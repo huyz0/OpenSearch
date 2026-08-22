@@ -39,6 +39,7 @@ import org.opensearch.common.xcontent.LoggingDeprecationHandler;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
@@ -105,5 +106,15 @@ public class RestCreateIndexAction extends BaseRestHandler {
 
         newSource.put("mappings", singletonMap(MapperService.SINGLE_MAPPING_NAME, mappings));
         return newSource;
+    }
+
+    /**
+     * A deployment
+     * with no way to create an index is not a deployment, so this must be available -- an omission
+     * found by walking the core CRUD surface, not a case this handler needed to argue for.
+     */
+    @Override
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 }

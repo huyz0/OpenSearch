@@ -64,6 +64,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -125,12 +126,19 @@ public class GoogleCloudStorageHttpHandler implements HttpHandler {
     }
     private final ConcurrentMap<String, BytesReference> blobs;
     private final ConcurrentMap<String, BlobResumableUpload> resumableUploads;
+    // Real GCS objects carry a monotonically increasing generation number as first-class
+    // metadata; this fixture tracks one per key so ifGenerationMatch conditional-write semantics
+    // (used by compareAndSwapRegister) can be enforced for real rather than trivially accepted.
+    private final ConcurrentMap<String, Long> generationsByKey;
+    private final AtomicLong nextGeneration;
     private final String bucket;
 
     public GoogleCloudStorageHttpHandler(final String bucket) {
         this.bucket = Objects.requireNonNull(bucket);
         this.blobs = new ConcurrentHashMap<>();
         this.resumableUploads = new ConcurrentHashMap<>();
+        this.generationsByKey = new ConcurrentHashMap<>();
+        this.nextGeneration = new AtomicLong(1);
     }
 
     @Override
@@ -153,7 +161,7 @@ public class GoogleCloudStorageHttpHandler implements HttpHandler {
                 if (blob == null) {
                     exchange.sendResponseHeaders(RestStatus.NOT_FOUND.getStatus(), -1);
                 } else {
-                    final byte[] response = buildBlobInfoJson(key, blob.length()).getBytes(UTF_8);
+                    final byte[] response = buildBlobInfoJson(key, blob.length(), generationsByKey.get(key)).getBytes(UTF_8);
                     exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
                     exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
                     exchange.getResponseBody().write(response);
@@ -175,7 +183,7 @@ public class GoogleCloudStorageHttpHandler implements HttpHandler {
                         if (delimiterPos > -1) {
                             prefixes.add("\"" + blobName.substring(0, prefix.length() + delimiterPos + 1) + "\"");
                         } else {
-                            listOfBlobs.add(buildBlobInfoJson(blobName, blob.getValue().length()));
+                            listOfBlobs.add(buildBlobInfoJson(blobName, blob.getValue().length(), generationsByKey.get(blobName)));
                         }
                     }
                 }
@@ -234,7 +242,9 @@ public class GoogleCloudStorageHttpHandler implements HttpHandler {
                     } else if (line.startsWith("DELETE")) {
                         final String name = line.substring(line.indexOf(uri) + uri.length(), line.lastIndexOf(" HTTP"));
                         if (Strings.hasText(name)) {
-                            blobs.remove(URLDecoder.decode(name, UTF_8.name()));
+                            final String decodedName = URLDecoder.decode(name, UTF_8.name());
+                            blobs.remove(decodedName);
+                            generationsByKey.remove(decodedName);
                             batch.append("HTTP/1.1 204 NO_CONTENT").append("\r\n");
                             batch.append("\r\n");
                         }
@@ -249,16 +259,30 @@ public class GoogleCloudStorageHttpHandler implements HttpHandler {
                 // Multipart upload
                 Optional<Tuple<String, BytesReference>> content = parseMultipartRequestBody(requestBody.streamInput());
                 if (content.isPresent()) {
-                    blobs.put(content.get().v1(), content.get().v2());
-                    byte[] response = String.format("""
-                            {
-                                "bucket":"%s",
-                                "name":"%s"
-                            }
-                        """,  bucket, content.get().v1()).getBytes(UTF_8);
-                    exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
-                    exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
-                    exchange.getResponseBody().write(response);
+                    final String key = content.get().v1();
+                    final Map<String, String> params = new HashMap<>();
+                    RestUtils.decodeQueryString(exchange.getRequestURI().getQuery(), 0, params);
+                    final String ifGenerationMatch = params.get("ifGenerationMatch");
+                    final Long currentGeneration = generationsByKey.get(key);
+                    final boolean preconditionFailed = ifGenerationMatch != null
+                        && Long.parseLong(ifGenerationMatch) != (currentGeneration == null ? 0L : currentGeneration);
+                    if (preconditionFailed) {
+                        exchange.sendResponseHeaders(RestStatus.PRECONDITION_FAILED.getStatus(), -1);
+                    } else {
+                        blobs.put(key, content.get().v2());
+                        final long newGeneration = nextGeneration.getAndIncrement();
+                        generationsByKey.put(key, newGeneration);
+                        byte[] response = String.format("""
+                                {
+                                    "bucket":"%s",
+                                    "name":"%s",
+                                    "generation":"%s"
+                                }
+                            """, bucket, key, newGeneration).getBytes(UTF_8);
+                        exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+                        exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
+                        exchange.getResponseBody().write(response);
+                    }
                 } else {
                     throw new AssertionError("Could not read multi-part request to [" + request + "] with headers ["
                         + new HashMap<>(exchange.getRequestHeaders()) + "]");
@@ -332,16 +356,17 @@ public class GoogleCloudStorageHttpHandler implements HttpHandler {
         }
     }
 
-    private String buildBlobInfoJson(String blobName, int size) {
+    private String buildBlobInfoJson(String blobName, int size, Long generation) {
         return String.format("""
             {
                 "kind":   "storage#object",
                 "bucket": "%s",
                 "name":   "%s",
                 "id":     "%s",
-                "size":   "%s"
+                "size":   "%s",
+                "generation": "%s"
             }
-            """, bucket, blobName, blobName, size);
+            """, bucket, blobName, blobName, size, generation == null ? 0L : generation);
     }
 
     public Map<String, BytesReference> blobs() {

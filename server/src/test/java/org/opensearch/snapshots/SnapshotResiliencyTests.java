@@ -2143,7 +2143,11 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                     threadPool
                 );
                 nodeConnectionsService = createTestNodeConnectionsService(clusterService.getSettings(), threadPool, transportService);
-                final MetadataMappingService metadataMappingService = new MetadataMappingService(clusterService, indicesService);
+                final MetadataMappingService metadataMappingService = new MetadataMappingService(
+                    clusterService,
+                    indicesService,
+                    threadPool
+                );
                 indicesClusterStateService = new IndicesClusterStateService(
                     settings,
                     indicesService,
@@ -2371,7 +2375,8 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                     null,
                     new TaskResourceTrackingService(settings, clusterSettings, threadPool),
                     Collections.emptyList(),
-                    Collections.emptyList()
+                    Collections.emptyList(),
+                    null
                 );
                 SearchPhaseController searchPhaseController = new SearchPhaseController(
                     writableRegistry(),

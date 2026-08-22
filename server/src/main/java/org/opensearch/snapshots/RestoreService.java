@@ -66,7 +66,6 @@ import org.opensearch.cluster.routing.RecoverySource.SnapshotRecoverySource;
 import org.opensearch.cluster.routing.RoutingChangesObserver;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
-import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.routing.UnassignedInfo;
 import org.opensearch.cluster.routing.allocation.AllocationService;
 import org.opensearch.cluster.service.ClusterManagerTaskThrottler;
@@ -171,6 +170,78 @@ public class RestoreService implements ClusterStateApplier {
         unremovable.add(SETTING_AUTO_EXPAND_REPLICAS);
         unremovable.add(SETTING_VERSION_UPGRADED);
         USER_UNREMOVABLE_SETTINGS = unmodifiableSet(unremovable);
+    }
+
+    /**
+     * Creates a settings filter predicate that separates internal ignore patterns from user ignore patterns.
+     * Internal ignore patterns override protection and can filter any setting.
+     * User ignore patterns respect protected settings and cannot filter them.
+     *
+     * @param userIgnoreSettings array of user-provided settings to ignore
+     * @param internalIgnoreSettings array of internal settings to ignore (override protection)
+     * @param protectedSettings set of settings that user cannot remove
+     * @return a predicate that returns true if the setting should be kept, false if it should be filtered out
+     */
+    static Predicate<String> createSettingsFilterPredicate(
+        String[] userIgnoreSettings,
+        String[] internalIgnoreSettings,
+        Set<String> protectedSettings
+    ) {
+        Set<String> userKeyFilters = new HashSet<>();
+        List<String> userSimpleMatchPatterns = new ArrayList<>();
+        Set<String> internalKeyFilters = new HashSet<>();
+        List<String> internalSimpleMatchPatterns = new ArrayList<>();
+
+        // Process user ignore settings
+        for (String ignoredSetting : userIgnoreSettings) {
+            if (!Regex.isSimpleMatchPattern(ignoredSetting)) {
+                userKeyFilters.add(ignoredSetting);
+            } else {
+                userSimpleMatchPatterns.add(ignoredSetting);
+            }
+        }
+
+        // Process internal ignore settings
+        for (String ignoredSetting : internalIgnoreSettings) {
+            if (!Regex.isSimpleMatchPattern(ignoredSetting)) {
+                internalKeyFilters.add(ignoredSetting);
+            } else {
+                internalSimpleMatchPatterns.add(ignoredSetting);
+            }
+        }
+
+        return k -> {
+            // Check internal ignore patterns first (they override protection)
+            if (internalKeyFilters.contains(k)) {
+                return false;
+            }
+            for (String pattern : internalSimpleMatchPatterns) {
+                if (Regex.simpleMatch(pattern, k)) {
+                    return false;
+                }
+            }
+
+            // Check user ignore patterns only for non-protected settings
+            if (!protectedSettings.contains(k)) {
+                if (userKeyFilters.contains(k)) {
+                    return false;
+                }
+                for (String pattern : userSimpleMatchPatterns) {
+                    if (Regex.simpleMatch(pattern, k)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+    }
+
+    /**
+     * Returns the set of settings that users cannot remove during restore.
+     * Exposed for testing purposes.
+     */
+    static Set<String> getUserUnremovableSettings() {
+        return USER_UNREMOVABLE_SETTINGS;
     }
 
     private final ClusterService clusterService;
@@ -818,8 +889,7 @@ public class RestoreService implements ClusterStateApplier {
                         }
                         IndexMetadata.Builder builder = IndexMetadata.builder(indexMetadata);
                         Settings settings = indexMetadata.getSettings();
-                        Set<String> keyFilters = new HashSet<>();
-                        List<String> simpleMatchPatterns = new ArrayList<>();
+
                         for (String ignoredSetting : ignoreSettings) {
                             if (!Regex.isSimpleMatchPattern(ignoredSetting)) {
                                 if (USER_UNREMOVABLE_SETTINGS.contains(ignoredSetting)) {
@@ -832,38 +902,24 @@ public class RestoreService implements ClusterStateApplier {
                                         snapshot,
                                         "cannot remove UnmodifiableOnRestore setting [" + ignoredSetting + "] on restore"
                                     );
-                                } else {
-                                    keyFilters.add(ignoredSetting);
                                 }
-                            } else {
-                                simpleMatchPatterns.add(ignoredSetting);
                             }
                         }
 
-                        // add internal settings to ignore settings list
-                        for (String ignoredSetting : ignoreSettingsInternal) {
-                            if (!Regex.isSimpleMatchPattern(ignoredSetting)) {
-                                keyFilters.add(ignoredSetting);
-                            } else {
-                                simpleMatchPatterns.add(ignoredSetting);
+                        // Build combined protected settings set including dynamic unmodifiable settings
+                        Set<String> protectedSettings = new HashSet<>(USER_UNREMOVABLE_SETTINGS);
+                        for (String key : settings.keySet()) {
+                            if (indexScopedSettings.isUnmodifiableOnRestoreSetting(key)) {
+                                protectedSettings.add(key);
                             }
                         }
 
-                        Predicate<String> settingsFilter = k -> {
-                            if (USER_UNREMOVABLE_SETTINGS.contains(k) == false && !indexScopedSettings.isUnmodifiableOnRestoreSetting(k)) {
-                                for (String filterKey : keyFilters) {
-                                    if (k.equals(filterKey)) {
-                                        return false;
-                                    }
-                                }
-                                for (String pattern : simpleMatchPatterns) {
-                                    if (Regex.simpleMatch(pattern, k)) {
-                                        return false;
-                                    }
-                                }
-                            }
-                            return true;
-                        };
+                        Predicate<String> settingsFilter = createSettingsFilterPredicate(
+                            ignoreSettings,
+                            ignoreSettingsInternal,
+                            protectedSettings
+                        );
+
                         Settings.Builder settingsBuilder = Settings.builder()
                             .put(settings.filter(settingsFilter))
                             .put(normalizedChangeSettings.filter(k -> {
@@ -905,13 +961,33 @@ public class RestoreService implements ClusterStateApplier {
                         Predicate<ShardRouting> isRemoteSnapshotShard = shardRouting -> shardRouting.primary()
                             && clusterService.state().getMetadata().getIndexSafe(shardRouting.index()).isRemoteSnapshot();
 
-                        ShardsIterator shardsIterator = clusterService.state()
-                            .routingTable()
-                            .allShardsSatisfyingPredicate(isRemoteSnapshotShard);
+                        // Resolved rather than looked up. The no-argument accessor takes its index list
+                        // from the routing table's own key set, so an index with no published entry is
+                        // invisible to it and its shards are missing from this total.
+                        //
+                        // Reachability is configuration dependent rather than impossible, and the path is
+                        // worth naming. Restore publishes routing unconditionally, so a freshly restored
+                        // index is always visible here. State recovery does not: after a full cluster
+                        // restart it rebuilds routing from metadata and skips whatever the deployment's
+                        // predicate calls unpublished, so a restored remote snapshot index that matches
+                        // that predicate comes back without a published entry.
+                        //
+                        // The direction of the error is why this is worth fixing rather than noting. This
+                        // is a capacity check, so missing shards make the total too small, and a total
+                        // that is too small admits a restore that overflows the file cache. Unlike the
+                        // rest of this seam, it fails towards doing the damage rather than towards
+                        // reporting nothing.
+                        // clusterService.state().allShards() replaces the static registry's
+                        // the since-deleted AbsentIndexRoutingSuppliers.allShards(...) here -- same composition,
+                        // discovered through the resolver attached to this state's own routing table.
+                        List<ShardRouting> routings = clusterService.state()
+                            .allShards()
+                            .stream()
+                            .filter(isRemoteSnapshotShard)
+                            .collect(Collectors.toList());
 
                         long totalRestoredRemoteIndicesSize = 0;
                         int missingSizeCount = 0;
-                        List<ShardRouting> routings = shardsIterator.getShardRoutings();
 
                         for (ShardRouting shardRouting : routings) {
                             Long shardSize = clusterInfo.getShardSize(shardRouting);

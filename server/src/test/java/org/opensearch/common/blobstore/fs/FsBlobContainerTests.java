@@ -46,11 +46,13 @@ import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
 import org.junit.Before;
 
+import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileSystem;
 import java.nio.file.Files;
 import java.nio.file.OpenOption;
@@ -110,6 +112,41 @@ public class FsBlobContainerTests extends OpenSearchTestCase {
             assertThat(totalBytesRead.get(), equalTo(0L));
             assertThat(Streams.consumeFully(stream), equalTo(length));
             assertThat(totalBytesRead.get(), equalTo(length));
+        }
+    }
+
+    /**
+     * The create-only contract, pinned here because it is the reference the S3 implementation was made to
+     * match. {@code S3BlobContainer} accepted this flag and dropped it for years, and nothing noticed
+     * because every test runs against this class, where it has always worked. An untested contract that
+     * two implementations are supposed to share is a contract only one of them keeps.
+     */
+    public void testWriteBlobHonoursFailIfAlreadyExists() throws IOException {
+        final Path path = PathUtils.get(createTempDir().toString());
+        final FsBlobContainer container = new FsBlobContainer(
+            new FsBlobStore(randomIntBetween(1, 8) * 1024, path, false),
+            BlobPath.cleanPath(),
+            path
+        );
+
+        final byte[] first = randomByteArrayOfLength(32);
+        container.writeBlob("blob", new ByteArrayInputStream(first), first.length, true);
+
+        final byte[] second = randomByteArrayOfLength(32);
+        expectThrows(
+            FileAlreadyExistsException.class,
+            () -> container.writeBlob("blob", new ByteArrayInputStream(second), second.length, true)
+        );
+
+        // The original survives the rejected write rather than being half-replaced.
+        try (InputStream stream = container.readBlob("blob")) {
+            assertArrayEquals(first, stream.readAllBytes());
+        }
+
+        // And with the flag off the same call overwrites, which is the behaviour the flag selects between.
+        container.writeBlob("blob", new ByteArrayInputStream(second), second.length, false);
+        try (InputStream stream = container.readBlob("blob")) {
+            assertArrayEquals(second, stream.readAllBytes());
         }
     }
 

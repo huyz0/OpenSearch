@@ -39,6 +39,7 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.Collections;
@@ -49,6 +50,17 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class RestClusterGetSettingsActionTests extends OpenSearchTestCase {
+
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(
+            ApiAvailabilityScope.AVAILABLE,
+            new RestClusterGetSettingsAction(
+                Settings.EMPTY,
+                new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS),
+                null
+            ).apiAvailabilityScope()
+        );
+    }
 
     public void testFilterPersistentSettings() {
         runTestFilterSettingsTest(Metadata.Builder::persistentSettings, ClusterGetSettingsResponse::getPersistentSettings);

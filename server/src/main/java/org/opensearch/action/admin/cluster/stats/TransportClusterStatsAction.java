@@ -202,7 +202,7 @@ public class TransportClusterStatsAction extends TransportNodesAction<
             false,
             false,
             false,
-            false
+            false // pluginStats
         );
         List<ShardStats> shardsStats = new ArrayList<>();
         if (isMetricRequired(Metric.INDICES, nodeRequest.request)) {

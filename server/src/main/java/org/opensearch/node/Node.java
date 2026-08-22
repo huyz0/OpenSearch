@@ -56,8 +56,11 @@ import org.opensearch.action.search.SearchTransportService;
 import org.opensearch.action.search.StreamSearchTransportService;
 import org.opensearch.action.support.TransportAction;
 import org.opensearch.action.update.UpdateHelper;
+import org.opensearch.arrow.spi.NativeAllocator;
+import org.opensearch.arrow.spi.PoolGroup;
 import org.opensearch.bootstrap.BootstrapCheck;
 import org.opensearch.bootstrap.BootstrapContext;
+import org.opensearch.bootstrap.BootstrapSettings;
 import org.opensearch.cluster.ClusterInfoService;
 import org.opensearch.cluster.ClusterManagerMetrics;
 import org.opensearch.cluster.ClusterModule;
@@ -66,6 +69,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.InternalClusterInfoService;
 import org.opensearch.cluster.NodeConnectionsService;
+import org.opensearch.cluster.ResolverAttachingClusterStateApplier;
 import org.opensearch.cluster.StreamNodeConnectionsService;
 import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.action.shard.LocalShardStateAction;
@@ -74,17 +78,24 @@ import org.opensearch.cluster.applicationtemplates.SystemTemplatesPlugin;
 import org.opensearch.cluster.applicationtemplates.SystemTemplatesService;
 import org.opensearch.cluster.coordination.PersistedStateRegistry;
 import org.opensearch.cluster.metadata.AliasValidator;
+import org.opensearch.cluster.metadata.IndexCreationStrategy;
+import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
+import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
 import org.opensearch.cluster.metadata.MetadataCreateIndexService;
+import org.opensearch.cluster.metadata.MetadataInPlaceMergeShardCommitService;
+import org.opensearch.cluster.metadata.MetadataInPlaceSplitShardCommitService;
 import org.opensearch.cluster.metadata.MetadataIndexUpgradeService;
 import org.opensearch.cluster.metadata.SystemIndexMetadataUpgradeService;
 import org.opensearch.cluster.metadata.TemplateUpgradeService;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.routing.BatchedRerouteService;
+import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.RerouteService;
+import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance;
 import org.opensearch.cluster.routing.allocation.DiskThresholdMonitor;
 import org.opensearch.cluster.service.ClusterService;
@@ -92,6 +103,7 @@ import org.opensearch.cluster.service.LocalClusterService;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.StopWatch;
+import org.opensearch.common.UUIDs;
 import org.opensearch.common.cache.module.CacheModule;
 import org.opensearch.common.cache.service.CacheService;
 import org.opensearch.common.inject.Injector;
@@ -183,6 +195,8 @@ import org.opensearch.indices.SystemIndices;
 import org.opensearch.indices.analysis.AnalysisModule;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
+import org.opensearch.indices.cluster.IndexResidencyPolicy;
+import org.opensearch.indices.cluster.IndexResidencyPolicyRegistry;
 import org.opensearch.indices.cluster.IndicesClusterStateService;
 import org.opensearch.indices.recovery.PeerRecoverySourceService;
 import org.opensearch.indices.recovery.PeerRecoveryTargetService;
@@ -211,7 +225,8 @@ import org.opensearch.persistent.PersistentTasksClusterService;
 import org.opensearch.persistent.PersistentTasksExecutor;
 import org.opensearch.persistent.PersistentTasksExecutorRegistry;
 import org.opensearch.persistent.PersistentTasksService;
-import org.opensearch.plugin.stats.AnalyticsBackendTaskCancellationStats;
+import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
+import org.opensearch.plugin.stats.NativeAllocatorStatsRegistry;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.AnalysisPlugin;
 import org.opensearch.plugins.BlockCacheRegistry;
@@ -242,12 +257,14 @@ import org.opensearch.plugins.ScriptPlugin;
 import org.opensearch.plugins.SearchBackEndPlugin;
 import org.opensearch.plugins.SearchPipelinePlugin;
 import org.opensearch.plugins.SearchPlugin;
+import org.opensearch.plugins.SearchStatsContributor;
 import org.opensearch.plugins.SecureSettingsFactory;
 import org.opensearch.plugins.SystemIndexPlugin;
 import org.opensearch.plugins.TaskManagerClientPlugin;
 import org.opensearch.plugins.TelemetryAwarePlugin;
 import org.opensearch.plugins.TelemetryPlugin;
 import org.opensearch.ratelimitting.admissioncontrol.AdmissionControlService;
+import org.opensearch.ratelimitting.admissioncontrol.NativeMemoryPressureSignal;
 import org.opensearch.ratelimitting.admissioncontrol.transport.AdmissionControlTransportInterceptor;
 import org.opensearch.repositories.RepositoriesModule;
 import org.opensearch.repositories.RepositoriesService;
@@ -323,9 +340,13 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -345,6 +366,7 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
@@ -568,6 +590,10 @@ public class Node implements Closeable {
 
             final Settings settings = pluginsService.updatedSettings();
 
+            if (BootstrapSettings.SERIAL_FILTER_SETTING.get(settings)) {
+                BootstrapSettings.initializeSerialFilter();
+            }
+
             final List<IdentityPlugin> identityPlugins = new ArrayList<>();
             identityPlugins.addAll(pluginsService.filterPlugins(IdentityPlugin.class));
 
@@ -742,6 +768,74 @@ public class Node implements Closeable {
             }
             clusterService.addStateApplier(scriptService);
             resourcesToClose.add(clusterService);
+
+            // Give the node its plugin-supplied
+            // IndexMetadataResolver/IndexRoutingResolver, if any ClusterPlugin on this node provides
+            // one. See ResolverAttachingClusterStateApplier's own javadoc for why this attachment point
+            // -- a high-priority applier -- is the right one, and Metadata#resolver's javadoc for the
+            // propagation mechanics that carry the attached resolver forward from here.
+            List<IndexMetadataResolver> indexMetadataResolvers = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexMetadataResolver)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toList());
+            if (indexMetadataResolvers.size() > 1) {
+                throw new IllegalStateException(
+                    "at most one ClusterPlugin may supply an IndexMetadataResolver, but found " + indexMetadataResolvers.size()
+                );
+            }
+            List<IndexRoutingResolver> indexRoutingResolvers = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexRoutingResolver)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toList());
+            if (indexRoutingResolvers.size() > 1) {
+                throw new IllegalStateException(
+                    "at most one ClusterPlugin may supply an IndexRoutingResolver, but found " + indexRoutingResolvers.size()
+                );
+            }
+            Optional<IndexMetadataResolver> indexMetadataResolver = indexMetadataResolvers.stream().findFirst();
+            Optional<IndexRoutingResolver> indexRoutingResolver = indexRoutingResolvers.stream().findFirst();
+            if (indexMetadataResolver.isPresent() || indexRoutingResolver.isPresent()) {
+                clusterService.addHighPriorityApplier(
+                    new ResolverAttachingClusterStateApplier(indexMetadataResolver, indexRoutingResolver)
+                );
+            }
+
+            // Give the node its plugin-supplied
+            // IndexCreationStrategy, if any ClusterPlugin on this node provides one. Unlike the resolvers
+            // above, claims() is a pure, cheap, synchronous, purely-local predicate with no deadlock-safety
+            // concerns and nothing to propagate through cluster state -- a one-time registration here,
+            // mirroring exactly how DescriptorOnlyCreation.register(...) is called once from a plugin's own
+            // bootstrap today, is the whole of what's needed. See IndexCreationStrategyRegistry's own
+            // javadoc.
+            List<IndexCreationStrategy> indexCreationStrategies = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexCreationStrategy)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toList());
+            if (indexCreationStrategies.size() > 1) {
+                throw new IllegalStateException(
+                    "at most one ClusterPlugin may supply an IndexCreationStrategy, but found " + indexCreationStrategies.size()
+                );
+            }
+            indexCreationStrategies.stream().findFirst().ifPresent(IndexCreationStrategyRegistry::register);
+
+            // Give the node its plugin-supplied
+            // IndexResidencyPolicy, if any ClusterPlugin on this node provides one. Same one-registration-
+            // at-startup shape as IndexCreationStrategy immediately above, for the same reason -- see
+            // IndexResidencyPolicyRegistry's own javadoc.
+            List<IndexResidencyPolicy> indexResidencyPolicies = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexResidencyPolicy)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toList());
+            if (indexResidencyPolicies.size() > 1) {
+                throw new IllegalStateException(
+                    "at most one ClusterPlugin may supply an IndexResidencyPolicy, but found " + indexResidencyPolicies.size()
+                );
+            }
+            indexResidencyPolicies.stream().findFirst().ifPresent(IndexResidencyPolicyRegistry::register);
             final Set<Setting<?>> consistentSettings = settingsModule.getConsistentSettings();
             if (consistentSettings.isEmpty() == false) {
                 clusterService.addLocalNodeClusterManagerListener(
@@ -766,12 +860,26 @@ public class Node implements Closeable {
             for (Module pluginModule : pluginsService.createGuiceModules()) {
                 modules.add(pluginModule);
             }
+            // Defensive: filter out nulls (a misbehaving plugin returning a list containing null
+            // would NPE inside FsHealthService.monitorFSHealth and mark the node UNHEALTHY with a
+            // misleading log) and dedupe (avoid probing the same path twice if a plugin happens to
+            // report a path that overlaps with another contributor or with nodeDataPaths).
+            final List<Path> pluginAdditionalHealthPaths = pluginsService.filterPlugins(Plugin.class)
+                .stream()
+                .flatMap(p -> p.getAdditionalHealthPaths(settings).stream())
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+
+            assertCanWritePluginHealthPaths(pluginAdditionalHealthPaths);
+
             final FsHealthService fsHealthService = new FsHealthService(
                 settings,
                 clusterService.getClusterSettings(),
                 threadPool,
                 nodeEnvironment,
-                metricsRegistry
+                metricsRegistry,
+                pluginAdditionalHealthPaths
             );
             final SetOnce<RerouteService> rerouteServiceReference = new SetOnce<>();
             final InternalSnapshotsInfoService snapshotsInfoService = new InternalSnapshotsInfoService(
@@ -917,8 +1025,9 @@ public class Node implements Closeable {
 
             // collect engine factory providers from plugins
             final Collection<EnginePlugin> enginePlugins = pluginsService.filterPlugins(EnginePlugin.class);
-            final Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders = enginePlugins.stream()
-                .map(plugin -> (Function<IndexSettings, Optional<EngineFactory>>) plugin::getEngineFactory)
+            final Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders = enginePlugins
+                .stream()
+                .map(plugin -> (BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>) plugin::getEngineFactory)
                 .collect(Collectors.toList());
 
             // collect ingestion consumer factory providers from plugins
@@ -1202,6 +1311,14 @@ public class Node implements Closeable {
             // Add the telemetryAwarePlugin components to the existing pluginComponents collection.
             pluginComponents.addAll(telemetryAwarePluginComponents);
 
+            // Extract the NativeAllocator instance (published by ArrowBasePlugin in phase 1)
+            // so it can be passed to SearchBackEndPlugin.createComponents for virtual pool registration.
+            final NativeAllocator nativeAllocator = pluginComponents.stream()
+                .filter(c -> c instanceof NativeAllocator)
+                .map(c -> (NativeAllocator) c)
+                .findFirst()
+                .orElse(null);
+
             @SuppressWarnings("rawtypes")
             Collection<Object> searchBackEndPluginComponents = pluginsService.filterPlugins(SearchBackEndPlugin.class)
                 .stream()
@@ -1218,18 +1335,26 @@ public class Node implements Closeable {
                         namedWriteableRegistry,
                         clusterModule.getIndexNameExpressionResolver(),
                         repositoriesServiceReference::get,
-                        dataFormatRegistry
+                        dataFormatRegistry,
+                        nativeAllocator
                     ).stream()
                 )
                 .collect(Collectors.toList());
             pluginComponents.addAll(searchBackEndPluginComponents);
 
-            pluginsService.filterPlugins(SearchBackEndPlugin.class)
-                .stream()
-                .map(SearchBackEndPlugin::getAnalyticsBackendNativeMemoryStats)
-                .filter(Objects::nonNull)
-                .findFirst()
-                .ifPresent(supplier -> monitorService.memoryReportingService().setNativeStatsSupplier(supplier));
+            List<SearchStatsContributor> searchStatsContributors = pluginsService.filterPlugins(SearchStatsContributor.class);
+            if (searchStatsContributors.isEmpty() == false) {
+                indicesService.setSearchStatsContributors(searchStatsContributors);
+            }
+
+            // Wire indexing pool group limit changes to the IndexingMemoryController.
+            // When the rebalancer adjusts the effective limit of pools in the INDEXING group,
+            // IMC's native buffer is updated to 70% of the new grouped limit.
+            if (nativeAllocator != null) {
+                nativeAllocator.addPoolGroupLimitListener(PoolGroup.INDEXING, newGroupLimit -> {
+                    indicesService.setNativeIndexBufferBytes((long) (newGroupLimit * 0.70));
+                });
+            }
 
             if (nodeCacheService != null) {
                 nodeCacheService.registerProviders(blockCacheProviders);
@@ -1301,6 +1426,20 @@ public class Node implements Closeable {
 
             final RestController restController = actionModule.getRestController();
 
+            // Discover the native-allocator stats supplier from any plugin that publishes a
+            // NativeAllocatorStatsRegistry component (today: ArrowBasePlugin). Lookup mirrors
+            // the SearchRequestOperationsListener instanceof filter on pluginComponents elsewhere
+            // in this file. Server has no compile-time dependency on arrow-base.
+            // Discovered here (ahead of AdmissionControlService) so it can be forwarded to the
+            // native-memory admission controller for indexing-pool based rejection.
+            final Optional<NativeAllocatorStatsRegistry> nativeAllocatorStatsRegistry = pluginComponents.stream()
+                .filter(c -> c instanceof NativeAllocatorStatsRegistry)
+                .map(c -> (NativeAllocatorStatsRegistry) c)
+                .findFirst();
+            final Supplier<NativeAllocatorPoolStats> nativeAllocatorStatsSupplier = nativeAllocatorStatsRegistry.map(
+                NativeAllocatorStatsRegistry::supplier
+            ).orElse(null);
+
             final NodeResourceUsageTracker nodeResourceUsageTracker = new NodeResourceUsageTracker(
                 monitorService.fsService(),
                 threadPool,
@@ -1313,11 +1452,33 @@ public class Node implements Closeable {
                 threadPool
             );
 
+            // Inject the node-level native memory pressure signal (same signal admission control uses)
+            // into the allocator so it can make over-commit admission decisions when a native pool is
+            // full. Reuses the registry discovered above. No-op when no such plugin is loaded.
+            nativeAllocatorStatsRegistry.ifPresent(
+                reg -> reg.setNativeMemoryPressureSupplier(nodeResourceUsageTracker::getNativeMemoryUtilizationPercent)
+            );
+
+            // AdmissionControlService (and everything it
+            // constructs, including NativeMemoryBasedAdmissionController) takes the generic
+            // NativeMemoryPressureSignal, not the Arrow allocator's concrete pool-stats type -- this is
+            // the one place that adapts between them, so org.opensearch.ratelimitting.admissioncontrol
+            // itself has no arrow-spi dependency. null in means null out, same as before this adapter.
+            // The adapter instance itself is stateless (it re-reads nativeAllocatorStatsSupplier on every
+            // call), so one instance suffices for the life of the node -- this supplier just hands it back.
+            final NativeMemoryPressureSignal nativeMemoryPressureSignal = nativeAllocatorStatsSupplier == null
+                ? null
+                : new NativeAllocatorMemoryPressureSignal(nativeAllocatorStatsSupplier);
+            final Supplier<NativeMemoryPressureSignal> nativeMemoryPressureSignalSupplier = nativeMemoryPressureSignal == null
+                ? null
+                : () -> nativeMemoryPressureSignal;
+
             final AdmissionControlService admissionControlService = new AdmissionControlService(
                 settings,
                 clusterService,
                 threadPool,
-                resourceUsageCollectorService
+                resourceUsageCollectorService,
+                nativeMemoryPressureSignalSupplier
             );
 
             AdmissionControlTransportInterceptor admissionControlTransportInterceptor = new AdmissionControlTransportInterceptor(
@@ -1582,14 +1743,10 @@ public class Node implements Closeable {
                 settings,
                 clusterService.getClusterSettings()
             );
-            final Supplier<AnalyticsBackendTaskCancellationStats> analyticsTaskCancellationStatsSupplier = pluginsService.filterPlugins(
-                SearchBackEndPlugin.class
-            ).stream().map(SearchBackEndPlugin::getAnalyticsBackendTaskCancellationStats).filter(Objects::nonNull).findFirst().orElse(null);
             final TaskCancellationMonitoringService taskCancellationMonitoringService = new TaskCancellationMonitoringService(
                 threadPool,
                 transportService.getTaskManager(),
-                taskCancellationMonitoringSettings,
-                analyticsTaskCancellationStatsSupplier
+                taskCancellationMonitoringSettings
             );
 
             this.nodeService = new NodeService(
@@ -1634,7 +1791,8 @@ public class Node implements Closeable {
                 searchModule.getIndexSearcherExecutor(threadPool),
                 taskResourceTrackingService,
                 searchModule.getConcurrentSearchRequestDeciderFactories(),
-                searchModule.getPluginProfileMetricsProviders()
+                searchModule.getPluginProfileMetricsProviders(),
+                workloadGroupService
             );
 
             final List<PersistentTasksExecutor<?>> tasksExecutors = pluginsService.filterPlugins(PersistentTaskPlugin.class)
@@ -1667,6 +1825,27 @@ public class Node implements Closeable {
             );
             resourcesToClose.add(persistentTasksClusterService);
             final PersistentTasksService persistentTasksService = new PersistentTasksService(clusterService, threadPool, client);
+
+            // Finalizes or aborts in-place shard splits once their child shards converge -- see
+            // MetadataInPlaceSplitShardCommitService's javadoc for why this can't reuse
+            // PersistentTasksClusterService itself despite the similar shape.
+            new MetadataInPlaceSplitShardCommitService(settings, clusterService);
+
+            // Surfaces a revived in-place-merge parent that exhausted its allocation retries as a loud,
+            // operator-actionable warning (merge has no automatic rollback yet -- see the service's javadoc).
+            new MetadataInPlaceMergeShardCommitService(settings, clusterService);
+
+            // The service TransportInPlaceSplitShardAction actually calls to trigger a split --
+            // previously constructed nowhere, making the whole in-place split feature unreachable
+            // from any user-facing API despite MetadataInPlaceSplitShardService itself existing.
+            final org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService metadataInPlaceSplitShardService =
+                new org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService(clusterService, clusterModule.getAllocationService());
+
+            // The service TransportInPlaceMergeShardAction calls to reverse a split in place -- the
+            // merge counterpart of metadataInPlaceSplitShardService above, likewise previously
+            // constructed nowhere, so the whole in-place merge feature was unreachable from any API.
+            final org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService metadataInPlaceMergeShardService =
+                new org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService(clusterService, clusterModule.getAllocationService());
 
             mergedSegmentWarmerFactory = new MergedSegmentWarmerFactory(transportService, recoverySettings, clusterService);
 
@@ -1717,6 +1896,8 @@ public class Node implements Closeable {
                 }
                 b.bind(AliasValidator.class).toInstance(aliasValidator);
                 b.bind(MetadataCreateIndexService.class).toInstance(metadataCreateIndexService);
+                b.bind(org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService.class).toInstance(metadataInPlaceSplitShardService);
+                b.bind(org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService.class).toInstance(metadataInPlaceMergeShardService);
                 b.bind(AwarenessReplicaBalance.class).toInstance(awarenessReplicaBalance);
                 b.bind(MetadataCreateDataStreamService.class).toInstance(metadataCreateDataStreamService);
                 b.bind(ViewService.class).toInstance(viewService);
@@ -2393,7 +2574,8 @@ public class Node implements Closeable {
         Executor indexSearcherExecutor,
         TaskResourceTrackingService taskResourceTrackingService,
         Collection<ConcurrentSearchRequestDecider.Factory> concurrentSearchDeciderFactories,
-        List<SearchPlugin.ProfileMetricsProvider> pluginProfilers
+        List<SearchPlugin.ProfileMetricsProvider> pluginProfilers,
+        WorkloadGroupService workloadGroupService
     ) {
         return new SearchService(
             clusterService,
@@ -2408,7 +2590,8 @@ public class Node implements Closeable {
             indexSearcherExecutor,
             taskResourceTrackingService,
             concurrentSearchDeciderFactories,
-            pluginProfilers
+            pluginProfilers,
+            workloadGroupService
         );
     }
 
@@ -2544,6 +2727,44 @@ public class Node implements Closeable {
     private static String validateFileCacheSize(String capacityRaw) {
         calculateFileCacheSize(capacityRaw, 0L);
         return capacityRaw;
+    }
+
+    /**
+     * Pre-flight write probe for plugin-supplied {@link FsHealthService} paths. Throws
+     * {@link IllegalStateException} on any failure so node boot halts loudly on misconfiguration.
+     * Mirrors the spirit of {@code NodeEnvironment.assertCanWrite()} but for plugin paths.
+     *
+     * <p>Visible for testing.
+     */
+    static void assertCanWritePluginHealthPaths(List<Path> paths) {
+        for (Path path : paths) {
+            Path probe = path.resolve(".opensearch_plugin_health_boot_probe_" + UUIDs.randomBase64UUID());
+            try {
+                Files.deleteIfExists(probe);
+                Files.write(probe, "boot".getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE_NEW);
+                Files.delete(probe);
+            } catch (AccessDeniedException e) {
+                throw new IllegalStateException(
+                    "Plugin-supplied health path [" + path + "] is not writable (permission denied): " + e.getMessage(),
+                    e
+                );
+            } catch (NoSuchFileException e) {
+                throw new IllegalStateException(
+                    "Plugin-supplied health path [" + path + "] is not writable (no such file or directory): " + e.getMessage(),
+                    e
+                );
+            } catch (FileSystemException e) {
+                // Covers ENOSPC, read-only filesystem, etc. The reason() field, when present, is
+                // the OS-level error string (e.g. "No space left on device").
+                String reason = e.getReason() != null ? e.getReason() : e.getMessage();
+                throw new IllegalStateException(
+                    "Plugin-supplied health path [" + path + "] is not writable (filesystem error): " + reason,
+                    e
+                );
+            } catch (IOException | RuntimeException e) {
+                throw new IllegalStateException("Plugin-supplied health path [" + path + "] is not writable: " + e.getMessage(), e);
+            }
+        }
     }
 
     /**

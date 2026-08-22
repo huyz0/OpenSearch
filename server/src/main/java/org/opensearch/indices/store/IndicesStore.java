@@ -45,6 +45,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingNode;
+import org.opensearch.cluster.routing.RoutingNodes;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
@@ -166,7 +167,8 @@ public class IndicesStore implements ClusterStateListener, Closeable {
         folderNotFoundCache.removeIf(shardId -> !routingTable.hasIndex(shardId.getIndex()));
         // remove entries from cache which are allocated to this node
         final String localNodeId = event.state().nodes().getLocalNodeId();
-        RoutingNode localRoutingNode = event.state().getRoutingNodes().node(localNodeId);
+        // Only this node's shards are read, so avoid building the cluster-wide RoutingNodes index.
+        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(event.state(), localNodeId);
         if (localRoutingNode != null) {
             for (ShardRouting routing : localRoutingNode) {
                 folderNotFoundCache.remove(routing.shardId());

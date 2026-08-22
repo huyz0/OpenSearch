@@ -175,6 +175,54 @@ public class MetadataIndexStateService {
         if (concreteIndices == null || concreteIndices.length == 0) {
             throw new IllegalArgumentException("Index name is required");
         }
+        // Refused rather than failed later, for the same reason update-settings is. A gated index has no
+        // cluster state entry, so everything below -- the blocks, the routing table rewrite, the wait for
+        // shards to verify -- has nothing to operate on, and the request would surface as "no such index"
+        // from getIndexSafe. The descriptor can represent State.CLOSE, so this is a missing feature rather
+        // than an impossible one, and saying so is more useful than a misleading error.
+        //
+        // Resolved on this thread, which is the transport thread that received the request: the seam refuses
+        // to answer on the cluster state thread, so checking inside the update task would learn nothing.
+        // clusterService.state().metadata().gatedAmong(...)
+        // replaces AbsentIndexDescriptorSuppliers.gatedAmong(...) here -- same predicate, discovered through
+        // the resolver attached to this state's own metadata.
+        final List<Index> gated = clusterService.state().metadata().gatedAmong(request.indices());
+        if (gated.isEmpty() == false) {
+            // The cap and the namespace wording both come
+            // from the registered strategy now, instead of core hardcoding 50 and naming one product's
+            // storage technology in an error a user reads. Unregistered answers MAX_VALUE/a generic
+            // description, so a node without the plugin is unaffected -- and cannot reach here anyway,
+            // since nothing is gated without a resolver attached.
+            final int maxTargets = IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets();
+            if (gated.size() > maxTargets) {
+                listener.onFailure(
+                    new IllegalArgumentException(
+                        "Multi-index close operations on indices in "
+                            + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                            + " may target at most "
+                            + maxTargets
+                            + " indices, because each one costs a separate external-storage operation. Specified: "
+                            + gated.size()
+                    )
+                );
+                return;
+            }
+            if (gated.size() == request.indices().length) {
+                closeGatedIndices(request, gated, listener);
+                return;
+            }
+            listener.onFailure(
+                new UnsupportedOperationException(
+                    "cannot close "
+                        + names(gated)
+                        + " in "
+                        + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                        + ": mixed request with these and ordinary indices is not supported"
+                )
+            );
+            return;
+        }
+
         List<String> writeIndices = new ArrayList<>();
         SortedMap<String, IndexAbstraction> lookup = clusterService.state().metadata().getIndicesLookup();
         for (Index index : concreteIndices) {
@@ -808,7 +856,7 @@ public class MetadataIndexStateService {
             final ActionListener<ReplicationResponse> listener
         ) {
             final ShardId shardId = shardRoutingTable.shardId();
-            if (shardRoutingTable.primaryShard().unassigned()) {
+            if (shardRoutingTable.primaryShard() == null || shardRoutingTable.primaryShard().unassigned()) {
                 logger.debug("primary shard {} is unassigned, ignoring", shardId);
                 final ReplicationResponse response = new ReplicationResponse();
                 response.setShardInfo(new ReplicationResponse.ShardInfo(shardRoutingTable.size(), shardRoutingTable.size()));
@@ -932,6 +980,43 @@ public class MetadataIndexStateService {
         final OpenIndexClusterStateUpdateRequest request,
         final ActionListener<OpenIndexClusterStateUpdateResponse> listener
     ) {
+        // Same refusal as closeIndices, and reachable by the same route: an operator opening a name that
+        // resolves through a descriptor rather than through cluster state.
+        // clusterService.state().metadata().gatedAmong(...)
+        // replaces AbsentIndexDescriptorSuppliers.gatedAmong(...) here -- same predicate, discovered through
+        // the resolver attached to this state's own metadata.
+        final List<Index> gatedToOpen = clusterService.state().metadata().gatedAmong(request.indices());
+        if (gatedToOpen.isEmpty() == false) {
+            // Same strategy-supplied cap and namespace wording as closeIndices above.
+            final int maxTargets = IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets();
+            if (gatedToOpen.size() > maxTargets) {
+                listener.onFailure(
+                    new IllegalArgumentException(
+                        "Multi-index open operations on indices in "
+                            + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                            + " may target at most "
+                            + maxTargets
+                            + " indices, because each one costs a separate external-storage operation. Specified: "
+                            + gatedToOpen.size()
+                    )
+                );
+                return;
+            }
+            if (gatedToOpen.size() == request.indices().length) {
+                openGatedIndices(request, gatedToOpen, listener);
+                return;
+            }
+            listener.onFailure(
+                new UnsupportedOperationException(
+                    "cannot open "
+                        + names(gatedToOpen)
+                        + " in "
+                        + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                        + ": mixed request with these and ordinary indices is not supported"
+                )
+            );
+            return;
+        }
         onlyOpenIndex(request, ActionListener.wrap(response -> {
             if (response.isAcknowledged()) {
                 String[] indexNames = Arrays.stream(request.indices()).map(Index::getName).toArray(String[]::new);
@@ -1160,6 +1245,99 @@ public class MetadataIndexStateService {
             clusterBlock.isAllowReleaseResources(),
             clusterBlock.status(),
             clusterBlock.levels()
+        );
+    }
+
+    /** Reads as "index x" or "indices [x, y]", so a single-name error does not say "indices". */
+    private static String names(List<Index> indices) {
+        if (indices.size() == 1) {
+            return "index " + indices.get(0).getName();
+        }
+        return "indices " + indices.stream().map(Index::getName).collect(java.util.stream.Collectors.toList());
+    }
+
+    /**
+     * Moves every named gated index to {@code targetState}, acknowledging only once all of them are stored.
+     *
+     * <p><b>Why the acknowledgement waits.</b>
+     *
+     * For a gated index the descriptor write <em>is</em> the state change: there is no cluster state entry
+     * behind it that would still carry a close if the write were lost. Both of these paths used to call
+     * {@code updateGated} and throw the returned future away, then answer {@code acknowledged=true}
+     * immediately -- so a close could be acknowledged while the index stayed OPEN and went on taking writes,
+     * which is precisely the failure {@code IndexDescriptor#toIndexMetadata}'s own comment records from the
+     * other direction. A null return meaning "no updater installed" was indistinguishable from success too.
+     *
+     * <p>Nothing blocks. {@link IndexDescriptorPublisher#updateGated} runs the read-modify-write on the
+     * store's own executor and completes the listener from there; this thread only hands the work over. That
+     * is the same arrangement {@code DurableTombstones} uses for a deletion's tombstone.
+     *
+     * <p><b>Why the new state is a mutation rather than a descriptor.</b>
+     *
+     * The descriptor resolved here is a cached one and may be a freshness window out of date. Writing
+     * {@code cached.withState(...)} back would revert everything that changed on the real descriptor since
+     * -- a concurrent dynamic-field addition, most obviously. Handing over the change instead lets the store
+     * apply it to what it actually holds, under a conditional write.
+     */
+    private void updateGatedIndicesState(
+        final List<Index> gatedIndices,
+        final IndexDescriptor.State targetState,
+        final ActionListener<Void> whenAllStored
+    ) {
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                // The existence check stays on the resolved descriptor: an operator naming an index that is
+                // not there needs "no such index" rather than a write failure. Deliberately still
+                // AbsentIndexDescriptorSuppliers directly, since this is the gated plane's own record.
+                for (Index index : gatedIndices) {
+                    IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
+                    if (descriptor == null || descriptor.exists() == false) {
+                        throw new IndexNotFoundException(index.getName());
+                    }
+                }
+                // Grouped so the acknowledgement waits for the last one and reports the first failure, the
+                // same shape a multi-index delete already uses for its tombstones.
+                final ActionListener<Void> perIndex = new org.opensearch.action.support.GroupedActionListener<>(
+                    ActionListener.wrap(ignored -> whenAllStored.onResponse(null), whenAllStored::onFailure),
+                    gatedIndices.size()
+                );
+                for (Index index : gatedIndices) {
+                    IndexDescriptorPublisher.updateGated(
+                        index.getName(),
+                        current -> current.state() == targetState ? current : current.withState(targetState),
+                        perIndex
+                    );
+                }
+            } catch (Exception e) {
+                whenAllStored.onFailure(e);
+            }
+        });
+    }
+
+    private void closeGatedIndices(
+        final CloseIndexClusterStateUpdateRequest request,
+        final List<Index> gatedIndices,
+        final ActionListener<CloseIndexResponse> listener
+    ) {
+        updateGatedIndicesState(
+            gatedIndices,
+            IndexDescriptor.State.CLOSE,
+            ActionListener.wrap(
+                ignored -> listener.onResponse(new CloseIndexResponse(true, false, Collections.emptyList())),
+                listener::onFailure
+            )
+        );
+    }
+
+    private void openGatedIndices(
+        final OpenIndexClusterStateUpdateRequest request,
+        final List<Index> gatedIndices,
+        final ActionListener<OpenIndexClusterStateUpdateResponse> listener
+    ) {
+        updateGatedIndicesState(
+            gatedIndices,
+            IndexDescriptor.State.OPEN,
+            ActionListener.wrap(ignored -> listener.onResponse(new OpenIndexClusterStateUpdateResponse(true, true)), listener::onFailure)
         );
     }
 }

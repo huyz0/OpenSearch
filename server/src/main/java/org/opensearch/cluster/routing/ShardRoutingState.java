@@ -38,6 +38,21 @@ import org.opensearch.common.annotation.PublicApi;
  * Represents the current state of a {@link ShardRouting} as defined by the
  * cluster.
  *
+ * <p><b>Recorded here as a deliberate, reviewed decision.</b> A previous {@code SPLITTING} constant, and
+ * the paired {@code ShardRouting} fields
+ * {@code recoveringChildShards}/{@code parentShardId} it went with, were removed by the in-place-split
+ * rework as a side effect rather than a reviewed API change, which an external review flagged since this
+ * enum is {@link PublicApi}. Investigating found no real caller of that representation anywhere in this
+ * codebase's history, on this branch or on {@code main}: {@code OperationRouting#shardWithRecoveringChild}
+ * (the one production method that could have produced it) was itself never called by anything outside its
+ * own definition, and every other reference to {@code SPLITTING}/{@code recoveringChildShards} lived only
+ * in {@code ShardRoutingStateSplitTests}, a dedicated unit test exercising the accessors in isolation. It
+ * was speculative scaffolding for an earlier design that a real caller was never wired up to, on either
+ * branch, not a load-bearing representation any deployed cluster could have produced. The removal stands
+ * as-is. In-place split/merge is represented today by {@code org.opensearch.cluster.metadata.SplitShardsMetadata}
+ * instead -- see {@code IndexRoutingTable#validate(Metadata)}'s {@code isSplitParent()} check and {@link
+ * RecoverySource.Type#IN_PLACE_SPLIT_SHARD}/{@code IN_PLACE_MERGE_SHARD} for the current mechanism.
+ *
  * @opensearch.api
  */
 @PublicApi(since = "1.0.0")
@@ -58,11 +73,7 @@ public enum ShardRoutingState {
     /**
      * The shard is in the process being relocated.
      */
-    RELOCATING((byte) 4),
-    /**
-     * The shard is in the process of being split in-place.
-     */
-    SPLITTING((byte) 5);
+    RELOCATING((byte) 4);
 
     private byte value;
 
@@ -88,8 +99,6 @@ public enum ShardRoutingState {
                 return STARTED;
             case 4:
                 return RELOCATING;
-            case 5:
-                return SPLITTING;
             default:
                 throw new IllegalStateException("No routing state mapped for [" + value + "]");
         }

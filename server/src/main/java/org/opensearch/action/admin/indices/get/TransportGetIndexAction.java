@@ -145,7 +145,16 @@ public class TransportGetIndexAction extends TransportClusterInfoAction<GetIndex
                         final Map<String, Settings> settingsMapBuilder = new HashMap<>();
                         final Map<String, Settings> defaultSettingsMapBuilder = new HashMap<>();
                         for (String index : concreteIndices) {
-                            Settings indexSettings = state.metadata().index(index).getSettings();
+                            // Through the descriptor seam, and null-checked. A gated index has no cluster
+                            // state entry, so the bare map lookup answered null and this line threw an NPE
+                            // on a name the resolver had just accepted -- a crash rather than the silent
+                            // drop the identical pattern caused in TransportGetSettingsAction, but with the
+                            // same root cause: metadata read from the one place a gated index is never in.
+                            IndexMetadata indexMetadata = state.metadata().indexOrResolved(index);
+                            if (indexMetadata == null) {
+                                continue;
+                            }
+                            Settings indexSettings = indexMetadata.getSettings();
                             if (request.humanReadable()) {
                                 indexSettings = IndexMetadata.addHumanReadableSettings(indexSettings);
                             }
@@ -166,7 +175,11 @@ public class TransportGetIndexAction extends TransportClusterInfoAction<GetIndex
                     if (!doneContext) {
                         final Map<String, Context> contextBuilder = new HashMap<>();
                         for (String index : concreteIndices) {
-                            Context indexContext = state.metadata().index(index).context();
+                            IndexMetadata indexMetadata = state.metadata().indexOrResolved(index);
+                            if (indexMetadata == null) {
+                                continue;
+                            }
+                            Context indexContext = indexMetadata.context();
                             if (indexContext != null) {
                                 contextBuilder.put(index, indexContext);
                             }

@@ -65,11 +65,23 @@ import java.util.stream.Collectors;
 public class AzureHttpHandler implements HttpHandler {
 
     private final Map<String, BytesReference> blobs;
+    // Tracked separately from blobs so every other branch that already reads/writes it stays
+    // untouched: only PUT Blob (below) and GET/HEAD need to know about ETags/If-Match at all.
+    private final Map<String, String> eTagsByKey;
     private final String container;
 
     public AzureHttpHandler(final String container) {
         this.container = Objects.requireNonNull(container);
         this.blobs = new ConcurrentHashMap<>();
+        this.eTagsByKey = new ConcurrentHashMap<>();
+    }
+
+    private static String newETag() {
+        // Unquoted: the Azure SDK's BlobDownloadHeaders#getETag() strips the HTTP quoting before
+        // handing the value back to callers, and BlobRequestConditions#setIfMatch() expects that
+        // same unquoted form -- storing it quoted here would make every real If-Match comparison
+        // fail against a value the SDK itself produced from this fixture's own prior response.
+        return org.opensearch.common.UUIDs.randomBase64UUID();
     }
 
     @Override
@@ -110,15 +122,30 @@ public class AzureHttpHandler implements HttpHandler {
 
             } else if (Regex.simpleMatch("PUT /" + container + "/*", request)) {
                 // PUT Blob (see https://docs.microsoft.com/en-us/rest/api/storageservices/put-blob)
+                final String key = exchange.getRequestURI().getPath();
                 final String ifNoneMatch = exchange.getRequestHeaders().getFirst("If-None-Match");
+                final String ifMatch = exchange.getRequestHeaders().getFirst("If-Match");
                 if ("*".equals(ifNoneMatch)) {
-                    if (blobs.putIfAbsent(exchange.getRequestURI().getPath(), Streams.readFully(exchange.getRequestBody())) != null) {
+                    if (blobs.putIfAbsent(key, Streams.readFully(exchange.getRequestBody())) != null) {
                         sendError(exchange, RestStatus.CONFLICT);
                         return;
                     }
+                    eTagsByKey.put(key, newETag());
+                } else if (ifMatch != null) {
+                    // Real Azure PUT Blob If-Match semantics (used by compareAndSwapRegister):
+                    // atomically checked against the blob's live ETag, 412 on mismatch.
+                    if (ifMatch.equals(eTagsByKey.get(key)) == false) {
+                        Streams.readFully(exchange.getRequestBody());
+                        sendError(exchange, RestStatus.PRECONDITION_FAILED);
+                        return;
+                    }
+                    blobs.put(key, Streams.readFully(exchange.getRequestBody()));
+                    eTagsByKey.put(key, newETag());
                 } else {
-                    blobs.put(exchange.getRequestURI().getPath(), Streams.readFully(exchange.getRequestBody()));
+                    blobs.put(key, Streams.readFully(exchange.getRequestBody()));
+                    eTagsByKey.put(key, newETag());
                 }
+                exchange.getResponseHeaders().add("ETag", eTagsByKey.get(key));
                 exchange.getResponseHeaders().add("x-ms-request-server-encrypted", "false");
                 exchange.sendResponseHeaders(RestStatus.CREATED.getStatus(), -1);
 
@@ -129,6 +156,10 @@ public class AzureHttpHandler implements HttpHandler {
                     sendError(exchange, RestStatus.NOT_FOUND);
                     return;
                 }
+                final String headEtag = eTagsByKey.get(exchange.getRequestURI().getPath());
+                if (headEtag != null) {
+                    exchange.getResponseHeaders().add("ETag", headEtag);
+                }
                 exchange.getResponseHeaders().add("Content-Length", String.valueOf(blob.length()));
                 exchange.getResponseHeaders().add("x-ms-blob-type", "blockblob");
                 exchange.getResponseHeaders().add("x-ms-request-server-encrypted", "false");
@@ -136,21 +167,34 @@ public class AzureHttpHandler implements HttpHandler {
 
             } else if (Regex.simpleMatch("GET /" + container + "/*", request)) {
                 // GET Object (https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html)
-                final BytesReference blob = blobs.get(exchange.getRequestURI().getPath());
+                final String key = exchange.getRequestURI().getPath();
+                final BytesReference blob = blobs.get(key);
                 if (blob == null) {
                     sendError(exchange, RestStatus.NOT_FOUND);
                     return;
                 }
 
-                // see Constants.HeaderConstants.STORAGE_RANGE_HEADER
-                final String range = exchange.getRequestHeaders().getFirst("x-ms-range");
-                final Matcher matcher = Pattern.compile("^bytes=([0-9]+)-([0-9]+)$").matcher(range);
-                if (matcher.matches() == false) {
-                    throw new AssertionError("Range header does not match expected format: " + range);
+                final String getEtag = eTagsByKey.get(key);
+                if (getEtag != null) {
+                    exchange.getResponseHeaders().add("ETag", getEtag);
                 }
 
-                final int start = Integer.parseInt(matcher.group(1));
-                final int end = Integer.parseInt(matcher.group(2));
+                // see Constants.HeaderConstants.STORAGE_RANGE_HEADER
+                final String range = exchange.getRequestHeaders().getFirst("x-ms-range");
+                final int start;
+                final int end;
+                if (range == null) {
+                    // No explicit range (e.g. downloadContentWithResponse): the whole blob.
+                    start = 0;
+                    end = Math.max(blob.length() - 1, 0);
+                } else {
+                    final Matcher matcher = Pattern.compile("^bytes=([0-9]+)-([0-9]+)$").matcher(range);
+                    if (matcher.matches() == false) {
+                        throw new AssertionError("Range header does not match expected format: " + range);
+                    }
+                    start = Integer.parseInt(matcher.group(1));
+                    end = Integer.parseInt(matcher.group(2));
+                }
                 final int length = Math.min(end - start + 1, blob.length());
 
                 exchange.getResponseHeaders().add("Content-Type", "application/octet-stream");
@@ -166,6 +210,7 @@ public class AzureHttpHandler implements HttpHandler {
             } else if (Regex.simpleMatch("DELETE /" + container + "/*", request)) {
                 // Delete Blob (https://docs.microsoft.com/en-us/rest/api/storageservices/delete-blob)
                 blobs.entrySet().removeIf(blob -> blob.getKey().startsWith(exchange.getRequestURI().getPath()));
+                eTagsByKey.entrySet().removeIf(entry -> entry.getKey().startsWith(exchange.getRequestURI().getPath()));
                 exchange.sendResponseHeaders(RestStatus.ACCEPTED.getStatus(), -1);
 
             } else if (Regex.simpleMatch("GET /container?restype=container&comp=list*", request)) {
@@ -272,6 +317,8 @@ public class AzureHttpHandler implements HttpHandler {
                 return "ServerBusy";
             case CONFLICT:
                 return "BlobAlreadyExists";
+            case PRECONDITION_FAILED:
+                return "ConditionNotMet";
             default:
                 throw new IllegalArgumentException("Error code [" + status.getStatus() + "] is not mapped to an existing Azure code");
         }

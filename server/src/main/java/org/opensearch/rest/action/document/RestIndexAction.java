@@ -38,6 +38,7 @@ import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.index.VersionType;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestStatusToXContentListener;
@@ -68,6 +69,17 @@ public class RestIndexAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "document_index_action";
+    }
+
+    /**
+     * A core API a restricted deployment needs to function at all, so declared available explicitly.
+     * Both {@link
+     * CreateHandler} and {@link AutoIdHandler} extend this class without overriding {@link
+     * #apiAvailabilityScope()}, so they inherit {@code AVAILABLE} from here too.
+     */
+    @Override
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 
     /**

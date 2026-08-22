@@ -427,7 +427,9 @@ public class DataStreamsStatsAction extends ActionType<DataStreamsStatsAction.Re
                     return Stream.empty();
                 }
             }).toArray(String[]::new);
-            return clusterState.getRoutingTable().allShards(concreteDatastreamIndices);
+            // clusterState.allShards(...) resolves through the resolver attached to this state's own
+            // routing table (replacing an earlier static-registry lookup) -- same composition.
+            return clusterState.allShards(concreteDatastreamIndices);
         }
 
         @Override

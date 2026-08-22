@@ -32,10 +32,18 @@ public abstract class DataFormat {
     public abstract String name();
 
     /**
-     * Returns the priority of this data format. Higher priority formats are preferred
-     * when multiple formats can handle the same field type.
+     * Returns this data format's precedence rank. Formats are ordered <em>ascending</em> by this value
+     * and the earliest match wins, so a <b>lower</b> number is preferred when several formats can handle
+     * the same field type.
      *
-     * @return the priority value
+     * <p>Stated this way round deliberately: this javadoc previously said "higher priority formats are
+     * preferred", which is backwards for both places the value is actually used --
+     * {@code DataFormatRegistry#supportsCapability} and the composite plugin's own secondary ordering,
+     * which both sort ascending. Implementations were written against the sorts rather than against the
+     * doc, so the doc was the thing that was wrong; correcting the sorts instead would have silently
+     * inverted every existing format's precedence.
+     *
+     * @return the precedence rank, lower being preferred
      */
     public abstract long priority();
 

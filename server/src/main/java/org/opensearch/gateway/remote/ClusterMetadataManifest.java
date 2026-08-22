@@ -9,6 +9,7 @@
 package org.opensearch.gateway.remote;
 
 import org.opensearch.Version;
+import org.opensearch.common.Nullable;
 import org.opensearch.core.ParseField;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -48,7 +49,39 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
     public static final int CODEC_V4 = 4; // In Codec V4, we have removed upserts and delete field for routing table in diff manifest and
                                           // added checksum of cluster state.
 
-    public static final int[] CODEC_VERSIONS = { CODEC_V0, CODEC_V1, CODEC_V2, CODEC_V3, CODEC_V4 };
+    public static final int CODEC_V5 = 5; // In Codec V5, each uploaded index entry may carry the index
+                                          // descriptor, so a node can build Metadata's derived arrays and
+                                          // indicesLookup without fetching every index blob first.
+
+    /**
+     * The manifest may carry its index list behind {@link UploadedManifestShard} references instead of
+     * inline in {@link #getIndices()}. {@link #getManifestShardCount()} of {@code 0} (the default, and
+     * the only value any manifest written before this codec can have) means "not sharded" -- {@code
+     * getIndices()} is authoritative, exactly as every earlier codec already behaves. A positive shard
+     * count means {@code getIndices()} is empty and {@link #getIndexMetadataShards()} must be resolved
+     * instead; see {@code RemoteClusterStateService#getClusterStateForManifest} for the read side and
+     * {@code RemoteClusterStateCleanupManager#deleteClusterMetadata} for why the cleanup sweep cannot
+     * simply keep calling {@code getIndices()} once a manifest carries shard references.
+     */
+    public static final int CODEC_V6 = 6;
+    public static final int[] CODEC_VERSIONS = { CODEC_V0, CODEC_V1, CODEC_V2, CODEC_V3, CODEC_V4, CODEC_V5, CODEC_V6 };
+
+    /**
+     * The floor for any codec version this
+     * fork adds beyond {@link #CODEC_V5}, reserved now so a future one never collides with a real
+     * upstream codec number reached by a normal merge/rebase. {@code CODEC_V5} itself already carries
+     * fork-specific behaviour (the descriptor-carrying index entry, not an upstream V5), a risk already
+     * taken before this reservation existed -- this only protects codecs added from here on.
+     *
+     * <p>Verified safe by the dispatch this reservation depends on:
+     * {@code RemoteClusterMetadataManifest#getClusterMetadataManifestBlobStoreFormat} is an exact-match
+     * lookup that throws on an unrecognised codec version rather than falling through to the nearest
+     * known one, so an upstream node reading a manifest written under {@code FORK_CODEC_BASE} (or
+     * higher) fails cleanly before deserialising anything, rather than misreading it as, say, a cluster
+     * with zero indices. No codec at or above this value exists yet -- it is a reservation, not a
+     * codec the sharded-manifest write path has yet claimed.
+     */
+    public static final int FORK_CODEC_BASE = 10_000;
     private static final ParseField CLUSTER_TERM_FIELD = new ParseField("cluster_term");
     private static final ParseField STATE_VERSION_FIELD = new ParseField("state_version");
     private static final ParseField CLUSTER_UUID_FIELD = new ParseField("cluster_uuid");
@@ -77,6 +110,8 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
     private static final ParseField UPLOADED_CLUSTER_STATE_CUSTOM_METADATA = new ParseField("uploaded_cluster_state_custom_metadata");
     private static final ParseField DIFF_MANIFEST = new ParseField("diff_manifest");
     private static final ParseField CHECKSUM = new ParseField("checksum");
+    private static final ParseField MANIFEST_SHARD_COUNT_FIELD = new ParseField("manifest_shard_count");
+    private static final ParseField INDEX_METADATA_SHARDS_FIELD = new ParseField("index_metadata_shards");
 
     private static ClusterMetadataManifest.Builder manifestV0Builder(Object[] fields) {
         return ClusterMetadataManifest.builder()
@@ -120,6 +155,10 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
 
     private static ClusterMetadataManifest.Builder manifestV4Builder(Object[] fields) {
         return manifestV3Builder(fields).checksum(checksum(fields));
+    }
+
+    private static ClusterMetadataManifest.Builder manifestV6Builder(Object[] fields) {
+        return manifestV4Builder(fields).manifestShardCount(manifestShardCount(fields)).indexMetadataShards(indexMetadataShards(fields));
     }
 
     private static long term(Object[] fields) {
@@ -228,6 +267,21 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         return (ClusterStateChecksum) fields[24];
     }
 
+    private static int manifestShardCount(Object[] fields) {
+        // Optional in the parser (see declareParser's own CODEC_V6 branch): a manifest whose actual
+        // codec predates CODEC_V6, parsed through the generic (current-codec) entry point, simply never
+        // wrote this field, and 0 -- "not sharded" -- is the correct default for that, matching every
+        // manifest ever written before this codec existed.
+        Integer value = (Integer) fields[25];
+        return value != null ? value : 0;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<UploadedManifestShard> indexMetadataShards(Object[] fields) {
+        List<UploadedManifestShard> value = (List<UploadedManifestShard>) fields[26];
+        return value != null ? value : Collections.emptyList();
+    }
+
     private static final ConstructingObjectParser<ClusterMetadataManifest, Void> PARSER_V0 = new ConstructingObjectParser<>(
         "cluster_metadata_manifest",
         fields -> manifestV0Builder(fields).build()
@@ -253,9 +307,19 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         fields -> manifestV4Builder(fields).build()
     );
 
-    private static final ConstructingObjectParser<ClusterMetadataManifest, Void> CURRENT_PARSER = PARSER_V4;
+    private static final ConstructingObjectParser<ClusterMetadataManifest, Void> PARSER_V5 = new ConstructingObjectParser<>(
+        "cluster_metadata_manifest",
+        fields -> manifestV4Builder(fields).build()
+    );
 
-    public static final int MANIFEST_CURRENT_CODEC_VERSION = CODEC_V4;
+    private static final ConstructingObjectParser<ClusterMetadataManifest, Void> PARSER_V6 = new ConstructingObjectParser<>(
+        "cluster_metadata_manifest",
+        fields -> manifestV6Builder(fields).build()
+    );
+
+    private static final ConstructingObjectParser<ClusterMetadataManifest, Void> CURRENT_PARSER = PARSER_V6;
+
+    public static final int MANIFEST_CURRENT_CODEC_VERSION = CODEC_V6;
 
     private static final Map<Version, Integer> VERSION_TO_CODEC_MAPPING;
 
@@ -265,7 +329,17 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         declareParser(PARSER_V2, CODEC_V2);
         declareParser(PARSER_V3, CODEC_V3);
         declareParser(PARSER_V4, CODEC_V4);
+        declareParser(PARSER_V5, CODEC_V5);
+        declareParser(PARSER_V6, CODEC_V6);
 
+        // This assertion means adding a new
+        // codec to CODEC_VERSIONS and pointing MANIFEST_CURRENT_CODEC_VERSION at it flips every node to
+        // writing that codec immediately -- for a fork, this is correct and deliberately simpler than
+        // upstream's own two-release rollout: no dormant landing, no setting to flip, no gap where some
+        // nodes write the old format and some write the new one. The direct, intended consequence: once
+        // any node has written a manifest under a fork-only codec (see FORK_CODEC_BASE), that
+        // repository is no longer readable by stock OpenSearch -- a one-way door, taken deliberately,
+        // not a bug to guard against.
         assert Arrays.stream(CODEC_VERSIONS).max().getAsInt() == MANIFEST_CURRENT_CODEC_VERSION;
         Map<Version, Integer> versionToCodecMapping = new HashMap<>();
         for (Version version : Version.getDeclaredVersions(Version.class)) {
@@ -277,8 +351,13 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                 versionToCodecMapping.put(version, ClusterMetadataManifest.CODEC_V2);
             } else if (version.onOrAfter(Version.V_2_16_0) && version.before(Version.V_2_17_0)) {
                 versionToCodecMapping.put(version, ClusterMetadataManifest.CODEC_V3);
-            } else if (version.onOrAfter(Version.V_2_17_0)) {
+            } else if (version.onOrAfter(Version.V_2_17_0) && version.before(Version.V_3_8_0)) {
                 versionToCodecMapping.put(version, ClusterMetadataManifest.CODEC_V4);
+            } else if (version.onOrAfter(Version.V_3_8_0)) {
+                // This fork's codec bump policy (see the assertion doc in declareParser above) is
+                // unconditional -- MANIFEST_CURRENT_CODEC_VERSION moving to CODEC_V6 means every node on
+                // this build writes CODEC_V6 from here on, not just nodes past some future release.
+                versionToCodecMapping.put(version, ClusterMetadataManifest.CODEC_V6);
             }
         }
         VERSION_TO_CODEC_MAPPING = Collections.unmodifiableMap(versionToCodecMapping);
@@ -374,6 +453,18 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                 CHECKSUM
             );
         }
+        if (codec_version >= CODEC_V6) {
+            // Optional, not required: a document reaching this parser might genuinely predate CODEC_V6
+            // (see fromXContent's own doc -- the generic entry point always uses the newest parser) and
+            // never wrote these fields at all. See manifestShardCount(Object[])/indexMetadataShards(Object[])
+            // for the defaults that apply when they are absent.
+            parser.declareInt(ConstructingObjectParser.optionalConstructorArg(), MANIFEST_SHARD_COUNT_FIELD);
+            parser.declareObjectArray(
+                ConstructingObjectParser.optionalConstructorArg(),
+                (p, c) -> UploadedManifestShard.fromXContent(p),
+                INDEX_METADATA_SHARDS_FIELD
+            );
+        }
     }
 
     private final int codecVersion;
@@ -402,9 +493,21 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
     private final Map<String, UploadedMetadataAttribute> uploadedClusterStateCustomMap;
     private final ClusterStateDiffManifest diffManifest;
     private ClusterStateChecksum clusterStateChecksum;
+    private final int manifestShardCount;
+    private final List<UploadedManifestShard> indexMetadataShards;
 
     public List<UploadedIndexMetadata> getIndices() {
         return indices;
+    }
+
+    /** {@code 0} means this manifest is not sharded and {@link #getIndices()} is authoritative -- see {@link #CODEC_V6}. */
+    public int getManifestShardCount() {
+        return manifestShardCount;
+    }
+
+    /** Empty unless {@link #getManifestShardCount()} is positive -- see {@link #CODEC_V6}. */
+    public List<UploadedManifestShard> getIndexMetadataShards() {
+        return indexMetadataShards;
     }
 
     public long getClusterTerm() {
@@ -540,7 +643,9 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         UploadedMetadataAttribute uploadedHashesOfConsistentSettings,
         Map<String, UploadedMetadataAttribute> uploadedClusterStateCustomMap,
         ClusterStateDiffManifest diffManifest,
-        ClusterStateChecksum clusterStateChecksum
+        ClusterStateChecksum clusterStateChecksum,
+        int manifestShardCount,
+        List<UploadedManifestShard> indexMetadataShards
     ) {
         this.clusterTerm = clusterTerm;
         this.stateVersion = version;
@@ -572,6 +677,8 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             uploadedClusterStateCustomMap != null ? uploadedClusterStateCustomMap : new HashMap<>()
         );
         this.clusterStateChecksum = clusterStateChecksum;
+        this.manifestShardCount = manifestShardCount;
+        this.indexMetadataShards = Collections.unmodifiableList(indexMetadataShards != null ? indexMetadataShards : new ArrayList<>());
     }
 
     public ClusterMetadataManifest(StreamInput in) throws IOException {
@@ -650,6 +757,13 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         }
         if (in.getVersion().onOrAfter(Version.V_2_17_0) && in.readBoolean()) {
             clusterStateChecksum = new ClusterStateChecksum(in);
+        }
+        if (in.getVersion().onOrAfter(Version.V_3_8_0)) {
+            this.manifestShardCount = in.readVInt();
+            this.indexMetadataShards = Collections.unmodifiableList(in.readList(UploadedManifestShard::new));
+        } else {
+            this.manifestShardCount = 0;
+            this.indexMetadataShards = Collections.emptyList();
         }
     }
 
@@ -755,6 +869,14 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                 builder.endObject();
             }
         }
+        if (onOrAfterCodecVersion(CODEC_V6)) {
+            builder.field(MANIFEST_SHARD_COUNT_FIELD.getPreferredName(), getManifestShardCount());
+            builder.startArray(INDEX_METADATA_SHARDS_FIELD.getPreferredName());
+            for (UploadedManifestShard shard : indexMetadataShards) {
+                shard.toXContent(builder, params);
+            }
+            builder.endArray();
+        }
         return builder;
     }
 
@@ -822,6 +944,10 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                 out.writeBoolean(false);
             }
         }
+        if (out.getVersion().onOrAfter(Version.V_3_8_0)) {
+            out.writeVInt(manifestShardCount);
+            out.writeCollection(indexMetadataShards);
+        }
     }
 
     @Override
@@ -858,7 +984,9 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             && Objects.equals(uploadedHashesOfConsistentSettings, that.uploadedHashesOfConsistentSettings)
             && Objects.equals(uploadedClusterStateCustomMap, that.uploadedClusterStateCustomMap)
             && Objects.equals(diffManifest, that.diffManifest)
-            && Objects.equals(clusterStateChecksum, that.clusterStateChecksum);
+            && Objects.equals(clusterStateChecksum, that.clusterStateChecksum)
+            && manifestShardCount == that.manifestShardCount
+            && Objects.equals(indexMetadataShards, that.indexMetadataShards);
     }
 
     @Override
@@ -889,7 +1017,9 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             uploadedHashesOfConsistentSettings,
             uploadedClusterStateCustomMap,
             diffManifest,
-            clusterStateChecksum
+            clusterStateChecksum,
+            manifestShardCount,
+            indexMetadataShards
         );
     }
 
@@ -898,6 +1028,21 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         return Strings.toString(MediaTypeRegistry.JSON, this);
     }
 
+    /**
+     * Whether this manifest's codec is at or after {@code codecVersion}, in the direct sense the name
+     * says: a plain {@code >=}.
+     *
+     * <p>A real, deliberate consequence of
+     * that plain comparison is worth stating rather than leaving accidental. Any future fork-only
+     * codec (see {@link #FORK_CODEC_BASE}) is numerically far larger than every {@code CODEC_V0}
+     * through {@link #CODEC_V5}, so {@code onOrAfterCodecVersion(CODEC_V1)} through
+     * {@code onOrAfterCodecVersion(CODEC_V5)} all evaluate true for it -- a fork codec is a superset of
+     * every upstream codec's own {@code toXContent} branches, never a fresh format that has to repeat
+     * fields those branches already write. That is the intended shape (the fork format only ever adds
+     * fields on top of the highest upstream codec it forked from), pinned here and by
+     * {@code ClusterMetadataManifestTests#testOnOrAfterCodecVersionTreatsAnyForkCodecAsASupersetOfEveryUpstreamOne}
+     * so it does not silently stop holding on a future merge.
+     */
     public boolean onOrAfterCodecVersion(int codecVersion) {
         return this.codecVersion >= codecVersion;
     }
@@ -916,6 +1061,21 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
 
     public static ClusterMetadataManifest fromXContentV3(XContentParser parser) throws IOException {
         return PARSER_V3.parse(parser, null);
+    }
+
+    public static ClusterMetadataManifest fromXContentV4(XContentParser parser) throws IOException {
+        return PARSER_V4.parse(parser, null);
+    }
+
+    /**
+     * Preserved the same way {@link #fromXContentV4} was when {@link #CODEC_V5} superseded
+     * it as current -- a manifest already written at {@link #CODEC_V5} before {@link #CODEC_V6} existed
+     * must still be readable through its own dedicated parser, not fall through {@link
+     * org.opensearch.gateway.remote.model.RemoteClusterMetadataManifest}'s exact-match dispatch to the
+     * "unrecognised codec" error.
+     */
+    public static ClusterMetadataManifest fromXContentV5(XContentParser parser) throws IOException {
+        return PARSER_V5.parse(parser, null);
     }
 
     public static ClusterMetadataManifest fromXContent(XContentParser parser) throws IOException {
@@ -955,6 +1115,8 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         private Map<String, UploadedMetadataAttribute> clusterStateCustomMetadataMap;
         private ClusterStateDiffManifest diffManifest;
         private ClusterStateChecksum checksum;
+        private int manifestShardCount;
+        private List<UploadedManifestShard> indexMetadataShards;
 
         public Builder indices(List<UploadedIndexMetadata> indices) {
             this.indices = indices;
@@ -1099,11 +1261,26 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             return this;
         }
 
+        public Builder manifestShardCount(int manifestShardCount) {
+            this.manifestShardCount = manifestShardCount;
+            return this;
+        }
+
+        public Builder indexMetadataShards(List<UploadedManifestShard> indexMetadataShards) {
+            this.indexMetadataShards = indexMetadataShards;
+            return this;
+        }
+
+        public List<UploadedManifestShard> getIndexMetadataShards() {
+            return indexMetadataShards;
+        }
+
         public Builder() {
             indices = new ArrayList<>();
             customMetadataMap = new HashMap<>();
             indicesRouting = new ArrayList<>();
             clusterStateCustomMetadataMap = new HashMap<>();
+            indexMetadataShards = new ArrayList<>();
         }
 
         public Builder(ClusterMetadataManifest manifest) {
@@ -1132,6 +1309,8 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             this.hashesOfConsistentSettings = manifest.uploadedHashesOfConsistentSettings;
             this.clusterStateCustomMetadataMap = manifest.uploadedClusterStateCustomMap;
             this.checksum = manifest.clusterStateChecksum;
+            this.manifestShardCount = manifest.manifestShardCount;
+            this.indexMetadataShards = new ArrayList<>(manifest.indexMetadataShards);
         }
 
         public ClusterMetadataManifest build() {
@@ -1161,7 +1340,9 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                 hashesOfConsistentSettings,
                 clusterStateCustomMetadataMap,
                 diffManifest,
-                checksum
+                checksum,
+                manifestShardCount,
+                indexMetadataShards
             );
         }
 
@@ -1197,6 +1378,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         private static final ParseField INDEX_UUID_FIELD = new ParseField("index_uuid");
         private static final ParseField UPLOADED_FILENAME_FIELD = new ParseField("uploaded_filename");
         private static final ParseField COMPONENT_PREFIX_FIELD = new ParseField("component_prefix");
+        private static final ParseField DESCRIPTOR_FIELD = new ParseField("descriptor");
 
         private static String indexName(Object[] fields) {
             return (String) fields[0];
@@ -1214,6 +1396,10 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             return (String) fields[3];
         }
 
+        private static ManifestIndexDescriptor descriptor(Object[] fields) {
+            return (ManifestIndexDescriptor) fields[4];
+        }
+
         private static final ConstructingObjectParser<UploadedIndexMetadata, Void> PARSER_V0 = new ConstructingObjectParser<>(
             "uploaded_index_metadata",
             fields -> new UploadedIndexMetadata(indexName(fields), indexUUID(fields), uploadedFilename(fields))
@@ -1224,11 +1410,22 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             fields -> new UploadedIndexMetadata(indexName(fields), indexUUID(fields), uploadedFilename(fields), componentPrefix(fields))
         );
 
-        private static final ConstructingObjectParser<UploadedIndexMetadata, Void> CURRENT_PARSER = PARSER_V2;
+        private static final ConstructingObjectParser<UploadedIndexMetadata, Void> PARSER_V5 = new ConstructingObjectParser<>(
+            "uploaded_index_metadata",
+            fields -> new UploadedIndexMetadata(
+                indexName(fields),
+                indexUUID(fields),
+                uploadedFilename(fields),
+                componentPrefix(fields),
+                CODEC_V5,
+                descriptor(fields)
+            )
+        );
 
         static {
             declareParser(PARSER_V0, CODEC_V0);
             declareParser(PARSER_V2, CODEC_V2);
+            declareParser(PARSER_V5, CODEC_V5);
         }
 
         private static void declareParser(ConstructingObjectParser<UploadedIndexMetadata, Void> parser, long codec_version) {
@@ -1238,13 +1435,25 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             if (codec_version >= CODEC_V2) {
                 parser.declareString(ConstructingObjectParser.constructorArg(), COMPONENT_PREFIX_FIELD);
             }
+            if (codec_version >= CODEC_V5) {
+                // Optional even at V5: a node writes it only when configured to, so the reader has to
+                // cope with a V5 manifest whose entries carry no descriptor.
+                parser.declareObject(
+                    ConstructingObjectParser.optionalConstructorArg(),
+                    (p, c) -> ManifestIndexDescriptor.fromXContent(p),
+                    DESCRIPTOR_FIELD
+                );
+            }
         }
 
-        static final String COMPONENT_PREFIX = "index--";
+        public static final String COMPONENT_PREFIX = "index--";
         private final String componentPrefix;
         private final String indexName;
         private final String indexUUID;
         private final String uploadedFilename;
+        /** Null whenever the manifest predates {@link ClusterMetadataManifest#CODEC_V5} or the writer opted out. */
+        @Nullable
+        private final ManifestIndexDescriptor descriptor;
 
         private long codecVersion = CODEC_V2;
 
@@ -1267,11 +1476,23 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             String componentPrefix,
             long codecVersion
         ) {
+            this(indexName, indexUUID, uploadedFileName, componentPrefix, codecVersion, null);
+        }
+
+        public UploadedIndexMetadata(
+            String indexName,
+            String indexUUID,
+            String uploadedFileName,
+            String componentPrefix,
+            long codecVersion,
+            @Nullable ManifestIndexDescriptor descriptor
+        ) {
             this.componentPrefix = componentPrefix;
             this.indexName = indexName;
             this.indexUUID = indexUUID;
             this.uploadedFilename = uploadedFileName;
             this.codecVersion = codecVersion;
+            this.descriptor = descriptor;
         }
 
         public UploadedIndexMetadata(StreamInput in) throws IOException {
@@ -1279,6 +1500,11 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             this.indexUUID = in.readString();
             this.uploadedFilename = in.readString();
             this.componentPrefix = in.readString();
+            if (in.getVersion().onOrAfter(Version.V_3_8_0)) {
+                this.descriptor = in.readOptionalWriteable(ManifestIndexDescriptor::new);
+            } else {
+                this.descriptor = null;
+            }
         }
 
         public String getUploadedFilePath() {
@@ -1306,6 +1532,21 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             return componentPrefix;
         }
 
+        /** The resident part of the index's metadata, or null if this manifest does not carry it. */
+        @Nullable
+        public ManifestIndexDescriptor getDescriptor() {
+            return descriptor;
+        }
+
+        /**
+         * A copy of this entry carrying {@code descriptor}, at {@link ClusterMetadataManifest#CODEC_V5}.
+         * The blob this points at is unchanged, so this is how an index that did not change gains a
+         * descriptor without being re-uploaded.
+         */
+        public UploadedIndexMetadata withDescriptor(ManifestIndexDescriptor descriptor) {
+            return new UploadedIndexMetadata(indexName, indexUUID, uploadedFilename, componentPrefix, CODEC_V5, descriptor);
+        }
+
         @Override
         public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
             builder.field(INDEX_NAME_FIELD.getPreferredName(), getIndexName())
@@ -1313,6 +1554,10 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                 .field(UPLOADED_FILENAME_FIELD.getPreferredName(), getUploadedFilePath());
             if (codecVersion >= CODEC_V2) {
                 builder.field(COMPONENT_PREFIX_FIELD.getPreferredName(), getComponentPrefix());
+            }
+            if (codecVersion >= CODEC_V5 && descriptor != null) {
+                builder.field(DESCRIPTOR_FIELD.getPreferredName());
+                descriptor.toXContent(builder, params);
             }
             return builder;
         }
@@ -1323,6 +1568,9 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             out.writeString(indexUUID);
             out.writeString(uploadedFilename);
             out.writeString(componentPrefix);
+            if (out.getVersion().onOrAfter(Version.V_3_8_0)) {
+                out.writeOptionalWriteable(descriptor);
+            }
         }
 
         @Override
@@ -1337,12 +1585,13 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             return Objects.equals(indexName, that.indexName)
                 && Objects.equals(indexUUID, that.indexUUID)
                 && Objects.equals(uploadedFilename, that.uploadedFilename)
-                && Objects.equals(componentPrefix, that.componentPrefix);
+                && Objects.equals(componentPrefix, that.componentPrefix)
+                && Objects.equals(descriptor, that.descriptor);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(indexName, indexUUID, uploadedFilename, componentPrefix);
+            return Objects.hash(indexName, indexUUID, uploadedFilename, componentPrefix, descriptor);
         }
 
         @Override
@@ -1351,8 +1600,14 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         }
 
         public static UploadedIndexMetadata fromXContent(XContentParser parser, long codecVersion) throws IOException {
+            // Route by the manifest's codec rather than always using the newest parser. V5's parser can
+            // read a V2-V4 entry -- the descriptor is optional -- but it would stamp the entry as V5,
+            // and an entry's codec is what decides which fields it writes back out.
+            if (codecVersion >= CODEC_V5) {
+                return PARSER_V5.parse(parser, null);
+            }
             if (codecVersion >= CODEC_V2) {
-                return CURRENT_PARSER.parse(parser, null);
+                return PARSER_V2.parse(parser, null);
             }
             return PARSER_V0.parse(parser, null);
         }

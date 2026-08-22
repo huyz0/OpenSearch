@@ -11,7 +11,6 @@ package org.opensearch.action.admin.indices.tiering;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.RoutingAllocation;
-import org.opensearch.index.IndexModule;
 
 /**
  * Utility class for tiering operations
@@ -41,6 +40,6 @@ public class TieringUtils {
      * @return true if the index is a warm index, false otherwise
      */
     public static boolean isWarmIndex(final IndexMetadata indexMetadata) {
-        return indexMetadata.getSettings().getAsBoolean(IndexModule.IS_WARM_INDEX_SETTING.getKey(), false);
+        return indexMetadata.isWarmIndex();
     }
 }

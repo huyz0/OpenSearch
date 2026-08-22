@@ -37,10 +37,12 @@ import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.common.SetOnce;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.rest.RestChannel;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpNodeClient;
@@ -58,6 +60,10 @@ import static org.mockito.Mockito.mock;
  * Tests for {@link RestBulkAction}.
  */
 public class RestBulkActionTests extends OpenSearchTestCase {
+
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestBulkAction(Settings.EMPTY).apiAvailabilityScope());
+    }
 
     public void testBulkPipelineUpsert() throws Exception {
         SetOnce<Boolean> bulkCalled = new SetOnce<>();

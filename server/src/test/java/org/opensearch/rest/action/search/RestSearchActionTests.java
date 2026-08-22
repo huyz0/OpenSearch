@@ -21,6 +21,7 @@ import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -248,5 +249,9 @@ public class RestSearchActionTests extends OpenSearchTestCase {
         );
         searchRequest.source(source);
         assertTrue(RestSearchAction.canUseStreamSearch(searchRequest));
+    }
+
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestSearchAction().apiAvailabilityScope());
     }
 }

@@ -37,6 +37,7 @@ import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.cluster.health.ClusterHealthStatus;
 import org.opensearch.common.Priority;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.rest.FakeRestRequest;
@@ -47,6 +48,10 @@ import java.util.Map;
 import static org.hamcrest.Matchers.equalTo;
 
 public class RestClusterHealthActionTests extends OpenSearchTestCase {
+
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestClusterHealthAction().apiAvailabilityScope());
+    }
 
     public void testFromRequest() {
         Map<String, String> params = new HashMap<>();

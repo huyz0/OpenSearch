@@ -49,16 +49,20 @@ import org.opensearch.common.Priority;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.compositeindex.CompositeIndexValidator;
 import org.opensearch.index.mapper.DocumentMapper;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -81,15 +85,17 @@ public class MetadataMappingService {
 
     private final ClusterService clusterService;
     private final IndicesService indicesService;
+    private final ThreadPool threadPool;
     private final ClusterManagerTaskThrottler.ThrottlingKey putMappingTaskKey;
 
     final RefreshTaskExecutor refreshExecutor = new RefreshTaskExecutor();
     final PutMappingExecutor putMappingExecutor = new PutMappingExecutor();
 
     @Inject
-    public MetadataMappingService(ClusterService clusterService, IndicesService indicesService) {
+    public MetadataMappingService(ClusterService clusterService, IndicesService indicesService, ThreadPool threadPool) {
         this.clusterService = clusterService;
         this.indicesService = indicesService;
+        this.threadPool = threadPool;
 
         // Task is onboarded for throttling, it will get retried from associated TransportClusterManagerNodeAction.
         putMappingTaskKey = clusterService.registerClusterManagerTask(PUT_MAPPING, true);
@@ -233,6 +239,19 @@ public class MetadataMappingService {
             try {
                 for (PutMappingClusterStateUpdateRequest request : tasks) {
                     try {
+                        // A gated index has no metadata entry by design, so getIndexSafe below
+                        // would throw and a document carrying a new field would fail. Its mapping lives in
+                        // the store instead, and that is handled in putMapping before anything is submitted
+                        // here -- doing it in this method did it on the cluster manager's update
+                        // thread, and the store blocks.
+                        //
+                        // Deliberately not left here as a fallback. putMapping is the only submitter of this
+                        // executor, so a copy of the branch would be unreachable, and an unreachable copy of
+                        // a blocking call on this thread is worse than none: it reads as a safety net while
+                        // being the defect. If a gated request ever does arrive here, getIndexSafe fails it
+                        // loudly, which is the outcome that gets noticed.
+                        assert MappingGenerationStore.isRegistered() == false || isGated(currentState, request) == false
+                            : "a gated put-mapping reached the cluster state update thread, which the GENERIC-pool dispatch in putMapping exists to prevent";
                         for (Index index : request.indices()) {
                             final IndexMetadata indexMetadata = currentState.metadata().getIndexSafe(index);
                             if (indexMapperServices.containsKey(indexMetadata.getIndex()) == false) {
@@ -257,6 +276,115 @@ public class MetadataMappingService {
         @Override
         public ClusterManagerTaskThrottler.ThrottlingKey getClusterManagerThrottlingKey() {
             return putMappingTaskKey;
+        }
+
+        /** Whether every index in this request is absent from cluster state, which is what gated means. */
+        boolean isGated(ClusterState currentState, PutMappingClusterStateUpdateRequest request) {
+            for (Index index : request.indices()) {
+                if (currentState.metadata().hasIndex(index.getName())) {
+                    return false;
+                }
+            }
+            return request.indices().length > 0;
+        }
+
+        /**
+         * Records the request's fields against the index's mapping generation.
+         *
+         * <p>Extraction is {@link DescriptorRepresentable#fieldDefinitionsOrNull(Object)}, the same call the
+         * creation path makes. Sharing it is the point rather than a tidy-up: these were two implementations
+         * documented as mirroring each other, and the divergence was not cosmetic. A mapping the creation
+         * path refused outright, this one accepted and silently reduced.
+         *
+         * <p>The store now holds a field's whole definition, so object and nested fields and every
+         * field parameter round-trip. What is left to refuse is a property whose definition is not an object
+         * at all.
+         */
+        void recordGatedMapping(PutMappingClusterStateUpdateRequest request) throws IOException {
+            for (Index index : request.indices()) {
+                refuseIfDescriptorShowsTheIndexIsGone(index);
+            }
+            Map<String, Object> parsed = XContentHelper.convertToMap(MediaTypeRegistry.JSON.xContent(), request.source(), false);
+            Map<String, Object> fields = DescriptorRepresentable.fieldDefinitionsOrNull(parsed.get("properties"));
+            if (fields == null) {
+                // Refused rather than partially recorded, and this is the half of the defect that was
+                // worse. The extraction here used to skip any property it could not read and record the
+                // rest, then report success -- so a put-mapping adding an object field to a gated index was
+                // acknowledged with the field silently absent. The same field at creation was refused and
+                // kept the index resident, which is exactly the "gated at creation and refused on update,
+                // or the reverse" that the shared extractor's javadoc says must not exist.
+                //
+                // There is no fallback available: the index is not in cluster state, so this cannot be
+                // applied the ordinary way. Failing is the only answer that does not lose the field, and
+                // the outer catch turns it into a failure of this request alone.
+                throw new IllegalArgumentException(
+                    "index ["
+                        + request.indices()[0].getName()
+                        + "] is held outside cluster state and its mapping store holds a flat map of field "
+                        + "name to type, so it cannot carry an object or nested field, or a field parameter "
+                        + "such as a date format or an analyzer. Applying this mapping would drop them"
+                );
+            }
+            if (fields.isEmpty()) {
+                return;
+            }
+            for (Index index : request.indices()) {
+                MappingGenerationStore.updateMapping(index.getUUID(), fields);
+            }
+        }
+
+        /**
+         * Refuses a gated put-mapping whose index the descriptor plane no longer says is live.
+         *
+         * <p>{@link #isGated} decides gating purely from the index's absence in cluster state, and that is
+         * equally true of a live gated index and one the deletion-time prune already removed: cluster
+         * state never carried an entry for either. The uuid this request names was resolved by the
+         * coordinating node from its own descriptor cache, which invalidates on a tombstone it has seen but
+         * not on one it has not -- so a node whose cache has not yet caught up can still route a put-mapping
+         * or a dynamic field inference at a uuid whose tombstone is already durable elsewhere. Nothing
+         * previously asked the store whether that uuid was still current, so the write landed, recreated the
+         * document the deletion had pruned, and nothing was ever going to remove it again.
+         *
+         * <p><b>The contract this closes the hole by:</b> refusing here, not letting the write land and sweeping
+         * it up later. The alternative -- a second pass that prunes stray mappings after the fact -- was
+         * tried first, keyed off the tombstone the deletion already wrote, and rejected as a second writer
+         * racing the same records. This resolves the descriptor for the uuid fresh, on the thread doing the write, which is
+         * off the cluster manager's update thread already and so may block. For a live index the resolution
+         * is a cache hit against the same descriptor cache every other resolution on this path already
+         * pays for, not a new cost.
+         *
+         * <p>Skipped when descriptor resolution is not registered at all, which is not a hole: {@code
+         * DescriptorGate} registers the descriptor supplier and {@link MappingGenerationStore} together in
+         * one {@code install} call, so a node that reached {@link #isGated} answering true by way of the
+         * store also has descriptor resolution to consult. A caller that registers only the store, as several
+         * tests below the descriptor plane do, is exercising the mapping store in isolation and has no
+         * tombstone to consult in the first place.
+         *
+         * <p><b>A null answer is not treated as "gone".</b> {@link AbsentIndexDescriptorSuppliers#supply}
+         * documents null as "no answer" and swallows any failure that is not a {@link
+         * DescriptorUnavailableException} into it, precisely so a resolver bug degrades a request rather than
+         * failing it -- every other caller of this seam relies on that. Refusing on null as well as on a
+         * confirmed tombstone would let that same resolver bug fail a live index's put-mapping outright,
+         * which is a regression this task must not introduce to close a narrower one. It is also not what a
+         * genuine deletion looks like here: {@code BlobDescriptorBackend#get} answers a tombstoned name with
+         * the tombstone record, not null, so this only ever refuses on an answer that actually says so.
+         */
+        // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated to the resolver-backed
+        // Metadata accessors: this needs the raw IndexDescriptor's own uuid() and the
+        // three-way null/tombstoned/live distinction, which IndexMetadataResolver's generic, collapsed
+        // "null means absent" contract deliberately does not expose (see that interface's own javadoc).
+        private void refuseIfDescriptorShowsTheIndexIsGone(Index index) {
+            if (AbsentIndexDescriptorSuppliers.isRegistered() == false) {
+                return;
+            }
+            IndexDescriptor current = AbsentIndexDescriptorSuppliers.supply(index.getName());
+            if (current != null && (current.exists() == false || current.uuid().equals(index.getUUID()) == false)) {
+                throw new org.opensearch.index.IndexNotFoundException(
+                    "its tombstone is already durable; the mapping store refuses a write against a uuid the descriptor plane no "
+                        + "longer resolves as live",
+                    index.getName()
+                );
+            }
         }
 
         private ClusterState applyRequest(
@@ -363,6 +491,39 @@ public class MetadataMappingService {
     }
 
     public void putMapping(final PutMappingClusterStateUpdateRequest request, final ActionListener<ClusterStateUpdateResponse> listener) {
+        // A gated index has no cluster state entry, so a put-mapping against one changes no cluster state at
+        // all: the fields go to MappingGenerationStore and nothing is published. Handling that here, before
+        // any task is submitted, is what keeps it off the cluster manager's update thread.
+        //
+        // It used to be handled inside PutMappingExecutor#execute, which runs on that thread, and the store
+        // is backed by an ordinary index whose read and write both block. So every put-mapping on a gated
+        // index made two blocking round trips on the single thread whose serialization is the ceiling this
+        // whole design exists to remove -- the same mistake creation and deletion were already moved off,
+        // in the one metadata path that was not looked at.
+        //
+        // It was also an assertion failure rather than merely slow: "Expected current thread to not be the
+        // cluster-manager service thread. Reason: [Blocking operation]". IndexBackedMappingStore's javadoc
+        // argues the blocking is safe because a mapping update runs on a transport thread "not on the
+        // cluster state thread", which is true of dynamic field inference and false of put-mapping.
+        //
+        // GENERIC rather than the calling thread, because TransportPutMappingAction declares
+        // ThreadPool.Names.SAME: the caller here is a transport thread, and blocking one of those trades a
+        // stalled cluster manager for a stalled transport pool.
+        if (MappingGenerationStore.isRegistered() && putMappingExecutor.isGated(clusterService.state(), request)) {
+            threadPool.executor(ThreadPool.Names.GENERIC).execute(new AbstractRunnable() {
+                @Override
+                protected void doRun() throws Exception {
+                    putMappingExecutor.recordGatedMapping(request);
+                    listener.onResponse(new ClusterStateUpdateResponse(true));
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    listener.onFailure(e);
+                }
+            });
+            return;
+        }
         clusterService.submitStateUpdateTask(
             "put-mapping " + Strings.arrayToCommaDelimitedString(request.indices()),
             request,

@@ -360,6 +360,19 @@ public class LocalShardsBalancer extends ShardsBalancer {
             }
             IndexMetadata indexMetadata = metadata.index(index);
 
+            // Skip indices that provably cannot yield a relocation before paying for the per-node
+            // decider scan below. The spread computed here is across all nodes, and the loop that
+            // follows only ever compares weights within a subset of those same nodes, so it is an
+            // upper bound on any delta that loop can see. If it is already under the threshold,
+            // every comparison below would take the "stop balancing this index" branch.
+            //
+            // Computed fresh per index rather than reused from buildWeightOrderedIndices(): earlier
+            // indices in this loop may have relocated shards, which changes node weights, so a
+            // spread captured before the loop started would be stale and could under-report.
+            if (lessThan(sorter.weightSpreadAcrossAllNodes(index), threshold)) {
+                continue;
+            }
+
             // find nodes that have a shard of this index or where shards of this index are allowed to be allocated to,
             // move these nodes to the front of modelNodes so that we can only balance based on these nodes
             int relevantNodes = 0;

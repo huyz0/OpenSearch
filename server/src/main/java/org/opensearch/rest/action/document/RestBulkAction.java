@@ -38,6 +38,7 @@ import org.opensearch.action.bulk.BulkShardRequest;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestStatusToXContentListener;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
@@ -81,6 +82,12 @@ public class RestBulkAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "bulk_action";
+    }
+
+    /** A core API a restricted deployment needs to function at all, so declared available explicitly. */
+    @Override
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 
     @Override

@@ -54,6 +54,7 @@ import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V1;
 import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V2;
 import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V3;
 import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V4;
+import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V5;
 import static org.opensearch.gateway.remote.RemoteClusterStateAttributesManager.CLUSTER_BLOCKS;
 import static org.opensearch.gateway.remote.RemoteClusterStateAttributesManager.DISCOVERY_NODES;
 import static org.opensearch.gateway.remote.model.RemoteCoordinationMetadata.COORDINATION_METADATA;
@@ -829,6 +830,48 @@ public class ClusterMetadataManifestTests extends OpenSearchTestCase {
         assertEquals(CODEC_V2, ClusterMetadataManifest.getCodecForVersion(Version.V_2_15_0));
         assertEquals(CODEC_V3, ClusterMetadataManifest.getCodecForVersion(Version.V_2_16_0));
         assertEquals(CODEC_V4, ClusterMetadataManifest.getCodecForVersion(Version.V_2_17_0));
+    }
+
+    /**
+     * Plan item E2 (plan-100m-index-implementation.md, Area E), pinning
+     * {@link ClusterMetadataManifest#onOrAfterCodecVersion}'s own javadoc claim: a manifest carrying a
+     * hypothetical fork-only codec (numerically at or above {@link ClusterMetadataManifest#FORK_CODEC_BASE})
+     * must read as on-or-after every real upstream codec, since the fork format is a superset that
+     * only ever adds fields on top of the highest upstream codec it forked from -- not a fresh format
+     * that would need its own {@code toXContent} branch repeating what V1 through V5 already write.
+     */
+    public void testOnOrAfterCodecVersionTreatsAnyForkCodecAsASupersetOfEveryUpstreamOne() {
+        ClusterMetadataManifest forkManifest = ClusterMetadataManifest.builder()
+            .clusterTerm(1L)
+            .stateVersion(1L)
+            .clusterUUID("test-cluster-uuid")
+            .stateUUID("test-state-uuid")
+            .opensearchVersion(Version.CURRENT)
+            .nodeId("test-node-id")
+            .committed(false)
+            .codecVersion(ClusterMetadataManifest.FORK_CODEC_BASE)
+            .build();
+
+        assertTrue(forkManifest.onOrAfterCodecVersion(CODEC_V0));
+        assertTrue(forkManifest.onOrAfterCodecVersion(CODEC_V1));
+        assertTrue(forkManifest.onOrAfterCodecVersion(CODEC_V2));
+        assertTrue(forkManifest.onOrAfterCodecVersion(CODEC_V3));
+        assertTrue(forkManifest.onOrAfterCodecVersion(CODEC_V4));
+        assertTrue(forkManifest.onOrAfterCodecVersion(CODEC_V5));
+
+        // Control: an older, real codec must not read as on-or-after a newer one, or this test would
+        // hold trivially regardless of what onOrAfterCodecVersion actually does.
+        ClusterMetadataManifest oldManifest = ClusterMetadataManifest.builder()
+            .clusterTerm(1L)
+            .stateVersion(1L)
+            .clusterUUID("test-cluster-uuid")
+            .stateUUID("test-state-uuid")
+            .opensearchVersion(Version.CURRENT)
+            .nodeId("test-node-id")
+            .committed(false)
+            .codecVersion(CODEC_V2)
+            .build();
+        assertFalse(oldManifest.onOrAfterCodecVersion(CODEC_V5));
     }
 
     private UploadedIndexMetadata randomlyChangingUploadedIndexMetadata(UploadedIndexMetadata uploadedIndexMetadata) {

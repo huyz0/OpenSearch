@@ -39,6 +39,7 @@ import org.opensearch.cluster.ClusterInfo;
 import org.opensearch.cluster.DiskUsage;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RoutingNode;
@@ -659,13 +660,16 @@ public class DiskThresholdDecider extends AllocationDecider {
             long targetShardSize = 0;
             final Index mergeSourceIndex = indexMetadata.getResizeSourceIndex();
             final IndexMetadata sourceIndexMeta = metadata.index(mergeSourceIndex);
-            if (sourceIndexMeta != null) {
+            // The source can be in metadata and absent from routing; then it contributes no shard sizes
+            // and the caller falls back to the default, rather than this throwing during allocation.
+            final IndexRoutingTable sourceRouting = routingTable.index(mergeSourceIndex.getName());
+            if (sourceIndexMeta != null && sourceRouting != null) {
                 final Set<ShardId> shardIds = IndexMetadata.selectRecoverFromShards(
                     shard.id(),
                     sourceIndexMeta,
                     indexMetadata.getNumberOfShards()
                 );
-                for (IndexShardRoutingTable shardRoutingTable : routingTable.index(mergeSourceIndex.getName())) {
+                for (IndexShardRoutingTable shardRoutingTable : sourceRouting) {
                     if (shardIds.contains(shardRoutingTable.shardId())) {
                         targetShardSize += clusterInfo.getShardSize(shardRoutingTable.primaryShard(), 0);
                     }

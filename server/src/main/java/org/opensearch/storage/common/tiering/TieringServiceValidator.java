@@ -60,15 +60,12 @@ public class TieringServiceValidator {
     private static final long DEFAULT_FALLBACK_SHARD_SIZE = 0L;
 
     /**
-     * Validates that the specified index is in the required initial tiering state.
-     * Validation on the final tiering state is done by before calling this validation.
+     * Validates that the specified index is in the required initial tiering state for the requested
+     * operation. Validation of the final tiering state is performed before calling this method.
      *
      * @param state the current cluster state
      * @param index the index to be validated
-     * @param currentTieringType tiering type
-     */
-    /**
-     * Validates that the index is in the correct initial state for the requested tiering operation.
+     * @param currentTieringType the requested tiering transition
      */
     private static void validateIndexCurrentState(
         final ClusterState state,
@@ -77,8 +74,8 @@ public class TieringServiceValidator {
     ) {
         final String indexState = state.getMetadata().getIndexSafe(index).getSettings().get(INDEX_TIERING_STATE.getKey(), HOT.toString());
         boolean isCurrentStateValid = true;
-        if (currentTieringType.equals(HOT_TO_WARM) && indexState.equals(IndexModule.TieringState.HOT.toString()) == false
-            || currentTieringType.equals(WARM_TO_HOT) && indexState.equals(IndexModule.TieringState.WARM.toString()) == false) {
+        if ((currentTieringType.equals(HOT_TO_WARM) && indexState.equals(HOT.toString()) == false)
+            || (currentTieringType.equals(WARM_TO_HOT) && indexState.equals(WARM.toString()) == false)) {
             isCurrentStateValid = false;
         }
         if (isCurrentStateValid == false) {
@@ -96,9 +93,6 @@ public class TieringServiceValidator {
         }
     }
 
-    /**
-     * Performs common validations for tiering operations.
-     */
     /**
      * Performs common validations applicable to all tiering operations.
      */
@@ -194,8 +188,12 @@ public class TieringServiceValidator {
     private static void validateIndexHealth(ClusterState clusterState, Index index, IndexModule.TieringState finalIndexType) {
         final IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(index);
         final IndexMetadata indexMetadata = clusterState.metadata().index(index);
-        final ClusterIndexHealth indexHealth = new ClusterIndexHealth(indexMetadata, indexRoutingTable);
-        if (ClusterHealthStatus.RED.equals(indexHealth.getStatus())) {
+        // An index in metadata with no routing entry has no shards to assess, and ClusterIndexHealth
+        // iterates the routing table it is handed. Reject it for the same reason a RED index is
+        // rejected, rather than dereferencing null.
+        final boolean unhealthy = indexRoutingTable == null
+            || ClusterHealthStatus.RED.equals(new ClusterIndexHealth(indexMetadata, indexRoutingTable).getStatus());
+        if (unhealthy) {
             final String errorMsg = "Rejecting tiering request because index ["
                 + index.getName()
                 + "] is in RED status and cannot be migrated to ["

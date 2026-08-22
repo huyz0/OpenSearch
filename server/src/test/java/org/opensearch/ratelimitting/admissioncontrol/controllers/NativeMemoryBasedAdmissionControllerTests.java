@@ -12,6 +12,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.node.NodeResourceUsageStats;
 import org.opensearch.node.ResourceUsageCollectorService;
+import org.opensearch.ratelimitting.admissioncontrol.NativeMemoryPressureSignal;
 import org.opensearch.ratelimitting.admissioncontrol.enums.AdmissionControlActionType;
 import org.opensearch.ratelimitting.admissioncontrol.enums.AdmissionControlMode;
 import org.opensearch.ratelimitting.admissioncontrol.settings.NativeMemoryBasedAdmissionControllerSettings;
@@ -21,6 +22,8 @@ import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.function.Supplier;
 
 import org.mockito.Mockito;
 
@@ -51,7 +54,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             null,
             clusterService,
-            Settings.EMPTY
+            Settings.EMPTY,
+            null
         );
         assertEquals(admissionController.getName(), NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER);
         assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.INDEXING.getType()), 0);
@@ -66,7 +70,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             null,
             clusterService,
-            Settings.EMPTY
+            Settings.EMPTY,
+            null
         );
         assertEquals(
             admissionController.getSettings().getSearchNativeMemoryUsageLimit().longValue(),
@@ -87,7 +92,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             null,
             clusterService,
-            Settings.EMPTY
+            Settings.EMPTY,
+            null
         );
         Settings settings = Settings.builder()
             .put(
@@ -109,7 +115,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             null,
             clusterService,
-            Settings.EMPTY
+            Settings.EMPTY,
+            null
         );
         Settings settings = Settings.builder()
             .put(NativeMemoryBasedAdmissionControllerSettings.SEARCH_NATIVE_MEMORY_USAGE_LIMIT.getKey(), 80)
@@ -126,7 +133,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             rs,
             clusterService,
-            Settings.EMPTY
+            Settings.EMPTY,
+            null
         );
         assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.INDEXING.getType()), 0);
         assertEquals(admissionController.getSettings().getTransportLayerAdmissionControllerMode(), AdmissionControlMode.DISABLED);
@@ -147,7 +155,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             rs,
             clusterService,
-            settings
+            settings,
+            null
         );
         assertTrue(
             admissionController.isEnabledForTransportLayer(admissionController.getSettings().getTransportLayerAdmissionControllerMode())
@@ -172,7 +181,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             rs,
             clusterService,
-            settings
+            settings,
+            null
         );
 
         // Mock node stats with native memory usage above the threshold
@@ -202,7 +212,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             rs,
             clusterService,
-            settings
+            settings,
+            null
         );
 
         // Mock node stats with native memory usage below the threshold
@@ -229,7 +240,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             rs,
             clusterService,
-            settings
+            settings,
+            null
         );
 
         // Mock node stats with native memory usage above the threshold
@@ -255,7 +267,8 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
             NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
             rs,
             clusterService,
-            settings
+            settings,
+            null
         );
         admissionController.addRejectionCount(AdmissionControlActionType.SEARCH.getType(), 1);
         admissionController.addRejectionCount(AdmissionControlActionType.INDEXING.getType(), 3);
@@ -265,5 +278,144 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
         admissionController.addRejectionCount(AdmissionControlActionType.INDEXING.getType(), 2);
         assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.SEARCH.getType()), 2);
         assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.INDEXING.getType()), 5);
+    }
+
+    /**
+     * Phase H of core-pluggability-refactor-plan.md: builds a NativeMemoryPressureSignal directly rather
+     * than routing through NativeAllocatorPoolStats/PoolGroup -- this test no longer needs to know the
+     * Arrow allocator's concrete pool-stats shape at all, which is the point of that phase.
+     */
+    private static Supplier<NativeMemoryPressureSignal> indexingPoolSupplier(long allocatedBytes, long limitBytes) {
+        double utilization = 100.0 * allocatedBytes / limitBytes;
+        NativeMemoryPressureSignal signal = actionType -> actionType == AdmissionControlActionType.INDEXING
+            ? OptionalDouble.of(utilization)
+            : OptionalDouble.empty();
+        return () -> signal;
+    }
+
+    public void testApplyControllerWhenIndexingPoolUsageBreached() {
+        Settings settings = Settings.builder()
+            .put(
+                NativeMemoryBasedAdmissionControllerSettings.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER_TRANSPORT_LAYER_MODE.getKey(),
+                AdmissionControlMode.ENFORCED.getMode()
+            )
+            .put(NativeMemoryBasedAdmissionControllerSettings.INDEXING_NATIVE_MEMORY_POOL_USAGE_LIMIT.getKey(), 90)
+            .build();
+        ResourceUsageCollectorService rs = Mockito.mock(ResourceUsageCollectorService.class);
+        // 95 / 100 = 95% > 90% limit
+        admissionController = new NativeMemoryBasedAdmissionController(
+            NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
+            rs,
+            clusterService,
+            settings,
+            indexingPoolSupplier(95, 100)
+        );
+        action = "indices:data/write/bulk[s][p]";
+        expectThrows(
+            org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class,
+            () -> admissionController.apply(action, AdmissionControlActionType.INDEXING)
+        );
+        assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.INDEXING.getType()), 1);
+    }
+
+    public void testApplyControllerWhenIndexingPoolUsageNotBreached() {
+        Settings settings = Settings.builder()
+            .put(
+                NativeMemoryBasedAdmissionControllerSettings.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER_TRANSPORT_LAYER_MODE.getKey(),
+                AdmissionControlMode.ENFORCED.getMode()
+            )
+            .put(NativeMemoryBasedAdmissionControllerSettings.INDEXING_NATIVE_MEMORY_POOL_USAGE_LIMIT.getKey(), 90)
+            .build();
+        ResourceUsageCollectorService rs = Mockito.mock(ResourceUsageCollectorService.class);
+        // 50 / 100 = 50% < 90% limit
+        admissionController = new NativeMemoryBasedAdmissionController(
+            NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
+            rs,
+            clusterService,
+            settings,
+            indexingPoolSupplier(50, 100)
+        );
+        action = "indices:data/write/bulk[s][p]";
+        admissionController.apply(action, AdmissionControlActionType.INDEXING);
+        assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.INDEXING.getType()), 0);
+    }
+
+    public void testIndexingPoolCheckSkippedWhenSupplierNull() {
+        Settings settings = Settings.builder()
+            .put(
+                NativeMemoryBasedAdmissionControllerSettings.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER_TRANSPORT_LAYER_MODE.getKey(),
+                AdmissionControlMode.ENFORCED.getMode()
+            )
+            .put(NativeMemoryBasedAdmissionControllerSettings.INDEXING_NATIVE_MEMORY_POOL_USAGE_LIMIT.getKey(), 90)
+            .build();
+        ResourceUsageCollectorService rs = Mockito.mock(ResourceUsageCollectorService.class);
+        // No stats supplier installed -> indexing-pool check is skipped entirely (current behavior preserved)
+        admissionController = new NativeMemoryBasedAdmissionController(
+            NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
+            rs,
+            clusterService,
+            settings,
+            null
+        );
+        action = "indices:data/write/bulk[s][p]";
+        admissionController.apply(action, AdmissionControlActionType.INDEXING);
+        assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.INDEXING.getType()), 0);
+    }
+
+    public void testIndexingPoolCheckIgnoredForSearchAction() {
+        Settings settings = Settings.builder()
+            .put(
+                NativeMemoryBasedAdmissionControllerSettings.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER_TRANSPORT_LAYER_MODE.getKey(),
+                AdmissionControlMode.ENFORCED.getMode()
+            )
+            .put(NativeMemoryBasedAdmissionControllerSettings.INDEXING_NATIVE_MEMORY_POOL_USAGE_LIMIT.getKey(), 90)
+            .build();
+        ResourceUsageCollectorService rs = Mockito.mock(ResourceUsageCollectorService.class);
+        // Indexing pool is breached (95%) but the action is SEARCH, so the pool check must not apply
+        admissionController = new NativeMemoryBasedAdmissionController(
+            NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
+            rs,
+            clusterService,
+            settings,
+            indexingPoolSupplier(95, 100)
+        );
+        action = "indices:data/read/search";
+        admissionController.apply(action, AdmissionControlActionType.SEARCH);
+        assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.SEARCH.getType()), 0);
+    }
+
+    public void testIndexingPoolCheckInMonitorModeCountsButDoesNotThrow() {
+        Settings settings = Settings.builder()
+            .put(
+                NativeMemoryBasedAdmissionControllerSettings.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER_TRANSPORT_LAYER_MODE.getKey(),
+                AdmissionControlMode.MONITOR.getMode()
+            )
+            .put(NativeMemoryBasedAdmissionControllerSettings.INDEXING_NATIVE_MEMORY_POOL_USAGE_LIMIT.getKey(), 90)
+            .build();
+        ResourceUsageCollectorService rs = Mockito.mock(ResourceUsageCollectorService.class);
+        admissionController = new NativeMemoryBasedAdmissionController(
+            NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
+            rs,
+            clusterService,
+            settings,
+            indexingPoolSupplier(95, 100)
+        );
+        action = "indices:data/write/bulk[s][p]";
+        admissionController.apply(action, AdmissionControlActionType.INDEXING);
+        assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.INDEXING.getType()), 1);
+    }
+
+    public void testCheckDefaultIndexingPoolUsageLimit() {
+        admissionController = new NativeMemoryBasedAdmissionController(
+            NativeMemoryBasedAdmissionController.NATIVE_MEMORY_BASED_ADMISSION_CONTROLLER,
+            null,
+            clusterService,
+            Settings.EMPTY,
+            null
+        );
+        assertEquals(
+            admissionController.getSettings().getIndexingNativeMemoryPoolUsageLimit().longValue(),
+            NativeMemoryBasedAdmissionControllerSettings.Defaults.INDEXING_NATIVE_MEMORY_POOL_USAGE_LIMIT
+        );
     }
 }

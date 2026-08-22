@@ -11,6 +11,8 @@ package org.opensearch.index.engine.dataformat;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.exec.commit.Committer;
+import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.mapper.MapperParsingException;
 
 import java.util.Map;
 import java.util.function.Supplier;
@@ -62,6 +64,27 @@ public interface DataFormatPlugin {
         DataFormatRegistry dataFormatRegistry
     ) {
         return Map.of();
+    }
+
+    /**
+     * Assigns the capability map on the given field type. The plugin determines which capabilities
+     * its data format(s) can provide for the field type and sets the result via
+     * {@link MappedFieldType#setCapabilityMap}.
+     *
+     * <p>The default implementation handles the single-format case: the plugin's own data format
+     * claims all capabilities it supports for the field type (see
+     * {@link DataFormatRegistry#assignSingleFormatCapabilities}). Composite plugins override this
+     * to delegate to primary and secondary formats in priority order.
+     *
+     * @param fieldType the field type to assign capabilities to
+     * @param indexSettings the index settings
+     * @param dataFormatRegistry the registry, used by composite plugins to resolve sub-format plugins.
+     *                           The default implementation does not need it and tolerates {@code null},
+     *                           which is what a plugin exercised outside a wired node is handed.
+     * @throws MapperParsingException if the field type's requested capabilities cannot be fully covered
+     */
+    default void assignCapabilities(MappedFieldType fieldType, IndexSettings indexSettings, DataFormatRegistry dataFormatRegistry) {
+        DataFormatRegistry.assignSingleFormatCapabilities(fieldType, getDataFormat());
     }
 
     /**

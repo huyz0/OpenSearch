@@ -174,7 +174,9 @@ public class TransportGetIngestionStateAction extends TransportBroadcastByNodeAc
             );
         }
 
-        return clusterState.routingTable().allShardsSatisfyingPredicate(request.indices(), shardFilter);
+        // clusterState.allShards(...) resolves through the resolver attached to this state's own
+        // routing table (replacing an earlier static-registry lookup) -- same predicate/composition.
+        return clusterState.allShards(request.indices(), shardFilter, false);
     }
 
     @Override

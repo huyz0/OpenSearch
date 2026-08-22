@@ -97,9 +97,76 @@ public class MetadataDeleteIndexService {
             throw new IllegalArgumentException("Index name is required");
         }
 
+        // What was deleted, captured while the transform runs so the tombstone write below knows which
+        // descriptors to store. Overwritten rather than appended to, because a cluster state task may be
+        // re-executed and only the run that commits is the one whose deletions happened.
+        final java.util.concurrent.atomic.AtomicReference<java.util.List<IndexMetadata>> deletedIndices =
+            new java.util.concurrent.atomic.AtomicReference<>(java.util.List.of());
+
+        // Which of these are gated, decided here rather than inside the transform.
+        //
+        // It has to be here because a resolver refuses to answer on a cluster state thread at all --
+        // Metadata#indexOrResolved's own ClusterStateMutationThreads guard (originally
+        // AbsentIndexDescriptorSuppliers's) returns null on clusterManagerService#updateTask, since resolving
+        // a descriptor there means a remote read on the thread that applies cluster state, which is the
+        // deadlock that guard exists to prevent. The first attempt at this partitioned inside execute and
+        // every index came back
+        // not-gated, so the delete threw exactly as before -- the guard did its job and the code asking the
+        // question was in the one place forbidden to ask it.
+        //
+        // This method runs on a transport thread, where blocking is allowed and where shard opening already
+        // puts the equivalent read.
+        //
+        // currentMetadata.index(index) on the line below is
+        // deliberately the plain, never-resolving accessor -- this is exactly the "is it gated" distinguishing
+        // check that made Metadata#index(String) auto-resolving unsafe in the first place (see Metadata
+        // #indexOrResolved's own javadoc for that history). indexOrResolved(index) on the next line is the
+        // separate, explicit "now actually fetch the gated metadata" call this method already needed a second
+        // question for.
+        final Map<Index, IndexMetadata> gatedDeletions = new HashMap<>();
+        final Metadata currentMetadata = clusterService.state().metadata();
+        for (Index index : request.indices()) {
+            if (currentMetadata.index(index) == null) {
+                IndexMetadata descriptorMetadata = currentMetadata.indexOrResolved(index);
+                if (descriptorMetadata != null) {
+                    gatedDeletions.put(index, descriptorMetadata);
+                }
+            }
+        }
+
+        // Every index named here is gated, so there is nothing for a cluster state update to do and no
+        // reason to queue behind the one thread that does them. See deleteGatedIndices.
+        if (gatedDeletions.size() == request.indices().length) {
+            deleteGatedIndices(request, gatedDeletions, listener);
+            return;
+        }
+
+        // The acknowledgement is deferred until the tombstones are durable.
+        //
+        // The publish hook inside the transform is asynchronous and best-effort, because it runs on the
+        // cluster state thread where a blocking write deadlocks. Retries close transient failures but not a
+        // crash between the commit and the write landing, and inferring a tombstone from a missing
+        // descriptor was rejected: an unavailable store and a store with no record give the same answer, so
+        // acting on absence would discard live shard data.
+        //
+        // Ordering is what is left. This window, after the state is committed and before the client is told
+        // the delete succeeded, is the only place a write can be both off the cluster state thread and
+        // ahead of the acknowledgement. Nothing blocks: the listener is deferred, not waited on.
+        final ActionListener<ClusterStateUpdateResponse> durableListener = ActionListener.wrap(
+            response -> DurableTombstones.whenDurable(deletedIndices.get(), ActionListener.wrap(ignored -> {
+                listener.onResponse(response);
+                // The same prune the all-gated path does. It belongs here too, and leaving it out was a
+                // real leak rather than an omission of symmetry: a request naming one gated index and one
+                // ordinary one -- which is what any wildcard over a mixed cluster is -- takes this path,
+                // and its gated indices' mappings would outlive them permanently.
+                removeStoredMappings(deletedIndices.get());
+            }, listener::onFailure)),
+            listener::onFailure
+        );
+
         clusterService.submitStateUpdateTask(
             "delete-index " + Arrays.toString(request.indices()),
-            new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(Priority.URGENT, request, listener) {
+            new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(Priority.URGENT, request, durableListener) {
 
                 @Override
                 protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
@@ -113,17 +180,198 @@ public class MetadataDeleteIndexService {
 
                 @Override
                 public ClusterState execute(final ClusterState currentState) {
-                    return deleteIndices(currentState, Sets.newHashSet(request.indices()));
+                    java.util.List<IndexMetadata> deleted = new java.util.ArrayList<>();
+                    for (Index index : request.indices()) {
+                        IndexMetadata metadata = currentState.metadata().index(index);
+                        if (metadata == null) {
+                            // Gated: the descriptor is the only record, so it is also the only thing a
+                            // tombstone can be derived from. Left out of this list, a gated delete would
+                            // acknowledge with no durable no behind it, which is the resurrection
+                            // DurableTombstones exists to prevent and is worse for a gated index than for an
+                            // ordinary one, since there is no graveyard entry standing behind it either.
+                            // Read from the map resolved on the calling thread, never re-resolved here.
+                            metadata = gatedDeletions.get(index);
+                        }
+                        if (metadata != null) {
+                            deleted.add(metadata);
+                        }
+                    }
+                    deletedIndices.set(java.util.List.copyOf(deleted));
+                    return deleteIndices(currentState, Sets.newHashSet(request.indices()), gatedDeletions);
                 }
             }
         );
     }
 
     /**
+     * Deletes indices that are all gated, without going near the cluster state update thread.
+     *
+     * <h4>Why this is a separate road</h4>
+     *
+     * The transform already knew a gated deletion writes nothing: for an all-gated request it publishes
+     * tombstones and returns {@code currentState} unchanged, so there is no diff, no publication and no
+     * reroute. What it could not avoid was <em>being</em> a cluster state update task -- submitted at URGENT,
+     * queued behind every other one, and folded one at a time by the batch executor on the single
+     * {@code clusterManagerService#updateTask} thread.
+     *
+     * <p>That is the same defect creation had, one path over, and it produced the same shape of number.
+     * With creation admitted off the thread it reached 10,505 per second while deletion stayed at 582, which
+     * made deletion the slowest operation in the system by an order of magnitude and the one that consumed
+     * the population soak's entire clock. Externalising the record without externalising the admission
+     * leaves the ceiling exactly where it was.
+     *
+     * <h4>What still has to be true</h4>
+     *
+     * The tombstone is the deletion, exactly as the descriptor write is the creation, so the acknowledgement
+     * still waits for {@link DurableTombstones#whenDurable}. Acknowledging before the write lands is the
+     * resurrection this whole area exists to prevent: a gated index has no graveyard entry standing behind
+     * it, so a lost tombstone means a node can adopt the shard again on rejoin.
+     *
+     * <p>Shards are released by the change feed rather than by cluster state, which is what makes this safe
+     * to skip. {@code DescriptorChangeTailer} calls {@code GatedIndexRelease.release} when it sees the
+     * tombstone, and {@code IndicesClusterStateService}'s sweep catches whatever the feed misses. Neither
+     * was ever driven by the update this replaces.
+     *
+     * <p>Nothing blocks here. {@link DurableTombstones#whenDurable} hands the write to the registered
+     * writer asynchronously -- the write had to be asynchronous by construction, since the tombstone hook's
+     * original caller ran on the cluster state thread where a blocking write deadlocks -- and the listener
+     * is deferred rather than waited on.
+     *
+     * <h4>Why every index, not any</h4>
+     *
+     * A request naming one gated index and one ordinary one still takes the old path, because the ordinary
+     * one genuinely needs the cluster state update. Taking this road for a mixed request would delete the
+     * gated half and silently drop the rest.
+     */
+    private void deleteGatedIndices(
+        final DeleteIndexClusterStateUpdateRequest request,
+        final Map<Index, IndexMetadata> gatedDeletions,
+        final ActionListener<ClusterStateUpdateResponse> listener
+    ) {
+        final java.util.List<IndexMetadata> deleted = new java.util.ArrayList<>(request.indices().length);
+        for (Index index : request.indices()) {
+            IndexMetadata metadata = gatedDeletions.get(index);
+            if (metadata == null) {
+                // Cannot happen while the caller checks every index is gated, and worth failing loudly
+                // rather than acknowledging a deletion that recorded nothing.
+                listener.onFailure(new IllegalStateException("index [" + index + "] was admitted as gated but has no descriptor"));
+                return;
+            }
+            logger.info("{} deleting gated index, recording a tombstone rather than a cluster state change", index);
+            deleted.add(metadata);
+        }
+        DurableTombstones.whenDurable(java.util.List.copyOf(deleted), ActionListener.wrap(ignored -> {
+            listener.onResponse(new ClusterStateUpdateResponse(true));
+            removeStoredMappings(deleted);
+        }, listener::onFailure));
+    }
+
+    /**
+     * Removes the mappings of indices that have just been deleted.
+     *
+     * <p>Nothing ever removed one before this: {@code MappingGenerationStore.Store} had no delete at all, so
+     * {@code .opensearch-index-mappings} grew with every index that had ever existed rather than with the
+     * live population. That is the residency problem this area exists to remove, reproduced one level down,
+     * and churn is what makes it bite -- a tenant that creates and drops an index a day leaves a document a
+     * day behind forever.
+     *
+     * <p><b>After the tombstone is durable, and that order is the safety argument.</b> The tombstone is what
+     * makes the deletion real. Removing the mapping first would mean a failure between the two left an index
+     * that still exists and whose declared fields are gone, which is a silent loss; this way the same
+     * failure leaves a document nobody references, which is exactly the status quo before this existed.
+     *
+     * <p><b>A failure here does not fail the deletion.</b> The index is gone either way, and reporting the
+     * delete as failed would invite a retry of something that already happened. A stranded document is the
+     * lesser outcome, and it is logged rather than swallowed.
+     *
+     * <p><b>After the acknowledgement, not before it.</b> Each prune is a blocking round trip, and a request
+     * naming five hundred gated indices would otherwise make the client wait for five hundred of them --
+     * including for every index that never declared a mapping, since removing an absent document still costs
+     * a round trip -- before hearing about a deletion that had already happened. With an unassigned primary
+     * on the mapping index each one waits out the replication timeout instead. Making the caller wait for
+     * work whose result is then discarded is the worst of both.
+     *
+     * <p>Catching {@link Throwable} rather than {@link Exception}, which is deliberate and narrow. A
+     * blocking client call from the wrong thread raises an {@code AssertionError}, and an {@code Error}
+     * escaping here would leave the completion chain broken on a path whose entire purpose is best-effort
+     * cleanup after the client has already been answered.
+     */
+    private void removeStoredMappings(java.util.List<IndexMetadata> deleted) {
+        for (IndexMetadata metadata : deleted) {
+            try {
+                MappingGenerationStore.deleteMapping(metadata.getIndexUUID());
+            } catch (Throwable e) {
+                logger.warn(
+                    () -> new org.apache.logging.log4j.message.ParameterizedMessage(
+                        "{} was deleted but its stored mapping could not be removed, leaving a document nobody references",
+                        metadata.getIndex()
+                    ),
+                    e
+                );
+            }
+        }
+    }
+
+    /**
      * Delete some indices from the cluster state.
      */
     public ClusterState deleteIndices(ClusterState currentState, Set<Index> indices) {
+        return deleteIndices(currentState, indices, Map.of());
+    }
+
+    /**
+     * Deletes indices, treating the ones named in {@code gatedDeletions} as having no cluster state entry.
+     *
+     * <p>A gated index has no cluster state entry, so everything below would fail on it, and
+     * {@code getIndexSafe} is where it failed: "no such index" for a name the resolver had just resolved to
+     * a concrete {@link Index} carrying the descriptor's uuid. Creation grew its branch for this
+     * ({@code MetadataCreateIndexService} consulting {@code DescriptorOnlyCreation}) and deletion never grew
+     * the matching one, so a gated index could be created and could never be deleted.
+     *
+     * <p>Nothing caught it because the only test that deletes one lives in a class that had been muted for
+     * the symptom rather than the cause: the shard was still holding its lock at teardown precisely because
+     * the delete had thrown.
+     *
+     * <p>The map is passed in rather than computed here because resolving a descriptor is a remote read and
+     * this runs on the cluster state thread, where {@link Metadata#indexOrResolved(Index)} refuses to answer.
+     */
+    private ClusterState deleteIndices(ClusterState currentState, Set<Index> indices, Map<Index, IndexMetadata> gatedDeletions) {
         final Metadata meta = currentState.metadata();
+
+        if (gatedDeletions.isEmpty() == false) {
+            final Set<Index> gated = new HashSet<>();
+            for (Index index : indices) {
+                if (meta.index(index) == null && gatedDeletions.containsKey(index)) {
+                    gated.add(index);
+                }
+            }
+            for (Index index : gated) {
+                // The tombstone is not written here. It is written once, by the DurableTombstones writer on
+                // the acknowledgement path, for every index this request deletes.
+                //
+                // Writing it here as well wrote it twice, and the second write failed: writeTombstone
+                // finishes by removing the live descriptor blob, so whichever write lost the race found it
+                // already gone and FsBlobContainer.deleteBlobsIgnoringIfNotExists threw NoSuchFileException
+                // despite its name. That stayed hidden because the fire-and-forget publish hook that used to
+                // write the second copy (IndexDescriptorPublisher's since-removed tombstone entry point)
+                // swallowed and logged its exceptions while the durable writer reports them, so the visible
+                // outcome depended on which of two asynchronous writes happened to finish first.
+                logger.info("{} deleting gated index, recording a tombstone rather than a cluster state change", index);
+            }
+            // Deliberately not added to the IndexGraveyard. The graveyard is a bounded list carried in every
+            // cluster state, and putting gated deletions in it would reintroduce per-index cluster state cost
+            // on the one operation that had escaped it. The tombstoned descriptor is the durable no for these,
+            // which is what DurableTombstones already says.
+            final Set<Index> remaining = new HashSet<>(indices);
+            remaining.removeAll(gated);
+            if (remaining.isEmpty()) {
+                // Returning the state unchanged means no publication and no reroute. That is the point: a
+                // gated delete must cost what a gated creation costs, and both are one descriptor write.
+                return currentState;
+            }
+            indices = remaining;
+        }
+
         final Set<Index> indicesToDelete = new HashSet<>();
         final Map<Index, DataStream> backingIndices = new HashMap<>();
         for (Index index : indices) {
@@ -166,6 +414,15 @@ public class MetadataDeleteIndexService {
             logger.info("{} deleting index", index);
             routingTableBuilder.remove(indexName);
             clusterBlocksBuilder.removeIndexBlocks(indexName);
+            // The descriptor tombstone, recorded before the metadata entry goes, since it is derived from it.
+            // Deletion has to be remembered rather than represented by absence: a node that was
+            // partitioned during the delete cannot tell "this index never existed" from "I have not
+            // looked yet", and adopting its dangling data on rejoin is the resurrection IndexGraveyard
+            // exists to prevent. A tombstoned descriptor is the durable no, and unlike the graveyard,
+            // which keeps a bounded list and forgets older deletions, it does not expire.
+            // Written once, on the acknowledgement path, rather than here as well. See the gated branch
+            // above: two writers of the same tombstone means the loser finds the live descriptor blob
+            // already removed and fails, and only one of the two reports that it failed.
             metadataBuilder.remove(indexName);
             if (backingIndices.containsKey(index)) {
                 DataStream parent = metadataBuilder.dataStream(backingIndices.get(index).getName());

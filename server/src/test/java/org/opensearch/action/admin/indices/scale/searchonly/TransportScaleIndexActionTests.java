@@ -40,6 +40,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.translog.TranslogStats;
@@ -738,11 +739,40 @@ public class TransportScaleIndexActionTests extends OpenSearchTestCase {
         boolean hasBlockWithCorrectId = indexBlocks.stream().anyMatch(block -> block.id() == INDEX_SEARCH_ONLY_BLOCK_ID);
         assertTrue("Should find a block with ID " + INDEX_SEARCH_ONLY_BLOCK_ID, hasBlockWithCorrectId);
 
-        // Test execution with missing index
-        initialState = ClusterState.builder(new ClusterName("test")).metadata(Metadata.builder().build()).build();
+        // Test execution with missing index triggers validation failure and does not complete onResponse
+        ActionListener<AcknowledgedResponse> failListener = mock(ActionListener.class);
+        TransportScaleIndexAction.AddBlockClusterStateUpdateTask failTask = action.new AddBlockClusterStateUpdateTask(
+            indexName, blockedIndices, failListener
+        );
+        ClusterState missingIndexState = ClusterState.builder(new ClusterName("test")).metadata(Metadata.builder().build()).build();
+        ClusterState resultState = failTask.execute(missingIndexState);
+        assertEquals(missingIndexState, resultState);
+        verify(failListener).onFailure(any(IllegalArgumentException.class));
 
-        ClusterState resultState = task.execute(initialState);
-        assertEquals(initialState, resultState);
+        failTask.clusterStateProcessed("test", missingIndexState, missingIndexState);
+        verify(failListener, times(0)).onResponse(any());
+
+        // An unchanged state after validation passed means the block was never applied. That must be
+        // reported as a failure rather than acknowledged, or a scale-down that did not happen looks
+        // to the caller exactly like one that did.
+        ActionListener<AcknowledgedResponse> unchangedListener = mock(ActionListener.class);
+        TransportScaleIndexAction.AddBlockClusterStateUpdateTask unchangedTask = action.new AddBlockClusterStateUpdateTask(
+            indexName, blockedIndices, unchangedListener
+        );
+        unchangedTask.clusterStateProcessed("test", initialState, initialState);
+        verify(unchangedListener, times(0)).onResponse(any());
+        verify(unchangedListener).onFailure(any(IllegalStateException.class));
+
+        // The index disappearing between execute() and clusterStateProcessed used to fall off the end
+        // of the method without completing the listener at all, hanging the caller until it timed out.
+        ActionListener<AcknowledgedResponse> vanishedListener = mock(ActionListener.class);
+        TransportScaleIndexAction.AddBlockClusterStateUpdateTask vanishedTask = action.new AddBlockClusterStateUpdateTask(
+            indexName, blockedIndices, vanishedListener
+        );
+        ClusterState withoutIndex = ClusterState.builder(new ClusterName("test")).metadata(Metadata.builder().build()).build();
+        vanishedTask.clusterStateProcessed("test", initialState, withoutIndex);
+        verify(vanishedListener, times(0)).onResponse(any());
+        verify(vanishedListener).onFailure(any(IndexNotFoundException.class));
 
         // Test onFailure
         Exception testException = new Exception("Test failure");

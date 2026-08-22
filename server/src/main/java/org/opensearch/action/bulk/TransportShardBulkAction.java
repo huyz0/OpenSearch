@@ -61,6 +61,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.metadata.ResolvedIndices;
@@ -81,6 +82,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.core.xcontent.MediaType;
@@ -92,6 +94,7 @@ import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.get.GetResult;
 import org.opensearch.index.mapper.MapperException;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.index.mapper.Mapping;
 import org.opensearch.index.mapper.SourceToParse;
 import org.opensearch.index.remote.RemoteStorePressureService;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -424,26 +427,85 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
         ActionListener<PrimaryResult<BulkShardRequest, BulkShardResponse>> listener
     ) {
         ClusterStateObserver observer = new ClusterStateObserver(clusterService, request.timeout(), logger, threadPool.getThreadContext());
+        // Whether this shard's index is one cluster state does not carry. Sampled once here rather than
+        // per document, because it cannot change under a write: an index does not become gated, it is
+        // created gated.
+        final boolean gated = isGated(primary.shardId().getIndex());
         performOnPrimary(request, primary, updateHelper, threadPool::absoluteTimeInMillis, (update, shardId, mappingListener) -> {
             assert update != null;
             assert shardId != null;
+            if (gated) {
+                applyGatedMappingUpdate(primary, update, mappingListener);
+                return;
+            }
             mappingUpdatedAction.updateMappingOnClusterManager(shardId.getIndex(), update, mappingListener);
-        }, mappingUpdateListener -> observer.waitForNextChange(new ClusterStateObserver.Listener() {
-            @Override
-            public void onNewClusterState(ClusterState state) {
+        }, mappingUpdateListener -> {
+            if (gated) {
+                // Nothing to wait for. This wait exists because an ordinary index's mapping comes back to
+                // the shard through a cluster state update, and a gated index's mapping never travels that
+                // way: it went to the store, and applyGatedMappingUpdate has already applied it here.
+                // Waiting would block until the request timed out, and would then fail the document with
+                // "timed out while waiting for a dynamic mapping update" for a mapping that was already in
+                // place.
                 mappingUpdateListener.onResponse(null);
+                return;
             }
+            observer.waitForNextChange(new ClusterStateObserver.Listener() {
+                @Override
+                public void onNewClusterState(ClusterState state) {
+                    mappingUpdateListener.onResponse(null);
+                }
 
-            @Override
-            public void onClusterServiceClose() {
-                mappingUpdateListener.onFailure(new NodeClosedException(clusterService.localNode()));
-            }
+                @Override
+                public void onClusterServiceClose() {
+                    mappingUpdateListener.onFailure(new NodeClosedException(clusterService.localNode()));
+                }
 
-            @Override
-            public void onTimeout(TimeValue timeout) {
-                mappingUpdateListener.onFailure(new MapperException("timed out while waiting for a dynamic mapping update"));
-            }
-        }), listener, threadPool, executor(primary));
+                @Override
+                public void onTimeout(TimeValue timeout) {
+                    mappingUpdateListener.onFailure(new MapperException("timed out while waiting for a dynamic mapping update"));
+                }
+            });
+        }, listener, threadPool, executor(primary));
+    }
+
+    /**
+     * Whether this index keeps its metadata in a descriptor rather than in cluster state.
+     *
+     * <p>Absence from cluster state is the whole test, and it is enough: this runs on the node holding the
+     * shard's primary, so the index demonstrably exists. No descriptor read happens here, which matters
+     * because this is per bulk request on the hot write path.
+     */
+    private boolean isGated(Index index) {
+        return AbsentIndexDescriptorSuppliers.isRegistered() && clusterService.state().metadata().hasIndex(index.getName()) == false;
+    }
+
+    /**
+     * Records a gated index's new fields in the mapping store and applies them to this shard.
+     *
+     * <p>The store half goes through the cluster manager, which looks wrong for a design whose point is to
+     * keep indices off the cluster manager, and is deliberate: {@code MetadataMappingService} already
+     * recognises a gated put-mapping request and turns it into a compare-and-swap against
+     * {@code MappingGenerationStore} with no cluster state change at all. Sending it there rather than
+     * writing the store from here keeps one writer, which is what makes the swap meaningful.
+     *
+     * <p>The local half is the part the ordinary path gets for free. A primary merges the inferred mapping
+     * with {@code MAPPING_UPDATE_PREFLIGHT} before asking, and preflight deliberately does not commit --
+     * it returns the merged result and leaves the mapper alone, because for an ordinary index the commit
+     * arrives with the next cluster state. Nothing brings it to a gated index, so it is committed here.
+     * Without this the document is retried against a mapper that still has not heard of its field, for as
+     * long as the request lives.
+     */
+    private void applyGatedMappingUpdate(IndexShard primary, Mapping update, ActionListener<Void> mappingListener) {
+        mappingUpdatedAction.updateMappingOnClusterManager(primary.shardId().getIndex(), update, ActionListener.wrap(ignored -> {
+            primary.mapperService()
+                .merge(
+                    MapperService.SINGLE_MAPPING_NAME,
+                    new CompressedXContent(update, ToXContent.EMPTY_PARAMS),
+                    MapperService.MergeReason.MAPPING_UPDATE
+                );
+            mappingListener.onResponse(null);
+        }, mappingListener::onFailure));
     }
 
     @Override

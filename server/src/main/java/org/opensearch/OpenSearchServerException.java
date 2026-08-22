@@ -25,6 +25,7 @@ import static org.opensearch.Version.V_2_7_0;
 import static org.opensearch.Version.V_3_0_0;
 import static org.opensearch.Version.V_3_2_0;
 import static org.opensearch.Version.V_3_7_0;
+import static org.opensearch.Version.V_3_8_0;
 
 /**
  * Utility class to register server exceptions
@@ -1248,6 +1249,30 @@ public final class OpenSearchServerException {
                 org.opensearch.index.engine.dataformat.merge.MergeFailedEngineException::new,
                 178,
                 V_3_7_0
+            )
+        );
+        registerExceptionHandle(
+            new OpenSearchExceptionHandle(
+                org.opensearch.storage.action.tiering.MergeDrainTimeoutException.class,
+                org.opensearch.storage.action.tiering.MergeDrainTimeoutException::new,
+                179,
+                V_3_8_0
+            )
+        );
+        registerExceptionHandle(
+            new OpenSearchExceptionHandle(
+                org.opensearch.cluster.metadata.DescriptorUnavailableException.class,
+                org.opensearch.cluster.metadata.DescriptorUnavailableException::new,
+                180,
+                V_3_8_0
+            )
+        );
+        registerExceptionHandle(
+            new OpenSearchExceptionHandle(
+                org.opensearch.cluster.metadata.UnsupportedWildcardException.class,
+                org.opensearch.cluster.metadata.UnsupportedWildcardException::new,
+                181,
+                V_3_8_0
             )
         );
     }

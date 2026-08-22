@@ -978,6 +978,40 @@ public class SnapshotsServiceTests extends OpenSearchTestCase {
         return new SnapshotsInProgress.ShardSnapshotStatus(nodeId, uuid());
     }
 
+    /**
+     * Which snapshot requests silently omit gated indices, and therefore have to warn.
+     *
+     * <h4>Why this is a predicate with its own test</h4>
+     *
+     * Because the failure it guards is a snapshot that reports SUCCESS having captured a subset. A gated
+     * index has no cluster state entry, so no wildcard reaches it and nothing refuses the request -- unlike
+     * naming one directly, which is refused loudly. All four spellings of "everything" were measured to
+     * behave this way, so all four are asserted here rather than the one that happened to be tried first.
+     */
+    public void testEveryWayOfSayingEverythingCountsAsPossiblyOmittingGatedIndices() {
+        assertTrue("no indices set at all is the default, and it means everything", SnapshotsService.mayHaveMatchedGatedIndices(null));
+        assertTrue(SnapshotsService.mayHaveMatchedGatedIndices(new String[0]));
+        assertTrue(SnapshotsService.mayHaveMatchedGatedIndices(new String[] { "*" }));
+        assertTrue(SnapshotsService.mayHaveMatchedGatedIndices(new String[] { "_all" }));
+        assertTrue(
+            "a prefix wildcard reaches names the caller cannot enumerate",
+            SnapshotsService.mayHaveMatchedGatedIndices(new String[] { "logs-*" })
+        );
+        assertTrue(
+            "one wildcard among explicit names is still a wildcard",
+            SnapshotsService.mayHaveMatchedGatedIndices(new String[] { "explicit", "logs-*" })
+        );
+    }
+
+    public void testFullyExplicitIndexNamesDoNotWarn() {
+        assertFalse(
+            "naming indices explicitly is refused loudly when one of them is gated, so there is nothing "
+                + "silent left to warn about -- warning here would train operators to ignore it",
+            SnapshotsService.mayHaveMatchedGatedIndices(new String[] { "one", "two" })
+        );
+        assertFalse(SnapshotsService.mayHaveMatchedGatedIndices(new String[] { "one" }));
+    }
+
     private static SnapshotsInProgress.ShardSnapshotStatus successfulShardStatus(String nodeId) {
         return new SnapshotsInProgress.ShardSnapshotStatus(nodeId, SnapshotsInProgress.ShardState.SUCCESS, uuid());
     }

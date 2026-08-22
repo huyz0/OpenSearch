@@ -37,6 +37,7 @@ import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.core.common.Strings;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
@@ -56,6 +57,12 @@ import static org.opensearch.rest.RestRequest.Method.GET;
 public class RestGetSettingsAction extends BaseRestHandler {
 
     private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(RestGetSettingsAction.class);
+
+    /** Read-only metadata lookup, safe to expose when a plugin restricts the REST surface to a vetted allowlist. */
+    @Override
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
+    }
 
     @Override
     public List<Route> routes() {

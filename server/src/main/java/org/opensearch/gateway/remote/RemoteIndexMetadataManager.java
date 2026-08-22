@@ -61,6 +61,20 @@ public class RemoteIndexMetadataManager extends AbstractRemoteWritableEntityMana
      * This setting will come to effect if the {@link #REMOTE_INDEX_METADATA_PATH_TYPE_SETTING}
      * is either {@code HASHED_PREFIX} or {@code HASHED_INFIX}.
      */
+    /**
+     * Whether uploaded index entries in the manifest carry the index descriptor. With it, a node reading
+     * full cluster state can build {@code Metadata} without fetching every index blob; without it, the
+     * behaviour is exactly what it was before {@link ClusterMetadataManifest#CODEC_V5}. Off by default:
+     * it makes the manifest larger, and nothing reads the descriptor unless the matching read-side
+     * setting {@code cluster.remote_store.state.index_metadata.defer.enabled} is also on.
+     */
+    public static final Setting<Boolean> REMOTE_INDEX_METADATA_DESCRIPTOR_SETTING = Setting.boolSetting(
+        "cluster.remote_store.state.index_metadata.descriptor.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     public static final Setting<RemoteStoreEnums.PathHashAlgorithm> REMOTE_INDEX_METADATA_PATH_HASH_ALGO_SETTING = new Setting<>(
         "cluster.remote_store.index_metadata.path_hash_algo",
         RemoteStoreEnums.PathHashAlgorithm.FNV_1A_BASE64.toString(),
@@ -76,6 +90,7 @@ public class RemoteIndexMetadataManager extends AbstractRemoteWritableEntityMana
 
     private RemoteStoreEnums.PathType pathType;
     private RemoteStoreEnums.PathHashAlgorithm pathHashAlgo;
+    private volatile boolean writeDescriptor;
 
     public RemoteIndexMetadataManager(
         ClusterSettings clusterSettings,
@@ -100,18 +115,24 @@ public class RemoteIndexMetadataManager extends AbstractRemoteWritableEntityMana
         this.indexMetadataUploadTimeout = clusterSettings.get(INDEX_METADATA_UPLOAD_TIMEOUT_SETTING);
         this.pathType = clusterSettings.get(REMOTE_INDEX_METADATA_PATH_TYPE_SETTING);
         this.pathHashAlgo = clusterSettings.get(REMOTE_INDEX_METADATA_PATH_HASH_ALGO_SETTING);
+        this.writeDescriptor = clusterSettings.get(REMOTE_INDEX_METADATA_DESCRIPTOR_SETTING);
+        clusterSettings.addSettingsUpdateConsumer(REMOTE_INDEX_METADATA_DESCRIPTOR_SETTING, this::setWriteDescriptor);
         clusterSettings.addSettingsUpdateConsumer(INDEX_METADATA_UPLOAD_TIMEOUT_SETTING, this::setIndexMetadataUploadTimeout);
         clusterSettings.addSettingsUpdateConsumer(REMOTE_INDEX_METADATA_PATH_TYPE_SETTING, this::setPathTypeSetting);
         clusterSettings.addSettingsUpdateConsumer(REMOTE_INDEX_METADATA_PATH_HASH_ALGO_SETTING, this::setPathHashAlgoSetting);
     }
 
     /**
-     * Fetch index metadata from remote cluster state
+     * Fetch index metadata from remote cluster state.
+     *
+     * <p>Public because a deferred index needs it: when the manifest carries the descriptor, the read
+     * path installs a holder that calls this the first time something wants the whole index, rather than
+     * fetching every index up front. See {@link ManifestIndexDescriptor}.
      *
      * @param uploadedIndexMetadata {@link ClusterMetadataManifest.UploadedIndexMetadata} contains details about remote location of index metadata
      * @return {@link IndexMetadata}
      */
-    IndexMetadata getIndexMetadata(ClusterMetadataManifest.UploadedIndexMetadata uploadedIndexMetadata, String clusterUUID) {
+    public IndexMetadata getIndexMetadata(ClusterMetadataManifest.UploadedIndexMetadata uploadedIndexMetadata, String clusterUUID) {
         RemoteIndexMetadata remoteIndexMetadata = new RemoteIndexMetadata(
             RemoteClusterStateUtils.getFormattedIndexFileName(uploadedIndexMetadata.getUploadedFilename()),
             clusterUUID,
@@ -174,5 +195,14 @@ public class RemoteIndexMetadataManager extends AbstractRemoteWritableEntityMana
 
     protected RemoteStoreEnums.PathHashAlgorithm getPathHashAlgoSetting() {
         return pathHashAlgo;
+    }
+
+    private void setWriteDescriptor(boolean writeDescriptor) {
+        this.writeDescriptor = writeDescriptor;
+    }
+
+    /** Whether uploaded index entries should carry {@link ManifestIndexDescriptor}. */
+    public boolean isWriteDescriptorEnabled() {
+        return writeDescriptor;
     }
 }

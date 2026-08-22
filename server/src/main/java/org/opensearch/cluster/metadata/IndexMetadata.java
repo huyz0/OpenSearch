@@ -68,6 +68,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.gateway.MetadataStateFormat;
 import org.opensearch.index.IndexModule;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.indices.pollingingest.IngestionErrorStrategy;
@@ -108,7 +109,7 @@ import static org.opensearch.common.settings.Settings.writeSettingsToStream;
  * @opensearch.api
  */
 @PublicApi(since = "1.0.0")
-public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragment, VerifiableWriteable {
+public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragment, VerifiableWriteable, IndexMetadataHolder {
 
     public static final ClusterBlock INDEX_READ_ONLY_BLOCK = new ClusterBlock(
         5,
@@ -1209,7 +1210,9 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
         this.settingsVersion = settingsVersion;
         assert aliasesVersion >= 0 : aliasesVersion;
         this.aliasesVersion = aliasesVersion;
-        assert primaryTermsMap.size() == numberOfShards;
+        // primaryTermsMap may hold extra entries for shard ids >= numberOfShards (in-place split
+        // children -- see #inSyncAllocationIds(int)'s javadoc); it must at least cover every base shard.
+        assert primaryTermsMap.size() >= numberOfShards;
         this.primaryTermsMap = Collections.unmodifiableMap(primaryTermsMap);
         this.state = state;
         this.numberOfShards = numberOfShards;
@@ -1486,9 +1489,16 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
         return rolloverInfos;
     }
 
+    /**
+     * The in-sync allocation ids for the given shard id. {@code shardId} is not required to be
+     * {@code < numberOfShards}: an in-place split reserves child shard ids beyond
+     * {@link #numberOfShards} without growing it (see {@link #getSplitShardsMetadata()}), so a shard
+     * id past the base range with no recorded entry yet simply has none in sync -- an empty set,
+     * not a missing/invalid shard id.
+     */
     public Set<String> inSyncAllocationIds(int shardId) {
-        assert shardId >= 0 && shardId < numberOfShards;
-        return inSyncAllocationIds.get(shardId);
+        assert shardId >= 0;
+        return inSyncAllocationIds.getOrDefault(shardId, Collections.emptySet());
     }
 
     public SplitShardsMetadata getSplitShardsMetadata() {
@@ -2032,6 +2042,25 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
         return isRemoteSnapshot;
     }
 
+    /**
+     * This metadata is already materialized, so it is its own holder. See {@link IndexMetadataHolder}
+     * for why {@link Metadata} stores indices behind that interface.
+     */
+    @Override
+    public IndexMetadata get() {
+        return this;
+    }
+
+    @Override
+    public boolean isHidden() {
+        return INDEX_HIDDEN_SETTING.get(settings);
+    }
+
+    @Override
+    public boolean isWarmIndex() {
+        return settings.getAsBoolean(IndexModule.IS_WARM_INDEX_SETTING.getKey(), false);
+    }
+
     public static Builder builder(String index) {
         return new Builder(index);
     }
@@ -2414,14 +2443,17 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
                 }
             }
 
-            // fill missing slots in inSyncAllocationIds with empty set if needed and make all entries immutable
+            // fill missing slots in inSyncAllocationIds with empty set if needed and make all entries immutable.
+            // Preserves entries for shard ids >= numberOfShards verbatim -- an in-place split (see
+            // SplitShardsMetadata) deliberately reserves child shard ids beyond numberOfShards without
+            // growing it (numberOfShards keeps meaning OperationRouting's routing-hash denominator origin
+            // count), so those entries would otherwise be silently dropped here.
             final Map<Integer, Set<String>> filledInSyncAllocationIds = new HashMap<>();
+            for (Map.Entry<Integer, Set<String>> entry : inSyncAllocationIds.entrySet()) {
+                filledInSyncAllocationIds.put(entry.getKey(), Collections.unmodifiableSet(new HashSet<>(entry.getValue())));
+            }
             for (int i = 0; i < numberOfShards; i++) {
-                if (inSyncAllocationIds.containsKey(i)) {
-                    filledInSyncAllocationIds.put(i, Collections.unmodifiableSet(new HashSet<>(inSyncAllocationIds.get(i))));
-                } else {
-                    filledInSyncAllocationIds.put(i, Collections.emptySet());
-                }
+                filledInSyncAllocationIds.putIfAbsent(i, Collections.emptySet());
             }
             final Map<String, String> requireMap = INDEX_ROUTING_REQUIRE_GROUP_SETTING.getAsMap(settings);
             final DiscoveryNodeFilters requireFilters;
@@ -2458,14 +2490,17 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
                 for (int i = 0; i < numberOfShards; i++) {
                     primaryTermsMap.put(i, SequenceNumbers.UNASSIGNED_PRIMARY_TERM);
                 }
-            } else if (primaryTermsMap.size() != numberOfShards) {
-                throw new IllegalStateException(
-                    "primaryTerms length is ["
-                        + primaryTermsMap.size()
-                        + "] but should be equal to number of shards ["
-                        + numberOfShards()
-                        + "]"
-                );
+            } else {
+                // Every base shard (< numberOfShards) must have an explicit term; entries for shard ids
+                // >= numberOfShards are allowed and preserved verbatim -- see the matching
+                // inSyncAllocationIds comment above for why (in-place split child shard ids).
+                for (int i = 0; i < numberOfShards; i++) {
+                    if (primaryTermsMap.containsKey(i) == false) {
+                        throw new IllegalStateException(
+                            "primaryTerms is missing an entry for shard [" + i + "] of [" + numberOfShards + "] shards"
+                        );
+                    }
+                }
             }
 
             final ActiveShardCount waitForActiveShards = SETTING_WAIT_FOR_ACTIVE_SHARDS.get(settings);
@@ -2490,7 +2525,8 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
                 ShardsLimitAllocationDecider.INDEX_TOTAL_REMOTE_CAPABLE_SHARDS_PER_NODE_SETTING.get(settings);
             final int indexTotalRemoteCapablePrimaryShardsPerNodeLimit =
                 ShardsLimitAllocationDecider.INDEX_TOTAL_REMOTE_CAPABLE_PRIMARY_SHARDS_PER_NODE_SETTING.get(settings);
-            final boolean isAppendOnlyIndex = INDEX_APPEND_ONLY_ENABLED_SETTING.get(settings);
+            final boolean isAppendOnlyIndex = INDEX_APPEND_ONLY_ENABLED_SETTING.get(settings)
+                || IndexSettings.PLUGGABLE_DATAFORMAT_ENABLED_SETTING.get(settings);
 
             final String uuid = settings.get(SETTING_INDEX_UUID, INDEX_UUID_NA_VALUE);
 

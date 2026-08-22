@@ -35,6 +35,7 @@ package org.opensearch.rest.action.admin.indices;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestResponse;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -48,6 +49,10 @@ import static org.opensearch.core.rest.RestStatus.OK;
 import static org.hamcrest.Matchers.equalTo;
 
 public class RestGetAliasesActionTests extends OpenSearchTestCase {
+
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestGetAliasesAction().apiAvailabilityScope());
+    }
 
     // # Assumes the following setup
     // curl -X PUT "localhost:9200/index" -H "Content-Type: application/json" -d'

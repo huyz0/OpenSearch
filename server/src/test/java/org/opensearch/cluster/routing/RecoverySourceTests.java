@@ -86,10 +86,11 @@ public class RecoverySourceTests extends OpenSearchTestCase {
         assertEquals(RecoverySource.Type.LOCAL_SHARDS.ordinal(), 4);
         assertEquals(RecoverySource.Type.REMOTE_STORE.ordinal(), 5);
         assertEquals(RecoverySource.Type.IN_PLACE_SPLIT_SHARD.ordinal(), 6);
+        assertEquals(RecoverySource.Type.IN_PLACE_MERGE_SHARD.ordinal(), 7);
         // check exhaustiveness
         for (RecoverySource.Type type : RecoverySource.Type.values()) {
             assertThat(type.ordinal(), greaterThanOrEqualTo(0));
-            assertThat(type.ordinal(), lessThanOrEqualTo(6));
+            assertThat(type.ordinal(), lessThanOrEqualTo(7));
         }
     }
 

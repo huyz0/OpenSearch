@@ -34,6 +34,7 @@ package org.opensearch.cluster.routing;
 
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.ShardRange;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -46,6 +47,9 @@ import org.opensearch.repositories.IndexId;
 import org.opensearch.snapshots.Snapshot;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -93,6 +97,8 @@ public abstract class RecoverySource implements Writeable, ToXContentObject {
                 return LocalShardsRecoverySource.INSTANCE;
             case IN_PLACE_SPLIT_SHARD:
                 return InPlaceSplitShardRecoverySource.INSTANCE;
+            case IN_PLACE_MERGE_SHARD:
+                return new InPlaceMergeShardRecoverySource(in);
             case REMOTE_STORE:
                 return new RemoteStoreRecoverySource(in);
             default:
@@ -126,7 +132,8 @@ public abstract class RecoverySource implements Writeable, ToXContentObject {
         SNAPSHOT,
         LOCAL_SHARDS,
         REMOTE_STORE,
-        IN_PLACE_SPLIT_SHARD
+        IN_PLACE_SPLIT_SHARD,
+        IN_PLACE_MERGE_SHARD
     }
 
     public abstract Type getType();
@@ -275,6 +282,102 @@ public abstract class RecoverySource implements Writeable, ToXContentObject {
         @Override
         public boolean expectEmptyRetentionLeases() {
             return false;
+        }
+    }
+
+    /**
+     * Recovery of a parent shard revived on the same node during an in-place shard merge -- the
+     * reverse of {@link InPlaceSplitShardRecoverySource}. A merge retires the (up to N, exactly 2 in
+     * the sibling-pair scope) children of one earlier split and revives the single parent shard;
+     * that revived parent's primary recovers via this source.
+     *
+     * <p>Unlike its split counterpart, this source <b>carries the retired children's own
+     * {@link ShardRange}s</b> (each of which encodes its child shard id alongside the hash range).
+     * This is not a symmetry-breaking accident, it is forced by the ordering: a split's child
+     * recovers <em>during</em> the in-progress window, so the child can still resolve its own parent
+     * and range from {@code SplitShardsMetadata} at recovery time. A merge, by contrast, de-commits
+     * the split in {@code SplitShardsMetadata} in the <em>same</em> cluster-state update that revives
+     * the parent (see {@link org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService}), so by
+     * the time the parent recovers the metadata no longer records which children it came from. The
+     * plugin-side engine hook that revives the parent needs each child's own blob container and hash
+     * range to fold both children's authoritative document sets back together, so those children are
+     * captured here, on the recovery source, at merge time -- the one channel that survives the
+     * de-commit and reaches the recovering parent.
+     *
+     * @opensearch.experimental
+     */
+    public static class InPlaceMergeShardRecoverySource extends RecoverySource {
+
+        /**
+         * An empty-children instance, retained for callers (and tests) that only need the recovery
+         * source's <em>type</em> and never inspect its children (e.g. a routing-table shape assertion).
+         * A real merge always constructs one carrying the actual retired children via
+         * {@link #InPlaceMergeShardRecoverySource(List)}.
+         */
+        public static final InPlaceMergeShardRecoverySource INSTANCE = new InPlaceMergeShardRecoverySource(Collections.emptyList());
+
+        private final List<ShardRange> children;
+
+        /**
+         * @param children the retired children's ranges (each carrying its own child shard id), whose
+         *                 authoritative document sets the revived parent folds back together.
+         */
+        public InPlaceMergeShardRecoverySource(List<ShardRange> children) {
+            this.children = Collections.unmodifiableList(new ArrayList<>(children));
+        }
+
+        InPlaceMergeShardRecoverySource(StreamInput in) throws IOException {
+            this.children = Collections.unmodifiableList(in.readList(ShardRange::new));
+        }
+
+        /** The retired children's ranges (each carrying its own child shard id) this merge folds back together. */
+        public List<ShardRange> children() {
+            return children;
+        }
+
+        @Override
+        protected void writeAdditionalFields(StreamOutput out) throws IOException {
+            out.writeList(children);
+        }
+
+        @Override
+        public void addAdditionalFields(XContentBuilder builder, ToXContent.Params params) throws IOException {
+            builder.startArray("children");
+            for (ShardRange child : children) {
+                child.toXContent(builder, params);
+            }
+            builder.endArray();
+        }
+
+        @Override
+        public Type getType() {
+            return Type.IN_PLACE_MERGE_SHARD;
+        }
+
+        @Override
+        public String toString() {
+            return "in-place shard merge";
+        }
+
+        @Override
+        public boolean expectEmptyRetentionLeases() {
+            return false;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            return children.equals(((InPlaceMergeShardRecoverySource) o).children);
+        }
+
+        @Override
+        public int hashCode() {
+            return children.hashCode();
         }
     }
 

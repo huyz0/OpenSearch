@@ -22,6 +22,7 @@ import org.opensearch.cluster.coordination.CoordinationMetadata;
 import org.opensearch.cluster.coordination.PersistedStateStats;
 import org.opensearch.cluster.metadata.DiffableStringMap;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.IndexMetadataHolder;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.Metadata.XContentContext;
 import org.opensearch.cluster.metadata.TemplatesMetadata;
@@ -45,6 +46,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedIndexMetadata;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedMetadataAttribute;
@@ -74,9 +76,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -130,6 +134,22 @@ public class RemoteClusterStateService implements Closeable {
     /**
      * Gates the functionality of remote publication.
      */
+    /**
+     * When set, an index whose manifest entry carries an {@link ManifestIndexDescriptor} is installed into
+     * {@code Metadata} as a deferred holder rather than being fetched. Reading full cluster state then
+     * costs one blob per index the node actually touches instead of one per index in the cluster.
+     *
+     * <p>Requires the writer to have populated the descriptor
+     * ({@code cluster.remote_store.state.index_metadata.descriptor.enabled}); entries without one are
+     * fetched exactly as before, so a mixed or older repository degrades rather than fails.
+     */
+    public static final Setting<Boolean> REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING = Setting.boolSetting(
+        "cluster.remote_store.state.index_metadata.defer.enabled",
+        false,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
     public static final String REMOTE_PUBLICATION_SETTING_KEY = "cluster.remote_store.publication.enabled";
     public static final String REMOTE_STATE_DOWNLOAD_TO_SERVE_READ_API_KEY = "cluster.remote_state.download.serve_read_api.enabled";
 
@@ -227,6 +247,7 @@ public class RemoteClusterStateService implements Closeable {
     private final LongSupplier applicationDurationMsSupplier;
     private final ThreadPool threadpool;
     private final List<IndexMetadataUploadListener> indexMetadataUploadListeners;
+    private volatile boolean deferIndexMetadata;
     private BlobStoreRepository blobStoreRepository;
     private BlobStoreTransferService blobStoreTransferService;
     private RemoteRoutingTableService remoteRoutingTableService;
@@ -282,6 +303,8 @@ public class RemoteClusterStateService implements Closeable {
         this.threadpool = threadPool;
         clusterSettings = clusterService.getClusterSettings();
         this.slowWriteLoggingThreshold = clusterSettings.get(SLOW_WRITE_LOGGING_THRESHOLD);
+        this.deferIndexMetadata = clusterSettings.get(REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING);
+        clusterSettings.addSettingsUpdateConsumer(REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING, this::setDeferIndexMetadata);
         clusterSettings.addSettingsUpdateConsumer(SLOW_WRITE_LOGGING_THRESHOLD, this::setSlowWriteLoggingThreshold);
         this.remoteStateReadTimeout = clusterSettings.get(REMOTE_STATE_READ_TIMEOUT_SETTING);
         clusterSettings.addSettingsUpdateConsumer(REMOTE_STATE_READ_TIMEOUT_SETTING, this::setRemoteStateReadTimeout);
@@ -350,6 +373,12 @@ public class RemoteClusterStateService implements Closeable {
             null,
             null
         );
+        // A full write has no previous manifest to diff against -- every currently-live index is
+        // "changed" for sharding purposes, the same way writeMetadataInParallel above uploads every
+        // index's metadata unconditionally rather than diffing it.
+        Set<String> allIndexUUIDs = uploadedMetadataResults.uploadedIndexMetadata.stream()
+            .map(UploadedIndexMetadata::getIndexUUID)
+            .collect(Collectors.toSet());
         final RemoteClusterStateManifestInfo manifestDetails = remoteManifestManager.uploadManifest(
             clusterState,
             uploadedMetadataResults,
@@ -358,7 +387,9 @@ public class RemoteClusterStateService implements Closeable {
             !remoteClusterStateValidationMode.equals(RemoteClusterStateValidationMode.NONE)
                 ? new ClusterStateChecksum(clusterState, threadpool)
                 : null,
-            false
+            false,
+            null,
+            allIndexUUIDs
         );
 
         final long durationMillis = TimeValue.nsecToMSec(relativeTimeNanosSupplier.getAsLong() - startTimeNanos);
@@ -426,9 +457,14 @@ public class RemoteClusterStateService implements Closeable {
         final Map<String, IndexMetadata> indicesToBeDeletedFromRemote = new HashMap<>(previousClusterState.metadata().indices());
         int numIndicesUpdated = 0;
         int numIndicesUnchanged = 0;
-        final Map<String, ClusterMetadataManifest.UploadedIndexMetadata> allUploadedIndexMetadata = previousManifest.getIndices()
-            .stream()
-            .collect(Collectors.toMap(UploadedIndexMetadata::getIndexName, Function.identity()));
+        // remoteManifestManager.resolveIndices, not previousManifest.getIndices() directly: when the
+        // previous manifest is sharded, getIndices() is empty by design (see ClusterMetadataManifest's
+        // own CODEC_V6 doc) -- calling it here directly would silently drop every index that did not
+        // change this version from the new manifest: the same data-loss shape the cleanup sweep's
+        // "transitive cleanup" comment warns about, one layer up from the GC sweep.
+        final Map<String, ClusterMetadataManifest.UploadedIndexMetadata> allUploadedIndexMetadata = remoteManifestManager.resolveIndices(
+            previousManifest
+        ).stream().collect(Collectors.toMap(UploadedIndexMetadata::getIndexName, Function.identity()));
 
         List<IndexMetadata> toUpload = new ArrayList<>();
         // We prepare a map that contains the previous index metadata for the indexes for which version has changed.
@@ -517,6 +553,21 @@ public class RemoteClusterStateService implements Closeable {
         indicesToBeDeletedFromRemote.keySet().forEach(allUploadedIndexMetadata::remove);
         clusterStateCustomsDiff.getDeletes().forEach(allUploadedClusterStateCustomsMap::remove);
 
+        // An index that did not change reuses its previous manifest entry verbatim, so without this the
+        // descriptor would only ever reach indices that happen to be written after the setting is turned
+        // on -- and for a quiescent tenant index, which is exactly what this is for, that may be never.
+        // The descriptor is derived from the cluster state being published, so filling it in here costs
+        // no blob write, and reads only descriptor-level fields so it does not materialize a deferred
+        // index to do it.
+        if (remoteIndexMetadataManager.isWriteDescriptorEnabled()) {
+            for (Map.Entry<String, IndexMetadataHolder> holder : clusterState.metadata().indexHolders().entrySet()) {
+                UploadedIndexMetadata existing = allUploadedIndexMetadata.get(holder.getKey());
+                if (existing != null && existing.getDescriptor() == null) {
+                    allUploadedIndexMetadata.put(holder.getKey(), existing.withDescriptor(ManifestIndexDescriptor.of(holder.getValue())));
+                }
+            }
+        }
+
         if (!updateCoordinationMetadata) {
             uploadedMetadataResults.uploadedCoordinationMetadata = previousManifest.getCoordinationMetadata();
         }
@@ -542,6 +593,14 @@ public class RemoteClusterStateService implements Closeable {
         uploadedMetadataResults.uploadedClusterStateCustomMetadataMap = allUploadedClusterStateCustomsMap;
         uploadedMetadataResults.uploadedIndexMetadata = new ArrayList<>(allUploadedIndexMetadata.values());
 
+        // Which shards (if sharding is on) need rewriting this version -- an index
+        // present in toUpload changed, and one present in indicesToBeDeletedFromRemote (by now trimmed
+        // down to genuinely deleted indices, see the loop above) is gone. Both move their shard's
+        // membership; an index that is simply unchanged does not.
+        Set<String> changedOrDeletedIndexUUIDs = new HashSet<>();
+        toUpload.forEach(indexMetadata -> changedOrDeletedIndexUUIDs.add(indexMetadata.getIndexUUID()));
+        indicesToBeDeletedFromRemote.values().forEach(indexMetadata -> changedOrDeletedIndexUUIDs.add(indexMetadata.getIndexUUID()));
+
         uploadedMetadataResults.uploadedIndicesRoutingMetadata = remoteRoutingTableService.getAllUploadedIndicesRouting(
             previousManifest,
             uploadedMetadataResults.uploadedIndicesRoutingMetadata,
@@ -566,7 +625,9 @@ public class RemoteClusterStateService implements Closeable {
             !remoteClusterStateValidationMode.equals(RemoteClusterStateValidationMode.NONE)
                 ? new ClusterStateChecksum(clusterState, threadpool)
                 : null,
-            false
+            false,
+            previousManifest,
+            changedOrDeletedIndexUUIDs
         );
 
         final long durationMillis = TimeValue.nsecToMSec(relativeTimeNanosSupplier.getAsLong() - startTimeNanos);
@@ -789,7 +850,8 @@ public class RemoteClusterStateService implements Closeable {
                     blobStoreRepository.getNamedXContentRegistry(),
                     remoteIndexMetadataManager.getPathTypeSetting(),
                     remoteIndexMetadataManager.getPathHashAlgoSetting(),
-                    remotePathPrefix
+                    remotePathPrefix,
+                    remoteIndexMetadataManager.isWriteDescriptorEnabled()
                 ),
                 listener
             );
@@ -1017,7 +1079,7 @@ public class RemoteClusterStateService implements Closeable {
             ).uploadedCoordinationMetadata;
         }
         UploadedMetadataResults uploadedMetadataResults = new UploadedMetadataResults(
-            previousManifest.getIndices(),
+            remoteManifestManager.resolveIndices(previousManifest),
             previousManifest.getCustomMetadataMap(),
             uploadedCoordinationMetadata,
             previousManifest.getSettingsMetadata(),
@@ -1038,7 +1100,11 @@ public class RemoteClusterStateService implements Closeable {
             !remoteClusterStateValidationMode.equals(RemoteClusterStateValidationMode.NONE)
                 ? new ClusterStateChecksum(clusterState, threadpool)
                 : null,
-            true
+            true,
+            // Nothing about the index set changed here -- this only marks the existing state committed
+            // -- so an empty changed set makes every shard (if sharding is on) carry forward verbatim.
+            previousManifest,
+            Collections.emptySet()
         );
         if (!previousManifest.isClusterUUIDCommitted() && committedManifestDetails.getClusterMetadataManifest().isClusterUUIDCommitted()) {
             remoteClusterStateCleanupManager.deleteStaleClusterUUIDs(clusterState, committedManifestDetails.getClusterMetadataManifest());
@@ -1124,6 +1190,10 @@ public class RemoteClusterStateService implements Closeable {
 
         remoteRoutingTableService.start();
         remoteClusterStateCleanupManager.start();
+    }
+
+    private void setDeferIndexMetadata(boolean deferIndexMetadata) {
+        this.deferIndexMetadata = deferIndexMetadata;
     }
 
     private void setSlowWriteLoggingThreshold(TimeValue slowWriteLoggingThreshold) {
@@ -1253,7 +1323,31 @@ public class RemoteClusterStateService implements Closeable {
         Consumer<Metadata.Builder> metadataTransformer,
         Consumer<RoutingTable> routingTableTransformer
     ) {
-        int totalReadTasks = indicesToRead.size() + customToRead.size() + (readCoordinationMetadata ? 1 : 0) + (readSettingsMetadata
+        // An index whose manifest entry already carries its descriptor does not have to be fetched: the
+        // descriptor is everything Metadata needs resident, and the blob can wait until something asks
+        // for the index itself. Everything else is read exactly as before, so an older manifest, or one
+        // written with the descriptor turned off, behaves identically.
+        final Map<String, IndexMetadataHolder> deferredIndices = new HashMap<>();
+        final List<UploadedIndexMetadata> indicesToFetch;
+        if (deferIndexMetadata) {
+            indicesToFetch = new ArrayList<>(indicesToRead.size());
+            for (UploadedIndexMetadata uploaded : indicesToRead) {
+                ManifestIndexDescriptor descriptor = uploaded.getDescriptor();
+                if (descriptor == null) {
+                    indicesToFetch.add(uploaded);
+                    continue;
+                }
+                Index index = new Index(uploaded.getIndexName(), uploaded.getIndexUUID());
+                deferredIndices.put(
+                    uploaded.getIndexName(),
+                    descriptor.toHolder(index, () -> remoteIndexMetadataManager.getIndexMetadata(uploaded, clusterUUID))
+                );
+            }
+        } else {
+            indicesToFetch = indicesToRead;
+        }
+
+        int totalReadTasks = indicesToFetch.size() + customToRead.size() + (readCoordinationMetadata ? 1 : 0) + (readSettingsMetadata
             ? 1
             : 0) + (readTemplatesMetadata ? 1 : 0) + (readDiscoveryNodes ? 1 : 0) + (readClusterBlocks ? 1 : 0)
             + (readTransientSettingsMetadata ? 1 : 0) + (readHashesOfConsistentSettings ? 1 : 0) + clusterStateCustomToRead.size()
@@ -1280,7 +1374,7 @@ public class RemoteClusterStateService implements Closeable {
             exceptionList.add(ex);
         }), latch);
 
-        for (UploadedIndexMetadata indexMetadata : indicesToRead) {
+        for (UploadedIndexMetadata indexMetadata : indicesToFetch) {
             remoteIndexMetadataManager.readAsync(
                 indexMetadata.getIndexName(),
                 new RemoteIndexMetadata(
@@ -1531,6 +1625,10 @@ public class RemoteClusterStateService implements Closeable {
         });
 
         metadataBuilder.indices(indexMetadataMap);
+        if (deferredIndices.isEmpty() == false) {
+            metadataBuilder.indexHolders(deferredIndices);
+            logger.debug("Deferred {} of {} indices; {} fetched", deferredIndices.size(), indicesToRead.size(), indexMetadataMap.size());
+        }
         metadataTransformer.accept(metadataBuilder);
         if (readDiscoveryNodes) {
             clusterStateBuilder.nodes(discoveryNodesBuilder.get().localNodeId(localNodeId));
@@ -1587,7 +1685,10 @@ public class RemoteClusterStateService implements Closeable {
                     manifest,
                     manifest.getClusterUUID(),
                     localNodeId,
-                    manifest.getIndices(),
+                    // resolveIndices, not getIndices() directly: a manifest sharded under CODEC_V6
+                    // carries its index list behind UploadedManifestShard references instead -- see
+                    // ClusterMetadataManifest#CODEC_V6's own doc. A no-op passthrough when unsharded.
+                    remoteManifestManager.resolveIndices(manifest),
                     manifest.getCustomMetadataMap(),
                     manifest.getCoordinationMetadata() != null,
                     manifest.getSettingsMetadata() != null,
@@ -1613,6 +1714,9 @@ public class RemoteClusterStateService implements Closeable {
                     manifest,
                     manifest.getClusterUUID(),
                     localNodeId,
+                    // Sharding is CODEC_V6-only and this branch is codec < CODEC_V2, so this manifest
+                    // can never be sharded -- getIndices() is always inline and authoritative here. Kept
+                    // as a direct call (rather than resolveIndices) to say so rather than imply otherwise.
                     manifest.getIndices(),
                     // for manifest codec V1, we don't have the following objects to read, so not passing anything
                     emptyMap(),
@@ -1654,13 +1758,31 @@ public class RemoteClusterStateService implements Closeable {
             ClusterStateDiffManifest diff = manifest.getDiffManifest();
             boolean includeEphemeral = true;
 
+            // Resolved once, outside the loop below (and only if there is anything to resolve): manifest
+            // .getIndices() directly would both miss every entry when the manifest is sharded (see
+            // resolveIndices' own doc) and, even when unsharded, re-derive the same list on every
+            // iteration for no reason. The emptiness check preserves the original laziness -- an empty
+            // diff must not require a working remoteManifestManager any more than it did before.
+            List<UploadedIndexMetadata> resolvedIndices = diff.getIndicesUpdated().isEmpty()
+                ? Collections.emptyList()
+                : remoteManifestManager.resolveIndices(manifest);
+            // Indexed once and looked up k times, rather than a linear scan of the resolved list per
+            // updated index. That scan was O(k x N) on every applied diff -- with N the whole cluster's
+            // index count and k the handful that changed, which is the ratio that makes it worth removing:
+            // at N=1,000,000 and k=10 it walked ten million entries to find ten.
+            final Map<String, UploadedIndexMetadata> resolvedByName = new HashMap<>(resolvedIndices.size());
+            for (UploadedIndexMetadata resolved : resolvedIndices) {
+                resolvedByName.put(resolved.getIndexName(), resolved);
+            }
             List<UploadedIndexMetadata> updatedIndices = diff.getIndicesUpdated().stream().map(idx -> {
-                Optional<UploadedIndexMetadata> uploadedIndexMetadataOptional = manifest.getIndices()
-                    .stream()
-                    .filter(idx2 -> idx2.getIndexName().equals(idx))
-                    .findFirst();
-                assert uploadedIndexMetadataOptional.isPresent() == true;
-                return uploadedIndexMetadataOptional.get();
+                UploadedIndexMetadata uploadedIndexMetadata = resolvedByName.get(idx);
+                assert uploadedIndexMetadata != null;
+                if (uploadedIndexMetadata == null) {
+                    // Same failure as the Optional#get this replaced, kept because assertions are off in
+                    // production and a null entry here would surface far away from its cause.
+                    throw new NoSuchElementException("no manifest entry for updated index [" + idx + "]");
+                }
+                return uploadedIndexMetadata;
             }).collect(Collectors.toList());
 
             Map<String, UploadedMetadataAttribute> updatedCustomMetadata = new HashMap<>();
@@ -1798,7 +1920,7 @@ public class RemoteClusterStateService implements Closeable {
                 manifest,
                 manifest.getClusterUUID(),
                 localNodeId,
-                manifest.getIndices(),
+                remoteManifestManager.resolveIndices(manifest),
                 manifest.getCustomMetadataMap(),
                 manifest.getCoordinationMetadata() != null,
                 manifest.getSettingsMetadata() != null,
@@ -2062,13 +2184,17 @@ public class RemoteClusterStateService implements Closeable {
 
     private boolean isMetadataEqual(ClusterMetadataManifest first, ClusterMetadataManifest second, String clusterName) {
         // todo clusterName can be set as final in the constructor
-        if (first.getIndices().size() != second.getIndices().size()) {
+        // resolveIndices, not getIndices() directly -- either manifest may be sharded (see that
+        // method's own doc), and comparing empty shard-reference lists against each other would make
+        // every sharded manifest pair look trivially "equal" regardless of their actual index sets.
+        final List<UploadedIndexMetadata> firstIndices = remoteManifestManager.resolveIndices(first);
+        final List<UploadedIndexMetadata> secondIndicesList = remoteManifestManager.resolveIndices(second);
+        if (firstIndices.size() != secondIndicesList.size()) {
             return false;
         }
-        final Map<String, UploadedIndexMetadata> secondIndices = second.getIndices()
-            .stream()
+        final Map<String, UploadedIndexMetadata> secondIndices = secondIndicesList.stream()
             .collect(Collectors.toMap(UploadedIndexMetadata::getIndexName, Function.identity()));
-        for (UploadedIndexMetadata uploadedIndexMetadata : first.getIndices()) {
+        for (UploadedIndexMetadata uploadedIndexMetadata : firstIndices) {
             final IndexMetadata firstIndexMetadata = remoteIndexMetadataManager.getIndexMetadata(
                 uploadedIndexMetadata,
                 first.getClusterUUID()

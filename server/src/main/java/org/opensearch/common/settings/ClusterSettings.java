@@ -63,6 +63,7 @@ import org.opensearch.cluster.coordination.Reconfigurator;
 import org.opensearch.cluster.metadata.IndexGraveyard;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.OperationRouting;
+import org.opensearch.cluster.routing.UnassignedInfo;
 import org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance;
 import org.opensearch.cluster.routing.allocation.DiskThresholdSettings;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
@@ -143,7 +144,6 @@ import org.opensearch.monitor.fs.FsHealthService;
 import org.opensearch.monitor.fs.FsService;
 import org.opensearch.monitor.jvm.JvmGcMonitorService;
 import org.opensearch.monitor.jvm.JvmService;
-import org.opensearch.monitor.memory.NativeMemoryService;
 import org.opensearch.monitor.os.OsService;
 import org.opensearch.monitor.process.ProcessService;
 import org.opensearch.node.Node;
@@ -203,6 +203,8 @@ import java.util.function.Predicate;
 
 import static org.opensearch.gateway.remote.RemoteGlobalMetadataManager.GLOBAL_METADATA_UPLOAD_TIMEOUT_SETTING;
 import static org.opensearch.gateway.remote.RemoteIndexMetadataManager.INDEX_METADATA_UPLOAD_TIMEOUT_SETTING;
+import static org.opensearch.gateway.remote.RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING;
+import static org.opensearch.gateway.remote.RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING;
 import static org.opensearch.gateway.remote.RemoteManifestManager.METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING;
 
 /**
@@ -300,6 +302,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 DanglingIndicesState.AUTO_IMPORT_DANGLING_INDICES_SETTING,
                 EnableAllocationDecider.CLUSTER_ROUTING_ALLOCATION_ENABLE_SETTING,
                 EnableAllocationDecider.CLUSTER_ROUTING_REBALANCE_ENABLE_SETTING,
+                UnassignedInfo.CLUSTER_DELAYED_NODE_LEFT_TIMEOUT_SETTING,
                 ExistingShardsAllocator.EXISTING_SHARDS_ALLOCATOR_BATCH_MODE,
                 FilterAllocationDecider.CLUSTER_ROUTING_INCLUDE_GROUP_SETTING,
                 FilterAllocationDecider.CLUSTER_ROUTING_EXCLUDE_GROUP_SETTING,
@@ -564,6 +567,10 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 HunspellService.HUNSPELL_IGNORE_CASE,
                 HunspellService.HUNSPELL_DICTIONARY_OPTIONS,
                 IndicesStore.INDICES_STORE_DELETE_SHARD_TIMEOUT,
+                // The three indices.gated.* settings that
+                // used to be registered here directly are now owned by whichever plugin implements
+                // org.opensearch.indices.cluster.IndexResidencyPolicy, registered through its own
+                // Plugin#getSettings() the ordinary plugin-settings way -- see that interface's javadoc.
                 Environment.PATH_DATA_SETTING,
                 Environment.PATH_HOME_SETTING,
                 Environment.PATH_LOGS_SETTING,
@@ -625,7 +632,6 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 ProcessService.REFRESH_INTERVAL_SETTING,
                 JvmService.REFRESH_INTERVAL_SETTING,
                 FsService.REFRESH_INTERVAL_SETTING,
-                NativeMemoryService.REFRESH_INTERVAL_SETTING,
                 JvmGcMonitorService.ENABLED_SETTING,
                 JvmGcMonitorService.REFRESH_INTERVAL_SETTING,
                 JvmGcMonitorService.GC_SETTING,
@@ -643,12 +649,16 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 BootstrapSettings.MEMORY_LOCK_SETTING,
                 BootstrapSettings.SYSTEM_CALL_FILTER_SETTING,
                 BootstrapSettings.CTRLHANDLER_SETTING,
+                BootstrapSettings.SERIAL_FILTER_SETTING,
                 KeyStoreWrapper.SEED_SETTING,
                 IndexingMemoryController.INDEX_BUFFER_SIZE_SETTING,
                 IndexingMemoryController.MIN_INDEX_BUFFER_SIZE_SETTING,
                 IndexingMemoryController.MAX_INDEX_BUFFER_SIZE_SETTING,
                 IndexingMemoryController.SHARD_INACTIVE_TIME_SETTING,
                 IndexingMemoryController.SHARD_MEMORY_INTERVAL_TIME_SETTING,
+                IndexingMemoryController.NATIVE_INDEX_BUFFER_SIZE_SETTING,
+                IndexingMemoryController.MIN_NATIVE_INDEX_BUFFER_SIZE_SETTING,
+                IndexingMemoryController.MAX_NATIVE_INDEX_BUFFER_SIZE_SETTING,
                 ResourceWatcherService.ENABLED,
                 ResourceWatcherService.RELOAD_INTERVAL_HIGH,
                 ResourceWatcherService.RELOAD_INTERVAL_MEDIUM,
@@ -775,6 +785,8 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 TieringUtils.W2H_MAX_CONCURRENT_TIERING_REQUESTS,
                 TieringUtils.JVM_USAGE_TIERING_THRESHOLD_PERCENT,
                 TieringUtils.FILECACHE_ACTIVE_USAGE_TIERING_THRESHOLD_PERCENT,
+                TieringUtils.PREPARE_TIERING_TIMEOUT,
+                TieringUtils.REPLICA_SYNC_TIMEOUT_SETTING,
 
                 // Settings related to Remote Refresh Segment Pressure
                 RemoteStorePressureSettings.REMOTE_REFRESH_SEGMENT_PRESSURE_ENABLED,
@@ -807,9 +819,13 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 INDEX_METADATA_UPLOAD_TIMEOUT_SETTING,
                 GLOBAL_METADATA_UPLOAD_TIMEOUT_SETTING,
                 METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING,
+                CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING,
+                CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING,
                 RemoteClusterStateService.REMOTE_STATE_READ_TIMEOUT_SETTING,
+                RemoteClusterStateService.REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING,
                 RemoteClusterStateService.CLUSTER_REMOTE_STORE_STATE_PATH_PREFIX,
                 RemoteIndexMetadataManager.REMOTE_INDEX_METADATA_PATH_TYPE_SETTING,
+                RemoteIndexMetadataManager.REMOTE_INDEX_METADATA_DESCRIPTOR_SETTING,
                 RemoteIndexMetadataManager.REMOTE_INDEX_METADATA_PATH_HASH_ALGO_SETTING,
                 RemoteStoreNodeService.REMOTE_STORE_COMPATIBILITY_MODE_SETTING,
                 RemoteStoreNodeService.MIGRATION_DIRECTION_SETTING,
@@ -833,6 +849,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 NativeMemoryBasedAdmissionControllerSettings.SEARCH_NATIVE_MEMORY_USAGE_LIMIT,
                 NativeMemoryBasedAdmissionControllerSettings.INDEXING_NATIVE_MEMORY_USAGE_LIMIT,
                 NativeMemoryBasedAdmissionControllerSettings.CLUSTER_ADMIN_NATIVE_MEMORY_USAGE_LIMIT,
+                NativeMemoryBasedAdmissionControllerSettings.INDEXING_NATIVE_MEMORY_POOL_USAGE_LIMIT,
 
                 // Concurrent segment search settings
                 SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING, // deprecated

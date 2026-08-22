@@ -151,6 +151,7 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.index.shard.IndexingOperationListener;
 import org.opensearch.index.shard.IndexingStats;
+import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.remote.filecache.NodeCacheService;
 import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
@@ -174,6 +175,7 @@ import org.opensearch.node.Node;
 import org.opensearch.node.remotestore.RemoteStoreNodeAttribute;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.PluginsService;
+import org.opensearch.plugins.SearchStatsContributor;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
@@ -440,6 +442,16 @@ public class IndicesService extends AbstractLifecycleComponent
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
     private final Client client;
     private volatile Map<String, IndexService> indices = emptyMap();
+
+    /**
+     * Asked to build an index that is not here, before its absence is reported as an error.
+     *
+     * <p>Installed by {@code IndicesClusterStateService}, which owns the shard lifecycle and every
+     * collaborator opening a shard needs. Null until then, and null on a node that holds no shards, so
+     * {@link #indexServiceSafe} behaves exactly as it always has.
+     */
+    private volatile Consumer<Index> onDemandShardOpener;
+
     private final Map<Index, List<PendingDelete>> pendingDeletes = new HashMap<>();
     private final AtomicInteger numUncompletedDeletes = new AtomicInteger();
     private final OldShardsStats oldShardsStats = new OldShardsStats();
@@ -450,7 +462,7 @@ public class IndicesService extends AbstractLifecycleComponent
     final IndicesRequestCache indicesRequestCache; // pkg-private for testing
     private final IndicesQueryCache indicesQueryCache;
     private final MetaStateService metaStateService;
-    private final Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders;
+    private final Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders;
     private final Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories;
     private final Map<String, IndexStorePlugin.CompositeDirectoryFactory> compositeDirectoryFactories;
     private final Map<String, IngestionConsumerFactory> ingestionConsumerFactories;
@@ -481,6 +493,7 @@ public class IndicesService extends AbstractLifecycleComponent
     private volatile int maxSizeInRequestCache;
     private volatile int defaultMaxMergeAtOnce;
     private final StatusCounterStats statusCounterStats;
+    private volatile List<SearchStatsContributor> searchStatsContributors = Collections.emptyList();
     private final ClusterMergeSchedulerConfig clusterMergeSchedulerConfig;
     private final DataFormatRegistry dataFormatRegistry;
     private final Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories;
@@ -509,7 +522,7 @@ public class IndicesService extends AbstractLifecycleComponent
         ClusterService clusterService,
         Client client,
         MetaStateService metaStateService,
-        Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders,
+        Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders,
         Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         Map<String, IndexStorePlugin.CompositeDirectoryFactory> compositeDirectoryFactories,
         Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories,
@@ -700,7 +713,7 @@ public class IndicesService extends AbstractLifecycleComponent
         ClusterService clusterService,
         Client client,
         MetaStateService metaStateService,
-        Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders,
+        Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders,
         Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         ValuesSourceRegistry valuesSourceRegistry,
         Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories,
@@ -750,7 +763,7 @@ public class IndicesService extends AbstractLifecycleComponent
             null,
             null,
             null,
-            null
+            new DataFormatRegistry(pluginsService)
         );
     }
 
@@ -896,6 +909,12 @@ public class IndicesService extends AbstractLifecycleComponent
                     break;
                 case Search:
                     commonStats.search.add(oldShardsStats.searchStats);
+                    for (SearchStatsContributor contributor : searchStatsContributors) {
+                        SearchStats contributed = contributor.contributeSearchStats();
+                        if (contributed != null) {
+                            commonStats.search.add(contributed);
+                        }
+                    }
                     break;
                 case Merge:
                     commonStats.merge.add(oldShardsStats.mergeStats);
@@ -1014,8 +1033,24 @@ public class IndicesService extends AbstractLifecycleComponent
     /**
      * Returns an IndexService for the specified index if exists otherwise a {@link IndexNotFoundException} is thrown.
      */
+    @Override
+    public void setOnDemandShardOpener(Consumer<Index> opener) {
+        this.onDemandShardOpener = opener;
+    }
+
     public IndexService indexServiceSafe(Index index) {
         IndexService indexService = indices.get(index.getUUID());
+        if (indexService == null) {
+            // The on-demand opener's trigger. An index whose metadata never appears in cluster state is never built by
+            // cluster state application, so the first request for one of its shards is the only thing that
+            // can ask for it. Reached only on the way to throwing, so an ordinary cluster pays one null
+            // check on a path that was already about to fail.
+            Consumer<Index> opener = onDemandShardOpener;
+            if (opener != null) {
+                opener.accept(index);
+                indexService = indices.get(index.getUUID());
+            }
+        }
         if (indexService == null) {
             throw new IndexNotFoundException(index);
         }
@@ -1164,21 +1199,7 @@ public class IndicesService extends AbstractLifecycleComponent
             indexCreationContext
         );
 
-        final IndexModule indexModule = new IndexModule(
-            idxSettings,
-            analysisRegistry,
-            getIndexerFactory(idxSettings),
-            getEngineConfigFactory(idxSettings),
-            directoryFactories,
-            compositeDirectoryFactories,
-            () -> allowExpensiveQueries,
-            indexNameExpressionResolver,
-            recoveryStateFactories,
-            storeFactories,
-            nodeCacheService,
-            compositeIndexSettings,
-            dataFormatAwareStoreDirectoryFactories
-        );
+        final IndexModule indexModule = newIndexModule(idxSettings, this::getIndexerFactory);
         for (IndexingOperationListener operationListener : indexingOperationListeners) {
             indexModule.addIndexOperationListener(operationListener);
         }
@@ -1226,7 +1247,12 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     private EngineConfigFactory getEngineConfigFactory(final IndexSettings idxSettings) {
-        return new EngineConfigFactory(this.pluginsService, idxSettings);
+        return new EngineConfigFactory(
+            this.pluginsService,
+            idxSettings,
+            dataFormatRegistry.getDocumentLookupProvider(),
+            dataFormatRegistry.getDocumentMetadataResolver()
+        );
     }
 
     private IngestionConsumerFactory getIngestionConsumerFactory(final IndexSettings idxSettings) {
@@ -1245,14 +1271,28 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     private IndexerFactory getIndexerFactory(final IndexSettings idxSettings) {
+        return getIndexerFactory(idxSettings, null);
+    }
+
+    /**
+     * Resolves the {@link IndexerFactory} for a specific shard copy. {@code shardRouting} is {@code null} when
+     * resolving the index-wide default ahead of any shard being allocated (e.g. administrative lookups); it is
+     * non-null when resolving for an actual shard, letting registered {@link org.opensearch.plugins.EnginePlugin}s
+     * pick a different engine depending on the shard's role (see {@link ShardRouting#isSearchOnly()}).
+     */
+    private IndexerFactory getIndexerFactory(final IndexSettings idxSettings, @Nullable final ShardRouting shardRouting) {
         if (idxSettings.isPluggableDataFormatEnabled()) {
             return new DataFormatAwareIndexerFactory();
         } else {
-            return new EngineBackedIndexerFactory(getEngineFactory(idxSettings));
+            return new EngineBackedIndexerFactory(getEngineFactory(idxSettings, shardRouting));
         }
     }
 
     private EngineFactory getEngineFactory(final IndexSettings idxSettings) {
+        return getEngineFactory(idxSettings, null);
+    }
+
+    private EngineFactory getEngineFactory(final IndexSettings idxSettings, @Nullable final ShardRouting shardRouting) {
         final IndexMetadata indexMetadata = idxSettings.getIndexMetadata();
         if (indexMetadata != null && indexMetadata.getState() == IndexMetadata.State.CLOSE) {
             // NoOpEngine takes precedence as long as the index is closed
@@ -1266,7 +1306,7 @@ public class IndicesService extends AbstractLifecycleComponent
         }
 
         final List<Optional<EngineFactory>> engineFactories = engineFactoryProviders.stream()
-            .map(engineFactoryProvider -> engineFactoryProvider.apply(idxSettings))
+            .map(engineFactoryProvider -> engineFactoryProvider.apply(idxSettings, shardRouting))
             .filter(maybe -> Objects.requireNonNull(maybe).isPresent())
             .collect(Collectors.toList());
         if (engineFactories.isEmpty()) {
@@ -1295,6 +1335,69 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     /**
+     * Whether {@code type} is a field type this node knows how to build, without building anything.
+     *
+     * <p>Deliberately not synchronized, and that is the entire point of it existing. Every other route to
+     * this question -- {@link #createIndexMapperService}, {@link #withTempIndexService} -- constructs an
+     * {@link org.opensearch.index.IndexModule} and calls {@code pluginsService.onIndexModule} on it, which
+     * is why both hold this object's monitor. Profiling measured what that costs a creation that only needs to
+     * know whether a type name is real: 275 gated creations per second against 6,011.
+     *
+     * <p>The registry is an immutable map fixed at node construction, so reading it needs no lock and
+     * cannot race. This answers exactly one question and is not a shortcut around mapping validation in
+     * general: for a field whose definition is nothing but {@code {"type": X}} it is complete, because
+     * there is no other parameter to check, and for anything richer the caller must still go the long way.
+     */
+    public boolean hasFieldTypeParser(String type) {
+        return mapperRegistry.getMapperParsers().containsKey(type);
+    }
+
+    /**
+     * A mapper service for validating a mapping, built without holding this object's monitor for the whole
+     * of it.
+     *
+     * <h4>Why this exists</h4>
+     *
+     * Validating a declared mapping means building one of these, and every existing route to one --
+     * {@link #createIndexMapperService}, {@link #withTempIndexService} -- is {@code synchronized} on this
+     * object, so every concurrent index creation on the node queues behind one monitor. Profiling measured what
+     * that costs: a gated creation whose mapping is nothing but field types runs at 2,095 per second, and
+     * the same creation with one parameter added -- which is what sends it down this road -- runs at 315.
+     * Per creation that is about 21.6 ms of service time at concurrency 8, against 276 us for everything
+     * else a declared mapping costs. The store is not the bottleneck and neither is the blob write; this
+     * monitor is.
+     *
+     * <h4>What is still inside the monitor, and why that is the right line</h4>
+     *
+     * {@code pluginsService.onIndexModule} runs third-party code, and nothing about a plugin's
+     * {@code onIndexModule} promises to tolerate being called concurrently. That keeps the monitor. What
+     * moves out is the work either side of it: constructing the settings and the module, and -- the
+     * expensive half -- {@code analysisRegistry.build}, which builds this index's analyzers, plus the
+     * mapper service itself. Those read node-level registries fixed at construction and write nothing
+     * shared.
+     *
+     * <h4>What this must not be used for</h4>
+     *
+     * A mapper service that is going to be *kept*. This one is built, merged into, read once and closed, and
+     * it is never registered in {@link #indices}, so it cannot race the creation and removal paths that the
+     * monitor also serialises. {@link #createIndexMapperService} is unchanged and remains the method for
+     * anything that outlives its own validation -- narrowing the monitor there would change concurrency for
+     * ordinary indices, which is not this change's to make.
+     *
+     * <p>Note: the returned {@link MapperService} should be closed when unneeded.
+     */
+    public MapperService createMapperServiceForValidation(IndexMetadata indexMetadata) throws IOException {
+        final IndexSettings idxSettings = new IndexSettings(indexMetadata, this.settings, indexScopedSettings);
+        final IndexModule indexModule = newIndexModule(idxSettings, null);
+        synchronized (this) {
+            // The one part that runs code this class does not own. Held for the callback and released
+            // before the analyzers are built, which is where the time actually goes.
+            pluginsService.onIndexModule(indexModule);
+        }
+        return indexModule.newIndexMapperService(xContentRegistry, mapperRegistry, scriptService);
+    }
+
+    /**
      * creates a new mapper service for the given index, in order to do administrative work like mapping updates.
      * This *should not* be used for document parsing. Doing so will result in an exception.
      * <p>
@@ -1302,10 +1405,25 @@ public class IndicesService extends AbstractLifecycleComponent
      */
     public synchronized MapperService createIndexMapperService(IndexMetadata indexMetadata) throws IOException {
         final IndexSettings idxSettings = new IndexSettings(indexMetadata, this.settings, indexScopedSettings);
-        final IndexModule indexModule = new IndexModule(
+        final IndexModule indexModule = newIndexModule(idxSettings, null);
+        pluginsService.onIndexModule(indexModule);
+        return indexModule.newIndexMapperService(xContentRegistry, mapperRegistry, scriptService);
+    }
+
+    /**
+     * Builds an {@link IndexModule} from this service's node-level registries. {@code indexerFactoryProvider}
+     * is non-null only when resolving per-shard indexer factories (index creation); administrative
+     * mapper-service builds pass {@code null}.
+     */
+    private IndexModule newIndexModule(
+        IndexSettings idxSettings,
+        @Nullable BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider
+    ) {
+        return new IndexModule(
             idxSettings,
             analysisRegistry,
             getIndexerFactory(idxSettings),
+            indexerFactoryProvider,
             getEngineConfigFactory(idxSettings),
             directoryFactories,
             compositeDirectoryFactories,
@@ -1317,8 +1435,6 @@ public class IndicesService extends AbstractLifecycleComponent
             compositeIndexSettings,
             dataFormatAwareStoreDirectoryFactories
         );
-        pluginsService.onIndexModule(indexModule);
-        return indexModule.newIndexMapperService(xContentRegistry, mapperRegistry, scriptService);
     }
 
     /**
@@ -1888,6 +2004,19 @@ public class IndicesService extends AbstractLifecycleComponent
         }
     }
 
+    @Override
+    public boolean hasExistingShardData(ShardId shardId, String customDataPath) {
+        try {
+            return ShardPath.loadShardPath(logger, nodeEnv, shardId, customDataPath) != null;
+        } catch (Exception e) {
+            // Unreadable is not the same as absent, but treating it as absent here would recover the
+            // shard from an empty store, which is the outcome this call exists to prevent. Reporting
+            // "data present" makes the recovery fail loudly instead.
+            logger.warn(() -> new ParameterizedMessage("{} could not determine whether shard data exists", shardId), e);
+            return true;
+        }
+    }
+
     /**
      * Processes all pending deletes for the given index. This method will acquire all locks for the given index and will
      * process all pending deletes for this index. Pending deletes might occur if the OS doesn't allow deletion of files because
@@ -2144,6 +2273,14 @@ public class IndicesService extends AbstractLifecycleComponent
 
     public ByteSizeValue getTotalIndexingBufferBytes() {
         return indexingMemoryController.indexingBufferSize();
+    }
+
+    /**
+     * Updates the native memory budget used by the IndexingMemoryController for flush/throttle decisions.
+     * Called when the indexing pool group's effective limit changes.
+     */
+    public void setNativeIndexBufferBytes(long bytes) {
+        indexingMemoryController.setNativeBufferBytes(bytes);
     }
 
     /**
@@ -2469,6 +2606,13 @@ public class IndicesService extends AbstractLifecycleComponent
 
     public void setFixedRefreshIntervalSchedulingEnabled(boolean fixedRefreshIntervalSchedulingEnabled) {
         this.fixedRefreshIntervalSchedulingEnabled = fixedRefreshIntervalSchedulingEnabled;
+    }
+
+    /**
+     * Sets the list of search stats contributors. Called by {@code Node} after plugin discovery.
+     */
+    public void setSearchStatsContributors(List<SearchStatsContributor> contributors) {
+        this.searchStatsContributors = contributors;
     }
 
     private boolean isFixedRefreshIntervalSchedulingEnabled() {

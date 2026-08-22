@@ -51,6 +51,7 @@ import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.mapper.Mapper.TypeParser.ParserContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.QueryShardException;
 import org.opensearch.search.lookup.SearchLookup;
@@ -173,8 +174,15 @@ public class SourceFieldMapper extends MetadataFieldMapper {
             Collections.emptyList()
         );
 
+        private final boolean requiresSourceEnabled;
+
         public Builder() {
+            this(false);
+        }
+
+        public Builder(boolean requiresSourceEnabled) {
             super(Defaults.NAME);
+            this.requiresSourceEnabled = requiresSourceEnabled;
         }
 
         @Override
@@ -184,7 +192,8 @@ public class SourceFieldMapper extends MetadataFieldMapper {
 
         @Override
         public SourceFieldMapper build(BuilderContext context) {
-            if (context.indexSettings().getAsBoolean(IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey(), false) && !enabled.getValue()) {
+            if ((context.indexSettings().getAsBoolean(IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey(), false) || requiresSourceEnabled)
+                && !enabled.getValue()) {
                 throw new MapperParsingException(
                     "_source can't be disabled with " + IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey() + " enabled index setting"
                 );
@@ -195,12 +204,27 @@ public class SourceFieldMapper extends MetadataFieldMapper {
                 excludes.getValue().toArray(new String[0]),
                 recoverySourceEnabled.getValue(),
                 recoverySourceIncludes.getValue().toArray(new String[0]),
-                recoverySourceExcludes.getValue().toArray(new String[0])
+                recoverySourceExcludes.getValue().toArray(new String[0]),
+                requiresSourceEnabled
             );
         }
     }
 
-    public static final TypeParser PARSER = new ConfigurableTypeParser(c -> new SourceFieldMapper(), c -> new Builder());
+    public static final TypeParser PARSER = new ConfigurableTypeParser(
+        c -> new SourceFieldMapper(),
+        c -> new Builder(requiresSourceEnabledForPluggableFormat(c))
+    );
+
+    /**
+     * {@code _source} cannot be disabled when the pluggable-data-format feature is enabled.
+     * {@code mapperService()}/{@code getIndexSettings()} can each independently be null in
+     * lightweight mapper-only test harnesses.
+     */
+    private static boolean requiresSourceEnabledForPluggableFormat(ParserContext parserContext) {
+        MapperService mapperService = parserContext.mapperService();
+        IndexSettings indexSettings = mapperService == null ? null : mapperService.getIndexSettings();
+        return indexSettings != null && indexSettings.isPluggableDataFormatEnabled();
+    }
 
     /**
      * Field type for source field mapper
@@ -243,9 +267,10 @@ public class SourceFieldMapper extends MetadataFieldMapper {
     private final String[] excludes;
     private final String[] recoverySourceIncludes;
     private final String[] recoverySourceExcludes;
+    private final boolean requiresSourceEnabled;
 
     private SourceFieldMapper() {
-        this(Defaults.ENABLED, Strings.EMPTY_ARRAY, Strings.EMPTY_ARRAY, Defaults.ENABLED, Strings.EMPTY_ARRAY, Strings.EMPTY_ARRAY);
+        this(Defaults.ENABLED, Strings.EMPTY_ARRAY, Strings.EMPTY_ARRAY, Defaults.ENABLED, Strings.EMPTY_ARRAY, Strings.EMPTY_ARRAY, false);
     }
 
     private SourceFieldMapper(
@@ -254,10 +279,12 @@ public class SourceFieldMapper extends MetadataFieldMapper {
         String[] excludes,
         boolean recoverySourceEnabled,
         String[] recoverySourceIncludes,
-        String[] recoverySourceExcludes
+        String[] recoverySourceExcludes,
+        boolean requiresSourceEnabled
     ) {
         super(new SourceFieldType(enabled));
         this.enabled = enabled;
+        this.requiresSourceEnabled = requiresSourceEnabled;
         this.includes = includes;
         this.excludes = excludes;
         final boolean filtered = CollectionUtils.isEmpty(includes) == false || CollectionUtils.isEmpty(excludes) == false;
@@ -359,6 +386,6 @@ public class SourceFieldMapper extends MetadataFieldMapper {
 
     @Override
     public ParametrizedFieldMapper.Builder getMergeBuilder() {
-        return new Builder().init(this);
+        return new Builder(this.requiresSourceEnabled).init(this);
     }
 }

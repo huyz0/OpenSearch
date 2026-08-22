@@ -61,6 +61,7 @@ import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.DataStream;
+import org.opensearch.cluster.metadata.DescriptorPrefetch;
 import org.opensearch.cluster.metadata.IndexAbstraction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -252,11 +253,46 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
         final Releasable releasable = indexingPressureService.markCoordinatingOperationStarted(bulkRequest::ramBytesUsed, isOnlySystem);
         final ActionListener<BulkResponse> releasingListener = ActionListener.runBefore(listener, releasable::close);
         final String executorName = isOnlySystem ? Names.SYSTEM_WRITE : Names.WRITE;
-        try {
-            doInternalExecute(task, bulkRequest, executorName, releasingListener);
-        } catch (Exception e) {
-            releasingListener.onFailure(e);
+        // C1. Resolve the descriptors this request will need before entering the synchronous path that
+        // needs them. Inert unless a prefetcher is installed, in which case it completes on this thread
+        // and this is the same call it always was.
+        //
+        // Here rather than deeper in because this is the last point that knows the whole request: by
+        // doRun the work is per document, and a lookup issued from inside that loop is one round trip per
+        // distinct index, sequentially. Batched, it is one. That stopped being an optimisation when the
+        // hit rate was measured: at a cache bound of a tenth of the population under realistic skew,
+        // roughly three lookups in ten still reach the store.
+        DescriptorPrefetch.prefetch(distinctIndicesOf(bulkRequest), ActionListener.wrap(ignored -> {
+            try {
+                doInternalExecute(task, bulkRequest, executorName, releasingListener);
+            } catch (Exception e) {
+                releasingListener.onFailure(e);
+            }
+        },
+            // Unreachable by contract: prefetch always completes successfully, precisely so that a
+            // speculative read cannot fail a request. Wired anyway rather than left to throw, because
+            // "cannot happen" is how a listener ends up silently dropping a bulk request.
+            releasingListener::onFailure
+        ));
+    }
+
+    /**
+     * The distinct index names a bulk request names, or an empty set when nothing is installed to use them.
+     *
+     * <p>Distinct rather than one per document: a bulk of ten thousand documents across fifty tenants is
+     * fifty descriptors, and passing the raw list would make the batch as large as the request.
+     */
+    private static Set<String> distinctIndicesOf(BulkRequest bulkRequest) {
+        if (DescriptorPrefetch.isRegistered() == false) {
+            return Set.of();
         }
+        Set<String> names = new HashSet<>();
+        for (DocWriteRequest<?> request : bulkRequest.requests()) {
+            if (request.index() != null) {
+                names.add(request.index());
+            }
+        }
+        return names;
     }
 
     protected void doInternalExecute(Task task, BulkRequest bulkRequest, String executorName, ActionListener<BulkResponse> listener) {
@@ -640,8 +676,13 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     // The ConcreteIndices#resolveIfAbsent(...) method validates via IndexNameExpressionResolver whether
                     // an operation is allowed in index into a data stream, but this isn't done when resolve call is cached, so
                     // the validation needs to be performed here too.
+                    // Site 6. A gated index has no abstraction in the lookup, and absent means it has no
+                    // parent data stream rather than that it is unroutable: T29 established that an index
+                    // which could be part of a data stream keeps its cluster state entry, because every
+                    // data stream operation is a cluster state update over metadata a gated index does not
+                    // have. So absence here is an answer, and it is "no".
                     IndexAbstraction indexAbstraction = clusterState.getMetadata().getIndicesLookup().get(concreteIndex.getName());
-                    if (indexAbstraction.getParentDataStream() != null &&
+                    if (indexAbstraction != null && indexAbstraction.getParentDataStream() != null &&
                     // avoid valid cases when directly indexing into a backing index
                     // (for example when directly indexing into .ds-logs-foobar-000001)
                         concreteIndex.getName().equals(docWriteRequest.index()) == false
@@ -655,7 +696,11 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                             prohibitAppendWritesInBackingIndices(docWriteRequest, metadata);
                             prohibitCustomRoutingOnDataStream(docWriteRequest, metadata);
                             IndexRequest indexRequest = (IndexRequest) docWriteRequest;
-                            final IndexMetadata indexMetadata = metadata.index(concreteIndex);
+                            // Site 3. The mapping is legitimately absent for a gated index rather than
+                            // merely unavailable: H4c moved mappings off cluster state entirely, and a null
+                            // mapping here is what process() already expects from an index that has not been
+                            // mapped yet. The creation version is what the descriptor records at creation.
+                            final IndexMetadata indexMetadata = metadata.indexOrResolved(concreteIndex);
                             MappingMetadata mappingMd = indexMetadata.mapping();
                             Version indexCreated = indexMetadata.getCreationVersion();
                             indexRequest.resolveRouting(metadata);
@@ -679,7 +724,10 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                             throw new AssertionError("request type not supported: [" + docWriteRequest.opType() + "]");
                     }
 
-                    IndexMetadata indexMetaData = clusterState.metadata().index(concreteIndex.getName());
+                    // Site 4. Append-only is a setting a gated index does not carry, so the descriptor's
+                    // synthesised metadata answers false, which is the same answer an ordinary index
+                    // without the setting gives.
+                    IndexMetadata indexMetaData = clusterState.metadata().indexOrResolved(concreteIndex.getName());
                     ShardId shardId = null;
                     if (indexMetaData.isAppendOnlyIndex() && indexMetaData.bulkAdaptiveShardSelectionEnabled()) {
                         shardId = index2ShardId.computeIfAbsent(
@@ -738,10 +786,17 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     bulkShardRequest.setParentTask(nodeId, task.getId());
                 }
                 final long startTimeNanos = relativeTime();
-                final ShardRouting primary = routingTable.shardRoutingTable(shardId).primaryShard();
+                // OrNull for the same reason as TransportReplicationAction: this line already copes
+                // with a null primary one statement later, and the throwing lookup meant an index
+                // present in metadata and absent from routing never got that far.
+                final IndexShardRoutingTable shardRoutingTable = routingTable.shardRoutingTableOrNull(shardId);
+                final ShardRouting primary = shardRoutingTable == null ? null : shardRoutingTable.primaryShard();
                 String targetNodeId = primary != null ? primary.currentNodeId() : null;
-                IndexMetadata indexMetaData = clusterState.metadata().index(shardId.getIndexName());
-                boolean bulkAdaptiveShardSelectionEnabled = indexMetaData.isAppendOnlyIndex()
+                // Site 9. The same append-only question as site 4, asked again per shard request rather
+                // than per document, and it throws on a null the same way.
+                IndexMetadata indexMetaData = clusterState.metadata().indexOrResolved(shardId.getIndexName());
+                boolean bulkAdaptiveShardSelectionEnabled = indexMetaData != null
+                    && indexMetaData.isAppendOnlyIndex()
                     && indexMetaData.bulkAdaptiveShardSelectionEnabled();
 
                 // Add the shard level accounting for coordinating and supply the listener
@@ -895,8 +950,9 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
             Metadata metadata
         ) {
             Index concreteIndex = concreteIndices.resolveIfAbsent(request);
-            final IndexMetadata indexMetadata = metadata.index(concreteIndex);
-            if (indexMetadata.isAppendOnlyIndex()) {
+            // Site 5. Same question as sites 4 and 9, third call site.
+            final IndexMetadata indexMetadata = metadata.indexOrResolved(concreteIndex);
+            if (indexMetadata != null && indexMetadata.isAppendOnlyIndex()) {
                 if ((request.opType() == DocWriteRequest.OpType.UPDATE || request.opType() == DocWriteRequest.OpType.DELETE)) {
                     ValidationException exception = new ValidationException();
                     exception.addValidationError(
@@ -961,7 +1017,14 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     return true;
                 }
             }
-            IndexMetadata indexMetadata = metadata.getIndexSafe(concreteIndex);
+            // Site 2, and the first one a write hits once auto-creation stops covering for it: getIndexSafe
+            // throws IndexNotFoundException for an index that exists and is simply not in cluster state.
+            // The descriptor carries the state, which is what this check wanted.
+            IndexMetadata indexMetadata = metadata.indexOrResolved(concreteIndex);
+            if (indexMetadata == null) {
+                addFailure(request, idx, new IndexNotFoundException(concreteIndex));
+                return true;
+            }
             if (indexMetadata.getState() == IndexMetadata.State.CLOSE) {
                 addFailure(request, idx, new IndexClosedException(concreteIndex));
                 return true;
@@ -1002,7 +1065,8 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
             return null;
         }
         if (indexRoutingTable.shards().size() == 1) {
-            return indexRoutingTable.shards().get(0).shardId();
+            ShardRouting primary = indexRoutingTable.iterator().next().primaryShard();
+            return primary != null ? primary.shardId() : null;
         }
 
         // Two-stage selection: first rank nodes by metrics, then randomly pick a shard on the best node
@@ -1031,7 +1095,7 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
         Map<String, List<ShardRouting>> node2Shards = new HashMap<>();
         for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable.shards().values()) {
             ShardRouting primary = shardRoutingTable.primaryShard();
-            if (primary.active()) {
+            if (primary != null && primary.active()) {
                 node2Shards.compute(primary.currentNodeId(), (nodeId, shardList) -> {
                     if (shardList == null) {
                         shardList = new ArrayList<>();

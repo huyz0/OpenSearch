@@ -36,6 +36,7 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.store.remote.filecache.FileCacheSettings;
 import org.opensearch.indices.ShardLimitValidator;
 import org.opensearch.node.NodeResourceUsageStats;
+import org.opensearch.storage.common.tiering.TieringRejectionException.RejectionReason;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.Before;
 
@@ -76,6 +77,37 @@ public class TieringServiceValidatorTests extends OpenSearchTestCase {
         setupClusterState(1, HOT.toString(), true);
         setupClusterInfo(1, 100, 50, 10L, 50, 20);
         TieringServiceValidator.validateCommon(clusterState, clusterInfo, testIndex, 2, 3, 99, WARM, HOT_TO_WARM, shardLimitValidator);
+    }
+
+    /**
+     * An index can be in metadata without a routing entry. Health validation built a
+     * {@code ClusterIndexHealth} from that routing table, and its constructor iterates it, so this used
+     * to throw a NullPointerException out of tiering validation. It must be rejected the way a RED
+     * index is: there are no shards to assess, so it is not healthy enough to tier.
+     */
+    public void testValidateCommon_FailsWhenIndexHasNoRoutingTable() {
+        setupClusterState(1, HOT.toString(), true);
+        setupClusterInfo(1, 100, 50, 10L, 50, 20);
+        // Same cluster state, routing emptied. Metadata still has the index.
+        clusterState = ClusterState.builder(clusterState).routingTable(RoutingTable.builder().build()).build();
+        assertTrue("the index must still be in metadata", clusterState.metadata().hasIndex(testIndex.getName()));
+        assertNull("...and absent from routing", clusterState.routingTable().index(testIndex.getName()));
+
+        TieringRejectionException e = expectThrows(
+            TieringRejectionException.class,
+            () -> TieringServiceValidator.validateCommon(
+                clusterState,
+                clusterInfo,
+                testIndex,
+                2,
+                3,
+                99,
+                WARM,
+                HOT_TO_WARM,
+                shardLimitValidator
+            )
+        );
+        assertEquals(RejectionReason.INDEX_RED_STATUS, e.getRejectionReason());
     }
 
     public void testValidateCommon_FailsWithNoWarmNodes() {

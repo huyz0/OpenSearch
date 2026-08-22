@@ -226,8 +226,12 @@ public class NodesStatsRequest extends BaseNodesRequest<NodesStatsRequest> {
         ADMISSION_CONTROL("admission_control"),
         CACHE_STATS("caches"),
         REMOTE_STORE("remote_store"),
-        PLUGIN_STATS("plugin_stats"),
-        NATIVE_MEMORY("native_memory");
+        /** @deprecated Use {@link #NATIVE_MEMORY} instead. */
+        @Deprecated
+        NATIVE_ALLOCATOR("native_allocator"),
+        NATIVE_MEMORY("native_memory"),
+        /** Restored alongside the generic plugin node-stats extension point -- see {@code Plugin#nodeStats()}. */
+        PLUGIN_STATS("plugin_stats");
 
         private String metricName;
 

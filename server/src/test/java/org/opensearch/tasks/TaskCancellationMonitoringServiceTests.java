@@ -15,7 +15,6 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.tasks.TaskId;
-import org.opensearch.plugin.stats.AnalyticsBackendTaskCancellationStats;
 import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.transport.MockTransportService;
@@ -34,7 +33,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
-import java.util.function.Supplier;
 
 import static org.opensearch.tasks.TaskCancellationMonitoringSettings.DURATION_MILLIS_SETTING;
 import static org.mockito.ArgumentMatchers.any;
@@ -312,7 +310,22 @@ public class TaskCancellationMonitoringServiceTests extends OpenSearchTestCase {
         verify(scheduleFuture, times(1)).cancel();
     }
 
-    public void testStatsIncludesNativeCountersWhenProviderAvailable() {
+    /**
+     * {@code stats()} carries only the core counters now.
+     *
+     * <p>Three tests used to live here —
+     * {@code testStatsIncludesNativeCountersWhenProviderAvailable},
+     * {@code testStatsReturnsNullNativeStatsWhenProviderIsNull} and
+     * {@code testStatsHandlesProviderExceptionGracefully} — exercising a fourth constructor argument
+     * that took a supplier of an analytics backend's post-cancellation counters. This service only
+     * forwarded those counters into {@code TaskCancellationStats}' XContent and never read them, so
+     * the argument, the field and the supplier are gone; the backend plugin contributes the same
+     * counters directly through {@code Plugin#nodeStats()}. Their replacements are
+     * {@code DataFusionPluginNodeStatsTests} (contribution + registration + wire round-trip,
+     * including the zeroed fallback when the native read fails) in the DataFusion plugin, and
+     * {@code AnalyticsBackendTaskCancellationStatsTests} (rendering) beside the type itself.
+     */
+    public void testStatsCarriesOnlyCoreCounters() {
         TaskCancellationMonitoringSettings settings = new TaskCancellationMonitoringSettings(
             Settings.EMPTY,
             new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
@@ -320,62 +333,11 @@ public class TaskCancellationMonitoringServiceTests extends OpenSearchTestCase {
         TaskManager mockTaskManager = mock(TaskManager.class);
         when(mockTaskManager.getCancellableTasks()).thenReturn(new java.util.HashMap<>());
 
-        AnalyticsBackendTaskCancellationStats expectedNativeStats = new AnalyticsBackendTaskCancellationStats(3, 100, 7, 500);
-        Supplier<AnalyticsBackendTaskCancellationStats> mockSupplier;
-        mockSupplier = () -> expectedNativeStats;
-
-        TaskCancellationMonitoringService service = new TaskCancellationMonitoringService(
-            threadPool,
-            mockTaskManager,
-            settings,
-            mockSupplier
-        );
-
-        TaskCancellationStats stats = service.stats();
-        assertNotNull(stats.getNativeStats());
-        assertEquals(3, stats.getNativeStats().getSearchTaskCurrent());
-        assertEquals(100, stats.getNativeStats().getSearchTaskTotal());
-        assertEquals(7, stats.getNativeStats().getSearchShardTaskCurrent());
-        assertEquals(500, stats.getNativeStats().getSearchShardTaskTotal());
-    }
-
-    public void testStatsReturnsNullNativeStatsWhenProviderIsNull() {
-        TaskCancellationMonitoringSettings settings = new TaskCancellationMonitoringSettings(
-            Settings.EMPTY,
-            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
-        );
-        TaskManager mockTaskManager = mock(TaskManager.class);
-        when(mockTaskManager.getCancellableTasks()).thenReturn(new java.util.HashMap<>());
-
-        // Use the 3-arg constructor which passes null for the provider
         TaskCancellationMonitoringService service = new TaskCancellationMonitoringService(threadPool, mockTaskManager, settings);
 
         TaskCancellationStats stats = service.stats();
-        assertNull(stats.getNativeStats());
-    }
-
-    public void testStatsHandlesProviderExceptionGracefully() {
-        TaskCancellationMonitoringSettings settings = new TaskCancellationMonitoringSettings(
-            Settings.EMPTY,
-            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
-        );
-        TaskManager mockTaskManager = mock(TaskManager.class);
-        when(mockTaskManager.getCancellableTasks()).thenReturn(new java.util.HashMap<>());
-
-        Supplier<AnalyticsBackendTaskCancellationStats> mockSupplier = () -> {
-            throw new RuntimeException("Native runtime not initialized");
-        };
-
-        TaskCancellationMonitoringService service = new TaskCancellationMonitoringService(
-            threadPool,
-            mockTaskManager,
-            settings,
-            mockSupplier
-        );
-
-        TaskCancellationStats stats = service.stats();
-        // Should handle exception gracefully and return null native stats
-        assertNull(stats.getNativeStats());
+        assertNotNull(stats);
+        assertEquals(new TaskCancellationStats(new SearchTaskCancellationStats(0, 0), new SearchShardTaskCancellationStats(0, 0)), stats);
     }
 
     @SuppressWarnings("unchecked")

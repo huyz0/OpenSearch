@@ -57,6 +57,22 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         new ChecksumBlobStoreFormat<>("cluster-metadata-manifest", METADATA_MANIFEST_NAME_FORMAT, ClusterMetadataManifest::fromXContentV3);
 
     /**
+     * Manifest format compatible with codec v4, i.e. before uploaded index entries could carry the
+     * index descriptor. Manifests already in a repository are read through this.
+     */
+    public static final ChecksumBlobStoreFormat<ClusterMetadataManifest> CLUSTER_METADATA_MANIFEST_FORMAT_V4 =
+        new ChecksumBlobStoreFormat<>("cluster-metadata-manifest", METADATA_MANIFEST_NAME_FORMAT, ClusterMetadataManifest::fromXContentV4);
+
+    /**
+     * Manifest format compatible with codec v5, i.e. before the index list could live behind manifest
+     * shard references. Manifests already in a repository at v5 are read through
+     * this rather than falling through to {@link #getClusterMetadataManifestBlobStoreFormat()}'s
+     * "unrecognised codec" branch -- the same reason {@link #CLUSTER_METADATA_MANIFEST_FORMAT_V4} exists.
+     */
+    public static final ChecksumBlobStoreFormat<ClusterMetadataManifest> CLUSTER_METADATA_MANIFEST_FORMAT_V5 =
+        new ChecksumBlobStoreFormat<>("cluster-metadata-manifest", METADATA_MANIFEST_NAME_FORMAT, ClusterMetadataManifest::fromXContentV5);
+
+    /**
      * Manifest format compatible with codec v2, where we introduced codec versions/global metadata.
      */
     public static final ChecksumBlobStoreFormat<ClusterMetadataManifest> CLUSTER_METADATA_MANIFEST_FORMAT = new ChecksumBlobStoreFormat<>(
@@ -155,6 +171,10 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         long codecVersion = getManifestCodecVersion();
         if (codecVersion == ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION) {
             return CLUSTER_METADATA_MANIFEST_FORMAT;
+        } else if (codecVersion == ClusterMetadataManifest.CODEC_V5) {
+            return CLUSTER_METADATA_MANIFEST_FORMAT_V5;
+        } else if (codecVersion == ClusterMetadataManifest.CODEC_V4) {
+            return CLUSTER_METADATA_MANIFEST_FORMAT_V4;
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V3) {
             return CLUSTER_METADATA_MANIFEST_FORMAT_V3;
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V2) {
@@ -164,7 +184,21 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V0) {
             return CLUSTER_METADATA_MANIFEST_FORMAT_V0;
         }
-        throw new IllegalArgumentException("Cluster metadata manifest file is corrupted, don't have valid codec version");
+        // The previous wording, "corrupted", asserted a single cause
+        // for two genuinely different ones this dispatch cannot tell apart -- a truncated/garbled codec
+        // field, or a codec this reading node's own build has simply never heard of (a fork-only codec
+        // at or above ClusterMetadataManifest#FORK_CODEC_BASE written by a newer or fork build, or an
+        // upstream codec from a release this node predates). Naming only the first possibility as fact
+        // is misleading for the second, which is not corruption at all. This exact-match dispatch
+        // failing cleanly, before deserialising anything, is the safety property either way (see
+        // FORK_CODEC_BASE's own javadoc) -- only the wording claimed more than the dispatch actually
+        // knows.
+        throw new IllegalArgumentException(
+            "Cluster metadata manifest file has codec version ["
+                + codecVersion
+                + "], which this node does not recognize -- either the file is corrupted, or it was "
+                + "written by a build (fork or newer upstream release) this node does not understand"
+        );
     }
 
 }

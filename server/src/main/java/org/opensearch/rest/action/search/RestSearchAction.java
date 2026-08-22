@@ -49,6 +49,7 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestCancellableNodeClient;
@@ -116,6 +117,17 @@ public class RestSearchAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "search_action";
+    }
+
+    /**
+     * A deployment with a restricted REST surface still needs {@code _search} to function at all,
+     * which is why this and a
+     * handful of other core APIs are annotated explicitly rather than left to default to
+     * {@code UNAVAILABLE} alongside everything else in core.
+     */
+    @Override
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 
     @Override

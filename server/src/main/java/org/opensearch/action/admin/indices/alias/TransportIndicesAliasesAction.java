@@ -44,6 +44,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlocks;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.AliasAction;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexAbstraction;
@@ -216,6 +217,16 @@ public class TransportIndicesAliasesAction extends TransportClusterManagerNodeAc
             if (validate) {
                 for (Index concreteIndex : concreteIndices.concreteIndices()) {
                     IndexAbstraction indexAbstraction = state.metadata().getIndicesLookup().get(concreteIndex.getName());
+                    // Deliberately still the raw AbsentIndexDescriptorSuppliers.supply(...) != null, not
+                    // Metadata#existsOrResolved: the two
+                    // differ for a tombstoned descriptor (supply() returns the tombstone record, non-null;
+                    // existsOrResolved's resolver chain filters it to false), and concreteIndex here already
+                    // passed IndexNameExpressionResolver's own existence filtering upstream -- left on the
+                    // exact original call rather than assumed equivalent without tracing every request shape
+                    // through that upstream filtering.
+                    if (indexAbstraction == null && AbsentIndexDescriptorSuppliers.supply(concreteIndex.getName()) != null) {
+                        continue;
+                    }
                     assert indexAbstraction != null : "invalid cluster metadata. index [" + concreteIndex.getName() + "] was not found";
                     if (indexAbstraction.getParentDataStream() != null) {
                         throw new IllegalArgumentException(

@@ -47,6 +47,8 @@ import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.action.support.ActiveShardsObserver;
 import org.opensearch.cluster.AckedClusterStateUpdateTask;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateTaskConfig;
+import org.opensearch.cluster.ClusterStateTaskExecutor;
 import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
 import org.opensearch.cluster.ack.CreateIndexClusterStateUpdateResponse;
 import org.opensearch.cluster.applicationtemplates.SystemTemplatesService;
@@ -76,6 +78,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.FeatureFlags;
+import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.set.Sets;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
@@ -184,6 +187,11 @@ public class MetadataCreateIndexService {
     private final Environment env;
     private final IndexScopedSettings indexScopedSettings;
     private final ActiveShardsObserver activeShardsObserver;
+    /**
+     * Kept as a field, unlike before, because a gated creation has to be admitted somewhere other than the
+     * cluster state update thread and this is what dispatches it there.
+     */
+    private final ThreadPool threadPool;
     private final NamedXContentRegistry xContentRegistry;
     private final SystemIndices systemIndices;
     private final ShardLimitValidator shardLimitValidator;
@@ -221,6 +229,7 @@ public class MetadataCreateIndexService {
         this.env = env;
         this.indexScopedSettings = indexScopedSettings;
         this.activeShardsObserver = new ActiveShardsObserver(clusterService, threadPool);
+        this.threadPool = threadPool;
         this.xContentRegistry = xContentRegistry;
         this.systemIndices = systemIndices;
         this.forbidPrivateIndexSettings = forbidPrivateIndexSettings;
@@ -354,10 +363,24 @@ public class MetadataCreateIndexService {
      * @param request the index creation cluster state update request
      * @param listener the listener on which to send the index creation cluster state update response
      */
+
     public void createIndex(
         final CreateIndexClusterStateUpdateRequest request,
         final ActionListener<CreateIndexClusterStateUpdateResponse> listener
     ) {
+        // The road, chosen from the name before any of the work that would once have been needed to choose
+        // it. Unregistered answers false, so an ordinary cluster never reaches the branch below.
+        //
+        // IndexCreationStrategyRegistry.claims(...) replaces the earlier
+        // DescriptorOnlyCreation.isRegistered() && namespace-membership check here -- the same predicate,
+        // discovered through the SPI instead of the static registry directly. createGatedIndex's own
+        // body, and everything downstream of this branch, is unchanged.
+        if (IndexCreationStrategyRegistry.claims(request.index(), request)) {
+            // Exact rather than admitted-on-a-guess: the name says which plane this belongs in, so there is
+            // no road to fall back from and no template to resolve first.
+            createGatedIndex(request, listener);
+            return;
+        }
         onlyCreateIndex(request, ActionListener.wrap(response -> {
             if (response.isAcknowledged()) {
                 activeShardsObserver.waitForActiveShards(
@@ -381,41 +404,317 @@ public class MetadataCreateIndexService {
         }, listener::onFailure));
     }
 
+    /**
+     * Whether this request will certainly be gated, and can therefore be executed on whatever node received
+     * it rather than on the elected cluster manager.
+     *
+     * <h4>What this used to have to do, and why it no longer does</h4>
+     *
+     * Gating followed the settings, so this could not know the answer. It resolved the request's templates to
+     * find out whether the gating setting would be contributed, resolved them a second time to find out
+     * whether a template's aliases would make the finished index unrepresentable, and still only reached
+     * <em>probably</em>: the real gate ran later, on finished metadata, and could decline. Declining meant
+     * falling back to a cluster state update task, which only the cluster manager can publish, so a request
+     * routed away on a maybe was a request whose failure mode was "the fallback cannot run". Hence the list
+     * of conditions that each answered "not certain" rather than "not gated".
+     *
+     * <p>The namespace removes the question. A name in it is gated or the creation fails -- {@code
+     * clusterStateCreateIndex} refuses it a cluster state entry, so there is no ordinary road to fall back
+     * onto and nothing that needs the cluster manager. The conditions that used to decline here are refused
+     * outright by {@link #validateClaimedNamespaceRequest}, and they are refused identically on every node,
+     * because the check reads the request rather than the cluster.
+     *
+     * <h4>The same-name race, which the namespace also settles</h4>
+     *
+     * A gated creation off the cluster manager sees a cluster state snapshot that can be a publication
+     * behind, which used to widen the window for an ordinary index of the same name. There is no such index
+     * now: no cluster state entry may bear a name in this namespace, so the only competitor for the name is
+     * another gated creation, and those are resolved by the descriptor store's register compare-and-swap
+     * rather than by whichever snapshot either node happened to hold.
+     */
+    public boolean certainlyGated(final CreateIndexClusterStateUpdateRequest request, final ClusterState state) {
+        // Same registry-to-SPI migration as createIndex()'s own top branch -- see that call site's comment.
+        return IndexCreationStrategyRegistry.claims(request.index(), request);
+    }
+
+    /**
+     * Creates a gated index without going through the cluster state update thread.
+     *
+     * <h4>Why this is a separate road rather than a branch inside the old one</h4>
+     *
+     * A gated creation writes nothing to cluster state: {@link #clusterStateCreateIndex} returns the state it
+     * was given, unchanged. It has done so since gating was turned on, and yet every such creation was still
+     * submitted as an URGENT cluster state update task, ran on the single {@code clusterManagerService#
+     * updateTask} thread, and did all of its validation there before reaching the branch that decided it had
+     * nothing to publish.
+     *
+     * <p>Profiling put a number on that. Twenty-seven percent of all on-CPU samples across a three node
+     * cluster were that one thread, about 3.9 ms of single-threaded CPU per creation, of which the largest
+     * part was {@code IndicesService.withTempIndexService} building a whole throwaway {@code IndexService} to
+     * validate a mapping that {@link IndexDescriptor#from} then discards. Batching does not help: the batch
+     * executor folds tasks one at a time, so it amortises the diff and the publication -- the costs gating had
+     * already reduced to zero -- and not the per-index validation, which is what remains. So N concurrent
+     * creations were N times 3.9 ms on one thread however they arrived.
+     *
+     * <p>Externalising the record without externalising the admission left the ceiling exactly where it was.
+     * This is the other half.
+     *
+     * <h4>What still has to be true</h4>
+     *
+     * Uniqueness does not come from here and never did. The store owns it: {@code op_type=create} is what
+     * makes a name unique, which is precisely what makes the cluster manager unnecessary for this. Two nodes
+     * admitting the same name concurrently is now possible and is resolved the way it was always designed to
+     * be -- one write wins, the loser's future completes false, and the client gets
+     * {@link ResourceAlreadyExistsException}.
+     *
+     * <p>What is needed from cluster state is a <em>read</em>: templates, scoped settings and the name
+     * collision check against ordinary indices. A snapshot is enough for that, and every node has one.
+     *
+     * <h4>When it turns out not to be gated</h4>
+     *
+     * The admission check reads request settings; the real gate reads finished metadata and can still decline,
+     * for instance because {@code DescriptorRepresentable} refuses an index with a filtered alias. That is
+     * detected here by the descriptor write never being handed over, and the request falls back to the
+     * ordinary path, which redoes the work correctly on the update thread. Paid for twice and correct, rather
+     * than fast and wrong.
+     */
+    private void createGatedIndex(
+        final CreateIndexClusterStateUpdateRequest request,
+        final ActionListener<CreateIndexClusterStateUpdateResponse> listener
+    ) {
+        // GENERIC rather than the calling thread, and that is not a preference. TransportCreateIndexAction
+        // declares Names.SAME, so clusterManagerOperation runs on a transport worker; doing the descriptor
+        // work there is the same defect this branch found in the read path, where a blocking descriptor read
+        // on node_t0's only transport worker stalled the connection until it was dropped.
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(new AbstractRunnable() {
+            @Override
+            public void onFailure(Exception e) {
+                listener.onFailure(e);
+            }
+
+            @Override
+            protected void doRun() {
+                final ClusterState snapshot = clusterService.state();
+                normalizeRequestSetting(request);
+                try {
+                    // The state this returns is discarded. For a gated index it is the snapshot unchanged,
+                    // and for one that turns out not to be gated it is a state built against a snapshot this
+                    // thread has no right to publish -- which is why that case falls back rather than
+                    // applying what it just computed.
+                    applyCreateIndexRequest(snapshot, request, false);
+                } catch (Exception e) {
+                    listener.onFailure(e);
+                    return;
+                }
+
+                final java.util.concurrent.CompletableFuture<Boolean> write = request.descriptorWrite();
+                if (write == null) {
+                    // Unreachable by construction, and kept because "unreachable by construction" is a claim
+                    // this branch has had to withdraw before. applyCreateIndexRequest above either gated the
+                    // index -- which is what hands a descriptor write over -- or refused it a cluster state
+                    // entry and threw, which the catch has already turned into a failure. Reaching here means
+                    // one of those two stopped being true, and the request must fail rather than take a road
+                    // that would claim this name in the other plane.
+                    listener.onFailure(
+                        new IllegalStateException(
+                            // Namespace description from the registered strategy, not core's
+                            // own words for one product's namespace.
+                            "index ["
+                                + request.index()
+                                + "] is in "
+                                + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                                + " and was neither gated nor refused, which "
+                                + "should not be possible; creating it anywhere now would claim the name in "
+                                + "both planes"
+                        )
+                    );
+                    return;
+                }
+
+                write.whenComplete((created, failure) -> {
+                    if (failure != null) {
+                        listener.onFailure(unwrapCompletion(failure));
+                    } else if (Boolean.TRUE.equals(created) == false) {
+                        // the store's uniqueness gate reporting a lost race, which is the same answer an ordinary
+                        // duplicate gets.
+                        listener.onFailure(new ResourceAlreadyExistsException(request.index()));
+                    } else {
+                        // Shards are reported acknowledged without consulting the observer, because for a
+                        // gated index the observer can only agree: ActiveShardCount#enoughShardsActive finds
+                        // no metadata entry for the name and treats that as nothing left to wait for. Asking
+                        // it would be a round trip to be told what is already known here.
+                        listener.onResponse(new CreateIndexClusterStateUpdateResponse(true, true));
+                    }
+                });
+            }
+        });
+    }
+
+    /** Strips the wrapper the future stage adds, so the client sees the cause rather than the plumbing. */
+    private static Exception unwrapCompletion(Throwable failure) {
+        Throwable cause = failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
+            ? failure.getCause()
+            : failure;
+        return cause instanceof Exception e ? e : new OpenSearchException(cause);
+    }
+
     private void onlyCreateIndex(
         final CreateIndexClusterStateUpdateRequest request,
         final ActionListener<ClusterStateUpdateResponse> listener
     ) {
         normalizeRequestSetting(request);
-        clusterService.submitStateUpdateTask(
+        final CreateIndexTask task = new CreateIndexTask(request, listener);
+        clusterService.submitStateUpdateTasks(
             "create-index [" + request.index() + "], cause [" + request.cause() + "]",
-            new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(Priority.URGENT, request, listener) {
-                @Override
-                protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
-                    return new ClusterStateUpdateResponse(acknowledged);
-                }
-
-                @Override
-                public ClusterManagerTaskThrottler.ThrottlingKey getClusterManagerThrottlingKey() {
-                    return createIndexTaskKey;
-                }
-
-                @Override
-                public ClusterState execute(ClusterState currentState) throws Exception {
-                    return applyCreateIndexRequest(currentState, request, false);
-                }
-
-                @Override
-                public void onFailure(String source, Exception e) {
-                    if (e instanceof ResourceAlreadyExistsException) {
-                        logger.trace(() -> new ParameterizedMessage("[{}] failed to create", request.index()), e);
-                    } else {
-                        logger.debug(() -> new ParameterizedMessage("[{}] failed to create", request.index()), e);
-                    }
-                    super.onFailure(source, e);
-                }
-            }
+            Map.of(task, task),
+            ClusterStateTaskConfig.build(Priority.URGENT, request.clusterManagerNodeTimeout()),
+            createIndexExecutor
         );
     }
+
+    /**
+     * One pending index creation. Serves as both the batch element and its own
+     * {@link org.opensearch.cluster.AckedClusterStateTaskListener}, so each request keeps its own
+     * acknowledgement timeout and listener even though many are applied in a single cluster-state
+     * update.
+     *
+     * <p>The batch path in {@link #createIndexExecutor} is what actually runs; {@code execute} is
+     * implemented to perform the same single-request transition so the task remains correct if it is
+     * ever submitted without that executor.
+     */
+    // Package-private rather than private so tests can drive a genuine multi-task batch; no test
+    // path otherwise submits more than one creation per executor invocation.
+    class CreateIndexTask extends AckedClusterStateUpdateTask<ClusterStateUpdateResponse> {
+        final CreateIndexClusterStateUpdateRequest request;
+
+        CreateIndexTask(CreateIndexClusterStateUpdateRequest request, ActionListener<ClusterStateUpdateResponse> listener) {
+            super(Priority.URGENT, request, listener);
+            this.request = request;
+        }
+
+        @Override
+        protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
+            return new ClusterStateUpdateResponse(acknowledged);
+        }
+
+        @Override
+        public ClusterManagerTaskThrottler.ThrottlingKey getClusterManagerThrottlingKey() {
+            return createIndexTaskKey;
+        }
+
+        @Override
+        public ClusterState execute(ClusterState currentState) throws Exception {
+            return applyCreateIndexRequest(currentState, request, false);
+        }
+
+        @Override
+        public void onFailure(String source, Exception e) {
+            if (e instanceof ResourceAlreadyExistsException) {
+                logger.trace(() -> new ParameterizedMessage("[{}] failed to create", request.index()), e);
+            } else {
+                logger.debug(() -> new ParameterizedMessage("[{}] failed to create", request.index()), e);
+            }
+            super.onFailure(source, e);
+        }
+
+        /**
+         * Answers the client, and for a gated index answers it only once the descriptor write has landed.
+         *
+         * <p>For an ordinary index the cluster state update is the creation, so acknowledging it is
+         * the truth and this defers to the parent unchanged. For a gated index the update deliberately
+         * changes nothing and therefore always succeeds, so acknowledging it says only that nothing
+         * happened. The descriptor write is the creation, and its outcome is what the client is owed.
+         *
+         * <p>The cluster state thread has already returned by the time this runs, which is what keeps the
+         * store-lookup self-deadlock closed: nothing waits on the thread that would have to route the write.
+         *
+         * <p>A completed-false future means a competing creation won the name, which is the store's uniqueness
+         * gate reporting rather than an error, so the client gets the same
+         * {@link ResourceAlreadyExistsException} an ordinary duplicate would produce.
+         */
+        @Override
+        public void onAllNodesAcked(@Nullable Exception e) {
+            java.util.concurrent.CompletableFuture<Boolean> write = request.descriptorWrite();
+            if (write == null) {
+                super.onAllNodesAcked(e);
+                return;
+            }
+            write.whenComplete((created, failure) -> {
+                if (failure != null) {
+                    onFailure("create-index [" + request.index() + "] descriptor write", unwrap(failure));
+                } else if (Boolean.TRUE.equals(created) == false) {
+                    onFailure(
+                        "create-index [" + request.index() + "] descriptor write",
+                        new ResourceAlreadyExistsException(request.index())
+                    );
+                } else {
+                    super.onAllNodesAcked(e);
+                }
+            });
+        }
+
+        /**
+         * The same deferral for the timeout path, since a gated creation that times out its acknowledgement
+         * has still not been told whether its descriptor landed.
+         */
+        @Override
+        public void onAckTimeout() {
+            java.util.concurrent.CompletableFuture<Boolean> write = request.descriptorWrite();
+            if (write == null) {
+                super.onAckTimeout();
+                return;
+            }
+            write.whenComplete((created, failure) -> {
+                if (failure != null) {
+                    onFailure("create-index [" + request.index() + "] descriptor write", unwrap(failure));
+                } else if (Boolean.TRUE.equals(created) == false) {
+                    onFailure(
+                        "create-index [" + request.index() + "] descriptor write",
+                        new ResourceAlreadyExistsException(request.index())
+                    );
+                } else {
+                    super.onAckTimeout();
+                }
+            });
+        }
+
+        /** Unwraps the CompletionException the future stage adds, so the client sees the real cause. */
+        private Exception unwrap(Throwable failure) {
+            Throwable cause = failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
+                ? failure.getCause()
+                : failure;
+            return cause instanceof Exception exception ? exception : new OpenSearchException(cause);
+        }
+    }
+
+    /**
+     * Applies a batch of index creations as a single cluster-state update.
+     *
+     * <p>Index creation previously submitted an {@code AckedClusterStateUpdateTask} that was its own
+     * executor, and {@code ClusterStateUpdateTask}'s executor implementation asserts a batch size of
+     * one -- so N concurrent creations cost N full cluster-state cycles, each with its own diff,
+     * publication and cluster-wide acknowledgement round. Provisioning many indices at once is
+     * exactly the workload that made this expensive.
+     *
+     * <p>{@link #applyCreateIndexRequest} both takes and returns a {@link ClusterState}, so the batch
+     * is a straightforward fold. Each task is recorded as an individual success or failure, so one
+     * bad request (a duplicate name, a validation error) fails only itself and the rest of the batch
+     * still applies -- matching the per-request behaviour callers had before.
+     */
+    final ClusterStateTaskExecutor<CreateIndexTask> createIndexExecutor = (currentState, tasks) -> {
+        final ClusterStateTaskExecutor.ClusterTasksResult.Builder<CreateIndexTask> builder = ClusterStateTaskExecutor.ClusterTasksResult
+            .builder();
+        ClusterState state = currentState;
+        for (CreateIndexTask task : tasks) {
+            try {
+                state = applyCreateIndexRequest(state, task.request, false);
+                builder.success(task);
+            } catch (Exception e) {
+                builder.failure(task, e);
+            }
+        }
+        return builder.build(state);
+    };
 
     private void normalizeRequestSetting(CreateIndexClusterStateUpdateRequest createIndexClusterStateRequest) {
         Settings.Builder updatedSettingsBuilder = Settings.builder();
@@ -529,8 +828,41 @@ public class MetadataCreateIndexService {
         final List<Map<String, Object>> mappings,
         final BiFunction<IndexService, Map<String, AliasMetadata>, List<AliasMetadata>> aliasSupplier,
         final List<String> templatesApplied,
+        final List<Map<String, AliasMetadata>> templateAliases,
         final BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer
     ) throws Exception {
+        if (needsNothingFromATemporaryIndexService(
+            request,
+            sourceMetadata,
+            temporaryIndexMeta,
+            mappings,
+            templatesApplied,
+            templateAliases
+        )) {
+            String needsAMapperService = whyTheseMappingsNeedAMapperService(mappings);
+            if (needsAMapperService == null) {
+                return applyCreateIndexWithoutTemporaryService(currentState, request, temporaryIndexMeta, mappings, metadataTransformer);
+            }
+            // Everything except the mapping is satisfied, so what is missing is a mapper service and not an
+            // index service. Measurement showed the difference: building the whole thing serialises every
+            // concurrent creation on the node behind one monitor and costs about 21.6 ms of service time
+            // each, which is seven times what the creation itself costs.
+            logger.debug("[{}] validating with a mapper service alone: {}", request.index(), needsAMapperService);
+            ClusterState withAMapperService = applyCreateIndexWithOnlyAMapperService(
+                currentState,
+                request,
+                temporaryIndexMeta,
+                mappings,
+                metadataTransformer,
+                silent
+            );
+            if (withAMapperService != null) {
+                return withAMapperService;
+            }
+            // A composite index, which is the one thing a mapper service cannot finish validating on its
+            // own. Nothing was published and the merge happened in a throwaway service, so falling through
+            // to the full path below repeats the work rather than continuing from half-done state.
+        }
         // create the index here (on the master) to validate it can be created, as well as adding the mapping
         return indicesService.<ClusterState, Exception>withTempIndexService(temporaryIndexMeta, indexService -> {
             Settings.Builder tmpSettingsBuilder = Settings.builder().put(temporaryIndexMeta.getSettings());
@@ -581,8 +913,395 @@ public class MetadataCreateIndexService {
             );
 
             indexService.getIndexEventListener().beforeIndexAddedToCluster(indexMetadata.getIndex(), indexMetadata.getSettings());
-            return clusterStateCreateIndex(currentState, request.blocks(), indexMetadata, allocationService::reroute, metadataTransformer);
+            return clusterStateCreateIndex(
+                currentState,
+                request.blocks(),
+                indexMetadata,
+                allocationService::reroute,
+                metadataTransformer,
+                request::descriptorWrite
+            );
         });
+    }
+
+    /**
+     * Whether a creation can be finished without building a throwaway {@link IndexService} to validate it.
+     *
+     * <h4>Why this exists</h4>
+     *
+     * {@link IndicesService#withTempIndexService} builds a complete {@code IndexService} -- settings,
+     * analysis, mappers, caches, the engine factory, every plugin's {@code onIndexModule} hook -- runs the
+     * validation against it, and throws it away. For an index with a mapping that is what pays for the
+     * mapping being checked before anything is published. For a gated index it buys nothing twice over:
+     * there is no mapping to check, and {@link IndexDescriptor#from} discards mappings anyway, so the object
+     * is built to produce a result that is then dropped.
+     *
+     * <p>It is also built under a lock. {@code IndicesService.createIndexService} is {@code synchronized},
+     * so every concurrent creation queues on one monitor on the cluster manager. Profiling 215,000 gated
+     * creations at concurrency 16 recorded 122,222 blocking events on that monitor totalling 1,453 seconds
+     * of blocked thread time in a 120 second run -- around 60% of all generic-thread time -- with a further
+     * 41.5% of on-CPU samples inside the same call tree. That is the ceiling, and it is spent on an object
+     * whose output is discarded.
+     *
+     * <p>The lock is not touched. It is inherited from upstream with no recorded rationale, and changing it
+     * would change concurrency for every index in every cluster, which is exactly what R1 forbids. Not
+     * entering it is a decision this path can make for itself.
+     *
+     * <h4>Every condition, and what would go wrong without it</h4>
+     *
+     * <ul>
+     *   <li><b>Admitted as gated.</b> Restricts the whole bypass to indices the descriptor gate already
+     *       claimed, so an ordinary cluster cannot reach it at all.</li>
+     *   <li><b>No mappings, from the request or a template.</b> Otherwise there is a mapping to merge and
+     *       validate, and skipping it would accept a malformed mapping silently.</li>
+     *   <li><b>No aliases, from the request or a template.</b> Alias resolution validates a filter against a
+     *       {@link org.opensearch.index.query.QueryShardContext} that only an {@code IndexService} can make.
+     *       <p>This condition is about aliases rather than about templates, and the difference is the whole
+     *       value of the change. The first version declined whenever any template applied at all, which is
+     *       simpler and made the bypass almost unreachable: a template that carries only settings needs
+     *       nothing validated, and settings-only templates are the normal way to configure a large tenant
+     *       population. It is also how the defect was found -- every internal cluster test runs under a
+     *       wildcard {@code random_index_template} that sets settings and nothing else, so the fast path
+     *       never once fired and the test asserting it fires is what said so.</li>
+     *   <li><b>No index sort.</b> {@code getIndexSortSupplier} resolves sort fields against the merged
+     *       mappings, which is a real check with no cheaper form.</li>
+     *   <li><b>No source metadata and no data stream.</b> Both add validation of their own further in.</li>
+     *   <li><b>No context.</b> {@code applyContext} can add mappings and settings after this point, so a
+     *       request carrying one has not finished being assembled.</li>
+     *   <li><b>Every registered {@link IndexCreationValidator} answers {@code requiresMappings() == false}.</b>
+     *       They still run below, against real {@link IndexSettings} and a null mapper service, which is the
+     *       contract that method exists to state. The default is true, so a plugin that says nothing keeps
+     *       the temporary service and its own behaviour unchanged.</li>
+     * </ul>
+     *
+     * <p>Fails closed: every condition has to hold, and anything unrecognised takes the ordinary path.
+     */
+    private boolean needsNothingFromATemporaryIndexService(
+        final CreateIndexClusterStateUpdateRequest request,
+        final IndexMetadata sourceMetadata,
+        final IndexMetadata temporaryIndexMeta,
+        final List<Map<String, Object>> mappings,
+        final List<String> templatesApplied,
+        final List<Map<String, AliasMetadata>> templateAliases
+    ) {
+        String declined = whyATemporaryIndexServiceIsStillNeeded(
+            request,
+            sourceMetadata,
+            temporaryIndexMeta,
+            mappings,
+            templatesApplied,
+            templateAliases
+        );
+        if (declined != null) {
+            logger.debug("[{}] keeping the temporary index service: {}", request.index(), declined);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * The first condition that fails, named, or null when none do.
+     *
+     * <p>Separated from the predicate so a decline has a reason rather than a boolean. Eight conditions
+     * reduced to one {@code false} is a thing that can be quietly wrong for months: the bypass would simply
+     * never fire, every measurement would look like the change did nothing, and there would be nothing to
+     * read. That is not hypothetical -- the first run of
+     * {@code GatedCreationWithoutTemporaryIndexServiceIT} failed exactly this way, and this method is what
+     * turned it from a guess into a lookup.
+     */
+    private String whyATemporaryIndexServiceIsStillNeeded(
+        final CreateIndexClusterStateUpdateRequest request,
+        final IndexMetadata sourceMetadata,
+        final IndexMetadata temporaryIndexMeta,
+        final List<Map<String, Object>> mappings,
+        final List<String> templatesApplied,
+        final List<Map<String, AliasMetadata>> templateAliases
+    ) {
+        // The same question the road above asked, asked the same way, and since the namespace it is a
+        // string comparison rather than a template resolution. It used to read the request's own settings,
+        // which missed a template-gated creation and made it pay for the throwaway IndexService this exists
+        // to avoid; then it read template-merged settings, which cost a resolution here and another there.
+        // A name costs neither and cannot disagree with the gate, because the gate reads the same name.
+        //
+        // Same registry-to-SPI migration as createIndex()'s own top branch, negated -- the old
+        // isRegistered()==false || not-in-namespace==false pair is De Morgan's equivalent of
+        // !claims(...).
+        if (IndexCreationStrategyRegistry.claims(request.index(), request) == false) {
+            // Description from the registered strategy, not core's own words for one product's.
+            return "the index is not in " + IndexCreationStrategyRegistry.describeClaimedNamespace();
+        }
+        if (sourceMetadata != null) {
+            return "it is being built from an existing index";
+        }
+        if (request.dataStreamName() != null) {
+            return "it backs the data stream [" + request.dataStreamName() + "]";
+        }
+        if (request.context() != null) {
+            return "it carries a context, which can still add mappings and settings";
+        }
+        if (request.aliases().isEmpty() == false) {
+            return "it has " + request.aliases().size() + " alias(es), whose filters need a query shard context";
+        }
+        // Every map, not the list. resolveAliases returns one entry per template, so a template that
+        // declares no aliases still contributes an empty map and leaves the outer list non-empty. Reading
+        // the outer list is the same predicate as "any template applied", which is exactly the condition
+        // this replaced -- so getting the level wrong here silently reverts the change while looking correct.
+        for (Map<String, AliasMetadata> fromOneTemplate : templateAliases) {
+            if (fromOneTemplate.isEmpty() == false) {
+                return "templates " + templatesApplied + " contribute alias(es) " + fromOneTemplate.keySet();
+            }
+        }
+        // The mapping is deliberately not one of these conditions. It used to be: a declared mapping meant a
+        // throwaway IndexService, and profiling measured what that cost once mapped indices became the common
+        // kind. What a mapping needs is a *mapper service*, which was later separated from an index service --
+        // see whyTheseMappingsNeedAMapperService and applyCreateIndexWithOnlyAMapperService. What the
+        // conditions here have in common is that each one needs something a mapper service does not have:
+        // a query shard context, a sort supplier, an existing index's metadata.
+        if (org.opensearch.index.IndexSortConfig.INDEX_SORT_FIELD_SETTING.exists(temporaryIndexMeta.getSettings())) {
+            return "it configures an index sort, which resolves against the merged mappings";
+        }
+        for (IndexCreationValidator validator : indexCreationValidators) {
+            if (validator.requiresMappings()) {
+                return "the validator " + validator.getClass().getName() + " reads the mapper service";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The same creation, with the temporary {@link IndexService} not built.
+     *
+     * <p>Reachable only when {@link #needsNothingFromATemporaryIndexService} holds, which is what makes the
+     * omissions here safe rather than merely cheap. There are no mappings so the document mapper is null and
+     * {@link #buildIndexMetadata} puts none; there are no aliases so the list is empty; the settings are
+     * {@code temporaryIndexMeta}'s unchanged, because the only thing that rewrites them at this point is
+     * {@code applyContext}, and a request carrying a context does not get here.
+     *
+     * <p><b>One thing is genuinely not done, and it is worth naming rather than leaving to be discovered.</b>
+     * {@code IndexEventListener.beforeIndexAddedToCluster} is not called, because the listener chain belongs
+     * to the {@code IndexService} that is no longer built. Nothing in this repository implements it -- the
+     * interface's own method is an empty default and {@code CompositeIndexEventListener} only forwards -- so
+     * this changes no behaviour here. A third-party plugin that implements it would not see the hook for a
+     * gated creation. That is the one behavioural difference on this path, and it is confined to indices the
+     * descriptor gate has already claimed.
+     */
+    /**
+     * Why this mapping cannot be validated without a mapper service, or null when it can.
+     *
+     * <p>Answers only for the shape it can answer completely: every top-level property whose definition is
+     * exactly a declared type, and every one of those types registered on this node. That is not a subset
+     * of validation, it is all of it for such a field -- a definition with one key has nothing else that
+     * could be wrong.
+     *
+     * <p>Everything else is refused rather than half-checked. A parameter needs its own validation (an
+     * analyzer has to resolve against the index's analysis configuration, a date format has to parse), an
+     * object field needs its sub-properties walked, and a shorthand needs interpreting. Accepting any of
+     * those here on the strength of the type name would be a mapping accepted and not really checked,
+     * which is the failure this area has produced repeatedly.
+     */
+    private String whyThisMappingNeedsAMapperService(Map<String, Object> mapping) {
+        Object properties = propertiesOf(mapping).get("properties");
+        if (properties instanceof Map == false) {
+            // No properties to validate. Metadata fields and mapping-level settings are not covered by the
+            // registry check, so anything other than a plain properties object goes the long way.
+            return mapping.isEmpty() ? null : "its mapping declares more than field properties";
+        }
+        for (Map.Entry<?, ?> property : ((Map<?, ?>) properties).entrySet()) {
+            Object definition = property.getValue();
+            if (definition instanceof Map == false) {
+                return "field [" + property.getKey() + "] uses a shorthand definition, which needs interpreting";
+            }
+            Map<?, ?> asMap = (Map<?, ?>) definition;
+            Object type = asMap.get("type");
+            if (type == null || asMap.size() != 1) {
+                return "field [" + property.getKey() + "] declares more than a type, which needs a mapper service to validate";
+            }
+            if (indicesService.hasFieldTypeParser(String.valueOf(type)) == false) {
+                // Not a refusal of the fast path but of the request. Left to the ordinary path so the
+                // caller gets the same error it has always got, from the code that owns that message.
+                return "field [" + property.getKey() + "] declares unknown type [" + type + "]";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Why these mappings cannot be validated from the mapper registry alone, or null when they can.
+     *
+     * <p>Two sources of mapping -- a template's and the request's -- used to send a creation down the full
+     * path, on the reasoning that their precedence is what the index service implements. It is not: the
+     * merge is {@code mapperService.merge} once per mapping in order, which is a mapper service's job and
+     * nothing an {@code IndexService} contributes to. So more than one mapping needs a mapper service,
+     * which is what this answers, rather than needing an index service, which is what it used to be read as.
+     */
+    private String whyTheseMappingsNeedAMapperService(List<Map<String, Object>> mappings) {
+        List<Map<String, Object>> declared = mappings.stream().filter(mapping -> mapping.isEmpty() == false).collect(toList());
+        if (declared.isEmpty()) {
+            return null;
+        }
+        if (declared.size() > 1) {
+            return "it has " + declared.size() + " mappings to merge in order";
+        }
+        return whyThisMappingNeedsAMapperService(declared.get(0));
+    }
+
+    /**
+     * The same creation, validated against a mapper service rather than a whole {@link IndexService}.
+     *
+     * <p>Reachable only when every condition in {@link #whyATemporaryIndexServiceIsStillNeeded} holds and
+     * the mapping is the one thing left, so what this omits is what those conditions already established is
+     * not needed: no aliases to resolve against a query shard context, no index sort to build, no source
+     * index, no context rewriting the settings, and no validator that reads mappings beyond the ones run
+     * here. {@code beforeIndexAddedToCluster} is not called, for the same reason and with the same
+     * consequence the fast path documents: the listener chain belongs to the index service that is not
+     * built, nothing in this repository implements the hook, and a third-party plugin that does would not
+     * see it for a gated creation.
+     *
+     * @return the new cluster state, or null when the merged mapping turns out to declare a composite index
+     *         -- the one thing whose validation needs settings a mapper service does not carry, and rare
+     *         enough to be worth paying the full path for rather than reimplementing here.
+     */
+    private ClusterState applyCreateIndexWithOnlyAMapperService(
+        final ClusterState currentState,
+        final CreateIndexClusterStateUpdateRequest request,
+        final IndexMetadata temporaryIndexMeta,
+        final List<Map<String, Object>> mappings,
+        final BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer,
+        final boolean silent
+    ) throws Exception {
+        try (MapperService mapperService = indicesService.createMapperServiceForValidation(temporaryIndexMeta)) {
+            for (Map<String, Object> mapping : mappings) {
+                if (mapping.isEmpty() == false) {
+                    // In order and with the same merge reason as the full path, because this is the whole of
+                    // what that path did with the mappings.
+                    mapperService.merge(MapperService.SINGLE_MAPPING_NAME, mapping, MergeReason.INDEX_TEMPLATE);
+                }
+            }
+            if (mapperService.isCompositeIndexPresent()) {
+                return null;
+            }
+            for (IndexCreationValidator validator : indexCreationValidators) {
+                // A real mapper service, unlike the fast path's null one, so a validator that reads mappings
+                // is no longer a reason to decline this road -- it is served here exactly as it would have
+                // been through the index service.
+                validator.validate(mapperService, mapperService.getIndexSettings());
+            }
+
+            IndexMetadata indexMetadata = buildIndexMetadata(
+                request.index(),
+                List.of(),
+                mapperService::documentMapper,
+                temporaryIndexMeta.getSettings(),
+                temporaryIndexMeta.getRoutingNumShards(),
+                null,
+                temporaryIndexMeta.isSystem(),
+                temporaryIndexMeta.getCustomData(),
+                temporaryIndexMeta.context()
+            );
+
+            logger.log(
+                silent ? Level.DEBUG : Level.INFO,
+                "[{}] creating index, cause [{}], shards [{}]/[{}]",
+                request.index(),
+                request.cause(),
+                indexMetadata.getNumberOfShards(),
+                indexMetadata.getNumberOfReplicas()
+            );
+
+            return clusterStateCreateIndex(
+                currentState,
+                request.blocks(),
+                indexMetadata,
+                allocationService::reroute,
+                metadataTransformer,
+                request::descriptorWrite
+            );
+        }
+    }
+
+    /**
+     * A parsed mapping with its single type key removed, if it has one.
+     *
+     * <p>The type key is excluded by name rather than by position, because "the only key" is ambiguous: a
+     * mapping written as {@code {"properties": {...}}} is also a single-entry map, and unwrapping it yields
+     * the field list where the caller expects the mapping body. That mistake does not fail loudly -- it
+     * reads as a mapping with no properties, so the fast path simply declines every request and the change
+     * appears to do nothing.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> propertiesOf(Map<String, Object> mapping) {
+        if (mapping.size() == 1) {
+            Map.Entry<String, Object> only = mapping.entrySet().iterator().next();
+            if (only.getValue() instanceof Map && "properties".equals(only.getKey()) == false) {
+                return (Map<String, Object>) only.getValue();
+            }
+        }
+        return mapping;
+    }
+
+    private ClusterState applyCreateIndexWithoutTemporaryService(
+        final ClusterState currentState,
+        final CreateIndexClusterStateUpdateRequest request,
+        final IndexMetadata temporaryIndexMeta,
+        final List<Map<String, Object>> mappings,
+        final BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer
+    ) {
+        if (indexCreationValidators.isEmpty() == false) {
+            // Real settings, so a validator sees exactly what it would have seen through the index service.
+            // Null mapper service, which every validator reaching this point has declared it does not read.
+            IndexSettings indexSettings = new IndexSettings(temporaryIndexMeta, settings, indexScopedSettings);
+            for (IndexCreationValidator validator : indexCreationValidators) {
+                validator.validate(null, indexSettings);
+            }
+        }
+
+        IndexMetadata indexMetadata = buildIndexMetadata(
+            request.index(),
+            List.of(),
+            () -> null,
+            temporaryIndexMeta.getSettings(),
+            temporaryIndexMeta.getRoutingNumShards(),
+            null,
+            temporaryIndexMeta.isSystem(),
+            temporaryIndexMeta.getCustomData(),
+            temporaryIndexMeta.context()
+        );
+
+        // The declared mapping, put on the metadata by hand because there is no document mapper to take it
+        // from -- buildIndexMetadata is given () -> null above, since building one is the cost this path
+        // exists to avoid.
+        //
+        // This is not a nicety. Everything downstream reads an index's declared fields off IndexMetadata:
+        // DescriptorRepresentable decides gating from it, and clusterStateCreateIndex writes them to the
+        // mapping store from it. Without this the fast path would create a gated index whose mapping was
+        // parsed, validated against the registry, and then present nowhere -- acknowledged, with the fields
+        // silently absent. That is the silent field loss earlier fixes were spent removing, and a performance change
+        // is exactly the kind of change that reintroduces it quietly.
+        for (Map<String, Object> mapping : mappings) {
+            if (mapping.isEmpty() == false) {
+                indexMetadata = IndexMetadata.builder(indexMetadata)
+                    .putMapping(new MappingMetadata(MapperService.SINGLE_MAPPING_NAME, mapping))
+                    .build();
+                break;
+            }
+        }
+
+        logger.debug(
+            "[{}] creating index off the temporary index service path, cause [{}], shards [{}]/[{}]",
+            request.index(),
+            request.cause(),
+            indexMetadata.getNumberOfShards(),
+            indexMetadata.getNumberOfReplicas()
+        );
+
+        return clusterStateCreateIndex(
+            currentState,
+            request.blocks(),
+            indexMetadata,
+            allocationService::reroute,
+            metadataTransformer,
+            request::descriptorWrite
+        );
     }
 
     Template applyContext(
@@ -782,6 +1501,7 @@ public class MetadataCreateIndexService {
                 indexService.newQueryShardContext(0, null, () -> 0L, null)
             ),
             templates.stream().map(IndexTemplateMetadata::getName).collect(toList()),
+            MetadataIndexTemplateService.resolveAliases(templates),
             metadataTransformer
         );
     }
@@ -850,6 +1570,7 @@ public class MetadataCreateIndexService {
                 indexService.newQueryShardContext(0, null, () -> 0L, null)
             ),
             Collections.singletonList(templateName),
+            MetadataIndexTemplateService.resolveAliases(currentState.metadata(), templateName),
             metadataTransformer
         );
     }
@@ -934,6 +1655,7 @@ public class MetadataCreateIndexService {
                 // shard id and the current timestamp
                 indexService.newQueryShardContext(0, null, () -> 0L, null)
             ),
+            List.of(),
             List.of(),
             metadataTransformer
         );
@@ -1213,7 +1935,7 @@ public class MetadataCreateIndexService {
         }
         if (INDEX_NUMBER_OF_REPLICAS_SETTING.exists(indexSettingsBuilder) == false
             || indexSettingsBuilder.get(SETTING_NUMBER_OF_REPLICAS) == null) {
-            indexSettingsBuilder.put(SETTING_NUMBER_OF_REPLICAS, DEFAULT_REPLICA_COUNT_SETTING.get(currentState.metadata().settings()));
+            indexSettingsBuilder.put(SETTING_NUMBER_OF_REPLICAS, clusterSettings.get(DEFAULT_REPLICA_COUNT_SETTING));
         }
         if (settings.get(SETTING_AUTO_EXPAND_REPLICAS) != null && indexSettingsBuilder.get(SETTING_AUTO_EXPAND_REPLICAS) == null) {
             indexSettingsBuilder.put(SETTING_AUTO_EXPAND_REPLICAS, settings.get(SETTING_AUTO_EXPAND_REPLICAS));
@@ -1580,6 +2302,50 @@ public class MetadataCreateIndexService {
      * Creates the index into the cluster state applying the provided blocks. The final cluster state will contain an updated routing
      * table based on the live nodes.
      */
+    /**
+     * Creates an ordinary index, one whose creation is the cluster state update itself.
+     *
+     * <p>Deliberately refuses a gated index rather than dropping its descriptor write on the floor. A gated
+     * creation's write is the creation, so somebody has to await it, and a sink that silently discarded it
+     * would reinstate exactly the measured defect: an acknowledgement that means nothing and a
+     * name with no uniqueness. Callers that can create a gated index must use the six argument form and
+     * carry the future to whoever answers the client.
+     */
+    /**
+     * Fails a creation that reached the gated branch on the state update thread, instead of blocking there.
+     *
+     * <p>The known way that used to happen is closed -- admission now resolves templates, so an index gated only
+     * by one is admitted off-thread like any other -- and this is the tripwire for the next way. Admission is
+     * an approximation by design, and the property it protects is not one to hold by care: a blocking store
+     * write here occupies the thread that serialises every cluster state update, and the write can submit an
+     * update of its own and then wait for the thread it is standing on.
+     *
+     * <p><b>Refusing rather than asserting, because assertions are off in production.</b> A rejected creation
+     * is visible, attributable and retryable. A stalled cluster manager presents as everything else being
+     * broken, which is how the same defect was found the last two times.
+     */
+    private static void refuseToWriteAMappingFromTheClusterStateThread(IndexMetadata indexMetadata) {
+        // ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread() replaces
+        // AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere() here -- the exact same thread-name list,
+        // generalized into one shared home specifically so this kind of duplicate list (this call site's
+        // own comment used to warn about exactly that risk) would have one place to live instead of two
+        // that could drift.
+        if (org.opensearch.cluster.ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
+            String thread = Thread.currentThread().getName();
+            throw new IllegalStateException(
+                "index ["
+                    + indexMetadata.getIndex().getName()
+                    + "] is gated and declares a mapping, but reached the write on ["
+                    + thread
+                    + "], where the store's blocking write would occupy the thread that serialises cluster "
+                    + "state updates. Either admission failed to send this creation off that thread, or it "
+                    + "arrived through a door that has no admission check: auto-creation, rollover and data "
+                    + "stream creation all reach this from inside a cluster state task. Refusing costs this "
+                    + "request; blocking would cost the cluster."
+            );
+        }
+    }
+
     static ClusterState clusterStateCreateIndex(
         ClusterState currentState,
         Set<ClusterBlock> clusterBlocks,
@@ -1587,22 +2353,196 @@ public class MetadataCreateIndexService {
         BiFunction<ClusterState, String, ClusterState> rerouteRoutingTable,
         BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer
     ) {
+        return clusterStateCreateIndex(currentState, clusterBlocks, indexMetadata, rerouteRoutingTable, metadataTransformer, write -> {
+            throw new IllegalStateException(
+                "index ["
+                    + indexMetadata.getIndex().getName()
+                    + "] is gated, so its descriptor write is its creation and must be awaited. Use the "
+                    + "clusterStateCreateIndex overload that accepts a descriptor write sink."
+            );
+        });
+    }
+
+    static ClusterState clusterStateCreateIndex(
+        ClusterState currentState,
+        Set<ClusterBlock> clusterBlocks,
+        IndexMetadata indexMetadata,
+        BiFunction<ClusterState, String, ClusterState> rerouteRoutingTable,
+        BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer,
+        java.util.function.Consumer<java.util.concurrent.CompletableFuture<Boolean>> descriptorWrite
+    ) {
+        // When the gate is open for this index, creation records a descriptor and
+        // writes nothing to cluster state: no metadata entry, no routing entry, no publication, and none
+        // of the O(total indices) rebuild that was measured at 69 ms per change at fifty thousand
+        // indices. The descriptor write is the creation, and it is the thing that must succeed.
+        //
+        // Failure semantics invert from the dual-write era's here. During dual write a lost descriptor
+        // cost a comparison; now it costs the index, so publish is required to report that someone was
+        // listening rather than being allowed to no-op.
+        //
+        // IndexCreationStrategyRegistry.skipsClusterState(...) replaces
+        // DescriptorOnlyCreation.skipsClusterState(...) directly here --
+        // the same predicate, discovered through the SPI instead of the static registry. Deliberately not
+        // IndexCreationStrategyRegistry.claims(...): that answers a different, broader question (is this
+        // name/request admitted to the strategy's plane at all), while this branch needs the strategy's own
+        // narrower, post-build gate (placement ownership, descriptor representability -- see
+        // IndexCreationStrategy#skipsClusterState's own javadoc for why the two can disagree). Everything
+        // below this line -- the nine lines whose ordering and refusal guarantees the tests below lean
+        // on -- is unchanged.
+        if (IndexCreationStrategyRegistry.skipsClusterState(indexMetadata)) {
+            // The descriptor write is the creation, so it goes through createGated rather than
+            // publish: op_type=create makes it atomic against a competing creation (a test measured eight
+            // concurrent creations of one name all acknowledged without it), and the future carries the
+            // outcome so the acknowledgement can wait for it (a test measured an acknowledged creation whose
+            // write could not possibly have landed).
+            //
+            // The cluster state thread does not wait here. It hands the future to the task, which defers
+            // its response until the write completes, which is what keeps the store-lookup self-deadlock
+            // closed: the thread that would have to supply a cluster state for this write to route is this one.
+            // The mapping first, because the descriptor is the acknowledgement. A descriptor carries a
+            // mapping generation and not a mapping, so declared fields have to reach MappingGenerationStore
+            // or they are lost -- which is what DescriptorRepresentable had to refuse the whole index for.
+            // Writing them here is what lets it stop refusing.
+            //
+            // Ordered before the descriptor write deliberately. If this fails, the creation fails and no
+            // descriptor exists, so neither does the index. The reverse order would leave a name that
+            // resolves to an index whose declared fields are missing, which is the same silent loss wearing
+            // a different shape.
+            //
+            // Blocking here is safe only where admission ran, and the template-gating fix is the record of
+            // what that sentence used to hide. It said every path reaching this branch came through createGatedIndex on
+            // GENERIC, because the admission check reads the gating setting from the request. Two things
+            // were wrong with that. An index gated by a template says nothing in its request, so it took
+            // the ordinary road and reached this line on the state update thread; admission is now given
+            // template-merged settings, which closes that one. And createIndex is not the only door:
+            // auto-creation, rollover and data stream creation call applyCreateIndexRequest from inside a
+            // cluster state task, where no admission check runs and none can. The refusal below is what
+            // stands in for the argument, because the argument has been wrong twice.
+            //
+            // Initial creation-time mappings are carried directly in IndexDescriptor.from(indexMetadata)
+            // and written atomically to object storage by IndexDescriptorPublisher.createGated(indexMetadata),
+            // avoiding system index round-trips entirely.
+            //
+            // The refusal itself: this comment used to describe it without the call actually being here,
+            // a defect a later audit found and closed. A creation reaching this branch from
+            // createGatedIndex's GENERIC executor is fine; one reaching it from inside a cluster state task
+            // (auto-creation, rollover, data stream creation) is exactly the self-deadlock -- a blocking
+            // store write standing on the thread that would have to serve it -- this method exists to
+            // refuse instead of hitting.
+            refuseToWriteAMappingFromTheClusterStateThread(indexMetadata);
+            java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
+            if (write == null) {
+                throw new IllegalStateException(
+                    "index ["
+                        + indexMetadata.getIndex().getName()
+                        + "] is configured to skip its cluster state entry, but no descriptor creator is "
+                        + "installed, so creating it would leave no record of it anywhere"
+                );
+            }
+            descriptorWrite.accept(write);
+            if (metadataTransformer != null) {
+                Metadata.Builder builder = Metadata.builder(currentState.metadata());
+                metadataTransformer.accept(builder, indexMetadata);
+                return ClusterState.builder(currentState).metadata(builder.build()).build();
+            }
+            return currentState;
+        }
+
+        String indexName = indexMetadata.getIndex().getName();
+
+        // The other half of closing the two-plane name collision, and the half that has to live here.
+        //
+        // DescriptorGate#gatable refuses to gate a name outside the claimed namespace, so no name out
+        // there can be held by a descriptor alone. This refuses a name inside it a cluster state entry, so
+        // no name in here can be held by cluster state. Each name has exactly one authority. Neither
+        // authority has to consult the other -- which is what made the collision unfixable where it was
+        // found, because the consulting would have to be a blocking descriptor read on this very thread --
+        // the measured self-deadlock. A string comparison is total, needs no store, and is safe anywhere.
+        //
+        // A refusal rather than the fallback that used to be here. An admitted creation the gate declines
+        // once had an ordinary road to take, and taking it is exactly how an ordinary index came to hold a
+        // name a live descriptor already held. In the namespace there is no such road: an index that cannot
+        // be gated cannot exist under this name, and the caller is told which feature stopped it rather than
+        // being handed a differently-shaped index than it asked for.
+        //
+        // IndexCreationStrategyRegistry.claims(indexName) replaces the earlier
+        // DescriptorOnlyCreation.isRegistered() && namespace-membership pair --
+        // the same predicate (see IndexCreationStrategy#claims(String)'s own javadoc for why the name-only
+        // overload, not the request-taking one, is what belongs here: this branch runs after the index is
+        // already built, with no CreateIndexClusterStateUpdateRequest in scope). The error text's namespace
+        // description is now sourced from the registered strategy too, instead of interpolating
+        // DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX directly -- the message-text half of the same
+        // core-shouldn't-name-the-plugin's-vocabulary problem the boolean check itself already had.
+        if (IndexCreationStrategyRegistry.claims(indexName)) {
+            String reason = DescriptorRepresentable.whyNotRepresentable(indexMetadata);
+            throw new IllegalArgumentException(
+                "index ["
+                    + indexName
+                    + "] is in "
+                    + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                    + " and so may not have a cluster state entry, but it could not be gated"
+                    + (reason == null ? "" : ": " + reason)
+                    + ". Create it under a name outside that namespace, or drop what makes it "
+                    + "unrepresentable as a descriptor."
+            );
+        }
+
         Metadata.Builder builder = Metadata.builder(currentState.metadata()).put(indexMetadata, false);
         if (metadataTransformer != null) {
             metadataTransformer.accept(builder, indexMetadata);
         }
         Metadata newMetadata = builder.build();
 
-        String indexName = indexMetadata.getIndex().getName();
         ClusterBlocks.Builder blocks = createClusterBlocksBuilder(currentState, indexName, clusterBlocks);
         blocks.updateBlocks(indexMetadata);
 
         ClusterState updatedState = ClusterState.builder(currentState).blocks(blocks).metadata(newMetadata).build();
 
-        RoutingTable.Builder routingTableBuilder = RoutingTable.builder(updatedState.routingTable())
-            .addAsNew(updatedState.metadata().index(indexName));
+        // An index whose placement is computed publishes no routing entry: every node derives the same
+        // answer from the node list, so publishing it would be state that says nothing new and has to be
+        // diffed on every cluster state change. Skipping publication is what makes the supplier
+        // reachable at all -- with an entry published, it would never be consulted.
+        RoutingTable.Builder routingTableBuilder = RoutingTable.builder(updatedState.routingTable());
+        // updatedState.routingTable().shouldPublishRouting(...) replaces the earlier static-registry call
+        // AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate, discovered
+        // through the resolver attached to this state's own routing table.
+        if (updatedState.routingTable().shouldPublishRouting(updatedState.metadata().index(indexName))) {
+            routingTableBuilder.addAsNew(updatedState.metadata().index(indexName));
+        } else {
+            // Creation is the assignment, so creation sets the primary term. A term is normally bumped by
+            // the cluster manager when it assigns a primary, and for an index the allocator never touches
+            // it would stay at zero. Zero is not a legal term: activatePrimaryMode fails adding the peer
+            // recovery retention lease with "primary term must be positive but was [0]", and the shard is
+            // failed and removed after recovery. Setting it here rather than on the node keeps every later
+            // reader agreeing, which the node-local version did not: the shard is constructed from
+            // metadata, so a node that substituted its own term tripped "term is only increased as part of
+            // primary promotion" instead.
+            updatedState = ClusterState.builder(updatedState)
+                .metadata(
+                    Metadata.builder(updatedState.metadata()).put(withInitialPrimaryTerms(updatedState.metadata().index(indexName)), true)
+                )
+                .build();
+        }
         updatedState = ClusterState.builder(updatedState).routingTable(routingTableBuilder.build()).build();
         return rerouteRoutingTable.apply(updatedState, "index [" + indexName + "] created");
+    }
+
+    /**
+     * The same index metadata with every shard's primary term at least one.
+     *
+     * <p>Only for indices whose routing is not published. A term orders primary failovers, and under
+     * computed placement the lease in {@code ShardHead} is the authority on who may write, so one is a
+     * legal starting value rather than a meaningful one. Failover, when it arrives, has to take its term
+     * from the lease.
+     */
+    private static IndexMetadata withInitialPrimaryTerms(IndexMetadata indexMetadata) {
+        IndexMetadata.Builder builder = IndexMetadata.builder(indexMetadata);
+        for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
+            if (indexMetadata.primaryTerm(shardId) == 0) {
+                builder.primaryTerm(shardId, 1);
+            }
+        }
+        return builder.build();
     }
 
     static IndexMetadata buildIndexMetadata(
@@ -1738,9 +2678,63 @@ public class MetadataCreateIndexService {
 
     private void validate(CreateIndexClusterStateUpdateRequest request, ClusterState state) {
         validateIndexName(request.index(), state);
+        validateClaimedNamespaceRequest(request);
         validateIndexSettings(request.index(), request.settings(), forbidPrivateIndexSettings);
         validateContext(request);
         validateIngestionSourceSettings(request.settings(), state);
+    }
+
+    /**
+     * Refuses a creation in the claimed namespace that asks for something a gated index cannot be.
+     *
+     * <p>The name decides the plane, so these can no longer be answered by quietly making the index an
+     * ordinary one -- that is the ambiguity the namespace exists to remove, and it is how a name came to be
+     * claimable in both planes. Each of these is a condition {@code DescriptorRepresentable} refuses, said
+     * at the point the client can still do something about it.
+     *
+     * <p>Only what the request itself carries. A template that contributes an alias to a name in this
+     * namespace is not caught here, and is still decided the old way -- the gate declines and the index
+     * keeps a cluster state entry. That is a hole in the contract rather than a correctness one (nothing is
+     * written to two places), and closing it means resolving templates during validation, which is a larger
+     * change than this.
+     */
+    private void validateClaimedNamespaceRequest(CreateIndexClusterStateUpdateRequest request) {
+        // Same registry-to-SPI migration as createIndex()'s own top branch, negated -- see
+        // whyATemporaryIndexServiceIsStillNeeded's comment for the De Morgan's equivalence.
+        // Deliberately not the larger change once sketched for this method (deleting it entirely in favor
+        // of a plugin-owned IndexCreationValidator) -- that changes what gets validated and where; this
+        // changes only how the same predicate is discovered.
+        //
+        // The error text below also sources its namespace description from the registered
+        // strategy (IndexCreationStrategyRegistry.describeClaimedNamespace()) instead of interpolating
+        // the plugin's own name-prefix constant directly -- the same message-text fix applied at
+        // clusterStateCreateIndex's own two-plane-collision refusal, so core stops naming this plugin's
+        // vocabulary in both places that do, not just the boolean check already moved to the SPI.
+        if (IndexCreationStrategyRegistry.claims(request.index(), request) == false) {
+            return;
+        }
+        final String unsupported;
+        if (request.aliases().isEmpty() == false) {
+            unsupported = "aliases " + request.aliases().stream().map(alias -> alias.name()).collect(toList());
+        } else if (request.context() != null) {
+            unsupported = "a context";
+        } else if (request.dataStreamName() != null) {
+            unsupported = "membership of data stream [" + request.dataStreamName() + "]";
+        } else if (request.recoverFrom() != null) {
+            unsupported = "being built from [" + request.recoverFrom().getName() + "]";
+        } else {
+            return;
+        }
+        throw new IllegalArgumentException(
+            "index ["
+                + request.index()
+                + "] is in "
+                + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                + ", whose indices keep no cluster state entry, and it requests "
+                + unsupported
+                + ", which such an index cannot have. Create it outside the namespace, or drop what it "
+                + "cannot support."
+        );
     }
 
     public void validateIndexSettings(String indexName, final Settings settings, final boolean forbidPrivateIndexSettings)
@@ -1777,7 +2771,7 @@ public class MetadataCreateIndexService {
             // Apply aware replica balance validation only to non system indices
             int replicaCount = settings.getAsInt(
                 IndexMetadata.SETTING_NUMBER_OF_REPLICAS,
-                DEFAULT_REPLICA_COUNT_SETTING.get(this.clusterService.state().metadata().settings())
+                clusterService.getClusterSettings().get(DEFAULT_REPLICA_COUNT_SETTING)
             );
             int searchReplicaCount = settings.getAsInt(SETTING_NUMBER_OF_SEARCH_REPLICAS, 0);
             AutoExpandReplicas autoExpandReplica = AutoExpandReplicas.SETTING.get(settings);
@@ -1936,8 +2930,12 @@ public class MetadataCreateIndexService {
         final IndexRoutingTable table = state.routingTable().index(sourceIndex);
         Map<String, AtomicInteger> nodesToNumRouting = new HashMap<>();
         int numShards = sourceMetadata.getNumberOfShards();
-        for (ShardRouting routing : table.shardsWithState(ShardRoutingState.STARTED)) {
-            nodesToNumRouting.computeIfAbsent(routing.currentNodeId(), (s) -> new AtomicInteger(0)).incrementAndGet();
+        // No routing entry means no started shards, so no node holds a full copy. Falling through leaves
+        // nodesToAllocateOn empty and produces the existing, clearer error below.
+        if (table != null) {
+            for (ShardRouting routing : table.shardsWithState(ShardRoutingState.STARTED)) {
+                nodesToNumRouting.computeIfAbsent(routing.currentNodeId(), (s) -> new AtomicInteger(0)).incrementAndGet();
+            }
         }
         List<String> nodesToAllocateOn = new ArrayList<>();
         for (Map.Entry<String, AtomicInteger> entries : nodesToNumRouting.entrySet()) {

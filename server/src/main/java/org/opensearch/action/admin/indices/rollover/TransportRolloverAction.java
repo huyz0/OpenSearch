@@ -34,6 +34,7 @@ package org.opensearch.action.admin.indices.rollover;
 
 import org.opensearch.OpenSearchException;
 import org.opensearch.action.admin.indices.create.CreateIndexAction;
+import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateRequest;
 import org.opensearch.action.admin.indices.stats.IndicesStatsAction;
 import org.opensearch.action.admin.indices.stats.IndicesStatsRequest;
 import org.opensearch.action.admin.indices.stats.IndicesStatsResponse;
@@ -46,9 +47,11 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlocks;
+import org.opensearch.cluster.metadata.IndexAbstraction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.MetadataCreateIndexService;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.service.ClusterManagerTaskThrottler;
 import org.opensearch.cluster.service.ClusterService;
@@ -64,10 +67,8 @@ import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.Client;
 
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -85,6 +86,7 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
         TransportIndicesResolvingAction<RolloverRequest> {
 
     private final MetadataRolloverService rolloverService;
+    private final MetadataCreateIndexService createIndexService;
     private final ActiveShardsObserver activeShardsObserver;
     private final Client client;
     private final ClusterManagerTaskThrottler.ThrottlingKey rolloverIndexTaskKey;
@@ -97,6 +99,7 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
         ActionFilters actionFilters,
         IndexNameExpressionResolver indexNameExpressionResolver,
         MetadataRolloverService rolloverService,
+        MetadataCreateIndexService createIndexService,
         Client client
     ) {
         super(
@@ -109,6 +112,7 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
             indexNameExpressionResolver
         );
         this.rolloverService = rolloverService;
+        this.createIndexService = createIndexService;
         this.client = client;
         this.activeShardsObserver = new ActiveShardsObserver(clusterService, threadPool);
         // Task is onboarded for throttling, it will get retried from associated TransportClusterManagerNodeAction.
@@ -128,17 +132,15 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
 
     @Override
     protected ClusterBlockException checkBlock(RolloverRequest request, ClusterState state) {
-        IndicesOptions indicesOptions = IndicesOptions.fromOptions(
-            true,
-            true,
-            request.indicesOptions().expandWildcardsOpen(),
-            request.indicesOptions().expandWildcardsClosed()
-        );
-
-        return ClusterBlocks.indicesWithRemoteSnapshotBlockedException(
-            new HashSet<>(Arrays.asList(indexNameExpressionResolver.concreteIndexNames(state, indicesOptions, request))),
-            state
-        );
+        IndexAbstraction indexAbstraction = state.metadata().getIndicesLookup().get(request.getRolloverTarget());
+        if (indexAbstraction == null) {
+            return null;
+        }
+        IndexMetadata writeIndex = indexAbstraction.getWriteIndex();
+        if (writeIndex == null) {
+            return null;
+        }
+        return ClusterBlocks.indicesWithRemoteSnapshotBlockedException(Collections.singletonList(writeIndex.getIndex().getName()), state);
     }
 
     @Override
@@ -193,6 +195,24 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
                     .filter(condition -> conditionResults.get(condition.toString()))
                     .collect(Collectors.toList());
                 if (conditionResults.size() == 0 || metConditions.size() > 0) {
+                    CreateIndexClusterStateUpdateRequest createIndexClusterStateRequest = MetadataRolloverService.prepareCreateIndexRequest(
+                        rolloverRequest.getNewIndexName(),
+                        rolloverIndexName,
+                        "rollover_index",
+                        rolloverRequest.getCreateIndexRequest(),
+                        null
+                    );
+                    // A gated rollover target used to be computed off the state update thread here, on the
+                    // grounds that a gated creation has no cluster state to publish. The plugin-claimed
+                    // namespace ended that: a rollover target needs the alias it is rolled over by, and an
+                    // index in that namespace may not carry one, so no rollover target can be gated.
+                    //
+                    // Worth stating what went with it, because it was not only dead. The condition read the
+                    // gating *setting*, which an index can carry without being gated -- a data stream backing
+                    // index, or any alias-bearing index using the plugin-managed storage. For those this
+                    // branch ran the rollover, discarded the cluster state it computed, and answered
+                    // acknowledged: a rollover that silently did nothing. Nothing measured it, because the
+                    // tests that exercised this path used indices that really were gated.
                     clusterService.submitStateUpdateTask(
                         "rollover_index source [" + sourceIndexName + "] to target [" + rolloverIndexName + "]",
                         new ClusterStateUpdateTask() {

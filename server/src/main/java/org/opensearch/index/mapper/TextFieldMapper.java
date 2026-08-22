@@ -81,6 +81,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.analysis.AnalyzerScope;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.analysis.NamedAnalyzer;
+import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.plain.PagedBytesIndexFieldData;
 import org.opensearch.index.mapper.Mapper.TypeParser.ParserContext;
@@ -336,15 +337,21 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         protected final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         final TextParams.Analyzers analyzers;
+        private final boolean requiresStoredFields;
 
         public Builder(String name, IndexAnalyzers indexAnalyzers) {
             this(name, Version.CURRENT, indexAnalyzers);
         }
 
         public Builder(String name, Version indexCreatedVersion, IndexAnalyzers indexAnalyzers) {
+            this(name, indexCreatedVersion, indexAnalyzers, false);
+        }
+
+        public Builder(String name, Version indexCreatedVersion, IndexAnalyzers indexAnalyzers, boolean requiresStoredFields) {
             super(name);
             this.indexCreatedVersion = indexCreatedVersion;
             this.analyzers = new TextParams.Analyzers(indexAnalyzers);
+            this.requiresStoredFields = requiresStoredFields;
         }
 
         public Builder index(boolean index) {
@@ -472,7 +479,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         public TextFieldMapper build(BuilderContext context) {
             FieldType fieldType = TextParams.buildFieldType(index, store, indexOptions, norms, termVectors);
             TextFieldType tft = buildFieldType(fieldType, context);
-            if (context.indexSettings().getAsBoolean(IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey(), false)) {
+            if (context.indexSettings().getAsBoolean(IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey(), false) || requiresStoredFields) {
                 fieldType.setStored(true);
             }
             return new TextFieldMapper(
@@ -488,7 +495,20 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         }
     }
 
-    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n, c.indexVersionCreated(), c.getIndexAnalyzers()));
+    public static final TypeParser PARSER = new TypeParser(
+        (n, c) -> new Builder(n, c.indexVersionCreated(), c.getIndexAnalyzers(), requiresStoredFieldsForPluggableFormat(c))
+    );
+
+    /**
+     * Text fields are force-stored whenever the pluggable-data-format feature is enabled.
+     * {@code mapperService()}/{@code getIndexSettings()} can each independently be null in
+     * lightweight mapper-only test harnesses.
+     */
+    static boolean requiresStoredFieldsForPluggableFormat(ParserContext parserContext) {
+        MapperService mapperService = parserContext.mapperService();
+        IndexSettings indexSettings = mapperService == null ? null : mapperService.getIndexSettings();
+        return indexSettings != null && indexSettings.isPluggableDataFormatEnabled();
+    }
 
     /**
      * A phrase wrapped field analyzer
@@ -838,6 +858,11 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
             this.indexPhrases = true;
         }
 
+        @Override
+        protected FieldTypeCapabilities.Capability searchCapability() {
+            return FieldTypeCapabilities.Capability.FULL_TEXT_SEARCH;
+        }
+
         public PrefixFieldType getPrefixFieldType() {
             return this.prefixFieldType;
         }
@@ -1004,6 +1029,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
     protected final Version indexCreatedVersion;
     protected final IndexAnalyzers indexAnalyzers;
     private final FielddataFrequencyFilter freqFilter;
+    private final boolean requiresStoredFields;
 
     protected TextFieldMapper(
         String simpleName,
@@ -1031,6 +1057,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         this.indexCreatedVersion = builder.indexCreatedVersion;
         this.indexAnalyzers = builder.analyzers.indexAnalyzers;
         this.freqFilter = builder.freqFilter.getValue();
+        this.requiresStoredFields = builder.requiresStoredFields;
     }
 
     @Override
@@ -1040,7 +1067,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     public ParametrizedFieldMapper.Builder getMergeBuilder() {
-        return new Builder(simpleName(), this.indexCreatedVersion, this.indexAnalyzers).init(this);
+        return new Builder(simpleName(), this.indexCreatedVersion, this.indexAnalyzers, this.requiresStoredFields).init(this);
     }
 
     @Override

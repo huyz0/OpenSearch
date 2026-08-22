@@ -59,9 +59,11 @@ import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.search.AutomatonQueries;
 import org.opensearch.common.unit.Fuzziness;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.compositeindex.datacube.DimensionType;
+import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.plain.SortedSetOrdinalsIndexFieldData;
 import org.opensearch.index.query.QueryShardContext;
@@ -174,14 +176,16 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
         private final Parameter<Float> boost = Parameter.boostParam();
 
         private final IndexAnalyzers indexAnalyzers;
+        private final boolean canConsumeRawValueForSource;
 
-        public Builder(String name, IndexAnalyzers indexAnalyzers) {
+        public Builder(String name, IndexAnalyzers indexAnalyzers, boolean canConsumeRawValueForSource) {
             super(name);
             this.indexAnalyzers = indexAnalyzers;
+            this.canConsumeRawValueForSource = canConsumeRawValueForSource;
         }
 
         public Builder(String name) {
-            this(name, null);
+            this(name, null, false);
         }
 
         public Builder ignoreAbove(int ignoreAbove) {
@@ -267,16 +271,33 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
         }
     }
 
-    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n, c.getIndexAnalyzers()));
+    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n, c.getIndexAnalyzers(), canConsumeRawValueForSource(c)));
+
+    /**
+     * Raw-value tracking (for derived-source reconstruction) is enabled whenever the
+     * pluggable-data-format feature is enabled. Both {@code mapperService()} and
+     * {@code getIndexSettings()} can independently be null (confirmed by
+     * TypeParsersTests#testMultiFieldWithinMultiField/ParametrizedMapperTests#testMultifields, which
+     * exercise a MapperService with no index settings at all).
+     */
+    private static boolean canConsumeRawValueForSource(TypeParser.ParserContext parserContext) {
+        MapperService mapperService = parserContext.mapperService();
+        IndexSettings indexSettings = mapperService == null ? null : mapperService.getIndexSettings();
+        return indexSettings != null && indexSettings.isPluggableDataFormatEnabled();
+    }
 
     @Override
     protected void canDeriveSourceInternal() {
-        if (this.ignoreAbove != Integer.MAX_VALUE || !Objects.equals(this.normalizerName, "default")) {
+        if (isIneligibleForGeneratingSource() && rawKeywordValueFieldType == null) {
             throw new UnsupportedOperationException(
                 "Unable to derive source for [" + name() + "] with " + "ignore_above and/or normalizer set"
             );
         }
         checkStoredAndDocValuesForDerivedSource();
+    }
+
+    private boolean isIneligibleForGeneratingSource() {
+        return this.ignoreAbove != Integer.MAX_VALUE || !Objects.equals(this.normalizerName, "default");
     }
 
     /**
@@ -390,6 +411,11 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
 
         NamedAnalyzer normalizer() {
             return indexAnalyzer();
+        }
+
+        @Override
+        protected FieldTypeCapabilities.Capability searchCapability() {
+            return FieldTypeCapabilities.Capability.FULL_TEXT_SEARCH;
         }
 
         @Override
@@ -808,8 +834,10 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
     private final boolean useSimilarity;
     private final String normalizerName;
     private final boolean splitQueriesOnWhitespace;
+    private final KeywordFieldType rawKeywordValueFieldType;
 
     private final IndexAnalyzers indexAnalyzers;
+    private volatile boolean canConsumeRawValueForSource;
 
     protected KeywordFieldMapper(
         String simpleName,
@@ -832,8 +860,10 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
         this.useSimilarity = builder.useSimilarity.getValue();
         this.normalizerName = builder.normalizer.getValue();
         this.splitQueriesOnWhitespace = builder.splitQueriesOnWhitespace.getValue();
-
         this.indexAnalyzers = builder.indexAnalyzers;
+        this.canConsumeRawValueForSource = builder.canConsumeRawValueForSource;
+        this.rawKeywordValueFieldType = buildRawKeywordValueFieldType();
+
     }
 
     /**
@@ -842,6 +872,31 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
      */
     public int ignoreAbove() {
         return ignoreAbove;
+    }
+
+    /**
+     * Returns the normalizer used for this keyword field.
+     * @return normalizerName
+     */
+    public String normalizerName() {
+        return normalizerName;
+    }
+
+    /**
+     * The field type to be used for derived source use cases.
+     * Keyword fields get ignored above a certain length and/or may get normalized.
+     * In such cases, storage layer would need to add another field which can be used for source generation
+     * @return sourceKeywordFieldType
+     */
+    private KeywordFieldType buildRawKeywordValueFieldType() {
+        if (isIneligibleForGeneratingSource() && canConsumeRawValueForSource) {
+            return new KeywordFieldType("_ignored_source." + fieldType().name(), false, true, false, false, fieldType().meta());
+        }
+        return null;
+    }
+
+    public KeywordFieldType getRawValueFieldType() {
+        return rawKeywordValueFieldType;
     }
 
     boolean useSimilarity() {
@@ -883,14 +938,27 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     protected void parseCreateFieldForPluggableFormat(ParseContext context) throws IOException {
-        String value = parseKeywordValue(context);
-        if (value == null) {
+        String textValue = textValue(context);
+        if (textValue == null) {
             return;
         }
-        context.documentInput().addField(fieldType(), value);
+        String value = parseKeyword(textValue);
+        if (value != null) {
+            context.documentInput().addField(fieldType(), value);
+        }
+        // For derived source: store raw value separately when normalizer/ignore_above alters it.
+        // Skip for multi-field sub-fields (name contains dot) — parent field stores the raw source.
+        if (rawKeywordValueFieldType != null && (textValue.length() > ignoreAbove || !Objects.equals(normalizerName, "default"))) {
+            context.documentInput().addField(rawKeywordValueFieldType, textValue);
+        }
     }
 
     private String parseKeywordValue(ParseContext context) throws IOException {
+        String value = textValue(context);
+        return parseKeyword(value);
+    }
+
+    private String textValue(ParseContext context) throws IOException {
         String value;
         if (context.externalValueSet()) {
             value = context.externalValue().toString();
@@ -902,7 +970,10 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
                 value = parser.textOrNull();
             }
         }
+        return value;
+    }
 
+    private String parseKeyword(String value) throws IOException {
         if (value == null || value.length() > ignoreAbove) {
             return null;
         }
@@ -951,6 +1022,6 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     public ParametrizedFieldMapper.Builder getMergeBuilder() {
-        return new Builder(simpleName(), indexAnalyzers).init(this);
+        return new Builder(simpleName(), indexAnalyzers, canConsumeRawValueForSource).init(this);
     }
 }

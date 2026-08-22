@@ -38,6 +38,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.VersionType;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestToXContentListener;
@@ -64,6 +65,12 @@ public class RestGetAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "document_get_action";
+    }
+
+    /** A core API a restricted deployment needs to function at all, so declared available explicitly. */
+    @Override
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 
     @Override

@@ -238,6 +238,41 @@ public class RestControllerTests extends OpenSearchTestCase {
         assertTrue(channel.getSendResponseCalled());
     }
 
+    /**
+     * Core never acts on {@link RestHandler#apiAvailabilityScope()}, and this is the test that says so.
+     *
+     * <p>An earlier version of this class enforced the declaration itself, behind a
+     * {@code rest.serverless_mode.enabled} setting. It worked, and it was default-off, but it put a
+     * serverless-specific decision inside core rather than a hook, and it needed a special case to stop its
+     * own new setting from 410-ing {@code /favicon.ico}. Enforcement now lives in the serverless plugin,
+     * which reaches every handler through the {@code getRestHandlerWrapper} extension point that upstream
+     * already provides. See {@code ServerlessRestGateTests}.
+     *
+     * <p>So the property core owes is the opposite of the old one: a handler declaring itself
+     * {@code UNAVAILABLE} must be dispatched completely normally, because with no plugin installed there is
+     * no such thing as serverless mode to be unavailable under. UNAVAILABLE is also the default for any
+     * handler that has never heard of this, which is what makes it the case worth pinning.
+     */
+    public void testCoreDispatchesAnUnavailableHandlerNormally() {
+        final ThreadContext threadContext = client.threadPool().getThreadContext();
+        final RestController restController = new RestController(Collections.emptySet(), null, client, circuitBreakerService, usageService);
+        RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/unannotated").build();
+        restController.registerHandler(RestRequest.Method.GET, "/unannotated", new RestHandler() {
+            @Override
+            public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) throws Exception {
+                channel.sendResponse(new BytesRestResponse(RestStatus.OK, BytesRestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY));
+            }
+
+            @Override
+            public ApiAvailabilityScope apiAvailabilityScope() {
+                return ApiAvailabilityScope.UNAVAILABLE;
+            }
+        });
+        AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.OK);
+        restController.dispatchRequest(fakeRequest, channel, threadContext);
+        assertTrue(channel.getSendResponseCalled());
+    }
+
     public void testRegisterAsDeprecatedHandler() {
         RestController controller = mock(RestController.class);
 

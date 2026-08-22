@@ -79,6 +79,10 @@ public class S3HttpHandler implements HttpHandler {
     private final String path;
 
     private final ConcurrentMap<String, BytesReference> blobs = new ConcurrentHashMap<>();
+    // Tracked separately from blobs (rather than folded into a richer value type) to keep every
+    // other handler branch that already reads/writes blobs untouched: only the plain PUT and GET
+    // branches below know about conditional-write / ETag semantics.
+    private final ConcurrentMap<String, String> eTagsByKey = new ConcurrentHashMap<>();
 
     public S3HttpHandler(final String bucket) {
         this(bucket, null);
@@ -165,10 +169,22 @@ public class S3HttpHandler implements HttpHandler {
                 exchange.getResponseBody().write(response);
 
             } else if (Regex.simpleMatch("PUT /" + path + "*", request)) {
-                final Tuple<String, BytesReference> blob = parseRequestBody(exchange);
-                blobs.put(exchange.getRequestURI().toString(), blob.v2());
-                exchange.getResponseHeaders().add("ETag", blob.v1());
-                exchange.sendResponseHeaders(RestStatus.OK.getStatus(), -1);
+                final String key = exchange.getRequestURI().toString();
+                final String ifMatch = exchange.getRequestHeaders().getFirst("If-Match");
+                final String ifNoneMatch = exchange.getRequestHeaders().getFirst("If-None-Match");
+                final String existingETag = eTagsByKey.get(key);
+                final boolean preconditionFailed = ("*".equals(ifNoneMatch) && existingETag != null)
+                    || (ifMatch != null && ifMatch.equals(existingETag) == false);
+                if (preconditionFailed) {
+                    Streams.readFully(exchange.getRequestBody());
+                    exchange.sendResponseHeaders(RestStatus.PRECONDITION_FAILED.getStatus(), -1);
+                } else {
+                    final Tuple<String, BytesReference> blob = parseRequestBody(exchange);
+                    blobs.put(key, blob.v2());
+                    eTagsByKey.put(key, blob.v1());
+                    exchange.getResponseHeaders().add("ETag", blob.v1());
+                    exchange.sendResponseHeaders(RestStatus.OK.getStatus(), -1);
+                }
 
             } else if (Regex.simpleMatch("GET /" + bucket + "?list-type=*", request)) {
                 final Map<String, String> params = new HashMap<>();
@@ -220,8 +236,13 @@ public class S3HttpHandler implements HttpHandler {
                 exchange.getResponseBody().write(response);
 
             } else if (Regex.simpleMatch("GET /" + path + "*", request)) {
-                final BytesReference blob = blobs.get(exchange.getRequestURI().toString());
+                final String key = exchange.getRequestURI().toString();
+                final BytesReference blob = blobs.get(key);
                 if (blob != null) {
+                    final String eTag = eTagsByKey.get(key);
+                    if (eTag != null) {
+                        exchange.getResponseHeaders().add("ETag", eTag);
+                    }
                     final String range = exchange.getRequestHeaders().getFirst("Range");
                     if (range == null) {
                         exchange.getResponseHeaders().add("Content-Type", "application/octet-stream");
@@ -253,6 +274,7 @@ public class S3HttpHandler implements HttpHandler {
                     Map.Entry<String, BytesReference> blob = iterator.next();
                     if (blob.getKey().startsWith(exchange.getRequestURI().toString())) {
                         iterator.remove();
+                        eTagsByKey.remove(blob.getKey());
                         deletions++;
                     }
                 }

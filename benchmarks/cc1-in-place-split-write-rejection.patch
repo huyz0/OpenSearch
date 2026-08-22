@@ -1,0 +1,690 @@
+From ea2f558fbc7ad14cbc348f9a2c3b7b00b72a4c9f Mon Sep 17 00:00:00 2001
+From: Huy Nguyen <tuonghuy@gmail.com>
+Date: Sun, 2 Aug 2026 22:59:36 +1000
+Subject: [PATCH] Reject writes to a split parent during an in-progress
+ in-place split
+
+Closes a silent data-loss window in in-place shard split. Ordinary indexing
+routes to the still-STARTED parent while the children each clone the parent's
+then-latest published manifest once, at their own recovery time. Any document
+the parent acknowledged after a child had cloned but before the split committed
+landed only in a later parent manifest generation that no child references, and
+became permanently unreachable once the parent's routing was retired at commit.
+
+Fix: reject new primary writes on a shard while it is the parent of an
+in-progress split (IndexShard.ensureWriteAllowed calls a new
+ensureNotInProgressSplitParent), throwing IllegalIndexShardStateException. That
+is a shard-not-available (retriable) exception, so the write fails fast and
+succeeds once it re-routes to a committed child, which is the same behaviour a
+relocating or closing shard already has. Simpler and more obviously correct than
+synchronous dual-write across two engines mid-recovery; the split design already
+accepts a recovery-time cost, so a short write-rejection window is acceptable.
+
+Having chosen reject-writes over dual-write, this also removes the scaffolding
+left in place for the dual-write path that the feature never wired up. All of it
+is dead: across server, plugins, modules and libs, ShardRoutingState.SPLITTING
+appears only inside ShardRouting and its own enum declaration, so nothing ever
+puts a shard into that state and byte 5 is never written to the wire; and
+ShardRouting.splitting/isSplitTarget/getParentShardId/getRecoveringChildShards
+and OperationRouting.shardWithRecoveringChild have no callers outside the two
+files declaring them. Also drops the includeInProgressChildren branch and
+parameter threaded through generateShardId/getShardIdOfHash, which only that
+scaffolding ever passed true for.
+
+Test: IndexShardTests.testRejectsPrimaryWriteWhileInPlaceSplitInProgress indexes
+a doc, marks the shard an in-progress split parent, and asserts index and delete
+are both rejected with a retriable shard-not-available exception. Verified by
+removing the guard, which fails the test.
+
+Signed-off-by: Huy Nguyen <tuonghuy@gmail.com>
+---
+ .../cluster/metadata/SplitShardsMetadata.java | 12 +--
+ .../cluster/routing/OperationRouting.java     | 27 +----
+ .../cluster/routing/ShardRouting.java         | 81 +--------------
+ .../cluster/routing/ShardRoutingState.java    |  8 +-
+ .../opensearch/index/shard/IndexShard.java    | 35 +++++++
+ .../metadata/SplitShardsMetadataTests.java    | 43 ++++----
+ .../routing/ShardRoutingStateSplitTests.java  | 98 -------------------
+ .../index/shard/IndexShardTests.java          | 45 +++++++++
+ .../cluster/routing/TestShardRouting.java     |  5 -
+ 9 files changed, 112 insertions(+), 242 deletions(-)
+ delete mode 100644 server/src/test/java/org/opensearch/cluster/routing/ShardRoutingStateSplitTests.java
+
+diff --git a/server/src/main/java/org/opensearch/cluster/metadata/SplitShardsMetadata.java b/server/src/main/java/org/opensearch/cluster/metadata/SplitShardsMetadata.java
+index 96542685c00..927ab7d5271 100644
+--- a/server/src/main/java/org/opensearch/cluster/metadata/SplitShardsMetadata.java
++++ b/server/src/main/java/org/opensearch/cluster/metadata/SplitShardsMetadata.java
+@@ -99,14 +99,9 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
+         out.writeMap(this.parentToChildShards, StreamOutput::writeInt, StreamOutput::writeArray);
+     }
+ 
+-    public int getShardIdOfHash(int rootShardId, int hash, boolean includeInProgressChildren) {
++    public int getShardIdOfHash(int rootShardId, int hash) {
+         // First check if we have child shards against this root shard.
+         if (rootShardsToAllChildren[rootShardId] == null) {
+-            if (includeInProgressChildren && parentToChildShards.containsKey(rootShardId)) {
+-                ShardRange shardRange = binarySearchShards(parentToChildShards.get(rootShardId), hash);
+-                assert shardRange != null;
+-                return shardRange.shardId();
+-            }
+             return rootShardId;
+         }
+ 
+@@ -114,11 +109,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
+         ShardRange shardRange = binarySearchShards(existingChildShards, hash);
+         assert shardRange != null;
+ 
+-        if (includeInProgressChildren && parentToChildShards.containsKey(shardRange.shardId())) {
+-            shardRange = binarySearchShards(parentToChildShards.get(shardRange.shardId()), hash);
+-        }
+-        assert shardRange != null;
+-
+         return shardRange.shardId();
+     }
+ 
+diff --git a/server/src/main/java/org/opensearch/cluster/routing/OperationRouting.java b/server/src/main/java/org/opensearch/cluster/routing/OperationRouting.java
+index 210e9828876..55e9c7e3579 100644
+--- a/server/src/main/java/org/opensearch/cluster/routing/OperationRouting.java
++++ b/server/src/main/java/org/opensearch/cluster/routing/OperationRouting.java
+@@ -499,26 +499,12 @@ public class OperationRouting {
+         return clusterState.getRoutingTable().shardRoutingTable(index, shardId);
+     }
+ 
+-    public ShardId shardWithRecoveringChild(ClusterState clusterState, String index, String id, String routing, Index shardIndex) {
+-        int shardId = generateShardId(indexMetadata(clusterState, index), id, routing, true);
+-        return new ShardId(shardIndex, shardId);
+-    }
+-
+     public ShardId shardId(ClusterState clusterState, String index, String id, @Nullable String routing) {
+         IndexMetadata indexMetadata = indexMetadata(clusterState, index);
+         return new ShardId(indexMetadata.getIndex(), generateShardId(indexMetadata, id, routing));
+     }
+ 
+     public static int generateShardId(IndexMetadata indexMetadata, @Nullable String id, @Nullable String routing) {
+-        return generateShardId(indexMetadata, id, routing, false);
+-    }
+-
+-    public static int generateShardId(
+-        IndexMetadata indexMetadata,
+-        @Nullable String id,
+-        @Nullable String routing,
+-        boolean includeInProgressChild
+-    ) {
+         final String effectiveRouting;
+         final int partitionOffset;
+ 
+@@ -543,26 +529,17 @@ public class OperationRouting {
+             return VirtualShardRoutingHelper.resolvePhysicalShardId(indexMetadata, vShardId);
+         }
+ 
+-        return calculateShardIdOfChild(indexMetadata, effectiveRouting, partitionOffset, includeInProgressChild);
++        return calculateScaledShardId(indexMetadata, effectiveRouting, partitionOffset);
+     }
+ 
+     private static int calculateScaledShardId(IndexMetadata indexMetadata, String effectiveRouting, int partitionOffset) {
+-        return calculateShardIdOfChild(indexMetadata, effectiveRouting, partitionOffset, false);
+-    }
+-
+-    private static int calculateShardIdOfChild(
+-        IndexMetadata indexMetadata,
+-        String effectiveRouting,
+-        int partitionOffset,
+-        boolean includeInProgressChild
+-    ) {
+         final int hash = Murmur3HashFunction.hash(effectiveRouting) + partitionOffset;
+ 
+         // we don't use IMD#getNumberOfShards since the index might have been shrunk such that we need to use the size
+         // of original index to hash documents
+         int rootShardId = Math.floorMod(hash, indexMetadata.getRoutingNumShards()) / indexMetadata.getRoutingFactor();
+ 
+-        return indexMetadata.getSplitShardsMetadata().getShardIdOfHash(rootShardId, hash, includeInProgressChild);
++        return indexMetadata.getSplitShardsMetadata().getShardIdOfHash(rootShardId, hash);
+     }
+ 
+     private void checkPreferenceBasedRoutingAllowed(Preference preference, @Nullable WeightedRoutingMetadata weightedRoutingMetadata) {
+diff --git a/server/src/main/java/org/opensearch/cluster/routing/ShardRouting.java b/server/src/main/java/org/opensearch/cluster/routing/ShardRouting.java
+index ee9ed188405..4055d991cf9 100644
+--- a/server/src/main/java/org/opensearch/cluster/routing/ShardRouting.java
++++ b/server/src/main/java/org/opensearch/cluster/routing/ShardRouting.java
+@@ -77,10 +77,6 @@ public class ShardRouting implements Writeable, ToXContentObject {
+     private final long expectedShardSize;
+     @Nullable
+     private final ShardRouting targetRelocatingShard;
+-    @Nullable
+-    private final ShardRouting[] recoveringChildShards;
+-    @Nullable
+-    private final ShardId parentShardId;
+ 
+     /**
+      * A constructor to internally create shard routing instances, note, the internal flag should only be set to true
+@@ -97,36 +93,6 @@ public class ShardRouting implements Writeable, ToXContentObject {
+         UnassignedInfo unassignedInfo,
+         AllocationId allocationId,
+         long expectedShardSize
+-    ) {
+-        this(
+-            shardId,
+-            currentNodeId,
+-            relocatingNodeId,
+-            primary,
+-            searchOnly,
+-            state,
+-            recoverySource,
+-            unassignedInfo,
+-            allocationId,
+-            expectedShardSize,
+-            null,
+-            null
+-        );
+-    }
+-
+-    protected ShardRouting(
+-        ShardId shardId,
+-        String currentNodeId,
+-        String relocatingNodeId,
+-        boolean primary,
+-        boolean searchOnly,
+-        ShardRoutingState state,
+-        RecoverySource recoverySource,
+-        UnassignedInfo unassignedInfo,
+-        AllocationId allocationId,
+-        long expectedShardSize,
+-        ShardRouting[] recoveringChildShards,
+-        ShardId parentShardId
+     ) {
+         this.shardId = shardId;
+         this.currentNodeId = currentNodeId;
+@@ -139,17 +105,13 @@ public class ShardRouting implements Writeable, ToXContentObject {
+         this.allocationId = allocationId;
+         this.expectedShardSize = expectedShardSize;
+         this.targetRelocatingShard = initializeTargetRelocatingShard();
+-        this.recoveringChildShards = recoveringChildShards;
+-        this.parentShardId = parentShardId;
+         this.asList = Collections.singletonList(this);
+         assert expectedShardSize == UNAVAILABLE_EXPECTED_SHARD_SIZE
+             || state == ShardRoutingState.INITIALIZING
+-            || state == ShardRoutingState.RELOCATING
+-            || state == ShardRoutingState.SPLITTING : expectedShardSize + " state: " + state;
++            || state == ShardRoutingState.RELOCATING : expectedShardSize + " state: " + state;
+         assert expectedShardSize >= 0
+             || state != ShardRoutingState.INITIALIZING
+-            || state != ShardRoutingState.RELOCATING
+-            || state != ShardRoutingState.SPLITTING : expectedShardSize + " state: " + state;
++            || state != ShardRoutingState.RELOCATING : expectedShardSize + " state: " + state;
+         assert !(state == ShardRoutingState.UNASSIGNED && unassignedInfo == null) : "unassigned shard must be created with meta";
+         assert (state == ShardRoutingState.UNASSIGNED || state == ShardRoutingState.INITIALIZING) == (recoverySource != null)
+             : "recovery source only available on unassigned or initializing shard but was " + state;
+@@ -286,12 +248,11 @@ public class ShardRouting implements Writeable, ToXContentObject {
+     /**
+      * Returns <code>true</code> iff the this shard is currently
+      * {@link ShardRoutingState#STARTED started} or
+-     * {@link ShardRoutingState#SPLITTING splitting} or
+      * {@link ShardRoutingState#RELOCATING relocating} to another node.
+      * Otherwise <code>false</code>
+      */
+     public boolean active() {
+-        return started() || relocating() || splitting();
++        return started() || relocating();
+     }
+ 
+     /**
+@@ -311,35 +272,6 @@ public class ShardRouting implements Writeable, ToXContentObject {
+         return state == ShardRoutingState.RELOCATING;
+     }
+ 
+-    /**
+-     * Returns <code>true</code> iff the shard is in splitting state.
+-     */
+-    public boolean splitting() {
+-        return state == ShardRoutingState.SPLITTING;
+-    }
+-
+-    /**
+-     * Returns <code>true</code> if this shard is a child shard created by an in-place split.
+-     */
+-    public boolean isSplitTarget() {
+-        return parentShardId != null;
+-    }
+-
+-    /**
+-     * Returns a copy of the recovering child shards of this splitting shard, or null if not splitting.
+-     */
+-    @Nullable
+-    public ShardRouting[] getRecoveringChildShards() {
+-        return recoveringChildShards == null ? null : recoveringChildShards.clone();
+-    }
+-
+-    /**
+-     * Returns the parent shard id if this is a child shard created by split, or null otherwise.
+-     */
+-    public ShardId getParentShardId() {
+-        return parentShardId;
+-    }
+-
+     /**
+      * Returns <code>true</code> iff this shard is assigned to a node ie. not
+      * {@link ShardRoutingState#UNASSIGNED unassigned}. Otherwise <code>false</code>
+@@ -443,7 +375,7 @@ public class ShardRouting implements Writeable, ToXContentObject {
+         unassignedInfo = in.readOptionalWriteable(UnassignedInfo::new);
+         allocationId = in.readOptionalWriteable(AllocationId::new);
+         final long shardSize;
+-        if (state == ShardRoutingState.RELOCATING || state == ShardRoutingState.INITIALIZING || state == ShardRoutingState.SPLITTING) {
++        if (state == ShardRoutingState.RELOCATING || state == ShardRoutingState.INITIALIZING) {
+             shardSize = in.readLong();
+         } else {
+             shardSize = UNAVAILABLE_EXPECTED_SHARD_SIZE;
+@@ -451,9 +383,6 @@ public class ShardRouting implements Writeable, ToXContentObject {
+         expectedShardSize = shardSize;
+         asList = Collections.singletonList(this);
+         targetRelocatingShard = initializeTargetRelocatingShard();
+-        // These fields are transient - populated by RoutingNodes constructor, not serialized on the wire.
+-        recoveringChildShards = null;
+-        parentShardId = null;
+     }
+ 
+     public ShardRouting(StreamInput in) throws IOException {
+@@ -479,7 +408,7 @@ public class ShardRouting implements Writeable, ToXContentObject {
+         }
+         out.writeOptionalWriteable(unassignedInfo);
+         out.writeOptionalWriteable(allocationId);
+-        if (state == ShardRoutingState.RELOCATING || state == ShardRoutingState.INITIALIZING || state == ShardRoutingState.SPLITTING) {
++        if (state == ShardRoutingState.RELOCATING || state == ShardRoutingState.INITIALIZING) {
+             out.writeLong(expectedShardSize);
+         }
+     }
+diff --git a/server/src/main/java/org/opensearch/cluster/routing/ShardRoutingState.java b/server/src/main/java/org/opensearch/cluster/routing/ShardRoutingState.java
+index 100d110c3b2..2086159790b 100644
+--- a/server/src/main/java/org/opensearch/cluster/routing/ShardRoutingState.java
++++ b/server/src/main/java/org/opensearch/cluster/routing/ShardRoutingState.java
+@@ -58,11 +58,7 @@ public enum ShardRoutingState {
+     /**
+      * The shard is in the process being relocated.
+      */
+-    RELOCATING((byte) 4),
+-    /**
+-     * The shard is in the process of being split in-place.
+-     */
+-    SPLITTING((byte) 5);
++    RELOCATING((byte) 4);
+ 
+     private byte value;
+ 
+@@ -88,8 +84,6 @@ public enum ShardRoutingState {
+                 return STARTED;
+             case 4:
+                 return RELOCATING;
+-            case 5:
+-                return SPLITTING;
+             default:
+                 throw new IllegalStateException("No routing state mapped for [" + value + "]");
+         }
+diff --git a/server/src/main/java/org/opensearch/index/shard/IndexShard.java b/server/src/main/java/org/opensearch/index/shard/IndexShard.java
+index 46ac14f2cfb..5765f9fa210 100644
+--- a/server/src/main/java/org/opensearch/index/shard/IndexShard.java
++++ b/server/src/main/java/org/opensearch/index/shard/IndexShard.java
+@@ -3385,6 +3385,41 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
+                     "operation only allowed when shard state is one of " + writeAllowedStates + ", origin [" + origin + "]"
+                 );
+             }
++            if (origin == Engine.Operation.Origin.PRIMARY) {
++                ensureNotInProgressSplitParent();
++            }
++        }
++    }
++
++    /**
++     * Rejects a new primary write while this shard is the parent of an in-progress in-place split.
++     *
++     * <p>During an in-place split the children each clone the parent's <em>then-latest published
++     * manifest</em> once, at their own recovery time, and ordinary indexing keeps routing to the
++     * still-{@code STARTED} parent (routing resolves in-progress children only when explicitly asked
++     * to). Any document the parent acknowledged after a child had already cloned but before the split
++     * committed would be written only into a later parent manifest generation that no child ever
++     * references; once {@code MetadataInPlaceSplitShardCommitService} retires the parent's routing and
++     * closes it at commit, those documents become permanently unreachable -- silent data loss under
++     * continuous write load during a split.
++     *
++     * <p>Rejecting the write here closes that window entirely: no document is acknowledged on the
++     * parent once the split is in progress, so nothing can be stranded in a post-clone parent
++     * generation. The thrown {@link IllegalIndexShardStateException} is a shard-not-available
++     * exception (see {@code TransportActions#isShardNotAvailableException}), so it is retriable the
++     * same way a relocating/closing shard's rejection is -- the write succeeds once it re-routes to a
++     * committed child.
++     */
++    private void ensureNotInProgressSplitParent() throws IllegalIndexShardStateException {
++        final IndexMetadata indexMetadata = indexSettings.getIndexMetadata();
++        if (indexMetadata != null
++            && indexMetadata.getSplitShardsMetadata() != null
++            && indexMetadata.getSplitShardsMetadata().isSplitOfShardInProgress(shardId.id())) {
++            throw new IllegalIndexShardStateException(
++                shardId,
++                state,
++                "operation rejected while an in-place split of this shard is in progress; retry once the split completes"
++            );
+         }
+     }
+ 
+diff --git a/server/src/test/java/org/opensearch/cluster/metadata/SplitShardsMetadataTests.java b/server/src/test/java/org/opensearch/cluster/metadata/SplitShardsMetadataTests.java
+index 7526d9c40c7..e3b03d4e1e8 100644
+--- a/server/src/test/java/org/opensearch/cluster/metadata/SplitShardsMetadataTests.java
++++ b/server/src/test/java/org/opensearch/cluster/metadata/SplitShardsMetadataTests.java
+@@ -40,7 +40,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
+         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(5);
+ 
+         // Test: When there are no children, should return the root shard id
+-        int result = builder.build().getShardIdOfHash(0, 100, false);
++        int result = builder.build().getShardIdOfHash(0, 100);
+         assertEquals(0, result);
+     }
+ 
+@@ -168,7 +168,10 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
+     }
+ 
+     /**
+-     * Tests getShardIdOfHash when there are existing child shards and in-progress children.
++     * Tests getShardIdOfHash resolves to a committed child while an in-progress split of that child
++     * is ignored. Routing never targets an in-progress (not-yet-committed) child -- writes stay on
++     * the last committed shard until commit -- so a hash under shard 2's committed range resolves to
++     * shard 2, not to shard 2's still-recovering grandchildren.
+      */
+     public void testGetShardIdOfHashWithExistingAndInProgressChildren() {
+         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
+@@ -176,31 +179,33 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
+         builder.splitShard(0, 3);
+         builder.updateSplitMetadataForChildShards(0, Set.of(1, 2, 3));
+ 
+-        // Second split - split the middle shard (ID 2)
++        // Second split - split the middle shard (ID 2), still in progress (not committed)
+         builder.splitShard(2, 2);
+         SplitShardsMetadata metadata = builder.build();
+ 
+-        // Execute - test hash that falls in the range of first child of shard 2
+-        int result = metadata.getShardIdOfHash(0, 500, true);
++        // Execute - test hash that falls in the range of the committed child shard 2
++        int result = metadata.getShardIdOfHash(0, 500);
+ 
+-        // Assert - should route to the first child of the in-progress split
+-        assertEquals("Hash should route to first child of in-progress split", 5, result);
++        // Assert - resolves to the committed child, ignoring the in-progress grandchildren
++        assertEquals("Hash should route to committed child, not the in-progress grandchild", 2, result);
+     }
+ 
+     /**
+-     * Test getShardIdOfHash when root shard has no children but in-progress split exists
++     * Test getShardIdOfHash when root shard has no committed children but an in-progress split exists:
++     * routing resolves to the root (parent) shard, since an in-progress split's children are never
++     * routing targets until the split commits.
+      */
+     public void testGetShardIdOfHashWithInProgressSplit() {
+         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
+-        // Setup - split root shard
++        // Setup - split root shard (in progress, not committed)
+         builder.splitShard(0, 2);
+         SplitShardsMetadata metadata = builder.build();
+ 
+-        // Execute - test with hash that should go to second child
+-        int result = metadata.getShardIdOfHash(0, 100, true);
++        // Execute
++        int result = metadata.getShardIdOfHash(0, 100);
+ 
+-        // Verify - should route to the second child shard
+-        assertEquals("Should route to second child shard", 2, result);
++        // Verify - resolves to the still-active parent shard, not a recovering child
++        assertEquals("Should route to the parent shard while the split is in progress", 0, result);
+     }
+ 
+     /**
+@@ -211,8 +216,8 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
+         builder.splitShard(0, 2);
+         SplitShardsMetadata metadata = builder.build();
+ 
+-        // Should return root shard ID when includeInProgressChildren is false
+-        assertEquals(0, metadata.getShardIdOfHash(0, 100, false));
++        // Should return root shard ID while the split is in progress
++        assertEquals(0, metadata.getShardIdOfHash(0, 100));
+     }
+ 
+     /**
+@@ -222,13 +227,12 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
+         // Arrange
+         int rootShardId = 0;
+         int hash = 123;
+-        boolean includeInProgressChildren = false;
+ 
+         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // 1 root shard
+         SplitShardsMetadata metadata = builder.build();
+ 
+         // Act
+-        int result = metadata.getShardIdOfHash(rootShardId, hash, includeInProgressChildren);
++        int result = metadata.getShardIdOfHash(rootShardId, hash);
+ 
+         // Assert
+         assertEquals("Should return the root shard ID when there are no children", rootShardId, result);
+@@ -241,7 +245,6 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
+         // Setup
+         int rootShardId = 0;
+         int hash = 500;
+-        boolean includeInProgressChildren = true;
+ 
+         // Setup
+         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
+@@ -256,7 +259,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
+         SplitShardsMetadata metadata = builder.build();
+ 
+         // Execute
+-        int result = metadata.getShardIdOfHash(rootShardId, hash, includeInProgressChildren);
++        int result = metadata.getShardIdOfHash(rootShardId, hash);
+ 
+         // Verify
+         assertEquals(2, result);
+@@ -927,7 +930,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
+         long childShardRangeDiff = Math.abs((long) parentRange.end() - parentRange.start() + 1) / 3;
+         int hashInFirstThird = parentRange.start() + (int) childShardRangeDiff - 1;
+ 
+-        assertEquals("Hash should route to first child of nested split", 3, metadata.getShardIdOfHash(0, hashInFirstThird, true));
++        assertEquals("Hash should route to first child of nested split", 3, metadata.getShardIdOfHash(0, hashInFirstThird));
+     }
+ 
+     public void testHashCodeAndEquals() {
+diff --git a/server/src/test/java/org/opensearch/cluster/routing/ShardRoutingStateSplitTests.java b/server/src/test/java/org/opensearch/cluster/routing/ShardRoutingStateSplitTests.java
+deleted file mode 100644
+index 1e382457ede..00000000000
+--- a/server/src/test/java/org/opensearch/cluster/routing/ShardRoutingStateSplitTests.java
++++ /dev/null
+@@ -1,98 +0,0 @@
+-/*
+- * SPDX-License-Identifier: Apache-2.0
+- *
+- * The OpenSearch Contributors require contributions made to
+- * this file be licensed under the Apache-2.0 license or a
+- * compatible open source license.
+- */
+-
+-package org.opensearch.cluster.routing;
+-
+-import org.opensearch.core.index.Index;
+-import org.opensearch.core.index.shard.ShardId;
+-import org.opensearch.test.OpenSearchTestCase;
+-
+-public class ShardRoutingStateSplitTests extends OpenSearchTestCase {
+-
+-    public void testSplittingStateValue() {
+-        assertEquals((byte) 5, ShardRoutingState.SPLITTING.value());
+-    }
+-
+-    public void testFromValueSplitting() {
+-        assertEquals(ShardRoutingState.SPLITTING, ShardRoutingState.fromValue((byte) 5));
+-    }
+-
+-    public void testFromValueInvalid() {
+-        expectThrows(IllegalStateException.class, () -> ShardRoutingState.fromValue((byte) 6));
+-    }
+-
+-    public void testAllStatesRoundTrip() {
+-        for (ShardRoutingState state : ShardRoutingState.values()) {
+-            assertEquals(state, ShardRoutingState.fromValue(state.value()));
+-        }
+-    }
+-
+-    public void testSplittingMethodReturnsTrueForSplittingState() {
+-        ShardRouting shard = TestShardRouting.newShardRouting(
+-            new ShardId(new Index("idx", "uuid"), 0),
+-            "node1",
+-            true,
+-            ShardRoutingState.SPLITTING
+-        );
+-        assertTrue(shard.splitting());
+-        assertFalse(shard.started());
+-        assertFalse(shard.relocating());
+-    }
+-
+-    public void testSplittingMethodReturnsFalseForOtherStates() {
+-        ShardRouting started = TestShardRouting.newShardRouting(
+-            new ShardId(new Index("idx", "uuid"), 0),
+-            "node1",
+-            true,
+-            ShardRoutingState.STARTED
+-        );
+-        assertFalse(started.splitting());
+-    }
+-
+-    public void testIsSplitTargetReturnsFalseForNormalShard() {
+-        ShardRouting shard = TestShardRouting.newShardRouting(
+-            new ShardId(new Index("idx", "uuid"), 0),
+-            "node1",
+-            true,
+-            ShardRoutingState.STARTED
+-        );
+-        assertFalse(shard.isSplitTarget());
+-        assertNull(shard.getParentShardId());
+-    }
+-
+-    public void testGetRecoveringChildShardsReturnsNullForNonSplittingShard() {
+-        ShardRouting shard = TestShardRouting.newShardRouting(
+-            new ShardId(new Index("idx", "uuid"), 0),
+-            "node1",
+-            true,
+-            ShardRoutingState.STARTED
+-        );
+-        assertNull(shard.getRecoveringChildShards());
+-    }
+-
+-    public void testSplittingShardIsActive() {
+-        ShardRouting splitting = new ShardRouting(
+-            new ShardId("index", "uuid", 0),
+-            "node1",
+-            null,
+-            true,
+-            false,
+-            ShardRoutingState.SPLITTING,
+-            null,
+-            null,
+-            AllocationId.newInitializing(),
+-            0,
+-            null,
+-            null
+-        );
+-        assertTrue(splitting.active());
+-        assertTrue(splitting.splitting());
+-        assertFalse(splitting.started());
+-        assertFalse(splitting.relocating());
+-    }
+-}
+diff --git a/server/src/test/java/org/opensearch/index/shard/IndexShardTests.java b/server/src/test/java/org/opensearch/index/shard/IndexShardTests.java
+index 48baf75b462..1ccb9f5ae6f 100644
+--- a/server/src/test/java/org/opensearch/index/shard/IndexShardTests.java
++++ b/server/src/test/java/org/opensearch/index/shard/IndexShardTests.java
+@@ -58,8 +58,10 @@ import org.opensearch.action.admin.indices.stats.CommonStatsFlags;
+ import org.opensearch.action.admin.indices.stats.ShardStats;
+ import org.opensearch.action.index.IndexRequest;
+ import org.opensearch.action.support.PlainActionFuture;
++import org.opensearch.action.support.TransportActions;
+ import org.opensearch.cluster.metadata.IndexMetadata;
+ import org.opensearch.cluster.metadata.MappingMetadata;
++import org.opensearch.cluster.metadata.SplitShardsMetadata;
+ import org.opensearch.cluster.node.DiscoveryNode;
+ import org.opensearch.cluster.routing.AllocationId;
+ import org.opensearch.cluster.routing.IndexShardRoutingTable;
+@@ -2221,6 +2223,49 @@ public class IndexShardTests extends IndexShardTestCase {
+         closeShards(shard);
+     }
+ 
++    /**
++     * CC1 regression: while a shard is the parent of an in-progress in-place split, new primary
++     * writes must be rejected. Children clone the parent's published manifest once at their own
++     * recovery time; a document the parent acknowledges after a child cloned but before the split
++     * commits would only ever land in a later parent manifest generation that no child references,
++     * and would be lost when the parent's routing is retired at commit. The rejection is a
++     * shard-not-available (retriable) exception, so the write succeeds after re-routing to a
++     * committed child -- no silent data loss.
++     */
++    public void testRejectsPrimaryWriteWhileInPlaceSplitInProgress() throws IOException {
++        final IndexShard shard = newStartedShard(true);
++        try {
++            // A write succeeds normally before the split starts.
++            indexDoc(shard, "_doc", "0");
++
++            // Mark this shard as the parent of an in-progress (not-yet-committed) in-place split.
++            final IndexMetadata current = shard.indexSettings().getIndexMetadata();
++            final SplitShardsMetadata.Builder splittingBuilder = new SplitShardsMetadata.Builder(current.getNumberOfShards());
++            splittingBuilder.splitShard(shard.shardId().id(), 2);
++            final SplitShardsMetadata splitting = splittingBuilder.build();
++            assertTrue(splitting.isSplitOfShardInProgress(shard.shardId().id()));
++            shard.indexSettings().updateIndexMetadata(IndexMetadata.builder(current).splitShardsMetadata(splitting).build());
++
++            // A new primary index is now cleanly rejected...
++            final IllegalIndexShardStateException indexRejection = expectThrows(
++                IllegalIndexShardStateException.class,
++                () -> indexDoc(shard, "_doc", "1")
++            );
++            assertThat(indexRejection.getMessage(), containsString("in-place split of this shard is in progress"));
++            // ...with a shard-not-available (retriable) exception, exactly like a relocating/closing shard.
++            assertTrue(TransportActions.isShardNotAvailableException(indexRejection));
++
++            // Deletes are rejected the same way.
++            final IllegalIndexShardStateException deleteRejection = expectThrows(
++                IllegalIndexShardStateException.class,
++                () -> deleteDoc(shard, "0")
++            );
++            assertTrue(TransportActions.isShardNotAvailableException(deleteRejection));
++        } finally {
++            closeShards(shard);
++        }
++    }
++
+     public void testRelocatedSegRepError() throws IOException, InterruptedException {
+         final IndexShard shard = newStartedShard(true);
+         final ShardRouting originalRouting = shard.routingEntry();
+diff --git a/test/framework/src/main/java/org/opensearch/cluster/routing/TestShardRouting.java b/test/framework/src/main/java/org/opensearch/cluster/routing/TestShardRouting.java
+index 55c42878d45..a6af658be2c 100644
+--- a/test/framework/src/main/java/org/opensearch/cluster/routing/TestShardRouting.java
++++ b/test/framework/src/main/java/org/opensearch/cluster/routing/TestShardRouting.java
+@@ -271,7 +271,6 @@ public class TestShardRouting {
+                 }
+             case STARTED:
+             case RELOCATING:
+-            case SPLITTING:
+                 return null;
+             default:
+                 throw new IllegalStateException("illegal state");
+@@ -288,9 +287,6 @@ public class TestShardRouting {
+             case RELOCATING:
+                 AllocationId allocationId = AllocationId.newInitializing();
+                 return AllocationId.newRelocation(allocationId);
+-            case SPLITTING:
+-                AllocationId splitAllocId = AllocationId.newInitializing();
+-                return AllocationId.newSplit(splitAllocId, 2);
+             default:
+                 throw new IllegalStateException("illegal state");
+         }
+@@ -303,7 +299,6 @@ public class TestShardRouting {
+                 return new UnassignedInfo(OpenSearchTestCase.randomFrom(UnassignedInfo.Reason.values()), "auto generated for test");
+             case STARTED:
+             case RELOCATING:
+-            case SPLITTING:
+                 return null;
+             default:
+                 throw new IllegalStateException("illegal state");
+-- 
+2.53.0
+

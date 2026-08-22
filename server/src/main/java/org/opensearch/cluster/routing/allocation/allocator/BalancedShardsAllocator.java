@@ -59,9 +59,11 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -99,6 +101,8 @@ public class BalancedShardsAllocator implements ShardsAllocator {
         "cluster.routing.allocation.balance.index",
         0.55f,
         0.0f,
+        Float.MAX_VALUE,
+        new IndexBalanceFactorValidator(),
         Property.Dynamic,
         Property.NodeScope
     );
@@ -106,6 +110,8 @@ public class BalancedShardsAllocator implements ShardsAllocator {
         "cluster.routing.allocation.balance.shard",
         0.45f,
         0.0f,
+        Float.MAX_VALUE,
+        new ShardBalanceFactorValidator(),
         Property.Dynamic,
         Property.NodeScope
     );
@@ -519,6 +525,67 @@ public class BalancedShardsAllocator implements ShardsAllocator {
     }
 
     /**
+     * Validates that the index balance factor, combined with the shard balance factor, sums to a value greater than zero.
+     *
+     * @opensearch.internal
+     */
+    static final class IndexBalanceFactorValidator implements Setting.Validator<Float> {
+
+        @Override
+        public void validate(Float value) {}
+
+        @Override
+        public void validate(final Float value, final Map<Setting<?>, Object> settings) {
+            final float shardBalance = (Float) settings.get(SHARD_BALANCE_FACTOR_SETTING);
+            doValidateBalanceFactorSum(value, shardBalance);
+        }
+
+        @Override
+        public Iterator<Setting<?>> settings() {
+            final List<Setting<?>> settings = Collections.singletonList(SHARD_BALANCE_FACTOR_SETTING);
+            return settings.iterator();
+        }
+    }
+
+    /**
+     * Validates that the shard balance factor, combined with the index balance factor, sums to a value greater than zero.
+     *
+     * @opensearch.internal
+     */
+    static final class ShardBalanceFactorValidator implements Setting.Validator<Float> {
+
+        @Override
+        public void validate(Float value) {}
+
+        @Override
+        public void validate(final Float value, final Map<Setting<?>, Object> settings) {
+            final float indexBalance = (Float) settings.get(INDEX_BALANCE_FACTOR_SETTING);
+            doValidateBalanceFactorSum(indexBalance, value);
+        }
+
+        @Override
+        public Iterator<Setting<?>> settings() {
+            final List<Setting<?>> settings = Collections.singletonList(INDEX_BALANCE_FACTOR_SETTING);
+            return settings.iterator();
+        }
+    }
+
+    static void doValidateBalanceFactorSum(float indexBalance, float shardBalance) {
+        float sum = indexBalance + shardBalance;
+        if (sum <= 0.0f) {
+            throw new IllegalArgumentException(
+                "Balance factors ["
+                    + INDEX_BALANCE_FACTOR_SETTING.getKey()
+                    + "] and ["
+                    + SHARD_BALANCE_FACTOR_SETTING.getKey()
+                    + "] must sum to a value greater than zero but was ["
+                    + sum
+                    + "]"
+            );
+        }
+    }
+
+    /**
      * This class is the primary weight function used to create balanced over nodes and shards in the cluster.
      * Currently this function has 3 properties:
      * <ul>
@@ -871,6 +938,32 @@ public class BalancedShardsAllocator implements ShardsAllocator {
 
         public float delta() {
             return weights[weights.length - 1] - weights[0];
+        }
+
+        /**
+         * Returns the weight spread between the heaviest and lightest node for {@code index} across
+         * <em>all</em> nodes, without sorting, reordering, or otherwise mutating this sorter.
+         *
+         * <p>This is an upper bound on any spread {@code balanceByWeights} can observe for that
+         * index, because it only ever compares weights within a subset of these same nodes and
+         * {@link WeightFunction#weightWithRebalanceConstraints} depends solely on the node and on
+         * balancer-wide averages -- never on which nodes happen to be in the array. So an index
+         * whose spread here is already under the balance threshold provably cannot yield a
+         * relocation, and the expensive per-node decider scan for it can be skipped.
+         *
+         * <p>Deliberately does not sort: {@link #reset(String)} would reorder {@code modelNodes},
+         * and with tied weights a non-stable sort could change which node is later selected as the
+         * min or max candidate. Computing the bound must not perturb the decisions it is guarding.
+         */
+        public float weightSpreadAcrossAllNodes(String index) {
+            float min = Float.POSITIVE_INFINITY;
+            float max = Float.NEGATIVE_INFINITY;
+            for (ModelNode node : modelNodes) {
+                final float weight = function.weightWithRebalanceConstraints(balancer, node, index);
+                min = Math.min(min, weight);
+                max = Math.max(max, weight);
+            }
+            return max - min;
         }
     }
 }

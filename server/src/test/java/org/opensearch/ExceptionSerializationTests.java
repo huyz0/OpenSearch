@@ -903,6 +903,9 @@ public class ExceptionSerializationTests extends OpenSearchTestCase {
         ids.put(176, IngestionEngineException.class);
         ids.put(177, StreamException.class);
         ids.put(178, org.opensearch.index.engine.dataformat.merge.MergeFailedEngineException.class);
+        ids.put(179, org.opensearch.storage.action.tiering.MergeDrainTimeoutException.class);
+        ids.put(180, org.opensearch.cluster.metadata.DescriptorUnavailableException.class);
+        ids.put(181, org.opensearch.cluster.metadata.UnsupportedWildcardException.class);
         ids.put(10001, IndexCreateBlockException.class);
 
         Map<Class<? extends OpenSearchException>, Integer> reverse = new HashMap<>();

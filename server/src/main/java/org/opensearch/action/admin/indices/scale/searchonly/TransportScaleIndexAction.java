@@ -37,6 +37,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
@@ -310,7 +311,7 @@ public class TransportScaleIndexAction extends TransportClusterManagerNodeAction
         final ActionListener<AcknowledgedResponse> listener
     ) {
         IndexMetadata indexMetadata = currentState.metadata().index(index);
-        if (!validator.validateScalePrerequisites(indexMetadata, index, listener, false)) {
+        if (!validator.validateScalePrerequisites(indexMetadata, currentState.routingTable(), index, listener, false)) {
             return;
         }
 
@@ -340,6 +341,7 @@ public class TransportScaleIndexAction extends TransportClusterManagerNodeAction
         private final String index;
         private final Map<Index, ClusterBlock> blockedIndices;
         private final ActionListener<AcknowledgedResponse> listener;
+        private boolean validationFailed;
 
         AddBlockClusterStateUpdateTask(
             String index,
@@ -355,26 +357,42 @@ public class TransportScaleIndexAction extends TransportClusterManagerNodeAction
         @Override
         public ClusterState execute(final ClusterState currentState) {
             IndexMetadata indexMetadata = currentState.metadata().index(index);
-            try {
-                validator.validateScalePrerequisites(indexMetadata, index, listener, true);
-                return scaleIndexClusterStateBuilder.buildScaleDownState(currentState, index, blockedIndices);
-            } catch (Exception e) {
+            if (validator.validateScalePrerequisites(indexMetadata, currentState.routingTable(), index, listener, true) == false) {
+                this.validationFailed = true;
                 return currentState;
             }
+            return scaleIndexClusterStateBuilder.buildScaleDownState(currentState, index, blockedIndices);
         }
 
         @Override
         public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+            if (validationFailed) {
+                return;
+            }
+
             if (oldState == newState) {
-                listener.onResponse(new AcknowledgedResponse(true));
+                // Validation passed but the state did not change, so the scale-down block was never
+                // applied and nothing downstream will run. Reporting success here would be the
+                // failure mode this whole path is careful about elsewhere: a confident ack for an
+                // operation that did not happen.
+                listener.onFailure(
+                    new IllegalStateException(
+                        "scale-down of index [" + index + "] produced no cluster state change; the block was not applied"
+                    )
+                );
                 return;
             }
 
             IndexMetadata indexMetadata = newState.metadata().index(index);
-            if (indexMetadata != null) {
-                Map<ShardId, String> primaryShardsNodes = scaleIndexShardSyncManager.getPrimaryShardAssignments(indexMetadata, newState);
-                proceedWithScaleDown(index, primaryShardsNodes, listener);
+            if (indexMetadata == null) {
+                // The index went away between execute() and here. Previously this fell off the end of
+                // the method without touching the listener, so the caller's request hung until it
+                // timed out rather than being told what happened.
+                listener.onFailure(new IndexNotFoundException(index));
+                return;
             }
+            Map<ShardId, String> primaryShardsNodes = scaleIndexShardSyncManager.getPrimaryShardAssignments(indexMetadata, newState);
+            proceedWithScaleDown(index, primaryShardsNodes, listener);
         }
 
         @Override

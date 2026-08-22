@@ -12,10 +12,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.search.SearchShardTask;
 import org.opensearch.action.search.SearchTask;
-import org.opensearch.common.Nullable;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.common.metrics.CounterMetric;
-import org.opensearch.plugin.stats.AnalyticsBackendTaskCancellationStats;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -26,7 +24,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -57,11 +54,15 @@ public class TaskCancellationMonitoringService extends AbstractLifecycleComponen
      */
     private final Map<Class<? extends CancellableTask>, TaskCancellationStatsHolder> cancellationStatsHolder;
     private final TaskCancellationMonitoringSettings taskCancellationMonitoringSettings;
-    @Nullable
-    private final Supplier<AnalyticsBackendTaskCancellationStats> nativeStatsSupplier;
 
     /**
-     * Constructs a TaskCancellationMonitoringService without native stats support.
+     * Constructs a TaskCancellationMonitoringService.
+     *
+     * <p>This used to take a fourth argument: a nullable supplier of an analytics backend's
+     * post-cancellation counters, picked in {@code Node} from whichever backend plugin happened to
+     * come first. Core only forwarded those counters into {@code TaskCancellationStats}' XContent
+     * and never read them, so the plugin now contributes them directly through
+     * {@code Plugin#nodeStats()} instead of pushing them into this service.
      *
      * @param threadPool                          the thread pool for scheduling
      * @param taskManager                         the task manager to monitor
@@ -72,27 +73,9 @@ public class TaskCancellationMonitoringService extends AbstractLifecycleComponen
         TaskManager taskManager,
         TaskCancellationMonitoringSettings taskCancellationMonitoringSettings
     ) {
-        this(threadPool, taskManager, taskCancellationMonitoringSettings, null);
-    }
-
-    /**
-     * Constructs a TaskCancellationMonitoringService with optional native stats support.
-     *
-     * @param threadPool                          the thread pool for scheduling
-     * @param taskManager                         the task manager to monitor
-     * @param taskCancellationMonitoringSettings  the monitoring settings
-     * @param nativeStatsSupplier                 supplier for native task cancellation stats, or null
-     */
-    public TaskCancellationMonitoringService(
-        ThreadPool threadPool,
-        TaskManager taskManager,
-        TaskCancellationMonitoringSettings taskCancellationMonitoringSettings,
-        @Nullable Supplier<AnalyticsBackendTaskCancellationStats> nativeStatsSupplier
-    ) {
         this.threadPool = threadPool;
         this.taskManager = taskManager;
         this.taskCancellationMonitoringSettings = taskCancellationMonitoringSettings;
-        this.nativeStatsSupplier = nativeStatsSupplier;
         this.cancelledTaskTracker = new ConcurrentHashMap<>();
         cancellationStatsHolder = TASKS_TO_TRACK.stream()
             .collect(Collectors.toConcurrentMap(task -> task, task -> new TaskCancellationStatsHolder()));
@@ -177,8 +160,6 @@ public class TaskCancellationMonitoringService extends AbstractLifecycleComponen
         Map<Class<? extends CancellableTask>, List<CancellableTask>> currentRunningCancelledTasks =
             getCurrentRunningTasksPostCancellation();
 
-        AnalyticsBackendTaskCancellationStats nativeStats = fetchNativeStats();
-
         return new TaskCancellationStats(
             new SearchTaskCancellationStats(
                 Optional.of(currentRunningCancelledTasks).map(mapper -> mapper.get(SearchTask.class)).map(List::size).orElse(0),
@@ -187,22 +168,8 @@ public class TaskCancellationMonitoringService extends AbstractLifecycleComponen
             new SearchShardTaskCancellationStats(
                 Optional.of(currentRunningCancelledTasks).map(mapper -> mapper.get(SearchShardTask.class)).map(List::size).orElse(0),
                 cancellationStatsHolder.get(SearchShardTask.class).totalLongRunningCancelledTaskCount.count()
-            ),
-            nativeStats
+            )
         );
-    }
-
-    @Nullable
-    private AnalyticsBackendTaskCancellationStats fetchNativeStats() {
-        if (nativeStatsSupplier == null) {
-            return null;
-        }
-        try {
-            return nativeStatsSupplier.get();
-        } catch (Exception e) {
-            logger.debug("Failed to fetch native task cancellation stats", e);
-            return null;
-        }
     }
 
     private Map<Class<? extends CancellableTask>, List<CancellableTask>> getCurrentRunningTasksPostCancellation() {

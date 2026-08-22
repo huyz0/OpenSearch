@@ -10,6 +10,7 @@ package org.opensearch.action.admin.indices.scale.searchonly;
 
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.indices.replication.common.ReplicationType;
 
@@ -42,6 +43,11 @@ class ScaleIndexOperationValidator {
      * </ul>
      *
      * @param indexMetadata the metadata of the index to validate
+     * @param routingTable  the routing table {@code indexMetadata} was read alongside, consulted for
+     *                      whether this index's routing
+     *                      is computed rather than published; {@link RoutingTable#EMPTY_ROUTING_TABLE} (or
+     *                      any routing table with no resolver attached) is always safe to pass and answers
+     *                      exactly as before this parameter existed.
      * @param index         the name of the index being validated
      * @param listener      the action listener to notify in case of validation failure
      * @param isScaleDown   true if validating for scale-down, false for scale-up
@@ -49,6 +55,7 @@ class ScaleIndexOperationValidator {
      */
     boolean validateScalePrerequisites(
         IndexMetadata indexMetadata,
+        RoutingTable routingTable,
         String index,
         ActionListener<AcknowledgedResponse> listener,
         boolean isScaleDown
@@ -56,6 +63,28 @@ class ScaleIndexOperationValidator {
         try {
             if (indexMetadata == null) {
                 throw new IllegalArgumentException("Index [" + index + "] not found");
+            }
+            // Refused here rather than half-supported, and this has to come before every other check so
+            // that nothing downstream reads routing that does not exist. Scaling works by rewriting the
+            // published routing table to add and remove search-only shards, and a computed index has no
+            // published entry to rewrite. Supporting it would mean the placement function itself had to
+            // express search-only scaling, which is a design question nobody has asked yet.
+            //
+            // What this replaces is not a polite failure. ScaleIndexShardSyncManager dereferenced the
+            // absent entry and threw NullPointerException from clusterStateProcessed, which runs on the
+            // cluster state applier thread, so the failure landed in an applier rather than in the
+            // request that caused it. The scale-up path was worse in a quieter way: a null guard meant it
+            // built a routing table with no trace of the index and reported success.
+            // routingTable.shouldPublishRouting(...) resolves through the resolver attached to this
+            // call's own routing table (replacing an earlier static-registry lookup) -- the same
+            // predicate.
+            if (routingTable.shouldPublishRouting(indexMetadata) == false) {
+                throw new IllegalArgumentException(
+                    "Index ["
+                        + index
+                        + "] cannot be scaled because its shard placement is computed rather than published, "
+                        + "and scaling works by rewriting the published routing table"
+                );
             }
             if (isScaleDown) {
                 if (indexMetadata.getSettings().getAsBoolean(IndexMetadata.INDEX_BLOCKS_SEARCH_ONLY_SETTING.getKey(), false)) {

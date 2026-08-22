@@ -48,6 +48,7 @@ import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.XContent;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestCancellableNodeClient;
 import org.opensearch.rest.action.RestToXContentListener;
@@ -216,5 +217,11 @@ public class RestMultiSearchAction extends BaseRestHandler {
     @Override
     protected Set<String> responseParams() {
         return RESPONSE_PARAMS;
+    }
+
+    /** Phase 5 REST gating audit: standard read, alongside search (already AVAILABLE). */
+    @Override
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 }

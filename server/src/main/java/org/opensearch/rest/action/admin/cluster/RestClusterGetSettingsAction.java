@@ -45,6 +45,7 @@ import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.RestResponse;
 import org.opensearch.rest.action.RestBuilderListener;
@@ -75,6 +76,12 @@ public class RestClusterGetSettingsAction extends BaseRestHandler {
         this.settings = settings;
         this.clusterSettings = clusterSettings;
         this.settingsFilter = settingsFilter;
+    }
+
+    /** Read-only metadata lookup, safe to expose when a plugin restricts the REST surface to a vetted allowlist. */
+    @Override
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 
     @Override

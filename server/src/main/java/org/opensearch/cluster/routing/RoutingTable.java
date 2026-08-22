@@ -81,9 +81,76 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
     // index to IndexRoutingTable map
     private final Map<String, IndexRoutingTable> indicesRouting;
 
+    /**
+     * Storage for a plugin-supplied {@link
+     * IndexRoutingResolver}, propagated the same way {@link org.opensearch.cluster.metadata.Metadata}'s
+     * own resolver is (see that field's javadoc for the full reasoning): a mutable, non-wire field, not a
+     * constructor parameter -- this constructor is {@code public} and used directly by callers this
+     * branch does not control, so its arity cannot change.
+     *
+     * <p><b>Design note the implementation surfaced:</b> unlike {@code Metadata#index(String)},
+     * a bare {@code RoutingTable} genuinely cannot consult this resolver from inside {@link
+     * #index(String)} itself -- real routing resolution needs the index's {@code IndexMetadata} (at
+     * minimum, its shard count) and often the live node list, and {@code RoutingTable} deliberately holds
+     * neither; it is one of {@link org.opensearch.cluster.ClusterState}'s constituent parts, not the
+     * whole. The consultation point is therefore a new method on {@code ClusterState} itself (which holds
+     * both {@code metadata()} and {@code routingTable()} together), not here. This field only stores the
+     * resolver so it survives every {@code RoutingTable} mutation on a node, the same way {@code
+     * Metadata}'s does.
+     */
+    private transient IndexRoutingResolver resolver;
+
     public RoutingTable(long version, final Map<String, IndexRoutingTable> indicesRouting) {
         this.version = version;
         this.indicesRouting = Collections.unmodifiableMap(indicesRouting);
+    }
+
+    /**
+     * See {@link #resolver}'s own javadoc for why this is a mutable setter, not a constructor parameter.
+     *
+     * <p>A no-op on {@link #EMPTY_ROUTING_TABLE} itself: that field is a shared, JVM-wide singleton --
+     * {@link org.opensearch.cluster.ClusterState.Builder}'s default when no explicit routing table is set,
+     * and reused as a convenience placeholder throughout tests and bootstrap code -- so mutating this
+     * transient field on it would leak one caller's resolver into every other unrelated {@code
+     * ClusterState} that also defaults to it. See {@link org.opensearch.cluster.metadata.Metadata
+     * #attachIndexMetadataResolver}'s identical guard for the full reasoning.
+     */
+    public void attachIndexRoutingResolver(IndexRoutingResolver resolver) {
+        if (this == EMPTY_ROUTING_TABLE) {
+            return;
+        }
+        this.resolver = resolver;
+    }
+
+    /** The currently-attached resolver, or {@code null} if none is. */
+    public IndexRoutingResolver indexRoutingResolver() {
+        return resolver;
+    }
+
+    /**
+     * Wires {@link IndexRoutingResolver#shouldPublishRouting}
+     * -- declared before, per that method's own "wiring status" note, any core call site consulted it --
+     * replacing direct calls to the pre-existing static registry, {@code
+     * AbsentIndexRoutingSuppliers#shouldPublishRouting}.
+     *
+     * <p>Lives here rather than on {@code ClusterState}, unlike {@link
+     * org.opensearch.cluster.ClusterState#getIndexRoutingTable}: this question only ever needs an {@link
+     * IndexMetadata}, which every real call site already has in hand, so there is no reason to require a
+     * full {@code ClusterState} the way resolving an actual routing table does.
+     *
+     * <p>{@code true} by default -- matching the resolver method's own default and the static registry's --
+     * so a node with no resolver attached, or one that declines/throws, always publishes routing, exactly
+     * today's behavior.
+     */
+    public boolean shouldPublishRouting(IndexMetadata indexMetadata) {
+        if (resolver == null || indexMetadata == null) {
+            return true;
+        }
+        try {
+            return resolver.shouldPublishRouting(indexMetadata);
+        } catch (Exception e) {
+            return true;
+        }
     }
 
     /**
@@ -164,6 +231,45 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
     public IndexShardRoutingTable shardRoutingTable(ShardId shardId) {
         IndexRoutingTable indexRouting = index(shardId.getIndexName());
         if (indexRouting == null || indexRouting.getIndex().equals(shardId.getIndex()) == false) {
+            throw new IndexNotFoundException(shardId.getIndex());
+        }
+        IndexShardRoutingTable shard = indexRouting.shard(shardId.id());
+        if (shard == null) {
+            throw new ShardNotFoundException(shardId);
+        }
+        return shard;
+    }
+
+    /**
+     * All shards for the provided {@link ShardId}, returning {@code null} when -- and only when -- the
+     * index has no {@link IndexRoutingTable} entry at all.
+     *
+     * <p>The null-returning sibling of {@link #shardRoutingTable(ShardId)}, added rather than changing
+     * that method's contract because it has more than twenty callers and most of them do want the
+     * exception. The two that do not are {@code TransportReplicationAction.ReroutePhase} and
+     * {@code TransportBulkAction}: both already have a "primary is not allocated yet, wait and retry"
+     * branch immediately below the lookup, and both were failing the request outright before ever
+     * reaching it, because the lookup threw first on an index present in metadata and absent from
+     * routing.
+     *
+     * <p><b>The narrowness is the design.</b> An unknown shard of an index that <em>is</em> in the
+     * routing table still throws {@link ShardNotFoundException}, and a {@link ShardId} carrying a
+     * different index UUID still throws {@link IndexNotFoundException}. Both are permanent errors and
+     * neither has anything to do with cold indices; a blanket null would have turned them into
+     * retry-until-timeout, reporting the wrong error after wasting the timeout. An existing
+     * {@code TransportReplicationActionTests} case caught exactly that when this method was first
+     * written the broad way.
+     *
+     * <p>So the only behaviour this changes is absence of the index from routing. Prefer
+     * {@link #shardRoutingTable(ShardId)} unless the caller has a real answer for that state.
+     */
+    @Nullable
+    public IndexShardRoutingTable shardRoutingTableOrNull(ShardId shardId) {
+        IndexRoutingTable indexRouting = index(shardId.getIndexName());
+        if (indexRouting == null) {
+            return null;
+        }
+        if (indexRouting.getIndex().equals(shardId.getIndex()) == false) {
             throw new IndexNotFoundException(shardId.getIndex());
         }
         IndexShardRoutingTable shard = indexRouting.shard(shardId.id());
@@ -441,7 +547,13 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
 
         @Override
         public RoutingTable apply(RoutingTable part) {
-            return new RoutingTable(version, indicesRouting.apply(part.indicesRouting));
+            RoutingTable applied = new RoutingTable(version, indicesRouting.apply(part.indicesRouting));
+            // Same fix MetadataDiff#apply needed and for
+            // the same reason -- this constructs a fresh RoutingTable with nothing to inherit a resolver
+            // from on its own, and diff application is the normal way cluster state propagates after the
+            // first full state.
+            applied.attachIndexRoutingResolver(part.resolver);
+            return applied;
         }
 
         @Override
@@ -474,6 +586,8 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
 
         private long version;
         private Map<String, IndexRoutingTable> indicesRouting = new HashMap<>();
+        /** Carried forward to whatever this builder produces. See {@link RoutingTable#resolver}'s own javadoc. */
+        private IndexRoutingResolver resolver;
 
         public Builder() {
 
@@ -484,6 +598,17 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
             for (IndexRoutingTable indexRoutingTable : routingTable) {
                 indicesRouting.put(indexRoutingTable.getIndex().getName(), indexRoutingTable);
             }
+            resolver = routingTable.resolver;
+        }
+
+        /**
+         * Overrides the resolver this builder's {@link #build()} attaches. See {@code
+         * Metadata.Builder#resolver}'s own javadoc for the parallel case -- most callers never need this,
+         * it exists for the one place that has to attach it in the first place.
+         */
+        public Builder resolver(IndexRoutingResolver resolver) {
+            this.resolver = resolver;
+            return this;
         }
 
         public Builder updateNodes(long version, RoutingNodes routingNodes) {
@@ -717,6 +842,7 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
                 throw new IllegalStateException("once build is called the builder cannot be reused");
             }
             RoutingTable table = new RoutingTable(version, indicesRouting);
+            table.attachIndexRoutingResolver(resolver);
             indicesRouting = null;
             return table;
         }

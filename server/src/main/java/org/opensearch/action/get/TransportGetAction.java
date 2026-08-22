@@ -36,6 +36,7 @@ import org.opensearch.action.RoutingMissingException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.single.shard.TransportSingleShardAction;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.Preference;
@@ -172,7 +173,15 @@ public class TransportGetAction extends TransportSingleShardAction<GetRequest, G
     @Override
     protected String getExecutor(GetRequest request, ShardId shardId) {
         final ClusterState clusterState = clusterService.state();
-        if (clusterState.metadata().getIndexSafe(shardId.getIndex()).isSystem()) {
+        // Resolved rather than demanded. getIndexSafe throws for an index cluster state has no entry for,
+        // and a gated index is exactly that by design, so consulting it here failed every get by id with
+        // "no such index" while bulk and search worked. This is the only read path that picks its thread
+        // pool from metadata, which is why it was the only one that broke and why nothing else caught it.
+        //
+        // A null answer means neither cluster state nor the descriptor knows this index, which is a case the
+        // executor choice does not have to be right about: the request is about to fail on its own.
+        final IndexMetadata indexMetadata = clusterState.metadata().indexOrResolved(shardId.getIndex());
+        if (indexMetadata != null && indexMetadata.isSystem()) {
             return ThreadPool.Names.SYSTEM_READ;
         } else if (indicesService.indexServiceSafe(shardId.getIndex()).getIndexSettings().isSearchThrottled()) {
             return ThreadPool.Names.SEARCH_THROTTLED;
