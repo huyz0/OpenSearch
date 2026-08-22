@@ -8,9 +8,11 @@
 
 package org.opensearch.serverless.storage;
 
+import org.opensearch.cluster.NamedDiff;
 import org.opensearch.cluster.metadata.IndexCreationStrategy;
 import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver;
 import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -1835,6 +1837,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(SERVERLESS_STORAGE_READER_PRE_WARM_ENABLED_SETTING, readerShardPreWarmCoordinator::setEnabled);
         clusterService.addStateApplier(readerShardPreWarmCoordinator);
+        // Same registration shape as the coordinator above: this applier used to be constructed by
+        // core's IndicesClusterStateService, but everything it does (descriptor prefetch on fleet
+        // expansion, filtered to this node's affinity share) only means something with this plugin
+        // installed, so this plugin owns it. Its gated-index supplier tolerates running before
+        // setIndicesClusterStateService by answering empty, same as onDemandOpenGatedIndices().
+        clusterService.addStateApplier(
+            new org.opensearch.serverless.storage.placement.GatedIndexPrewarmer(this::onDemandOpenGatedIndexNames)
+        );
+        // Placement membership maintenance, relocated here from core's Node.java when the service moved
+        // into this plugin. Same registration shape Node used: membership is written by whichever node is
+        // elected, so every cluster-manager-eligible node carries the maintainer and the service itself
+        // checks election. It stays inert until a placement supplier is installed, so a cluster running
+        // this plugin with the feature off never acquires the metadata.
+        if (org.opensearch.cluster.node.DiscoveryNode.isClusterManagerNode(environment.settings())) {
+            clusterService.addListener(
+                new org.opensearch.serverless.storage.placement.ComputedPlacementMembershipService(clusterService)
+            );
+        }
         serverlessStorageIndexSettingProvider.setDependencies(dataStreamShardCountAdvisorCache);
         serverlessStorageExistingShardsAllocator.setDependencies(
             clusterService,
@@ -2981,6 +3001,30 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return Optional.of(new SupplierBackedIndexMetadataResolver());
     }
 
+    /**
+     * The {@link org.opensearch.serverless.storage.placement.ComputedPlacementMembership} cluster-state
+     * custom, relocated here from core's {@code ClusterModule} registration when the class itself moved
+     * into this plugin. The wire name ({@code computed_placement_membership}) is byte-identical to what
+     * core registered, so a rolling restart across the relocation reads its own persisted membership
+     * back. NamedWriteable-only, deliberately: this custom never had a NamedXContent parser in core
+     * either, and registering one here would be a behavior change rather than a move.
+     */
+    @Override
+    public List<NamedWriteableRegistry.Entry> getNamedWriteables() {
+        return List.of(
+            new NamedWriteableRegistry.Entry(
+                Metadata.Custom.class,
+                org.opensearch.serverless.storage.placement.ComputedPlacementMembership.TYPE,
+                org.opensearch.serverless.storage.placement.ComputedPlacementMembership::new
+            ),
+            new NamedWriteableRegistry.Entry(
+                NamedDiff.class,
+                org.opensearch.serverless.storage.placement.ComputedPlacementMembership.TYPE,
+                org.opensearch.serverless.storage.placement.ComputedPlacementMembership::readDiffFrom
+            )
+        );
+    }
+
     /** The routing counterpart to {@link #getIndexMetadataResolver()} -- see that method's own javadoc. */
     @Override
     public Optional<IndexRoutingResolver> getIndexRoutingResolver() {
@@ -3520,6 +3564,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
+     * Name-level companion to {@link #onDemandOpenGatedIndices()}, with the same "empty until
+     * {@link #setIndicesClusterStateService} has run" contract. {@link
+     * org.opensearch.serverless.storage.placement.GatedIndexPrewarmer}'s gated-index supplier.
+     */
+    public List<String> onDemandOpenGatedIndexNames() {
+        org.opensearch.indices.cluster.IndicesClusterStateService service = indicesClusterStateService;
+        return service == null ? List.of() : service.onDemandOpenIndexNames();
+    }
+
+    /**
      * Builds a fresh {@link WriterPublicationNotifier} for {@link #getEngineFactory} to hand to a
      * produced {@code WriterEngineFactory}, or {@code null} if {@link #setTransportService} hasn't
      * run yet -- in practice this never happens for a real writer shard (every registered transport
@@ -3637,7 +3691,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         //
         // One node's claim rather than everyone's. Clearing outright disarmed gating for every other node
         // still running in the same JVM, which InternalTestCluster always has several of. That is not only a
-        // test problem: IndicesClusterStateService.heldOnDemand reads whether a descriptor supplier is
+        // test problem: GatedIndexResidency.heldOnDemand reads whether a descriptor supplier is
         // registered to decide whether it is holding an index on demand, so an unbalanced uninstall can make
         // a live node stop recognising gated indices it is currently serving.
         org.opensearch.serverless.storage.descriptor.DescriptorGate.uninstallOneNode();

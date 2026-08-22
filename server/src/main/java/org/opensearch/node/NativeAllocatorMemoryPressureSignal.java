@@ -17,7 +17,7 @@ import java.util.OptionalDouble;
 import java.util.function.Supplier;
 
 /**
- * Phase H of {@code core-pluggability-refactor-plan.md}: adapts the Arrow allocator's concrete {@link
+ * Adapts the Arrow allocator's concrete {@link
  * NativeAllocatorPoolStats} (grouped by {@link PoolGroup}) onto the generic {@link
  * NativeMemoryPressureSignal} the admission-control package consumes -- see that interface's own javadoc
  * for why this split exists. This class, not {@code NativeMemoryBasedAdmissionController}, is the one

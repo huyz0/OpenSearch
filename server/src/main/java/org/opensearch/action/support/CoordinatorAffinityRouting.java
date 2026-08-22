@@ -19,10 +19,14 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Utility for computing coordinator node affinity for index names.
+ * Utility for computing a stable node affinity for index names.
  *
- * <p>Uses consistent rendezvous hashing over node IDs to map an index name to a primary
- * candidate coordinator node, maximizing coordinator LRU descriptor cache hit ratios (Area B).
+ * <p>Uses rendezvous (highest-random-weight) hashing over node IDs: every node in the cluster
+ * independently computes the same preferred node for a given index name, with no coordination or
+ * shared state, and the mapping is minimally disturbed when nodes join or leave -- only the index
+ * names whose preferred node departed move. Callers use this to route repeated work for the same
+ * index name to the same node, e.g. so that any per-index state cached on that node is reused
+ * rather than rebuilt elsewhere.
  */
 public final class CoordinatorAffinityRouting {
 

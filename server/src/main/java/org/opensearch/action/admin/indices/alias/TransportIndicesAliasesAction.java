@@ -218,7 +218,7 @@ public class TransportIndicesAliasesAction extends TransportClusterManagerNodeAc
                 for (Index concreteIndex : concreteIndices.concreteIndices()) {
                     IndexAbstraction indexAbstraction = state.metadata().getIndicesLookup().get(concreteIndex.getName());
                     // Deliberately still the raw AbsentIndexDescriptorSuppliers.supply(...) != null, not
-                    // Metadata#existsOrResolved (Phase C4b of core-pluggability-refactor-plan.md): the two
+                    // Metadata#existsOrResolved: the two
                     // differ for a tombstoned descriptor (supply() returns the tombstone record, non-null;
                     // existsOrResolved's resolver chain filters it to false), and concreteIndex here already
                     // passed IndexNameExpressionResolver's own existence filtering upstream -- left on the

@@ -16,18 +16,13 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import java.io.IOException;
 
 /**
- * Phase F of core-pluggability-refactor-plan.md, the fifth and final call site. {@code SourceFieldMapper.PARSER}
- * now asks {@link org.opensearch.index.engine.dataformat.DataFormat#requiresSourceEnabled()} instead of
- * unconditionally rejecting {@code "_source": {"enabled": false}} whenever the pluggable-data-format feature
- * is on.
+ * {@code SourceFieldMapper.PARSER} rejects {@code "_source": {"enabled": false}} whenever the
+ * pluggable-data-format feature is on.
  *
- * <p>This is a genuinely different question from {@code TextFieldMapperPluggableDataFormatTests}' stored
- * -field forcing, not a copy of it despite the near-identical wiring shape: {@code _source}'s own {@link
- * SourceFieldMapper.Defaults#FIELD_TYPE} is <em>already</em> unconditionally stored, regardless of any
- * setting or this new capability -- what {@code requiresSourceEnabled()} actually gates is whether a mapping
- * is allowed to disable {@code _source} entirely. See {@code DataFormat#requiresSourceEnabled()}'s own
- * javadoc for why this is a separate capability method from {@code requiresStoredFields()} rather than a
- * reuse of it.
+ * <p>This is a different question from {@code TextFieldMapperPluggableDataFormatTests}' stored
+ * -field forcing: {@code _source}'s own {@link SourceFieldMapper.Defaults#FIELD_TYPE} is
+ * <em>already</em> unconditionally stored, regardless of any setting -- what is gated here is
+ * whether a mapping is allowed to disable {@code _source} entirely.
  *
  * <p>Follows the same shape/rationale as {@code TextFieldMapperPluggableDataFormatTests}/{@code
  * ObjectMapperPluggableDataFormatTests} for why this extends {@link MapperServiceTestCase} rather than

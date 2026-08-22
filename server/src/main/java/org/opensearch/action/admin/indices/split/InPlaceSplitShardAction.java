@@ -21,10 +21,10 @@ import java.io.IOException;
 import static org.opensearch.action.ValidateActions.addValidationError;
 
 /**
- * Operator-triggered in-place shard split (dynamic-partitioning-plan.md Phase 0.6): closes core's
+ * Operator-triggered in-place shard split: closes core's
  * previously-missing public API for {@link org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService},
- * which existed with no REST/transport action reaching it at all -- see
- * dynamic-partitioning-progress.md's "Task 1" entry, which found this gap directly.
+ * which existed with no REST/transport action reaching it at all -- a gap found directly by
+ * auditing what could actually reach that service.
  *
  * @opensearch.experimental
  */

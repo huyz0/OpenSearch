@@ -360,13 +360,13 @@ public class IndexNameExpressionResolver {
         for (String expression : expressions) {
             IndexAbstraction indexAbstraction = metadata.getIndicesLookup().get(expression);
             if (indexAbstraction == null) {
-                // Area H: an index whose metadata is not in cluster state resolves from its descriptor,
+                // An index whose metadata is not in cluster state resolves from its descriptor,
                 // which carries the uuid the concrete Index needs. Consulted only on a miss, so a name
                 // present in the lookup never reaches the seam and no cluster that has not opted in pays
                 // a lookup it did not pay before.
                 //
-                // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b of
-                // core-pluggability-refactor-plan.md: this reads descriptor.uuid()/state() directly below,
+                // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated to the
+                // resolver-seam accessors: this reads descriptor.uuid()/state() directly below,
                 // which IndexMetadataResolver's generic contract deliberately does not expose.
                 IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(expression);
                 if (descriptor != null && descriptor.exists()) {
@@ -628,13 +628,14 @@ public class IndexNameExpressionResolver {
     public boolean hasIndexAbstraction(String indexAbstraction, ClusterState state) {
         Context context = new Context(state, IndicesOptions.lenientExpandOpen(), false, false, true, isSystemIndexAccessAllowed());
         String resolvedAliasOrIndex = dateMathExpressionResolver.resolveExpression(indexAbstraction, context);
-        // Site 1 of eleven, and the one that was hiding the other ten. H8a taught aliasOrIndexExists to
-        // consult the descriptor seam and did not teach this sibling, so AutoCreateIndex.shouldAutoCreate
-        // was told a gated index does not exist and auto-created an ordinary one over the top of it. S49
-        // and S50 measured the consequence: gating did not survive a first write, and every end-to-end
-        // result claimed before then was served by indices that were no longer gated.
-        // Phase C4b of core-pluggability-refactor-plan.md: state.metadata().existsOrResolved(...) replaces
-        // AbsentIndexDescriptorSuppliers.exists(...) here -- same collapsed exists-or-tombstoned semantics,
+        // Site 1 of eleven, and the one that was hiding the other ten. An earlier fix taught
+        // aliasOrIndexExists to consult the descriptor seam and did not teach this sibling, so
+        // AutoCreateIndex.shouldAutoCreate was told a gated index does not exist and auto-created an
+        // ordinary one over the top of it. Later end-to-end measurement showed the consequence: gating did
+        // not survive a first write, and every end-to-end result claimed before then was served by indices
+        // that were no longer gated.
+        // state.metadata().existsOrResolved(...) replaces AbsentIndexDescriptorSuppliers.exists(...)
+        // here -- same collapsed exists-or-tombstoned semantics,
         // discovered through the resolver attached to this state's own metadata.
         return state.metadata().existsOrResolved(resolvedAliasOrIndex);
     }
@@ -703,15 +704,15 @@ public class IndexNameExpressionResolver {
 
         final IndexMetadata indexMetadata = state.metadata().getIndices().get(index);
         if (indexMetadata == null) {
-            // Site 14, found by T39 on the search half of the end-to-end path rather than by S52 on the
+            // Site 14, found on the search half of the end-to-end path rather than the
             // write half, and only reachable once an index stays gated through a write.
             //
             // Answered here rather than through the descriptor seam -- correctly, but not for the reason
             // this comment used to give. A gated index CAN hold aliases (see
             // MetadataIndexAliasesService#applyAliasActions), so "a gated index has no aliases" was never
             // actually true. What makes "no filtering required" the right answer regardless is narrower and
-            // enforced, not assumed: MetadataIndexAliasesService refuses (Phase A2 of
-            // core-pluggability-refactor-plan.md) any Add action against a gated index that carries a
+            // enforced, not assumed: MetadataIndexAliasesService refuses
+            // any Add action against a gated index that carries a
             // filter, a routing value, or a write-index flag, because IndexDescriptor#aliases has nowhere to
             // record any of those. So every alias a gated index can possibly hold is unfiltered by
             // construction, which is what this method actually needs to be true.
@@ -1128,7 +1129,7 @@ public class IndexNameExpressionResolver {
 
             if (isEmptyOrTrivialWildcard(expressions)) {
                 List<String> resolvedExpressions = resolveEmptyOrTrivialWildcard(options, metadata);
-                // T28. Match-all deliberately does not expand over indices held outside cluster state, and
+                // Match-all deliberately does not expand over indices held outside cluster state, and
                 // this is the one place the wildcard contract gives something up rather than bounding it.
                 //
                 // Two attempts came before this. Expanding _all under the same cap as any other prefix made
@@ -1142,7 +1143,7 @@ public class IndexNameExpressionResolver {
                 //
                 // So _all and * mean what they have always meant, which is everything in cluster state, and
                 // a gated index is reached by prefix or by name. That is consistent rather than
-                // population-dependent, it cannot fail, and it is the same answer H19 and H20 reached for
+                // population-dependent, it cannot fail, and it is the same answer the pagination and stats paths reached for
                 // cluster-wide questions: at this size they are served by aggregates, not by enumeration.
                 //
                 // The cost is real and worth naming: on a small cluster, * silently omits gated indices.
@@ -1240,9 +1241,9 @@ public class IndexNameExpressionResolver {
                 final IndexMetadata.State excludeState = excludeState(options);
                 final Map<String, IndexAbstraction> matches = matches(context, metadata, expression);
                 Set<String> expand = expand(context, excludeState, matches, expression, options.expandWildcardsHidden());
-                // T28. Indices held outside cluster state match no pattern above, because every branch of
+                // Indices held outside cluster state match no pattern above, because every branch of
                 // matches() reads getIndicesLookup() and a gated index is absent from it by construction.
-                // T25 measured the consequence: a tenant searching tenant-* was told there are no matching
+                // The measured consequence: a tenant searching tenant-* was told there are no matching
                 // indices when there were five, and was told it without an error.
                 Set<String> gated = expandGated(expression, options, excludeState);
                 expand.addAll(gated);
@@ -1277,15 +1278,16 @@ public class IndexNameExpressionResolver {
                 // A pattern is not a name, so asking the store whether an index is literally called
                 // "tenant-*" is a remote read that can only miss. Every expression reaches here, including
                 // wildcards, so without this each wildcard request paid one pointless descriptor GET before
-                // reaching the expansion that does the real work. Harmless when H8a added this seam and no
-                // wildcard consulted it; a per-request cost once T28 made wildcards a normal path.
+                // reaching the expansion that does the real work. Harmless when the seam was first added
+                // and no wildcard consulted it; a per-request cost once wildcard expansion over gated
+                // indices made wildcards a normal path.
                 if (Regex.isSimpleMatchPattern(expression)) {
                     return false;
                 }
-                // Area H: an index whose metadata is not in cluster state answers from the descriptor
+                // An index whose metadata is not in cluster state answers from the descriptor
                 // instead. The order matters and is asserted: a name present in the lookup never reaches
                 // the seam, so no cluster that has not opted in pays a lookup it did not pay before.
-                // Phase C4b of core-pluggability-refactor-plan.md: metadata.existsOrResolved(...) replaces
+                // metadata.existsOrResolved(...) replaces
                 // AbsentIndexDescriptorSuppliers.exists(...) here -- same collapsed exists-or-tombstoned
                 // semantics, discovered through the resolver attached to this metadata.
                 return metadata.existsOrResolved(expression);
@@ -1424,21 +1426,21 @@ public class IndexNameExpressionResolver {
          * <p><b>Only a trailing star is answerable.</b> That is not a limitation chosen for convenience: it
          * is the same shape the sorted structure underneath can serve, and it is why {@code matches()} above
          * already has a dedicated {@code suffixWildcard} branch. A leading or embedded star has no range to
-         * scan, so refusing it is the honest answer rather than a slow one. S13 reached this conclusion
-         * about the in-memory name index and it holds identically here.
+         * scan, so refusing it is the honest answer rather than a slow one. The same conclusion was
+         * reached for the in-memory name index and it holds identically here.
          *
          * <p>State and hidden filtering happen here rather than in the store, because both are decisions
          * {@code IndicesOptions} makes per request while the expansion is cached and shared. Closed and
          * hidden gated indices are therefore fetched and then discarded, which costs a field each within a
          * page that is already capped.
          */
-        // Deliberately still AbsentIndexDescriptorSuppliers directly, out of scope for Phase C4b of
-        // core-pluggability-refactor-plan.md (not attempted, not merely unfinished): this is a bulk,
+        // Deliberately still AbsentIndexDescriptorSuppliers directly, scoped out of the resolver-seam
+        // migration (not attempted, not merely unfinished): this is a bulk,
         // capped prefix scan with its own result shape (PrefixMatch/PrefixExpansion), a fundamentally
         // different question from IndexMetadataResolver#resolve's single-index "does this exist". Migrating
         // it would mean designing and adding real new SPI surface for a capability exactly one call site in
-        // core uses -- the kind of interface bloat this plan's own D1 narrowing already rejected once for a
-        // different SPI. Left as a genuinely separate, scoped-out remainder.
+        // core uses -- the kind of interface bloat already rejected once when a
+        // different SPI was narrowed. Left as a genuinely separate, scoped-out remainder.
         private static Set<String> expandGated(String expression, IndicesOptions options, IndexMetadata.State excludeState) {
             if (AbsentIndexDescriptorSuppliers.isExpanderRegistered() == false) {
                 return Set.of();

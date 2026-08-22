@@ -43,7 +43,7 @@ import java.util.function.Supplier;
  *
  * @opensearch.internal
  */
-public class IndexDescriptor implements Writeable, ToXContentObject {
+public class ManifestIndexDescriptor implements Writeable, ToXContentObject {
 
     static final String STATE_FIELD = "state";
     static final String ALIASES_FIELD = "aliases";
@@ -61,7 +61,7 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
     private final boolean warmIndex;
     private final int totalNumberOfShards;
 
-    public IndexDescriptor(
+    public ManifestIndexDescriptor(
         IndexMetadata.State state,
         Map<String, AliasMetadata> aliases,
         boolean system,
@@ -80,7 +80,7 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
     }
 
     /** Taken from the index being written out, so the manifest and the blob cannot disagree. */
-    public static IndexDescriptor of(IndexMetadata indexMetadata) {
+    public static ManifestIndexDescriptor of(IndexMetadata indexMetadata) {
         return of((IndexMetadataHolder) indexMetadata);
     }
 
@@ -89,8 +89,8 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
      * that is currently deferred -- which matters when filling the descriptor in for indices that did
      * not change and so are not being written.
      */
-    public static IndexDescriptor of(IndexMetadataHolder indexMetadata) {
-        return new IndexDescriptor(
+    public static ManifestIndexDescriptor of(IndexMetadataHolder indexMetadata) {
+        return new ManifestIndexDescriptor(
             indexMetadata.getState(),
             indexMetadata.getAliases(),
             indexMetadata.isSystem(),
@@ -146,7 +146,7 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
         return totalNumberOfShards;
     }
 
-    public IndexDescriptor(StreamInput in) throws IOException {
+    public ManifestIndexDescriptor(StreamInput in) throws IOException {
         this.state = IndexMetadata.State.fromId(in.readByte());
         int aliasCount = in.readVInt();
         Map<String, AliasMetadata> aliases = new HashMap<>(aliasCount);
@@ -199,7 +199,7 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
      * of {@link AliasMetadata} keyed by alias name, which that parser cannot express without a wrapper
      * type per alias.
      */
-    public static IndexDescriptor fromXContent(XContentParser parser) throws IOException {
+    public static ManifestIndexDescriptor fromXContent(XContentParser parser) throws IOException {
         if (parser.currentToken() == null) {
             parser.nextToken();
         }
@@ -255,7 +255,7 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
                 }
             }
         }
-        return new IndexDescriptor(state, aliases, system, hidden, remoteSnapshot, warmIndex, totalNumberOfShards);
+        return new ManifestIndexDescriptor(state, aliases, system, hidden, remoteSnapshot, warmIndex, totalNumberOfShards);
     }
 
     @Override
@@ -266,7 +266,7 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        IndexDescriptor that = (IndexDescriptor) o;
+        ManifestIndexDescriptor that = (ManifestIndexDescriptor) o;
         return system == that.system
             && hidden == that.hidden
             && remoteSnapshot == that.remoteSnapshot
@@ -283,7 +283,7 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
 
     @Override
     public String toString() {
-        return "IndexDescriptor{state="
+        return "ManifestIndexDescriptor{state="
             + state
             + ", aliases="
             + aliases.keySet()

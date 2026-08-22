@@ -26,7 +26,7 @@ import org.junit.After;
  * flakiness more than once in this work, including by the residency and eviction changes that had to be
  * debugged around it.
  *
- * <p>It is not only test flakiness. {@code IndicesClusterStateService.heldOnDemand} asks whether a descriptor
+ * <p>It is not only test flakiness. {@code GatedIndexResidency.heldOnDemand} asks whether a descriptor
  * supplier is registered to decide whether this node is holding an index on demand, and a gated index whose
  * computed placement has been unregistered has no routing table at all. An unbalanced uninstall can
  * therefore make a live node stop recognising indices it is currently serving.

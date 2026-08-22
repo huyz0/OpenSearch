@@ -25,27 +25,27 @@ import java.io.IOException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * {@link IndexDescriptor} is what lets a node build {@code Metadata} from the manifest alone. It is
+ * {@link ManifestIndexDescriptor} is what lets a node build {@code Metadata} from the manifest alone. It is
  * only useful if it survives the round trip through the manifest exactly, and if the holder it
  * produces answers from the descriptor rather than reaching for the index.
  */
-public class IndexDescriptorTests extends OpenSearchTestCase {
+public class ManifestIndexDescriptorTests extends OpenSearchTestCase {
 
     public void testXContentRoundTrip() throws IOException {
-        IndexDescriptor original = IndexDescriptor.of(index());
+        ManifestIndexDescriptor original = ManifestIndexDescriptor.of(index());
 
         XContentBuilder builder = JsonXContent.contentBuilder();
         original.toXContent(builder, ToXContent.EMPTY_PARAMS);
         BytesReference bytes = BytesReference.bytes(builder);
 
         try (XContentParser parser = createParser(JsonXContent.jsonXContent, bytes)) {
-            assertEquals(original, IndexDescriptor.fromXContent(parser));
+            assertEquals(original, ManifestIndexDescriptor.fromXContent(parser));
         }
     }
 
     public void testStreamRoundTrip() throws IOException {
-        IndexDescriptor original = IndexDescriptor.of(index());
-        assertEquals(original, copyWriteable(original, writableRegistry(), IndexDescriptor::new));
+        ManifestIndexDescriptor original = ManifestIndexDescriptor.of(index());
+        assertEquals(original, copyWriteable(original, writableRegistry(), ManifestIndexDescriptor::new));
     }
 
     /** A closed, hidden, system index must round trip as such, not fall back to defaults. */
@@ -55,7 +55,7 @@ public class IndexDescriptorTests extends OpenSearchTestCase {
             .settings(Settings.builder().put(index().getSettings()).put(IndexMetadata.SETTING_INDEX_HIDDEN, true))
             .system(true)
             .build();
-        IndexDescriptor original = IndexDescriptor.of(metadata);
+        ManifestIndexDescriptor original = ManifestIndexDescriptor.of(metadata);
 
         assertEquals(IndexMetadata.State.CLOSE, original.getState());
         assertTrue(original.isHidden());
@@ -64,19 +64,19 @@ public class IndexDescriptorTests extends OpenSearchTestCase {
         XContentBuilder builder = JsonXContent.contentBuilder();
         original.toXContent(builder, ToXContent.EMPTY_PARAMS);
         try (XContentParser parser = createParser(JsonXContent.jsonXContent, BytesReference.bytes(builder))) {
-            IndexDescriptor parsed = IndexDescriptor.fromXContent(parser);
+            ManifestIndexDescriptor parsed = ManifestIndexDescriptor.fromXContent(parser);
             assertEquals(original, parsed);
             assertEquals(IndexMetadata.State.CLOSE, parsed.getState());
             assertTrue(parsed.isHidden());
             assertTrue(parsed.isSystem());
         }
-        assertEquals(original, copyWriteable(original, writableRegistry(), IndexDescriptor::new));
+        assertEquals(original, copyWriteable(original, writableRegistry(), ManifestIndexDescriptor::new));
     }
 
     /** The descriptor has to agree with the index it describes, or the lookup it builds is wrong. */
     public void testDescriptorAgreesWithTheIndexItDescribes() {
         IndexMetadata metadata = index();
-        IndexDescriptor descriptor = IndexDescriptor.of(metadata);
+        ManifestIndexDescriptor descriptor = ManifestIndexDescriptor.of(metadata);
 
         assertEquals(metadata.getState(), descriptor.getState());
         assertEquals(metadata.getAliases(), descriptor.getAliases());
@@ -91,7 +91,7 @@ public class IndexDescriptorTests extends OpenSearchTestCase {
     public void testHolderAnswersFromTheDescriptorWithoutLoading() {
         IndexMetadata metadata = index();
         AtomicInteger loads = new AtomicInteger();
-        IndexMetadataHolder holder = IndexDescriptor.of(metadata).toHolder(metadata.getIndex(), () -> {
+        IndexMetadataHolder holder = ManifestIndexDescriptor.of(metadata).toHolder(metadata.getIndex(), () -> {
             loads.incrementAndGet();
             return metadata;
         });
@@ -117,7 +117,7 @@ public class IndexDescriptorTests extends OpenSearchTestCase {
         String json = "{\"state\":0,\"system\":false,\"hidden\":false,\"remote_snapshot\":false,\"warm\":false,"
             + "\"total_shards\":6,\"something_from_the_future\":\"x\",\"aliases\":{}}";
         try (XContentParser parser = createParser(JsonXContent.jsonXContent, new BytesArray(json))) {
-            IndexDescriptor parsed = IndexDescriptor.fromXContent(parser);
+            ManifestIndexDescriptor parsed = ManifestIndexDescriptor.fromXContent(parser);
             assertEquals(6, parsed.getTotalNumberOfShards());
             assertEquals(IndexMetadata.State.OPEN, parsed.getState());
         }

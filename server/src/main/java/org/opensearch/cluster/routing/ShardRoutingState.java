@@ -38,8 +38,8 @@ import org.opensearch.common.annotation.PublicApi;
  * Represents the current state of a {@link ShardRouting} as defined by the
  * cluster.
  *
- * <p><b>Phase A3 of core-pluggability-refactor-plan.md, recorded here as the deliberate decision that
- * plan called for.</b> A previous {@code SPLITTING} constant, and the paired {@code ShardRouting} fields
+ * <p><b>Recorded here as a deliberate, reviewed decision.</b> A previous {@code SPLITTING} constant, and
+ * the paired {@code ShardRouting} fields
  * {@code recoveringChildShards}/{@code parentShardId} it went with, were removed by the in-place-split
  * rework as a side effect rather than a reviewed API change, which an external review flagged since this
  * enum is {@link PublicApi}. Investigating found no real caller of that representation anywhere in this

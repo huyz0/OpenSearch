@@ -21,7 +21,7 @@ import java.io.IOException;
 import static org.opensearch.action.ValidateActions.addValidationError;
 
 /**
- * Operator-triggered in-place shard merge (dynamic-partitioning-plan.md Phase 2 item 2.1) -- the
+ * Operator-triggered in-place shard merge -- the
  * reverse of {@link InPlaceSplitShardAction}. Reverses an earlier split by folding that split's
  * children back into the single parent shard, closing core's public API for
  * {@link org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService}.

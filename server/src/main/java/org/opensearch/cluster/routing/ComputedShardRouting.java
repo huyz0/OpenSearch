@@ -18,10 +18,9 @@ import java.util.Base64;
  *
  * <p>Both views of a computed shard are built here, and that is the point of the class rather than an
  * incidental convenience. A coordinator asks {@link AbsentIndexRoutingSuppliers#supply} where an index
- * lives and needs a STARTED entry to route to; the data node asks
- * {@link AbsentIndexRoutingSuppliers#localShards} which shards it should open and needs an INITIALIZING
- * entry, because {@code IndicesClusterStateService} fails any active shard it does not already have. The
- * two answers differ in state and must agree on everything else.
+ * lives and needs a STARTED entry to route to; the data node, opening the same shard on demand through
+ * {@code IndicesClusterStateService}, needs an INITIALIZING entry, because that service fails any active
+ * shard it does not already have. The two answers differ in state and must agree on everything else.
  *
  * <h2>Why the allocation id cannot be random</h2>
  *

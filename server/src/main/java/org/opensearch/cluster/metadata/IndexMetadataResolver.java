@@ -12,8 +12,8 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.ExperimentalApi;
 
 /**
- * Phase C of {@code core-pluggability-refactor-plan.md}: a plugin-supplied fallback for resolving an
- * index's {@link IndexMetadata} when it has no entry in {@link Metadata}'s own index map.
+ * A plugin-supplied fallback for resolving an index's {@link IndexMetadata} when it has no entry in
+ * {@link Metadata}'s own index map.
  *
  * <p><b>Consulted from {@link Metadata#indexOrResolved(String)}, a separate, explicitly-named method --
  * not from {@link Metadata#index(String)} itself.</b> This is a correction made mid-session after an
@@ -21,11 +21,10 @@ import org.opensearch.common.annotation.ExperimentalApi;
  * for every caller, caused a real, {@code internalClusterTest}-confirmed regression: {@code
  * MetadataDeleteIndexService#deleteIndices} relies on {@code index(String)}'s null-ness as a
  * <em>distinguishing signal</em> ("is this index gated, and does it need the durable tombstone-write path")
- * rather than a plain existence check, and auto-resolving broke that distinction silently. See {@code
- * core-pluggability-refactor-plan.md}'s C5 status-log entry for the full failure evidence.
+ * rather than a plain existence check, and auto-resolving broke that distinction silently.
  *
- * <p>The practical effect: a caller that wants the fallback (this plan's Phase C4a candidate call sites,
- * migrating off the pre-existing static registry, previously {@code AbsentIndexDescriptorSuppliers}) must
+ * <p>The practical effect: a caller that wants the fallback (the call sites migrating off the
+ * pre-existing static registry, previously {@code AbsentIndexDescriptorSuppliers}) must
  * call {@code indexOrResolved(String)} by name instead of the plain accessor. This is one extra word at
  * each of those call sites, in exchange for leaving every other caller of {@code index(String)} -- which is
  * nearly every read path in the codebase, the overwhelming majority never audited for the

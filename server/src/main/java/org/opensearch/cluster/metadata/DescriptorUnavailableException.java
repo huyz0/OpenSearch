@@ -26,7 +26,7 @@ import org.opensearch.core.rest.RestStatus;
  * the caller to create; "unknown" must not.
  *
  * <p><b>What this deliberately does not change.</b> {@code AbsentIndexDescriptorSuppliers} treats a
- * supplier that throws as having no answer, which Area C settled on the grounds that resolution is already
+ * supplier that throws as having no answer, which was settled on the grounds that resolution is already
  * a degradation path and turning a plugin bug into a request failure makes the absence worse. That
  * reasoning holds for a bug and fails for unreachable data, so this one type propagates and everything
  * else is still swallowed.
@@ -43,7 +43,7 @@ public class DescriptorUnavailableException extends OpenSearchStatusException {
     /**
      * Read from a stream, which every {@link org.opensearch.OpenSearchException} subclass must support.
      *
-     * <p>Missing when T12 introduced this type, which broke
+     * <p>Missing when this type was first introduced, which broke
      * {@code ExceptionSerializationTests.testExceptionRegistration} and went unnoticed because that run only
      * exercised the descriptor tests. The whole point of the type is that a caller can tell "unknown" from
      * "absent", and an unregistered exception loses its identity crossing the wire, so the distinction

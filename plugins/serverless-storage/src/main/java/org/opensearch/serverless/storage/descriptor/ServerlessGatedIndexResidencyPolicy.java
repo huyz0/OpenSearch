@@ -62,13 +62,15 @@ public final class ServerlessGatedIndexResidencyPolicy implements IndexResidency
 
     @Override
     public int maxOpen() {
-        int configured = ServerlessStoragePlugin.GATED_MAX_OPEN_SETTING.get(settings);
-        if (configured > 0) {
-            return configured;
-        }
-        long derived = (Runtime.getRuntime().maxMemory() / 2) / MEASURED_BYTES_PER_OPEN_GATED_INDEX;
-        // Clamped so a tiny heap does not produce a cap of nought or one, which would evict an index the
-        // request that opened it is about to use, and so a very large heap does not overflow an int.
-        return (int) Math.max(16, Math.min(Integer.MAX_VALUE, derived));
+        // Zero when the operator has not set it, which asks core to derive a ceiling from the heap and
+        // bytesPerOpenIndex() below -- the same formula (and the same clamp) this method used to inline;
+        // it lives in one place now, GatedIndexResidency#resolveGatedMaxOpen, with this plugin supplying
+        // only the measured number.
+        return ServerlessStoragePlugin.GATED_MAX_OPEN_SETTING.get(settings);
+    }
+
+    @Override
+    public long bytesPerOpenIndex() {
+        return MEASURED_BYTES_PER_OPEN_GATED_INDEX;
     }
 }

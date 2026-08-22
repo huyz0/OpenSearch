@@ -12,23 +12,23 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.annotation.ExperimentalApi;
 
-import java.util.Collection;
-
 /**
- * Phase C5 of {@code core-pluggability-refactor-plan.md}: the routing counterpart to {@link
- * org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver} -- see that class's own javadoc for
- * why this is a thin, generic adapter over the pre-existing static registry ({@link
- * AbsentIndexRoutingSuppliers}) rather than plugin-owned logic, and why it is safe to register additively,
- * ahead of Phase C4's call-site migration.
+ * The routing counterpart to {@link org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver}:
+ * a thin, generic adapter over the static registry ({@link AbsentIndexRoutingSuppliers}) rather than
+ * plugin-owned logic -- see that class's own javadoc for why the adapter lives in {@code server/}.
  *
- * <p>Implements all three {@link IndexRoutingResolver} methods, not just {@link #resolve}, since {@link
- * AbsentIndexRoutingSuppliers} already has the equivalent of all three ({@link
- * AbsentIndexRoutingSuppliers#supply(ClusterState, IndexMetadata)}, {@link
- * AbsentIndexRoutingSuppliers#shouldPublishRouting}, {@link AbsentIndexRoutingSuppliers#localShards}) and
- * forwarding all of them costs nothing extra here -- though as {@link IndexRoutingResolver}'s own "wiring
- * status" note documents, only {@link #resolve} has a core call site consulting it yet, so the other two
- * are currently reachable only by a caller that goes looking for this class directly (e.g. a future Phase
- * C4b call-site migration, or a test).
+ * <p><b>Settled architecture: one authority per plane.</b> {@link AbsentIndexRoutingSuppliers} is the
+ * node-level <em>authority</em> for computed routing; this adapter is the registration <em>front door</em>
+ * a plugin returns from {@code ClusterPlugin#getIndexRoutingResolver()} to feed the state-scoped read path
+ * ({@code ClusterState#getIndexRoutingTable}/{@code #resolveShard}/{@code #allShards}, {@code
+ * RoutingTable#shouldPublishRouting}) from that authority. It holds no state of its own: every method
+ * forwards to the registry, so the answers a state-scoped read gets and the answers the registry's few
+ * deliberate direct callers get are the same answers by construction.
+ *
+ * <p>Implements both {@link IndexRoutingResolver} methods, not just {@link #resolve}, since {@link
+ * AbsentIndexRoutingSuppliers} already has the equivalent of both ({@link
+ * AbsentIndexRoutingSuppliers#supply(ClusterState, IndexMetadata)} and {@link
+ * AbsentIndexRoutingSuppliers#shouldPublishRouting}) and forwarding both costs nothing extra here.
  *
  * @opensearch.experimental
  */
@@ -43,10 +43,5 @@ public final class SupplierBackedIndexRoutingResolver implements IndexRoutingRes
     @Override
     public boolean shouldPublishRouting(IndexMetadata indexMetadata) {
         return AbsentIndexRoutingSuppliers.shouldPublishRouting(indexMetadata);
-    }
-
-    @Override
-    public Collection<ShardRouting> localShardsFor(ClusterState state, String nodeId) {
-        return AbsentIndexRoutingSuppliers.localShards(state, nodeId);
     }
 }

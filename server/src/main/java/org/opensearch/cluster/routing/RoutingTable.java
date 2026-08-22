@@ -82,13 +82,13 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
     private final Map<String, IndexRoutingTable> indicesRouting;
 
     /**
-     * Phase C3 of {@code core-pluggability-refactor-plan.md}. Storage for a plugin-supplied {@link
+     * Storage for a plugin-supplied {@link
      * IndexRoutingResolver}, propagated the same way {@link org.opensearch.cluster.metadata.Metadata}'s
      * own resolver is (see that field's javadoc for the full reasoning): a mutable, non-wire field, not a
      * constructor parameter -- this constructor is {@code public} and used directly by callers this
      * branch does not control, so its arity cannot change.
      *
-     * <p><b>Design note this phase's implementation surfaced:</b> unlike {@code Metadata#index(String)},
+     * <p><b>Design note the implementation surfaced:</b> unlike {@code Metadata#index(String)},
      * a bare {@code RoutingTable} genuinely cannot consult this resolver from inside {@link
      * #index(String)} itself -- real routing resolution needs the index's {@code IndexMetadata} (at
      * minimum, its shard count) and often the live node list, and {@code RoutingTable} deliberately holds
@@ -128,9 +128,9 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
     }
 
     /**
-     * Phase C4b of {@code core-pluggability-refactor-plan.md}: wires {@link IndexRoutingResolver#shouldPublishRouting}
-     * -- declared since Phase C1 but, per that method's own "wiring status" note, not yet consulted by any
-     * core call site -- replacing direct calls to the pre-existing static registry, {@code
+     * Wires {@link IndexRoutingResolver#shouldPublishRouting}
+     * -- declared before, per that method's own "wiring status" note, any core call site consulted it --
+     * replacing direct calls to the pre-existing static registry, {@code
      * AbsentIndexRoutingSuppliers#shouldPublishRouting}.
      *
      * <p>Lives here rather than on {@code ClusterState}, unlike {@link
@@ -548,7 +548,7 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
         @Override
         public RoutingTable apply(RoutingTable part) {
             RoutingTable applied = new RoutingTable(version, indicesRouting.apply(part.indicesRouting));
-            // Phase C3 of core-pluggability-refactor-plan.md: same fix MetadataDiff#apply needed and for
+            // Same fix MetadataDiff#apply needed and for
             // the same reason -- this constructs a fresh RoutingTable with nothing to inherit a resolver
             // from on its own, and diff application is the normal way cluster state propagates after the
             // first full state.

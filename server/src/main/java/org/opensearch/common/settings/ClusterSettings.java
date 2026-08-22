@@ -568,7 +568,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 HunspellService.HUNSPELL_IGNORE_CASE,
                 HunspellService.HUNSPELL_DICTIONARY_OPTIONS,
                 IndicesStore.INDICES_STORE_DELETE_SHARD_TIMEOUT,
-                // Phase E2 of core-pluggability-refactor-plan.md: the three indices.gated.* settings that
+                // The three indices.gated.* settings that
                 // used to be registered here directly are now owned by whichever plugin implements
                 // org.opensearch.indices.cluster.IndexResidencyPolicy, registered through its own
                 // Plugin#getSettings() the ordinary plugin-settings way -- see that interface's javadoc.

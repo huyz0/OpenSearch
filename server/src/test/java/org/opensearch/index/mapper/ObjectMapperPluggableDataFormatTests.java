@@ -14,9 +14,8 @@ import org.opensearch.common.util.FeatureFlags;
 import java.io.IOException;
 
 /**
- * Phase F of core-pluggability-refactor-plan.md. {@code ObjectMapper.TypeParser.parseNested} now asks
- * {@link org.opensearch.index.engine.dataformat.DataFormat#unsupportedMapperTypes()} instead of
- * unconditionally rejecting nested whenever the pluggable-data-format feature is on.
+ * {@code ObjectMapper.TypeParser.parseNested} rejects nested mappers whenever the
+ * pluggable-data-format feature is on.
  *
  * <p>Extends {@link MapperServiceTestCase} directly rather than {@link MapperTestCase} (what {@code
  * KeywordFieldMapperTests} and friends use): {@code MapperTestCase} layers a large inherited single-field
@@ -41,9 +40,7 @@ public class ObjectMapperPluggableDataFormatTests extends MapperServiceTestCase 
 
     /**
      * The realistic default case: pluggable data format enabled, but no {@code DataFormatPlugin} installed
-     * to resolve the configured format name -- must still reject nested exactly as it always has, via the
-     * "format doesn't resolve" fallback ({@link org.opensearch.index.engine.dataformat.DataFormat
-     * #unsupportedMapperTypes()}'s default) rather than the removed blanket check.
+     * to resolve the configured format name -- nested must still be rejected exactly as it always has.
      */
     @LockFeatureFlag(FeatureFlags.PLUGGABLE_DATAFORMAT_EXPERIMENTAL_FLAG)
     public void testNestedStillRejectedWhenNoFormatResolves() throws IOException {

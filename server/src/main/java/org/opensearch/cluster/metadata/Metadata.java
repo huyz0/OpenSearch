@@ -298,7 +298,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     private final Map<String, SortedMap<Long, String>> systemTemplatesLookup;
 
     /**
-     * Phase C2 of {@code core-pluggability-refactor-plan.md}. A plugin-supplied fallback {@link
+     * A plugin-supplied fallback {@link
      * #index(String)} consults on a lookup miss -- see {@link IndexMetadataResolver}'s own javadoc.
      *
      * <p>Deliberately NOT a constructor parameter and NOT part of {@link #writeTo}/{@link #readFrom}: a
@@ -309,7 +309,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
      * both carry the previous instance's resolver forward, so once attached it survives every subsequent
      * mutation and every diff application on that node indefinitely.
      *
-     * <p><b>What is NOT yet wired (tracked as the remaining Phase C2 step):</b> the single attachment
+     * <p><b>What is NOT yet wired (a deliberately deferred remaining step):</b> the single attachment
      * point that gives a node's very first {@code ClusterState}/{@code Metadata} its resolver in the
      * first place -- e.g. a {@code ClusterStateApplier} registered during {@code Node} construction,
      * alongside wherever the resolved {@code ClusterPlugin} list is already collected for other hooks
@@ -509,10 +509,10 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 // adds/removes plain (name-only) aliases on a gated index via IndexDescriptorPublisher,
                 // entirely outside cluster state. Reporting none here (rather than resolving them through
                 // that same descriptor seam) is a completeness gap in responses like GET /index, tracked
-                // separately -- see core-pluggability-refactor-plan.md Phase C, which would give this
-                // method the same resolver seam Metadata#index(String) is meant to get.
+                // separately -- the intended fix is to give this method the same plugin-supplied resolver
+                // seam Metadata#index(String) is meant to get.
                 //
-                // It is NOT a filtering-safety gap: that same service now refuses (Phase A2) any Add action
+                // It is NOT a filtering-safety gap: that same service now refuses any Add action
                 // for a gated index that carries a filter, an indexRouting/searchRouting value, or a
                 // writeIndex flag, specifically because IndexDescriptor#aliases is a bare List<String> with
                 // nowhere to record any of those, and this method (and filteringAliases below) both used to
@@ -856,12 +856,12 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     }
 
     /**
-     * Phase C of {@code core-pluggability-refactor-plan.md}, corrected mid-session after a real regression
-     * this exact design surfaced. {@link #index(String)}'s published-metadata-only answer, falling back to
-     * an attached {@link IndexMetadataResolver} on a miss.
+     * {@link #index(String)}'s published-metadata-only answer, falling back to
+     * an attached {@link IndexMetadataResolver} on a miss. The design was corrected mid-development after
+     * a real regression it surfaced, described below.
      *
      * <p><b>Deliberately a separate, explicitly-named method -- not folded into {@link #index(String)}
-     * itself.</b> An earlier version of this phase made {@code index(String)} auto-consult the resolver for
+     * itself.</b> An earlier version of this change made {@code index(String)} auto-consult the resolver for
      * every caller, on the premise that every caller "gets it for free" instead of remembering a second
      * path. That premise turned out to be exactly backwards for a caller that relies on {@code
      * index(String)}'s null-ness as a <em>distinguishing signal</em> rather than a plain existence check --
@@ -869,9 +869,8 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
      * MetadataDeleteIndexService#deleteIndices} uses {@code currentMetadata.index(index) == null} to decide
      * whether an index is gated and needs the durable, retried tombstone-write path; auto-resolving there
      * silently made that check say "no" for a genuinely gated index, and its tombstone stopped being written
-     * durably. See {@code core-pluggability-refactor-plan.md}'s C5 status-log entry for the full failure
-     * evidence. This method exists so a caller that explicitly wants the fallback (this phase's Phase C4a
-     * candidate call sites) can ask for it by name, while every other caller of {@link #index(String)} --
+     * durably. This method exists so a caller that explicitly wants the fallback (a small, individually
+     * audited set of call sites) can ask for it by name, while every other caller of {@link #index(String)} --
      * which is nearly every read path in the codebase, most of which were never audited for this pattern --
      * keeps exactly its pre-existing behavior, unconditionally, with no auditing required.
      *
@@ -908,7 +907,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     }
 
     /**
-     * Phase C4b of {@code core-pluggability-refactor-plan.md}: whether a name resolves to something that
+     * Whether a name resolves to something that
      * exists, consulting the published lookup first and an attached {@link IndexMetadataResolver} only on a
      * miss -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#exists}.
      *
@@ -917,7 +916,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
      * descriptor" into the same false, exactly what {@code indexOrResolved} already does by construction
      * (its own resolver chain returns null for both). A caller that needs to tell those two apart, or that
      * needs the underlying descriptor's own fields (uuid, state, aliases), cannot use this method -- that is
-     * a real, narrower set of call sites this phase deliberately left on the static registry, since {@link
+     * a real, narrower set of call sites the migration deliberately left on the static registry, since {@link
      * IndexMetadataResolver} correctly does not expose plugin-specific descriptor vocabulary.
      */
     public boolean existsOrResolved(String indexName) {
@@ -925,7 +924,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     }
 
     /**
-     * Phase C4b of {@code core-pluggability-refactor-plan.md}: the names among {@code indices} that are
+     * The names among {@code indices} that are
      * gated, meaning this {@link Metadata} has no entry and an attached {@link IndexMetadataResolver} does
      * -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#gatedAmong}.
      *
@@ -1354,7 +1353,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             builder.indexHolders(indices.apply(part.indices));
             builder.templates(templates.apply(part.templates.getTemplates()));
             builder.customs(customs.apply(part.customs));
-            // Phase C2 of core-pluggability-refactor-plan.md: builder() above is the from-scratch
+            // builder() above is the from-scratch
             // no-arg constructor (deliberately, per the comment above), so it has no resolver to carry
             // forward on its own -- unlike Builder(Metadata), which copies one. Diff application is the
             // normal way cluster state propagates after the first full state, so without this line every
@@ -1707,7 +1706,8 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         }
 
         /**
-         * Records the descriptor for an index whose metadata just changed, for Area H.
+         * Records the descriptor for an index whose metadata just changed, so an index whose metadata
+         * lives off cluster state stays current.
          *
          * <p>Hooked at the two {@code put} overloads rather than at each of the twelve services that
          * update index metadata, because enumerating those call sites is how a writer gets missed. Closing

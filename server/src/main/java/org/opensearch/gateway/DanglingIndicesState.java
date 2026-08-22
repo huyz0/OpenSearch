@@ -174,15 +174,15 @@ public class DanglingIndicesState implements ClusterStateListener {
     /**
      * Whether an index found on disk was deleted, consulting the descriptor as well as the graveyard.
      *
-     * <p>This is the half of Area H's deletion story that actually prevents resurrection. Recording a
+     * <p>This is the half of the off-cluster-state deletion story that actually prevents resurrection. Recording a
      * tombstone prevents nothing until something reads it: a node partitioned during a delete rejoins
      * holding shard data for an index cluster state no longer mentions, and without a durable no it
      * imports that data back.
      *
      * <p>The graveyard is still consulted first and still authoritative when it answers. It is bounded
      * though, purging its oldest tombstones once it exceeds its configured size, so an index deleted long
-     * enough ago is forgotten by it and remembered by the descriptor. Under Area H, where cluster state
-     * holds no per-index entry at all, the descriptor is the only record there is.
+     * enough ago is forgotten by it and remembered by the descriptor. For a gated index, where cluster
+     * state holds no per-index entry at all, the descriptor is the only record there is.
      *
      * <p>Absence of a descriptor is deliberately not treated as deletion. A supplier that is not
      * installed, or one that declines, answers null, and importing nothing on that basis would discard
@@ -192,9 +192,9 @@ public class DanglingIndicesState implements ClusterStateListener {
         if (graveyard.containsIndex(index)) {
             return true;
         }
-        // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b of
-        // core-pluggability-refactor-plan.md: this reads descriptor.uuid() below and needs the three-way
-        // null/tombstoned/live distinction, which IndexMetadataResolver's generic, collapsed contract
+        // Deliberately still AbsentIndexDescriptorSuppliers directly rather than the
+        // IndexMetadataResolver SPI: this reads descriptor.uuid() below and needs the three-way
+        // null/tombstoned/live distinction, which that resolver's generic, collapsed contract
         // deliberately does not expose.
         IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
         return descriptor != null && descriptor.uuid().equals(index.getUUID()) && descriptor.exists() == false;

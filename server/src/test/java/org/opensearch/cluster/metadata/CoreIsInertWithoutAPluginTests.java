@@ -153,10 +153,9 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         );
     }
 
-    /** The publisher and the tombstone writer report that nobody listened, rather than pretending. */
+    /** The publisher reports that nobody listened, rather than pretending. */
     public void testPublishingRecordsNothingAndSaysSo() {
         assertFalse(IndexDescriptorPublisher.publish(anIndex("ordinary")));
-        assertFalse(IndexDescriptorPublisher.publishTombstone(anIndex("ordinary")));
         assertNull(
             "a null future is how the creation path is told no creator exists, which it must treat as a "
                 + "failure rather than as success",

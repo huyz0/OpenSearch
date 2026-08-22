@@ -102,7 +102,7 @@ public class TransportSegmentReplicationStatsActionTests extends OpenSearchTestC
         // Phase C4b of core-pluggability-refactor-plan.md: TransportSegmentReplicationStatsAction#shards
         // now calls ClusterState#allShardsIncludingRelocationTargets directly (composing the
         // resolver-aware getIndexRoutingTable internally) instead of
-        // AbsentIndexRoutingSuppliers.allShardsIncludingRelocationTargets(state, ...), which itself used to
+        // the since-deleted AbsentIndexRoutingSuppliers.allShardsIncludingRelocationTargets(state, ...), which itself used to
         // read state.routingTable().allShardsIncludingRelocationTargets(...) on the unregistered fast path.
         // Stubbing the old RoutingTable-level method here would stub a call this mock's own
         // ClusterState#allShardsIncludingRelocationTargets never makes (it's a real, unmocked method on the

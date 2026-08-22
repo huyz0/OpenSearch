@@ -174,9 +174,8 @@ public class TransportGetIngestionStateAction extends TransportBroadcastByNodeAc
             );
         }
 
-        // Phase C4b of core-pluggability-refactor-plan.md: clusterState.allShards(...) replaces
-        // AbsentIndexRoutingSuppliers.allShards(...) here -- same predicate/composition, discovered through
-        // the resolver attached to this state's own routing table.
+        // clusterState.allShards(...) resolves through the resolver attached to this state's own
+        // routing table (replacing an earlier static-registry lookup) -- same predicate/composition.
         return clusterState.allShards(request.indices(), shardFilter, false);
     }
 

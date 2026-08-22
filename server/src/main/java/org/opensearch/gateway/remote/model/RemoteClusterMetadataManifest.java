@@ -65,7 +65,7 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
 
     /**
      * Manifest format compatible with codec v5, i.e. before the index list could live behind manifest
-     * shard references (plan item E5, Area E). Manifests already in a repository at v5 are read through
+     * shard references. Manifests already in a repository at v5 are read through
      * this rather than falling through to {@link #getClusterMetadataManifestBlobStoreFormat()}'s
      * "unrecognised codec" branch -- the same reason {@link #CLUSTER_METADATA_MANIFEST_FORMAT_V4} exists.
      */
@@ -184,7 +184,7 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V0) {
             return CLUSTER_METADATA_MANIFEST_FORMAT_V0;
         }
-        // Plan item E4 (plan-100m-index-implementation.md, Area E): "corrupted" asserted a single cause
+        // The previous wording, "corrupted", asserted a single cause
         // for two genuinely different ones this dispatch cannot tell apart -- a truncated/garbled codec
         // field, or a codec this reading node's own build has simply never heard of (a fork-only codec
         // at or above ClusterMetadataManifest#FORK_CODEC_BASE written by a newer or fork build, or an

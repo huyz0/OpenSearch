@@ -114,7 +114,7 @@ public interface EngineFactory {
     /**
      * Called by {@code StoreRecovery#internalRecoverFromStore} exactly once, only for a shard
      * recovering via {@code RecoverySource.Type.IN_PLACE_SPLIT_SHARD} (a child shard of an in-place
-     * split, dynamic-partitioning-plan.md Phase 0) -- before this shard's local translog is created
+     * split) -- before this shard's local translog is created
      * or its engine is opened, the same careful ordering {@link #recoverMissingLocalStore} already
      * requires and for the identical reason (see that method's own javadoc on the stale
      * translog-UUID trap of materializing too late). Default {@code false}: this engine has nothing
@@ -140,7 +140,7 @@ public interface EngineFactory {
     /**
      * Called by {@code StoreRecovery#internalRecoverFromStore} exactly once, only for a shard
      * recovering via {@code RecoverySource.Type.IN_PLACE_MERGE_SHARD} (a parent shard revived by an
-     * in-place merge, dynamic-partitioning-plan.md Phase 2 item 2.1) -- the reverse of
+     * in-place merge) -- the reverse of
      * {@link #recoverInPlaceSplitLocalStore} and, like it, called before this shard's local translog
      * is created or its engine is opened, for the same stale-translog-UUID-ordering reason. Default
      * {@code false}: this engine has nothing to revive the parent from.

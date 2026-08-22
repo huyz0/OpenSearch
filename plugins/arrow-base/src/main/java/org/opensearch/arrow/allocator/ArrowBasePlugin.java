@@ -31,6 +31,7 @@ import org.opensearch.plugin.stats.NativeAllocatorStatsRegistry;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.ExtensiblePlugin;
 import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.PluginNodeStats;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
@@ -242,6 +243,33 @@ public class ArrowBasePlugin extends Plugin implements ExtensiblePlugin, ActionP
             return a != null ? a.stats() : null;
         };
         return List.of(built, new NativeAllocatorStatsRegistry(statsSupplier, built::setNativeMemoryPressureSupplier));
+    }
+
+    /**
+     * Contributes the allocator's pool stats snapshot to {@code _nodes/stats} through the generic
+     * {@link PluginNodeStats} path, rendered under the top-level
+     * {@link NativeAllocatorPoolStats#WRITEABLE_NAME} key. Same snapshot the
+     * {@link NativeAllocatorStatsRegistry} supplier publishes; empty while the allocator is not built
+     * (before {@code createComponents}) or after it is closed.
+     */
+    @Override
+    public List<PluginNodeStats> nodeStats() {
+        ArrowNativeAllocator a = this.allocator;
+        NativeAllocatorPoolStats stats = a != null ? a.stats() : null;
+        return stats == null ? List.of() : List.of(stats);
+    }
+
+    /**
+     * Registers the {@link PluginNodeStats} entry the {@code NodeStats} wire framing needs: the
+     * coordinator deserializes each per-node plugin payload via
+     * {@code readNamedWriteable(PluginNodeStats.class)}, resolving by the contribution's
+     * {@code getWriteableName()}.
+     */
+    @Override
+    public List<NamedWriteableRegistry.Entry> getNamedWriteables() {
+        return List.of(
+            new NamedWriteableRegistry.Entry(PluginNodeStats.class, NativeAllocatorPoolStats.WRITEABLE_NAME, NativeAllocatorPoolStats::new)
+        );
     }
 
     @Override

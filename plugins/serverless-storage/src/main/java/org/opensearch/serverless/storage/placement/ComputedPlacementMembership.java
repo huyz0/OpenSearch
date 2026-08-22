@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.routing;
+package org.opensearch.serverless.storage.placement;
 
 import org.opensearch.Version;
 import org.opensearch.cluster.AbstractNamedDiffable;

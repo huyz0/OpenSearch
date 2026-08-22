@@ -145,9 +145,9 @@ public final class AutoCreateAction extends ActionType<CreateIndexResponse> {
             // know which plane it belongs in -- no template to resolve, and no chance of disagreeing with the
             // gate, which reads the same name.
             //
-            // Phase D2 of core-pluggability-refactor-plan.md: IndexCreationStrategyRegistry.claims(...)
-            // replaces DescriptorOnlyCreation.isRegistered() && namesAServerlessIndex(...) here -- see
-            // MetadataCreateIndexService#createIndex's own comment for the same migration.
+            // IndexCreationStrategyRegistry.claims(...) replaces an earlier static-registry check paired
+            // with a plugin-specific name test -- see MetadataCreateIndexService#createIndex's own
+            // comment for the same migration.
             if (IndexCreationStrategyRegistry.claims(indexName, updateRequest)) {
                 createIndexService.createIndex(
                     updateRequest,

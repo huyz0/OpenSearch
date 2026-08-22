@@ -108,15 +108,16 @@ public class MetadataDeleteIndexService {
         // It has to be here because a resolver refuses to answer on a cluster state thread at all --
         // Metadata#indexOrResolved's own ClusterStateMutationThreads guard (originally
         // AbsentIndexDescriptorSuppliers's) returns null on clusterManagerService#updateTask, since resolving
-        // a descriptor there means a remote read on the thread that applies cluster state, which is the W4
-        // deadlock. The first attempt at this partitioned inside execute and every index came back
+        // a descriptor there means a remote read on the thread that applies cluster state, which is the
+        // deadlock that guard exists to prevent. The first attempt at this partitioned inside execute and
+        // every index came back
         // not-gated, so the delete threw exactly as before -- the guard did its job and the code asking the
         // question was in the one place forbidden to ask it.
         //
-        // This method runs on a transport thread, where blocking is allowed and where T39 already puts the
-        // equivalent read for shard opening.
+        // This method runs on a transport thread, where blocking is allowed and where shard opening already
+        // puts the equivalent read.
         //
-        // Phase C4a of core-pluggability-refactor-plan.md: currentMetadata.index(index) on the line below is
+        // currentMetadata.index(index) on the line below is
         // deliberately the plain, never-resolving accessor -- this is exactly the "is it gated" distinguishing
         // check that made Metadata#index(String) auto-resolving unsafe in the first place (see Metadata
         // #indexOrResolved's own javadoc for that history). indexOrResolved(index) on the next line is the
@@ -231,9 +232,10 @@ public class MetadataDeleteIndexService {
      * tombstone, and {@code IndicesClusterStateService}'s sweep catches whatever the feed misses. Neither
      * was ever driven by the update this replaces.
      *
-     * <p>Nothing blocks here. {@code publishTombstone} is asynchronous by construction -- it had to be,
-     * since its previous caller ran on the cluster state thread where a blocking write deadlocks -- and the
-     * listener is deferred rather than waited on.
+     * <p>Nothing blocks here. {@link DurableTombstones#whenDurable} hands the write to the registered
+     * writer asynchronously -- the write had to be asynchronous by construction, since the tombstone hook's
+     * original caller ran on the cluster state thread where a blocking write deadlocks -- and the listener
+     * is deferred rather than waited on.
      *
      * <h4>Why every index, not any</h4>
      *
@@ -267,7 +269,7 @@ public class MetadataDeleteIndexService {
     /**
      * Removes the mappings of indices that have just been deleted.
      *
-     * <p>T47. Nothing ever removed one: {@code MappingGenerationStore.Store} had no delete at all, so
+     * <p>Nothing ever removed one before this: {@code MappingGenerationStore.Store} had no delete at all, so
      * {@code .opensearch-index-mappings} grew with every index that had ever existed rather than with the
      * live population. That is the residency problem this area exists to remove, reproduced one level down,
      * and churn is what makes it bite -- a tenant that creates and drops an index a day leaves a document a
@@ -350,15 +352,16 @@ public class MetadataDeleteIndexService {
                 // Writing it here as well wrote it twice, and the second write failed: writeTombstone
                 // finishes by removing the live descriptor blob, so whichever write lost the race found it
                 // already gone and FsBlobContainer.deleteBlobsIgnoringIfNotExists threw NoSuchFileException
-                // despite its name. That stayed hidden because publishTombstone swallows and logs its
-                // exceptions while the durable writer reports them, so the visible outcome depended on which
-                // of two asynchronous writes happened to finish first.
+                // despite its name. That stayed hidden because the fire-and-forget publish hook that used to
+                // write the second copy (IndexDescriptorPublisher's since-removed tombstone entry point)
+                // swallowed and logged its exceptions while the durable writer reports them, so the visible
+                // outcome depended on which of two asynchronous writes happened to finish first.
                 logger.info("{} deleting gated index, recording a tombstone rather than a cluster state change", index);
             }
             // Deliberately not added to the IndexGraveyard. The graveyard is a bounded list carried in every
             // cluster state, and putting gated deletions in it would reintroduce per-index cluster state cost
             // on the one operation that had escaped it. The tombstoned descriptor is the durable no for these,
-            // which is what DurableTombstones and IndexDescriptorPublisher.publishTombstone already say.
+            // which is what DurableTombstones already says.
             final Set<Index> remaining = new HashSet<>(indices);
             remaining.removeAll(gated);
             if (remaining.isEmpty()) {
@@ -411,7 +414,7 @@ public class MetadataDeleteIndexService {
             logger.info("{} deleting index", index);
             routingTableBuilder.remove(indexName);
             clusterBlocksBuilder.removeIndexBlocks(indexName);
-            // Area H's tombstone, recorded before the metadata entry goes, since it is derived from it.
+            // The descriptor tombstone, recorded before the metadata entry goes, since it is derived from it.
             // Deletion has to be remembered rather than represented by absence: a node that was
             // partitioned during the delete cannot tell "this index never existed" from "I have not
             // looked yet", and adopting its dangling data on rejoin is the resurrection IndexGraveyard

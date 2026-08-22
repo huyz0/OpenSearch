@@ -275,8 +275,8 @@ public abstract class Plugin implements Closeable {
      * {@link PluginNodeStats} subclass via {@link #getNamedWriteables()} so the
      * coordinator can deserialize per-node payloads received over transport.
      *
-     * <p>Default: empty. Restored by Phase B of {@code core-pluggability-refactor-plan.md} -- see
-     * {@link PluginNodeStats}'s own javadoc for why.
+     * <p>Default: empty. See {@link PluginNodeStats}'s own javadoc for why this hook was
+     * restored after an earlier deletion.
      *
      * @opensearch.experimental
      */

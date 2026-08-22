@@ -75,7 +75,7 @@ public class RestClusterHealthAction extends BaseRestHandler {
         return "cluster_health_action";
     }
 
-    /** See rfc-serverless-opensearch.md &sect;15's "operational caveat" note. */
+    /** A core API a restricted deployment needs to function at all, so declared available explicitly. */
     @Override
     public ApiAvailabilityScope apiAvailabilityScope() {
         return ApiAvailabilityScope.AVAILABLE;

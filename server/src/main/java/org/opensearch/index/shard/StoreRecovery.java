@@ -855,10 +855,10 @@ final class StoreRecovery {
                 } catch (Exception e) {
                     if (indexShouldExists && recoverMissingLocalStoreFromEngine(indexShard, store)) {
                         // The engine says it materialized this shard's last durable state from
-                        // elsewhere -- re-read rather than fail outright (rfc-serverless-opensearch.md
-                        // &sect;7.1.2's "no peer recovery" writer shards are the motivating case: no
+                        // elsewhere -- re-read rather than fail outright. The motivating case is an
+                        // engine whose durability lives in remote storage with no peer recovery: no
                         // node's local disk is ever the shard's authoritative copy, so finding
-                        // nothing here is the expected, not exceptional, starting state).
+                        // nothing here is the expected, not exceptional, starting state.
                         si = store.readLastCommittedSegmentsInfo();
                     } else if (isInPlaceSplitChild && recoverInPlaceSplitFromEngine(indexShard, store)) {
                         // Symmetric to the branch above, but for a shard that has never had ANY prior

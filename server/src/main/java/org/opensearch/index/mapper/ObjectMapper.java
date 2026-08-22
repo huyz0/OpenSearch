@@ -48,8 +48,6 @@ import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeIndexSettings;
-import org.opensearch.index.engine.dataformat.DataFormat;
-import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 
 import java.io.IOException;
@@ -458,51 +456,14 @@ public class ObjectMapper extends Mapper implements Cloneable {
         }
 
         /**
-         * Phase F of {@code core-pluggability-refactor-plan.md}: whether the currently active pluggable data
-         * format (if any) rejects nested mappers, per {@link DataFormat#unsupportedMapperTypes()} -- replacing
-         * a blanket "pluggable data format means no nested" rule with a per-format question.
-         *
-         * <p>In production, {@code parserContext.dataFormatRegistry()} is non-null exactly when the
-         * pluggable-data-format feature is enabled for this index (see {@code DocumentMapperParser}'s own
-         * construction of {@code ParserContext}) -- but a null registry does <em>not</em> reliably mean "no
-         * pluggable format active" in every caller: a {@code ParserContext}/{@code MapperService} built
-         * directly rather than through {@code DocumentMapperParser} (as several lightweight mapper-only test
-         * harnesses do, bypassing that registry-threading logic entirely) can have the feature enabled via
-         * settings with no registry wired at all. A first version of this method treated a null registry as
-         * "nested is fine," found wrong by exactly that scenario: {@code
-         * ObjectMapperPluggableDataFormatTests#testNestedStillRejectedWhenNoFormatResolves} silently stopped
-         * rejecting nested. Falling back to the original flag check here is what makes both cases -- feature
-         * genuinely off, and feature on with no registry available -- resolve identically to how {@code
-         * ObjectMapper} always behaved before this method existed.
-         *
-         * <p>A registry present but unable to resolve the index's configured format name -- which should not
-         * happen for a validly-created index, but this runs on the mapper-parsing path and must never throw
-         * for a reason unrelated to the mapping itself -- falls back to {@code true}, preserving the exact
-         * universal rejection every pluggable-format index has always gotten rather than silently allowing
-         * nested through on an unresolvable format.
-         *
-         * <p>{@code parserContext.mapperService()}/{@code mapperService.getIndexSettings()} are each guarded
-         * against being {@code null} independently before use (not just before the first dereference) --
-         * {@code KeywordFieldMapper}'s identically-shaped {@code canConsumeRawValueForSource} hit exactly this
-         * gap (a mocked {@code MapperService} with {@code getIndexSettings()} unstubbed, i.e. {@code null}, in
-         * {@code TypeParsersTests}/{@code ParametrizedMapperTests}) after only guarding the outer null.
+         * Nested mappers are not supported when the pluggable-data-format feature is enabled.
+         * {@code mapperService()}/{@code getIndexSettings()} are each guarded independently — lightweight
+         * mapper-only test harnesses can leave either null.
          */
         private static boolean isNestedUnsupportedByActiveDataFormat(ParserContext parserContext) {
-            DataFormatRegistry registry = parserContext.dataFormatRegistry();
             MapperService mapperService = parserContext.mapperService();
             IndexSettings indexSettings = mapperService == null ? null : mapperService.getIndexSettings();
-            if (registry == null) {
-                return indexSettings != null && indexSettings.isPluggableDataFormatEnabled();
-            }
-            if (indexSettings == null) {
-                return true;
-            }
-            String activeFormatName = indexSettings.pluggableDataFormat();
-            DataFormat activeFormat = registry.format(activeFormatName);
-            if (activeFormat == null) {
-                return true;
-            }
-            return activeFormat.unsupportedMapperTypes().contains(NESTED_CONTENT_TYPE);
+            return indexSettings != null && indexSettings.isPluggableDataFormatEnabled();
         }
 
         protected static void parseDerived(ObjectMapper.Builder objBuilder, Map<String, Object> derivedNode, ParserContext parserContext) {

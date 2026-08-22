@@ -341,9 +341,9 @@ public class OperationRouting {
             IndexRoutingTable indexRouting = clusterState.routingTable().index(index);
             if (indexRouting == null) {
                 // An installed supplier can compute the entry rather than reporting its absence, which
-                // is how a serverless index avoids publishing routing at all. Falls back to Phase A's
-                // pessimistic answer when nothing is installed or the supplier declines.
-                // Phase C4b of core-pluggability-refactor-plan.md: clusterState.getIndexRoutingTable(index)
+                // is how a computed-placement index avoids publishing routing at all. Falls back to the
+                // pessimistic no-shard answer when nothing is installed or the supplier declines.
+                // clusterState.getIndexRoutingTable(index)
                 // replaces AbsentIndexRoutingSuppliers.supply(...) here -- same resolution (this branch has
                 // already confirmed the published lookup missed, so the redundant re-check inside
                 // getIndexRoutingTable costs one extra map lookup, not a behavior change), discovered
@@ -507,7 +507,7 @@ public class OperationRouting {
      * <p>Synthesising empty shards rather than skipping the index is the point. Skipping would leave
      * the search with nothing to route to and it would return 200 with zero hits, silently, which is
      * a worse answer than a loud failure for an index that exists and holds data. The failure a
-     * caller gets here is the same one it already knows how to handle and, for the serverless
+     * caller gets here is the same one it already knows how to handle and, for the
      * scale-to-zero case, the same one that reactivation is racing to prevent.
      */
     private static IndexRoutingTable noShardsAvailable(IndexMetadata indexMetadata) {
@@ -527,12 +527,12 @@ public class OperationRouting {
     }
 
     /**
-     * Site 7, and it is the one every other routing decision here is built on.
+     * The metadata lookup every other routing decision here is built on.
      *
      * <p>Routing a document means hashing its id against a shard count, and the shard count is the first
      * thing a gated index cannot supply from cluster state. Repaired here rather than at each of the four
-     * callers below, because they all reach the same question through this method and site 8 -- the routing
-     * table itself -- already has its supplier fallback and simply never ran, since this threw first.
+     * callers below, because they all reach the same question through this method, and the routing-table
+     * lookup itself already has its supplier fallback and simply never ran, since this threw first.
      */
     protected IndexMetadata indexMetadata(ClusterState clusterState, String index) {
         IndexMetadata indexMetadata = clusterState.metadata().indexOrResolved(index);
@@ -551,7 +551,7 @@ public class OperationRouting {
         // which is worse than not supplying at all: the failure looks like a missing index rather than
         // like an unsupported configuration.
         if (clusterState.routingTable().hasIndex(index) == false) {
-            // Phase C4b of core-pluggability-refactor-plan.md: clusterState.getIndexRoutingTable(index)
+            // clusterState.getIndexRoutingTable(index)
             // replaces AbsentIndexRoutingSuppliers.supply(...) here -- same resolution (this branch has
             // already confirmed the published lookup missed, so the redundant re-check inside
             // getIndexRoutingTable costs one extra map lookup, not a behavior change), discovered through

@@ -99,7 +99,7 @@ public interface ClusterPlugin {
     }
 
     /**
-     * Phase C of {@code core-pluggability-refactor-plan.md}: a fallback for resolving an index's {@link
+     * A fallback for resolving an index's {@link
      * org.opensearch.cluster.metadata.IndexMetadata} when {@link org.opensearch.cluster.metadata.Metadata}
      * has no entry for it -- see {@link org.opensearch.cluster.metadata.IndexMetadataResolver}'s own
      * javadoc for why this is a single seam rather than something every caller needs to know about.
@@ -112,7 +112,7 @@ public interface ClusterPlugin {
     }
 
     /**
-     * Phase C of {@code core-pluggability-refactor-plan.md}: the routing-table counterpart to {@link
+     * The routing-table counterpart to {@link
      * #getIndexMetadataResolver()} -- see {@link IndexRoutingResolver}'s own javadoc. Empty by default,
      * so a node without this plugin resolves exactly as it always has.
      *
@@ -123,7 +123,7 @@ public interface ClusterPlugin {
     }
 
     /**
-     * Phase D of {@code core-pluggability-refactor-plan.md}: a plugin-owned decision of which index
+     * A plugin-owned decision of which index
      * names/requests belong to a plugin-managed plane -- see {@link
      * org.opensearch.cluster.metadata.IndexCreationStrategy}'s own javadoc. Empty by default, so a node
      * without this plugin creates and deletes indices exactly as it always has.
@@ -135,7 +135,7 @@ public interface ClusterPlugin {
     }
 
     /**
-     * Phase E2 of {@code core-pluggability-refactor-plan.md}: a plugin-owned policy tuning {@link
+     * A plugin-owned policy tuning {@link
      * org.opensearch.indices.cluster.IndicesClusterStateService}'s on-demand-opened-index residency
      * bookkeeping (sweep interval, idle-eviction threshold, max-open ceiling) -- see {@link
      * org.opensearch.indices.cluster.IndexResidencyPolicy}'s own javadoc for exactly what this does and

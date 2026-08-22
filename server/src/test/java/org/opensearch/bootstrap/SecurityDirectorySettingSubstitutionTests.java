@@ -22,38 +22,50 @@ import java.security.Policy;
 import java.security.cert.Certificate;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.List;
 
 /**
- * End-to-end test for the policy substitution mechanism that backs the DataFusion plugin's
- * narrowed FilePermission grant. Verifies that:
- *  - When opensearch.datafusion.spill_directory is set, PolicyFile resolves
- *    {@code ${{opensearch.datafusion.spill_directory}}/-} to the configured path + "/-".
- *  - When the property is unset, the resolver leaves the literal {@code ${{...}}/-} in place,
+ * End-to-end test for the generic directory-setting policy substitution mechanism
+ * (plugin-security.properties, {@code directory.settings}). Verifies that:
+ *  - For a declared setting key with a value, PolicyFile resolves
+ *    {@code ${{opensearch.<key>}}/-} to the configured path + "/-".
+ *  - When the setting is unset, the resolver leaves the literal {@code ${{...}}/-} in place,
  *    granting no real filesystem path.
+ *  - A setting that is NOT declared by the plugin is not substituted, even when set.
  *
- * This is the test that would catch a regression where the plugin policy is written with
+ * This is the test that would catch a regression where a plugin policy is written with
  * single-brace ${...} instead of double-brace ${{...}} (which is hardcoded to a small allowlist
  * in PolicyFile and would silently produce a useless permission).
  */
 @SuppressWarnings("removal")
 @SuppressForbidden(reason = "https://github.com/opensearch-project/OpenSearch/issues/19640")
-public class SecurityDataFusionSpillDirSubstitutionTests extends OpenSearchTestCase {
+public class SecurityDirectorySettingSubstitutionTests extends OpenSearchTestCase {
 
-    private static final String PROPERTY = "opensearch.datafusion.spill_directory";
+    private static final String SETTING = "my_plugin.scratch_directory";
+    private static final String PROPERTY = "opensearch." + SETTING;
 
-    public void testFilePermissionResolvesWhenSpillDirectoryConfigured() throws Exception {
+    public void testFilePermissionResolvesWhenDirectorySettingConfigured() throws Exception {
         Path policy = writePluginStylePolicy();
-        Settings settings = Settings.builder().put("datafusion.spill_directory", "/tmp/test-spill").build();
-        Policy parsed = Security.readPolicy(policy.toUri().toURL(), Collections.emptyMap(), settings);
+        Settings settings = Settings.builder().put(SETTING, "/tmp/test-scratch").build();
+        Policy parsed = Security.readPolicy(policy.toUri().toURL(), Collections.emptyMap(), settings, List.of(SETTING));
         FilePermission resolved = firstFilePermission(parsed);
-        assertEquals("/tmp/test-spill/-", resolved.getName());
+        assertEquals("/tmp/test-scratch/-", resolved.getName());
         // The property must not leak past readPolicy.
         assertNull(System.getProperty(PROPERTY));
     }
 
-    public void testFilePermissionLeavesLiteralWhenSpillDirectoryEmpty() throws Exception {
+    public void testFilePermissionLeavesLiteralWhenDirectorySettingEmpty() throws Exception {
         Path policy = writePluginStylePolicy();
-        Policy parsed = Security.readPolicy(policy.toUri().toURL(), Collections.emptyMap(), Settings.EMPTY);
+        Policy parsed = Security.readPolicy(policy.toUri().toURL(), Collections.emptyMap(), Settings.EMPTY, List.of(SETTING));
+        FilePermission resolved = firstFilePermission(parsed);
+        assertEquals("${{" + PROPERTY + "}}/-", resolved.getName());
+        assertNull(System.getProperty(PROPERTY));
+    }
+
+    public void testUndeclaredSettingIsNotSubstituted() throws Exception {
+        Path policy = writePluginStylePolicy();
+        Settings settings = Settings.builder().put(SETTING, "/tmp/test-scratch").build();
+        Policy parsed = Security.readPolicy(policy.toUri().toURL(), Collections.emptyMap(), settings, Collections.emptyList());
         FilePermission resolved = firstFilePermission(parsed);
         assertEquals("${{" + PROPERTY + "}}/-", resolved.getName());
         assertNull(System.getProperty(PROPERTY));

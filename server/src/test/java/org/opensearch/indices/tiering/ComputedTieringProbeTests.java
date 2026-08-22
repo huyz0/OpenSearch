@@ -95,7 +95,7 @@ public class ComputedTieringProbeTests extends OpenSearchTestCase {
         registerComputedPlacement();
         ClusterState state = stateWithoutRouting();
 
-        IndexRoutingTable resolved = AbsentIndexRoutingSuppliers.resolve(state, INDEX);
+        IndexRoutingTable resolved = state.getIndexRoutingTable(INDEX);
 
         assertNotNull("placement resolves an entry, so the index is reachable rather than red", resolved);
         assertTrue(
@@ -171,9 +171,9 @@ public class ComputedTieringProbeTests extends OpenSearchTestCase {
         // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
         // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
         // TieringRequestValidator#validateHotToWarm now goes through for shouldPublishRouting) needs an
-        // explicit one here, same as production code gets from a real cluster state. Harmless for this
-        // class's other test, which resolves through AbsentIndexRoutingSuppliers directly and never reads
-        // this routing table's own attached resolver.
+        // explicit one here, same as production code gets from a real cluster state. Both of this class's
+        // tests read through it: the validator via shouldPublishRouting, and the red-check probe via
+        // ClusterState#getIndexRoutingTable.
         org.opensearch.cluster.routing.RoutingTable routingTable = org.opensearch.cluster.routing.RoutingTable.builder().build();
         routingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)

@@ -33,6 +33,7 @@ public class IndexResidencyPolicyRegistryTests extends OpenSearchTestCase {
         assertEquals(TimeValue.timeValueSeconds(60), IndexResidencyPolicyRegistry.sweepInterval());
         assertEquals(TimeValue.timeValueMinutes(30), IndexResidencyPolicyRegistry.idleEvictionAfter());
         assertEquals(0, IndexResidencyPolicyRegistry.maxOpen());
+        assertEquals(1_048_576L, IndexResidencyPolicyRegistry.bytesPerOpenIndex());
     }
 
     public void testDelegatesToTheRegisteredPolicy() {
@@ -51,12 +52,18 @@ public class IndexResidencyPolicyRegistryTests extends OpenSearchTestCase {
             public int maxOpen() {
                 return 42;
             }
+
+            @Override
+            public long bytesPerOpenIndex() {
+                return 150_888L;
+            }
         });
 
         assertTrue(IndexResidencyPolicyRegistry.isRegistered());
         assertEquals(TimeValue.timeValueSeconds(1), IndexResidencyPolicyRegistry.sweepInterval());
         assertEquals(TimeValue.timeValueSeconds(2), IndexResidencyPolicyRegistry.idleEvictionAfter());
         assertEquals(42, IndexResidencyPolicyRegistry.maxOpen());
+        assertEquals(150_888L, IndexResidencyPolicyRegistry.bytesPerOpenIndex());
     }
 
     public void testAThrowingPolicyFallsBackToTheDefaultsRatherThanPropagating() {
@@ -75,6 +82,11 @@ public class IndexResidencyPolicyRegistryTests extends OpenSearchTestCase {
             public int maxOpen() {
                 throw new RuntimeException("boom");
             }
+
+            @Override
+            public long bytesPerOpenIndex() {
+                throw new RuntimeException("boom");
+            }
         });
 
         assertEquals(
@@ -84,6 +96,21 @@ public class IndexResidencyPolicyRegistryTests extends OpenSearchTestCase {
         );
         assertEquals(TimeValue.timeValueMinutes(30), IndexResidencyPolicyRegistry.idleEvictionAfter());
         assertEquals(0, IndexResidencyPolicyRegistry.maxOpen());
+        assertEquals(1_048_576L, IndexResidencyPolicyRegistry.bytesPerOpenIndex());
+    }
+
+    /**
+     * The value is a divisor in the derived-ceiling formula, so a policy answering zero or a negative
+     * number must degrade to the default rather than surface as an ArithmeticException at node start.
+     */
+    public void testANonPositiveBytesPerOpenIndexFallsBackToTheDefault() {
+        IndexResidencyPolicyRegistry.register(new IndexResidencyPolicy() {
+            @Override
+            public long bytesPerOpenIndex() {
+                return 0L;
+            }
+        });
+        assertEquals(1_048_576L, IndexResidencyPolicyRegistry.bytesPerOpenIndex());
     }
 
     public void testDefaultMethodsAreTheHistoricalDefaults() {
@@ -92,5 +119,6 @@ public class IndexResidencyPolicyRegistryTests extends OpenSearchTestCase {
         assertEquals(TimeValue.timeValueSeconds(60), defaults.sweepInterval());
         assertEquals(TimeValue.timeValueMinutes(30), defaults.idleEvictionAfter());
         assertEquals(0, defaults.maxOpen());
+        assertEquals(1_048_576L, defaults.bytesPerOpenIndex());
     }
 }

@@ -97,20 +97,6 @@ public class AbsentIndexDescriptorSuppliersTests extends OpenSearchTestCase {
         );
     }
 
-    /** The plural form exists so a ten-index request is one round trip rather than ten. */
-    public void testSupplyAllResolvesEveryName() {
-        AbsentIndexDescriptorSuppliers.register(name -> name.startsWith("known") ? descriptor(name, IndexDescriptor.State.OPEN) : null);
-
-        List<IndexDescriptor> resolved = AbsentIndexDescriptorSuppliers.supplyAll(List.of("known-1", "unknown", "known-2"));
-
-        assertEquals("only the names the supplier knows may come back", 2, resolved.size());
-    }
-
-    /** With nothing installed the plural form must not allocate or call anything. */
-    public void testSupplyAllIsEmptyWithoutASupplier() {
-        assertTrue(AbsentIndexDescriptorSuppliers.supplyAll(List.of("a", "b")).isEmpty());
-    }
-
     // ---------------------------------------------------------------- helpers
 
     private static IndexDescriptor descriptor(String name, IndexDescriptor.State state) {

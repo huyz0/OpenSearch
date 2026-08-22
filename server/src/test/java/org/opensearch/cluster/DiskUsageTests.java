@@ -215,7 +215,6 @@ public class DiskUsageTests extends OpenSearchTestCase {
                 null,
                 null,
                 null,
-                null, // nativeAllocator
                 -1L  // totalEstimatedNativeBytes
             ),
             new NodeStats(
@@ -251,7 +250,6 @@ public class DiskUsageTests extends OpenSearchTestCase {
                 null,
                 null,
                 null,
-                null, // nativeAllocator
                 -1L  // totalEstimatedNativeBytes
             ),
             new NodeStats(
@@ -287,7 +285,6 @@ public class DiskUsageTests extends OpenSearchTestCase {
                 null,
                 null,
                 null,
-                null, // nativeAllocator
                 -1L  // totalEstimatedNativeBytes
             )
         );
@@ -354,7 +351,6 @@ public class DiskUsageTests extends OpenSearchTestCase {
                 null,
                 null,
                 null,
-                null, // nativeAllocator
                 -1L  // totalEstimatedNativeBytes
             ),
             new NodeStats(
@@ -390,7 +386,6 @@ public class DiskUsageTests extends OpenSearchTestCase {
                 null,
                 null,
                 null,
-                null, // nativeAllocator
                 -1L  // totalEstimatedNativeBytes
             ),
             new NodeStats(
@@ -426,7 +421,6 @@ public class DiskUsageTests extends OpenSearchTestCase {
                 null,
                 null,
                 null,
-                null, // nativeAllocator
                 -1L  // totalEstimatedNativeBytes
             )
         );
@@ -515,7 +509,6 @@ public class DiskUsageTests extends OpenSearchTestCase {
             null,
             null /* fileCacheOnlyStats */,
             null /* blockCacheOnlyStats */,
-            null,
             null,
             null,
             null,

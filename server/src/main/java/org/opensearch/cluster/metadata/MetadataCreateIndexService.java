@@ -371,9 +371,9 @@ public class MetadataCreateIndexService {
         // The road, chosen from the name before any of the work that would once have been needed to choose
         // it. Unregistered answers false, so an ordinary cluster never reaches the branch below.
         //
-        // Phase D2 of core-pluggability-refactor-plan.md: IndexCreationStrategyRegistry.claims(...) replaces
-        // DescriptorOnlyCreation.isRegistered() && namesAServerlessIndex(...) here -- the same predicate,
-        // discovered through the new SPI instead of the static registry directly. createGatedIndex's own
+        // IndexCreationStrategyRegistry.claims(...) replaces the earlier
+        // DescriptorOnlyCreation.isRegistered() && namespace-membership check here -- the same predicate,
+        // discovered through the SPI instead of the static registry directly. createGatedIndex's own
         // body, and everything downstream of this branch, is unchanged.
         if (IndexCreationStrategyRegistry.claims(request.index(), request)) {
             // Exact rather than admitted-on-a-guess: the name says which plane this belongs in, so there is
@@ -433,8 +433,7 @@ public class MetadataCreateIndexService {
      * rather than by whichever snapshot either node happened to hold.
      */
     public boolean certainlyGated(final CreateIndexClusterStateUpdateRequest request, final ClusterState state) {
-        // Phase D2 of core-pluggability-refactor-plan.md: same migration as createIndex()'s own top branch --
-        // see that call site's comment.
+        // Same registry-to-SPI migration as createIndex()'s own top branch -- see that call site's comment.
         return IndexCreationStrategyRegistry.claims(request.index(), request);
     }
 
@@ -462,7 +461,7 @@ public class MetadataCreateIndexService {
      *
      * <h4>What still has to be true</h4>
      *
-     * Uniqueness does not come from here and never did. H3 put it in the store: {@code op_type=create} is what
+     * Uniqueness does not come from here and never did. The store owns it: {@code op_type=create} is what
      * makes a name unique, which is precisely what makes the cluster manager unnecessary for this. Two nodes
      * admitting the same name concurrently is now possible and is resolved the way it was always designed to
      * be -- one write wins, the loser's future completes false, and the client gets
@@ -518,7 +517,7 @@ public class MetadataCreateIndexService {
                     // that would claim this name in the other plane.
                     listener.onFailure(
                         new IllegalStateException(
-                            // Phase J3: namespace description from the registered strategy, not core's
+                            // Namespace description from the registered strategy, not core's
                             // own words for one product's namespace.
                             "index ["
                                 + request.index()
@@ -536,7 +535,7 @@ public class MetadataCreateIndexService {
                     if (failure != null) {
                         listener.onFailure(unwrapCompletion(failure));
                     } else if (Boolean.TRUE.equals(created) == false) {
-                        // H3's uniqueness gate reporting a lost race, which is the same answer an ordinary
+                        // the store's uniqueness gate reporting a lost race, which is the same answer an ordinary
                         // duplicate gets.
                         listener.onFailure(new ResourceAlreadyExistsException(request.index()));
                     } else {
@@ -621,15 +620,15 @@ public class MetadataCreateIndexService {
         /**
          * Answers the client, and for a gated index answers it only once the descriptor write has landed.
          *
-         * <p>T18. For an ordinary index the cluster state update is the creation, so acknowledging it is
+         * <p>For an ordinary index the cluster state update is the creation, so acknowledging it is
          * the truth and this defers to the parent unchanged. For a gated index the update deliberately
          * changes nothing and therefore always succeeds, so acknowledging it says only that nothing
          * happened. The descriptor write is the creation, and its outcome is what the client is owed.
          *
-         * <p>The cluster state thread has already returned by the time this runs, which is what keeps W4's
-         * deadlock closed: nothing waits on the thread that would have to route the write.
+         * <p>The cluster state thread has already returned by the time this runs, which is what keeps the
+         * store-lookup self-deadlock closed: nothing waits on the thread that would have to route the write.
          *
-         * <p>A completed-false future means a competing creation won the name, which is H3's uniqueness
+         * <p>A completed-false future means a competing creation won the name, which is the store's uniqueness
          * gate reporting rather than an error, so the client gets the same
          * {@link ResourceAlreadyExistsException} an ordinary duplicate would produce.
          */
@@ -845,7 +844,7 @@ public class MetadataCreateIndexService {
                 return applyCreateIndexWithoutTemporaryService(currentState, request, temporaryIndexMeta, mappings, metadataTransformer);
             }
             // Everything except the mapping is satisfied, so what is missing is a mapper service and not an
-            // index service. T60 measured the difference: building the whole thing serialises every
+            // index service. Measurement showed the difference: building the whole thing serialises every
             // concurrent creation on the node behind one monitor and costs about 21.6 ms of service time
             // each, which is seven times what the creation itself costs.
             logger.debug("[{}] validating with a mapper service alone: {}", request.index(), needsAMapperService);
@@ -1024,11 +1023,11 @@ public class MetadataCreateIndexService {
         // to avoid; then it read template-merged settings, which cost a resolution here and another there.
         // A name costs neither and cannot disagree with the gate, because the gate reads the same name.
         //
-        // Phase D2 of core-pluggability-refactor-plan.md: same migration as createIndex()'s own top branch,
-        // negated -- isRegistered()==false || namesAServerlessIndex(...)==false is De Morgan's equivalent of
+        // Same registry-to-SPI migration as createIndex()'s own top branch, negated -- the old
+        // isRegistered()==false || not-in-namespace==false pair is De Morgan's equivalent of
         // !claims(...).
         if (IndexCreationStrategyRegistry.claims(request.index(), request) == false) {
-            // Phase J3: description from the registered strategy, not core's own words for one product's.
+            // Description from the registered strategy, not core's own words for one product's.
             return "the index is not in " + IndexCreationStrategyRegistry.describeClaimedNamespace();
         }
         if (sourceMetadata != null) {
@@ -1053,8 +1052,8 @@ public class MetadataCreateIndexService {
             }
         }
         // The mapping is deliberately not one of these conditions. It used to be: a declared mapping meant a
-        // throwaway IndexService, and T18 measured what that cost once mapped indices became the common
-        // kind. What a mapping needs is a *mapper service*, which T60 separated from an index service --
+        // throwaway IndexService, and profiling measured what that cost once mapped indices became the common
+        // kind. What a mapping needs is a *mapper service*, which was later separated from an index service --
         // see whyTheseMappingsNeedAMapperService and applyCreateIndexWithOnlyAMapperService. What the
         // conditions here have in common is that each one needs something a mapper service does not have:
         // a query shard context, a sort supplier, an existing index's metadata.
@@ -1276,7 +1275,7 @@ public class MetadataCreateIndexService {
         // DescriptorRepresentable decides gating from it, and clusterStateCreateIndex writes them to the
         // mapping store from it. Without this the fast path would create a gated index whose mapping was
         // parsed, validated against the registry, and then present nowhere -- acknowledged, with the fields
-        // silently absent. That is the loss T11, T13 and T15 were spent removing, and a performance change
+        // silently absent. That is the silent field loss earlier fixes were spent removing, and a performance change
         // is exactly the kind of change that reintroduces it quietly.
         for (Map<String, Object> mapping : mappings) {
             if (mapping.isEmpty() == false) {
@@ -2308,14 +2307,14 @@ public class MetadataCreateIndexService {
      *
      * <p>Deliberately refuses a gated index rather than dropping its descriptor write on the floor. A gated
      * creation's write is the creation, so somebody has to await it, and a sink that silently discarded it
-     * would reinstate exactly the defect T17 and T23 measured: an acknowledgement that means nothing and a
+     * would reinstate exactly the measured defect: an acknowledgement that means nothing and a
      * name with no uniqueness. Callers that can create a gated index must use the six argument form and
      * carry the future to whoever answers the client.
      */
     /**
      * Fails a creation that reached the gated branch on the state update thread, instead of blocking there.
      *
-     * <p>T49 removed the way that used to happen -- admission now resolves templates, so an index gated only
+     * <p>The known way that used to happen is closed -- admission now resolves templates, so an index gated only
      * by one is admitted off-thread like any other -- and this is the tripwire for the next way. Admission is
      * an approximation by design, and the property it protects is not one to hold by care: a blocking store
      * write here occupies the thread that serialises every cluster state update, and the write can submit an
@@ -2326,11 +2325,11 @@ public class MetadataCreateIndexService {
      * broken, which is how the same defect was found the last two times.
      */
     private static void refuseToWriteAMappingFromTheClusterStateThread(IndexMetadata indexMetadata) {
-        // Phase C4b of core-pluggability-refactor-plan.md: ClusterStateMutationThreads
-        // .blockingIsUnsafeOnCurrentThread() replaces AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere()
-        // here -- the exact same thread-name list, already generalized in Phase C4a specifically so this
-        // kind of duplicate list (this call site's own comment used to warn about exactly that risk) would
-        // have one place to live instead of two that could drift.
+        // ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread() replaces
+        // AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere() here -- the exact same thread-name list,
+        // generalized into one shared home specifically so this kind of duplicate list (this call site's
+        // own comment used to warn about exactly that risk) would have one place to live instead of two
+        // that could drift.
         if (org.opensearch.cluster.ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
             String thread = Thread.currentThread().getName();
             throw new IllegalStateException(
@@ -2372,33 +2371,34 @@ public class MetadataCreateIndexService {
         BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer,
         java.util.function.Consumer<java.util.concurrent.CompletableFuture<Boolean>> descriptorWrite
     ) {
-        // Area H's third phase. When the gate is open for this index, creation records a descriptor and
+        // When the gate is open for this index, creation records a descriptor and
         // writes nothing to cluster state: no metadata entry, no routing entry, no publication, and none
-        // of the O(total indices) rebuild that S20 measured at 69 ms per change at fifty thousand
+        // of the O(total indices) rebuild that was measured at 69 ms per change at fifty thousand
         // indices. The descriptor write is the creation, and it is the thing that must succeed.
         //
-        // Failure semantics invert from H2b's here. During dual write a lost descriptor cost a
-        // comparison; now it costs the index, so publish is required to report that someone was
+        // Failure semantics invert from the dual-write era's here. During dual write a lost descriptor
+        // cost a comparison; now it costs the index, so publish is required to report that someone was
         // listening rather than being allowed to no-op.
         //
-        // Phase D2 of core-pluggability-refactor-plan.md (final slice): IndexCreationStrategyRegistry
-        // .skipsClusterState(...) replaces DescriptorOnlyCreation.skipsClusterState(...) directly here --
+        // IndexCreationStrategyRegistry.skipsClusterState(...) replaces
+        // DescriptorOnlyCreation.skipsClusterState(...) directly here --
         // the same predicate, discovered through the SPI instead of the static registry. Deliberately not
         // IndexCreationStrategyRegistry.claims(...): that answers a different, broader question (is this
         // name/request admitted to the strategy's plane at all), while this branch needs the strategy's own
         // narrower, post-build gate (placement ownership, descriptor representability -- see
         // IndexCreationStrategy#skipsClusterState's own javadoc for why the two can disagree). Everything
-        // below this line -- the nine lines T18/T23/T17/T49/T52/W4 are load-bearing for -- is unchanged.
+        // below this line -- the nine lines whose ordering and refusal guarantees the tests below lean
+        // on -- is unchanged.
         if (IndexCreationStrategyRegistry.skipsClusterState(indexMetadata)) {
-            // T18. The descriptor write is the creation, so it goes through createGated rather than
-            // publish: op_type=create makes it atomic against a competing creation (T23 measured eight
+            // The descriptor write is the creation, so it goes through createGated rather than
+            // publish: op_type=create makes it atomic against a competing creation (a test measured eight
             // concurrent creations of one name all acknowledged without it), and the future carries the
-            // outcome so the acknowledgement can wait for it (T17 measured an acknowledged creation whose
+            // outcome so the acknowledgement can wait for it (a test measured an acknowledged creation whose
             // write could not possibly have landed).
             //
             // The cluster state thread does not wait here. It hands the future to the task, which defers
-            // its response until the write completes, which is what keeps W4's deadlock closed: the thread
-            // that would have to supply a cluster state for this write to route is this one.
+            // its response until the write completes, which is what keeps the store-lookup self-deadlock
+            // closed: the thread that would have to supply a cluster state for this write to route is this one.
             // The mapping first, because the descriptor is the acknowledgement. A descriptor carries a
             // mapping generation and not a mapping, so declared fields have to reach MappingGenerationStore
             // or they are lost -- which is what DescriptorRepresentable had to refuse the whole index for.
@@ -2409,8 +2409,8 @@ public class MetadataCreateIndexService {
             // resolves to an index whose declared fields are missing, which is the same silent loss wearing
             // a different shape.
             //
-            // Blocking here is safe only where admission ran, and T49 is the record of what that sentence
-            // used to hide. It said every path reaching this branch came through createGatedIndex on
+            // Blocking here is safe only where admission ran, and the template-gating fix is the record of
+            // what that sentence used to hide. It said every path reaching this branch came through createGatedIndex on
             // GENERIC, because the admission check reads the gating setting from the request. Two things
             // were wrong with that. An index gated by a template says nothing in its request, so it took
             // the ordinary road and reached this line on the state update thread; admission is now given
@@ -2424,10 +2424,11 @@ public class MetadataCreateIndexService {
             // avoiding system index round-trips entirely.
             //
             // The refusal itself: this comment used to describe it without the call actually being here,
-            // which is the defect Phase A1 of the core-pluggability-refactor-plan.md found and closed. A
-            // creation reaching this branch from createGatedIndex's GENERIC executor is fine; one reaching it
-            // from inside a cluster state task (auto-creation, rollover, data stream creation) is exactly the
-            // W4 deadlock this method exists to refuse instead of hitting.
+            // a defect a later audit found and closed. A creation reaching this branch from
+            // createGatedIndex's GENERIC executor is fine; one reaching it from inside a cluster state task
+            // (auto-creation, rollover, data stream creation) is exactly the self-deadlock -- a blocking
+            // store write standing on the thread that would have to serve it -- this method exists to
+            // refuse instead of hitting.
             refuseToWriteAMappingFromTheClusterStateThread(indexMetadata);
             java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
             if (write == null) {
@@ -2451,12 +2452,12 @@ public class MetadataCreateIndexService {
 
         // The other half of closing the two-plane name collision, and the half that has to live here.
         //
-        // DescriptorGate#gatable refuses to gate a name outside the serverless namespace, so no name out
+        // DescriptorGate#gatable refuses to gate a name outside the claimed namespace, so no name out
         // there can be held by a descriptor alone. This refuses a name inside it a cluster state entry, so
         // no name in here can be held by cluster state. Each name has exactly one authority. Neither
         // authority has to consult the other -- which is what made the collision unfixable where it was
-        // found, because the consulting would have to be a blocking descriptor read on this very thread, the
-        // deadlock W4 paid for. A string comparison is total, needs no store, and is safe anywhere.
+        // found, because the consulting would have to be a blocking descriptor read on this very thread --
+        // the measured self-deadlock. A string comparison is total, needs no store, and is safe anywhere.
         //
         // A refusal rather than the fallback that used to be here. An admitted creation the gate declines
         // once had an ordinary road to take, and taking it is exactly how an ordinary index came to hold a
@@ -2464,8 +2465,8 @@ public class MetadataCreateIndexService {
         // be gated cannot exist under this name, and the caller is told which feature stopped it rather than
         // being handed a differently-shaped index than it asked for.
         //
-        // Phase D2 of core-pluggability-refactor-plan.md (final slice): IndexCreationStrategyRegistry
-        // .claims(indexName) replaces DescriptorOnlyCreation.isRegistered() && namesAServerlessIndex(...) --
+        // IndexCreationStrategyRegistry.claims(indexName) replaces the earlier
+        // DescriptorOnlyCreation.isRegistered() && namespace-membership pair --
         // the same predicate (see IndexCreationStrategy#claims(String)'s own javadoc for why the name-only
         // overload, not the request-taking one, is what belongs here: this branch runs after the index is
         // already built, with no CreateIndexClusterStateUpdateRequest in scope). The error text's namespace
@@ -2502,8 +2503,8 @@ public class MetadataCreateIndexService {
         // diffed on every cluster state change. Skipping publication is what makes the supplier
         // reachable at all -- with an entry published, it would never be consulted.
         RoutingTable.Builder routingTableBuilder = RoutingTable.builder(updatedState.routingTable());
-        // Phase C4b of core-pluggability-refactor-plan.md: updatedState.routingTable().shouldPublishRouting(...)
-        // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate, discovered
+        // updatedState.routingTable().shouldPublishRouting(...) replaces the earlier static-registry call
+        // AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate, discovered
         // through the resolver attached to this state's own routing table.
         if (updatedState.routingTable().shouldPublishRouting(updatedState.metadata().index(indexName))) {
             routingTableBuilder.addAsNew(updatedState.metadata().index(indexName));
@@ -2684,7 +2685,7 @@ public class MetadataCreateIndexService {
     }
 
     /**
-     * Refuses a creation in the serverless namespace that asks for something a serverless index cannot be.
+     * Refuses a creation in the claimed namespace that asks for something a gated index cannot be.
      *
      * <p>The name decides the plane, so these can no longer be answered by quietly making the index an
      * ordinary one -- that is the ambiguity the namespace exists to remove, and it is how a name came to be
@@ -2698,17 +2699,17 @@ public class MetadataCreateIndexService {
      * change than this.
      */
     private void validateClaimedNamespaceRequest(CreateIndexClusterStateUpdateRequest request) {
-        // Phase D2 of core-pluggability-refactor-plan.md: same migration as createIndex()'s own top branch,
-        // negated -- see whyATemporaryIndexServiceIsStillNeeded's comment for the De Morgan's equivalence.
-        // Deliberately not the larger change the plan's own D2 sketch also names for this method (deleting
-        // it entirely in favor of a plugin-owned IndexCreationValidator) -- that changes what gets validated
-        // and where; this changes only how the same predicate is discovered.
+        // Same registry-to-SPI migration as createIndex()'s own top branch, negated -- see
+        // whyATemporaryIndexServiceIsStillNeeded's comment for the De Morgan's equivalence.
+        // Deliberately not the larger change once sketched for this method (deleting it entirely in favor
+        // of a plugin-owned IndexCreationValidator) -- that changes what gets validated and where; this
+        // changes only how the same predicate is discovered.
         //
-        // Final D2 slice: the error text below now sources its namespace description from the registered
+        // The error text below also sources its namespace description from the registered
         // strategy (IndexCreationStrategyRegistry.describeClaimedNamespace()) instead of interpolating
-        // DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX directly -- the same message-text fix applied at
+        // the plugin's own name-prefix constant directly -- the same message-text fix applied at
         // clusterStateCreateIndex's own two-plane-collision refusal, so core stops naming this plugin's
-        // vocabulary in both places that do, not just the boolean check the first D2 slices already moved.
+        // vocabulary in both places that do, not just the boolean check already moved to the SPI.
         if (IndexCreationStrategyRegistry.claims(request.index(), request) == false) {
             return;
         }

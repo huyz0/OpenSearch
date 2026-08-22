@@ -58,7 +58,7 @@ public class RestGetSettingsAction extends BaseRestHandler {
 
     private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(RestGetSettingsAction.class);
 
-    /** Read-only metadata lookup, safe to expose under serverless mode (rfc-serverless-opensearch.md &sect;11). */
+    /** Read-only metadata lookup, safe to expose when a plugin restricts the REST surface to a vetted allowlist. */
     @Override
     public ApiAvailabilityScope apiAvailabilityScope() {
         return ApiAvailabilityScope.AVAILABLE;

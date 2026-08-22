@@ -134,7 +134,7 @@ public class RemoteClusterStateService implements Closeable {
      * Gates the functionality of remote publication.
      */
     /**
-     * When set, an index whose manifest entry carries an {@link IndexDescriptor} is installed into
+     * When set, an index whose manifest entry carries an {@link ManifestIndexDescriptor} is installed into
      * {@code Metadata} as a deferred holder rather than being fetched. Reading full cluster state then
      * costs one blob per index the node actually touches instead of one per index in the cluster.
      *
@@ -459,8 +459,8 @@ public class RemoteClusterStateService implements Closeable {
         // remoteManifestManager.resolveIndices, not previousManifest.getIndices() directly: when the
         // previous manifest is sharded, getIndices() is empty by design (see ClusterMetadataManifest's
         // own CODEC_V6 doc) -- calling it here directly would silently drop every index that did not
-        // change this version from the new manifest, which is exactly the data-loss shape Area E's own
-        // "transitive cleanup" risk warns about, one layer up from the GC sweep.
+        // change this version from the new manifest: the same data-loss shape the cleanup sweep's
+        // "transitive cleanup" comment warns about, one layer up from the GC sweep.
         final Map<String, ClusterMetadataManifest.UploadedIndexMetadata> allUploadedIndexMetadata = remoteManifestManager.resolveIndices(
             previousManifest
         ).stream().collect(Collectors.toMap(UploadedIndexMetadata::getIndexName, Function.identity()));
@@ -562,7 +562,7 @@ public class RemoteClusterStateService implements Closeable {
             for (Map.Entry<String, IndexMetadataHolder> holder : clusterState.metadata().indexHolders().entrySet()) {
                 UploadedIndexMetadata existing = allUploadedIndexMetadata.get(holder.getKey());
                 if (existing != null && existing.getDescriptor() == null) {
-                    allUploadedIndexMetadata.put(holder.getKey(), existing.withDescriptor(IndexDescriptor.of(holder.getValue())));
+                    allUploadedIndexMetadata.put(holder.getKey(), existing.withDescriptor(ManifestIndexDescriptor.of(holder.getValue())));
                 }
             }
         }
@@ -592,7 +592,7 @@ public class RemoteClusterStateService implements Closeable {
         uploadedMetadataResults.uploadedClusterStateCustomMetadataMap = allUploadedClusterStateCustomsMap;
         uploadedMetadataResults.uploadedIndexMetadata = new ArrayList<>(allUploadedIndexMetadata.values());
 
-        // Plan item E5: which shards (if sharding is on) need rewriting this version -- an index
+        // Which shards (if sharding is on) need rewriting this version -- an index
         // present in toUpload changed, and one present in indicesToBeDeletedFromRemote (by now trimmed
         // down to genuinely deleted indices, see the loop above) is gone. Both move their shard's
         // membership; an index that is simply unchanged does not.
@@ -1331,7 +1331,7 @@ public class RemoteClusterStateService implements Closeable {
         if (deferIndexMetadata) {
             indicesToFetch = new ArrayList<>(indicesToRead.size());
             for (UploadedIndexMetadata uploaded : indicesToRead) {
-                IndexDescriptor descriptor = uploaded.getDescriptor();
+                ManifestIndexDescriptor descriptor = uploaded.getDescriptor();
                 if (descriptor == null) {
                     indicesToFetch.add(uploaded);
                     continue;

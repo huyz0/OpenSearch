@@ -275,8 +275,8 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
      * {@link #getParentAndRangeOfChild(int)} (deliberately scoped to only the in-progress window, for
      * recovery), this covers a child's entire lifetime: the read path needs a committed child's own
      * range for as long as its bundles remain logically-filtered rather than physically rewritten
-     * (see this plugin's own {@code InPlaceSplitFilteringDirectoryReader}), which is indefinitely in
-     * this increment, not just until commit.
+     * (a plugin's filtering reader hides documents not owned by the child shard), which is
+     * indefinitely in this increment, not just until commit.
      */
     public ShardRange getRangeOfShard(int shardId) {
         for (ShardRange[] childRanges : parentToChildShards.values()) {
@@ -637,15 +637,14 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
         /**
          * Reverses an already-committed split, merging every one of {@code parentShardId}'s children
-         * back into a single active shard again -- dynamic-partitioning-plan.md Phase 2 item 2.1's
+         * back into a single active shard again -- the
          * "undo my own split" in-place merge, deliberately scoped to exactly the flat, non-nested case
          * a first increment can support: {@code parentShardId} must itself be an original root shard
          * (not itself a child produced by an earlier split), and every one of its children must still
          * be active and unsplit -- if any child has itself been split further, this shard's children no
          * longer form a simple contiguous partition of the parent's own original range, and reversing
-         * that would require the harder, not-yet-designed nested-merge case (see
-         * dynamic-partitioning-progress.md's "Phase 2 item 2.1" entry for why that's explicitly out of
-         * scope here). Unlike {@link #cancelSplit}, which only ever undoes a still-*in-progress* split
+         * that would require the harder, not-yet-designed nested-merge case, which is explicitly out of
+         * scope here. Unlike {@link #cancelSplit}, which only ever undoes a still-*in-progress* split
          * (this plugin's own allocation-failure rollback path), this undoes a split that has already
          * committed and been serving traffic.
          *

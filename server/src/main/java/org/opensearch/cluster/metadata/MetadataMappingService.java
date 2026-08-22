@@ -239,10 +239,10 @@ public class MetadataMappingService {
             try {
                 for (PutMappingClusterStateUpdateRequest request : tasks) {
                     try {
-                        // A gated index has no metadata entry by design (H3, H5), so getIndexSafe below
+                        // A gated index has no metadata entry by design, so getIndexSafe below
                         // would throw and a document carrying a new field would fail. Its mapping lives in
                         // the store instead, and that is handled in putMapping before anything is submitted
-                        // here -- see T19: doing it in this method did it on the cluster manager's update
+                        // here -- doing it in this method did it on the cluster manager's update
                         // thread, and the store blocks.
                         //
                         // Deliberately not left here as a fallback. putMapping is the only submitter of this
@@ -251,7 +251,7 @@ public class MetadataMappingService {
                         // being the defect. If a gated request ever does arrive here, getIndexSafe fails it
                         // loudly, which is the outcome that gets noticed.
                         assert MappingGenerationStore.isRegistered() == false || isGated(currentState, request) == false
-                            : "a gated put-mapping reached the cluster state update thread, which T19 moved it off";
+                            : "a gated put-mapping reached the cluster state update thread, which the GENERIC-pool dispatch in putMapping exists to prevent";
                         for (Index index : request.indices()) {
                             final IndexMetadata indexMetadata = currentState.metadata().getIndexSafe(index);
                             if (indexMapperServices.containsKey(indexMetadata.getIndex()) == false) {
@@ -296,7 +296,7 @@ public class MetadataMappingService {
          * documented as mirroring each other, and the divergence was not cosmetic. A mapping the creation
          * path refused outright, this one accepted and silently reduced.
          *
-         * <p>Since T15 the store holds a field's whole definition, so object and nested fields and every
+         * <p>The store now holds a field's whole definition, so object and nested fields and every
          * field parameter round-trip. What is left to refuse is a property whose definition is not an object
          * at all.
          */
@@ -334,21 +334,21 @@ public class MetadataMappingService {
         }
 
         /**
-         * T50: refuses a gated put-mapping whose index the descriptor plane no longer says is live.
+         * Refuses a gated put-mapping whose index the descriptor plane no longer says is live.
          *
          * <p>{@link #isGated} decides gating purely from the index's absence in cluster state, and that is
-         * equally true of a live gated index and one T47's deletion-time prune already removed: cluster
+         * equally true of a live gated index and one the deletion-time prune already removed: cluster
          * state never carried an entry for either. The uuid this request names was resolved by the
          * coordinating node from its own descriptor cache, which invalidates on a tombstone it has seen but
          * not on one it has not -- so a node whose cache has not yet caught up can still route a put-mapping
-         * or a dynamic field inference at a uuid whose tombstone is already durable elsewhere. Nothing before
-         * T50 asked the store whether that uuid was still current, so the write landed, recreated the
-         * document T47 pruned, and nothing was ever going to remove it again.
+         * or a dynamic field inference at a uuid whose tombstone is already durable elsewhere. Nothing
+         * previously asked the store whether that uuid was still current, so the write landed, recreated the
+         * document the deletion had pruned, and nothing was ever going to remove it again.
          *
-         * <p><b>The contract this closes T50 by:</b> refusing here, not letting the write land and sweeping
+         * <p><b>The contract this closes the hole by:</b> refusing here, not letting the write land and sweeping
          * it up later. The alternative -- a second pass that prunes stray mappings after the fact -- was
-         * tried first, keyed off the tombstone the deletion already wrote, and rejected: see the plan and log
-         * for T50. This resolves the descriptor for the uuid fresh, on the thread doing the write, which is
+         * tried first, keyed off the tombstone the deletion already wrote, and rejected as a second writer
+         * racing the same records. This resolves the descriptor for the uuid fresh, on the thread doing the write, which is
          * off the cluster manager's update thread already and so may block. For a live index the resolution
          * is a cache hit against the same descriptor cache every other resolution on this path already
          * pays for, not a new cost.
@@ -369,8 +369,8 @@ public class MetadataMappingService {
          * genuine deletion looks like here: {@code BlobDescriptorBackend#get} answers a tombstoned name with
          * the tombstone record, not null, so this only ever refuses on an answer that actually says so.
          */
-        // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b of
-        // core-pluggability-refactor-plan.md: this needs the raw IndexDescriptor's own uuid() and the
+        // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated to the resolver-backed
+        // Metadata accessors: this needs the raw IndexDescriptor's own uuid() and the
         // three-way null/tombstoned/live distinction, which IndexMetadataResolver's generic, collapsed
         // "null means absent" contract deliberately does not expose (see that interface's own javadoc).
         private void refuseIfDescriptorShowsTheIndexIsGone(Index index) {
@@ -498,8 +498,8 @@ public class MetadataMappingService {
         // It used to be handled inside PutMappingExecutor#execute, which runs on that thread, and the store
         // is backed by an ordinary index whose read and write both block. So every put-mapping on a gated
         // index made two blocking round trips on the single thread whose serialization is the ceiling this
-        // whole design exists to remove -- the same mistake creation and deletion were moved off in T4, in
-        // the one metadata path that was not looked at.
+        // whole design exists to remove -- the same mistake creation and deletion were already moved off,
+        // in the one metadata path that was not looked at.
         //
         // It was also an assertion failure rather than merely slow: "Expected current thread to not be the
         // cluster-manager service thread. Reason: [Blocking operation]". IndexBackedMappingStore's javadoc

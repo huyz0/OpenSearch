@@ -70,7 +70,6 @@ import org.opensearch.discovery.Discovery;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -289,7 +288,7 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
     }
 
     /**
-     * Phase C3 of {@code core-pluggability-refactor-plan.md}: {@code routingTable().index(indexName)},
+     * {@code routingTable().index(indexName)},
      * falling back to the attached {@link org.opensearch.cluster.routing.IndexRoutingResolver} (see that
      * interface's own javadoc) on a miss.
      *
@@ -301,8 +300,8 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
      * than the plain {@link Metadata#index(String)} -- see that method's own javadoc for why the two are
      * not interchangeable. So this single method composes both resolvers correctly for any caller with a
      * {@code ClusterState} in hand, which is nearly every core caller today ({@code OperationRouting},
-     * {@code IndexNameExpressionResolver}, the action layer) -- see
-     * {@code core-pluggability-refactor-plan.md} Phase C4 for the caller migration this enables.
+     * {@code IndexNameExpressionResolver}, the action layer) -- which is what lets those call sites
+     * migrate onto this one method instead of consulting the static registries directly.
      *
      * @return the resolved {@link org.opensearch.cluster.routing.IndexRoutingTable}, or {@code null} if
      *         neither the routing table nor the resolver has one -- callers must treat this identically
@@ -331,38 +330,6 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
     }
 
     /**
-     * Phase C4b of {@code core-pluggability-refactor-plan.md}: wires {@link IndexRoutingResolver#localShardsFor}
-     * -- declared since Phase C1 but, per that method's own "wiring status" note, never consulted by any
-     * core call site until now -- into {@link org.opensearch.cluster.routing.RoutingNodes#localRoutingNode}, replacing a direct call to the
-     * pre-existing static registry, {@code AbsentIndexRoutingSuppliers#localShards}.
-     *
-     * <p><b>Deliberately not gated by {@link ClusterStateMutationThreads}</b>, unlike {@link #getIndexRoutingTable}
-     * and {@link Metadata#indexOrResolved(String)}. Those guard a resolver that may do real (e.g. remote)
-     * work to answer an on-demand miss; this method's contract is the opposite by design -- {@code
-     * AbsentIndexRoutingSuppliers#localShards}'s own javadoc already requires an in-memory-only answer
-     * ("a plugin bug must not stop a node from applying cluster state"), because {@code localRoutingNode}
-     * is itself called from cluster-state application. Gating this call the same way the on-demand seams
-     * are gated would silently break it on the one thread it exists to run on.
-     *
-     * @return the shards this resolver believes {@code nodeId} locally hosts but that have no published
-     *         routing entry at all, or an empty collection if no resolver is attached or it declines.
-     */
-    public Collection<ShardRouting> getLocallyComputedShards(String nodeId) {
-        IndexRoutingResolver resolver = routingTable.indexRoutingResolver();
-        if (resolver == null) {
-            return List.of();
-        }
-        try {
-            Collection<ShardRouting> shards = resolver.localShardsFor(this, nodeId);
-            return shards == null ? List.of() : shards;
-        } catch (Exception e) {
-            // Matches AbsentIndexRoutingSuppliers#localShards' own failure direction: a throwing resolver
-            // must not stop a node from applying cluster state, so it is treated as "nothing computed here".
-            return List.of();
-        }
-    }
-
-    /**
      * The "no filter" predicate for {@link #allShards(String[], Predicate, boolean)}, held as a constant so
      * the fast path can recognise it by identity and delegate to {@link RoutingTable#allShards(String[])}
      * itself rather than to an equivalent method -- see that method's own javadoc for why the distinction
@@ -372,18 +339,17 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
     private static final Predicate<ShardRouting> ALL_SHARDS = shardRouting -> true;
 
     /**
-     * Phase C4b of {@code core-pluggability-refactor-plan.md}: every shard of {@code concreteIndices},
-     * resolving each index through {@link #getIndexRoutingTable(String)} rather than reading {@link
-     * #routingTable()} directly -- replacing the pre-existing static registry, {@code
-     * AbsentIndexRoutingSuppliers#allShards}. Composed entirely from already-wired primitives ({@link
+     * Every shard of {@code concreteIndices}, resolving each index through {@link
+     * #getIndexRoutingTable(String)} rather than reading {@link #routingTable()} directly -- this is the
+     * batch read that replaced the static registry's since-deleted {@code allShards} helpers, and it is
+     * now the only one. Composed entirely from already-wired primitives ({@link
      * #getIndexRoutingTable(String)}, itself already resolver-aware and thread-guarded) rather than adding
      * new {@link IndexRoutingResolver} surface -- this is a batch/predicate operation over what {@link
      * IndexRoutingResolver#resolve} already answers per index, not a new question a resolver needs to
      * answer.
      *
      * <p>Falls straight through to {@link RoutingTable}'s own equivalent methods when nothing is registered
-     * -- not merely behaviorally identical but the exact same call, for the reason {@code
-     * AbsentIndexRoutingSuppliers#allShards}'s own javadoc gives: a caller or test bound to a specific
+     * -- not merely behaviorally identical but the exact same call: a caller or test bound to a specific
      * method (a mock verifying {@code allShards(String[])} was called, say) must see that exact call.
      *
      * @param includeRelocationTargets whether to add the target of a relocating shard, as recovery needs
@@ -435,9 +401,9 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
      * callers that name no indices at all ({@code _cat/shards}, {@code _cat/allocation}), which cannot use
      * the array-taking overloads above because they have no list to pass and {@link
      * RoutingTable#allShards()} takes its list from the routing table's own key set, which an unpublished
-     * index is not in. See {@code AbsentIndexRoutingSuppliers#allShards(ClusterState)}'s own javadoc for
-     * why enumerating {@link #metadata()} is acceptable here specifically (callers of this overload are
-     * already linear in shard count) but would not be on a request path, which is why this is a separate
+     * index is not in. Enumerating {@link #metadata()} is acceptable here specifically -- callers of this
+     * overload already produce one row per shard, so they are inherently linear in shard count and the
+     * walk adds no asymptotic cost -- but would not be on a request path, which is why this is a separate
      * overload rather than the array form's zero-length case.
      */
     public List<ShardRouting> allShards() {
@@ -464,16 +430,16 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
     }
 
     /**
-     * Phase C4b of {@code core-pluggability-refactor-plan.md}: one shard's routing table, from the
-     * published entry or the resolved one, or null if neither has it -- replacing the pre-existing static
-     * registry, {@code AbsentIndexRoutingSuppliers#resolveShard}. Delegates to {@link
+     * One shard's routing table, from the published entry or the resolved one, or null if neither has it
+     * -- the shard-level read that replaced the static registry's since-deleted {@code resolveShard}
+     * helper, and now the only one. Delegates to {@link
      * RoutingTable#shardRoutingTableOrNull} for the published case rather than reimplementing it, because
      * the two absences it distinguishes are not the same absence: an index with no entry is a
      * maybe-resolvable index and returns null; an index that <em>has</em> an entry without this shard is a
      * caller asking for a shard that does not exist, and that must keep throwing {@link
      * org.opensearch.index.shard.ShardNotFoundException}.
      *
-     * <p>This is the exact call shape Phase C4a's own status log deliberately left unmigrated at {@code
+     * <p>This is the exact call shape the earlier call-site migration deliberately left unmigrated at {@code
      * TransportReplicationAction#resolveShard} and {@code IndicesClusterStateService}'s two uses, pending
      * confirmation the published/absent distinction above would carry through a migration -- confirmed here
      * by delegating to {@link RoutingTable#shardRoutingTableOrNull} exactly rather than reimplementing it,

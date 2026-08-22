@@ -133,7 +133,13 @@ public class TransportNodesStatsAction extends TransportNodesAction<
             NodesStatsRequest.Metric.CACHE_STATS.containedIn(metrics),
             NodesStatsRequest.Metric.REMOTE_STORE.containedIn(metrics),
             NodesStatsRequest.Metric.NATIVE_MEMORY.containedIn(metrics) || NodesStatsRequest.Metric.NATIVE_ALLOCATOR.containedIn(metrics),
+            // The allocator pool stats the native_memory/native_allocator metrics used to fetch through
+            // a dedicated NodeStats field now travel via the generic pluginStats path (arrow-base's
+            // Plugin#nodeStats() contribution under "native_allocator"), so those metrics keep working
+            // by also enabling the pluginStats collection.
             NodesStatsRequest.Metric.PLUGIN_STATS.containedIn(metrics)
+                || NodesStatsRequest.Metric.NATIVE_MEMORY.containedIn(metrics)
+                || NodesStatsRequest.Metric.NATIVE_ALLOCATOR.containedIn(metrics)
         );
     }
 

@@ -22,11 +22,10 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * Plan item E5 (plan-100m-index-implementation.md, Area E; C3b in rfc-manifest-sharding-design.md): the
- * pure decision of which manifest shards a given cluster-state version actually needs to rewrite, kept
- * free of any blob-store I/O so it is testable without a repository.
+ * The pure decision of which manifest shards a given cluster-state version actually needs to rewrite,
+ * kept free of any blob-store I/O so it is testable without a repository.
  *
- * <p>The four-step algorithm the RFC's "Write path (C3)" section describes: partition every currently
+ * <p>The four-step algorithm: partition every currently
  * live index by {@link ManifestShardFunction#shardFor}, mark a shard dirty if any index that changed or
  * was deleted this version hashes into it (or if the declared shard count itself changed, in which case
  * every shard is dirty -- see {@link #plan}'s own doc), rewrite only the dirty shards, and carry every
@@ -82,9 +81,9 @@ final class IndexMetadataManifestSharder {
      *                           there is no previous sharded manifest. A mismatch with {@code
      *                           shardCount} means every existing shard reference is meaningless under
      *                           the new partitioning -- rendezvous-style "minimal reshuffling" is
-     *                           deliberately not attempted here (see {@code rfc-manifest-sharding-design.md}'s
-     *                           "Shard count" section: the count is fixed and not meant to change under
-     *                           normal operation), so a change degrades safely to a full rewrite rather
+     *                           deliberately not attempted here (the shard count is fixed by design and
+     *                           not meant to change under normal operation), so a change degrades safely
+     *                           to a full rewrite rather
      *                           than silently mixing two partitionings.
      * @param shardCount the shard count this new manifest declares; must be positive.
      */

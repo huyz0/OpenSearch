@@ -93,7 +93,6 @@ import org.opensearch.cluster.metadata.TemplateUpgradeService;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.routing.BatchedRerouteService;
-import org.opensearch.cluster.routing.ComputedPlacementMembershipService;
 import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.RerouteService;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -771,7 +770,7 @@ public class Node implements Closeable {
             clusterService.addStateApplier(scriptService);
             resourcesToClose.add(clusterService);
 
-            // Phase C of core-pluggability-refactor-plan.md: give the node its plugin-supplied
+            // Give the node its plugin-supplied
             // IndexMetadataResolver/IndexRoutingResolver, if any ClusterPlugin on this node provides
             // one. See ResolverAttachingClusterStateApplier's own javadoc for why this attachment point
             // -- a high-priority applier -- is the right one, and Metadata#resolver's javadoc for the
@@ -804,7 +803,7 @@ public class Node implements Closeable {
                 );
             }
 
-            // Phase D2 of core-pluggability-refactor-plan.md: give the node its plugin-supplied
+            // Give the node its plugin-supplied
             // IndexCreationStrategy, if any ClusterPlugin on this node provides one. Unlike the resolvers
             // above, claims() is a pure, cheap, synchronous, purely-local predicate with no deadlock-safety
             // concerns and nothing to propagate through cluster state -- a one-time registration here,
@@ -823,7 +822,7 @@ public class Node implements Closeable {
             }
             indexCreationStrategies.stream().findFirst().ifPresent(IndexCreationStrategyRegistry::register);
 
-            // Phase E2 of core-pluggability-refactor-plan.md: give the node its plugin-supplied
+            // Give the node its plugin-supplied
             // IndexResidencyPolicy, if any ClusterPlugin on this node provides one. Same one-registration-
             // at-startup shape as IndexCreationStrategy immediately above, for the same reason -- see
             // IndexResidencyPolicyRegistry's own javadoc.
@@ -1468,7 +1467,7 @@ public class Node implements Closeable {
                 reg -> reg.setNativeMemoryPressureSupplier(nodeResourceUsageTracker::getNativeMemoryUtilizationPercent)
             );
 
-            // Phase H of core-pluggability-refactor-plan.md: AdmissionControlService (and everything it
+            // AdmissionControlService (and everything it
             // constructs, including NativeMemoryBasedAdmissionController) takes the generic
             // NativeMemoryPressureSignal, not the Arrow allocator's concrete pool-stats type -- this is
             // the one place that adapts between them, so org.opensearch.ratelimitting.admissioncontrol
@@ -1550,11 +1549,6 @@ public class Node implements Closeable {
             );
             if (DiscoveryNode.isClusterManagerNode(settings)) {
                 clusterService.addListener(new SystemIndexMetadataUpgradeService(systemIndices, clusterService));
-                // Placement membership is written by whichever node is elected, so every
-                // cluster-manager-eligible node carries the maintainer and the service itself checks
-                // election. It stays inert until a placement supplier is installed, so an unconfigured
-                // cluster never acquires the metadata.
-                clusterService.addListener(new ComputedPlacementMembershipService(clusterService));
             }
             new TemplateUpgradeService(client, clusterService, threadPool, indexTemplateMetadataUpgraders);
             final Transport transport = networkModule.getTransportSupplier().get();
@@ -1793,8 +1787,7 @@ public class Node implements Closeable {
                 segmentReplicationStatsTracker,
                 repositoryService,
                 admissionControlService,
-                cacheService,
-                nativeAllocatorStatsSupplier
+                cacheService
             );
 
             final SearchService searchService = newSearchService(

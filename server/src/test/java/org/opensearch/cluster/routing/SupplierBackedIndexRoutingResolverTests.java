@@ -16,8 +16,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
 
-import java.util.List;
-
 /**
  * Phase C5 of core-pluggability-refactor-plan.md. See {@code SupplierBackedIndexMetadataResolverTests}'
  * own javadoc for why every test here registers and unregisters within itself rather than trusting
@@ -31,7 +29,6 @@ public class SupplierBackedIndexRoutingResolverTests extends OpenSearchTestCase 
     public void clearRegistry() {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
-        AbsentIndexRoutingSuppliers.registerLocalShards(null);
         AbsentIndexRoutingSuppliers.clearMemos();
     }
 
@@ -61,21 +58,6 @@ public class SupplierBackedIndexRoutingResolverTests extends OpenSearchTestCase 
 
         assertFalse(resolver.shouldPublishRouting(computed));
         assertTrue(resolver.shouldPublishRouting(indexMetadata("ordinary")));
-    }
-
-    public void testLocalShardsForReturnsEmptyWhenNothingIsRegistered() {
-        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
-
-        assertTrue(resolver.localShardsFor(state, "node-1").isEmpty());
-    }
-
-    public void testLocalShardsForDelegatesToWhateverIsRegistered() {
-        ShardRouting shard = TestShardRouting.newShardRouting("computed", 0, "node-1", true, ShardRoutingState.STARTED);
-        AbsentIndexRoutingSuppliers.registerLocalShards((state, nodeId) -> "node-1".equals(nodeId) ? List.of(shard) : List.of());
-        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
-
-        assertEquals(List.of(shard), resolver.localShardsFor(state, "node-1"));
-        assertTrue(resolver.localShardsFor(state, "node-2").isEmpty());
     }
 
     private static IndexMetadata indexMetadata(String name) {

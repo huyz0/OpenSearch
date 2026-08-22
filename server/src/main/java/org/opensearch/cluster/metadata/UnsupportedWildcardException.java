@@ -22,16 +22,16 @@ import org.opensearch.core.rest.RestStatus;
  * embedded star is a scan of every name in the population. At a hundred million indices that is not a slow
  * answer, it is no answer, and supporting it needs a second global structure keyed on reversed names.
  *
- * <p><b>A pattern that matches more than the cap</b> could be answered and should not be. T20 and T21
- * measured 118 KB and 3.06 file descriptors per awake shard, and with index per tenant most tenant indices
+ * <p><b>A pattern that matches more than the cap</b> could be answered and should not be. Measurement put
+ * an awake shard at 118 KB and 3.06 file descriptors, and with index per tenant most tenant indices
  * are asleep, so an expansion decides how many sleeping shards one request wakes. The cap bounds that, and
  * resolving the names was never the expensive part.
  *
  * <p><b>Why this is an error rather than a truncated answer.</b> Returning the first hundred of five
  * thousand matches reads exactly like a complete answer, and the caller has no way to tell. That is the
  * failure this whole area keeps producing, and it has now been measured four separate times: cluster stats
- * reporting a plausible wrong number (H19), eight clients each told they created the same index (T23), a
- * wildcard silently matching nothing (T25), and a hundred million indices listed as ten (T27).
+ * reporting a plausible wrong number, eight clients each told they created the same index, a
+ * wildcard silently matching nothing, and a hundred million indices listed as ten.
  *
  * <p>Reported as {@link RestStatus#BAD_REQUEST} because the request is answerable only in a narrower form,
  * and narrowing it is the client's decision rather than something the cluster can do on their behalf.
@@ -68,7 +68,7 @@ public class UnsupportedWildcardException extends OpenSearchStatusException {
     /**
      * A prefix that matches more indices than one request may expand to.
      *
-     * <p>Phase J3 of {@code core-pluggability-refactor-plan.md}: {@code limitSettingName} is supplied by
+     * <p>{@code limitSettingName} is supplied by
      * whichever expander produced the limit, rather than core interpolating one specific plugin's setting
      * key. Null when the expander did not name one, in which case the sentence is simply omitted.
      */

@@ -24,7 +24,7 @@ import java.util.Objects;
 /**
  * The irreducible per-index facts, small enough to store outside cluster state.
  *
- * <p>Area H's premise is that cluster state should hold no entry per index. The obstacle is that a
+ * <p>The gated-index premise is that cluster state should hold no entry per index. The obstacle is that a
  * coordinator receiving a request still has to answer two questions before it can do anything: does this
  * name exist, and what are its bones. This type is that answer, and it is deliberately the smallest thing
  * that suffices rather than a trimmed {@link IndexMetadata}.
@@ -32,7 +32,7 @@ import java.util.Objects;
  * <p><b>Why these fields and no others.</b> The set is derived from what placement actually reads, which
  * was audited rather than guessed: {@code ComputedRoutingTable} uses the index (name and uuid), the shard
  * count, and the search-only replica count, and {@code ComputedPlacementGate} reads whether the index is
- * serverless. State and aliases are here because resolution needs them to answer without materializing
+ * claimed. State and aliases are here because resolution needs them to answer without materializing
  * anything, and a resolver that had to load full metadata to decide whether an index is closed would
  * defeat the point.
  *
@@ -89,7 +89,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      * partition set. The setting is accepted and silently ignored, which is the worst of the three outcomes.
      */
     private final int routingPartitionSize;
-    private final boolean serverless;
+    private final boolean claimed;
     private final State state;
     private final List<String> aliases;
     private final long createdVersion;
@@ -101,7 +101,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
     /**
      * The generation of this index's mapping object, which is what makes a cached mapping checkable.
      *
-     * <p>H.7's read half in one field. A coordinator already fetches the descriptor to route, so carrying
+     * <p>The mapping seam's read half in one field. A coordinator already fetches the descriptor to route, so carrying
      * the generation here means that same fetch says whether its cached mapping is stale. Without it every
      * request would need a second lookup, or an invalidation protocol, to answer a question the routing
      * fetch could have answered for free.
@@ -129,7 +129,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      * When the index was created, which pagination orders by.
      *
      * <p>Carried because {@code IndexPaginationStrategy} orders by creation date then name, and a gated
-     * index that cannot express that ordering cannot appear in a page at all (H16). Unlike the
+     * index that cannot express that ordering cannot appear in a page at all. Unlike the
      * suspended-shard field this replaced, it is written at creation from {@link IndexMetadata}, so it is
      * not another wire field with no producer.
      */
@@ -149,7 +149,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         String uuid,
         int shardCount,
         int searchOnlyReplicaCount,
-        boolean serverless,
+        boolean claimed,
         State state,
         List<String> aliases,
         long createdVersion,
@@ -165,7 +165,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             state,
             aliases,
             createdVersion,
@@ -185,7 +185,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         String uuid,
         int shardCount,
         int searchOnlyReplicaCount,
-        boolean serverless,
+        boolean claimed,
         State state,
         List<String> aliases,
         long createdVersion,
@@ -203,7 +203,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             state,
             aliases,
             createdVersion,
@@ -225,7 +225,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         String uuid,
         int shardCount,
         int searchOnlyReplicaCount,
-        boolean serverless,
+        boolean claimed,
         State state,
         List<String> aliases,
         long createdVersion,
@@ -244,7 +244,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             state,
             aliases,
             createdVersion,
@@ -266,7 +266,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         String uuid,
         int shardCount,
         int searchOnlyReplicaCount,
-        boolean serverless,
+        boolean claimed,
         State state,
         List<String> aliases,
         long createdVersion,
@@ -288,7 +288,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.uuid = Objects.requireNonNull(uuid, "descriptor needs a uuid, since placement hashes it");
         this.shardCount = shardCount;
         this.searchOnlyReplicaCount = searchOnlyReplicaCount;
-        this.serverless = serverless;
+        this.claimed = claimed;
         this.state = Objects.requireNonNull(state, "descriptor needs a state");
         this.aliases = List.copyOf(aliases);
         this.createdVersion = createdVersion;
@@ -307,12 +307,13 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
     public static IndexDescriptor from(IndexMetadata indexMetadata) {
         Map<String, Object> declaredFields = DescriptorRepresentable.fieldDefinitionsOrNull(indexMetadata);
         long gen = (declaredFields != null && declaredFields.isEmpty() == false) ? 1L : 0L;
+        String claimedKey = IndexCreationStrategyRegistry.claimedIndexSettingKey();
         return new IndexDescriptor(
             indexMetadata.getIndex().getName(),
             indexMetadata.getIndexUUID(),
             indexMetadata.getNumberOfShards(),
             indexMetadata.getNumberOfSearchOnlyReplicas(),
-            indexMetadata.getSettings().getAsBoolean("index.serverless_storage.enabled", false),
+            claimedKey != null && indexMetadata.getSettings().getAsBoolean(claimedKey, false),
             indexMetadata.getState() == IndexMetadata.State.CLOSE ? State.CLOSE : State.OPEN,
             List.copyOf(indexMetadata.getAliases().keySet()),
             indexMetadata.getCreationVersion().id,
@@ -335,7 +336,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.uuid = in.readString();
         this.shardCount = in.readVInt();
         this.searchOnlyReplicaCount = in.readVInt();
-        this.serverless = in.readBoolean();
+        this.claimed = in.readBoolean();
         this.state = State.values()[in.readVInt()];
         this.aliases = List.copyOf(in.readStringList());
         this.createdVersion = in.readVLong();
@@ -362,7 +363,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeString(uuid);
         out.writeVInt(shardCount);
         out.writeVInt(searchOnlyReplicaCount);
-        out.writeBoolean(serverless);
+        out.writeBoolean(claimed);
         out.writeVInt(state.ordinal());
         out.writeStringCollection(aliases);
         out.writeVLong(createdVersion);
@@ -433,10 +434,6 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         return searchOnlyReplicaCount;
     }
 
-    public boolean serverless() {
-        return serverless;
-    }
-
     public State state() {
         return state;
     }
@@ -458,14 +455,15 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      * The four flags resolution needs and placement does not, taken from {@link LazyIndexMetadata}'s
      * field set rather than chosen independently.
      *
-     * <p>This is a correction. H2a audited what <em>placement</em> reads and concluded the descriptor was
+     * <p>This is a correction. The original audit covered what <em>placement</em> reads and concluded the
+     * descriptor was
      * sufficient, which was true of routing and false of resolution. Wildcard expansion consults hidden
      * and system to decide what an expression may match, so a descriptor without them would silently
      * include indices that should be excluded, and that is a security-relevant difference for system
      * indices rather than only a correctness one.
      *
-     * <p>Area A had already worked this out: {@code LazyIndexMetadata}, the holder that exists so an
-     * index can be described without materializing it, carries exactly these four. Matching its field set
+     * <p>{@code LazyIndexMetadata} had already worked this out: the holder that exists so an
+     * index can be described without materializing it carries exactly these four. Matching its field set
      * is deliberate.
      */
     public boolean system() {
@@ -510,7 +508,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             state,
             aliases,
             createdVersion,
@@ -533,7 +531,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             newState,
             aliases,
             createdVersion,
@@ -556,7 +554,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             state,
             newAliases != null ? List.copyOf(newAliases) : List.of(),
             createdVersion,
@@ -579,7 +577,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             state,
             aliases,
             createdVersion,
@@ -600,28 +598,29 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      * This descriptor as {@link IndexMetadata}, for the paths that still speak that language.
      *
      * <p>Placement is one of them. {@code ComputedPlacementGate.ownsIndex} decides from settings on an
-     * {@code IndexMetadata}, and a gated index has none, so P6 measured it owning nothing and being placed
+     * {@code IndexMetadata}, and a gated index has none, so it was measured owning nothing and being placed
      * nowhere. Synthesising the metadata rather than widening the routing seam keeps the change off a
-     * signature that C3 and every routing caller depend on.
+     * signature that every routing caller depends on.
      *
-     * <p>Deliberately minimal: the shard counts, the uuid and the serverless flag, which is what placement
+     * <p>Deliberately minimal: the shard counts, the uuid and the claimed flag, which is what placement
      * reads. It is not a general-purpose reconstruction and must not become one, because the whole reason
      * the descriptor exists is that full {@code IndexMetadata} is what could not be afforded per index.
      */
     public IndexMetadata toIndexMetadata() {
         int shards = Math.max(1, shardCount);
+        org.opensearch.common.settings.Settings.Builder settingsBuilder = org.opensearch.common.settings.Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.fromId((int) createdVersion))
+            .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
+            // routing_partition_size is a plain setting and is read back from one. The routing
+            // shard count is not: IndexMetadata holds it as a field and derives routingFactor from
+            // it, so it has to go through the builder below or it is silently ignored.
+            .put(IndexMetadata.SETTING_ROUTING_PARTITION_SIZE, effectiveRoutingPartitionSize());
+        String claimedKey = IndexCreationStrategyRegistry.claimedIndexSettingKey();
+        if (claimedKey != null) {
+            settingsBuilder.put(claimedKey, claimed);
+        }
         IndexMetadata.Builder builder = IndexMetadata.builder(name)
-            .settings(
-                org.opensearch.common.settings.Settings.builder()
-                    .put(IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.fromId((int) createdVersion))
-                    .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
-                    .put("index.serverless_storage.enabled", serverless)
-                    // routing_partition_size is a plain setting and is read back from one. The routing
-                    // shard count is not: IndexMetadata holds it as a field and derives routingFactor from
-                    // it, so it has to go through the builder below or it is silently ignored.
-                    .put(IndexMetadata.SETTING_ROUTING_PARTITION_SIZE, effectiveRoutingPartitionSize())
-                    .build()
-            )
+            .settings(settingsBuilder.build())
             .numberOfShards(shards)
             .numberOfReplicas(0)
             // The state, which this dropped until 2026-08-15 -- and dropping it made close a label rather
@@ -659,13 +658,13 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      */
     public static final long FIRST_PRIMARY_TERM = 1L;
 
-    /** Compact stream serialization for Object Storage blobs (T73). */
+    /** Compact stream serialization for Object Storage blobs. */
     public void writeCompact(StreamOutput out) throws IOException {
         out.writeString(name);
         out.writeString(uuid);
         out.writeVInt(shardCount);
         out.writeVInt(searchOnlyReplicaCount);
-        out.writeBoolean(serverless);
+        out.writeBoolean(claimed);
         out.writeEnum(state);
         out.writeVLong(createdVersion);
         out.writeBoolean(system);
@@ -684,7 +683,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         String uuid = in.readString();
         int shardCount = in.readVInt();
         int searchOnlyReplicaCount = in.readVInt();
-        boolean serverless = in.readBoolean();
+        boolean claimed = in.readBoolean();
         State state = in.readEnum(State.class);
         long createdVersion = in.readVLong();
         boolean system = in.readBoolean();
@@ -702,7 +701,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             state,
             List.of(),
             createdVersion,
@@ -744,7 +743,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             State.DELETED,
             aliases,
             createdVersion,
@@ -768,7 +767,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         builder.field("uuid", uuid);
         builder.field("shard_count", shardCount);
         builder.field("search_only_replicas", searchOnlyReplicaCount);
-        builder.field("serverless", serverless);
+        builder.field("claimed", claimed);
         builder.field("state", state.name());
         builder.field("aliases", aliases);
         builder.field("created_version", createdVersion);
@@ -794,7 +793,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         IndexDescriptor other = (IndexDescriptor) o;
         return shardCount == other.shardCount
             && searchOnlyReplicaCount == other.searchOnlyReplicaCount
-            && serverless == other.serverless
+            && claimed == other.claimed
             && createdVersion == other.createdVersion
             && name.equals(other.name)
             && uuid.equals(other.uuid)
@@ -814,7 +813,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             uuid,
             shardCount,
             searchOnlyReplicaCount,
-            serverless,
+            claimed,
             state,
             aliases,
             createdVersion,

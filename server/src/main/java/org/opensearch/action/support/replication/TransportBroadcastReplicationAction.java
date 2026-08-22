@@ -171,15 +171,16 @@ public abstract class TransportBroadcastReplicationAction<
             // RoutingTable#allShardsSatisfyingPredicate -- so do the same rather than fail the request.
             //
             // Resolving rather than looking up is what makes this work for a computed index. The guard
-            // above was correct for Phase A, where an absent entry really did mean no shards, but a
+            // above was correct before placements could be computed, when an absent entry really did
+            // mean no shards, but a
             // computed index has shards and simply does not publish them. Looking up directly found
             // nothing, so a refresh or a flush reported success having touched nothing at all, and every
             // read afterwards saw a stale searcher. Silent, and indistinguishable from a broken write.
             //
             // The metadata half of that guard then reintroduced the same defect for a gated index, which
-            // has no metadata entry at all, and T39 measured it: a refresh over twenty gated tenants
-            // touched nothing, reported success, and the search that followed found 450 documents of a
-            // thousand that had genuinely been written. It is dropped because it is redundant rather than
+            // has no metadata entry at all, measured in an integration run: a refresh over twenty gated
+            // tenants touched nothing, reported success, and the search that followed found 450 documents
+            // of a thousand that had genuinely been written. It is dropped because it is redundant rather than
             // because it is inconvenient -- resolve already answers null for an index that is in neither
             // table, which is the case the metadata check was standing in for.
             IndexRoutingTable indexRouting = clusterState.getIndexRoutingTable(index);

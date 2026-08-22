@@ -183,12 +183,12 @@ public class MetadataIndexStateService {
         //
         // Resolved on this thread, which is the transport thread that received the request: the seam refuses
         // to answer on the cluster state thread, so checking inside the update task would learn nothing.
-        // Phase C4b of core-pluggability-refactor-plan.md: clusterService.state().metadata().gatedAmong(...)
+        // clusterService.state().metadata().gatedAmong(...)
         // replaces AbsentIndexDescriptorSuppliers.gatedAmong(...) here -- same predicate, discovered through
         // the resolver attached to this state's own metadata.
         final List<Index> gated = clusterService.state().metadata().gatedAmong(request.indices());
         if (gated.isEmpty() == false) {
-            // Phase J3 of core-pluggability-refactor-plan.md: the cap and the namespace wording both come
+            // The cap and the namespace wording both come
             // from the registered strategy now, instead of core hardcoding 50 and naming one product's
             // storage technology in an error a user reads. Unregistered answers MAX_VALUE/a generic
             // description, so a node without the plugin is unaffected -- and cannot reach here anyway,
@@ -982,12 +982,12 @@ public class MetadataIndexStateService {
     ) {
         // Same refusal as closeIndices, and reachable by the same route: an operator opening a name that
         // resolves through a descriptor rather than through cluster state.
-        // Phase C4b of core-pluggability-refactor-plan.md: clusterService.state().metadata().gatedAmong(...)
+        // clusterService.state().metadata().gatedAmong(...)
         // replaces AbsentIndexDescriptorSuppliers.gatedAmong(...) here -- same predicate, discovered through
         // the resolver attached to this state's own metadata.
         final List<Index> gatedToOpen = clusterService.state().metadata().gatedAmong(request.indices());
         if (gatedToOpen.isEmpty() == false) {
-            // Phase J3: same strategy-supplied cap and namespace wording as closeIndices above.
+            // Same strategy-supplied cap and namespace wording as closeIndices above.
             final int maxTargets = IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets();
             if (gatedToOpen.size() > maxTargets) {
                 listener.onFailure(
@@ -1264,8 +1264,8 @@ public class MetadataIndexStateService {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 for (Index index : gatedIndices) {
-                    // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b
-                    // of core-pluggability-refactor-plan.md: this republishes descriptor.withState(...)
+                    // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated to the
+                    // resolver-seam accessors: this republishes descriptor.withState(...)
                     // below, which needs the concrete IndexDescriptor IndexMetadataResolver's generic
                     // IndexMetadata contract does not carry.
                     IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
@@ -1291,7 +1291,7 @@ public class MetadataIndexStateService {
                 for (Index index : gatedIndices) {
                     // Same reason as closeGatedIndices' identical shape: republishes descriptor.withState(...)
                     // below, so it needs the concrete IndexDescriptor, deliberately left on
-                    // AbsentIndexDescriptorSuppliers directly (Phase C4b of core-pluggability-refactor-plan.md).
+                    // AbsentIndexDescriptorSuppliers directly rather than the resolver-seam accessors.
                     IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
                     if (descriptor == null || descriptor.exists() == false) {
                         throw new IndexNotFoundException(index.getName());

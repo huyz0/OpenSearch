@@ -54,8 +54,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                                           // indicesLookup without fetching every index blob first.
 
     /**
-     * Plan item E5 (plan-100m-index-implementation.md, Area E; C3b/C5 in rfc-manifest-sharding-design.md):
-     * the manifest may carry its index list behind {@link UploadedManifestShard} references instead of
+     * The manifest may carry its index list behind {@link UploadedManifestShard} references instead of
      * inline in {@link #getIndices()}. {@link #getManifestShardCount()} of {@code 0} (the default, and
      * the only value any manifest written before this codec can have) means "not sharded" -- {@code
      * getIndices()} is authoritative, exactly as every earlier codec already behaves. A positive shard
@@ -68,7 +67,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
     public static final int[] CODEC_VERSIONS = { CODEC_V0, CODEC_V1, CODEC_V2, CODEC_V3, CODEC_V4, CODEC_V5, CODEC_V6 };
 
     /**
-     * Plan item E1 (plan-100m-index-implementation.md, Area E): the floor for any codec version this
+     * The floor for any codec version this
      * fork adds beyond {@link #CODEC_V5}, reserved now so a future one never collides with a real
      * upstream codec number reached by a normal merge/rebase. {@code CODEC_V5} itself already carries
      * fork-specific behaviour (the descriptor-carrying index entry, not an upstream V5), a risk already
@@ -80,7 +79,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
      * known one, so an upstream node reading a manifest written under {@code FORK_CODEC_BASE} (or
      * higher) fails cleanly before deserialising anything, rather than misreading it as, say, a cluster
      * with zero indices. No codec at or above this value exists yet -- it is a reservation, not a
-     * codec E5 (the sharded-manifest write path) has not yet claimed.
+     * codec the sharded-manifest write path has yet claimed.
      */
     public static final int FORK_CODEC_BASE = 10_000;
     private static final ParseField CLUSTER_TERM_FIELD = new ParseField("cluster_term");
@@ -333,7 +332,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         declareParser(PARSER_V5, CODEC_V5);
         declareParser(PARSER_V6, CODEC_V6);
 
-        // Plan item E3 (plan-100m-index-implementation.md, Area E): this assertion means adding a new
+        // This assertion means adding a new
         // codec to CODEC_VERSIONS and pointing MANIFEST_CURRENT_CODEC_VERSION at it flips every node to
         // writing that codec immediately -- for a fork, this is correct and deliberately simpler than
         // upstream's own two-release rollout: no dormant landing, no setting to flip, no gap where some
@@ -355,7 +354,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             } else if (version.onOrAfter(Version.V_2_17_0) && version.before(Version.V_3_8_0)) {
                 versionToCodecMapping.put(version, ClusterMetadataManifest.CODEC_V4);
             } else if (version.onOrAfter(Version.V_3_8_0)) {
-                // Plan item E5: this fork's codec bump policy (see E3's own doc on this file) is
+                // This fork's codec bump policy (see the assertion doc in declareParser above) is
                 // unconditional -- MANIFEST_CURRENT_CODEC_VERSION moving to CODEC_V6 means every node on
                 // this build writes CODEC_V6 from here on, not just nodes past some future release.
                 versionToCodecMapping.put(version, ClusterMetadataManifest.CODEC_V6);
@@ -1033,7 +1032,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
      * Whether this manifest's codec is at or after {@code codecVersion}, in the direct sense the name
      * says: a plain {@code >=}.
      *
-     * <p>Plan item E2 (plan-100m-index-implementation.md, Area E): a real, deliberate consequence of
+     * <p>A real, deliberate consequence of
      * that plain comparison is worth stating rather than leaving accidental. Any future fork-only
      * codec (see {@link #FORK_CODEC_BASE}) is numerically far larger than every {@code CODEC_V0}
      * through {@link #CODEC_V5}, so {@code onOrAfterCodecVersion(CODEC_V1)} through
@@ -1069,7 +1068,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
     }
 
     /**
-     * Plan item E5: preserved the same way {@link #fromXContentV4} was when {@link #CODEC_V5} superseded
+     * Preserved the same way {@link #fromXContentV4} was when {@link #CODEC_V5} superseded
      * it as current -- a manifest already written at {@link #CODEC_V5} before {@link #CODEC_V6} existed
      * must still be readable through its own dedicated parser, not fall through {@link
      * org.opensearch.gateway.remote.model.RemoteClusterMetadataManifest}'s exact-match dispatch to the
@@ -1397,8 +1396,8 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             return (String) fields[3];
         }
 
-        private static IndexDescriptor descriptor(Object[] fields) {
-            return (IndexDescriptor) fields[4];
+        private static ManifestIndexDescriptor descriptor(Object[] fields) {
+            return (ManifestIndexDescriptor) fields[4];
         }
 
         private static final ConstructingObjectParser<UploadedIndexMetadata, Void> PARSER_V0 = new ConstructingObjectParser<>(
@@ -1441,7 +1440,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                 // cope with a V5 manifest whose entries carry no descriptor.
                 parser.declareObject(
                     ConstructingObjectParser.optionalConstructorArg(),
-                    (p, c) -> IndexDescriptor.fromXContent(p),
+                    (p, c) -> ManifestIndexDescriptor.fromXContent(p),
                     DESCRIPTOR_FIELD
                 );
             }
@@ -1454,7 +1453,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         private final String uploadedFilename;
         /** Null whenever the manifest predates {@link ClusterMetadataManifest#CODEC_V5} or the writer opted out. */
         @Nullable
-        private final IndexDescriptor descriptor;
+        private final ManifestIndexDescriptor descriptor;
 
         private long codecVersion = CODEC_V2;
 
@@ -1486,7 +1485,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             String uploadedFileName,
             String componentPrefix,
             long codecVersion,
-            @Nullable IndexDescriptor descriptor
+            @Nullable ManifestIndexDescriptor descriptor
         ) {
             this.componentPrefix = componentPrefix;
             this.indexName = indexName;
@@ -1502,7 +1501,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             this.uploadedFilename = in.readString();
             this.componentPrefix = in.readString();
             if (in.getVersion().onOrAfter(Version.V_3_8_0)) {
-                this.descriptor = in.readOptionalWriteable(IndexDescriptor::new);
+                this.descriptor = in.readOptionalWriteable(ManifestIndexDescriptor::new);
             } else {
                 this.descriptor = null;
             }
@@ -1535,7 +1534,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
 
         /** The resident part of the index's metadata, or null if this manifest does not carry it. */
         @Nullable
-        public IndexDescriptor getDescriptor() {
+        public ManifestIndexDescriptor getDescriptor() {
             return descriptor;
         }
 
@@ -1544,7 +1543,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
          * The blob this points at is unchanged, so this is how an index that did not change gains a
          * descriptor without being re-uploaded.
          */
-        public UploadedIndexMetadata withDescriptor(IndexDescriptor descriptor) {
+        public UploadedIndexMetadata withDescriptor(ManifestIndexDescriptor descriptor) {
             return new UploadedIndexMetadata(indexName, indexUUID, uploadedFilename, componentPrefix, CODEC_V5, descriptor);
         }
 

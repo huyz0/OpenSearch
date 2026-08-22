@@ -56,7 +56,6 @@ import org.opensearch.ingest.IngestService;
 import org.opensearch.monitor.MonitorService;
 import org.opensearch.monitor.os.OsProbe;
 import org.opensearch.node.remotestore.RemoteStoreNodeStats;
-import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.PluginNodeStats;
 import org.opensearch.plugins.PluginsService;
@@ -76,7 +75,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
 
 /**
  * Services exposed to nodes
@@ -112,18 +110,6 @@ public class NodeService implements Closeable {
     private final SegmentReplicationStatsTracker segmentReplicationStatsTracker;
     private final CacheService cacheService;
 
-    /**
-     * Supplier for native allocator pool stats. Constructor-injected via discovery from
-     * {@code pluginComponents} in {@code Node.java} (looks up a published
-     * {@link org.opensearch.plugin.stats.NativeAllocatorStatsRegistry} from
-     * {@code ArrowBasePlugin.createComponents()}). When no plugin publishes a registry, the
-     * supplier is {@code null} and {@code _nodes/stats/native_allocator} returns no allocator
-     * stats. The supplier itself is responsible for returning {@code null} once its underlying
-     * allocator is closed.
-     */
-    @Nullable
-    private final Supplier<NativeAllocatorPoolStats> nativeAllocatorStatsSupplier;
-
     NodeService(
         Settings settings,
         ThreadPool threadPool,
@@ -150,8 +136,7 @@ public class NodeService implements Closeable {
         SegmentReplicationStatsTracker segmentReplicationStatsTracker,
         RepositoriesService repositoriesService,
         AdmissionControlService admissionControlService,
-        CacheService cacheService,
-        @Nullable Supplier<NativeAllocatorPoolStats> nativeAllocatorStatsSupplier
+        CacheService cacheService
     ) {
         this.settings = settings;
         this.threadPool = threadPool;
@@ -181,7 +166,6 @@ public class NodeService implements Closeable {
         clusterService.addStateApplier(searchPipelineService);
         this.segmentReplicationStatsTracker = segmentReplicationStatsTracker;
         this.cacheService = cacheService;
-        this.nativeAllocatorStatsSupplier = nativeAllocatorStatsSupplier;
     }
 
     public NodeInfo info(
@@ -268,6 +252,10 @@ public class NodeService implements Closeable {
         boolean admissionControl,
         boolean cacheService,
         boolean remoteStoreNodeStats,
+        // nativeMemory: retained for API stability. It used to gate the dedicated native-allocator
+        // pool-stats collection, which migrated to the generic pluginStats path (the arrow-base
+        // plugin's Plugin#nodeStats() contribution, gated by the pluginStats flag below); the
+        // process-level native-memory estimate it also covered is now always captured.
         boolean nativeMemory,
         boolean pluginStats
     ) {
@@ -306,7 +294,6 @@ public class NodeService implements Closeable {
             admissionControl ? this.admissionControlService.stats() : null,
             cacheService ? this.cacheService.stats(indices) : null,
             remoteStoreNodeStats ? new RemoteStoreNodeStats() : null,
-            nativeMemory ? collectNativeAllocatorStats() : null,
             // Always capture the process-level native memory estimate on this data node.
             // Serialized over the wire so the coordinator renders the source node's value,
             // not its own. Returns -1 on non-Linux platforms or when /proc/self/status is
@@ -316,13 +303,8 @@ public class NodeService implements Closeable {
         );
     }
 
-    @Nullable
-    private NativeAllocatorPoolStats collectNativeAllocatorStats() {
-        return nativeAllocatorStatsSupplier != null ? nativeAllocatorStatsSupplier.get() : null;
-    }
-
     /**
-     * Phase B of core-pluggability-refactor-plan.md. Collects every installed plugin's own
+     * Collects every installed plugin's own
      * {@link Plugin#nodeStats()} contribution into one map, keyed by each entry's
      * {@code getWriteableName()} -- the same key {@link NodeStats#toXContent} renders it under and the
      * transport wire format frames it by. A later plugin overwriting an earlier one under the same key is

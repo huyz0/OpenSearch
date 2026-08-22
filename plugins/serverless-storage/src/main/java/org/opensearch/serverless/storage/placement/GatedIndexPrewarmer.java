@@ -6,13 +6,14 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.metadata;
+package org.opensearch.serverless.storage.placement;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.CoordinatorAffinityRouting;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterStateApplier;
+import org.opensearch.cluster.metadata.DescriptorPrefetch;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.core.action.ActionListener;
@@ -27,8 +28,8 @@ import java.util.List;
  *
  * <h2>Why this only prefetches its own affinity share, not the whole set</h2>
  *
- * This applier runs once per node -- {@link org.opensearch.indices.cluster.IndicesClusterStateService}
- * constructs one instance per node, and {@link ClusterStateApplier#applyClusterState} fires on every
+ * This applier runs once per node -- {@code ServerlessStoragePlugin#createComponents} registers one
+ * instance per node, and {@link ClusterStateApplier#applyClusterState} fires on every
  * node for the same cluster-state transition. Prefetching the full {@code activeGatedIndices} set
  * unfiltered, as this class did before {@link CoordinatorAffinityRouting} had a caller, means N nodes
  * each independently re-warm all M indices: N times the store reads a single node join should cost,

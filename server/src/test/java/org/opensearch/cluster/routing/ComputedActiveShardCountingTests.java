@@ -152,12 +152,12 @@ public class ComputedActiveShardCountingTests extends OpenSearchTestCase {
         ClusterState computed = stateWithoutRouting(1);
         assertNull(
             "an index with no entry resolves to null so the supplier can answer",
-            AbsentIndexRoutingSuppliers.resolveShard(computed, new ShardId(computed.metadata().index(INDEX).getIndex(), 0))
+            computed.resolveShard(new ShardId(computed.metadata().index(INDEX).getIndex(), 0))
         );
 
         ClusterState published = stateWithPublishedRouting(1, "node-1");
         ShardId missing = new ShardId(published.metadata().index(INDEX).getIndex(), 7);
-        expectThrows(ShardNotFoundException.class, () -> AbsentIndexRoutingSuppliers.resolveShard(published, missing));
+        expectThrows(ShardNotFoundException.class, () -> published.resolveShard(missing));
     }
 
     // ---------------------------------------------------------------- helpers

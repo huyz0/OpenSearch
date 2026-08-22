@@ -13,10 +13,10 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Phase D2 of {@code core-pluggability-refactor-plan.md}: the node-level holder for the single {@link
+ * The node-level holder for the single {@link
  * IndexCreationStrategy} a {@link org.opensearch.plugins.ClusterPlugin} may supply, mirroring {@code
- * DescriptorOnlyCreation}'s own static-registry shape deliberately (a plugin-owned class since Phase D3
- * relocated it out of {@code server/}) -- the safest possible way to introduce
+ * DescriptorOnlyCreation}'s own static-registry shape deliberately (a plugin-owned class, since
+ * relocated out of {@code server/}) -- the safest possible way to introduce
  * this seam is one that looks structurally identical to the mechanism already proven in this exact spot,
  * changing only <em>who decides</em> a name is claimed, not <em>how</em> that decision is discovered.
  *
@@ -134,6 +134,24 @@ public final class IndexCreationStrategyRegistry {
             return strategy.maxMultiIndexStateChangeTargets();
         } catch (Exception e) {
             return Integer.MAX_VALUE;
+        }
+    }
+
+    /**
+     * The registered strategy's claimed-plane settings key -- see {@link
+     * IndexCreationStrategy#claimedIndexSettingKey()}. Answers {@code null} when nothing is registered,
+     * the strategy declares none, or the strategy throws; in each case descriptor synthesis simply
+     * round-trips no membership marker.
+     */
+    public static String claimedIndexSettingKey() {
+        IndexCreationStrategy strategy = STRATEGY.get();
+        if (strategy == null) {
+            return null;
+        }
+        try {
+            return strategy.claimedIndexSettingKey();
+        } catch (Exception e) {
+            return null;
         }
     }
 

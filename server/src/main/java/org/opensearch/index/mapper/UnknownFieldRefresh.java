@@ -15,8 +15,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * The point at which a shard discovers its mapping is behind.
  *
- * <p>H6c designed refresh-on-demand around a generation stamped on the request: a shard already at or ahead
- * of it does no read, which is what makes pulling cheaper than broadcasting. W13 found that no request
+ * <p>Refresh-on-demand was first designed around a generation stamped on the request: a shard already at
+ * or ahead
+ * of it does no read, which is what makes pulling cheaper than broadcasting. It turned out that no request
  * carries such a generation and no shard entry point accepts one, so that trigger has no caller and cannot
  * acquire one without a request format change.
  *
@@ -72,12 +73,12 @@ public final class UnknownFieldRefresh {
      * new field into an error: the caller's existing behaviour, rejecting or inferring, is a correct
      * outcome, while a failed write is not.
      *
-     * <p><b>T59's one exception to that, and why it has to be one.</b> {@link MappingGenerationStore.MissingMappingException}
+     * <p><b>The one exception to that, and why it has to be one.</b> {@link MappingGenerationStore.MissingMappingException}
      * is not a store hiccup: it is the descriptor this node resolved for the index saying it declared
      * fields, and the store answering that it has none. Swallowing that here and returning false would send
      * the caller to infer the field fresh from this one document, silently replacing whatever generation the
      * descriptor claims with whatever this document happens to carry -- the exact silent-empty-mapping shape
-     * T59 exists to close, reintroduced one layer up from where {@code StoreBackedFieldRefresher} raises it.
+     * that check exists to close, reintroduced one layer up from where a plugin's field refresher raises it.
      * Matches {@code AbsentIndexDescriptorSuppliers#supply}'s own precedent for {@code
      * DescriptorUnavailableException}: everything else degrades because resolution is already a degradation
      * path, and a bug in it must not become a failed request; this one is not a bug, it is the resolver

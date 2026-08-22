@@ -20,11 +20,11 @@ import java.util.List;
 import static org.opensearch.rest.RestRequest.Method.POST;
 
 /**
- * REST action for {@link InPlaceSplitShardAction}: operator-triggered in-place shard split
- * (dynamic-partitioning-plan.md Phase 0.6). Deliberately operator-only, no invented auto-triggering
+ * REST action for {@link InPlaceSplitShardAction}: operator-triggered in-place shard split.
+ * Deliberately operator-only, no invented auto-triggering
  * policy -- matches this fork's own established discipline for early-phase resharding actions (see
  * {@code TransportOrchestrateShardSplitAction}'s own javadoc for the same "operator always supplies
- * the split" rule applied to this plugin's separate, older split mechanism).
+ * the split" rule applied to the separate, older split mechanism).
  *
  * @opensearch.experimental
  */
@@ -43,7 +43,10 @@ public class RestInPlaceSplitShardAction extends BaseRestHandler {
     @Override
     public RestChannelConsumer prepareRequest(final RestRequest request, final NodeClient client) throws IOException {
         String index = request.param("index");
-        int shardId = Integer.parseInt(request.param("shard_id"));
+        // paramAsInt rather than a bare Integer.parseInt so a non-numeric shard id surfaces as a 400
+        // (IllegalArgumentException) instead of an unhandled NumberFormatException 500. The path param is
+        // required by the route, so the default is unreachable; -1 fails request validation if it ever isn't.
+        int shardId = request.paramAsInt("shard_id", -1);
         int splitInto = request.paramAsInt("split_into", 2);
 
         InPlaceSplitShardAction.Request splitRequest = new InPlaceSplitShardAction.Request(index, shardId, splitInto);

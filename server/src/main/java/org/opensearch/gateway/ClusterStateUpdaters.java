@@ -130,8 +130,8 @@ public class ClusterStateUpdaters {
             // This is the same guard index creation applies, and it is here for the same reason: state
             // recovery rebuilds the routing table from metadata, so it is the second place that decides
             // what gets published.
-            // Phase C4b of core-pluggability-refactor-plan.md: state.routingTable().shouldPublishRouting(...)
-            // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate,
+            // shouldPublishRouting is the same predicate the static registry
+            // (AbsentIndexRoutingSuppliers) used to answer here, now
             // discovered through the resolver already attached to this state's own routing table.
             if (state.routingTable().shouldPublishRouting(cursor) == false) {
                 continue;

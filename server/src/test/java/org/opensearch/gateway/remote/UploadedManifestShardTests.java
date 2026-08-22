@@ -46,7 +46,7 @@ public class UploadedManifestShardTests extends OpenSearchTestCase {
     /**
      * A shard reference written by a newer node may carry fields this one does not know. Skipping them
      * rather than failing is what lets a mixed-version cluster read each other's manifests at all --
-     * the same choice {@link IndexDescriptor} makes, for the same reason.
+     * the same choice {@link ManifestIndexDescriptor} makes, for the same reason.
      */
     public void testUnknownFieldsAreSkipped() throws IOException {
         String json = "{\"shard_id\":3,\"blob_name\":\"b\",\"entry_count\":9,\"future_field\":{\"nested\":[1,2]}}";

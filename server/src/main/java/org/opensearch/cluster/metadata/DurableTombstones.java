@@ -74,19 +74,12 @@ public final class DurableTombstones {
      * written has not achieved what a delete promises, and saying so is the whole point of doing the write
      * before the acknowledgement rather than after it.
      */
-    private static final java.util.concurrent.atomic.AtomicLong TOMBSTONE_WRITE_COUNT = new java.util.concurrent.atomic.AtomicLong();
-
-    public static long getTombstoneWriteCount() {
-        return TOMBSTONE_WRITE_COUNT.get();
-    }
-
     public static void whenDurable(List<IndexMetadata> deleted, ActionListener<Void> onDurable) {
         Writer writer = WRITER.get();
         if (writer == null || deleted.isEmpty()) {
             onDurable.onResponse(null);
             return;
         }
-        TOMBSTONE_WRITE_COUNT.addAndGet(deleted.size());
         try {
             writer.writeAll(deleted, onDurable);
         } catch (Exception e) {

@@ -20,25 +20,39 @@ import java.util.function.Function;
 /**
  * Node-level hook for resolving an index that has no entry in cluster state metadata.
  *
- * <p>Area H's premise is that cluster state should hold no entry per index, which means resolution has to
- * answer from somewhere else. This is that seam, and it is deliberately the same shape as
- * {@code AbsentIndexRoutingSuppliers} from Area C: try the published structure first, fall back to a
- * supplier, and behave exactly as before when nothing is installed.
+ * <p>The gated-index design's premise is that cluster state should hold no entry per index, which means
+ * resolution has to answer from somewhere else. This is that seam, and it is deliberately the same shape as
+ * its routing-plane counterpart {@code AbsentIndexRoutingSuppliers}: try the published structure first,
+ * fall back to a supplier, and behave exactly as before when nothing is installed.
  *
- * <p><b>Why copy that shape rather than design a new one.</b> Area C's seam was applied across nine call
+ * <p><b>Why copy that shape rather than design a new one.</b> The routing seam was applied across nine call
  * sites and the failures it produced are known and documented: the same absence has to mean the same thing
  * everywhere, the fast path has to be identical rather than merely equivalent, and a caller that silently
  * resolves nothing is worse than one that throws. Reusing the shape inherits those lessons instead of
  * rediscovering them.
  *
  * <p><b>What this does not do.</b> It does not make resolution asynchronous. A descriptor lookup is a
- * realtime GET against one shard, measured flat at about 0.8 ms up to fifty thousand descriptors (S21),
+ * realtime GET against one shard, measured flat at about 0.8 ms up to fifty thousand descriptors,
  * but it is still a remote call where a map read was local. Every caller of this seam is on a path that
  * already does remote work, and a supplier that blocks a transport thread would be a worse problem than
  * the one this solves. The supplier is therefore expected to answer from a cache and to decline rather
  * than block when it cannot.
  *
  * <p>Unset by default, so an ordinary cluster resolves exactly as it always has.
+ *
+ * <p><b>Settled architecture: one authority per plane.</b> This static registry is the node-level
+ * <em>authority</em> for descriptor-backed metadata -- the single place a plugin's answers live, and the
+ * seam the few core internals that ask node-level or descriptor-vocabulary questions consult directly.
+ * The {@code ClusterPlugin} SPI ({@link IndexMetadataResolver}, implemented for this registry by {@link
+ * SupplierBackedIndexMetadataResolver}) is the registration <em>front door</em>: how a plugin installs
+ * into this authority, not a second authority. The resolver instance attached to each {@link Metadata}
+ * is the state-scoped <em>read path</em> ({@code Metadata#indexOrResolved}, {@code
+ * Metadata#existsOrResolved}), and it answers by forwarding here. The direct static call sites that
+ * remain in core -- each carrying its own comment -- are permanent by design, not a pending migration:
+ * they either need descriptor-level vocabulary the SPI deliberately does not expose, or ask "is the
+ * feature currently active on this node", a node-level fact the state-attached resolver does not model.
+ * Its routing-plane counterpart, {@code org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers},
+ * follows exactly the same shape.
  */
 public final class AbsentIndexDescriptorSuppliers {
 
@@ -50,12 +64,12 @@ public final class AbsentIndexDescriptorSuppliers {
     /**
      * Threads on which a supplier must not be asked to do I/O.
      *
-     * <p>W4 established the deadlock: a remote lookup made from the cluster state applier thread needs
+     * <p>The deadlock is established by measurement: a remote lookup made from the cluster state applier thread needs
      * that thread to make progress before it can complete, so it waits on itself. The cluster manager's
      * update thread is the same shape and is additionally the one serialised thread this whole design
      * exists to keep out of the request path.
      *
-     * <p>T1 enumerated six call sites that reach a supplier from one of these: {@code DanglingIndicesState},
+     * <p>An audit enumerated six call sites that reach a supplier from one of these: {@code DanglingIndicesState},
      * {@code IndicesClusterStateService} twice, {@code RoutingNodes} through
      * {@code ClusterState.getRoutingNodes}, {@code ClusterStateHealth} by way of {@code AllocationService},
      * and {@code ActiveShardCount}. Six is few enough to fix one at a time and too many to keep correct by
@@ -65,7 +79,7 @@ public final class AbsentIndexDescriptorSuppliers {
      * <p>So this makes it impossible rather than forbidden. A warm descriptor still answers, because that
      * costs no I/O and never reaches a supplier that would block. A cold one degrades to the same absence
      * the seam already models everywhere. That turns a silent stall into a reported absence, which is the
-     * same trade T38 made when it landed the auto-creation removal alongside the shard path rather than
+     * same trade the auto-creation removal made when it landed alongside the shard path rather than
      * before it.
      */
     private static final String[] THREADS_WHERE_BLOCKING_IS_UNSAFE = {
@@ -113,15 +127,9 @@ public final class AbsentIndexDescriptorSuppliers {
      * The descriptor for a name with no metadata entry, or null to fall back to the existing behaviour.
      *
      * <p>A supplier that throws is treated as having no answer rather than being allowed to fail the
-     * request, for the reason Area C settled: this is a degradation path already, and turning a plugin
-     * bug into a request failure makes the absence worse than it was.
+     * request, for the reason the routing seam settled: this is a degradation path already, and turning a
+     * plugin bug into a request failure makes the absence worse than it was.
      */
-    private static final java.util.concurrent.atomic.AtomicLong UNAVAILABLE_COUNT = new java.util.concurrent.atomic.AtomicLong();
-
-    public static long getUnavailableCount() {
-        return UNAVAILABLE_COUNT.get();
-    }
-
     public static IndexDescriptor supply(String indexName) {
         if (indexName == null) {
             return null;
@@ -141,7 +149,6 @@ public final class AbsentIndexDescriptorSuppliers {
         try {
             return supplier.apply(indexName);
         } catch (DescriptorUnavailableException e) {
-            UNAVAILABLE_COUNT.incrementAndGet();
             logger.warn("Descriptor unavailable for [{}] on Object Storage: {}", indexName, e.getMessage());
             throw e;
         } catch (Exception e) {
@@ -170,42 +177,9 @@ public final class AbsentIndexDescriptorSuppliers {
     }
 
     /**
-     * Resolves several names at once, so a caller with a list pays one round trip rather than one each.
-     *
-     * <p>Present because resolution is frequently plural and the per-name form would otherwise turn a
-     * ten-index request into ten sequential lookups, which is the shape of mistake that made wake and
-     * sleep cost a publication each before they were batched.
-     */
-    /**
-     * Supplies one page of gated indices in pagination order.
-     *
-     * <p>The whole point is the {@code size} argument. H16 measured that pagination sorts the entire
-     * population to produce one page, so making gated indices visible by folding them into that sort would
-     * have made the cost problem worse while appearing to fix the correctness one. A pager is asked for a
-     * page and returns a page, which is what a store keyed by name can actually do cheaply: S24 measured
-     * paging by sorted name at roughly 33 ms per thousand names, against the descriptor system index of the
-     * time; object storage lists keys in the same order, so the shape of the answer outlived the medium.
-     */
-    public static List<IndexDescriptor> supplyAll(List<String> indexNames) {
-        if (isRegistered() == false || indexNames == null || indexNames.isEmpty()) {
-            return List.of();
-        }
-        if (DescriptorPrefetch.isRegistered()) {
-            java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-            DescriptorPrefetch.prefetch(indexNames, org.opensearch.core.action.ActionListener.wrap(latch::countDown));
-            try {
-                latch.await(5, java.util.concurrent.TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        return indexNames.stream().map(AbsentIndexDescriptorSuppliers::supply).filter(java.util.Objects::nonNull).toList();
-    }
-
-    /**
      * One gated index that matched a prefix, carrying only what wildcard expansion filters on.
      *
-     * <p>Three fields rather than an {@link IndexDescriptor}, because T5 measured that building the full
+     * <p>Three fields rather than an {@link IndexDescriptor}, because measurement showed that building the full
      * fourteen field record for every hit is a quarter to a third of what an expansion costs and only three
      * are read. Three rather than one because expansion is not just a name lookup. {@code IndicesOptions}
      * decides
@@ -235,7 +209,7 @@ public final class AbsentIndexDescriptorSuppliers {
         }
 
         /**
-         * Phase J3 of {@code core-pluggability-refactor-plan.md}: {@code limitSettingName} lets the
+         * {@code limitSettingName} lets the
          * expander name its own setting in the refusal a user reads. Core used to interpolate one specific
          * plugin's setting key ({@code serverless_storage.wildcard.max_expanded_indices}) into {@code
          * UnsupportedWildcardException}'s message, which is core naming a plugin's vocabulary. Nullable:
@@ -243,12 +217,6 @@ public final class AbsentIndexDescriptorSuppliers {
          */
         public static PrefixExpansion tooMany(int limit, String limitSettingName) {
             return new PrefixExpansion(List.of(), true, limit, limitSettingName);
-        }
-
-        /** @deprecated use {@link #tooMany(int, String)} so the expander names its own limit setting. */
-        @Deprecated
-        public static PrefixExpansion tooMany(int limit) {
-            return new PrefixExpansion(List.of(), true, limit, null);
         }
     }
 
@@ -313,7 +281,7 @@ public final class AbsentIndexDescriptorSuppliers {
      *
      * <p><b>Cached, and the cache is for stability rather than for speed.</b> {@code
      * AbsentIndexRoutingSuppliers} memoises placement on metadata <em>identity</em>, so a fresh instance per
-     * call makes that memo miss every time, which P5 measured as an 18x regression rather than a slow path.
+     * call makes that memo miss every time, which was measured as an 18x regression rather than a slow path.
      * Keyed on descriptor identity, so a descriptor that changes invalidates it.
      *
      * <p>One cache rather than one per caller, which is the reason this lives here and not beside each
@@ -352,13 +320,13 @@ public final class AbsentIndexDescriptorSuppliers {
      * The metadata for an index, from cluster state when it is there and from the descriptor when it is
      * not.
      *
-     * <p>This is the write path's whole repair, and S51 to S54 found the sites for it one stack trace at a
+     * <p>This is the write path's whole repair, and its sites were found one stack trace at a
      * time: eleven places on the path from a bulk request to a shard read cluster state for something a
      * gated index keeps in its descriptor. Each of them wants an {@link IndexMetadata} and each of them
      * gets a null or a throw instead.
      *
      * <p><b>Deliberately not folded into {@link Metadata#getIndexSafe}.</b> That is the obvious place and it
-     * is the wrong one: W4 established that widening a hot core accessor to do a remote lookup deadlocks,
+     * is the wrong one: widening a hot core accessor to do a remote lookup was measured to deadlock,
      * because the accessor is called from the cluster state applier thread and the lookup needs that thread
      * to make progress. A separate helper means every caller of it is one somebody chose, and the cluster
      * state thread is not among them.

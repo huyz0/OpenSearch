@@ -21,7 +21,7 @@ import static org.opensearch.rest.RestRequest.Method.POST;
 
 /**
  * REST action for {@link InPlaceMergeShardAction}: operator-triggered in-place shard merge
- * (dynamic-partitioning-plan.md Phase 2 item 2.1) -- the reverse of {@link RestInPlaceSplitShardAction}.
+ * -- the reverse of {@link RestInPlaceSplitShardAction}.
  * Deliberately operator-only, no invented auto-triggering policy, matching the split action's own
  * discipline.
  *
@@ -42,7 +42,10 @@ public class RestInPlaceMergeShardAction extends BaseRestHandler {
     @Override
     public RestChannelConsumer prepareRequest(final RestRequest request, final NodeClient client) throws IOException {
         String index = request.param("index");
-        int parentShardId = Integer.parseInt(request.param("parent_shard_id"));
+        // paramAsInt rather than a bare Integer.parseInt so a non-numeric parent shard id surfaces as a 400
+        // (IllegalArgumentException) instead of an unhandled NumberFormatException 500. The path param is
+        // required by the route, so the default is unreachable; -1 fails request validation if it ever isn't.
+        int parentShardId = request.paramAsInt("parent_shard_id", -1);
 
         InPlaceMergeShardAction.Request mergeRequest = new InPlaceMergeShardAction.Request(index, parentShardId);
         mergeRequest.timeout(request.paramAsTime("timeout", mergeRequest.ackTimeout()));

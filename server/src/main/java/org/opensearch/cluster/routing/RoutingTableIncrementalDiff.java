@@ -77,7 +77,7 @@ public class RoutingTableIncrementalDiff implements Diff<RoutingTable>, StringKe
     @Override
     public RoutingTable apply(RoutingTable part) {
         RoutingTable applied = new RoutingTable(version, indicesRouting.apply(part.getIndicesRouting()));
-        // Phase C3 of core-pluggability-refactor-plan.md: same fix RoutingTable's own (non-incremental)
+        // Same fix RoutingTable's own (non-incremental)
         // Diff#apply needed -- see that one's comment for why.
         applied.attachIndexRoutingResolver(part.indexRoutingResolver());
         return applied;

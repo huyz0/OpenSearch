@@ -232,11 +232,27 @@ public class MergeScheduler {
      * or because the index tiering state indicates preparation/migration is in progress.
      */
     public boolean isFrozen() {
-        if (frozen.get()) {
-            return true;
-        }
+        return frozen.get() || isTieringToWarm(indexSettings, logger);
+    }
+
+    /**
+     * Whether {@code INDEX_TIERING_STATE} indicates a hot-to-warm migration is in progress.
+     * Shared by this scheduler and {@code DataFormatAwareEngine}'s own freeze checks so the
+     * settings probe cannot drift between them. An unrecognized value is logged and treated
+     * as {@code HOT} (not frozen).
+     */
+    public static boolean isTieringToWarm(IndexSettings indexSettings, Logger logger) {
         String state = indexSettings.getSettings().get(IndexModule.INDEX_TIERING_STATE.getKey(), IndexModule.TieringState.HOT.name());
-        return IndexModule.TieringState.HOT_TO_WARM.name().equals(state);
+        try {
+            return IndexModule.TieringState.valueOf(state) == IndexModule.TieringState.HOT_TO_WARM;
+        } catch (IllegalArgumentException e) {
+            logger.warn(
+                "Unrecognized {} value [{}]; treating engine as not frozen for tiering",
+                IndexModule.INDEX_TIERING_STATE.getKey(),
+                state
+            );
+            return false;
+        }
     }
 
     /**

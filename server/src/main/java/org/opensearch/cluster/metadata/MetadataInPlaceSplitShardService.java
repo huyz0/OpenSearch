@@ -123,8 +123,8 @@ public class MetadataInPlaceSplitShardService {
         // Making resharding work under computed placement is a redesign rather than a fix, because the
         // children would have to be placed by the same function and the operation would have to reach
         // agreement without publishing anything. That is not attempted here.
-        // Phase C4b of core-pluggability-refactor-plan.md: currentState.routingTable().shouldPublishRouting(...)
-        // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate, discovered
+        // currentState.routingTable().shouldPublishRouting(...) replaced
+        // AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate, discovered
         // through the resolver attached to this state's own routing table.
         if (currentState.routingTable().shouldPublishRouting(curIndexMetadata) == false) {
             throw new IllegalArgumentException(
@@ -136,8 +136,8 @@ public class MetadataInPlaceSplitShardService {
 
         // An index with index.routing_partition_size > 1 spreads each routing value across a
         // partitionOffset-shifted band of the hash space (see OperationRouting#generateShardId). The
-        // in-place split read-path filter (InPlaceSplitPartitionFilter, used by the plugin's
-        // InPlaceSplitFilteringDirectoryReader) hashes effectiveRouting only and cannot reproduce that
+        // in-place split read-path filter (applied by a plugin's filtering reader to hide documents
+        // not owned by the child shard) hashes effectiveRouting only and cannot reproduce that
         // per-document partition offset, so a child would bucket partitioned documents by the wrong
         // hash. This is a hard, structural limitation of the filter -- reject the split up front rather
         // than silently corrupt search/GET visibility.

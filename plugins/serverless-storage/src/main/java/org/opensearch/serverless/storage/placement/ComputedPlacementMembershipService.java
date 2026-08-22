@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.routing;
+package org.opensearch.serverless.storage.placement;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -16,6 +16,7 @@ import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.lifecycle.Lifecycle;
 

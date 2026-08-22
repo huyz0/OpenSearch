@@ -163,16 +163,16 @@ public class MetadataIndexAliasesService {
                 }
                 IndexMetadata index = metadata.get(action.getIndex());
                 if (index == null) {
-                    // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b
-                    // of core-pluggability-refactor-plan.md: this reads gated.aliases() below, a
+                    // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated to the
+                    // resolver-backed Metadata accessors: this reads gated.aliases() below, a
                     // plugin-specific field IndexMetadataResolver's generic IndexMetadata contract does not
                     // carry.
                     IndexDescriptor gated = AbsentIndexDescriptorSuppliers.supply(action.getIndex());
                     if (gated != null && gated.exists()) {
                         List<String> currentAliases = new ArrayList<>(gated.aliases());
                         if (action instanceof AliasAction.Add addAction) {
-                            // Phase A2 of core-pluggability-refactor-plan.md. IndexDescriptor#aliases is a
-                            // plain List<String> -- it has nowhere to record a filter, a routing value, or
+                            // IndexDescriptor#aliases is a plain List<String> -- it has nowhere to record
+                            // a filter, a routing value, or
                             // a write-index flag. Silently keeping only the name while an operator asked
                             // for one of those too is exactly the "provably has none" invariant
                             // Metadata#aliasesForConcreteIndex and IndexNameExpressionResolver#filteringAliases

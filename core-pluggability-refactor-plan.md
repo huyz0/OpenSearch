@@ -679,3 +679,80 @@ shrinking the way D2's and D3's did, and there is no isolated low-risk sub-piece
     either fully landed or has a written, evidence-based reason for exactly what remains open** (Phase I's
     one deferred item, `SplitShardsMetadata`'s merge subsystem, on the separate extraction branch) — matching
     this plan's own acceptance criteria for "done," not a partial or rushed version of it.
+
+## Post-plan minimality campaign (2026-08-22)
+
+A follow-up review of the whole branch asked one question -- is the core (non-plugin) change minimal, and
+can it be cleaner -- re-verified this plan's claims independently, and then landed every improvement it
+found. All work compile-gated across server (main/test/internalClusterTest), plugins/serverless-storage
+(all source sets), arrow-base, arrow-flight-rpc, composite-engine, and the test framework.
+
+### Delivered
+
+- **Dead code deleted (~1,050 lines, every symbol verified caller-free before removal):** the Phase-F
+  per-format `DataFormat` capability methods (zero overrides existed; call sites restored to the
+  behavior-identical flag checks), `AbsentIndexRoutingSuppliers`' never-wired LOCAL_SHARDS channel and its
+  C4b-superseded batch helpers (`resolve`/`resolveShard`/`allShards` -- the last three via a designed
+  per-site migration of ~25 test call sites onto the production `ClusterState` reads), the streaming
+  `RemoteClusterAwareClient` surface (restored to `main` byte-for-byte), `UnrestrictedSystemIndexDescriptor`
+  and its `SystemIndexDescriptor.equals/hashCode` support, and six dead registry methods across
+  `AbsentIndexDescriptorSuppliers`/`DurableTombstones`/`DescriptorPrefetch`/`IndexDescriptorPublisher`,
+  plus `IndexDescriptor.serverless()`.
+- **Product-name leaks closed:** `Security.java`'s hardcoded `datafusion.spill_directory` replaced by a
+  generic mechanism -- a plugin declares directory-naming setting keys in a new optional
+  `plugin-security.properties` (`directory.settings=`) shipped next to its policy file; core substitutes
+  `${opensearch.<key>}` during that plugin's policy parse and adds the core-ledger grant with the same
+  exists-and-is-a-directory check (tests rewritten generic, plus new not-declared-no-grant coverage).
+  `cluster.metadata.IndexDescriptor`'s `serverless` boolean renamed to `claimed`, with the marker setting
+  key supplied by the registered strategy's new `IndexCreationStrategy.claimedIndexSettingKey()` (wire and
+  XContent positions unchanged; the plugin declares `index.serverless_storage.enabled`). The duplicate
+  class name resolved: `gateway.remote.IndexDescriptor` is now `ManifestIndexDescriptor`.
+- **Implementation moved out of core:** `GatedIndexPrewarmer` (plugin-registered applier; ICSS gained
+  `onDemandOpenIndexNames()`), `ComputedPlacementMembership` + its service (~477 lines; wire name
+  byte-identical; the five placement ITs moved with a membership-only test plugin preserving their exact
+  semantics), the gated-residency subsystem extracted from `IndicesClusterStateService` into
+  `GatedIndexResidency` (ICSS -446 lines; the 150,888-bytes-per-index measured constant now lives in
+  `ServerlessGatedIndexResidencyPolicy` behind `IndexResidencyPolicy.bytesPerOpenIndex()`), and
+  `NativeAllocatorPoolStats` off its hardcoded `NodeStats` field onto the generic `PluginNodeStats`
+  path (wire byte-structure preserved via vestigial always-absent slots; pools now render under a
+  top-level `native_allocator` key instead of inside `native_memory`).
+- **Seam architecture settled** (the one acceptance criterion this plan left open): the static registries
+  are the single node-level authority per plane; the ClusterPlugin SPI is the registration front door; the
+  RoutingTable/Metadata instance attachment is the state-scoped read path; the remaining direct static
+  call sites are permanent by design. All four seam classes now carry one consistent architecture
+  paragraph, and "migration still coming" wording was removed.
+- **De-jargonization sweep (~110 files, comment-only):** plan-document citations, phase/area/task codes,
+  and product-named phrasing in core comments replaced with self-contained neutral explanations; every
+  measurement and incident story preserved.
+- **Small correctness/quality fixes:** in-place split/merge REST handlers return 400 (not 500) on
+  non-numeric shard ids; `FsBlobContainer`'s register-lock map replaced with a fixed 64-way lock-stripe
+  table (unbounded growth removed); `server/build.gradle`'s arrow-spi dependency narrowed `api` ->
+  `implementation` (verified no free-riders); `DataFormatAwareEngine.getById` reuses
+  `DocumentLookupSupport.applyReadVersionConflicts`; the `INDEX_TIERING_STATE` raw-settings probe is one
+  shared helper; `IndicesService`'s triplicated `IndexModule` construction deduplicated;
+  `DataFormatPlugin.assignCapabilities`'s algorithm moved into `DataFormatRegistry`.
+
+### Known behavioral notes (deliberate, flagged rather than hidden)
+
+- A cluster that once ran the plugin, persisted `computed_placement_membership`, and restarts *without*
+  the plugin can no longer deserialize that custom (previously core carried it inertly). Inherent to the
+  move; plugin-installed rolling restarts unaffected.
+- On a vanilla node the (never-consulted) derived residency ceiling logs `heap/2 / 1 MiB` instead of
+  `heap/2 / 150,888`; on a plugin node the resolved cap is bit-for-bit identical.
+- `_nodes/stats` shape: allocator pools moved from `native_memory.{runtime,memory_pools}` to a
+  plugin-contributed top-level `native_allocator` object; `native_memory.total_estimated_bytes` stays
+  core-owned. The `native_memory` metric still fetches pools (it now also enables pluginStats collection).
+
+### Product decisions surfaced by the review, NOT acted on (still open)
+
+- `TieringService` forces `number_of_replicas: 1` on every tiered index (not just DFA), silently
+  overriding the user's replica count, with no revert on cancel recorded.
+- `ClusterMetadataManifest` writes fork codecs unconditionally for any remote-state cluster; stock
+  OpenSearch nodes cannot read these manifests (`FORK_CODEC_BASE` only reserves future numbers).
+- `MetadataCreateIndexService.onlyCreateIndex` now batches creations for all clusters (previously one
+  creation per state update).
+- The in-place split/merge REST endpoints register unconditionally on vanilla clusters (consistent with
+  the REST-scope gate defaulting them unavailable under a restricting plugin, but exposed otherwise).
+- The relocation-handoff final-sync condition covers pluggable-format indices only; the comment now says
+  so accurately, but whether vanilla remote-store REQUEST-durability indexes need the same sync remains
+  undecided.

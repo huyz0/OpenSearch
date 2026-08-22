@@ -1056,11 +1056,13 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
                 boolean syncTranslog = (isRemoteTranslogEnabled() || this.isMigratingToRemote())
                     && (Durability.ASYNC == indexSettings.getTranslogDurability() || indexSettings.isPluggableDataFormatEnabled());
-                // Force a final, blocking translog upload to remote for ALL remote-backed indexes before draining
-                // uploads below. This must run for REQUEST durability too, not just ASYNC: with REQUEST the freshest
-                // acked ops may still be in the buffered upload path and not yet on remote. If we drained without
-                // this sync, the pending upload would hit the drained syncPermit, no-op (TLOG-SKIP), and those acked
-                // ops would never reach remote, silently lost on handoff since the target recovers from remote.
+                // Force a final, blocking translog upload to remote before draining uploads below. Runs for
+                // ASYNC durability (as always), and additionally for pluggable-data-format indices even under
+                // REQUEST durability: there the freshest acked ops may still be in the buffered upload path and
+                // not yet on remote. If we drained without this sync, the pending upload would hit the drained
+                // syncPermit, no-op (TLOG-SKIP), and those acked ops would never reach remote, silently lost on
+                // handoff since the target recovers from remote. Vanilla REQUEST-durability indices keep their
+                // existing behavior (no extra sync here).
                 if (syncTranslog) {
                     maybeSync();
                 }
@@ -3632,7 +3634,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
      *
      * <p>Added for gated indices, whose shards are opened by a request arriving rather than by a cluster
      * state diff and are therefore closed by nothing. A node that has served a hundred thousand tenants
-     * holds a hundred thousand open shards, which is the ceiling the serverless design exists to avoid, so
+     * holds a hundred thousand open shards, which is the ceiling on-demand residency exists to avoid, so
      * something has to be able to ask which of them have gone cold.
      *
      * <p><b>The minimum of the two figures, not the maximum.</b> A shard is idle only while <em>both</em>
@@ -4082,7 +4084,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                 maxBytesBehind
             );
             try {
-                Thread.sleep(500);
+                Thread.sleep(REPLICA_SYNC_POLL_INTERVAL_MS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new OpenSearchException("Interrupted waiting for replica sync on shard [" + shardId + "]", e);

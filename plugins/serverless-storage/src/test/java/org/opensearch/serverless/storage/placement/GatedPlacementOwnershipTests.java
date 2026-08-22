@@ -23,9 +23,10 @@ import org.junit.After;
  * <p>Found while working out a memo key, which is worth recording: the question "what is this method's
  * argument when the index is gated" had a worse answer than the memo needed.
  *
- * <p>{@code AbsentIndexRoutingSuppliers.resolve} calls {@code supply(state, state.metadata().index(name))},
- * and for a gated index that metadata is null, because removing the cluster state entry is what gating
- * means. {@code ComputedPlacementGate.ownsIndex} then answers false for null and the gate returns no table.
+ * <p>Routing resolution reaches {@code AbsentIndexRoutingSuppliers.supply} with the index's metadata in
+ * hand, and for a gated index cluster state has none, because removing the cluster state entry is what
+ * gating means. {@code ComputedPlacementGate.ownsIndex} then answers false for null and the gate returns
+ * no table.
  *
  * <p>So after W3 made a gated index nameable and W12 turned gating on, an index can be created, resolved and
  * written to while having no routing at all. Nothing throws. That is the failure this area has produced at
@@ -43,7 +44,25 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.clearMemos();
         org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.register(null);
+        org.opensearch.cluster.metadata.IndexCreationStrategyRegistry.register(null);
         ComputedPlacementGate.uninstall();
+    }
+
+    /**
+     * Production parity for descriptor synthesis: {@code IndexDescriptor#toIndexMetadata} round-trips
+     * the ownership marker under the key the registered strategy declares, exactly as
+     * {@code SupplierBackedIndexCreationStrategy} declares it on a real node. Without this, the
+     * synthesised metadata carries no marker and the gate correctly refuses ownership.
+     */
+    private static void registerClaimedKeyDeclaringStrategy() {
+        org.opensearch.cluster.metadata.IndexCreationStrategyRegistry.register(
+            new org.opensearch.cluster.metadata.IndexCreationStrategy() {
+                @Override
+                public String claimedIndexSettingKey() {
+                    return org.opensearch.serverless.storage.ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey();
+                }
+            }
+        );
     }
 
     /**
@@ -76,6 +95,7 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
                 )
                 : null
         );
+        registerClaimedKeyDeclaringStrategy();
         ComputedPlacementGate.install(true);
         ClusterState gated = ClusterState.builder(ClusterName.DEFAULT)
             .nodes(
@@ -92,9 +112,13 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
                     .localNodeId("node-1")
                     .build()
             )
+            .metadata(metadataWithDescriptorBridge())
+            .routingTable(routingTableWithBridge())
             .build();
 
-        org.opensearch.cluster.routing.IndexRoutingTable placed = AbsentIndexRoutingSuppliers.resolve(gated, "serverless_gated-index");
+        // Through the production read: name to descriptor to synthesised metadata to the gate's supplier,
+        // via the two bridges a real applied state carries.
+        org.opensearch.cluster.routing.IndexRoutingTable placed = gated.getIndexRoutingTable("serverless_gated-index");
 
         assertNotNull(
             "a gated index must have somewhere to place its shards. Before P7 this was null: nameable "
@@ -108,11 +132,28 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
     public void testAnUnknownNameIsStillUnplaced() {
         org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.register(name -> null);
         ComputedPlacementGate.install(true);
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(metadataWithDescriptorBridge())
+            .routingTable(routingTableWithBridge())
+            .build();
 
-        assertNull(
-            "a name no descriptor answers for must stay unplaced",
-            AbsentIndexRoutingSuppliers.resolve(ClusterState.builder(ClusterName.DEFAULT).build(), "never-existed")
-        );
+        assertNull("a name no descriptor answers for must stay unplaced", state.getIndexRoutingTable("never-existed"));
+    }
+
+    /**
+     * The bridges a real applied state carries, attached to real (non-singleton) instances --
+     * {@code attachIndex*Resolver} is deliberately a no-op on the shared empty singletons.
+     */
+    private static org.opensearch.cluster.metadata.Metadata metadataWithDescriptorBridge() {
+        org.opensearch.cluster.metadata.Metadata metadata = org.opensearch.cluster.metadata.Metadata.builder().build();
+        metadata.attachIndexMetadataResolver(new org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver());
+        return metadata;
+    }
+
+    private static org.opensearch.cluster.routing.RoutingTable routingTableWithBridge() {
+        org.opensearch.cluster.routing.RoutingTable routingTable = org.opensearch.cluster.routing.RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
+        return routingTable;
     }
 
     /** The control: an ordinary serverless index with metadata is still owned and still placed. */

@@ -90,9 +90,8 @@ public class TransportIndicesSegmentsAction extends TransportBroadcastByNodeActi
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, IndicesSegmentsRequest request, String[] concreteIndices) {
-        // Phase C4b of core-pluggability-refactor-plan.md: clusterState.allShards(...) replaces
-        // AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered through the
-        // resolver attached to this state's own routing table.
+        // clusterState.allShards(...) resolves through the resolver attached to this state's own
+        // routing table (replacing an earlier static-registry lookup) -- same composition.
         return clusterState.allShards(concreteIndices);
     }
 

@@ -48,6 +48,7 @@ import org.opensearch.secure_sm.policy.PolicyFile;
 import org.opensearch.transport.TcpTransport;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.SocketPermission;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -68,6 +69,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -219,7 +221,12 @@ final class Security {
                 }
 
                 // parse the plugin's policy file into a set of permissions
-                Policy policy = readPolicy(policyFile.toUri().toURL(), getCodebaseJarMap(codebases), environment.settings());
+                Policy policy = readPolicy(
+                    policyFile.toUri().toURL(),
+                    getCodebaseJarMap(codebases),
+                    environment.settings(),
+                    readPluginDirectorySettings(plugin)
+                );
 
                 // consult this policy for each of the plugin's jars:
                 for (URL url : codebases) {
@@ -235,6 +242,48 @@ final class Security {
     }
 
     /**
+     * Reads a plugin's optional {@code plugin-security.properties} file and returns the setting
+     * keys declared under {@code directory.settings}: a comma-separated list of node settings,
+     * each naming an operator-configured directory the plugin's policy file references via
+     * {@code ${opensearch.<setting key>}}. Each declared directory additionally receives a
+     * core-side permission ledger entry (see {@link #addFilePermissions}) because core code
+     * (e.g. the health probes behind {@code Plugin#getAdditionalHealthPaths}) accesses it too.
+     */
+    static List<String> readPluginDirectorySettings(Path plugin) throws IOException {
+        Path propsFile = plugin.resolve(PluginInfo.OPENSEARCH_PLUGIN_SECURITY_PROPERTIES);
+        if (Files.exists(propsFile) == false) {
+            return Collections.emptyList();
+        }
+        Properties props = new Properties();
+        try (InputStream in = Files.newInputStream(propsFile)) {
+            props.load(in);
+        }
+        String declared = props.getProperty("directory.settings");
+        if (declared == null || declared.isBlank()) {
+            return Collections.emptyList();
+        }
+        List<String> keys = new ArrayList<>();
+        for (String key : declared.split(",")) {
+            String trimmed = key.trim();
+            if (trimmed.isEmpty() == false) {
+                keys.add(trimmed);
+            }
+        }
+        return keys;
+    }
+
+    /** Union of every installed plugin's and module's declared directory settings, in discovery order. */
+    static List<String> getPluginDirectoryGrantSettings(Environment environment) throws IOException {
+        Set<Path> pluginsAndModules = new LinkedHashSet<>(PluginsService.findPluginDirs(environment.pluginsDir()));
+        pluginsAndModules.addAll(PluginsService.findPluginDirs(environment.modulesDir()));
+        Set<String> keys = new LinkedHashSet<>();
+        for (Path plugin : pluginsAndModules) {
+            keys.addAll(readPluginDirectorySettings(plugin));
+        }
+        return new ArrayList<>(keys);
+    }
+
+    /**
      * Reads and returns the specified {@code policyFile}.
      * <p>
      * Jar files listed in {@code codebases} location will be provided to the policy file via
@@ -243,21 +292,22 @@ final class Security {
      */
     @SuppressForbidden(reason = "accesses fully qualified URLs to configure security")
     static Policy readPolicy(URL policyFile, Map<String, URL> codebases) {
-        return readPolicy(policyFile, codebases, Settings.EMPTY);
+        return readPolicy(policyFile, codebases, Settings.EMPTY, Collections.emptyList());
     }
 
     /**
-     * Reads and returns the specified {@code policyFile}, additionally substituting plugin-policy
-     * properties derived from {@code settings}.
+     * Reads and returns the specified {@code policyFile}, additionally substituting the plugin's
+     * declared directory-setting properties derived from {@code settings}.
      * <p>
      * In addition to the per-codebase {@code ${codebase.*}} properties supplied by the 2-arg form,
-     * this overload sets {@code ${opensearch.datafusion.spill_directory}} from
-     * {@code datafusion.spill_directory} so plugin policy files can scope their {@link java.io.FilePermission}
-     * grants to the operator-configured directory rather than {@code <<ALL FILES>>}. The property is
+     * this overload sets {@code ${opensearch.<setting key>}} for each setting key in
+     * {@code directorySettings} (a plugin's {@code plugin-security.properties} declarations) so
+     * plugin policy files can scope their {@link java.io.FilePermission} grants to the
+     * operator-configured directory rather than {@code <<ALL FILES>>}. The properties are
      * cleared in the same {@code finally} block as the codebase properties.
      */
     @SuppressForbidden(reason = "accesses fully qualified URLs to configure security")
-    static Policy readPolicy(URL policyFile, Map<String, URL> codebases, Settings settings) {
+    static Policy readPolicy(URL policyFile, Map<String, URL> codebases, Settings settings, List<String> directorySettings) {
         try {
             List<String> propertiesSet = new ArrayList<>();
             try {
@@ -300,23 +350,23 @@ final class Security {
                     addCodebaseToSystemProperties(propertiesSet, url, property, aliasProperty);
                 }
 
-                // Plugin-policy substitution: datafusion.spill_directory.
-                // Set ${opensearch.datafusion.spill_directory} so plugin policy files can scope
-                // their FilePermission grants to the operator-configured directory rather than <<ALL FILES>>.
-                // TODO: this is a one-off plugin-specific substitution, hardcoded in core. A generic
-                // Plugin.getPolicySubstitutions(Settings) SPI would be cleaner — track in a follow-up
-                // issue. Acceptable here as a contained, single-property change.
-                String spillDir = settings.get("datafusion.spill_directory");
-                if (spillDir != null && !spillDir.isEmpty()) {
-                    String property = "opensearch.datafusion.spill_directory";
-                    // Mirrors addCodebaseToSystemProperties: register before setProperty so the finally clears
-                    // even if the IllegalStateException for "already set" fires. Note: setting overwrites any
-                    // pre-existing value before we detect the collision, so the previous value is lost when
-                    // we throw — same trade-off the codebase pattern accepts.
-                    propertiesSet.add(property);
-                    String previous = System.setProperty(property, spillDir);
-                    if (previous != null) {
-                        throw new IllegalStateException("datafusion spill directory property already set: " + previous);
+                // Plugin-policy substitution for declared directory settings: for each setting key a
+                // plugin declares in its plugin-security.properties, set ${opensearch.<setting key>} so
+                // the plugin's policy file can scope its FilePermission grants to the operator-configured
+                // directory rather than <<ALL FILES>>.
+                for (String settingKey : directorySettings) {
+                    String directory = settings.get(settingKey);
+                    if (directory != null && directory.isEmpty() == false) {
+                        String property = "opensearch." + settingKey;
+                        // Mirrors addCodebaseToSystemProperties: register before setProperty so the finally clears
+                        // even if the IllegalStateException for "already set" fires. Note: setting overwrites any
+                        // pre-existing value before we detect the collision, so the previous value is lost when
+                        // we throw — same trade-off the codebase pattern accepts.
+                        propertiesSet.add(property);
+                        String previous = System.setProperty(property, directory);
+                        if (previous != null) {
+                            throw new IllegalStateException("plugin directory-setting property already set: " + property + " -> " + previous);
+                        }
                     }
                 }
 
@@ -437,33 +487,36 @@ final class Security {
             // we just need permission to remove the file if its elsewhere.
             addSingleFilePath(policy, environment.pidFile(), "delete");
         }
-        // Operator-configured spill directory for the analytics-backend-datafusion plugin.
-        // FsHealthService.monitorFSHealth and Node.assertCanWritePluginHealthPaths run as
-        // CORE code (not plugin code) and probe this directory, so they need an entry in
-        // core's permission ledger. Plugin code accesses are granted separately via the
-        // plugin's plugin-security.policy.
+        // Operator-configured directories declared by installed plugins/modules via
+        // plugin-security.properties (directory.settings). FsHealthService.monitorFSHealth and
+        // Node.assertCanWritePluginHealthPaths run as CORE code (not plugin code) and probe
+        // these directories, so they need an entry in core's permission ledger. Plugin code
+        // accesses are granted separately via each plugin's plugin-security.policy.
         //
-        // We explicitly require the directory to already exist — unlike path.data, which
-        // auto-creates on first boot, the spill directory is expected to live on a
+        // We explicitly require each directory to already exist — unlike path.data, which
+        // auto-creates on first boot, a declared directory is expected to live on a
         // dedicated, pre-mounted volume. If we let addDirectoryPath auto-create, a missing
-        // mount would silently land the spill data on whatever filesystem the path resolves
+        // mount would silently land the data on whatever filesystem the path resolves
         // to (typically root), risking boot-disk exhaustion under load.
-        String spillDir = environment.settings().get("datafusion.spill_directory");
-        if (spillDir != null && spillDir.isEmpty() == false) {
-            // Use Path.of directly: PathUtils#get(String, String[]) is on the forbidden-API list
-            // (it advises resolving paths from Environment instead). This is an operator-supplied
-            // absolute path that lives outside the Environment's tracked filesystems by design,
-            // so resolving via Environment is not applicable.
-            Path spillPath = Path.of(spillDir);
-            if (Files.isDirectory(spillPath) == false) {
-                throw new IllegalStateException(
-                    "datafusion.spill_directory ["
-                        + spillDir
-                        + "] does not exist or is not a directory; ensure the spill volume is "
-                        + "mounted and the directory is created before starting OpenSearch"
-                );
+        for (String settingKey : getPluginDirectoryGrantSettings(environment)) {
+            String directory = environment.settings().get(settingKey);
+            if (directory != null && directory.isEmpty() == false) {
+                // Use Path.of directly: PathUtils#get(String, String[]) is on the forbidden-API list
+                // (it advises resolving paths from Environment instead). This is an operator-supplied
+                // absolute path that lives outside the Environment's tracked filesystems by design,
+                // so resolving via Environment is not applicable.
+                Path directoryPath = Path.of(directory);
+                if (Files.isDirectory(directoryPath) == false) {
+                    throw new IllegalStateException(
+                        settingKey
+                            + " ["
+                            + directory
+                            + "] does not exist or is not a directory; ensure the volume is "
+                            + "mounted and the directory is created before starting OpenSearch"
+                    );
+                }
+                addDirectoryPath(policy, settingKey, directoryPath, "read,readlink,write,delete", false);
             }
-            addDirectoryPath(policy, "datafusion.spill_directory", spillPath, "read,readlink,write,delete", false);
         }
     }
 

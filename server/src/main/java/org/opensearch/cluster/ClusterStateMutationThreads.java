@@ -9,8 +9,8 @@
 package org.opensearch.cluster;
 
 /**
- * Phase C of {@code core-pluggability-refactor-plan.md}: identifies the threads on which it is unsafe to
- * consult a plugin-supplied {@code org.opensearch.cluster.metadata.IndexMetadataResolver} or {@code
+ * Identifies the threads on which it is unsafe to consult a plugin-supplied {@code
+ * org.opensearch.cluster.metadata.IndexMetadataResolver} or {@code
  * org.opensearch.cluster.routing.IndexRoutingResolver}.
  *
  * <p><b>The deadlock this exists to prevent.</b> A resolver may need to do real work to answer -- in the
@@ -21,7 +21,7 @@ package org.opensearch.cluster;
  * lookup finish, and the lookup is what the resolver is blocking that processing on.
  *
  * <p>This is not a new problem particular to this SPI -- the static registries this SPI's call-site
- * migration (Phase C4) is meant to replace, {@code AbsentIndexDescriptorSuppliers} and {@code
+ * migration is meant to replace, {@code AbsentIndexDescriptorSuppliers} and {@code
  * AbsentIndexRoutingSuppliers}, discovered and solved exactly this deadlock (their own javadoc records it,
  * with real investigation history) by keeping a thread-name check identical to this one and refusing to
  * call their primary, possibly-blocking supplier from an unsafe thread -- falling back instead to a second,

@@ -10,10 +10,7 @@ package org.opensearch.cluster.routing;
 
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.index.shard.ShardNotFoundException;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -25,8 +22,8 @@ import java.util.function.Predicate;
 /**
  * Node-level hook for supplying a routing entry for an index that has none published.
  *
- * <p>Phase A made an index legal in metadata and absent from the routing table, and taught the request
- * paths to degrade rather than throw. That degradation is deliberately pessimistic: no routing entry
+ * <p>An earlier change made an index legal in metadata and absent from the routing table, and taught the
+ * request paths to degrade rather than throw. That degradation is deliberately pessimistic: no routing entry
  * means no shard available. This hook lets a plugin answer the same question differently, by
  * <em>computing</em> the entry instead of reporting its absence.
  *
@@ -39,16 +36,32 @@ import java.util.function.Predicate;
  * getting that wrong means either no saving or two nodes reading one state differently.
  *
  * <p>The question dissolves once you notice it does not need asking. An entry computed identically on
- * every node from inputs every node already has does not need publishing at all. So a serverless index
- * publishes no routing entry, there is nothing to diff or serialize, and each node fills the gap
- * locally. Phase A is what makes the gap legal, which is why it was a prerequisite rather than merely
- * adjacent work.
+ * every node from inputs every node already has does not need publishing at all. So a computed-placement
+ * index publishes no routing entry, there is nothing to diff or serialize, and each node fills the gap
+ * locally. The earlier absent-routing change is what makes the gap legal, which is why it was a
+ * prerequisite rather than merely adjacent work.
  *
  * <p>A single static reference rather than an injected service, following
  * {@code EngineNativeSnapshotReleasers}: the call site is deep inside routing resolution, reached from
  * paths that have no plugin context to thread a dependency through.
  *
- * <p>Unset by default, so behaviour is exactly what Phase A shipped until a plugin opts in.
+ * <p>Unset by default, so behaviour is exactly the pessimistic no-shard-available default until a plugin
+ * opts in.
+ *
+ * <p><b>Settled architecture: one authority per plane.</b> This static registry is the node-level
+ * <em>authority</em> for computed routing -- the single place a plugin's answers live, and the seam the
+ * few core internals that ask node-level questions consult directly. The {@code ClusterPlugin} SPI
+ * ({@link IndexRoutingResolver}, implemented for this registry by {@link
+ * SupplierBackedIndexRoutingResolver}) is the registration <em>front door</em>: how a plugin installs
+ * into this authority, not a second authority. The resolver instance attached to each {@link
+ * RoutingTable} is the state-scoped <em>read path</em> ({@code ClusterState#getIndexRoutingTable},
+ * {@code ClusterState#resolveShard}, {@code ClusterState#allShards}, {@code
+ * RoutingTable#shouldPublishRouting}), and it answers by forwarding here. The direct static call sites
+ * that remain in core -- each carrying its own comment -- are permanent by design, not a pending
+ * migration: they ask "is the feature currently active on this node", a node-level fact the
+ * state-attached resolver deliberately does not model (a resolver is attached for the node's lifetime;
+ * this registry's contents change with the feature). Its metadata-plane counterpart, {@code
+ * org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers}, follows exactly the same shape.
  */
 public final class AbsentIndexRoutingSuppliers {
 
@@ -77,14 +90,14 @@ public final class AbsentIndexRoutingSuppliers {
      *
      * <p>Suspension has to be expressed here rather than by a decider. {@code
      * SuspendedShardAllocationDecider} works by telling the allocator to refuse a shard, and a computed
-     * index never reaches the allocator: Area C derives its placement instead. So the only way a computed
+     * index never reaches the allocator: this registry derives its placement instead. So the only way a computed
      * shard can be asleep is for placement not to place it, which means the filter belongs at the point
      * where placement is read.
      *
      * <p>It is applied in {@link #supply} rather than left to each supplier because every routing read for
      * a computed index funnels through there. A supplier that forgets the check would place a sleeping
      * shard and wake it, and that is precisely the class of mistake this registry was built to make
-     * impossible: C3 hooked resolution, left the write path open-coded, and the two disagreed.
+     * impossible: an earlier pass hooked resolution, left the write path open-coded, and the two disagreed.
      *
      * <p>Keyed by uuid rather than by name for two reasons: it is what scale-to-zero already carries, so
      * no lookup is needed to record a suspension, and it does not survive a delete-and-recreate, so a new
@@ -176,7 +189,7 @@ public final class AbsentIndexRoutingSuppliers {
     }
 
     /**
-     * The computed entry for an index with none published, or null to fall back to Phase A's
+     * The computed entry for an index with none published, or null to fall back to the default
      * no-shard-available behaviour.
      *
      * <p>A supplier that throws is treated as having no answer rather than being allowed to fail the
@@ -186,15 +199,15 @@ public final class AbsentIndexRoutingSuppliers {
     /**
      * Placement for a named index, falling back to the descriptor when cluster state has no metadata.
      *
-     * <p>P6 measured why this overload exists. Gating removes the cluster state entry, so a gated index
-     * reaches placement as a null and {@code ownsIndex} answers false for null, leaving the index with no
-     * routing at all and nothing thrown. The name is what makes the descriptor reachable, and the two
+     * <p>Measurement showed why this overload exists. Gating removes the cluster state entry, so a gated
+     * index reaches placement as a null and {@code ownsIndex} answers false for null, leaving the index with
+     * no routing at all and nothing thrown. The name is what makes the descriptor reachable, and the two
      * resolution paths that lose it are the only ones that ever see a null.
      *
      * <p>The metadata is synthesised rather than the seam widened. Passing a descriptor through would
-     * change {@code supply}'s signature and the supplier interface behind it, which C3 and every routing
-     * caller depend on; synthesising keeps every existing supplier working unchanged and confines the fix
-     * to the one place the information was lost.
+     * change {@code supply}'s signature and the supplier interface behind it, which the resolution hook and
+     * every routing caller depend on; synthesising keeps every existing supplier working unchanged and
+     * confines the fix to the one place the information was lost.
      */
     public static IndexRoutingTable supply(ClusterState state, String indexName, IndexMetadata indexMetadata) {
         if (indexMetadata != null) {
@@ -256,7 +269,7 @@ public final class AbsentIndexRoutingSuppliers {
     /**
      * One memoised placement per index.
      *
-     * <p>P4 measured why. {@code ComputedRoutingTable.build} allocates a fresh table on every resolution
+     * <p>Measurement showed why. {@code ComputedRoutingTable.build} allocates a fresh table on every resolution
      * and the suspension filter then rebuilds it again when anything is asleep, so a hundred-shard index
      * with one cold shard cost about nine microseconds per request, linear in shard count, on a path taken
      * once per index per request.
@@ -265,7 +278,7 @@ public final class AbsentIndexRoutingSuppliers {
      * table itself has, so this cannot grow past what the node already holds. Entries are replaced rather
      * than accumulated: the key is the index uuid and each new cluster state for that index overwrites it.
      *
-     * <p>A {@code ConcurrentHashMap} with no access ordering, deliberately. P1 measured an access-ordered
+     * <p>A {@code ConcurrentHashMap} with no access ordering, deliberately. Measurement put an access-ordered
      * synchronized map on this same path at 9M reads per second across sixteen threads against 1,084M for a
      * concurrent one, because access ordering makes a read mutate shared structure. Repeating that here
      * would give back more than the memo saves.
@@ -336,233 +349,6 @@ public final class AbsentIndexRoutingSuppliers {
             awake.addIndexShard(shard);
         }
         return removedAny ? awake.build() : computed;
-    }
-
-    /**
-     * The routing entry for an index: the published one if there is one, otherwise the computed one, or
-     * null if neither exists.
-     *
-     * <p>Every caller that reads a routing entry and has to handle its absence should go through this
-     * rather than pairing {@code routingTable().index(name)} with its own call to {@link #supply}. C3
-     * hooked resolution and left the write path unhooked, so a computed index answered searches and
-     * failed writes; that divergence was possible because the pairing was open-coded at each site. One
-     * function is what makes the next site hard to get wrong.
-     *
-     * <p>Returns null rather than throwing for an index in neither table, because the callers disagree
-     * about what that means: routing treats it as no shard available, health skips it, and creation
-     * treats it as already deleted.
-     */
-    public static IndexRoutingTable resolve(ClusterState state, String indexName) {
-        IndexRoutingTable published = state.routingTable().index(indexName);
-        if (published != null) {
-            return published;
-        }
-        if (isRegistered() == false) {
-            // The metadata lookup is skipped rather than made and discarded. This runs once per index per
-            // health call, and the index count this area exists for is in the millions.
-            return null;
-        }
-        return supply(state, indexName, state.metadata().index(indexName));
-    }
-
-    /**
-     * One shard's routing table, from the published entry or the computed one, or null if neither has
-     * it.
-     *
-     * <p>The shard-level counterpart of {@link #resolve}, and here for the same reason: the request
-     * paths that ask this question are the ones that were missed last time. C3 hooked search and left
-     * the write path reading the table directly, and after that was fixed in {@code OperationRouting}
-     * the replication path was still reading it directly somewhere else. Each of those was one open-coded
-     * lookup that nobody thought of as a routing decision.
-     *
-     * <p>Delegates to {@link RoutingTable#shardRoutingTableOrNull} for the published case rather than
-     * reimplementing it, because the two absences it distinguishes are not the same absence. An index
-     * with no entry is a maybe-computed index and returns null; an index that <em>has</em> an entry
-     * without this shard is a caller asking for a shard that does not exist, and that must keep throwing
-     * {@link ShardNotFoundException}. Collapsing the two turned a hard error into a retry loop, which is
-     * what {@code TransportReplicationActionTests.testUnknownIndexOrShardOnReroute} noticed.
-     */
-    public static IndexShardRoutingTable resolveShard(ClusterState state, ShardId shardId) {
-        IndexShardRoutingTable published = state.routingTable().shardRoutingTableOrNull(shardId);
-        if (published != null) {
-            return published;
-        }
-        IndexRoutingTable computed = supplyIfRegistered(state, shardId.getIndex().getName());
-        return computed == null ? null : computed.shard(shardId.id());
-    }
-
-    /**
-     * Every shard of the named indices, resolving each index rather than looking it up.
-     *
-     * <p>The bulk counterpart of {@link #resolve}, and the reason it lives here rather than on
-     * {@link RoutingTable} is a constraint rather than a preference. Those accessors receive a routing
-     * table and nothing else, while supplying an entry needs the {@link ClusterState} and the index
-     * metadata; and the no-argument forms take their index list from the routing table's own key set,
-     * which a computed index is not in. So a computed index cannot be resolved there, and cannot even be
-     * named there.
-     *
-     * <p>What this replaces failed by succeeding. Stats reported an index with no shards, segments
-     * reported no segments, recovery reported nothing recovering, and a force merge reported success
-     * having merged nothing. None of them threw, so the caller had no way to tell an unreachable index
-     * from an empty one, which is the same signature as the refresh in C21 and the field mappings in C22.
-     *
-     * <p>Missing indices are skipped rather than raising, matching
-     * {@link RoutingTable#allShardsSatisfyingPredicate} exactly, because these callers already depend on
-     * that for indices that disappear mid-request.
-     *
-     * @param includeRelocationTargets whether to add the target of a relocating shard, as recovery needs
-     */
-    public static ShardsIterator allShards(
-        ClusterState state,
-        String[] concreteIndices,
-        Predicate<ShardRouting> predicate,
-        boolean includeRelocationTargets
-    ) {
-        if (isRegistered() == false) {
-            // Untouched behaviour when nothing is installed, delegating to the exact method each caller
-            // used to call rather than to an equivalent one. The distinction is not pedantry: routing
-            // through allShardsSatisfyingPredicate where the caller used allShards is behaviourally
-            // identical and still wrong, because callers and tests bind to the method rather than to the
-            // behaviour. TransportRemoteStoreStatsActionTests stubs allShards(String[]) on a spy, and the
-            // equivalent-but-different call slipped straight past it.
-            if (includeRelocationTargets) {
-                return state.routingTable().allShardsIncludingRelocationTargets(concreteIndices);
-            }
-            if (predicate == ALL_SHARDS) {
-                return state.routingTable().allShards(concreteIndices);
-            }
-            return state.routingTable().allShardsSatisfyingPredicate(concreteIndices, predicate);
-        }
-        // A list rather than a set, because these callers rely on shard identity being preserved.
-        List<ShardRouting> shards = new ArrayList<>();
-        for (String index : concreteIndices) {
-            IndexRoutingTable indexRoutingTable = resolve(state, index);
-            if (indexRoutingTable == null) {
-                continue;
-            }
-            for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
-                for (ShardRouting shardRouting : shardRoutingTable) {
-                    if (predicate.test(shardRouting) == false) {
-                        continue;
-                    }
-                    shards.add(shardRouting);
-                    if (includeRelocationTargets && shardRouting.relocating()) {
-                        shards.add(shardRouting.getTargetRelocatingShard());
-                    }
-                }
-            }
-        }
-        return new PlainShardsIterator(shards);
-    }
-
-    /**
-     * The "no filter" predicate, held as a constant so the fast path can recognise it by identity and
-     * delegate to {@link RoutingTable#allShards(String[])} itself rather than to an equivalent method.
-     */
-    private static final Predicate<ShardRouting> ALL_SHARDS = shardRouting -> true;
-
-    /**
-     * Every shard in the cluster, including those of indices that publish no routing entry.
-     *
-     * <p>For the callers that name no indices at all, {@code _cat/shards} and {@code _cat/allocation}.
-     * They cannot use the array form because they have no list to pass, and
-     * {@link RoutingTable#allShards()} takes its list from the routing table's own key set, which a
-     * computed index is not in. So the index list has to come from metadata, which is the one place every
-     * index appears whether its routing is published or not.
-     *
-     * <p><b>Why enumerating metadata is acceptable here specifically.</b> This area exists to avoid
-     * walking millions of indices, so the cost deserves an argument rather than a shrug. These callers
-     * already produce one row per shard, so they are inherently linear in the number of shards, and the
-     * index count is bounded by the shard count. The walk adds no asymptotic cost to a caller that is
-     * already paying more. It would not be acceptable on a request path, which is why this is separate
-     * from {@link #resolve} rather than folded into it.
-     *
-     * <p>The paginated {@code _cat/shards} path already enumerates metadata for its own ordering, which
-     * is both precedent and a warning: it did that and then looked routing up unguarded, so a computed
-     * index was a NullPointerException there rather than a missing row.
-     */
-    public static List<ShardRouting> allShards(ClusterState state) {
-        if (isRegistered() == false) {
-            // Identical to what the caller used to do, by calling exactly that method.
-            return state.routingTable().allShards();
-        }
-        List<ShardRouting> shards = new ArrayList<>(state.routingTable().allShards());
-        for (IndexMetadata indexMetadata : state.metadata()) {
-            if (shouldPublishRouting(indexMetadata)) {
-                // Published, so allShards() above already returned it.
-                continue;
-            }
-            IndexRoutingTable computed = supply(state, indexMetadata);
-            if (computed == null) {
-                continue;
-            }
-            for (IndexShardRoutingTable shardRoutingTable : computed) {
-                for (ShardRouting shardRouting : shardRoutingTable) {
-                    shards.add(shardRouting);
-                }
-            }
-        }
-        return shards;
-    }
-
-    /** Every shard of the named indices, the common case. */
-    public static ShardsIterator allShards(ClusterState state, String[] concreteIndices) {
-        return allShards(state, concreteIndices, ALL_SHARDS, false);
-    }
-
-    /** Every shard of the named indices, plus the targets of any that are relocating. */
-    public static ShardsIterator allShardsIncludingRelocationTargets(ClusterState state, String[] concreteIndices) {
-        return allShards(state, concreteIndices, ALL_SHARDS, true);
-    }
-
-    /** The computed entry for an index, skipping the metadata lookup when no supplier is installed. */
-    private static IndexRoutingTable supplyIfRegistered(ClusterState state, String indexName) {
-        if (isRegistered() == false) {
-            return null;
-        }
-        return supply(state, indexName, state.metadata().index(indexName));
-    }
-
-    /**
-     * Computed shards assigned to one node, for indices with no published routing entry.
-     *
-     * <p>Separate from {@link #register} because it answers the inverse question. A supplier is asked
-     * "where does index X live", which is what a coordinator needs; a data node needs "which shards live
-     * here", and deriving that from the supplier means enumerating every index in the cluster on every
-     * applied cluster state. At the index counts this area exists for that enumeration is the cost the
-     * area was built to avoid, so the inverse is a registration of its own and the plugin decides how to
-     * answer it.
-     */
-    private static final AtomicReference<BiFunction<ClusterState, String, List<ShardRouting>>> LOCAL_SHARDS = new AtomicReference<>();
-
-    /** Installs the inverse lookup. Registering null clears it. */
-    public static void registerLocalShards(BiFunction<ClusterState, String, List<ShardRouting>> localShards) {
-        LOCAL_SHARDS.set(localShards);
-    }
-
-    /**
-     * The computed shards this node should host, or empty when nothing is installed.
-     *
-     * <p>Empty rather than null, and a throwing implementation reads as empty, for the same reason
-     * {@link #supply} declines rather than fails: a plugin bug must not stop a node from applying
-     * cluster state.
-     */
-    public static List<ShardRouting> localShards(ClusterState state, String nodeId) {
-        BiFunction<ClusterState, String, List<ShardRouting>> localShards = LOCAL_SHARDS.get();
-        if (localShards == null) {
-            return List.of();
-        }
-        try {
-            List<ShardRouting> shards = localShards.apply(state, nodeId);
-            return shards == null ? List.of() : shards;
-        } catch (Exception e) {
-            return List.of();
-        }
-    }
-
-    /** Whether an inverse lookup is installed. Lets a caller skip work it would otherwise discard. */
-    public static boolean hasLocalShards() {
-        return LOCAL_SHARDS.get() != null;
     }
 
     /** Whether a supplier is installed. Exposed so callers can skip work they would otherwise discard. */

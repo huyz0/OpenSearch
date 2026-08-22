@@ -120,9 +120,9 @@ public class RestSearchAction extends BaseRestHandler {
     }
 
     /**
-     * A serverless deployment needs {@code _search} to function at all -- see
-     * rfc-serverless-opensearch.md &sect;15's "operational caveat" note for why this and the
-     * handful of other core APIs it names are annotated explicitly rather than left to default to
+     * A deployment with a restricted REST surface still needs {@code _search} to function at all,
+     * which is why this and a
+     * handful of other core APIs are annotated explicitly rather than left to default to
      * {@code UNAVAILABLE} alongside everything else in core.
      */
     @Override

@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.storage.placement;
 
-import org.opensearch.cluster.routing.ComputedPlacementMembership;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;

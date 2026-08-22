@@ -28,7 +28,7 @@ import static org.opensearch.gateway.remote.RemoteClusterStateUtils.DELIMITER;
 import static org.opensearch.gateway.remote.model.RemoteClusterMetadataManifest.MANIFEST;
 
 /**
- * Plan item E5 (plan-100m-index-implementation.md, Area E): wrapper class for uploading/downloading
+ * Wrapper class for uploading/downloading
  * one {@link ManifestShardContent} blob to/from remote blob store, the same role {@link
  * RemoteClusterMetadataManifest} plays for the top-level manifest and {@code RemoteIndexMetadata} plays
  * for one index's metadata.

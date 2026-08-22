@@ -23,7 +23,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedIndexMetadata;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedMetadata;
-import org.opensearch.gateway.remote.IndexDescriptor;
+import org.opensearch.gateway.remote.ManifestIndexDescriptor;
 import org.opensearch.gateway.remote.RemoteClusterStateUtils;
 import org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm;
 import org.opensearch.index.remote.RemoteStoreEnums.PathType;
@@ -256,9 +256,9 @@ public class RemoteIndexMetadataTests extends OpenSearchTestCase {
 
         UploadedIndexMetadata uploadedMetadata = (UploadedIndexMetadata) remoteObjectForUpload.getUploadedMetadata();
 
-        IndexDescriptor descriptor = uploadedMetadata.getDescriptor();
+        ManifestIndexDescriptor descriptor = uploadedMetadata.getDescriptor();
         assertNotNull("the descriptor is the whole point of enabling it", descriptor);
-        assertEquals(IndexDescriptor.of(indexMetadata), descriptor);
+        assertEquals(ManifestIndexDescriptor.of(indexMetadata), descriptor);
         assertEquals(indexMetadata.getState(), descriptor.getState());
         assertEquals(indexMetadata.getAliases(), descriptor.getAliases());
         assertEquals(indexMetadata.getTotalNumberOfShards(), descriptor.getTotalNumberOfShards());

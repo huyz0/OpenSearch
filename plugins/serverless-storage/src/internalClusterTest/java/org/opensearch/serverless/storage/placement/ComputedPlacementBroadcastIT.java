@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.routing;
+package org.opensearch.serverless.storage.placement;
 
 import org.opensearch.action.admin.indices.forcemerge.ForceMergeResponse;
 import org.opensearch.action.admin.indices.recovery.RecoveryResponse;
@@ -16,6 +16,11 @@ import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.action.support.replication.TransportReplicationAction;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
+import org.opensearch.cluster.routing.ComputedShardRouting;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
@@ -23,11 +28,13 @@ import org.opensearch.index.IndexService;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 import org.junit.Before;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -55,6 +62,15 @@ public class ComputedPlacementBroadcastIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-broadcast";
 
+    /**
+     * Only the membership machinery, not the full serverless plugin, whose gate and resolver would
+     * collide with this suite's own fake supplier registrations -- see {@link MembershipOnlyTestPlugin}.
+     */
+    @Override
+    protected Collection<Class<? extends Plugin>> nodePlugins() {
+        return List.of(MembershipOnlyTestPlugin.class);
+    }
+
     @Override
     protected Settings nodeSettings(int nodeOrdinal) {
         return Settings.builder()
@@ -67,14 +83,12 @@ public class ComputedPlacementBroadcastIT extends OpenSearchIntegTestCase {
     public void registerComputedPlacement() {
         AbsentIndexRoutingSuppliers.registerUnpublished(metadata -> metadata.getIndex().getName().startsWith("computed-"));
         AbsentIndexRoutingSuppliers.register(ComputedPlacementBroadcastIT::compute);
-        AbsentIndexRoutingSuppliers.registerLocalShards(ComputedPlacementBroadcastIT::localShards);
     }
 
     @After
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
         AbsentIndexRoutingSuppliers.register(null);
-        AbsentIndexRoutingSuppliers.registerLocalShards(null);
     }
 
     /**
@@ -178,32 +192,6 @@ public class ComputedPlacementBroadcastIT extends OpenSearchIntegTestCase {
             );
         }
         return builder.build();
-    }
-
-    private static List<ShardRouting> localShards(ClusterState state, String nodeId) {
-        List<String> dataNodes = sortedDataNodes(state);
-        List<ShardRouting> mine = new ArrayList<>();
-        if (dataNodes.isEmpty()) {
-            return mine;
-        }
-        for (IndexMetadata indexMetadata : state.metadata()) {
-            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(indexMetadata)) {
-                continue;
-            }
-            for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
-                if (nodeId.equals(owner(dataNodes, shardId)) == false) {
-                    continue;
-                }
-                mine.add(
-                    ComputedShardRouting.initializing(
-                        new ShardId(indexMetadata.getIndex(), shardId),
-                        nodeId,
-                        RecoverySource.EmptyStoreRecoverySource.INSTANCE
-                    )
-                );
-            }
-        }
-        return mine;
     }
 
     private static String owner(List<String> dataNodes, int shardId) {

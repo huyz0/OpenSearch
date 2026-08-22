@@ -25,11 +25,35 @@ import java.util.List;
  * placement reads from {@link IndexMetadata} are all present and identical.
  *
  * <p>That list was audited rather than assumed. {@code ComputedRoutingTable} reads the index, the uuid,
- * the shard count and the search-only replica count; {@code ComputedPlacementGate} reads whether the
- * index is serverless. Those five are asserted individually below, so a field quietly dropped from the
+ * the shard count and the search-only replica count; the placement gate reads whether the
+ * index is claimed. Those five are asserted individually below, so a field quietly dropped from the
  * descriptor fails here rather than in a routing decision.
  */
 public class IndexDescriptorTests extends OpenSearchTestCase {
+
+    /**
+     * A test-only stand-in for a plugin's membership-marker setting. The claimed flag only round-trips
+     * through settings when the registered {@link IndexCreationStrategy} declares a key, so these tests
+     * register one.
+     */
+    private static final String CLAIMED_KEY = "index.test_plane.enabled";
+
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
+        IndexCreationStrategyRegistry.register(new IndexCreationStrategy() {
+            @Override
+            public String claimedIndexSettingKey() {
+                return CLAIMED_KEY;
+            }
+        });
+    }
+
+    @Override
+    public void tearDown() throws Exception {
+        IndexCreationStrategyRegistry.register(null);
+        super.tearDown();
+    }
 
     /**
      * The load-bearing one. Every input placement takes from metadata must survive the reduction to a
@@ -48,14 +72,20 @@ public class IndexDescriptorTests extends OpenSearchTestCase {
             metadata.getNumberOfSearchOnlyReplicas(),
             descriptor.searchOnlyReplicaCount()
         );
-        assertTrue("the gate reads the serverless flag to decide whether placement applies at all", descriptor.serverless());
+        assertTrue(
+            "the gate reads the claimed flag (via the synthesised settings) to decide whether placement applies at all",
+            descriptor.toIndexMetadata().getSettings().getAsBoolean(CLAIMED_KEY, false)
+        );
     }
 
-    /** An ordinary index must be distinguishable from a serverless one, or the gate cannot gate. */
-    public void testAnOrdinaryIndexIsNotServerless() {
+    /** An ordinary index must be distinguishable from a claimed one, or the gate cannot gate. */
+    public void testAnOrdinaryIndexIsNotClaimed() {
         IndexDescriptor descriptor = IndexDescriptor.from(indexMetadata("ordinary", 1, 0, false));
 
-        assertFalse("an index without the setting must not be treated as serverless", descriptor.serverless());
+        assertFalse(
+            "an index without the setting must not be treated as claimed",
+            descriptor.toIndexMetadata().getSettings().getAsBoolean(CLAIMED_KEY, false)
+        );
     }
 
     /** Resolution needs closed state without materializing metadata, or the descriptor saves nothing. */
@@ -157,13 +187,13 @@ public class IndexDescriptorTests extends OpenSearchTestCase {
         assertFalse(descriptor.system());
     }
 
-    private static IndexMetadata indexMetadata(String name, int shards, int searchReplicas, boolean serverless) {
+    private static IndexMetadata indexMetadata(String name, int shards, int searchReplicas, boolean claimed) {
         return IndexMetadata.builder(name)
             .settings(
                 Settings.builder()
                     .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
                     .put(IndexMetadata.SETTING_INDEX_UUID, name + "-uuid-000000")
-                    .put("index.serverless_storage.enabled", serverless)
+                    .put(CLAIMED_KEY, claimed)
                     .put(IndexMetadata.SETTING_NUMBER_OF_SEARCH_REPLICAS, searchReplicas)
                     .build()
             )

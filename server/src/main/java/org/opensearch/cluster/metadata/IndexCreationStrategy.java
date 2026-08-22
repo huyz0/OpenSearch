@@ -11,27 +11,27 @@ package org.opensearch.cluster.metadata;
 import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateRequest;
 
 /**
- * Phase D1 of {@code core-pluggability-refactor-plan.md}: an SPI a plugin implements to decide which index
- * names/requests belong to it, replacing the fork's name-prefix convention (previously {@code
- * DescriptorOnlyCreation}'s {@code namesAServerlessIndex}-style check) with an explicit, plugin-owned
+ * An SPI a plugin implements to decide which index
+ * names/requests belong to it, replacing the fork's name-prefix convention (previously a static
+ * name-prefix membership check on {@code DescriptorOnlyCreation}) with an explicit, plugin-owned
  * decision.
  *
  * <p><b>Definition only, not yet consulted anywhere.</b> Pure additive API surface -- a new type plus a new
  * default-empty {@link org.opensearch.plugins.ClusterPlugin} hook -- with the exact same "zero behavior
- * change until something implements it" shape Phase C1's {@link IndexMetadataResolver}/{@link
+ * change until something implements it" shape {@link IndexMetadataResolver}/{@link
  * org.opensearch.cluster.routing.IndexRoutingResolver} had.
  *
- * <p><b>Revised down to a single method after a dedicated D2 scoping investigation, correcting this
+ * <p><b>Revised down to a single method after a dedicated scoping investigation, correcting this
  * interface's own first draft.</b> That draft additionally declared {@code createIndex(ClusterState,
  * CreateIndexClusterStateUpdateRequest)} and {@code claimsForDeletion}/{@code deleteIndex}, modeled on the
- * assumption that a plugin needs to take over creation and deletion *orchestration* entirely, the way the
- * plan's own D2 sketch described it. Reading the real call sites before migrating any of them (see the "D2
- * scoping investigation" status-log row) found that assumption wrong on both counts:
+ * assumption that a plugin needs to take over creation and deletion *orchestration* entirely, the way an
+ * earlier design sketch described it. Reading the real call sites before migrating any of them
+ * found that assumption wrong on both counts:
  *
  * <ul>
  *   <li>Deletion mechanics are already generic, plugin-independent infrastructure: {@link
  *       MetadataDeleteIndexService} never consults {@code DescriptorOnlyCreation} at all (gated deletion is
- *       decided entirely by Phase C's {@code Metadata#indexOrResolved} null-ness signal), and the actual
+ *       decided entirely by the {@code Metadata#indexOrResolved} null-ness signal), and the actual
  *       tombstone write is handed off through {@code DurableTombstones}'s own {@code register(Writer)}
  *       static hook -- a working, already-appropriately-scoped extension point this interface would have
  *       duplicated, not replaced.
@@ -52,16 +52,16 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  * meant either re-deriving {@code createGatedIndex}'s hard-won concurrency reasoning generically (real risk
  * of silently dropping one of the several previously-fixed bugs its own comments document) or leaving a
  * {@code createIndex()} method on the interface that no real migration would ever call -- dead API surface
- * mimicking a capability nothing needs. Narrowing to {@link #claims} instead means a real D2 migration only
+ * mimicking a capability nothing needs. Narrowing to {@link #claims} instead means a real migration only
  * ever replaces the *predicate* deciding whether {@code createGatedIndex}/{@code skipsClusterState}'s
  * existing, untouched bodies run -- not those bodies themselves.
  *
  * <p>Registered via a new {@code ClusterPlugin.getIndexCreationStrategy()} default-empty hook, the same
- * registration point Phase C1's resolvers use.
+ * registration point the metadata/routing resolvers use.
  *
- * <p><b>Extended to close out D2's own two remaining {@code clusterStateCreateIndex} call sites</b> (the
- * ones the D2-scoping status-log row identified as the genuinely dangerous, nine-line region and deliberately
- * left alone during the first two D2 slices). Reading those two sites found they ask two questions {@link
+ * <p><b>Extended to close out the two remaining {@code clusterStateCreateIndex} call sites</b> (the
+ * ones the scoping investigation identified as the genuinely dangerous, nine-line region and deliberately
+ * left alone during the first migration slices). Reading those two sites found they ask two questions {@link
  * #claims(String, CreateIndexClusterStateUpdateRequest)} cannot answer as originally shaped:
  *
  * <ul>
@@ -75,25 +75,25 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  *       vocabulary, rejected because it keeps a second, parallel plugin-registration point alive for no
  *       reason once one already exists; (c) add a dedicated, symmetric {@link #skipsClusterState} method
  *       to this same interface, the same "narrow, purpose-built method" shape {@link #claims} itself was
- *       narrowed to during D1 -- chosen, since it keeps exactly one registration point per plugin while
+ *       narrowed to earlier -- chosen, since it keeps exactly one registration point per plugin while
  *       being honest that the two questions are genuinely different.
  *   <li>The two-plane-collision refusal has no {@link CreateIndexClusterStateUpdateRequest} in scope at
  *       all -- only a name. Three shapes were considered: (a) pass a fabricated {@code null} request into
  *       the existing two-arg {@link #claims}, rejected because a future implementation that legitimately
- *       reads the request would silently NPE, and the plan's own D2 text already flagged a fabricated null
+ *       reads the request would silently NPE, and a fabricated null had already been flagged
  *       as the wrong answer; (b) a distinctly-named method (e.g. {@code reservesNamespace}) kept
  *       independent of {@code claims()}, rejected as speculative -- nothing today needs the two concepts to
  *       ever disagree, and the one real implementation would answer both identically; (c) a name-only
  *       {@link #claims(String)} overload, with the richer, request-aware overload defaulting to it -- chosen,
  *       because every real implementation of this interface today (see {@code SupplierBackedIndexCreationStrategy},
- *       a plugin-owned implementation since Phase D3 relocated it out of {@code server/})
+ *       a plugin-owned implementation since it was relocated out of {@code server/})
  *       already ignores the request entirely, so the name-only question is the actually-primitive one and
  *       the request-aware overload is the derived convenience, not the other way around.
  * </ul>
  *
  * <p>A third, smaller gap the same two call sites' error messages exposed: both interpolate {@code
  * DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX} directly into user-facing text, which is exactly the kind
- * of core-names-the-plugin's-vocabulary-by-name coupling this whole plan exists to remove, just in a
+ * of core-names-the-plugin's-vocabulary-by-name coupling this whole refactor exists to remove, just in a
  * message string rather than control flow. {@link #describeClaimedNamespace()} lets the registered strategy
  * supply its own description instead.
  *
@@ -102,7 +102,7 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  * @ExperimentalApi}/{@code @DeprecatedApi} (enforced at compile time) -- but {@link
  * CreateIndexClusterStateUpdateRequest} and its whole {@code ClusterStateUpdateRequest} hierarchy carry
  * none of those, and were never designed as a tracked API-compatibility surface. Retrofitting that
- * annotation onto a core internal request DTO -- unrelated to this SPI, and owned by services this phase
+ * annotation onto a core internal request DTO -- unrelated to this SPI, and owned by services this change
  * doesn't touch -- would be a bigger and wrong-owner change than "define an empty extension point" should
  * require. This mirrors {@code ClusterPlugin}'s own existing convention: its experimental hooks (e.g. {@code
  * getIndexMetadataResolver()}) are documented experimental via {@code @opensearch.experimental} javadoc
@@ -175,7 +175,7 @@ public interface IndexCreationStrategy {
      * The most claimed indices a single multi-index state change (open/close) may target, or {@link
      * Integer#MAX_VALUE} for no limit.
      *
-     * <p>Phase J3 of {@code core-pluggability-refactor-plan.md}. {@code MetadataIndexStateService} used to
+     * <p>{@code MetadataIndexStateService} used to
      * hardcode {@code 50} here, in a message that additionally named the specific storage technology whose
      * per-operation cost motivated the number ("to prevent high-cost Object Storage operations"). Both the
      * limit and the reason for it are properties of a particular strategy's storage model, not of core:
@@ -188,5 +188,19 @@ public interface IndexCreationStrategy {
      */
     default int maxMultiIndexStateChangeTargets() {
         return Integer.MAX_VALUE;
+    }
+
+    /**
+     * The index-settings key that marks an index as belonging to this strategy's claimed plane, or
+     * {@code null} when membership is not marked by a setting. When non-null, descriptor synthesis
+     * ({@link IndexDescriptor#from(IndexMetadata)} reading it, {@link IndexDescriptor#toIndexMetadata()}
+     * writing it back) round-trips the marker under this key, so core never hard-codes a plugin's
+     * setting name.
+     *
+     * <p>Defaults to {@code null}: a strategy that does not mark membership through settings loses
+     * nothing, and a node with no strategy registered synthesizes no marker at all.
+     */
+    default String claimedIndexSettingKey() {
+        return null;
     }
 }

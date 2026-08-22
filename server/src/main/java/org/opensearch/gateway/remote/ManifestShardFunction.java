@@ -14,9 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 /**
- * Plan item E5/E7 (plan-100m-index-implementation.md, Area E; see also rfc-manifest-sharding-design.md
- * "Partition function"): which manifest shard an index's entry lives in, "{@code murmurhash3(index
- * UUID) mod shardCount}" in the RFC's own words.
+ * Which manifest shard an index's entry lives in: {@code murmurhash3(index UUID) mod shardCount}.
  *
  * <p>The index UUID, not the name, is the partition key -- an index cannot be renamed, so the two are
  * equally stable in practice, but the UUID is fixed-width and uniformly distributed where names are
@@ -26,19 +24,19 @@ import java.util.Objects;
  * manifest is built, which is what makes "carry forward every shard but the ones that changed" sound at
  * all.
  *
- * <h2>E7 -- alignment with the coordinator/descriptor-cache affinity hash</h2>
+ * <h2>Alignment with the coordinator/descriptor-cache affinity hash</h2>
  *
- * {@code CoordinatorAffinityRouting} (Area B, {@code plugins/serverless-storage}) already rendezvous-
- * hashes indices onto coordinator nodes for a different reason (spreading resolver-cache warmth). The
- * RFC calls out that if the manifest's own partition function matched that one, a coordinator's warm
- * set and its manifest-shard read set would coincide -- "a free win from two independent designs lining
- * up." This class deliberately does not attempt that coupling: {@code CoordinatorAffinityRouting}
+ * The plugin's {@code CoordinatorAffinityRouting} already rendezvous-
+ * hashes indices onto coordinator nodes for a different reason (spreading resolver-cache warmth). If
+ * the manifest's own partition function matched that one, a coordinator's warm
+ * set and its manifest-shard read set would coincide -- a free win from two independent designs lining
+ * up. This class deliberately does not attempt that coupling: {@code CoordinatorAffinityRouting}
  * partitions over the current, size-varying node set (rendezvous hashing is defined precisely so adding
  * or removing a node reshuffles as little as possible), while this partitions over a shard count fixed
- * in the manifest and never derived from cluster size (see this class's own {@code shardCount} contract
- * and the RFC's "Shard count" section on why -- the C6 codec-flapping scar). Those are two different
- * hash domains; forcing them to coincide is a real design decision the RFC itself says "needs to be
- * built deliberately rather than discovered," not something this function can default its way into
+ * in the manifest and never derived from cluster size (see this class's own {@code shardCount} contract;
+ * an earlier design that derived it from cluster size caused codec flapping). Those are two different
+ * hash domains; forcing them to coincide is a real design decision that needs to be
+ * built deliberately rather than discovered, not something this function can default its way into
  * without deciding, on its own authority, what a fixed manifest shard count should even mean relative to
  * a live node count. What this class does instead is the safe half: reuse the same underlying primitive
  * ({@link MurmurHash3}, the one hash implementation already vendored in this codebase) rather than
@@ -53,9 +51,9 @@ public final class ManifestShardFunction {
      * @param indexUUID the index's stable UUID (see this class's own javadoc for why the UUID and not
      *                  the name).
      * @param shardCount the manifest's declared shard count; must be positive. This is always the value
-     *                   found in the manifest doing the partitioning, not a locally configured one --
-     *                   see {@code rfc-manifest-sharding-design.md}'s "readers use the value they find
-     *                   there, not the value they are configured with."
+     *                   found in the manifest doing the partitioning, not a locally configured one:
+     *                   readers use the value they find
+     *                   there, not the value they are configured with.
      * @return which manifest shard, in {@code [0, shardCount)}, {@code indexUUID}'s entry belongs in.
      */
     public static int shardFor(String indexUUID, int shardCount) {

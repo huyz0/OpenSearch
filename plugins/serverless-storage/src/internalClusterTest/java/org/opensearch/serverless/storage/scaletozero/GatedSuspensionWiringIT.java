@@ -54,11 +54,11 @@ public class GatedSuspensionWiringIT extends OpenSearchIntegTestCase {
             AbsentIndexRoutingSuppliers.register((state, metadata) -> placement());
             ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
 
-            assertNotNull("the premise: the shard is placed while awake", AbsentIndexRoutingSuppliers.resolve(empty, GATED).shard(1));
+            assertNotNull("the premise: the shard is placed while awake", AbsentIndexRoutingSuppliers.supply(empty, GATED, null).shard(1));
 
             registry.suspend(GATED_UUID, 1);
 
-            IndexRoutingTable afterSleep = AbsentIndexRoutingSuppliers.resolve(empty, GATED);
+            IndexRoutingTable afterSleep = AbsentIndexRoutingSuppliers.supply(empty, GATED, null);
             assertNull("a suspended gated shard must stop being placed", afterSleep.shard(1));
             assertNotNull("and its siblings must be untouched", afterSleep.shard(0));
         } finally {
@@ -81,7 +81,7 @@ public class GatedSuspensionWiringIT extends OpenSearchIntegTestCase {
         assertNotNull(
             "an uninstalled registry cannot affect placement, which is precisely why a gated index could "
                 + "never sleep before this wiring",
-            AbsentIndexRoutingSuppliers.resolve(empty, GATED).shard(1)
+            AbsentIndexRoutingSuppliers.supply(empty, GATED, null).shard(1)
         );
     }
 

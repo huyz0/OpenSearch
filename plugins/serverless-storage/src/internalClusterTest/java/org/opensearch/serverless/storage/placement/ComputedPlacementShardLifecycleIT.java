@@ -6,13 +6,20 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.routing;
+package org.opensearch.serverless.storage.placement;
 
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.action.support.replication.TransportReplicationAction;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
+import org.opensearch.cluster.routing.ComputedShardRouting;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.RecoverySource;
+import org.opensearch.cluster.routing.RoutingNodes;
+import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
@@ -21,11 +28,13 @@ import org.opensearch.index.IndexService;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 import org.junit.Before;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -54,6 +63,15 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
     private static final String INDEX = "computed-lifecycle";
 
     /**
+     * Only the membership machinery, not the full serverless plugin, whose gate and resolver would
+     * collide with this suite's own fake supplier registrations -- see {@link MembershipOnlyTestPlugin}.
+     */
+    @Override
+    protected Collection<Class<? extends Plugin>> nodePlugins() {
+        return List.of(MembershipOnlyTestPlugin.class);
+    }
+
+    /**
      * A five second replication retry timeout instead of the sixty second default.
      *
      * <p>Not a convenience. At sixty seconds the write test takes a minute whether it passes or fails and
@@ -79,7 +97,6 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
         AbsentIndexRoutingSuppliers.register(null);
-        AbsentIndexRoutingSuppliers.registerLocalShards(null);
     }
 
     /** The claim: a data node opens the shards a computed index says it owns. */
@@ -200,7 +217,6 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
     private static void registerComputedPlacement() {
         AbsentIndexRoutingSuppliers.registerUnpublished(metadata -> metadata.getIndex().getName().startsWith("computed-"));
         AbsentIndexRoutingSuppliers.register(ComputedPlacementShardLifecycleIT::compute);
-        AbsentIndexRoutingSuppliers.registerLocalShards(ComputedPlacementShardLifecycleIT::localShards);
     }
 
     private static IndexRoutingTable compute(ClusterState state, IndexMetadata indexMetadata) {
@@ -214,42 +230,6 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
             builder.addIndexShard(new IndexShardRoutingTable.Builder(shard).addShard(started(shard, owner(dataNodes, shardId))).build());
         }
         return builder.build();
-    }
-
-    /**
-     * The inverse lookup. Enumerating every index in metadata is exactly the cost this area exists to
-     * avoid, and a real implementation would not do it; a test cluster with a handful of indices can,
-     * and what is under test here is the seam rather than how a plugin answers through it.
-     */
-    private static List<ShardRouting> localShards(ClusterState state, String nodeId) {
-        List<String> dataNodes = sortedDataNodes(state);
-        List<ShardRouting> mine = new ArrayList<>();
-        if (dataNodes.isEmpty()) {
-            return mine;
-        }
-        for (IndexMetadata indexMetadata : state.metadata()) {
-            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(indexMetadata)) {
-                continue;
-            }
-            for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
-                if (nodeId.equals(owner(dataNodes, shardId)) == false) {
-                    continue;
-                }
-                // INITIALIZING, not STARTED. failMissingShards fails any shard the local view calls
-                // active that the node does not already have, and createIndices then skips it because it
-                // is in failedShardsCache, so an already-started local view can never open a shard. That
-                // was measured, not reasoned: the first run of this test failed with no node-side error
-                // at all.
-                mine.add(
-                    ComputedShardRouting.initializing(
-                        new ShardId(indexMetadata.getIndex(), shardId),
-                        nodeId,
-                        RecoverySource.EmptyStoreRecoverySource.INSTANCE
-                    )
-                );
-            }
-        }
-        return mine;
     }
 
     private static String owner(List<String> dataNodes, int shardId) {

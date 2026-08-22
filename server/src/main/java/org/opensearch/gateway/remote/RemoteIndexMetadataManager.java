@@ -127,7 +127,7 @@ public class RemoteIndexMetadataManager extends AbstractRemoteWritableEntityMana
      *
      * <p>Public because a deferred index needs it: when the manifest carries the descriptor, the read
      * path installs a holder that calls this the first time something wants the whole index, rather than
-     * fetching every index up front. See {@link IndexDescriptor}.
+     * fetching every index up front. See {@link ManifestIndexDescriptor}.
      *
      * @param uploadedIndexMetadata {@link ClusterMetadataManifest.UploadedIndexMetadata} contains details about remote location of index metadata
      * @return {@link IndexMetadata}
@@ -201,7 +201,7 @@ public class RemoteIndexMetadataManager extends AbstractRemoteWritableEntityMana
         this.writeDescriptor = writeDescriptor;
     }
 
-    /** Whether uploaded index entries should carry {@link IndexDescriptor}. */
+    /** Whether uploaded index entries should carry {@link ManifestIndexDescriptor}. */
     public boolean isWriteDescriptorEnabled() {
         return writeDescriptor;
     }

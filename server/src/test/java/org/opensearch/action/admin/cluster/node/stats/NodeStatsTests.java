@@ -62,6 +62,8 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
@@ -98,6 +100,7 @@ import org.opensearch.node.NodesResourceUsageStats;
 import org.opensearch.node.ResponseCollectorService;
 import org.opensearch.node.remotestore.RemoteStoreNodeStats;
 import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
+import org.opensearch.plugins.PluginNodeStats;
 import org.opensearch.ratelimitting.admissioncontrol.controllers.AdmissionController;
 import org.opensearch.ratelimitting.admissioncontrol.controllers.CpuBasedAdmissionController;
 import org.opensearch.ratelimitting.admissioncontrol.enums.AdmissionControlActionType;
@@ -1055,7 +1058,6 @@ public class NodeStatsTests extends OpenSearchTestCase {
             admissionControlStats,
             nodeCacheStats,
             remoteStoreNodeStats,
-            null,
             -1L
         );
     }
@@ -1516,8 +1518,9 @@ public class NodeStatsTests extends OpenSearchTestCase {
     }
 
     /**
-     * Older nodes (pre-V_3_7_0) don't write the native-allocator stats payload. The version
-     * gate must keep them round-tripping cleanly: the receiver should see {@code null}.
+     * Older nodes (pre-V_3_7_0) write neither the (vestigial) allocator slot nor the pluginStats map.
+     * The version gates must keep them round-tripping cleanly: the receiver should see an empty
+     * pluginStats map and the -1 default for totalEstimatedNativeBytes.
      */
     public void testNativeAllocatorStatsBwcEmptyOnOldVersion() throws IOException {
         NativeAllocatorPoolStats stats = new NativeAllocatorPoolStats(
@@ -1534,7 +1537,7 @@ public class NodeStatsTests extends OpenSearchTestCase {
             try (StreamInput in = out.bytes().streamInput()) {
                 in.setVersion(Version.V_3_6_0);
                 NodeStats roundtripped = new NodeStats(in);
-                assertNull("native allocator stats must be null when written by an older node", roundtripped.getNativeAllocatorStats());
+                assertTrue("pluginStats must be empty when written for an older wire version", roundtripped.getPluginStats().isEmpty());
                 assertEquals(
                     "totalEstimatedNativeBytes must default to -1 when written by a pre-V_3_7_0 node",
                     -1L,
@@ -1545,8 +1548,10 @@ public class NodeStatsTests extends OpenSearchTestCase {
     }
 
     /**
-     * Round-trip on the current wire version — the typed allocator stats payload must
-     * survive serialize/deserialize unchanged.
+     * Round-trip on the current wire version — the allocator stats payload now travels through the
+     * generic pluginStats map (under {@link NativeAllocatorPoolStats#WRITEABLE_NAME}) and must survive
+     * serialize/deserialize unchanged. The receiving stream needs the {@code PluginNodeStats} entry
+     * registered, exactly as a coordinator with the arrow-base plugin installed has.
      */
     public void testNativeAllocatorStatsRoundTripCurrentVersion() throws IOException {
         NativeAllocatorPoolStats stats = new NativeAllocatorPoolStats(
@@ -1561,14 +1566,24 @@ public class NodeStatsTests extends OpenSearchTestCase {
         DiscoveryNode node = new DiscoveryNode("node1", buildNewFakeTransportAddress(), emptyMap(), emptySet(), Version.CURRENT);
         NodeStats original = newNodeStatsWithNativeAllocator(node, stats);
 
+        NamedWriteableRegistry registry = new NamedWriteableRegistry(
+            List.of(
+                new NamedWriteableRegistry.Entry(
+                    PluginNodeStats.class,
+                    NativeAllocatorPoolStats.WRITEABLE_NAME,
+                    NativeAllocatorPoolStats::new
+                )
+            )
+        );
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             out.setVersion(Version.CURRENT);
             original.writeTo(out);
-            try (StreamInput in = out.bytes().streamInput()) {
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry)) {
                 in.setVersion(Version.CURRENT);
                 NodeStats roundtripped = new NodeStats(in);
-                NativeAllocatorPoolStats decoded = roundtripped.getNativeAllocatorStats();
-                assertNotNull("native allocator stats must round-trip on current wire version", decoded);
+                NativeAllocatorPoolStats decoded = (NativeAllocatorPoolStats) roundtripped.getPluginStats()
+                    .get(NativeAllocatorPoolStats.WRITEABLE_NAME);
+                assertNotNull("native allocator stats must round-trip via pluginStats on current wire version", decoded);
                 assertEquals(1024L, decoded.getNativeAllocatedBytes());
                 assertEquals(2048L, decoded.getNativeResidentBytes());
                 assertEquals(3, decoded.getPools().size());
@@ -1581,11 +1596,12 @@ public class NodeStatsTests extends OpenSearchTestCase {
     }
 
     /**
-     * Renders {@code NodeStats.toXContent} when {@code nativeAllocatorStats} is non-null and
-     * asserts the JSON shape: a top-level {@code native_memory} block with
-     * {@code runtime.allocated_bytes}/{@code runtime.resident_bytes} and grouped {@code memory_pools}.
+     * Renders {@code NodeStats.toXContent} with the allocator stats contributed via pluginStats and
+     * asserts the migrated JSON shape: a top-level {@code native_allocator} block with
+     * {@code runtime.allocated_bytes}/{@code runtime.resident_bytes} and grouped {@code memory_pools},
+     * while {@code native_memory} carries only the core-owned {@code total_estimated_bytes}.
      */
-    public void testNativeAllocatorStatsXContentRendersInsideNativeMemory() throws IOException {
+    public void testNativeAllocatorStatsXContentRendersTopLevelNativeAllocator() throws IOException {
         NativeAllocatorPoolStats stats = new NativeAllocatorPoolStats(
             1024L,
             2048L,
@@ -1600,25 +1616,33 @@ public class NodeStatsTests extends OpenSearchTestCase {
         Map<String, Object> root = xContentBuilderToMap(builder);
 
         @SuppressWarnings("unchecked")
-        Map<String, Object> nativeMemory = (Map<String, Object>) root.get("native_memory");
-        assertNotNull("native_memory wrapper must be opened when allocator stats are present", nativeMemory);
+        Map<String, Object> nativeAllocator = (Map<String, Object>) root.get("native_allocator");
+        assertNotNull("native_allocator block must be rendered from the pluginStats contribution", nativeAllocator);
 
         // Runtime stats are nested under "runtime"
         @SuppressWarnings("unchecked")
-        Map<String, Object> runtime = (Map<String, Object>) nativeMemory.get("runtime");
+        Map<String, Object> runtime = (Map<String, Object>) nativeAllocator.get("runtime");
         assertNotNull("runtime block must be present", runtime);
         assertEquals(1024L, ((Number) runtime.get("allocated_bytes")).longValue());
         assertEquals(2048L, ((Number) runtime.get("resident_bytes")).longValue());
 
         // Pools are grouped under "memory_pools"
         @SuppressWarnings("unchecked")
-        Map<String, Object> pools = (Map<String, Object>) nativeMemory.get("memory_pools");
+        Map<String, Object> pools = (Map<String, Object>) nativeAllocator.get("memory_pools");
         assertNotNull("memory_pools block must be present", pools);
         @SuppressWarnings("unchecked")
         Map<String, Object> flight = (Map<String, Object>) pools.get("flight");
         assertNotNull("flight pool must be present in memory_pools", flight);
         assertEquals(100L, ((Number) flight.get("allocated_bytes")).longValue());
         assertEquals(2048L, ((Number) flight.get("limit_bytes")).longValue());
+
+        // native_memory retains only the core-owned process-level estimate
+        @SuppressWarnings("unchecked")
+        Map<String, Object> nativeMemory = (Map<String, Object>) root.get("native_memory");
+        assertNotNull("native_memory must always be emitted", nativeMemory);
+        assertTrue("native_memory carries total_estimated_bytes", nativeMemory.containsKey("total_estimated_bytes"));
+        assertFalse("pool breakdown moved out of native_memory", nativeMemory.containsKey("memory_pools"));
+        assertFalse("runtime breakdown moved out of native_memory", nativeMemory.containsKey("runtime"));
     }
 
     /**
@@ -1699,8 +1723,10 @@ public class NodeStatsTests extends OpenSearchTestCase {
             null,
             null, // nodeCacheStats
             null,
-            nativeAllocatorStats,
-            totalEstimatedNativeBytes
+            totalEstimatedNativeBytes,
+            // The allocator stats travel through the generic pluginStats map, keyed by the same
+            // getWriteableName() the arrow-base plugin contributes them under in production.
+            nativeAllocatorStats == null ? null : Map.<String, PluginNodeStats>of(nativeAllocatorStats.getWriteableName(), nativeAllocatorStats)
         );
     }
 

@@ -18,7 +18,9 @@ import org.opensearch.cluster.routing.ComputedShardRouting;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
+import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.test.OpenSearchTestCase;
@@ -69,24 +71,32 @@ public class ComputedRestoreCapacityTests extends OpenSearchTestCase {
         assertEquals("the published routing table cannot name a computed index, so the capacity total was short", 0L, counted);
     }
 
-    /** What it does now: find the shard, so the total reflects what is actually in the cache. */
+    /**
+     * What it does now: find the shard, so the total reflects what is actually in the cache.
+     *
+     * <p>Through {@code ClusterState#allShards()}, the read the capacity check itself uses, so what this
+     * proves is the production path end to end: the bridge on the state's routing table, the registry
+     * behind it, and the metadata walk that names the unpublished index.
+     */
     public void testTheResolverCountsAComputedShard() {
         registerComputedPlacement();
         ClusterState state = stateWithoutRouting();
 
-        long counted = AbsentIndexRoutingSuppliers.allShards(state).stream().filter(primaries()).count();
+        long counted = state.allShards().stream().filter(primaries()).count();
 
         assertEquals("a computed shard must count towards file cache capacity, or the check admits too much", 1L, counted);
     }
 
     /**
-     * The control. With nothing registered the resolver must return exactly what the published table
-     * returns, since this runs on every searchable snapshot restore in every cluster.
+     * The control. With nothing registered in the authority the resolver-aware read must return exactly
+     * what the published table returns, since this runs on every searchable snapshot restore in every
+     * cluster. The bridge stays attached here deliberately: what production varies is whether the plugin
+     * has registered anything, not whether the bridge exists.
      */
     public void testWithoutASupplierTheCountIsUnchanged() {
         ClusterState state = stateWithoutRouting();
 
-        long viaResolver = AbsentIndexRoutingSuppliers.allShards(state).stream().filter(primaries()).count();
+        long viaResolver = state.allShards().stream().filter(primaries()).count();
         long viaTable = state.routingTable().allShardsSatisfyingPredicate(primaries()).getShardRoutings().size();
 
         assertEquals("an unconfigured cluster must count exactly what it counted before", viaTable, viaResolver);
@@ -126,6 +136,14 @@ public class ComputedRestoreCapacityTests extends OpenSearchTestCase {
             .numberOfReplicas(0)
             .build();
 
-        return ClusterState.builder(ClusterName.DEFAULT).metadata(Metadata.builder().put(metadata, false).build()).build();
+        // A real (non-EMPTY_ROUTING_TABLE) instance with the SupplierBackedIndexRoutingResolver bridge
+        // attached -- attachIndexRoutingResolver is deliberately a no-op on the shared singleton -- so
+        // ClusterState#allShards() reads through the resolver exactly as it does on a production state.
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
+        return ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(metadata, false).build())
+            .routingTable(routingTable)
+            .build();
     }
 }

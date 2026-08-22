@@ -15,14 +15,16 @@ import java.util.Map;
  * Every reason an index must keep its cluster state entry, in one place.
  *
  * <p>A gated index has no cluster state entry at all, so anything {@link IndexDescriptor} cannot carry is
- * not degraded when an index is gated, it is gone. Until T7 nothing checked that: {@code ownsIndex} answered
+ * not degraded when an index is gated, it is gone. Before this class nothing checked that: {@code ownsIndex}
+ * answered
  * on the single setting {@code index.serverless_storage.enabled}, and an index with configuration the
  * descriptor has no field for was gated anyway.
  *
  * <p><b>The list being closed and in one file is the point.</b> This is TiDB's
  * {@code checkAttributesInOrder} ({@code meta/meta.go:1286}), which names every attribute that stops a table
  * being lazily loaded, so adding a feature that needs residency forces an edit to that list. Ours was spread
- * across whatever happened to notice, which is why H19 and H20 were found separately rather than together.
+ * across whatever happened to notice, which is why two of these gaps were found separately rather than
+ * together.
  *
  * <p><b>What is deliberately not here.</b> In-sync allocation IDs, index blocks and rollover info are
  * runtime state rather than declared configuration, and treating them as reasons would make almost every
@@ -49,7 +51,7 @@ public final class DescriptorRepresentable {
         if (indexMetadata == null) {
             return "there is no metadata to represent";
         }
-        // T29 widened this from four alias properties to every alias, and the reason is not that a
+        // This rule was widened from four alias properties to every alias, and the reason is not that a
         // descriptor cannot carry the name. It carries it already. The reason is that nothing can ever
         // change it.
         //
@@ -60,7 +62,7 @@ public final class DescriptorRepresentable {
         // which is the opposite of what an alias is for. A client is given an alias precisely so the index
         // behind it can change.
         //
-        // T29 also measured that resolution never reads the field: naming the alias of a gated index
+        // The widening also measured that resolution never reads the field: naming the alias of a gated index
         // resolved to nothing, silently under the options most clients use. Building that resolution was
         // the alternative to this rule and was rejected, because it would have served a set-once alias
         // with a refresh-bound visibility window, which is a partial feature that invites exactly the
@@ -96,12 +98,13 @@ public final class DescriptorRepresentable {
                 + "visible to everything else";
         }
         // A descriptor carries a mappingGeneration, not a mapping. The fields live in
-        // MappingGenerationStore, and until T11 nothing wrote them there at creation, so an index created
+        // MappingGenerationStore, and originally nothing wrote them there at creation, so an index created
         // with an explicit mapping had it parsed, validated, built into this very IndexMetadata, and then
         // dropped when the descriptor was written -- acknowledged, with the first document to arrive
         // inferring the fields again from its own values.
         //
-        // T11 carried them, T13 stopped the carrying being lossy, and T15 widened the store to hold a
+        // First the fields were carried, then the carrying stopped being lossy, then the store was widened
+        // to hold a
         // field's whole definition rather than its type. What is left to refuse is small: a property whose
         // definition is not an object at all. Object and nested fields, and every field parameter, now
         // round-trip.
@@ -121,9 +124,9 @@ public final class DescriptorRepresentable {
      * <p><b>What this refuses shrank twice, and the order matters.</b> It first required a declared type and
      * no sub-properties, which reads like a completeness check and was not one: a definition may name a type
      * and carry six other things, and only the type was stored, so {@code format}, {@code analyzer},
-     * {@code ignore_above} and multi-{@code fields} passed the guard and were dropped. T13 made the rule
-     * match what was kept -- the type and nothing beside it -- which was honest and refused most real
-     * mappings. T15 then widened the store to hold the definition itself, so the rule could shrink to what
+     * {@code ignore_above} and multi-{@code fields} passed the guard and were dropped. The rule was then made
+     * to match what was kept -- the type and nothing beside it -- which was honest and refused most real
+     * mappings. The store was then widened to hold the definition itself, so the rule could shrink to what
      * genuinely has no representation.
      *
      * <p><b>Null rather than a partial map, throughout.</b> Returning the fields that do round-trip and

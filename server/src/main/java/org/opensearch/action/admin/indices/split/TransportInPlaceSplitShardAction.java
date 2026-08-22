@@ -35,7 +35,7 @@ import java.io.IOException;
  * split itself actually does; this action is only the reachability seam.
  *
  * <p>Before submitting the split's cluster-state update, forces a real flush of the source index
- * (dynamic-partitioning-progress.md's "Task 18": {@code ShardCloner} (in the serverless-storage
+ * ({@code ShardCloner} (in the storage
  * plugin), reused verbatim by a child's {@code Engine#recoverFromInPlaceSplit}, clones
  * whatever the parent's latest <em>published</em> manifest generation happens to be at the moment
  * of cloning -- without a preceding flush, writes acknowledged to a client after the parent's last

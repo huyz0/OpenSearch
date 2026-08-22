@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.routing;
+package org.opensearch.serverless.storage.placement;
 
 import org.opensearch.action.admin.cluster.shards.CatShardsAction;
 import org.opensearch.action.admin.cluster.shards.CatShardsRequest;
@@ -15,6 +15,12 @@ import org.opensearch.action.pagination.PageParams;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
+import org.opensearch.cluster.routing.ComputedShardRouting;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.RecoverySource;
+import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
@@ -22,11 +28,13 @@ import org.opensearch.index.IndexService;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 import org.junit.Before;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -54,18 +62,25 @@ public class ComputedPlacementCatIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-cat";
 
+    /**
+     * Only the membership machinery, not the full serverless plugin, whose gate and resolver would
+     * collide with this suite's own fake supplier registrations -- see {@link MembershipOnlyTestPlugin}.
+     */
+    @Override
+    protected Collection<Class<? extends Plugin>> nodePlugins() {
+        return List.of(MembershipOnlyTestPlugin.class);
+    }
+
     @Before
     public void registerComputedPlacement() {
         AbsentIndexRoutingSuppliers.registerUnpublished(metadata -> metadata.getIndex().getName().startsWith("computed-"));
         AbsentIndexRoutingSuppliers.register(ComputedPlacementCatIT::compute);
-        AbsentIndexRoutingSuppliers.registerLocalShards(ComputedPlacementCatIT::localShards);
     }
 
     @After
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
         AbsentIndexRoutingSuppliers.register(null);
-        AbsentIndexRoutingSuppliers.registerLocalShards(null);
     }
 
     /** The question an operator is really asking: is my shard listed, and on which node. */
@@ -133,7 +148,7 @@ public class ComputedPlacementCatIT extends OpenSearchIntegTestCase {
         ClusterState state = client().admin().cluster().prepareState().clear().setRoutingTable(true).setMetadata(true).get().getState();
 
         int computedShards = 0;
-        for (ShardRouting shardRouting : AbsentIndexRoutingSuppliers.allShards(state)) {
+        for (ShardRouting shardRouting : state.allShards()) {
             if (INDEX.equals(shardRouting.getIndexName())) {
                 computedShards++;
             }
@@ -156,7 +171,7 @@ public class ComputedPlacementCatIT extends OpenSearchIntegTestCase {
         ClusterState withoutMetadata = client().admin().cluster().prepareState().clear().setRoutingTable(true).get().getState();
 
         int computedShards = 0;
-        for (ShardRouting shardRouting : AbsentIndexRoutingSuppliers.allShards(withoutMetadata)) {
+        for (ShardRouting shardRouting : withoutMetadata.allShards()) {
             if (INDEX.equals(shardRouting.getIndexName())) {
                 computedShards++;
             }
@@ -219,32 +234,6 @@ public class ComputedPlacementCatIT extends OpenSearchIntegTestCase {
             );
         }
         return builder.build();
-    }
-
-    private static List<ShardRouting> localShards(ClusterState state, String nodeId) {
-        List<String> dataNodes = sortedDataNodes(state);
-        List<ShardRouting> mine = new ArrayList<>();
-        if (dataNodes.isEmpty()) {
-            return mine;
-        }
-        for (IndexMetadata indexMetadata : state.metadata()) {
-            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(indexMetadata)) {
-                continue;
-            }
-            for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
-                if (nodeId.equals(owner(dataNodes, shardId)) == false) {
-                    continue;
-                }
-                mine.add(
-                    ComputedShardRouting.initializing(
-                        new ShardId(indexMetadata.getIndex(), shardId),
-                        nodeId,
-                        RecoverySource.EmptyStoreRecoverySource.INSTANCE
-                    )
-                );
-            }
-        }
-        return mine;
     }
 
     private static String owner(List<String> dataNodes, int shardId) {

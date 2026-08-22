@@ -13,7 +13,7 @@ import org.opensearch.common.unit.TimeValue;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Phase E2 of {@code core-pluggability-refactor-plan.md}: the node-level holder for the single {@link
+ * The node-level holder for the single {@link
  * IndexResidencyPolicy} a {@link org.opensearch.plugins.ClusterPlugin} may supply, mirroring {@code
  * IndexCreationStrategyRegistry}'s own shape deliberately -- see that class's javadoc for why this
  * "structurally identical to a mechanism already proven in this exact codebase" approach is the chosen one.
@@ -78,6 +78,21 @@ public final class IndexResidencyPolicyRegistry {
             return current().maxOpen();
         } catch (Exception e) {
             return DEFAULT.maxOpen();
+        }
+    }
+
+    /**
+     * The registered policy's per-open-index heap cost, or {@link IndexResidencyPolicy#bytesPerOpenIndex()}'s
+     * own conservative default if nothing is registered, the registered policy throws, or it answers a
+     * non-positive number -- the last guard because this value is a divisor, and a broken policy must cost
+     * a wrong ceiling rather than an {@code ArithmeticException} at node start.
+     */
+    public static long bytesPerOpenIndex() {
+        try {
+            long bytes = current().bytesPerOpenIndex();
+            return bytes > 0 ? bytes : DEFAULT.bytesPerOpenIndex();
+        } catch (Exception e) {
+            return DEFAULT.bytesPerOpenIndex();
         }
     }
 

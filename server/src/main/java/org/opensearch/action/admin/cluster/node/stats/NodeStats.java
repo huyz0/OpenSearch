@@ -184,17 +184,13 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
     @Nullable
     private RemoteStoreNodeStats remoteStoreNodeStats;
 
-    @Nullable
-    private NativeAllocatorPoolStats nativeAllocatorStats;
-
     /**
-     * Phase B of core-pluggability-refactor-plan.md: a generic, any-plugin node-stats extension point,
-     * restored after being deleted (in favor of the hardcoded {@link #nativeAllocatorStats}/{@link
-     * #totalEstimatedNativeBytes} fields above) with no replacement for any other plugin that wanted to
-     * contribute node stats. See {@link org.opensearch.plugins.Plugin#nodeStats()}. Coexists with those
-     * hardcoded fields rather than replacing them in this phase -- migrating them onto this generic path
-     * is a separate, later change (see the plan), since two NodeStats wire-format changes in one commit
-     * is unnecessary risk.
+     * A generic, any-plugin node-stats extension point --
+     * see {@link org.opensearch.plugins.Plugin#nodeStats()}. The native-allocator pool stats that used to
+     * be a hardcoded {@code NativeAllocatorPoolStats} field here now travel through this map instead,
+     * contributed by the arrow-base plugin under the {@code "native_allocator"} key. The dedicated wire
+     * slot the hardcoded field occupied is retained as a vestigial always-absent optional for
+     * same-version compatibility -- see the read/write paths below.
      */
     private Map<String, PluginNodeStats> pluginStats;
 
@@ -301,13 +297,15 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
             remoteStoreNodeStats = null;
         }
         if (in.getVersion().onOrAfter(Version.V_3_8_0)) {
-            nativeAllocatorStats = in.readOptionalWriteable(NativeAllocatorPoolStats::new);
+            // Vestigial slot: the hardcoded NativeAllocatorPoolStats that used to live here migrated to
+            // the generic pluginStats map (under "native_allocator"). This node always writes the slot
+            // as absent, but a same-gate peer running an older 3.8 snapshot may still send a real
+            // payload, so consume (and discard) the optional to stay byte-aligned. Removable, along
+            // with the write side, at the next wire version bump.
+            in.readOptionalWriteable(NativeAllocatorPoolStats::new);
         } else if (in.getVersion().onOrAfter(Version.V_3_7_0)) {
             // BWC: V_3_7_0 wrote old-format NativeAllocatorPoolStats (3 VLongs + pools with 4 fields); read and discard.
             in.readOptionalWriteable(NativeAllocatorPoolStats::readAndDiscardV3_7);
-            nativeAllocatorStats = null;
-        } else {
-            nativeAllocatorStats = null;
         }
         if (in.getVersion().onOrAfter(Version.V_3_7_0)) {
             // BWC: V_3_7_0 wrote AnalyticsBackendNativeMemoryStats here; read and discard.
@@ -396,10 +394,9 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         @Nullable AdmissionControlStats admissionControlStats,
         @Nullable NodeCacheStats nodeCacheStats,
         @Nullable RemoteStoreNodeStats remoteStoreNodeStats,
-        @Nullable NativeAllocatorPoolStats nativeAllocatorStats,
         long totalEstimatedNativeBytes
     ) {
-        // Phase B of core-pluggability-refactor-plan.md: delegates to the overload below rather than
+        // Delegates to the overload below rather than
         // taking pluginStats itself, so every existing caller of this (very long) constructor keeps
         // compiling and behaving exactly as before -- the same "old signature untouched, add an overload"
         // shape EngineConfigFactory already uses elsewhere in this codebase.
@@ -436,15 +433,14 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
             admissionControlStats,
             nodeCacheStats,
             remoteStoreNodeStats,
-            nativeAllocatorStats,
             totalEstimatedNativeBytes,
             null
         );
     }
 
     /**
-     * Same as the constructor above, plus the generic {@link #pluginStats} map (Phase B of
-     * core-pluggability-refactor-plan.md). {@code null} means "no plugin populated this," identically to
+     * Same as the constructor above, plus the generic {@link #pluginStats} map.
+     * {@code null} means "no plugin populated this," identically to
      * every other optional stats argument here.
      */
     public NodeStats(
@@ -480,7 +476,6 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         @Nullable AdmissionControlStats admissionControlStats,
         @Nullable NodeCacheStats nodeCacheStats,
         @Nullable RemoteStoreNodeStats remoteStoreNodeStats,
-        @Nullable NativeAllocatorPoolStats nativeAllocatorStats,
         long totalEstimatedNativeBytes,
         @Nullable Map<String, PluginNodeStats> pluginStats
     ) {
@@ -516,7 +511,6 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         this.admissionControlStats = admissionControlStats;
         this.nodeCacheStats = nodeCacheStats;
         this.remoteStoreNodeStats = remoteStoreNodeStats;
-        this.nativeAllocatorStats = nativeAllocatorStats;
         this.totalEstimatedNativeBytes = totalEstimatedNativeBytes;
         this.pluginStats = pluginStats == null ? Collections.emptyMap() : pluginStats;
     }
@@ -696,14 +690,6 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
         return remoteStoreNodeStats;
     }
 
-    /**
-     * Returns the native allocator pool stats (Arrow allocator), or {@code null} if not available.
-     */
-    @Nullable
-    public NativeAllocatorPoolStats getNativeAllocatorStats() {
-        return nativeAllocatorStats;
-    }
-
     /** The generic, any-plugin node-stats map. See {@link #pluginStats}'s own javadoc. */
     public Map<String, PluginNodeStats> getPluginStats() {
         return pluginStats == null ? Collections.emptyMap() : pluginStats;
@@ -784,10 +770,13 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
             out.writeOptionalWriteable(remoteStoreNodeStats);
         }
         if (out.getVersion().onOrAfter(Version.V_3_8_0)) {
-            out.writeOptionalWriteable(nativeAllocatorStats);
+            // Vestigial slot (see the matching read path): the hardcoded NativeAllocatorPoolStats that
+            // used to be written here migrated to the generic pluginStats map. Always written absent to
+            // keep same-gate peers byte-aligned; removable at the next wire version bump.
+            out.writeOptionalWriteable(null);
         } else if (out.getVersion().onOrAfter(Version.V_3_7_0)) {
-            // BWC: write old-format NativeAllocatorPoolStats for V_3_7_0 nodes
-            NativeAllocatorPoolStats.writeV3_7(out, nativeAllocatorStats);
+            // BWC: V_3_7_0 expects the old-format NativeAllocatorPoolStats slot here; write absent.
+            NativeAllocatorPoolStats.writeV3_7(out, null);
         }
         if (out.getVersion().onOrAfter(Version.V_3_7_0)) {
             // BWC: V_3_7_0 expects AnalyticsBackendNativeMemoryStats here; write null.
@@ -942,23 +931,12 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
             e.getValue().toXContent(builder, params);
             builder.endObject();
         }
-        // total_estimated_bytes ≈ RssAnon - JVM heap committed - JVM non-heap committed.
-        // native_memory: unified view of all native memory pools and jemalloc stats.
-        // NativeAllocatorPoolStats now includes jemalloc allocated/resident + all pools.
+        // total_estimated_bytes ≈ RssAnon - JVM heap committed - JVM non-heap committed. Core-owned
+        // (computed via OsProbe in NodeService). The allocator pool/jemalloc breakdown that used to
+        // render alongside it now arrives through the generic pluginStats loop above, under the
+        // "native_allocator" key contributed by the arrow-base plugin.
         builder.startObject("native_memory");
         builder.field("total_estimated_bytes", totalEstimatedNativeBytes);
-        if (getNativeAllocatorStats() != null) {
-            NativeAllocatorPoolStats stats = getNativeAllocatorStats();
-            builder.startObject("runtime");
-            builder.field("allocated_bytes", stats.getNativeAllocatedBytes());
-            builder.field("resident_bytes", stats.getNativeResidentBytes());
-            builder.endObject();
-            builder.startObject("memory_pools");
-            for (var entry : stats.getGroupedStats().entrySet()) {
-                entry.getValue().toXContent(builder, params);
-            }
-            builder.endObject();
-        }
         builder.endObject();
         return builder;
     }

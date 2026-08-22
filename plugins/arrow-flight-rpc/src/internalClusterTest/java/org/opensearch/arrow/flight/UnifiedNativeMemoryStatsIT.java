@@ -60,8 +60,13 @@ public class UnifiedNativeMemoryStatsIT extends OpenSearchIntegTestCase {
             .get();
 
         assertThat(response.getNodes().isEmpty(), is(false));
-        NativeAllocatorPoolStats stats = response.getNodes().get(0).getNativeAllocatorStats();
-        assertThat("native_memory stats should be present", stats, notNullValue());
+        // The allocator stats travel through the generic pluginStats path now (the native_memory
+        // metric also enables the pluginStats collection), keyed by the arrow-base contribution name.
+        NativeAllocatorPoolStats stats = (NativeAllocatorPoolStats) response.getNodes()
+            .get(0)
+            .getPluginStats()
+            .get(NativeAllocatorPoolStats.WRITEABLE_NAME);
+        assertThat("native allocator stats should be present", stats, notNullValue());
 
         // Dump the stats for debugging
         StringBuilder sb = new StringBuilder();

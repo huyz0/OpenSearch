@@ -1041,7 +1041,7 @@ public class IndicesService extends AbstractLifecycleComponent
     public IndexService indexServiceSafe(Index index) {
         IndexService indexService = indices.get(index.getUUID());
         if (indexService == null) {
-            // T39's trigger. An index whose metadata never appears in cluster state is never built by
+            // The on-demand opener's trigger. An index whose metadata never appears in cluster state is never built by
             // cluster state application, so the first request for one of its shards is the only thing that
             // can ask for it. Reached only on the way to throwing, so an ordinary cluster pays one null
             // check on a path that was already about to fail.
@@ -1199,22 +1199,7 @@ public class IndicesService extends AbstractLifecycleComponent
             indexCreationContext
         );
 
-        final IndexModule indexModule = new IndexModule(
-            idxSettings,
-            analysisRegistry,
-            getIndexerFactory(idxSettings),
-            this::getIndexerFactory,
-            getEngineConfigFactory(idxSettings),
-            directoryFactories,
-            compositeDirectoryFactories,
-            () -> allowExpensiveQueries,
-            indexNameExpressionResolver,
-            recoveryStateFactories,
-            storeFactories,
-            nodeCacheService,
-            compositeIndexSettings,
-            dataFormatAwareStoreDirectoryFactories
-        );
+        final IndexModule indexModule = newIndexModule(idxSettings, this::getIndexerFactory);
         for (IndexingOperationListener operationListener : indexingOperationListeners) {
             indexModule.addIndexOperationListener(operationListener);
         }
@@ -1355,7 +1340,7 @@ public class IndicesService extends AbstractLifecycleComponent
      * <p>Deliberately not synchronized, and that is the entire point of it existing. Every other route to
      * this question -- {@link #createIndexMapperService}, {@link #withTempIndexService} -- constructs an
      * {@link org.opensearch.index.IndexModule} and calls {@code pluginsService.onIndexModule} on it, which
-     * is why both hold this object's monitor. T18 measured what that costs a creation that only needs to
+     * is why both hold this object's monitor. Profiling measured what that costs a creation that only needs to
      * know whether a type name is real: 275 gated creations per second against 6,011.
      *
      * <p>The registry is an immutable map fixed at node construction, so reading it needs no lock and
@@ -1375,7 +1360,7 @@ public class IndicesService extends AbstractLifecycleComponent
      *
      * Validating a declared mapping means building one of these, and every existing route to one --
      * {@link #createIndexMapperService}, {@link #withTempIndexService} -- is {@code synchronized} on this
-     * object, so every concurrent index creation on the node queues behind one monitor. T60 measured what
+     * object, so every concurrent index creation on the node queues behind one monitor. Profiling measured what
      * that costs: a gated creation whose mapping is nothing but field types runs at 2,095 per second, and
      * the same creation with one parameter added -- which is what sends it down this road -- runs at 315.
      * Per creation that is about 21.6 ms of service time at concurrency 8, against 276 us for everything
@@ -1403,22 +1388,7 @@ public class IndicesService extends AbstractLifecycleComponent
      */
     public MapperService createMapperServiceForValidation(IndexMetadata indexMetadata) throws IOException {
         final IndexSettings idxSettings = new IndexSettings(indexMetadata, this.settings, indexScopedSettings);
-        final IndexModule indexModule = new IndexModule(
-            idxSettings,
-            analysisRegistry,
-            getIndexerFactory(idxSettings),
-            null,
-            getEngineConfigFactory(idxSettings),
-            directoryFactories,
-            compositeDirectoryFactories,
-            () -> allowExpensiveQueries,
-            indexNameExpressionResolver,
-            recoveryStateFactories,
-            storeFactories,
-            nodeCacheService,
-            compositeIndexSettings,
-            dataFormatAwareStoreDirectoryFactories
-        );
+        final IndexModule indexModule = newIndexModule(idxSettings, null);
         synchronized (this) {
             // The one part that runs code this class does not own. Held for the callback and released
             // before the analyzers are built, which is where the time actually goes.
@@ -1435,11 +1405,25 @@ public class IndicesService extends AbstractLifecycleComponent
      */
     public synchronized MapperService createIndexMapperService(IndexMetadata indexMetadata) throws IOException {
         final IndexSettings idxSettings = new IndexSettings(indexMetadata, this.settings, indexScopedSettings);
-        final IndexModule indexModule = new IndexModule(
+        final IndexModule indexModule = newIndexModule(idxSettings, null);
+        pluginsService.onIndexModule(indexModule);
+        return indexModule.newIndexMapperService(xContentRegistry, mapperRegistry, scriptService);
+    }
+
+    /**
+     * Builds an {@link IndexModule} from this service's node-level registries. {@code indexerFactoryProvider}
+     * is non-null only when resolving per-shard indexer factories (index creation); administrative
+     * mapper-service builds pass {@code null}.
+     */
+    private IndexModule newIndexModule(
+        IndexSettings idxSettings,
+        @Nullable BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider
+    ) {
+        return new IndexModule(
             idxSettings,
             analysisRegistry,
             getIndexerFactory(idxSettings),
-            null,
+            indexerFactoryProvider,
             getEngineConfigFactory(idxSettings),
             directoryFactories,
             compositeDirectoryFactories,
@@ -1451,8 +1435,6 @@ public class IndicesService extends AbstractLifecycleComponent
             compositeIndexSettings,
             dataFormatAwareStoreDirectoryFactories
         );
-        pluginsService.onIndexModule(indexModule);
-        return indexModule.newIndexMapperService(xContentRegistry, mapperRegistry, scriptService);
     }
 
     /**

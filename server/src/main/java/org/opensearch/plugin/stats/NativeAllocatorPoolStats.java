@@ -14,6 +14,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.plugins.PluginNodeStats;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -28,12 +29,20 @@ import java.util.Map;
  * <p>Includes process-wide native memory stats (allocated/resident from jemalloc)
  * and per-pool stats for all registered pools (Arrow and virtual).
  *
- * <p>Renders as the body of the {@code native_memory} object inside
- * {@code _nodes/stats/native_memory}.
+ * <p>A {@link PluginNodeStats}: contributed by the plugin that owns the node-level allocator (today:
+ * arrow-base) via {@link org.opensearch.plugins.Plugin#nodeStats()}, and rendered by {@code NodeStats}
+ * under the top-level {@link #WRITEABLE_NAME} key in {@code _nodes/stats}. The class itself still lives
+ * in {@code :server} for now so the pre-migration V_3_7 wire shims keep compiling.
  *
  * @opensearch.api
  */
-public class NativeAllocatorPoolStats implements Writeable, ToXContentFragment {
+public class NativeAllocatorPoolStats implements PluginNodeStats {
+
+    /**
+     * The {@code getWriteableName()} of this contribution: the wire-framing key, the
+     * {@code pluginStats} map key, and the top-level key it renders under in {@code _nodes/stats}.
+     */
+    public static final String WRITEABLE_NAME = "native_allocator";
 
     private final long nativeAllocatedBytes;
     private final long nativeResidentBytes;
@@ -77,13 +86,26 @@ public class NativeAllocatorPoolStats implements Writeable, ToXContentFragment {
     }
 
     @Override
+    public String getWriteableName() {
+        return WRITEABLE_NAME;
+    }
+
+    /**
+     * Fragment body rendered inside the {@code "native_allocator"} object {@code NodeStats} opens for
+     * this contribution: the same {@code runtime} (jemalloc allocated/resident) and {@code memory_pools}
+     * (grouped by pool group) shape {@code NodeStats} used to hand-render inside {@code native_memory}
+     * before this class migrated onto the generic {@link PluginNodeStats} path.
+     */
+    @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        builder.startObject("runtime");
         builder.field("allocated_bytes", nativeAllocatedBytes);
         builder.field("resident_bytes", nativeResidentBytes);
+        builder.endObject();
 
-        builder.startObject("pools");
-        for (PoolStats pool : pools) {
-            pool.toXContent(builder, params);
+        builder.startObject("memory_pools");
+        for (Map.Entry<String, PoolStats> entry : getGroupedStats().entrySet()) {
+            entry.getValue().toXContent(builder, params);
         }
         builder.endObject();
         return builder;

@@ -57,7 +57,7 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
         registerPlacementFor(SHARDS);
         AbsentIndexRoutingSuppliers.registerSuspendedShards(name -> Set.of(1));
 
-        IndexRoutingTable resolved = AbsentIndexRoutingSuppliers.resolve(stateWithout(INDEX), INDEX);
+        IndexRoutingTable resolved = AbsentIndexRoutingSuppliers.supply(stateWithout(INDEX), INDEX, null);
 
         assertNotNull("the index must still resolve, since only one of its shards is asleep", resolved);
         assertNull("a suspended shard must not be placed", resolved.shard(1));
@@ -68,17 +68,21 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
     /**
      * The same absence through the shard-level read, which is the one a write or a get takes. Resolution
      * and routing disagreeing about whether a shard exists is the C3 failure exactly, so both are pinned.
+     *
+     * <p>Through {@code ClusterState#resolveShard}, the production shard-level read, so this state carries
+     * what production states carry: the index's metadata (in production synthesised from its descriptor by
+     * the time routing resolution runs) and the {@link SupplierBackedIndexRoutingResolver} bridge.
      */
     public void testASuspendedShardIsAbsentFromTheShardLevelRead() {
         registerPlacementFor(SHARDS);
         AbsentIndexRoutingSuppliers.registerSuspendedShards(name -> Set.of(1));
-        ClusterState state = stateWithout(INDEX);
+        ClusterState state = stateWithMetadataAndBridge();
 
         assertNull(
             "the shard-level read must agree with the index-level one, or a write reaches a sleeping shard " + "that a search cannot see",
-            AbsentIndexRoutingSuppliers.resolveShard(state, new ShardId(new Index(INDEX, INDEX + "-uuid"), 1))
+            state.resolveShard(new ShardId(new Index(INDEX, INDEX + "-uuid"), 1))
         );
-        assertNotNull(AbsentIndexRoutingSuppliers.resolveShard(state, new ShardId(new Index(INDEX, INDEX + "-uuid"), 0)));
+        assertNotNull(state.resolveShard(new ShardId(new Index(INDEX, INDEX + "-uuid"), 0)));
     }
 
     /**
@@ -90,10 +94,10 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
         ClusterState state = stateWithout(INDEX);
 
         AbsentIndexRoutingSuppliers.registerSuspendedShards(name -> Set.of(1));
-        assertNull("the premise: the shard is asleep", AbsentIndexRoutingSuppliers.resolve(state, INDEX).shard(1));
+        assertNull("the premise: the shard is asleep", AbsentIndexRoutingSuppliers.supply(state, INDEX, null).shard(1));
 
         AbsentIndexRoutingSuppliers.registerSuspendedShards(name -> Set.of());
-        assertNotNull("waking must take effect on the next read", AbsentIndexRoutingSuppliers.resolve(state, INDEX).shard(1));
+        assertNotNull("waking must take effect on the next read", AbsentIndexRoutingSuppliers.supply(state, INDEX, null).shard(1));
     }
 
     /**
@@ -105,7 +109,7 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
         registerPlacementFor(SHARDS);
         AbsentIndexRoutingSuppliers.registerSuspendedShards(name -> Set.of(0, 1, 2));
 
-        IndexRoutingTable resolved = AbsentIndexRoutingSuppliers.resolve(stateWithout(INDEX), INDEX);
+        IndexRoutingTable resolved = AbsentIndexRoutingSuppliers.supply(stateWithout(INDEX), INDEX, null);
 
         assertNotNull("a scaled-to-zero index must resolve rather than vanish", resolved);
         assertEquals("and it must have no shards placed", 0, resolved.shards().size());
@@ -122,7 +126,7 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
         assertSame(
             "with nothing suspended the supplied entry must be returned as-is, so the common case allocates " + "nothing",
             supplied,
-            AbsentIndexRoutingSuppliers.resolve(stateWithout(INDEX), INDEX)
+            AbsentIndexRoutingSuppliers.supply(stateWithout(INDEX), INDEX, null)
         );
     }
 
@@ -134,7 +138,7 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
         registerPlacementFor(SHARDS);
         AbsentIndexRoutingSuppliers.registerSuspendedShards(name -> { throw new IllegalStateException("suspension source down"); });
 
-        IndexRoutingTable resolved = AbsentIndexRoutingSuppliers.resolve(stateWithout(INDEX), INDEX);
+        IndexRoutingTable resolved = AbsentIndexRoutingSuppliers.supply(stateWithout(INDEX), INDEX, null);
 
         assertNotNull("a failing suspension source must not take the index away", resolved);
         assertEquals("every shard must stay placed", SHARDS, resolved.shards().size());
@@ -152,7 +156,7 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
             return Set.of();
         });
 
-        AbsentIndexRoutingSuppliers.resolve(stateWithout(INDEX), INDEX);
+        AbsentIndexRoutingSuppliers.supply(stateWithout(INDEX), INDEX, null);
 
         assertEquals("the suspension source must be asked by uuid", java.util.List.of(INDEX + "-uuid"), keys);
     }
@@ -170,7 +174,7 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
             .routingTable(RoutingTable.builder().addAsNew(metadata).build())
             .build();
 
-        IndexRoutingTable resolved = AbsentIndexRoutingSuppliers.resolve(state, INDEX);
+        IndexRoutingTable resolved = state.getIndexRoutingTable(INDEX);
 
         assertEquals("a published entry must be returned untouched", SHARDS, resolved.shards().size());
     }
@@ -199,6 +203,21 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
     /** A cluster state that does not hold this index, which is what a gated index looks like after H5. */
     private static ClusterState stateWithout(String indexName) {
         return ClusterState.builder(ClusterName.DEFAULT).build();
+    }
+
+    /**
+     * A state shaped like what {@code ClusterState#resolveShard} sees in production: the index's metadata
+     * present (production synthesises it from the descriptor before routing resolution runs), no published
+     * routing entry, and the {@link SupplierBackedIndexRoutingResolver} bridge attached to a real
+     * (non-EMPTY_ROUTING_TABLE) instance -- attachment is deliberately a no-op on the shared singleton.
+     */
+    private static ClusterState stateWithMetadataAndBridge() {
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
+        return ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(indexMetadata(), false).build())
+            .routingTable(routingTable)
+            .build();
     }
 
     private static IndexMetadata indexMetadata() {

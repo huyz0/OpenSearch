@@ -14,9 +14,8 @@ import org.opensearch.common.util.FeatureFlags;
 import java.io.IOException;
 
 /**
- * Phase F of core-pluggability-refactor-plan.md. {@code TextFieldMapper.PARSER} now asks {@link
- * org.opensearch.index.engine.dataformat.DataFormat#requiresStoredFields()} instead of unconditionally
- * force-storing {@code text} fields whenever the pluggable-data-format feature is on.
+ * {@code TextFieldMapper.PARSER} force-stores {@code text} fields whenever the
+ * pluggable-data-format feature is on.
  *
  * <p>Follows the same shape/rationale as {@code ObjectMapperPluggableDataFormatTests} /
  * {@code KeywordFieldMapperTests#testPluggableDataFormatDefaultKeyword} for why this extends {@code

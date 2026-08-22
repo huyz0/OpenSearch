@@ -9,7 +9,8 @@
 grant {
   // Operator-configured spill directory. The system property
   // opensearch.datafusion.spill_directory is set by Security.readPolicy from the
-  // datafusion.spill_directory cluster setting before this policy is parsed;
+  // datafusion.spill_directory cluster setting before this policy is parsed, because
+  // this plugin declares that setting in plugin-security.properties (directory.settings);
   // PolicyFile.expandPermissionName resolves the ${{...}} token via System.getProperty
   // at policy-load time.
   //

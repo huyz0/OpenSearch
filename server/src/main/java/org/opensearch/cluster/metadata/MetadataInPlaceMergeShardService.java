@@ -143,8 +143,8 @@ public class MetadataInPlaceMergeShardService {
         // Making resharding work under computed placement is a redesign rather than a fix, because the
         // children would have to be placed by the same function and the operation would have to reach
         // agreement without publishing anything. That is not attempted here.
-        // Phase C4b of core-pluggability-refactor-plan.md: currentState.routingTable().shouldPublishRouting(...)
-        // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate, discovered
+        // currentState.routingTable().shouldPublishRouting(...) replaced
+        // AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate, discovered
         // through the resolver attached to this state's own routing table.
         if (currentState.routingTable().shouldPublishRouting(curIndexMetadata) == false) {
             throw new IllegalArgumentException(

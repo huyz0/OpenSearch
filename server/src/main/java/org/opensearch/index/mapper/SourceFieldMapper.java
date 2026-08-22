@@ -51,8 +51,6 @@ import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexSettings;
-import org.opensearch.index.engine.dataformat.DataFormat;
-import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.mapper.Mapper.TypeParser.ParserContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.QueryShardException;
@@ -218,31 +216,14 @@ public class SourceFieldMapper extends MetadataFieldMapper {
     );
 
     /**
-     * Phase F of {@code core-pluggability-refactor-plan.md}: whether the currently active pluggable data
-     * format (if any) requires {@code _source} to stay enabled, per {@link DataFormat#requiresSourceEnabled()}
-     * -- replacing a blanket "pluggable data format means _source can't be disabled" rule with a per-format
-     * question. Mirrors {@code TextFieldMapper#requiresStoredFieldsForPluggableFormat}'s shape exactly --
-     * see that method's own javadoc for why a null {@link DataFormatRegistry} falls back to the original
-     * flag check rather than a bare boolean, and why {@code indexSettings == null} returns the
-     * behavior-preserving-for-the-disabled-case value ({@code false} -- no forced requirement -- since a
-     * null {@code IndexSettings} here only arises from a defensively-mocked test {@code MapperService}, not
-     * a real build, and this call site's real {@code BuilderContext} always has one).
+     * {@code _source} cannot be disabled when the pluggable-data-format feature is enabled.
+     * {@code mapperService()}/{@code getIndexSettings()} can each independently be null in
+     * lightweight mapper-only test harnesses.
      */
     private static boolean requiresSourceEnabledForPluggableFormat(ParserContext parserContext) {
         MapperService mapperService = parserContext.mapperService();
         IndexSettings indexSettings = mapperService == null ? null : mapperService.getIndexSettings();
-        if (indexSettings == null) {
-            return false;
-        }
-        DataFormatRegistry registry = parserContext.dataFormatRegistry();
-        if (registry == null) {
-            return indexSettings.isPluggableDataFormatEnabled();
-        }
-        DataFormat activeFormat = registry.format(indexSettings.pluggableDataFormat());
-        if (activeFormat == null) {
-            return true;
-        }
-        return activeFormat.requiresSourceEnabled();
+        return indexSettings != null && indexSettings.isPluggableDataFormatEnabled();
     }
 
     /**

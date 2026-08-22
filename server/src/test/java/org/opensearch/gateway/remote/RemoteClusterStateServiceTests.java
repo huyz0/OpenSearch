@@ -714,7 +714,7 @@ public class RemoteClusterStateServiceTests extends OpenSearchTestCase {
             .findFirst()
             .orElseThrow(() -> new AssertionError("the index must still be in the manifest"));
         assertNotNull("an unchanged index must still gain a descriptor", entry.getDescriptor());
-        assertEquals(IndexDescriptor.of(clusterState.metadata().index("test-index")), entry.getDescriptor());
+        assertEquals(ManifestIndexDescriptor.of(clusterState.metadata().index("test-index")), entry.getDescriptor());
     }
 
     /** With the setting off, a carried-forward entry is left exactly as it was. */
@@ -1434,7 +1434,7 @@ public class RemoteClusterStateServiceTests extends OpenSearchTestCase {
             "test-index-file__2",
             UploadedIndexMetadata.COMPONENT_PREFIX,
             ClusterMetadataManifest.CODEC_V5,
-            IndexDescriptor.of(indexMetadata)
+            ManifestIndexDescriptor.of(indexMetadata)
         );
 
         ClusterState previousClusterState = generateClusterStateWithAllAttributes().build();
@@ -1499,7 +1499,7 @@ public class RemoteClusterStateServiceTests extends OpenSearchTestCase {
             "test-index-file__2",
             UploadedIndexMetadata.COMPONENT_PREFIX,
             ClusterMetadataManifest.CODEC_V5,
-            IndexDescriptor.of(indexMetadata)
+            ManifestIndexDescriptor.of(indexMetadata)
         );
 
         ClusterState previousClusterState = generateClusterStateWithAllAttributes().build();

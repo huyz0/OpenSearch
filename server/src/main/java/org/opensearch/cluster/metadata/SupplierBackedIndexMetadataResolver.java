@@ -11,14 +11,21 @@ package org.opensearch.cluster.metadata;
 import org.opensearch.common.annotation.ExperimentalApi;
 
 /**
- * Phase C5 of {@code core-pluggability-refactor-plan.md}: an {@link IndexMetadataResolver} that answers
- * from whatever a plugin has already registered with {@link AbsentIndexDescriptorSuppliers} -- the
- * pre-existing static registry -- rather than duplicating that plugin's lookup/caching logic in a
- * plugin-owned adapter.
+ * An {@link IndexMetadataResolver} that answers from whatever a plugin has already registered with
+ * {@link AbsentIndexDescriptorSuppliers} -- the static registry -- rather than duplicating that plugin's
+ * lookup/caching logic in a plugin-owned adapter.
+ *
+ * <p><b>Settled architecture: one authority per plane.</b> {@link AbsentIndexDescriptorSuppliers} is the
+ * node-level <em>authority</em> for descriptor-backed metadata; this adapter is the registration
+ * <em>front door</em> a plugin returns from {@code ClusterPlugin#getIndexMetadataResolver()} to feed the
+ * state-scoped read path ({@link Metadata#indexOrResolved(String)}, {@link
+ * Metadata#existsOrResolved(String)}) from that authority. It holds no state of its own: it forwards to
+ * the registry, so the answers a state-scoped read gets and the answers the registry's few deliberate
+ * direct callers get are the same answers by construction.
  *
  * <p><b>Why this lives in {@code server/} instead of the plugin.</b> A plugin that calls {@code
- * AbsentIndexDescriptorSuppliers.register(...)} today (the only real one, as of this phase, is
- * {@code plugins/serverless-storage}'s {@code DescriptorGate}) already has everything this class needs
+ * AbsentIndexDescriptorSuppliers.register(...)} today (the only real one, as of this writing, is
+ * the registered storage plugin's {@code DescriptorGate}) already has everything this class needs
  * registered: this is pure glue with zero plugin-specific logic, so it belongs beside the registry it
  * forwards to, fully unit-testable with {@code :server:test} alone, and reusable by any future plugin that
  * populates the same registry instead of each one writing its own copy.

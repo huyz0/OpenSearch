@@ -977,8 +977,8 @@ public class RestoreService implements ClusterStateApplier {
                         // that is too small admits a restore that overflows the file cache. Unlike the
                         // rest of this seam, it fails towards doing the damage rather than towards
                         // reporting nothing.
-                        // Phase C4b of core-pluggability-refactor-plan.md: clusterService.state().allShards()
-                        // replaces AbsentIndexRoutingSuppliers.allShards(...) here -- same composition,
+                        // clusterService.state().allShards() replaces the static registry's
+                        // the since-deleted AbsentIndexRoutingSuppliers.allShards(...) here -- same composition,
                         // discovered through the resolver attached to this state's own routing table.
                         List<ShardRouting> routings = clusterService.state()
                             .allShards()

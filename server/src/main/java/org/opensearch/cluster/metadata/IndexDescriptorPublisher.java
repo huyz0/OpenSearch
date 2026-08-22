@@ -17,10 +17,11 @@ import java.util.function.Consumer;
 /**
  * Node-level hook for recording an index's descriptor when the index is created.
  *
- * <p>This is the dual-write half of Area H's second phase. While the cluster state entry is still being
+ * <p>This is the dual-write half of moving index metadata off cluster state. While the cluster state entry
+ * is still being
  * written, the descriptor is written alongside it, deliberately redundant, so the two resolution paths can
  * be compared against each other while the old structure is still there to be right. Once that comparison
- * holds, H3 stops writing the cluster state entry and only this remains.
+ * holds, the follow-up step stops writing the cluster state entry and only this remains.
  *
  * <p><b>The descriptor is derived, not constructed.</b> {@link IndexDescriptor#from} reduces the same
  * {@link IndexMetadata} that is going into cluster state, so the two cannot drift. Building it from
@@ -33,7 +34,8 @@ import java.util.function.Consumer;
  * problem to make the write durable, not this thread's.
  *
  * <p><b>A failure here must not fail index creation.</b> During dual write the descriptor is redundant, so
- * losing one costs a comparison rather than an index. That inverts in H3, where the descriptor becomes the
+ * losing one costs a comparison rather than an index. That inverts once the cluster state entry stops being
+ * written, where the descriptor becomes the
  * only record and its write has to be the thing that succeeds or fails the request. The two phases have
  * opposite failure semantics and this is the forgiving one.
  */
@@ -53,14 +55,15 @@ public final class IndexDescriptorPublisher {
     /**
      * Creates a gated index's descriptor, which for a gated index <em>is</em> the creation.
      *
-     * <p>Separate from {@link #register}'s publisher because the two have opposite failure semantics and
-     * T17 and T23 are what happens when one stands in for the other. A publisher records an index that
+     * <p>Separate from {@link #register}'s publisher because the two have opposite failure semantics, and
+     * lost creations and duplicate-name acknowledgements are what happens when one stands in for the
+     * other. A publisher records an index that
      * already exists in cluster state, so losing the write costs a comparison and fire and forget is
      * right. A creator is the only record the index will ever have, so it must be atomic against a
      * competing creation and its outcome must reach the client.
      *
      * <p>Returns a future rather than a boolean so the caller can defer the acknowledgement without
-     * blocking. W4 established that blocking on the cluster state thread deadlocks, and the thread does
+     * blocking. Blocking on the cluster state thread is an established deadlock, and the thread does
      * not need to wait; the acknowledgement does.
      */
     private static final AtomicReference<
@@ -120,34 +123,6 @@ public final class IndexDescriptorPublisher {
 
     public static boolean isRegistered() {
         return PUBLISHER.get() != null;
-    }
-
-    /**
-     * Records that an index was deleted, as a tombstoned descriptor rather than an absence.
-     *
-     * <p>Absence cannot be distinguished from not having looked, which is why {@link IndexGraveyard}
-     * exists at all: a node partitioned during a delete would otherwise adopt its dangling shard data on
-     * rejoin. A tombstoned descriptor answers that question durably, and unlike the graveyard it does not
-     * forget, since the graveyard keeps a bounded list and purges the oldest entries.
-     *
-     * <p>The uuid and shard count survive the tombstone deliberately. They are what identifies the
-     * dangling data that has to be reclaimed, so a tombstone that carried only the name would say an
-     * index is gone without saying what to delete.
-     *
-     * @return whether a publisher was invoked, so a caller can tell "nothing listening" from "recorded"
-     */
-    public static boolean publishTombstone(IndexMetadata indexMetadata) {
-        Consumer<IndexDescriptor> publisher = PUBLISHER.get();
-        if (publisher == null || indexMetadata == null) {
-            return false;
-        }
-        try {
-            publisher.accept(IndexDescriptor.from(indexMetadata).tombstoned(System.currentTimeMillis()));
-            return true;
-        } catch (Exception e) {
-            logger.warn("failed to publish tombstone for [" + indexMetadata.getIndex().getName() + "]", e);
-            return true;
-        }
     }
 
     /**

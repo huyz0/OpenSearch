@@ -355,10 +355,10 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         // "Indices don't have primary shards [name]") whenever either lookup comes back null -- which
         // happens for two structurally different, both genuinely-alive index shapes this plugin can
         // produce, not just one:
-        // - a gated index: absent from metadata.indices() entirely (Area H -- metadata lives off cluster
+        // - a gated index: absent from metadata.indices() entirely (its metadata lives off cluster
         // state), so metadata.index(name) itself returns null;
         // - a computed-placement index: present in metadata.indices() but never publishes a routing
-        // table entry (Area C -- routingTable.index(name) returns null), so routingTable is what's
+        // table entry (routingTable.index(name) returns null), so routingTable is what's
         // missing instead.
         // Both have primary shards serving live traffic; "don't have primary shards" is false for either.
         {
@@ -372,8 +372,8 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
                     if (stateForGatedCheck.metadata().indexOrResolved(indexName) != null) {
                         gatedIndices.add(indexName);
                     }
-                    // Phase C4b of core-pluggability-refactor-plan.md: stateForGatedCheck.routingTable()
-                    // .shouldPublishRouting(...) replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...)
+                    // stateForGatedCheck.routingTable().shouldPublishRouting(...) replaces the static
+                    // registry's AbsentIndexRoutingSuppliers.shouldPublishRouting(...)
                     // here -- same predicate, discovered through the resolver attached to this state's own
                     // routing table.
                 } else if (stateForGatedCheck.routingTable().shouldPublishRouting(published) == false) {
@@ -411,12 +411,12 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         // Deliberately not a new field on SnapshotInfo either: the engine-native snapshot design kept that
         // surface unchanged on purpose, and this is not the change that should be the first to break it.
         //
-        // Phase D2 of core-pluggability-refactor-plan.md: IndexCreationStrategyRegistry.isRegistered()
-        // replaces DescriptorOnlyCreation.isRegistered() here -- this call site only ever needed "is
-        // anything gated at all," never a specific name, so it needed no other change. See
+        // IndexCreationStrategyRegistry.isRegistered()
+        // replaces the plugin-owned static registry's isRegistered() here -- this call site only ever
+        // needed "is anything gated at all," never a specific name, so it needed no other change. See
         // IndexCreationStrategyRegistry's own javadoc for why nothing is lost for a node without a
         // ClusterPlugin supplying a strategy: it answers false unconditionally, exactly like
-        // DescriptorOnlyCreation.isRegistered() did before anything registered with it.
+        // the static registry did before anything registered with it.
         if (IndexCreationStrategyRegistry.isRegistered() && mayHaveMatchedGatedIndices(request.indices())) {
             logger.warn(
                 "snapshot [{}] resolves its indices by wildcard on a cluster with gated indices. Gated indices "

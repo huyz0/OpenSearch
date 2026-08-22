@@ -6,7 +6,9 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.metadata;
+package org.opensearch.serverless.storage.placement;
+
+import org.opensearch.cluster.metadata.DescriptorPrefetch;
 
 import org.opensearch.Version;
 import org.opensearch.action.support.CoordinatorAffinityRouting;

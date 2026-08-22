@@ -160,11 +160,11 @@ public interface RestHandler {
      * can record their intended availability incrementally instead of a plugin having to maintain
      * an external list of route names that drifts every time a handler is added.
      *
-     * <p><b>Phase J of {@code core-pluggability-refactor-plan.md}: renamed from {@code serverlessScope()}.</b>
-     * The mechanism is unchanged and was already correct -- the declaration belongs next to the handler it
-     * describes, and enforcement was already fully plugin-owned. What was wrong was only the vocabulary:
-     * a core-wide interface on {@code @PublicApi} {@link RestHandler}, implemented by handlers throughout
-     * core, named after one specific product. The question each handler actually answers is generic.
+     * <p><b>Deliberately named for what it declares, not for any product.</b> The declaration belongs
+     * next to the handler it
+     * describes, and enforcement is fully plugin-owned. An earlier name tied this core-wide interface on
+     * {@code @PublicApi} {@link RestHandler}, implemented by handlers throughout
+     * core, to one specific product; the question each handler actually answers is generic.
      */
     default ApiAvailabilityScope apiAvailabilityScope() {
         return ApiAvailabilityScope.UNAVAILABLE;

@@ -65,13 +65,12 @@ public class RemoteManifestManager {
     );
 
     /**
-     * Plan item E5 (plan-100m-index-implementation.md, Area E; C3b in rfc-manifest-sharding-design.md):
-     * how many shards the manifest's index list is partitioned into. {@code 0} (the default) means
+     * How many shards the manifest's index list is partitioned into. {@code 0} (the default) means
      * unsharded -- every manifest continues to carry its full index list inline in {@code indices},
      * exactly as before this setting existed. A positive value turns sharding on for every manifest
      * written from that point forward; see {@link ClusterMetadataManifest#CODEC_V6}'s own doc for what
-     * changes on the wire, and {@code rfc-manifest-sharding-design.md}'s "Shard count" section for why
-     * this is read fresh from configuration only when *writing* a manifest -- a reader always uses the
+     * changes on the wire. This setting is read fresh from configuration only when *writing* a
+     * manifest -- a reader always uses the
      * count found in the manifest it is reading, not this setting's current value.
      *
      * <p>Dynamic rather than fixed at startup: changing it mid-cluster-life is handled safely (see
@@ -89,24 +88,23 @@ public class RemoteManifestManager {
     );
 
     /**
-     * Phase G of {@code core-pluggability-refactor-plan.md}. {@link ClusterMetadataManifest#MANIFEST_CURRENT_CODEC_VERSION}
+     * {@link ClusterMetadataManifest#MANIFEST_CURRENT_CODEC_VERSION}
      * (currently {@link ClusterMetadataManifest#CODEC_V6}) is, by that class's own documented design,
      * written unconditionally by every node the moment it starts -- see {@code ClusterMetadataManifest}'s
      * static initializer comment for why that is deliberate for this fork rather than a bug. That is a
      * one-way door: once any node has written a {@code CODEC_V6} manifest, the repository is no longer
      * readable by a build that only understands up to {@link ClusterMetadataManifest#CODEC_V5} -- see
      * {@link ClusterMetadataManifest#FORK_CODEC_BASE}'s own javadoc for the sharper version of the same
-     * property. This setting is the escape hatch the review that produced
-     * {@code core-pluggability-refactor-plan.md} asked for: "an explicit, documented cluster setting...
-     * rather than an unconditional bump."
+     * property. This setting is the deliberately-provided escape hatch: an explicit, documented cluster
+     * setting rather than only an unconditional bump.
      *
      * <p><b>Default {@code false} on purpose, not {@code true}</b> -- unlike most gates in this codebase,
      * this one does NOT flip to change default behavior. Every existing deployment of this fork already
      * writes {@code CODEC_V6} unconditionally; defaulting this setting to "pin back to V5" would silently
      * change that on the next upgrade, and defaulting the earlier draft of this setting to "must opt in
      * to V6" broke the migration tests that assert an incremental update lands on {@code
-     * MANIFEST_CURRENT_CODEC_VERSION} -- exactly the kind of default-behavior change Phase G's own ground
-     * rule ("no behavior change for a node without an explicit opt-in") exists to prevent. So: {@code
+     * MANIFEST_CURRENT_CODEC_VERSION} -- exactly the kind of silent default-behavior change the ground
+     * rule "no behavior change for a node without an explicit opt-in" exists to prevent. So: {@code
      * false} here means "today's behavior, unchanged" -- CODEC_V6 written unconditionally, same as
      * before this setting existed. An operator who wants the staged-rollout safety this setting exists to
      * provide sets it {@code true} to pin manifests at {@link ClusterMetadataManifest#CODEC_V5} (a fully
@@ -182,7 +180,7 @@ public class RemoteManifestManager {
     }
 
     /**
-     * Phase G of {@code core-pluggability-refactor-plan.md}. {@code MANIFEST_CURRENT_CODEC_VERSION}
+     * {@code MANIFEST_CURRENT_CODEC_VERSION}
      * (today's unconditional default) unless an operator has explicitly pinned to {@code CODEC_V5} --
      * and even then, sharding (an operator's own explicit opt-in) overrides the pin, since {@code
      * CODEC_V6}'s shard-reference fields have no {@code CODEC_V5} representation. See {@link
@@ -265,7 +263,8 @@ public class RemoteManifestManager {
                 }
                 indexMetadataShards = written;
                 // The index list now lives entirely behind the shard references above -- an inline copy
-                // would defeat the entire point (this is the write amplification C3a measured) and give
+                // would defeat the entire point (reintroducing the per-version write amplification
+                // sharding exists to remove) and give
                 // every reader two disagreeing sources of truth for the same data.
                 inlineIndices = Collections.emptyList();
             }

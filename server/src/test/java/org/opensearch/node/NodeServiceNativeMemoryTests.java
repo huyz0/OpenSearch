@@ -24,6 +24,8 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.monitor.MonitorService;
 import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
+import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.PluginNodeStats;
 import org.opensearch.plugins.PluginsService;
 import org.opensearch.ratelimitting.admissioncontrol.AdmissionControlService;
 import org.opensearch.repositories.RepositoriesService;
@@ -37,24 +39,40 @@ import org.opensearch.transport.TransportService;
 
 import java.util.Collections;
 import java.util.List;
-import java.util.function.Supplier;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * Unit tests for NodeService native memory stats delegation logic.
- * <p>
- * Validates that NodeService correctly delegates to the native allocator stats
- * supplier when nativeMemory=true and the supplier is non-null,
- * and returns null otherwise.
+ * Unit tests for how the native-allocator pool stats reach {@code _nodes/stats} after their migration
+ * onto the generic {@link PluginNodeStats}/pluginStats path: the owning plugin (arrow-base in
+ * production, a stand-in here) contributes a {@link NativeAllocatorPoolStats} from
+ * {@link Plugin#nodeStats()}, {@code NodeService.stats(..., pluginStats=true)} collects it under its
+ * {@code getWriteableName()} ({@code "native_allocator"}), and the {@code pluginStats=false} path
+ * collects nothing. The legacy {@code nativeMemory} flag no longer gates any dedicated collection.
  */
 public class NodeServiceNativeMemoryTests extends OpenSearchTestCase {
 
-    private NodeService createNodeService(Supplier<NativeAllocatorPoolStats> nativeAllocatorStatsSupplier) {
+    /** Stand-in for ArrowBasePlugin's nodeStats() contribution. */
+    private static final class AllocatorStatsPlugin extends Plugin {
+        private final NativeAllocatorPoolStats stats;
+
+        AllocatorStatsPlugin(NativeAllocatorPoolStats stats) {
+            this.stats = stats;
+        }
+
+        @Override
+        public List<PluginNodeStats> nodeStats() {
+            return stats == null ? List.of() : List.of(stats);
+        }
+    }
+
+    private NodeService createNodeService(List<Plugin> plugins) {
         TransportService transportService = mock(TransportService.class);
         DiscoveryNode localNode = new DiscoveryNode("test_node", buildNewFakeTransportAddress(), Version.CURRENT);
         when(transportService.getLocalNode()).thenReturn(localNode);
+        PluginsService pluginsService = mock(PluginsService.class);
+        when(pluginsService.filterPlugins(Plugin.class)).thenReturn(plugins);
 
         return new NodeService(
             Settings.EMPTY,
@@ -63,7 +81,7 @@ public class NodeServiceNativeMemoryTests extends OpenSearchTestCase {
             mock(Discovery.class),
             transportService,
             mock(IndicesService.class),
-            mock(PluginsService.class),
+            pluginsService,
             mock(CircuitBreakerService.class),
             mock(ScriptService.class),
             null, // httpServerTransport
@@ -82,151 +100,92 @@ public class NodeServiceNativeMemoryTests extends OpenSearchTestCase {
             mock(SegmentReplicationStatsTracker.class),
             mock(RepositoriesService.class),
             mock(AdmissionControlService.class),
-            null, // cacheService
-            nativeAllocatorStatsSupplier
+            null // cacheService
+        );
+    }
+
+    private static NodeStats callStats(NodeService nodeService, boolean pluginStats) {
+        return nodeService.stats(
+            CommonStatsFlags.NONE,
+            false, // os
+            false, // process
+            false, // jvm
+            false, // threadPool
+            false, // fs
+            false, // transport
+            false, // http
+            false, // circuitBreaker
+            false, // script
+            false, // discoveryStats
+            false, // ingest
+            false, // adaptiveSelection
+            false, // scriptCache
+            false, // indexingPressure
+            false, // shardIndexingPressure
+            false, // searchBackpressure
+            false, // clusterManagerThrottling
+            false, // weightedRoutingStats
+            false, // fileCacheStats
+            false, // fileCacheDetailed
+            false, // taskCancellation
+            false, // searchPipelineStats
+            false, // resourceUsageStats
+            false, // segmentReplicationTrackerStats
+            false, // repositoriesStats
+            false, // admissionControl
+            false, // cacheService
+            false, // remoteStoreNodeStats
+            false, // nativeMemory (vestigial: gates nothing dedicated anymore)
+            pluginStats
         );
     }
 
     /**
-     * Tests that stats() with nativeMemory=true and a non-null supplier
-     * returns the stats from the supplier.
+     * With pluginStats=true and a plugin contributing allocator stats, the snapshot lands in the
+     * pluginStats map under the contribution's writeable name.
      */
-    public void testStatsWithNativeMemoryTrueAndSupplierPresent() {
+    public void testStatsWithPluginStatsTrueAndContributionPresent() {
         NativeAllocatorPoolStats expected = new NativeAllocatorPoolStats(
             1024L,
             2048L,
             List.of(new NativeAllocatorPoolStats.PoolStats("flight", 100L, 200L, 2048L))
         );
-        NodeService nodeService = createNodeService(() -> expected);
+        NodeService nodeService = createNodeService(List.of(new AllocatorStatsPlugin(expected)));
 
-        NodeStats nodeStats = nodeService.stats(
-            CommonStatsFlags.NONE,
-            false, // os
-            false, // process
-            false, // jvm
-            false, // threadPool
-            false, // fs
-            false, // transport
-            false, // http
-            false, // circuitBreaker
-            false, // script
-            false, // discoveryStats
-            false, // ingest
-            false, // adaptiveSelection
-            false, // scriptCache
-            false, // indexingPressure
-            false, // shardIndexingPressure
-            false, // searchBackpressure
-            false, // clusterManagerThrottling
-            false, // weightedRoutingStats
-            false, // fileCacheStats
-            false, // fileCacheDetailed
-            false, // taskCancellation
-            false, // searchPipelineStats
-            false, // resourceUsageStats
-            false, // segmentReplicationTrackerStats
-            false, // repositoriesStats
-            false, // admissionControl
-            false, // cacheService
-            false, // remoteStoreNodeStats
-            true,  // nativeMemory
-            false  // pluginStats
+        NodeStats nodeStats = callStats(nodeService, true);
+
+        assertSame(
+            "allocator stats must be collected under their writeable name",
+            expected,
+            nodeStats.getPluginStats().get(NativeAllocatorPoolStats.WRITEABLE_NAME)
         );
-
-        assertNotNull("nativeAllocatorStats should be present when supplier returns non-null", nodeStats.getNativeAllocatorStats());
-        assertSame(expected, nodeStats.getNativeAllocatorStats());
     }
 
     /**
-     * Tests that stats() with nativeMemory=true and no supplier
-     * returns null for the nativeAllocatorStats field.
+     * With pluginStats=true but no plugin contributing (allocator plugin absent, or its allocator not
+     * built), the map is simply empty.
      */
-    public void testStatsWithNativeMemoryTrueAndNoSupplier() {
-        NodeService nodeService = createNodeService(null);
+    public void testStatsWithPluginStatsTrueAndNoContribution() {
+        NodeService nodeService = createNodeService(List.of(new AllocatorStatsPlugin(null)));
 
-        NodeStats nodeStats = nodeService.stats(
-            CommonStatsFlags.NONE,
-            false, // os
-            false, // process
-            false, // jvm
-            false, // threadPool
-            false, // fs
-            false, // transport
-            false, // http
-            false, // circuitBreaker
-            false, // script
-            false, // discoveryStats
-            false, // ingest
-            false, // adaptiveSelection
-            false, // scriptCache
-            false, // indexingPressure
-            false, // shardIndexingPressure
-            false, // searchBackpressure
-            false, // clusterManagerThrottling
-            false, // weightedRoutingStats
-            false, // fileCacheStats
-            false, // fileCacheDetailed
-            false, // taskCancellation
-            false, // searchPipelineStats
-            false, // resourceUsageStats
-            false, // segmentReplicationTrackerStats
-            false, // repositoriesStats
-            false, // admissionControl
-            false, // cacheService
-            false, // remoteStoreNodeStats
-            true,  // nativeMemory
-            false  // pluginStats
-        );
+        NodeStats nodeStats = callStats(nodeService, true);
 
-        assertNull("nativeAllocatorStats should be null when no supplier registered", nodeStats.getNativeAllocatorStats());
+        assertTrue("pluginStats must be empty when no plugin contributes", nodeStats.getPluginStats().isEmpty());
     }
 
     /**
-     * Tests that stats() with nativeMemory=false returns null for the
-     * nativeAllocatorStats field regardless of whether the supplier is present.
+     * With pluginStats=false nothing is collected, regardless of what plugins would contribute.
      */
-    public void testStatsWithNativeMemoryFalse() {
+    public void testStatsWithPluginStatsFalse() {
         NativeAllocatorPoolStats expected = new NativeAllocatorPoolStats(
             4096L,
             8192L,
             List.of(new NativeAllocatorPoolStats.PoolStats("flight", 100L, 200L, 2048L))
         );
-        NodeService nodeService = createNodeService(() -> expected);
+        NodeService nodeService = createNodeService(List.of(new AllocatorStatsPlugin(expected)));
 
-        NodeStats nodeStats = nodeService.stats(
-            CommonStatsFlags.NONE,
-            false, // os
-            false, // process
-            false, // jvm
-            false, // threadPool
-            false, // fs
-            false, // transport
-            false, // http
-            false, // circuitBreaker
-            false, // script
-            false, // discoveryStats
-            false, // ingest
-            false, // adaptiveSelection
-            false, // scriptCache
-            false, // indexingPressure
-            false, // shardIndexingPressure
-            false, // searchBackpressure
-            false, // clusterManagerThrottling
-            false, // weightedRoutingStats
-            false, // fileCacheStats
-            false, // fileCacheDetailed
-            false, // taskCancellation
-            false, // searchPipelineStats
-            false, // resourceUsageStats
-            false, // segmentReplicationTrackerStats
-            false, // repositoriesStats
-            false, // admissionControl
-            false, // cacheService
-            false, // remoteStoreNodeStats
-            false, // nativeMemory
-            false  // pluginStats
-        );
+        NodeStats nodeStats = callStats(nodeService, false);
 
-        assertNull("nativeAllocatorStats should be null when nativeMemory=false", nodeStats.getNativeAllocatorStats());
+        assertTrue("pluginStats must be empty when the pluginStats flag is off", nodeStats.getPluginStats().isEmpty());
     }
 }

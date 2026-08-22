@@ -176,9 +176,9 @@ public class MetadataInPlaceSplitShardCommitService implements ClusterStateListe
      * actually being applied to (not just the state that triggered the listener), since cluster state
      * may have advanced between {@link #clusterChanged} firing and this task executing.
      *
-     * <p><b>Why the parent is retired here, atomically with the metadata commit</b> --
-     * dynamic-partitioning-plan.md's Part 3 "read-path correctness during the split transition window"
-     * question, resolved as option (a) there: a splitting child's manifest, until a physical bundle
+     * <p><b>Why the parent is retired here, atomically with the metadata commit</b> -- this is how
+     * read-path correctness during the split transition window
+     * is kept: a splitting child's manifest, until a physical bundle
      * rewrite happens (not yet built -- see {@code PartitionRewriteSchedulerTask}'s equivalent for
      * this plugin's older split mechanism, no counterpart exists yet for in-place split), references
      * the *same* underlying bundle files the parent's manifest does. If both parent and children were
@@ -188,8 +188,8 @@ public class MetadataInPlaceSplitShardCommitService implements ClusterStateListe
      * whichever child's hash range it falls into. Removing the parent's routing entry in the same
      * cluster-state update the children's `SplitShardsMetadata` promotion lands in (not a
      * separate, later step) closes that window at the only point where it can be closed atomically --
-     * a partition is owned by exactly one visible shard at a time, even across the split boundary,
-     * matching the plan's own "DynamoDB-like" resolution. This intentionally shuts down the parent's
+     * a partition is owned by exactly one visible shard at a time, even across the split boundary
+     * (the "DynamoDB-like" arrangement). This intentionally shuts down the parent's
      * {@code IndexShard} on whatever node(s) hosted it (ordinary core behavior when a routing entry
      * disappears) -- safe, since the parent's own manifest bytes are still referenced (and protected
      * from GC by the pin {@code ShardCloner.clone} placed during each child's {@code

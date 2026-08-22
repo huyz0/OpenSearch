@@ -34,7 +34,6 @@ import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.index.AppendOnlyIndexOperationRetryException;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.index.IndexModule;
 import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
@@ -1401,22 +1400,7 @@ public class DataFormatAwareEngine implements Indexer {
      * (frozen-while-HOT → HOT) to ensure merge scheduler resumes.
      */
     private void updateTieringFreezeState() {
-        String tieringStateStr = engineConfig.getIndexSettings()
-            .getSettings()
-            .get(IndexModule.INDEX_TIERING_STATE.getKey(), IndexModule.TieringState.HOT.name());
-        boolean shouldFreeze;
-        try {
-            IndexModule.TieringState tieringState = IndexModule.TieringState.valueOf(tieringStateStr);
-            shouldFreeze = tieringState == IndexModule.TieringState.HOT_TO_WARM;
-        } catch (IllegalArgumentException e) {
-            // Unrecognized tiering-state value — treat as not frozen, but surface the misconfiguration.
-            logger.warn(
-                "Unrecognized {} value [{}]; treating engine as not frozen for tiering",
-                IndexModule.INDEX_TIERING_STATE.getKey(),
-                tieringStateStr
-            );
-            shouldFreeze = false;
-        }
+        boolean shouldFreeze = MergeScheduler.isTieringToWarm(engineConfig.getIndexSettings(), logger);
         if (shouldFreeze) {
             if (frozenForTiering.compareAndSet(false, true)) {
                 logger.info("Freezing engine for tiering — blocking merges, refresh, flush, and catalog commits");
@@ -1450,14 +1434,8 @@ public class DataFormatAwareEngine implements Indexer {
      * action acquiring all primary permits.)
      */
     private boolean isFrozenForTiering() {
-        if (frozenForTiering.get()) {
-            return true;
-        }
-        // Fallback: read live settings to close the apply-ordering gap described above.
-        String state = engineConfig.getIndexSettings()
-            .getSettings()
-            .get(IndexModule.INDEX_TIERING_STATE.getKey(), IndexModule.TieringState.HOT.name());
-        return IndexModule.TieringState.HOT_TO_WARM.name().equals(state);
+        // Fallback probe reads live settings to close the apply-ordering gap described above.
+        return frozenForTiering.get() || MergeScheduler.isTieringToWarm(engineConfig.getIndexSettings(), logger);
     }
 
     /**
@@ -1961,24 +1939,20 @@ public class DataFormatAwareEngine implements Indexer {
                     if (versionValue.isDelete()) {
                         return Engine.GetResult.NOT_EXISTS;
                     }
-                    if (get.versionType().isVersionConflictForReads(versionValue.version, get.version())) {
-                        throw new VersionConflictEngineException(
-                            shardId,
+                    // Same read-time conflict checks the read-only/NRT engines apply on their lookups.
+                    documentLookup.applyReadVersionConflicts(
+                        get,
+                        new DocumentLookupResult(
                             get.id(),
-                            get.versionType().explainConflictForReads(versionValue.version, get.version())
-                        );
-                    }
-                    if (get.getIfSeqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO
-                        && (get.getIfSeqNo() != versionValue.seqNo || get.getIfPrimaryTerm() != versionValue.term)) {
-                        throw new VersionConflictEngineException(
-                            shardId,
-                            get.id(),
-                            get.getIfSeqNo(),
-                            get.getIfPrimaryTerm(),
+                            versionValue.version,
+                            true,
+                            null,
                             versionValue.seqNo,
-                            versionValue.term
-                        );
-                    }
+                            versionValue.term,
+                            Map.of(),
+                            Map.of()
+                        )
+                    );
                     if (get.isReadFromTranslog() && versionValue.getLocation() != null) {
                         try {
                             Translog.Operation operation = translogManager.readOperation(versionValue.getLocation());

@@ -13,7 +13,7 @@ import org.opensearch.ratelimitting.admissioncontrol.enums.AdmissionControlActio
 import java.util.OptionalDouble;
 
 /**
- * Phase H of {@code core-pluggability-refactor-plan.md}: a plugin-supplied off-heap/native memory
+ * A plugin-supplied off-heap/native memory
  * pressure signal, generic across whatever allocator or pool taxonomy a plugin actually uses.
  *
  * <p>Before this interface existed, {@code NativeMemoryBasedAdmissionController} read {@code

@@ -181,9 +181,8 @@ public class TransportUpgradeAction extends TransportBroadcastByNodeAction<Upgra
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, UpgradeRequest request, String[] concreteIndices) {
-        // Phase C4b of core-pluggability-refactor-plan.md: clusterState.allShards(...) replaces
-        // AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered through the
-        // resolver attached to this state's own routing table.
+        // clusterState.allShards(...) resolves through the resolver attached to this state's own
+        // routing table (replacing an earlier static-registry lookup) -- same composition.
         ShardsIterator iterator = clusterState.allShards(concreteIndices);
         Set<String> indicesWithMissingPrimaries = indicesWithMissingPrimaries(clusterState, concreteIndices);
         if (indicesWithMissingPrimaries.isEmpty()) {

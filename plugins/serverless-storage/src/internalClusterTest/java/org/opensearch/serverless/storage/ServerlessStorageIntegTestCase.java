@@ -272,6 +272,15 @@ public abstract class ServerlessStorageIntegTestCase extends OpenSearchIntegTest
     protected static org.opensearch.cluster.ClusterState emptyClusterStateWithDescriptorResolver() {
         org.opensearch.cluster.metadata.Metadata metadata = org.opensearch.cluster.metadata.Metadata.builder().build();
         metadata.attachIndexMetadataResolver(new org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver());
-        return org.opensearch.cluster.ClusterState.builder(org.opensearch.cluster.ClusterName.DEFAULT).metadata(metadata).build();
+        // The routing-side bridge too, on a real (non-EMPTY_ROUTING_TABLE) instance -- attachment is a
+        // no-op on the shared singleton -- so ClusterState#getIndexRoutingTable/#resolveShard resolve a
+        // gated index's computed placement the way a real applied state does: name to descriptor to
+        // synthesised metadata to supplied routing.
+        org.opensearch.cluster.routing.RoutingTable routingTable = org.opensearch.cluster.routing.RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
+        return org.opensearch.cluster.ClusterState.builder(org.opensearch.cluster.ClusterName.DEFAULT)
+            .metadata(metadata)
+            .routingTable(routingTable)
+            .build();
     }
 }

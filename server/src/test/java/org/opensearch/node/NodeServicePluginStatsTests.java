@@ -124,8 +124,7 @@ public class NodeServicePluginStatsTests extends OpenSearchTestCase {
             mock(SegmentReplicationStatsTracker.class),
             mock(RepositoriesService.class),
             mock(AdmissionControlService.class),
-            null, // cacheService
-            null // nativeAllocatorStatsSupplier
+            null // cacheService
         );
     }
 

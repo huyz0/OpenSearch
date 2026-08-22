@@ -789,7 +789,7 @@ final class DocumentParser {
         if (existingMapper == null && UnknownFieldRefresh.isRegistered()) {
             // The shard may simply be behind. For a gated index the mapping lives outside cluster state and
             // nothing broadcasts a change, so a field it does not know may already exist and have been
-            // inferred by another shard. W13 established there is no generation stamped on the request to
+            // inferred by another shard. There is no generation stamped on the request to
             // compare against, so the miss itself is the trigger: this is exactly and only the moment being
             // behind matters.
             //
@@ -1406,54 +1406,13 @@ final class DocumentParser {
     }
 
     private static java.util.function.Supplier<Mapper.Builder<?>> builderSupplierForText(String fieldName, ParseContext context) {
+        // Pluggable-data-format indices do not get the classic auto-added .keyword multi-field.
         if (context.indexSettings().isPluggableDataFormatEnabled()) {
-            if (dynamicTextIncludesKeywordMultiField(context)) {
-                return () -> new TextFieldMapper.Builder(fieldName, context.mapperService().getIndexAnalyzers()).addMultiField(
-                    new KeywordFieldMapper.Builder("keyword").ignoreAbove(256)
-                );
-            }
             return () -> new TextFieldMapper.Builder(fieldName, context.mapperService().getIndexAnalyzers());
-        } else {
-            return () -> new TextFieldMapper.Builder(fieldName, context.mapperService().getIndexAnalyzers()).addMultiField(
-                new KeywordFieldMapper.Builder("keyword").ignoreAbove(256)
-            );
         }
-    }
-
-    /**
-     * Phase F of {@code core-pluggability-refactor-plan.md}: whether the currently active pluggable data
-     * format wants the classic auto-{@code keyword}-multi-field shape for a dynamically-mapped text value,
-     * per {@link org.opensearch.index.engine.dataformat.DataFormat#dynamicTextIncludesKeywordMultiField()}.
-     *
-     * <p>Deliberately consulted only from <em>inside</em> the {@code isPluggableDataFormatEnabled()} branch
-     * above, not as an independent outer gate -- see this session's plan-document notes on {@code
-     * DocumentMapperParser#getDataFormatRegistry()} for why: that raw field is not itself flag-gated the
-     * way {@code Mapper.TypeParser.ParserContext#dataFormatRegistry()} is, so consulting it unconditionally
-     * (before knowing the per-index flag is on) could reach a registry belonging to an unrelated format
-     * plugin installed on the node. Reading it here, already inside the flag check, is safe: the outer
-     * branch already established the per-index feature is genuinely active.
-     *
-     * <p>Every intermediate object ({@code context.mapperService()}, the registry, the resolved format) is
-     * guarded independently before use, per the two null-safety bugs the other Phase F sites' own tests
-     * caught (a mocked/synthetic {@code ParseContext} with one intermediate object present and another
-     * absent is exactly the shape that broke assumptions twice already this phase).
-     */
-    private static boolean dynamicTextIncludesKeywordMultiField(ParseContext context) {
-        MapperService mapperService = context.mapperService();
-        if (mapperService == null) {
-            return false;
-        }
-        DocumentMapperParser documentMapperParser = mapperService.documentMapperParser();
-        org.opensearch.index.engine.dataformat.DataFormatRegistry registry = documentMapperParser == null
-            ? null
-            : documentMapperParser.getDataFormatRegistry();
-        if (registry == null) {
-            return false;
-        }
-        org.opensearch.index.engine.dataformat.DataFormat activeFormat = registry.format(
-            mapperService.getIndexSettings().pluggableDataFormat()
+        return () -> new TextFieldMapper.Builder(fieldName, context.mapperService().getIndexAnalyzers()).addMultiField(
+            new KeywordFieldMapper.Builder("keyword").ignoreAbove(256)
         );
-        return activeFormat != null && activeFormat.dynamicTextIncludesKeywordMultiField();
     }
 
     private static Mapper.Builder<?> handleNoTemplateFound(

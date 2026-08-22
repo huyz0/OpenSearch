@@ -382,8 +382,8 @@ public interface BlobContainer {
      * equals {@code expectedGeneration}. Pass {@link BlobRegister#ABSENT_GENERATION} to mean "the
      * register must not exist yet" (first-ever write, i.e. put-if-absent semantics).
      *
-     * <p>This is the seam production serverless implementations use to back a shard-head CAS
-     * protocol (rfc-serverless-metadata-plane.md &sect;4/&sect;7): a native-object-store-backed
+     * <p>This is the seam a plugin's externally-managed storage implementation uses to back a
+     * shard-ownership compare-and-swap protocol: a native-object-store-backed
      * container implements this with its provider's conditional write (S3 If-Match, GCS
      * generation preconditions, Azure ETag If-Match); {@link org.opensearch.common.blobstore.fs.FsBlobContainer}
      * implements it with real local-filesystem atomicity for filesystem repositories and tests.

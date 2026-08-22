@@ -58,8 +58,11 @@ public class ComputedPlacementRecoveryProbeIT extends OpenSearchIntegTestCase {
         ClusterState state = client().admin().cluster().prepareState().get().getState();
 
         // The premise: placement answers, and answers with started shards on a real node. Without this the
-        // rest of the test would pass by measuring an index that does not exist in any sense.
-        IndexRoutingTable computed = AbsentIndexRoutingSuppliers.resolve(state, GATED);
+        // rest of the test would pass by measuring an index that does not exist in any sense. Probed at the
+        // authority itself (supply, with no metadata -- GATED exists in no cluster state) rather than
+        // through ClusterState's resolver-attached read, because the premise is about what the registered
+        // supplier answers, not about a state-scoped resolution this bare response state cannot perform.
+        IndexRoutingTable computed = AbsentIndexRoutingSuppliers.supply(state, GATED, null);
         assertNotNull("the premise: the gated index has computed placement", computed);
         assertEquals("with every shard placed", SHARDS, computed.shards().size());
         assertTrue(

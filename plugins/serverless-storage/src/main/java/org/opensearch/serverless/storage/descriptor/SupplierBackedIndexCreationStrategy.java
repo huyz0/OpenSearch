@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.cluster.metadata.IndexCreationStrategy;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 
 /**
  * Phase D2 of {@code core-pluggability-refactor-plan.md}: a generic {@link IndexCreationStrategy} adapter
@@ -68,5 +69,15 @@ public final class SupplierBackedIndexCreationStrategy implements IndexCreationS
     @Override
     public int maxMultiIndexStateChangeTargets() {
         return 50;
+    }
+
+    /**
+     * The per-index opt-in switch is how this plugin marks an index as belonging to its plane;
+     * declaring it here lets descriptor synthesis in core round-trip the marker without core
+     * hard-coding this plugin's setting name.
+     */
+    @Override
+    public String claimedIndexSettingKey() {
+        return ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey();
     }
 }

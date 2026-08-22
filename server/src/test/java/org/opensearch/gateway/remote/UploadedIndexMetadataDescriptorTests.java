@@ -36,7 +36,7 @@ import java.io.IOException;
 public class UploadedIndexMetadataDescriptorTests extends OpenSearchTestCase {
 
     public void testV5EntryRoundTripsWithItsDescriptor() throws IOException {
-        IndexDescriptor descriptor = IndexDescriptor.of(index());
+        ManifestIndexDescriptor descriptor = ManifestIndexDescriptor.of(index());
         UploadedIndexMetadata original = v5Entry(descriptor);
 
         UploadedIndexMetadata parsed = parse(original, ClusterMetadataManifest.CODEC_V5);
@@ -72,7 +72,7 @@ public class UploadedIndexMetadataDescriptorTests extends OpenSearchTestCase {
 
     /** The descriptor must survive the transport stream form too, not just the blob form. */
     public void testStreamRoundTripCarriesTheDescriptor() throws IOException {
-        UploadedIndexMetadata original = v5Entry(IndexDescriptor.of(index()));
+        UploadedIndexMetadata original = v5Entry(ManifestIndexDescriptor.of(index()));
 
         UploadedIndexMetadata parsed = copyWriteable(original, writableRegistry(), UploadedIndexMetadata::new);
 
@@ -91,7 +91,7 @@ public class UploadedIndexMetadataDescriptorTests extends OpenSearchTestCase {
 
     /** Two entries differing only in their descriptor are not the same entry. */
     public void testDescriptorParticipatesInEquality() {
-        UploadedIndexMetadata withDescriptor = v5Entry(IndexDescriptor.of(index()));
+        UploadedIndexMetadata withDescriptor = v5Entry(ManifestIndexDescriptor.of(index()));
         UploadedIndexMetadata without = v5Entry(null);
 
         assertNotEquals(withDescriptor, without);
@@ -118,7 +118,7 @@ public class UploadedIndexMetadataDescriptorTests extends OpenSearchTestCase {
         assertNull(atV5.getDescriptor());
     }
 
-    private static UploadedIndexMetadata v5Entry(IndexDescriptor descriptor) {
+    private static UploadedIndexMetadata v5Entry(ManifestIndexDescriptor descriptor) {
         return new UploadedIndexMetadata(
             "idx",
             "idx-uuid",

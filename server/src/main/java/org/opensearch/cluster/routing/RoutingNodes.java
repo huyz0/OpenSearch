@@ -369,24 +369,6 @@ public class RoutingNodes implements Iterable<RoutingNode> {
                 }
             }
         }
-        // Computed shards, for indices that publish no routing entry at all. Without this a computed
-        // index is a routing fiction: coordinators resolve it and route requests to nodes that were
-        // never told to open a shard, because every phase of IndicesClusterStateService takes its work
-        // list from here.
-        //
-        // Deliberately here and not in the RoutingNodes constructor. The constructor is what
-        // AllocationService and ClusterState#getRoutingNodes build, so adding computed shards there
-        // would hand these indices back to the allocator, which is the one thing this area exists to
-        // avoid. This helper is read only by the data node's own shard lifecycle, so hooking it
-        // materializes shards locally and leaves allocation with nothing to allocate.
-        // Phase C4b of core-pluggability-refactor-plan.md: ClusterState#getLocallyComputedShards(...)
-        // replaces AbsentIndexRoutingSuppliers.localShards(...) here -- wiring IndexRoutingResolver
-        // #localShardsFor, declared since Phase C1 but not consulted by any core call site until now.
-        for (final ShardRouting computed : clusterState.getLocallyComputedShards(nodeId)) {
-            if (computed.assignedToNode() && nodeId.equals(computed.currentNodeId())) {
-                shards.add(computed);
-            }
-        }
         return new RoutingNode(nodeId, node, shards.toArray(new ShardRouting[0]));
     }
 

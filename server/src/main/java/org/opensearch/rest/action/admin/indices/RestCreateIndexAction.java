@@ -109,7 +109,7 @@ public class RestCreateIndexAction extends BaseRestHandler {
     }
 
     /**
-     * Plan item Phase 5 (rfc-serverless-opensearch.md, REST API gating audit): a serverless deployment
+     * A deployment
      * with no way to create an index is not a deployment, so this must be available -- an omission
      * found by walking the core CRUD surface, not a case this handler needed to argue for.
      */

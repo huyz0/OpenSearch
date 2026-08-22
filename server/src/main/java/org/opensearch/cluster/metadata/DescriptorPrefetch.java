@@ -54,16 +54,6 @@ public final class DescriptorPrefetch {
 
     private static final Logger logger = LogManager.getLogger(DescriptorPrefetch.class);
 
-    public static final int DEFAULT_MAX_PREFETCH_BATCH_SIZE = 500;
-
-    /** Calculates the optimal prefetch chunk size for a target population size (T84). */
-    public static int optimalBatchSize(int targetCount) {
-        if (targetCount <= 50) {
-            return targetCount;
-        }
-        return Math.min(DEFAULT_MAX_PREFETCH_BATCH_SIZE, Math.max(50, targetCount / 4));
-    }
-
     /** Resolves a batch of names into whatever cache the synchronous suppliers read from. */
     @FunctionalInterface
     public interface Prefetcher {
@@ -109,10 +99,5 @@ public final class DescriptorPrefetch {
             logger.debug("descriptor prefetch threw for {}; falling back to resolving inline: {}", indexNames.size(), e);
             listener.onResponse(null);
         }
-    }
-
-    /** Convenient fire-and-forget prefetch when no completion callback is required. */
-    public static void prefetchAsync(Collection<String> indexNames) {
-        prefetch(indexNames, ActionListener.wrap(() -> {}));
     }
 }

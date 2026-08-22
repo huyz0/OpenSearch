@@ -63,8 +63,13 @@ public class UnifiedNativeMemoryFullStackIT extends OpenSearchIntegTestCase {
             .get();
 
         assertThat(response.getNodes().isEmpty(), is(false));
-        NativeAllocatorPoolStats stats = response.getNodes().get(0).getNativeAllocatorStats();
-        assertThat("native_memory stats should be present", stats, notNullValue());
+        // The allocator stats travel through the generic pluginStats path now (the native_memory
+        // metric also enables the pluginStats collection), keyed by the arrow-base contribution name.
+        NativeAllocatorPoolStats stats = (NativeAllocatorPoolStats) response.getNodes()
+            .get(0)
+            .getPluginStats()
+            .get(NativeAllocatorPoolStats.WRITEABLE_NAME);
+        assertThat("native allocator stats should be present", stats, notNullValue());
 
         // All 6 pools should be present
         Set<String> poolNames = stats.getPools().stream().map(NativeAllocatorPoolStats.PoolStats::getName).collect(Collectors.toSet());

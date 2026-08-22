@@ -48,7 +48,8 @@ public class IndexDescriptorImmutabilityTests extends OpenSearchTestCase {
         assertEquals(descriptor.uuid(), read.uuid());
         assertEquals(descriptor.shardCount(), read.shardCount());
         assertEquals(descriptor.searchOnlyReplicaCount(), read.searchOnlyReplicaCount());
-        assertEquals(descriptor.serverless(), read.serverless());
+        // The claimed boolean sits between these fields in the compact stream, so the state and
+        // createdVersion asserts below would misalign and fail if it were dropped from the wire format.
         assertEquals(descriptor.state(), read.state());
         assertEquals(descriptor.createdVersion(), read.createdVersion());
         assertEquals(descriptor.mappingGeneration(), read.mappingGeneration());

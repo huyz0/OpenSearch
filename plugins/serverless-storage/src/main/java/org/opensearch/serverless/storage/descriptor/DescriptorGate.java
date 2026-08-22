@@ -505,7 +505,7 @@ public final class DescriptorGate {
      * <p>The symptom was a suite failing nondeterministically -- a different test each run, green on a rerun
      * of identical code. {@code GatedCreationSwitchIT} asserting an unregistered gate answers false is one
      * shape; a resolution that suddenly returns nothing is another. It was treated as test-only for a while,
-     * and it is not: {@code IndicesClusterStateService.heldOnDemand} reads
+     * and it is not: {@code GatedIndexResidency.heldOnDemand} (core's residency bookkeeping for on-demand-opened indices) reads
      * {@code AbsentIndexDescriptorSuppliers.isRegistered}, so an unbalanced uninstall can make a node stop
      * recognising gated indices it is currently holding open.
      */

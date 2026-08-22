@@ -22,7 +22,7 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Plan item E5 (plan-100m-index-implementation.md, Area E): the actual content of one manifest shard
+ * The actual content of one manifest shard
  * blob -- the {@link UploadedIndexMetadata} entries {@link ManifestShardFunction} partitioned into it.
  *
  * <p>{@link UploadedManifestShard} is only the top-level manifest's *reference* to a shard (its id, blob

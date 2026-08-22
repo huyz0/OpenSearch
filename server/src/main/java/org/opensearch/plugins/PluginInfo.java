@@ -76,6 +76,7 @@ public class PluginInfo implements Writeable, ToXContentObject {
 
     public static final String OPENSEARCH_PLUGIN_PROPERTIES = "plugin-descriptor.properties";
     public static final String OPENSEARCH_PLUGIN_POLICY = "plugin-security.policy";
+    public static final String OPENSEARCH_PLUGIN_SECURITY_PROPERTIES = "plugin-security.properties";
     private static final JsonFactory jsonFactory = new JsonFactoryBuilder().configure(JsonReadFeature.ALLOW_UNQUOTED_PROPERTY_NAMES, true)
         .build();
 

@@ -72,7 +72,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -107,7 +106,21 @@ public class FsBlobContainer extends AbstractBlobContainer {
     // Internal cluster tests give every node its own container, so that is the normal case rather
     // than an exotic one, and a test asserting one winner among concurrent CAS callers would have
     // been asserting nothing.
-    private static final ConcurrentHashMap<String, ReentrantLock> REGISTER_LOCKS_BY_PATH = new ConcurrentHashMap<>();
+    //
+    // A fixed stripe table rather than a per-path map: a map entry per register path lives for the
+    // JVM's lifetime, which is an unbounded leak on a workload with many registers. Striping is
+    // bounded by construction and still correct, because a given path always hashes to the same
+    // stripe -- two callers on the same file always contend on the same lock. The only cost is
+    // over-exclusion: two different files that share a stripe serialize needlessly, which affects
+    // throughput, never correctness, and each register operation holds exactly one stripe at a time
+    // so no lock-ordering deadlock is possible.
+    private static final int REGISTER_LOCK_STRIPE_COUNT = 64;
+    private static final ReentrantLock[] REGISTER_LOCK_STRIPES = new ReentrantLock[REGISTER_LOCK_STRIPE_COUNT];
+    static {
+        for (int i = 0; i < REGISTER_LOCK_STRIPE_COUNT; i++) {
+            REGISTER_LOCK_STRIPES[i] = new ReentrantLock();
+        }
+    }
 
     public FsBlobContainer(FsBlobStore blobStore, BlobPath blobPath, Path path) {
         super(blobPath);
@@ -367,14 +380,16 @@ public class FsBlobContainer extends AbstractBlobContainer {
     }
 
     /**
-     * The intra-process lock for one register file.
+     * The intra-process lock stripe for one register file.
      *
      * <p>Keyed by the absolute normalised path so two containers that reach the same file through
-     * different {@link BlobPath}s share a lock, and two containers over different directories with the
-     * same blob name do not.
+     * different {@link BlobPath}s always land on the same stripe -- mutual exclusion per file is
+     * preserved. Distinct files may share a stripe (bounded striping, see the field comment), which
+     * only serializes them, never lets two writers to the same file interleave.
      */
     private static ReentrantLock registerLockFor(Path registerPath) {
-        return REGISTER_LOCKS_BY_PATH.computeIfAbsent(registerPath.toAbsolutePath().normalize().toString(), ignored -> new ReentrantLock());
+        final int hash = registerPath.toAbsolutePath().normalize().toString().hashCode();
+        return REGISTER_LOCK_STRIPES[Math.floorMod(hash, REGISTER_LOCK_STRIPE_COUNT)];
     }
 
     private Optional<BlobRegister> readRegisterUnderLock(FileChannel channel) throws IOException {

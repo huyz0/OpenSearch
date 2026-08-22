@@ -120,9 +120,9 @@ public class TransportForceMergeAction extends TransportBroadcastByNodeAction<
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, ForceMergeRequest request, String[] concreteIndices) {
-        // Phase C4b of core-pluggability-refactor-plan.md: clusterState.allShards(...) replaces
-        // AbsentIndexRoutingSuppliers.allShards(...) at both branches below -- same composition, discovered
-        // through the resolver attached to this state's own routing table.
+        // clusterState.allShards(...) at both branches below resolves through the resolver attached
+        // to this state's own routing table (replacing an earlier static-registry lookup) -- same
+        // composition.
         if (request.primaryOnly()) {
             return clusterState.allShards(concreteIndices, ShardRouting::primary, false);
         } else {

@@ -18,7 +18,7 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.gateway.remote.ClusterMetadataManifest;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedIndexMetadata;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedMetadata;
-import org.opensearch.gateway.remote.IndexDescriptor;
+import org.opensearch.gateway.remote.ManifestIndexDescriptor;
 import org.opensearch.gateway.remote.RemoteClusterStateUtils;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
@@ -145,7 +145,7 @@ public class RemoteIndexMetadata extends AbstractClusterMetadataWriteableBlobEnt
             blobName,
             UploadedIndexMetadata.COMPONENT_PREFIX,
             ClusterMetadataManifest.CODEC_V5,
-            IndexDescriptor.of(indexMetadata)
+            ManifestIndexDescriptor.of(indexMetadata)
         );
     }
 

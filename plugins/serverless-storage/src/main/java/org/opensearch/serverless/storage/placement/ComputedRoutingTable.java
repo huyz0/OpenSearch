@@ -11,8 +11,6 @@ package org.opensearch.serverless.storage.placement;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.routing.ComputedPlacementMembership;
-import org.opensearch.cluster.routing.ComputedPlacementMembershipService;
 import org.opensearch.cluster.routing.ComputedShardRouting;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;

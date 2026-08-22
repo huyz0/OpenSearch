@@ -6,12 +6,17 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.routing;
+package org.opensearch.serverless.storage.placement;
 
 import org.opensearch.OpenSearchException;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
+import org.opensearch.cluster.routing.ComputedShardRouting;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
@@ -19,11 +24,13 @@ import org.opensearch.index.IndexService;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 import org.junit.Before;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -69,18 +76,26 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-restart";
 
+    /**
+     * Only the membership machinery, not the full serverless plugin. This suite registers its own fake
+     * placement suppliers, and the real plugin's gate and resolver would collide with them; see
+     * {@link MembershipOnlyTestPlugin}'s own javadoc.
+     */
+    @Override
+    protected Collection<Class<? extends Plugin>> nodePlugins() {
+        return List.of(MembershipOnlyTestPlugin.class);
+    }
+
     @Before
     public void registerComputedPlacement() {
         AbsentIndexRoutingSuppliers.registerUnpublished(metadata -> metadata.getIndex().getName().startsWith("computed-"));
         AbsentIndexRoutingSuppliers.register(ComputedPlacementRestartIT::compute);
-        AbsentIndexRoutingSuppliers.registerLocalShards(ComputedPlacementRestartIT::localShards);
     }
 
     @After
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
         AbsentIndexRoutingSuppliers.register(null);
-        AbsentIndexRoutingSuppliers.registerLocalShards(null);
     }
 
     /**
@@ -253,7 +268,7 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
     /** The node the published placement names as holding shard 0, which is where requests will go. */
     private String nodeComputedPlacementAssignsTheShardTo() {
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-        IndexRoutingTable routing = AbsentIndexRoutingSuppliers.resolve(state, INDEX);
+        IndexRoutingTable routing = state.getIndexRoutingTable(INDEX);
         assertNotNull("placement must resolve an entry for a computed index", routing);
         return routing.shard(0).primaryShard().currentNodeId();
     }
@@ -296,35 +311,6 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
         return builder.build();
     }
 
-    private static List<ShardRouting> localShards(ClusterState state, String nodeId) {
-        List<String> dataNodes = sortedDataNodes(state);
-        List<ShardRouting> mine = new ArrayList<>();
-        if (dataNodes.isEmpty()) {
-            return mine;
-        }
-        for (IndexMetadata indexMetadata : state.metadata()) {
-            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(indexMetadata)) {
-                continue;
-            }
-            for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
-                if (nodeId.equals(owner(dataNodes, shardId)) == false) {
-                    continue;
-                }
-                // EmptyStore is what the placement function can state. The node corrects it to
-                // ExistingStore when it finds it already holds the data, which is C19: only the node
-                // knows that, and a function computed identically everywhere cannot.
-                mine.add(
-                    ComputedShardRouting.initializing(
-                        new ShardId(indexMetadata.getIndex(), shardId),
-                        nodeId,
-                        RecoverySource.EmptyStoreRecoverySource.INSTANCE
-                    )
-                );
-            }
-        }
-        return mine;
-    }
-
     private static String owner(List<String> dataNodes, int shardId) {
         return dataNodes.get(shardId % dataNodes.size());
     }
@@ -338,11 +324,13 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
      * recovers empty while looking healthy. The membership is published, versioned and never shrinks, so
      * a node being away is not a placement event.
      *
-     * <p>Modulo rather than rendezvous here only because a server test cannot depend on the plugin that
-     * owns {@code RendezvousShardPlacement}. The distinction does not matter for this test: with a
-     * membership that never shrinks, a restart does not change the set, so both are stable. Rendezvous
-     * earns its keep when the membership genuinely grows, where modulo reshuffles everything and
-     * rendezvous moves only a fraction, and the plugin's own path uses it over this same membership.
+     * <p>Modulo rather than rendezvous here even though this suite now lives beside
+     * {@code RendezvousShardPlacement}: the suite deliberately runs with {@link MembershipOnlyTestPlugin}
+     * rather than the full plugin, keeping the environment it had when it lived in core. The distinction
+     * does not matter for this test: with a membership that never shrinks, a restart does not change the
+     * set, so both are stable. Rendezvous earns its keep when the membership genuinely grows, where
+     * modulo reshuffles everything and rendezvous moves only a fraction, and the plugin's own path uses
+     * it over this same membership.
      */
     private static List<String> sortedDataNodes(ClusterState state) {
         ComputedPlacementMembership membership = ComputedPlacementMembershipService.get(state);

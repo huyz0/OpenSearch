@@ -238,7 +238,7 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             // node knows -- but its unknown fields come back empty, so its references silently read
             // as none, and the subtraction deletes blobs that are very much still in use.
             //
-            // Manifest sharding (Phase C) is exactly that kind of change: it moves the index list out
+            // Manifest sharding is exactly that kind of change: it moves the index list out
             // of getIndices() and behind shard blobs, so a node running today's code against a
             // sharded manifest would compute an empty keep-set for every index in the cluster. This
             // guard lands first, deliberately, so that a mixed-version cluster during that rollout
@@ -265,7 +265,7 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             Set<String> staleEphemeralAttributePaths = new HashSet<>();
             Set<String> staleIndexRoutingPaths = new HashSet<>();
             Set<String> staleIndexRoutingDiffPaths = new HashSet<>();
-            // Plan item E5: the manifest shard blobs themselves (manifest/shards/...), as distinct from
+            // The manifest shard blobs themselves (manifest/shards/...), as distinct from
             // the index metadata blobs they name -- a shard blob that no retained manifest references
             // any more is exactly as stale as a global-metadata or index-routing blob nothing keeps, and
             // needs the same keep/delete treatment or it simply accumulates forever.
@@ -280,11 +280,11 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     blobMetadata.name()
                 );
                 unreadableCodec.accumulateAndGet(clusterMetadataManifest.getCodecVersion(), Math::max);
-                // Plan item E5's own "transitive cleanup" fix: resolveIndices, not getIndices()
+                // The transitive half of the sharded-manifest cleanup: resolveIndices, not getIndices()
                 // directly. A sharded manifest's index list lives behind UploadedManifestShard
                 // references -- calling getIndices() here would compute an empty keep-set for every
                 // index the manifest actually references, and the very next thing this method does is
-                // delete everything not in that set. The C1 codec guard above already stops a node that
+                // delete everything not in that set. The unreadable-codec guard above already stops a node that
                 // cannot parse a future codec at all; this is the half that makes a node that *can*
                 // parse CODEC_V6 compute a correct keep-set rather than an empty one.
                 remoteManifestManager.resolveIndices(clusterMetadataManifest)

@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * The seam a mapping update goes through when the index has no cluster state entry.
  *
- * <p>Area H's H.7 in one interface. Today a document carrying a new field builds a
+ * <p>Today a document carrying a new field builds a
  * {@code PutMappingRequest} and submits it through {@code MetadataMappingService}, which resolves the
  * index with {@code Metadata#getIndexSafe} and therefore throws for a gated index. The same path serves
  * the explicit {@code PUT _mapping} API, so the constraint being removed is not "no dynamic fields" but
@@ -58,7 +58,7 @@ public final class MappingGenerationStore {
          *
          * <p><b>Null means absent, and only absent.</b> An implementation that cannot find out must throw,
          * not answer null: a caller that reads "could not find out" as "has no fields" merges onto empty,
-         * and T43 removed exactly that from the index-backed implementation. Callers that would rather
+         * and exactly that was removed from the index-backed implementation. Callers that would rather
          * degrade than fail decide so themselves.
          */
         MappingGeneration read(String indexUuid);
@@ -74,7 +74,7 @@ public final class MappingGenerationStore {
         /**
          * Removes an index's mapping, for an index that is being deleted.
          *
-         * <p>Deliberately not a default no-op. Until T47 this interface had no delete at all, so nothing
+         * <p>Deliberately not a default no-op. This interface originally had no delete at all, so nothing
          * ever removed a mapping and the store grew with every index that had ever existed rather than with
          * the live population -- the residency problem this whole area exists to remove, one level down. A
          * default would let the next implementation inherit that silently.
@@ -89,10 +89,10 @@ public final class MappingGenerationStore {
     /**
      * A mapping and the generation it was read at, which is what makes the swap safe.
      *
-     * <p><b>Each value is a field's whole definition, not its type.</b> It held the type alone until T15,
+     * <p><b>Each value is a field's whole definition, not its type.</b> It originally held the type alone,
      * and that shape was the reason gating had to refuse most real mappings: a definition naming a type and
      * carrying anything else -- {@code format}, {@code analyzer}, {@code ignore_above} -- had nowhere to put
-     * the rest, and an object field had nowhere to put its properties. T13 made those refusals honest after
+     * the rest, and an object field had nowhere to put its properties. Those refusals were made honest after
      * they were found silently dropping what they could not hold. Widening the value is what makes them
      * narrow, because the limitation was always this map rather than either caller.
      *
@@ -159,11 +159,11 @@ public final class MappingGenerationStore {
     /**
      * Writes the fields an index declared at creation, for an index that cannot yet have any.
      *
-     * <p>T41. A creation reached {@link #updateMapping}, whose first act is to read the current mapping so
+     * <p>A creation used to reach {@link #updateMapping}, whose first act is to read the current mapping so
      * it has something to merge onto. For a creation there is nothing to merge onto and there cannot be: the
      * UUID was generated moments earlier and has never been given to anyone, so the read is a blocking round
-     * trip whose answer is known to be "absent" before it is issued. T40 measured the index-backed store at
-     * at least about 80% of what a declared mapping costs a creation, and this is one of its two round
+     * trip whose answer is known to be "absent" before it is issued. Measurement put the index-backed store
+     * at at least about 80% of what a declared mapping costs a creation, and this is one of its two round
      * trips.
      *
      * <p>So the swap is attempted first, at generation 1, and the read-and-merge loop is kept as the
@@ -221,7 +221,7 @@ public final class MappingGenerationStore {
                 current = store.read(indexUuid);
                 lastReadFailure = null;
             } catch (RuntimeException e) {
-                // T43 stopped the store answering null for a read it could not perform, which means this
+                // The store no longer answers null for a read it could not perform, which means this
                 // loop now sees the failures it used to be lied to about. Retrying them is what keeps the
                 // change from being a regression: a mapping index shard relocating fails a read where the
                 // write path underneath would have retried, and the old code got its retries by accident --
@@ -282,7 +282,7 @@ public final class MappingGenerationStore {
     /**
      * The current mapping and its generation, or null when nothing is stored or no store is registered.
      *
-     * <p>Added for W15, which needs the fields rather than only the generation: a shard that discovers it is
+     * <p>Added for stale-shard refresh, which needs the fields rather than only the generation: a shard that discovers it is
      * behind has to merge the field it was missing, and a generation alone cannot tell it what type that
      * field is. {@link #currentGeneration} remains for callers that only need to know whether they are
      * stale.
@@ -295,11 +295,12 @@ public final class MappingGenerationStore {
     /**
      * The current mapping, refusing to answer "no fields" when a descriptor says otherwise.
      *
-     * <p>T59. T43 and T48 taught {@code Store.read} to tell absent from unreadable and absent from lost, but
-     * neither covers a third case: the index resolves, the store answers "no document", and a caller with no
-     * other information reports that as an index declaring no fields. That is exactly what a reader sees in
-     * the window between T47's deletion-time prune and the moment a stale-cache node stops resolving the
-     * deleted name -- T50 closed the write half of that window; this is the read half.
+     * <p>{@code Store.read} was taught to tell absent from unreadable and absent from lost, but neither
+     * distinction covers a third case: the index resolves, the store answers "no document", and a caller
+     * with no other information reports that as an index declaring no fields. That is exactly what a reader
+     * sees in the window between the deletion-time prune and the moment a stale-cache node stops resolving
+     * the deleted name -- the gated put-mapping refusal closed the write half of that window; this is the
+     * read half.
      *
      * <p>The fix needs no new record. {@link IndexDescriptor#mappingGeneration()} already carries what
      * settles it: a caller that resolved a descriptor to reach this point, and found it claiming generation
@@ -308,14 +309,16 @@ public final class MappingGenerationStore {
      * the two apart -- the store itself cannot, which is why this lives here rather than in {@code
      * Store.read}.
      *
-     * <p><b>Why a null answer is not the only shape of this.</b> T59 checked only for null, which was
-     * exhaustive while the registered store was the index-backed one: it had a document or it did not. T58
-     * made the descriptor itself the store, and a descriptor that resolves always answers -- with its own
-     * generation and its own fields, which for an index whose mapping is missing is generation 0 and no
-     * fields. That is the identical wrong answer arriving as a value rather than as a null, so the guard has
-     * to be stated over the generation rather than over the reference; written the narrow way it survived
-     * T58 as one more mechanism that is correct, tested, and no longer reachable by the path it was built
-     * for. A store *behind* what the caller's descriptor claims is the same inconsistency for the same
+     * <p><b>Why a null answer is not the only shape of this.</b> The first version of this guard checked
+     * only for null, which was
+     * exhaustive while the registered store was the index-backed one: it had a document or it did not.
+     * Making the descriptor itself the store changed that: a descriptor that resolves always answers -- with
+     * its own generation and its own fields, which for an index whose mapping is missing is generation 0 and
+     * no fields. That is the identical wrong answer arriving as a value rather than as a null, so the guard
+     * has to be stated over the generation rather than over the reference; written the narrow way it
+     * survived that change as one more mechanism that is correct, tested, and no longer reachable by the
+     * path it was built for.
+     * A store *behind* what the caller's descriptor claims is the same inconsistency for the same
      * reason: the caller resolved a descriptor at generation N, and a mapping at anything below N cannot
      * contain what generation N declared.
      *
@@ -346,7 +349,7 @@ public final class MappingGenerationStore {
      * Raised by {@link #currentMapping(String, long)} when a descriptor's generation says an index has a
      * mapping and the store holds nothing for it.
      *
-     * <p>Deliberately not swallowed anywhere this is thrown from: T43 removed exactly this shape of failure
+     * <p>Deliberately not swallowed anywhere this is thrown from: an earlier fix removed exactly this shape of failure
      * being caught and reported as "no fields", and a caller here would be reintroducing it one level up if
      * it caught this and returned null or false.
      */

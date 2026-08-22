@@ -86,11 +86,11 @@ public class GatedShardSuspensionTests extends OpenSearchTestCase {
         ClusterService clusterService = clusterServiceFor(state);
         ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(clusterService, mock(Client.class), 0L, false, registry);
 
-        assertNotNull("the premise: the shard is placed before it sleeps", AbsentIndexRoutingSuppliers.resolve(state, "gated").shard(1));
+        assertNotNull("the premise: the shard is placed before it sleeps", AbsentIndexRoutingSuppliers.supply(state, "gated", null).shard(1));
 
         coordinator.suspendWriterShard(GATED_UUID, 1);
 
-        IndexRoutingTable afterSuspension = AbsentIndexRoutingSuppliers.resolve(state, "gated");
+        IndexRoutingTable afterSuspension = AbsentIndexRoutingSuppliers.supply(state, "gated", null);
         assertNull("the suspended shard must no longer be placed", afterSuspension.shard(1));
         assertNotNull("and its siblings must be untouched", afterSuspension.shard(0));
     }

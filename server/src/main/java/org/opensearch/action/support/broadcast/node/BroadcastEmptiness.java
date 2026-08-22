@@ -35,8 +35,8 @@ import java.util.Set;
  * the shared base, after the subclass has already produced its answer.
  *
  * <p><b>Assert and warn rather than fail.</b> Failing the request would turn a degraded read into an
- * outage and reverse the choice Phase A made deliberately, which was that an unresolvable placement
- * degrades rather than throws. The assertion makes this loud in CI, which is where the mistake is
+ * outage and reverse the design choice made deliberately when absent-routing degradation was
+ * introduced: an unresolvable placement degrades rather than throws. The assertion makes this loud in CI, which is where the mistake is
  * introduced; the warning makes it findable in production, where the alternative is an operator
  * concluding their index is empty.
  *
@@ -61,8 +61,8 @@ public final class BroadcastEmptiness {
         Set<String> indicesWithShards
     ) {
         // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not
-        // clusterState.routingTable().indexRoutingResolver() != null (Phase C4b of
-        // core-pluggability-refactor-plan.md attempted that swap and a real test caught why it's wrong):
+        // clusterState.routingTable().indexRoutingResolver() != null (an earlier attempt swapped this
+        // for checking the attached resolver and a real test caught why that's wrong):
         // "a resolver is attached" is a node-lifetime-scoped fact, true for as long as a plugin implements
         // the SPI at all, while this guard needs "is the underlying feature *currently active*" -- a
         // dynamically-toggled fact the SupplierBackedIndexRoutingResolver bridge's own methods already

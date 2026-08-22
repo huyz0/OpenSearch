@@ -1051,15 +1051,14 @@ public abstract class TransportReplicationAction<
                 // Resolved, so that an index whose routing is computed rather than published finds its
                 // primary. Reading the table directly returns null here, the retry branch below fires on
                 // every attempt, and the write fails with "primary shard is not active" after the full
-                // request timeout. That is Phase A's pessimistic answer being given to a question that
-                // now has a better one.
+                // request timeout. That is the original absent-means-no-shards pessimistic answer being
+                // given to a question that now has a better one.
                 //
                 // The OrNull behaviour is preserved for the case with no supplier: an index present in
                 // metadata and absent from routing still reaches the retry branch rather than throwing,
-                // which is what Phase A wanted and what that branch already handled.
-                // Phase C4b of core-pluggability-refactor-plan.md: state.resolveShard(...) replaces
-                // AbsentIndexRoutingSuppliers.resolveShard(...) here -- same composition, discovered through
-                // the resolver attached to this state's own routing table.
+                // which is what the original design wanted and what that branch already handled.
+                // state.resolveShard(...) resolves through the resolver attached to this state's own
+                // routing table (replacing an earlier static-registry lookup) -- same composition.
                 final IndexShardRoutingTable shardRoutingTable = state.resolveShard(request.shardId());
                 final ShardRouting primary = shardRoutingTable == null ? null : shardRoutingTable.primaryShard();
                 if (primary == null || primary.active() == false) {

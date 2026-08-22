@@ -26,7 +26,7 @@ import java.util.Objects;
  * when nothing changed. Sharding the index list moves those entries into separate immutable blobs, so
  * a version rewrites only the shards holding a changed index and carries the rest forward by
  * reference. `ManifestShardingWriteAmplificationEstimate` measured that at 125x less written for a
- * single changed index at 256 shards. See `rfc-manifest-sharding-design.md`.
+ * single changed index at 256 shards.
  *
  * <p>This type is the reference itself, and it is deliberately the whole of the first slice: nothing
  * writes or reads a shard blob yet. The same order worked for the index descriptor -- serialize first,
@@ -106,7 +106,7 @@ public class UploadedManifestShard implements Writeable, ToXContentObject {
     }
 
     /**
-     * Hand-written rather than a {@code ConstructingObjectParser}, matching {@link IndexDescriptor}:
+     * Hand-written rather than a {@code ConstructingObjectParser}, matching {@link ManifestIndexDescriptor}:
      * unknown fields are skipped rather than rejected, so a shard reference written by a newer node
      * with extra fields still parses here.
      */

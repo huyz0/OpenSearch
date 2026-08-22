@@ -43,8 +43,8 @@ class ScaleIndexOperationValidator {
      * </ul>
      *
      * @param indexMetadata the metadata of the index to validate
-     * @param routingTable  the routing table {@code indexMetadata} was read alongside, consulted (Phase C4b
-     *                      of {@code core-pluggability-refactor-plan.md}) for whether this index's routing
+     * @param routingTable  the routing table {@code indexMetadata} was read alongside, consulted for
+     *                      whether this index's routing
      *                      is computed rather than published; {@link RoutingTable#EMPTY_ROUTING_TABLE} (or
      *                      any routing table with no resolver attached) is always safe to pass and answers
      *                      exactly as before this parameter existed.
@@ -75,10 +75,9 @@ class ScaleIndexOperationValidator {
             // cluster state applier thread, so the failure landed in an applier rather than in the
             // request that caused it. The scale-up path was worse in a quieter way: a null guard meant it
             // built a routing table with no trace of the index and reported success.
-            // Phase C4b of core-pluggability-refactor-plan.md: routingTable.shouldPublishRouting(...)
-            // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- the same predicate,
-            // discovered through the resolver attached to this call's own routing table instead of the
-            // static registry.
+            // routingTable.shouldPublishRouting(...) resolves through the resolver attached to this
+            // call's own routing table (replacing an earlier static-registry lookup) -- the same
+            // predicate.
             if (routingTable.shouldPublishRouting(indexMetadata) == false) {
                 throw new IllegalArgumentException(
                     "Index ["

@@ -115,20 +115,20 @@ public class DescriptorLifecycleIT extends org.opensearch.serverless.storage.Ser
 
         // 6. Asleep. H9c: a computed index never reaches the allocator, so suspension has to be an input to
         // placement rather than a verdict handed to one.
-        assertNotNull("the premise: the shard is placed while awake", AbsentIndexRoutingSuppliers.resolve(stateWithoutIt, INDEX).shard(1));
+        assertNotNull("the premise: the shard is placed while awake", stateWithoutIt.getIndexRoutingTable(INDEX).shard(1));
         suspensions.suspend(UUID, 1);
         assertNull(
             "a suspended gated shard must stop being placed, which is the only definition of asleep "
                 + "available to an index whose routing is computed",
-            AbsentIndexRoutingSuppliers.resolve(stateWithoutIt, INDEX).shard(1)
+            stateWithoutIt.getIndexRoutingTable(INDEX).shard(1)
         );
-        assertNotNull("and its siblings must be untouched", AbsentIndexRoutingSuppliers.resolve(stateWithoutIt, INDEX).shard(0));
+        assertNotNull("and its siblings must be untouched", stateWithoutIt.getIndexRoutingTable(INDEX).shard(0));
 
         // 7. Awake again, on the next read, with no republication because there is nothing to republish.
         suspensions.reactivate(UUID, 1);
         assertNotNull(
             "waking must take effect on the next resolution",
-            AbsentIndexRoutingSuppliers.resolve(stateWithoutIt, INDEX).shard(1)
+            stateWithoutIt.getIndexRoutingTable(INDEX).shard(1)
         );
 
         // 8. Deleted as a tombstone. H4b: absence cannot be told apart from not having looked, so a node

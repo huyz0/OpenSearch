@@ -173,9 +173,9 @@ public final class ActiveShardCount implements Writeable {
             }
             // Resolution, not a raw lookup. An index whose placement is computed publishes no routing
             // entry, so reading the table directly finds nothing, counts zero active shards, and the
-            // create API waits forever for shards that were never going to be published. That is what
-            // C12 hit: creation hung until the twenty-minute suite timeout. Counting has to consult the
-            // supplier the same way routing resolution does.
+            // create API waits forever for shards that were never going to be published. A real
+            // integration run hit exactly this: creation hung until the twenty-minute suite timeout.
+            // Counting has to consult the supplier the same way routing resolution does.
             final IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(indexName);
             if (indexRoutingTable == null && indexMetadata.getState() == IndexMetadata.State.CLOSE) {
                 // its possible the index was closed while waiting for active shard copies,
@@ -192,7 +192,7 @@ public final class ActiveShardCount implements Writeable {
                 // listener rather than the request.
                 // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not
                 // clusterState.routingTable().indexRoutingResolver() != null -- see BroadcastEmptiness#check's
-                // own comment (Phase C4b of core-pluggability-refactor-plan.md) for why the two are not
+                // own comment for why the two are not
                 // equivalent: a resolver being attached is a node-lifetime-scoped fact, not the dynamically
                 // toggled "is the underlying feature active" question this assertion actually needs.
                 assert AbsentIndexRoutingSuppliers.isRegistered() : "open index [" + indexName + "] has no routing entry";

@@ -17,7 +17,7 @@ import org.opensearch.cluster.service.ClusterService;
 import java.util.Optional;
 
 /**
- * Phase C of {@code core-pluggability-refactor-plan.md}: the one attachment point that gives a node's
+ * The one attachment point that gives a node's
  * {@link Metadata}/{@link RoutingTable} their plugin-supplied {@link IndexMetadataResolver}/{@link
  * IndexRoutingResolver}, if any {@code ClusterPlugin} on this node provides one.
  *

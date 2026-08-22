@@ -93,7 +93,7 @@ public class TransportGetIngestionStateActionTests extends OpenSearchTestCase {
         ShardsIterator shardsIterator = mock(ShardsIterator.class);
         // Phase C4b of core-pluggability-refactor-plan.md: TransportGetIngestionStateAction#shards now
         // calls ClusterState#allShards(String[], Predicate, boolean) directly instead of
-        // AbsentIndexRoutingSuppliers.allShards(state, ...), which itself used to read
+        // the since-deleted AbsentIndexRoutingSuppliers.allShards(state, ...), which itself used to read
         // state.routingTable().allShardsSatisfyingPredicate(...) on the unregistered fast path. Stubbing
         // the old RoutingTable-level method here would stub a call this mock's own
         // ClusterState#allShards never makes, so the new method is stubbed directly.

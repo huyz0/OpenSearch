@@ -203,16 +203,16 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
                         null
                     );
                     // A gated rollover target used to be computed off the state update thread here, on the
-                    // grounds that a gated creation has no cluster state to publish. The serverless namespace
-                    // ended that: a rollover target needs the alias it is rolled over by, and an index in the
-                    // namespace may not carry one, so no rollover target can be gated. B2, answered.
+                    // grounds that a gated creation has no cluster state to publish. The plugin-claimed
+                    // namespace ended that: a rollover target needs the alias it is rolled over by, and an
+                    // index in that namespace may not carry one, so no rollover target can be gated.
                     //
                     // Worth stating what went with it, because it was not only dead. The condition read the
                     // gating *setting*, which an index can carry without being gated -- a data stream backing
-                    // index, or any alias-bearing index using serverless storage. For those this branch ran
-                    // the rollover, discarded the cluster state it computed, and answered acknowledged: a
-                    // rollover that silently did nothing. Nothing measured it, because the tests that
-                    // exercised this path used indices that really were gated.
+                    // index, or any alias-bearing index using the plugin-managed storage. For those this
+                    // branch ran the rollover, discarded the cluster state it computed, and answered
+                    // acknowledged: a rollover that silently did nothing. Nothing measured it, because the
+                    // tests that exercised this path used indices that really were gated.
                     clusterService.submitStateUpdateTask(
                         "rollover_index source [" + sourceIndexName + "] to target [" + rolloverIndexName + "]",
                         new ClusterStateUpdateTask() {

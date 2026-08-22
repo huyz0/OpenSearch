@@ -71,7 +71,7 @@ public class TieringRequestValidator {
             //
             // Without this the index was still refused, by validateIndexHealth returning false for an
             // absent routing entry, and reported as "index is red" while being perfectly available.
-            // Phase C4b of core-pluggability-refactor-plan.md: currentState.routingTable().shouldPublishRouting(...)
+            // currentState.routingTable().shouldPublishRouting(...)
             // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate,
             // discovered through the resolver attached to this state's own routing table.
             if (currentState.routingTable().shouldPublishRouting(currentState.metadata().index(index)) == false) {

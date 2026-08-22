@@ -72,7 +72,8 @@ public class RestIndexAction extends BaseRestHandler {
     }
 
     /**
-     * See rfc-serverless-opensearch.md &sect;15's "operational caveat" note. Both {@link
+     * A core API a restricted deployment needs to function at all, so declared available explicitly.
+     * Both {@link
      * CreateHandler} and {@link AutoIdHandler} extend this class without overriding {@link
      * #apiAvailabilityScope()}, so they inherit {@code AVAILABLE} from here too.
      */
