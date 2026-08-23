@@ -36,6 +36,7 @@ import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.action.index.NodeMappingRefreshAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.decommission.DecommissionAttributeMetadata;
+import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
 import org.opensearch.cluster.metadata.ComponentTemplateMetadata;
 import org.opensearch.cluster.metadata.ComposableIndexTemplateMetadata;
 import org.opensearch.cluster.metadata.DataStreamMetadata;
@@ -116,9 +117,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /**
  * Configures classes and services that affect the entire cluster.
@@ -145,6 +148,7 @@ public class ClusterModule extends AbstractModule {
     final ShardsAllocator shardsAllocator;
     private final ClusterManagerMetrics clusterManagerMetrics;
     private final Class<? extends ShardStateAction> shardStateActionClass;
+    private final ClaimedIndexLifecycle claimedIndexLifecycle;
 
     public ClusterModule(
         Settings settings,
@@ -172,6 +176,19 @@ public class ClusterModule extends AbstractModule {
         );
         this.clusterManagerMetrics = clusterManagerMetrics;
         this.shardStateActionClass = shardStateActionClass;
+        // The one plugin-supplied removal of an index's out-of-cluster-state record, resolved here rather
+        // than in Node.java's block of registrations because unlike IndexCatalog and IndexCreationStrategy
+        // this one has an injectable caller: MetadataDeleteIndexService is bound below, so the plane can be
+        // a constructor argument and needs no static holder. See ClaimedIndexLifecycle's own javadoc.
+        List<ClaimedIndexLifecycle> lifecycles = clusterPlugins.stream()
+            .map(ClusterPlugin::getClaimedIndexLifecycle)
+            .filter(Optional::isPresent)
+            .map(Optional::get)
+            .collect(Collectors.toList());
+        if (lifecycles.size() > 1) {
+            throw new IllegalStateException("at most one ClusterPlugin may supply a ClaimedIndexLifecycle, but found " + lifecycles.size());
+        }
+        this.claimedIndexLifecycle = lifecycles.isEmpty() ? ClaimedIndexLifecycle.NOOP : lifecycles.get(0);
     }
 
     public static List<Entry> getNamedWriteables() {
@@ -469,6 +486,7 @@ public class ClusterModule extends AbstractModule {
         bind(AllocationService.class).toInstance(allocationService);
         bind(ClusterService.class).toInstance(clusterService);
         bind(NodeConnectionsService.class).asEagerSingleton();
+        bind(ClaimedIndexLifecycle.class).toInstance(claimedIndexLifecycle);
         bind(MetadataDeleteIndexService.class).asEagerSingleton();
         bind(MetadataIndexStateService.class).asEagerSingleton();
         bind(MetadataMappingService.class).asEagerSingleton();

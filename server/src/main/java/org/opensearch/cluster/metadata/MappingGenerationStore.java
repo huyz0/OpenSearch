@@ -370,20 +370,6 @@ public final class MappingGenerationStore {
         }
     }
 
-    /**
-     * Removes an index's mapping, if a store is installed.
-     *
-     * <p>Failures propagate. The deletion path calls this after the index's tombstone is durable and
-     * treats a failure as a stranded document rather than a failed deletion, which is that caller's
-     * decision to make and not this seam's.
-     */
-    public static void deleteMapping(String indexUuid) {
-        Store store = STORE.get();
-        if (store != null) {
-            store.delete(indexUuid);
-        }
-    }
-
     /** The current generation, for a caller deciding whether its cached mapping is stale. */
     public static long currentGeneration(String indexUuid) {
         Store store = STORE.get();

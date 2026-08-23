@@ -13,7 +13,6 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DescriptorPrefetch;
-import org.opensearch.cluster.metadata.DurableTombstones;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
@@ -261,52 +260,16 @@ public final class DescriptorGate {
             // the creator, the updater, the mapping compare-and-swap and the tombstone writer, and all four
             // record.
         });
-        // The durable half of deletion, which had a hook in MetadataDeleteIndexService and no registrar, so
-        // every gated delete acknowledged with nothing durable behind it.
+        // The durable half of deletion is not registered here any more. It had a hook in
+        // MetadataDeleteIndexService and no registrar, so every gated delete acknowledged with nothing
+        // durable behind it; that is fixed, and the fix now lives in DescriptorBackedIndexLifecycle, which
+        // the plugin hands core through ClusterPlugin#getClaimedIndexLifecycle() rather than through a
+        // static registry. Its body -- the grouped tombstone writes, the change log entry, and the
+        // stored-mapping prune that used to sit in core after the acknowledgement -- moved verbatim.
         //
-        // The publisher above is fire-and-forget by necessity: it runs inside cluster state construction,
-        // where blocking deadlocks. That is fine for a creation, whose index is in cluster state anyway, and
-        // not fine for a tombstone. For a gated index there is no cluster state entry and no graveyard entry
-        // standing behind the tombstone, so losing it means a node holding that shard's data can adopt it
-        // again on rejoin -- the resurrection IndexGraveyard exists to prevent, reintroduced.
-        //
-        // This runs after the state is committed and before the client is told the delete succeeded, which
-        // is the one window where a write can be both off the cluster state thread and ahead of the
-        // acknowledgement. Nothing blocks; the acknowledgement is deferred, not waited on.
-        DurableTombstones.register((deleted, whenStored) -> {
-            if (deleted.isEmpty()) {
-                whenStored.onResponse(null);
-                return;
-            }
-            // Grouped so the acknowledgement waits for all of them and reports the first failure. A delete
-            // naming several indices is not durable until the last tombstone is.
-            org.opensearch.core.action.ActionListener<Void> perTombstone = new org.opensearch.action.support.GroupedActionListener<>(
-                org.opensearch.core.action.ActionListener.wrap(ignored -> whenStored.onResponse(null), whenStored::onFailure),
-                deleted.size()
-            );
-            for (org.opensearch.cluster.metadata.IndexMetadata metadata : deleted) {
-                IndexDescriptor tombstone = IndexDescriptor.from(metadata).tombstoned(System.currentTimeMillis());
-                // The change log entry for a deletion, which had no writer at all until now, and its absence
-                // was the worst of the five.
-                //
-                // The publisher above has an exists()==false branch that records a DELETED, and nothing
-                // reaches it: publish() is only ever called with metadata for an index that is in cluster
-                // state, and an all-gated delete does not go through a cluster state update in the first
-                // place -- MetadataDeleteIndexService.deleteGatedIndices writes the tombstone and
-                // acknowledges. So no node was ever told that a gated index had been deleted. Every other
-                // node went on resolving it from cache as live for the whole freshness window, a minute by
-                // default, and *accepted acknowledged writes against a deleted index* for that long. It also
-                // left DescriptorChangeTailer's delete-driven shard release unreachable in production, so
-                // the only thing closing those shards was the periodic sweep.
-                //
-                // Recorded after the write is durable rather than beside it, because an entry for a
-                // tombstone that never landed would have other nodes drop a live index's shards.
-                store.putTombstoneAsync(tombstone, org.opensearch.core.action.ActionListener.wrap(ignored -> {
-                    recordChange(tombstone);
-                    perTombstone.onResponse(null);
-                }, perTombstone::onFailure));
-            }
-        });
+        // Nothing to install and nothing to clear: it reads installedStore() live, so it is armed exactly
+        // when this gate is, which is the same lifetime the registration gave it.
+
         // T18. The creator is a separate registration from the publisher because the two have opposite
         // failure semantics, and T17 and T23 are what happened while one stood in for the other. The
         // publisher records an index that already exists in cluster state, so a lost write costs a
@@ -583,6 +546,16 @@ public final class DescriptorGate {
         return INSTALLED_MAPPING_STORE.get();
     }
 
+    /**
+     * The installed descriptor store, for the operations in this package that write through it without being
+     * registered into a static seam of their own. Null when nothing is installed, which is how {@link
+     * DescriptorBackedIndexLifecycle} tells "the feature is off" from "there is a store to tombstone into" --
+     * read live on every call, never captured, for the reason {@code WILDCARD_EXPANSION_LIMIT} states above.
+     */
+    static DescriptorBackend installedStore() {
+        return STORE.get();
+    }
+
     /** Installs the change log. Passing null clears it, matching every other registration here. */
     public static void setChangeFeed(BlobDescriptorChangeLog changeLog) {
         CHANGE_LOG.set(changeLog);
@@ -665,11 +638,13 @@ public final class DescriptorGate {
      *
      * <p>Here rather than there because the change log is this class's to own -- it is what {@link
      * #setChangeFeed} installs and what {@link #uninstall} clears -- and a second holder of it would be a
-     * second thing to keep in step. The one caller outside this class is
+     * second thing to keep in step. The callers outside this class are
      * {@link DescriptorBackedMappingStore}, whose compare-and-swap is the fifth descriptor write path and
      * the last one that recorded nothing: a dynamic field added on one node left every other node's cached
      * descriptor claiming the older mapping generation for the whole freshness window, which is what
-     * {@code StoreBackedFieldRefresher} then has to discover the hard way.
+     * {@code StoreBackedFieldRefresher} then has to discover the hard way; and {@link
+     * DescriptorBackedIndexLifecycle}, which records a deletion the moment its tombstone is durable and
+     * which reached this same code through a lambda registered here until deletion became one operation.
      */
     static void recordWrite(IndexDescriptor descriptor) {
         recordChange(descriptor);
@@ -726,7 +701,6 @@ public final class DescriptorGate {
         // otherwise decide the behaviour of every suite that ran after it in the same JVM.
         WILDCARD_EXPANSION_LIMIT.set(DEFAULT_WILDCARD_EXPANSION_LIMIT);
         IndexDescriptorPublisher.register(null);
-        DurableTombstones.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         IndexDescriptorPublisher.registerUpdater(null);
         // Before the registration is cleared, and before the node this belongs to finishes closing: a

@@ -32,6 +32,7 @@
 
 package org.opensearch.plugins;
 
+import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
 import org.opensearch.cluster.metadata.IndexCatalog;
 import org.opensearch.cluster.metadata.IndexCreationStrategy;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -124,6 +125,23 @@ public interface ClusterPlugin {
      * @opensearch.experimental
      */
     default Optional<IndexCreationStrategy> getIndexCreationStrategy() {
+        return Optional.empty();
+    }
+
+    /**
+     * The plugin-owned removal of an index's out-of-cluster-state record, performed as one operation when
+     * core deletes an index -- see {@link ClaimedIndexLifecycle}'s own javadoc for the shape and for the
+     * acknowledgement contract it carries. Replaces the pair of static seams deletion used to reach ({@code
+     * DurableTombstones} and {@code MappingGenerationStore.deleteMapping}), which between them had core
+     * running a storage-plane deletion protocol of its own.
+     *
+     * <p>Empty by default, so a node without this plugin deletes indices exactly as it always has. At most
+     * one plugin per node may supply one; {@code ClusterModule} enforces that and injects it into {@code
+     * MetadataDeleteIndexService}.
+     *
+     * @opensearch.experimental
+     */
+    default Optional<ClaimedIndexLifecycle> getClaimedIndexLifecycle() {
         return Optional.empty();
     }
 

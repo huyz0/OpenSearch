@@ -1270,7 +1270,7 @@ public class MetadataIndexStateService {
      *
      * <p>Nothing blocks. {@link IndexDescriptorPublisher#updateGated} runs the read-modify-write on the
      * store's own executor and completes the listener from there; this thread only hands the work over. That
-     * is the same arrangement {@code DurableTombstones} uses for a deletion's tombstone.
+     * is the same arrangement {@code ClaimedIndexLifecycle} uses for a deletion's record.
      *
      * <p><b>Why the new state is a mutation rather than a descriptor.</b>
      *

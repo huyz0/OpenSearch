@@ -139,6 +139,7 @@ import org.opensearch.cluster.coordination.MockSinglePrioritizingExecutor;
 import org.opensearch.cluster.coordination.PersistedStateRegistry;
 import org.opensearch.cluster.coordination.PersistedStateRegistry.PersistedStateType;
 import org.opensearch.cluster.metadata.AliasValidator;
+import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.MetadataCreateIndexService;
@@ -2238,7 +2239,8 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                 final MetadataDeleteIndexService metadataDeleteIndexService = new MetadataDeleteIndexService(
                     settings,
                     clusterService,
-                    allocationService
+                    allocationService,
+                    ClaimedIndexLifecycle.NOOP
                 );
                 final MetadataIndexAliasesService metadataIndexAliasesService = new MetadataIndexAliasesService(
                     clusterService,

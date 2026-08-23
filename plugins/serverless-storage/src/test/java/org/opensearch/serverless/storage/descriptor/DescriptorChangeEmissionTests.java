@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.Version;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
-import org.opensearch.cluster.metadata.DurableTombstones;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -18,7 +17,6 @@ import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.mapper.UnknownFieldRefresh;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
@@ -149,12 +147,9 @@ public class DescriptorChangeEmissionTests extends OpenSearchTestCase {
     public void testAGatedDeleteIsRecordedAsDeleted() throws Exception {
         assertTrue(IndexDescriptorPublisher.createGated(metadata("serverless_tenant-doomed")).get(10, TimeUnit.SECONDS));
 
-        CompletableFuture<Void> durable = new CompletableFuture<>();
-        DurableTombstones.whenDurable(
-            List.of(metadata("serverless_tenant-doomed")),
-            ActionListener.wrap(ignored -> durable.complete(null), durable::completeExceptionally)
-        );
-        durable.get(10, TimeUnit.SECONDS);
+        new DescriptorBackedIndexLifecycle().removeIndices(List.of(metadata("serverless_tenant-doomed")))
+            .toCompletableFuture()
+            .get(10, TimeUnit.SECONDS);
 
         assertTrue(
             "a delete must be recorded, or other nodes serve the live descriptor until their window expires",

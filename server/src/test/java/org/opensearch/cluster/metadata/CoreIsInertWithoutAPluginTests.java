@@ -59,7 +59,6 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         DescriptorPrefetch.register(null);
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
-        DurableTombstones.register(null);
         GatedIndexRelease.register(null);
         MappingGenerationStore.register(null);
         UnknownFieldRefresh.register(null);
@@ -98,7 +97,6 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         assertFalse("computed routing", AbsentIndexRoutingSuppliers.isRegistered());
         assertFalse("the descriptor prefetcher", DescriptorPrefetch.isRegistered());
         assertFalse("the descriptor publisher", IndexDescriptorPublisher.isRegistered());
-        assertFalse("the durable tombstone writer", DurableTombstones.isRegistered());
         assertFalse("the gated index releaser", GatedIndexRelease.isRegistered());
         assertFalse("the mapping generation store", MappingGenerationStore.isRegistered());
         assertFalse("the unknown field refresher", UnknownFieldRefresh.isRegistered());
@@ -172,8 +170,13 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         DescriptorPrefetch.prefetch(List.of("a", "b"), ActionListener.wrap(ignored -> prefetched.set(true), e -> {}));
         assertTrue("an unregistered prefetch must complete inline and not block the bulk path", prefetched.get());
 
+        // Deletion's seam is not a static registry any more -- it is injected, and a node with no plugin
+        // supplying one is given ClaimedIndexLifecycle.NOOP by ClusterModule. So the stock-node condition
+        // here is that constant rather than a cleared registry, and what must hold of it is the same thing
+        // that had to hold of an unregistered DurableTombstones.Writer: the acknowledgement is not deferred.
         AtomicBoolean acknowledged = new AtomicBoolean();
-        DurableTombstones.whenDurable(List.of(anIndex("ordinary")), ActionListener.wrap(ignored -> acknowledged.set(true), e -> {}));
+        ClaimedIndexLifecycle.NOOP.removeIndices(List.of(anIndex("ordinary")))
+            .whenComplete((ignored, failure) -> acknowledged.set(failure == null));
         assertTrue("an ordinary delete has the graveyard behind it and must not wait on a descriptor", acknowledged.get());
     }
 

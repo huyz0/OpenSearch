@@ -75,11 +75,11 @@ public class DescriptorGateReachabilityTests extends OpenSearchTestCase {
             DescriptorPrefetch.isRegistered()
         );
         assertTrue("the creation gate", DescriptorOnlyCreation.isRegistered());
-        assertTrue(
-            "the durable tombstone writer, which had its hook in MetadataDeleteIndexService from the start "
-                + "and no registrar, so every gated delete acknowledged with nothing durable behind it",
-            org.opensearch.cluster.metadata.DurableTombstones.isRegistered()
-        );
+        // The durable half of deletion had its hook in MetadataDeleteIndexService from the start and no
+        // registrar, so every gated delete acknowledged with nothing durable behind it. It is no longer a
+        // registration to forget: DescriptorBackedIndexLifecycle reads the installed store live, so the
+        // thing that has to be true after install is that there is a store for it to find.
+        assertNotNull("the store the removal operation writes tombstones through", DescriptorGate.installedStore());
         assertTrue("the mapping store", MappingGenerationStore.isRegistered());
         assertTrue("the unknown field refresher", UnknownFieldRefresh.isRegistered());
     }
@@ -92,7 +92,7 @@ public class DescriptorGateReachabilityTests extends OpenSearchTestCase {
         assertFalse(AbsentIndexDescriptorSuppliers.isExpanderRegistered());
         assertFalse("a prefetcher left behind would outlive the plugin that installed it", DescriptorPrefetch.isRegistered());
         assertFalse(DescriptorOnlyCreation.isRegistered());
-        assertFalse(org.opensearch.cluster.metadata.DurableTombstones.isRegistered());
+        assertNull("a store left behind would let a removal write through a closed node's client", DescriptorGate.installedStore());
         assertFalse(MappingGenerationStore.isRegistered());
         assertFalse(UnknownFieldRefresh.isRegistered());
     }

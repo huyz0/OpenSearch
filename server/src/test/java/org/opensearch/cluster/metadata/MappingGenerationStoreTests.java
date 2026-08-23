@@ -253,19 +253,20 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         assertNull(store.byUuid.get("idx"));
     }
 
-    /** Removing a mapping that was never written is not an error, since the caller cannot know. */
+    /**
+     * Removing a mapping that was never written is not an error, since the caller cannot know.
+     *
+     * <p>Asserted against {@link MappingGenerationStore.Store#delete} directly rather than through a static
+     * entry point on this class. The one core caller of that entry point was the deletion path, and deletion
+     * now reaches a store through {@link ClaimedIndexLifecycle} instead -- so the contract that survives is
+     * the one this interface states, which is what an implementer has to honour.
+     */
     public void testDeletingAMappingThatWasNeverWrittenIsNotAnError() {
         InMemoryStore store = new InMemoryStore();
-        MappingGenerationStore.register(store);
 
-        MappingGenerationStore.deleteMapping("never-written");
+        store.delete("never-written");
 
         assertNull(store.read("never-written"));
-    }
-
-    /** With no store installed, deleting is a no-op rather than an exception, like every other entry. */
-    public void testDeletingWithoutAStoreDoesNothing() {
-        MappingGenerationStore.deleteMapping("idx");
     }
 
     /**
@@ -355,7 +356,7 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         MappingGenerationStore.register(store);
         MappingGenerationStore.updateMapping("idx", Map.of("age", "long"));
 
-        MappingGenerationStore.deleteMapping("idx");
+        store.delete("idx");
 
         assertNull("a deleted mapping must not be readable, or nothing was pruned", store.read("idx"));
     }

@@ -230,8 +230,9 @@ public interface DescriptorBackend {
      *
      * <p>Needed because a tombstone is the one descriptor write that is not safe to lose. For a gated index
      * there is no cluster state entry and no graveyard entry standing behind it, so if the tombstone is lost
-     * a node holding that shard's data can adopt it again on rejoin. {@code DurableTombstones} defers the
-     * deletion's acknowledgement until this completes, which is the only window where the write can be both
+     * a node holding that shard's data can adopt it again on rejoin. {@code DescriptorBackedIndexLifecycle}
+     * defers the deletion's acknowledgement until this completes, which is the only window where the write
+     * can be both
      * off the cluster state thread and ahead of the client being told the delete succeeded.
      *
      * <p>Must fail the listener rather than complete it when the write cannot be made. A delete that could

@@ -185,7 +185,7 @@ public final class IndexDescriptorPublisher {
      * a request handler deferring its acknowledgement actually wants.
      *
      * <p>Nothing blocks: the listener is completed from whichever thread completes the write. That is the
-     * same arrangement {@link DurableTombstones} uses to make a deletion's acknowledgement wait for its
+     * same arrangement {@link ClaimedIndexLifecycle} uses to make a deletion's acknowledgement wait for its
      * tombstone, and it is the only way a caller on a thread that must not block can still refuse to
      * acknowledge a change that did not happen.
      *

@@ -84,7 +84,7 @@ public class MetadataDeleteIndexServiceTests extends OpenSearchTestCase {
         when(allocationService.reroute(any(ClusterState.class), any(String.class))).thenAnswer(
             mockInvocation -> mockInvocation.getArguments()[0]
         );
-        service = new MetadataDeleteIndexService(Settings.EMPTY, mock(ClusterService.class), allocationService);
+        service = new MetadataDeleteIndexService(Settings.EMPTY, mock(ClusterService.class), allocationService, ClaimedIndexLifecycle.NOOP);
     }
 
     public void testDeleteMissing() {

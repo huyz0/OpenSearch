@@ -32,9 +32,10 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  *   <li>Deletion mechanics are already generic, plugin-independent infrastructure: {@link
  *       MetadataDeleteIndexService} never consults {@code DescriptorOnlyCreation} at all (gated deletion is
  *       decided entirely by the {@code Metadata#indexOrResolved} null-ness signal), and the actual
- *       tombstone write is handed off through {@code DurableTombstones}'s own {@code register(Writer)}
- *       static hook -- a working, already-appropriately-scoped extension point this interface would have
- *       duplicated, not replaced.
+ *       removal of an index's out-of-cluster-state record is handed off whole through {@code
+ *       ClaimedIndexLifecycle} -- a working, already-appropriately-scoped extension point this interface
+ *       would have duplicated, not replaced. (It was two static hooks, {@code DurableTombstones} and
+ *       {@code MappingGenerationStore.deleteMapping}, when this paragraph was first written.)
  *   <li>Creation mechanics are the same story: {@code MetadataCreateIndexService#createGatedIndex}'s actual
  *       body (off-cluster-manager-thread admission, {@code applyCreateIndexRequest} validation, {@code
  *       op_type=create} atomicity reasoning, GENERIC-threadpool dispatch to avoid blocking a transport
@@ -117,7 +118,7 @@ public interface IndexCreationStrategy {
      * attribute a plugin recognizes. When this answers {@code true}, the index belongs to this strategy's
      * plane: {@code MetadataCreateIndexService}'s creation, deletion, and shard-lifecycle handling for it
      * follow whatever generic hooks that behavior already runs through ({@code IndexDescriptorPublisher},
-     * {@code DurableTombstones}, {@code Metadata#indexOrResolved}) rather than the ordinary cluster-state
+     * {@code ClaimedIndexLifecycle}, {@code Metadata#indexOrResolved}) rather than the ordinary cluster-state
      * -entry path.
      *
      * <p>Defaults to {@link #claims(String)} -- every real implementation of this interface answers this

@@ -9,6 +9,7 @@
 package org.opensearch.serverless.storage;
 
 import org.opensearch.cluster.NamedDiff;
+import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
 import org.opensearch.cluster.metadata.IndexCatalog;
 import org.opensearch.cluster.metadata.IndexCreationStrategy;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -53,6 +54,7 @@ import org.opensearch.serverless.storage.allocation.SuspendedShardAllocationDeci
 import org.opensearch.serverless.storage.compaction.CompactionPolicy;
 import org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor;
 import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
+import org.opensearch.serverless.storage.descriptor.DescriptorBackedIndexLifecycle;
 import org.opensearch.serverless.storage.descriptor.ServerlessGatedIndexResidencyPolicy;
 import org.opensearch.serverless.storage.descriptor.SupplierBackedIndexCreationStrategy;
 import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
@@ -3147,6 +3149,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     @Override
     public Optional<IndexCreationStrategy> getIndexCreationStrategy() {
         return Optional.of(new SupplierBackedIndexCreationStrategy());
+    }
+
+    /**
+     * The removal half of a deleted index's descriptor-plane record -- the durable tombstone and the
+     * stored-mapping prune -- as one operation core performs rather than two seams core sequences. See
+     * {@link org.opensearch.serverless.storage.descriptor.DescriptorBackedIndexLifecycle} for what moved
+     * into it and from where.
+     *
+     * <p>Returned unconditionally, for the same reason {@link #getIndexCatalog()} is: the object is
+     * node-lifetime and {@code DescriptorGate} is what fills and empties underneath it. With the gate
+     * uninstalled -- an ordinary node, or one with descriptor gating switched off -- there is no store to
+     * tombstone into and the operation completes at once, which is exactly what an unregistered {@code
+     * DurableTombstones.Writer} used to answer.
+     */
+    @Override
+    public Optional<ClaimedIndexLifecycle> getClaimedIndexLifecycle() {
+        return Optional.of(new DescriptorBackedIndexLifecycle());
     }
 
     /**

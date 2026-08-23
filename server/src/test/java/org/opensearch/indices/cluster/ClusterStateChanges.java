@@ -70,6 +70,7 @@ import org.opensearch.cluster.block.ClusterBlock;
 import org.opensearch.cluster.coordination.JoinTaskExecutor;
 import org.opensearch.cluster.coordination.NodeRemovalClusterStateTaskExecutor;
 import org.opensearch.cluster.metadata.AliasValidator;
+import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
@@ -296,7 +297,12 @@ public class ClusterStateChanges {
             transportVerifyShardBeforeCloseAction,
             transportVerifyShardIndexBlockAction
         );
-        MetadataDeleteIndexService deleteIndexService = new MetadataDeleteIndexService(SETTINGS, clusterService, allocationService);
+        MetadataDeleteIndexService deleteIndexService = new MetadataDeleteIndexService(
+            SETTINGS,
+            clusterService,
+            allocationService,
+            ClaimedIndexLifecycle.NOOP
+        );
 
         final AwarenessReplicaBalance awarenessReplicaBalance = new AwarenessReplicaBalance(SETTINGS, clusterService.getClusterSettings());
 

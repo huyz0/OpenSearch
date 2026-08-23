@@ -150,8 +150,8 @@ public class MetadataIndexAliasesService {
      *
      * <p>Nothing blocks. The futures complete on the descriptor store's own executor and the listener is
      * completed from there, which is what lets a write be both off the cluster state thread and ahead of the
-     * client being told the request succeeded -- the same window {@code DurableTombstones} uses for a
-     * deletion's tombstone.
+     * client being told the request succeeded -- the same window {@code ClaimedIndexLifecycle} uses for a
+     * deletion's record.
      */
     private static void whenGatedAliasWritesLand(
         final List<java.util.concurrent.CompletableFuture<Boolean>> writes,
