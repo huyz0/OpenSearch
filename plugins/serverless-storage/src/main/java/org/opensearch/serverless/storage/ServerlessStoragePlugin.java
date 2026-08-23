@@ -2419,14 +2419,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * mismatch can be caught. Failing here costs an unrecoverable shard with an explicit reason instead of a shard
      * that recovers wrongly, which is the direction this plugin fails in everywhere else.
      *
-     * <p><b>Upgrade hazard this deliberately surfaces rather than hides.</b> The setting is injected at index
-     * creation, so a serverless index created before {@code index.recovery.strategy} existed carries no value and
-     * reads the {@code local-lucene} default -- and this refuses to open it. That refusal is correct: core's
-     * strategy genuinely cannot recover such a shard, so opening it would be the silent wrong answer. But it means
-     * a cluster carrying pre-existing serverless indices needs those indices' settings updated before this change
-     * reaches it. No released build has such indices today, which is why this throws now rather than carrying a
-     * compatibility shim for a case that cannot yet exist; if that stops being true, the fix is an index-metadata
-     * upgrader that back-fills the setting, not loosening this check.
+     * <p><b>This is the backstop, not the primary check.</b> A mismatch is refused at index creation by
+     * {@code ServerlessStorageRecoveryStrategyValidator}, which is the only moment it can still be repaired --
+     * both settings are final afterwards, so there is no fix short of deleting the index. This check remains
+     * because creation is not the only way a shard arrives: an index restored, or created on a node whose
+     * plugin set differs, reaches here without passing that validator. It should be unreachable, and if it
+     * ever fires it is reporting a genuine invariant break rather than an operator mistake.
+     *
+     * <p><b>The one case it is expected to fire.</b> The setting is injected at creation, so an index created
+     * before {@code index.recovery.strategy} existed carries no value and reads the {@code local-lucene}
+     * default. Refusing it is correct -- core's strategy genuinely cannot recover such a shard, so opening it
+     * would be the silent wrong answer -- but it means a cluster carrying pre-existing serverless indices
+     * needs their settings back-filled first. No released build has such indices, which is why this throws
+     * rather than carrying a shim for a case that cannot yet occur; if that changes, the fix is an
+     * index-metadata upgrader that back-fills the setting, not a looser check here.
      */
     private static void requireObjectStoreRecoveryStrategy(IndexSettings indexSettings) {
         String strategy = org.opensearch.index.IndexModule.INDEX_RECOVERY_STRATEGY_SETTING.get(indexSettings.getSettings());
@@ -3165,7 +3171,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     @Override
     public Collection<IndexCreationValidator> getIndexCreationValidators() {
-        return Collections.singletonList(new ServerlessStorageRemoteClusterStateValidator());
+        return java.util.List.of(new ServerlessStorageRemoteClusterStateValidator(), new ServerlessStorageRecoveryStrategyValidator());
     }
 
     /**

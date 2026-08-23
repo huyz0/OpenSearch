@@ -214,13 +214,21 @@ public final class IndexModule {
      * it always has. Unlike {@link #INDEX_RECOVERY_TYPE_SETTING} and {@link #INDEX_STORE_FACTORY_SETTING} the
      * default is a real name rather than the empty string, because core registers a real implementation under it
      * into the same map plugins contribute to rather than special-casing "unset" ahead of the lookup.
+     *
+     * <p><b>Final, because this is not a knob.</b> The strategy describes where an index's durable copy already
+     * lives and how it is addressed -- a property fixed when the index was created, not a preference. Allowing an
+     * update would let an operator tell a running index to recover by a method that cannot read what it has
+     * written, and the damage would not appear until the next recovery, long after the setting change was
+     * acknowledged. There is no migration between strategies to express here: an index is one kind or the other
+     * for its whole life, so the setting is fixed at creation like the storage opt-in it accompanies.
      */
     public static final Setting<String> INDEX_RECOVERY_STRATEGY_SETTING = new Setting<>(
         "index.recovery.strategy",
         ShardRecoveryStrategy.LOCAL_LUCENE,
         Function.identity(),
         Property.IndexScope,
-        Property.NodeScope
+        Property.NodeScope,
+        Property.Final
     );
 
     /** On which extensions to load data into the file-system cache upon opening of files.
