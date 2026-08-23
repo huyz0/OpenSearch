@@ -8,6 +8,7 @@
 
 package org.opensearch.index.engine;
 
+import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.test.OpenSearchTestCase;
 
 import static org.mockito.Mockito.mock;
@@ -27,21 +28,21 @@ public class EngineNativeSnapshotReleasersTests extends OpenSearchTestCase {
     }
 
     public void testIsNotEmptyAfterRegister() {
-        EngineNativeSnapshotReleasers.register("test-engine-id", mock(EngineFactory.class));
+        EngineNativeSnapshotReleasers.register("test-engine-id", mock(ShardRecoveryStrategy.EngineNativeSnapshots.class));
         assertFalse("BlobStoreRepository's delete-path gate relies on this flipping false once anything is registered", isEmptyOfTestId());
     }
 
     public void testIsEmptyAgainAfterUnregister() {
-        EngineNativeSnapshotReleasers.register("test-engine-id", mock(EngineFactory.class));
+        EngineNativeSnapshotReleasers.register("test-engine-id", mock(ShardRecoveryStrategy.EngineNativeSnapshots.class));
         EngineNativeSnapshotReleasers.unregister("test-engine-id");
         assertTrue(isEmptyOfTestId());
     }
 
-    public void testFindReturnsTheRegisteredFactory() {
-        EngineFactory factory = mock(EngineFactory.class);
-        EngineNativeSnapshotReleasers.register("test-engine-id", factory);
+    public void testFindReturnsTheRegisteredReleaser() {
+        ShardRecoveryStrategy.EngineNativeSnapshots releaser = mock(ShardRecoveryStrategy.EngineNativeSnapshots.class);
+        EngineNativeSnapshotReleasers.register("test-engine-id", releaser);
         assertTrue(EngineNativeSnapshotReleasers.find("test-engine-id").isPresent());
-        assertSame(factory, EngineNativeSnapshotReleasers.find("test-engine-id").get());
+        assertSame(releaser, EngineNativeSnapshotReleasers.find("test-engine-id").get());
     }
 
     public void testFindReturnsEmptyForAnUnregisteredId() {

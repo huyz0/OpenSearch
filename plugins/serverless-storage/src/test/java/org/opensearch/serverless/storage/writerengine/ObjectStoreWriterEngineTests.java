@@ -124,9 +124,9 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
     // In-place split recovery (attaching a child shard to its parent's data, then materializing
     // that into the child's LOCAL Lucene store) is now covered by InPlaceSplitLocalStoreRecoveryTests
     // -- moved there because dynamic-partitioning-progress.md's "Task 19" fix relocated the whole
-    // seam from Engine#recoverFromInPlaceSplit (this class) to WriterEngineFactory
-    // #recoverInPlaceSplitLocalStore, which needs a real IndexShard (IndexShardTestCase), not just
-    // an Engine (EngineTestCase, this class's own base).
+    // seam from Engine#recoverFromInPlaceSplit (this class) to the store-population seam that is now
+    // ObjectStoreShardRecoveryStrategy's IN_PLACE_SPLIT_SHARD case, which needs a real IndexShard
+    // (IndexShardTestCase), not just an Engine (EngineTestCase, this class's own base).
 
     public void testFlushPublishesAManifestOntoTheShardHead() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);

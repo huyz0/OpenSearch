@@ -193,8 +193,8 @@ public class DanglingIndicesState implements ClusterStateListener {
             return true;
         }
         // Deliberately still AbsentIndexDescriptorSuppliers directly rather than the
-        // IndexMetadataResolver SPI: this reads descriptor.uuid() below and needs the three-way
-        // null/tombstoned/live distinction, which that resolver's generic, collapsed contract
+        // IndexCatalog SPI: this reads descriptor.uuid() below and needs the three-way
+        // null/tombstoned/live distinction, which that catalog's generic, collapsed contract
         // deliberately does not expose.
         IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
         return descriptor != null && descriptor.uuid().equals(index.getUUID()) && descriptor.exists() == false;

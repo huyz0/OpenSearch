@@ -9,6 +9,7 @@
 package org.opensearch.index.engine;
 
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.index.shard.ShardRecoveryStrategy;
 
 import java.util.Map;
 import java.util.Optional;
@@ -17,8 +18,9 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Node-level registry mapping the opaque {@code engineId} tag carried on an {@link
  * org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot} back to the {@link
- * EngineFactory} whose {@link EngineFactory#releaseEngineNativeSnapshot} should be called when a
- * snapshot referencing that tag is deleted.
+ * ShardRecoveryStrategy.EngineNativeSnapshots} whose {@link
+ * ShardRecoveryStrategy.EngineNativeSnapshots#release} should be called when a snapshot referencing
+ * that tag is deleted.
  *
  * <p>Deliberately a plain, node-wide static registry rather than a constructor-injected
  * dependency of {@code BlobStoreRepository}: a snapshot delete has to resolve a releaser purely
@@ -34,25 +36,32 @@ import java.util.concurrent.ConcurrentHashMap;
  * Engine#attemptEngineNativeSnapshot} to tag its pointer bytes with a given {@code engineId} is
  * responsible for calling {@link #register} with that same tag during its own plugin
  * initialization (e.g. from {@code Plugin#createComponents}), so a later delete can find it. A
- * missing registration is never fatal to a delete -- see {@link EngineFactory#releaseEngineNativeSnapshot}'s
- * own javadoc on why this is deliberately best-effort.
+ * missing registration is never fatal to a delete -- see {@link
+ * ShardRecoveryStrategy.EngineNativeSnapshots#release}'s own javadoc on why this is deliberately
+ * best-effort.
+ *
+ * <p>What this registry holds is deliberately <em>not</em> an {@link EngineFactory}: a release runs
+ * with no live shard and no engine to build, so keying it to a factory type forced the one
+ * implementation in the tree to be an {@link EngineFactory} whose {@code newReadWriteEngine} threw.
+ * {@link ShardRecoveryStrategy.EngineNativeSnapshots} is exactly the pair of operations a releaser
+ * can actually perform, so no such stub is needed.
  *
  * @opensearch.experimental
  */
 @ExperimentalApi
 public final class EngineNativeSnapshotReleasers {
 
-    private static final Map<String, EngineFactory> REGISTRY = new ConcurrentHashMap<>();
+    private static final Map<String, ShardRecoveryStrategy.EngineNativeSnapshots> REGISTRY = new ConcurrentHashMap<>();
 
     private EngineNativeSnapshotReleasers() {}
 
     /**
-     * Registers {@code engineFactory} as the releaser for any engine-native snapshot tagged with
-     * {@code engineId}. Re-registering the same {@code engineId} replaces the previous entry
+     * Registers {@code engineNativeSnapshots} as the releaser for any engine-native snapshot tagged
+     * with {@code engineId}. Re-registering the same {@code engineId} replaces the previous entry
      * (e.g. across a node restart within the same JVM in tests, or a plugin reload).
      */
-    public static void register(String engineId, EngineFactory engineFactory) {
-        REGISTRY.put(engineId, engineFactory);
+    public static void register(String engineId, ShardRecoveryStrategy.EngineNativeSnapshots engineNativeSnapshots) {
+        REGISTRY.put(engineId, engineNativeSnapshots);
     }
 
     /** Removes any releaser registered under {@code engineId}, if present. */
@@ -61,7 +70,7 @@ public final class EngineNativeSnapshotReleasers {
     }
 
     /** Looks up the releaser registered for {@code engineId}, if any. */
-    public static Optional<EngineFactory> find(String engineId) {
+    public static Optional<ShardRecoveryStrategy.EngineNativeSnapshots> find(String engineId) {
         return Optional.ofNullable(REGISTRY.get(engineId));
     }
 

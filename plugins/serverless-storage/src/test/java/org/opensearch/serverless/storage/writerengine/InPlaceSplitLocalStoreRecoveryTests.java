@@ -49,8 +49,8 @@ import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SH
  * End-to-end proof that a real in-place split child shard actually receives its parent's
  * documents at the *engine* level (not just the object-store bookkeeping level, already covered
  * by {@code MetadataInPlaceSplitShardCommitServiceTests} and this plugin's other tests) --
- * dynamic-partitioning-progress.md's "Task 19" fix. Uses {@link WriterEngineFactory
- * #recoverInPlaceSplitLocalStore} via a real {@link IndexShard} recovery, since that's the level
+ * dynamic-partitioning-progress.md's "Task 19" fix. Uses {@link ObjectStoreShardRecoveryStrategy}'s
+ * {@code IN_PLACE_SPLIT_SHARD} case via a real {@link IndexShard} recovery, since that's the level
  * the bug (materialization happening too late, or not at all) actually lived at.
  */
 public class InPlaceSplitLocalStoreRecoveryTests extends IndexShardTestCase {
@@ -126,16 +126,13 @@ public class InPlaceSplitLocalStoreRecoveryTests extends IndexShardTestCase {
         WriterEngineFactory childEngineFactory = new WriterEngineFactory(
             new ObjectStoreCommitHeadPublisher(childCommitPublisher, childShardStateStore),
             shardDirectory,
-            LOCAL_NODE_ID,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            0L,
-            null,
-            resolver
+            LOCAL_NODE_ID
+        );
+        // The strategy, not the engine factory, is what attaches this child to its parent's data --
+        // it runs before any engine exists and needs to reach a shard other than the one recovering.
+        this.shardRecoveryStrategy = new ObjectStoreShardRecoveryStrategy(
+            (resolvedIndexUuid, resolvedShardId) -> resolver.apply(resolvedShardId),
+            () -> null
         );
 
         ShardId childCoreShardId = new ShardId(parentShard.shardId().getIndex(), childShardId);

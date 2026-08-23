@@ -10,10 +10,8 @@ package org.opensearch.serverless.storage.writerengine;
 
 import org.apache.lucene.store.Directory;
 import org.opensearch.common.blobstore.BlobContainer;
-import org.opensearch.index.engine.Engine;
-import org.opensearch.index.engine.EngineConfig;
-import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.storage.clone.ShardCloner;
@@ -31,12 +29,12 @@ import java.io.IOException;
  * different callers with two different lifecycles:
  *
  * <ul>
- *   <li>{@link WriterEngineFactory#recoverFromEngineNativeSnapshot} delegates {@link
- *       #recoverFromEngineNativeSnapshot} here for a specific, live restore-target shard.
- *   <li>{@link org.opensearch.index.engine.EngineNativeSnapshotReleasers} holds a single instance
- *       of this class (registered once, node-wide, under {@link #ENGINE_ID}) for {@link
- *       #releaseEngineNativeSnapshot}, called when a snapshot is deleted -- potentially long after
- *       the original (or even the restore-target) shard no longer exists anywhere in the cluster.
+ *   <li>{@link ObjectStoreShardRecoveryStrategy#engineNativeSnapshots()} hands this instance to
+ *       core for {@link #restore} against a specific, live restore-target shard.
+ *   <li>{@link org.opensearch.index.engine.EngineNativeSnapshotReleasers} holds the same single
+ *       instance (registered once, node-wide, under {@link #ENGINE_ID}) for {@link #release},
+ *       called when a snapshot is deleted -- potentially long after the original (or even the
+ *       restore-target) shard no longer exists anywhere in the cluster.
  * </ul>
  *
  * <p>Both operations need the <em>original</em> snapshotted shard's own container -- which may
@@ -44,12 +42,13 @@ import java.io.IOException;
  * {@code containerResolver}, the same {@link ShardCloner.ContainerResolver} shape {@code
  * ShardCloner} itself already uses for cross-index resolution.
  *
- * <p>This class exists purely to hold these two operations; it is never used to construct a real
- * engine ({@link #newReadWriteEngine} always throws). It implements {@link EngineFactory} only
- * because that is the type {@link org.opensearch.index.engine.EngineNativeSnapshotReleasers}'
- * registry is keyed to.
+ * <p>This class used to implement {@code EngineFactory} with a {@code newReadWriteEngine} that
+ * threw, purely because that was the type the release registry was keyed to -- a stub whose only
+ * purpose was to satisfy a type it could never honor. {@link
+ * ShardRecoveryStrategy.EngineNativeSnapshots} is exactly these two operations and nothing else,
+ * so the stub is gone.
  */
-public final class EngineNativeSnapshotSupport implements EngineFactory {
+public final class EngineNativeSnapshotSupport implements ShardRecoveryStrategy.EngineNativeSnapshots {
 
     /** The {@code engineId} tag every pointer this plugin produces is written under. */
     public static final String ENGINE_ID = "serverless-storage/v1";
@@ -61,14 +60,7 @@ public final class EngineNativeSnapshotSupport implements EngineFactory {
     }
 
     @Override
-    public Engine newReadWriteEngine(EngineConfig config) {
-        throw new UnsupportedOperationException(
-            "EngineNativeSnapshotSupport is a shared restore/release helper, never a real EngineFactory"
-        );
-    }
-
-    @Override
-    public boolean recoverFromEngineNativeSnapshot(IndexShard indexShard, Store store, byte[] snapshotPointer) throws IOException {
+    public boolean restore(IndexShard indexShard, Store store, byte[] snapshotPointer) throws IOException {
         CommitManifest manifest = EngineNativeSnapshotPayload.fromBytes(snapshotPointer).manifest();
 
         // The manifest's bundle files physically live in the ORIGINAL shard's container -- this
@@ -113,7 +105,7 @@ public final class EngineNativeSnapshotSupport implements EngineFactory {
     }
 
     @Override
-    public void releaseEngineNativeSnapshot(byte[] snapshotPointer) throws IOException {
+    public void release(byte[] snapshotPointer) throws IOException {
         EngineNativeSnapshotPayload payload = EngineNativeSnapshotPayload.fromBytes(snapshotPointer);
         CommitManifest manifest = payload.manifest();
         BlobContainer sourceContainer = containerResolver.resolve(manifest.indexUuid(), manifest.shardId());

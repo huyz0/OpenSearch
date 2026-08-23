@@ -14,7 +14,7 @@ import java.util.Objects;
 
 /**
  * The result of a successful {@link Engine#attemptEngineNativeSnapshot} call: the opaque pointer
- * bytes plus the {@code engineId} tag identifying which {@link EngineFactory} produced them, so a
+ * bytes plus the {@code engineId} tag identifying which engine produced them, so a
  * later delete can route release back to the same engine via {@link
  * EngineNativeSnapshotReleasers}. Both fields travel together deliberately -- core reads {@code
  * engineId} directly (for the release-registry lookup) without ever interpreting {@code payload}.
@@ -33,7 +33,7 @@ public final class EngineNativeSnapshotPointer {
     }
 
     /**
-     * Opaque tag identifying which {@link EngineFactory} produced this pointer -- see {@link
+     * Opaque tag identifying which engine produced this pointer -- see {@link
      * EngineNativeSnapshotReleasers}. Core only ever compares this for equality; it never
      * interprets it.
      */
@@ -41,7 +41,7 @@ public final class EngineNativeSnapshotPointer {
         return engineId;
     }
 
-    /** The exact bytes handed to {@link EngineFactory#recoverFromEngineNativeSnapshot} on restore. */
+    /** The exact bytes handed to {@code ShardRecoveryStrategy.EngineNativeSnapshots#restore} on restore. */
     public byte[] payload() {
         return payload;
     }

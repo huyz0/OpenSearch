@@ -50,19 +50,18 @@ import java.util.List;
  * removeRegistrationListener}/{@code isRegistered} calls, in the constructor and {@link #publishIfElected}/
  * {@link #clusterChanged}). This service's whole reason to exist is reacting to a supplier's registration
  * <em>changing</em> during a node's lifetime -- publishing immediately once placement is enabled rather than
- * waiting for the next unrelated cluster-state change, and self-unregistering on node shutdown. The new SPI
- * ({@code ClusterPlugin#getIndexRoutingResolver()}) has no equivalent concept: a resolver is attached once,
+ * waiting for the next unrelated cluster-state change, and self-unregistering on node shutdown. The SPI
+ * ({@code ClusterPlugin#getIndexCatalog()}) has no equivalent concept: a catalog is registered once,
  * unconditionally, at node startup (confirmed against the real registration:
- * {@code ServerlessStoragePlugin#getIndexRoutingResolver()} always returns a resolver, regardless of
- * whether the underlying feature is on), and never re-attached or detached afterward. Migrating this
+ * {@code ServerlessStoragePlugin#getIndexCatalog()} always returns a catalog, regardless of
+ * whether the underlying feature is on), and never re-registered or unregistered afterward. Migrating this
  * service would mean either inventing a registration-change-notification concept the SPI doesn't have (a
  * real design question of its own, not attempted here) or dropping the "publish immediately on enable"
  * optimization and relying solely on {@link #clusterChanged}'s own organic triggering -- a real, if narrow,
- * behavior change deliberately not made without explicit sign-off. See {@code IndexCreationStrategyRegistry}
- * /{@code IndexRoutingResolver}'s own {@code isRegistered()}-shaped call sites for the closely related
- * finding (Phase C4b's second slice) that "a resolver is attached" and "the underlying feature is
- * currently active" are not the same question -- this service needs a third thing neither answers: notice
- * of the moment the feature turns on.
+ * behavior change deliberately not made without explicit sign-off. {@code IndexCatalog#isActive()} is the
+ * closest the SPI comes, and it is the answer to the closely related finding that "a catalog is registered"
+ * and "the underlying feature is currently active" are not the same question -- but this service needs a
+ * third thing neither answers: notice of the <em>moment</em> the feature turns on.
  */
 public class ComputedPlacementMembershipService implements ClusterStateListener {
 

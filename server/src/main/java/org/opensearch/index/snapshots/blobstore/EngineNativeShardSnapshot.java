@@ -66,7 +66,7 @@ public class EngineNativeShardSnapshot implements ToXContentFragment, IndexShard
     }
 
     /**
-     * Opaque tag identifying which {@link org.opensearch.index.engine.EngineFactory} produced
+     * Opaque tag identifying which engine produced
      * (and, on delete, must release) this snapshot -- core only ever compares it for equality
      * against a registered releaser's own tag, never interprets it.
      */
@@ -85,8 +85,8 @@ public class EngineNativeShardSnapshot implements ToXContentFragment, IndexShard
     /**
      * The exact bytes {@link org.opensearch.index.engine.Engine#attemptEngineNativeSnapshot}
      * returned at snapshot-creation time -- opaque to core, handed back verbatim to {@link
-     * org.opensearch.index.engine.EngineFactory#recoverFromEngineNativeSnapshot} on restore and to
-     * {@link org.opensearch.index.engine.EngineFactory#releaseEngineNativeSnapshot} on delete.
+     * org.opensearch.index.shard.ShardRecoveryStrategy.EngineNativeSnapshots#restore} on restore and
+     * to {@link org.opensearch.index.shard.ShardRecoveryStrategy.EngineNativeSnapshots#release} on delete.
      */
     public byte[] payload() {
         return payload;

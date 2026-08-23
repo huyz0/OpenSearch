@@ -15,7 +15,7 @@ import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 /**
  * Phase D2 of {@code core-pluggability-refactor-plan.md}: a generic {@link IndexCreationStrategy} adapter
  * delegating to {@link DescriptorOnlyCreation}'s existing static registry, mirroring {@code
- * SupplierBackedIndexMetadataResolver}/{@code SupplierBackedIndexRoutingResolver} (Phase C5) exactly --
+ * SupplierBackedIndexCatalog} (Phase C5) exactly --
  * both exist so a plugin can expose an already-registered static mechanism through a newer SPI without
  * writing bespoke adapter logic of its own, or changing what the underlying mechanism actually decides.
  *

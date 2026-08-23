@@ -141,8 +141,7 @@ public class ServerlessStorageEngineNativeSnapshotIT extends ServerlessStorageIn
         ensureGreen(INDEX_NAME);
 
         assertTrue(
-            "the document present at snapshot time must have been materialized back by "
-                + "EngineNativeSnapshotSupport#recoverFromEngineNativeSnapshot, not lost",
+            "the document present at snapshot time must have been materialized back by " + "EngineNativeSnapshotSupport#restore, not lost",
             client().prepareGet(INDEX_NAME, "1").get().isExists()
         );
     }

@@ -18,8 +18,8 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.TimeoutTaskCancellationUtility;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.common.breaker.ResponseLimitBreachedException;
 import org.opensearch.common.breaker.ResponseLimitSettings;
 import org.opensearch.common.inject.Inject;
@@ -69,13 +69,11 @@ public class TransportCatShardsAction extends HandledTransportAction<CatShardsRe
             // listing silently omits those shards. Requested only when a placement supplier is installed,
             // because metadata is the expensive part of a cluster state response and an ordinary cluster
             // must keep paying exactly what it paid before.
-            // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not the new
-            // IndexRoutingResolver SPI: this decides what
-            // to REQUEST, before any ClusterState exists to hold an attached resolver, and the SPI's
-            // per-ClusterState-instance attachment (deliberately not a node-level singleton, to avoid
-            // reintroducing global state) has no equivalent "is a resolver configured on this node at all"
-            // question answerable without one.
-            if (AbsentIndexRoutingSuppliers.isRegistered()) {
+            // IndexCatalog#isActive(), which exists precisely for call sites shaped like this one: it
+            // decides what to REQUEST, before any ClusterState exists at all. The predecessor SPI was
+            // attached per ClusterState instance, so it could not be consulted here and this line had to
+            // reach past it into the static registry; a node-scoped catalog can, and does.
+            if (IndexCatalogRegistry.isActive()) {
                 clusterStateRequest.metadata(true);
             }
         } else {

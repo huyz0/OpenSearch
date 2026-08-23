@@ -40,7 +40,7 @@ import java.util.Set;
 
 /**
  * {@link EngineNativeSnapshotSupport} is the shared restore/release helper reused by both a live
- * {@link WriterEngineFactory#recoverFromEngineNativeSnapshot} call and the node-level {@link
+ * {@link ObjectStoreShardRecoveryStrategy#engineNativeSnapshots()} and the node-level {@link
  * org.opensearch.index.engine.EngineNativeSnapshotReleasers} registry -- proves both of its own
  * operations directly against a real, disk-backed source container, the same way {@code
  * ShardClonerTests} proves {@link org.opensearch.serverless.storage.clone.ShardCloner}: a real
@@ -102,7 +102,7 @@ public class EngineNativeSnapshotSupportTests extends IndexShardTestCase {
 
         IndexShard targetShard = newShard(true);
         try {
-            boolean recovered = support.recoverFromEngineNativeSnapshot(targetShard, targetShard.store(), payload.toBytes());
+            boolean recovered = support.restore(targetShard, targetShard.store(), payload.toBytes());
             assertTrue("a valid engine-native pointer must always be recoverable", recovered);
 
             try (DirectoryReader reader = DirectoryReader.open(targetShard.store().directory())) {
@@ -138,7 +138,7 @@ public class EngineNativeSnapshotSupportTests extends IndexShardTestCase {
         try {
             java.io.IOException e = expectThrows(
                 java.io.IOException.class,
-                () -> support.recoverFromEngineNativeSnapshot(targetShard, targetShard.store(), payload.toBytes())
+                () -> support.restore(targetShard, targetShard.store(), payload.toBytes())
             );
             assertTrue(
                 "the failure must explain the cross-cluster/repository-mismatch cause, not surface a raw low-level read error",
@@ -165,7 +165,7 @@ public class EngineNativeSnapshotSupportTests extends IndexShardTestCase {
         sourcePinRegistry.addPin(SOURCE_INDEX_UUID, SHARD_ID, ownPin);
         sourcePinRegistry.addPin(SOURCE_INDEX_UUID, SHARD_ID, unrelatedPin);
 
-        support.releaseEngineNativeSnapshot(payload.toBytes());
+        support.release(payload.toBytes());
 
         assertEquals(
             "release must remove exactly the pin its own payload identifies, leaving an unrelated pin (e.g. a concurrent PITR "

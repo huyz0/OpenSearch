@@ -11,8 +11,10 @@ package org.opensearch.cluster.routing;
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.SupplierBackedIndexCatalog;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -57,6 +59,7 @@ public class ComputedCandidateRankingTests extends OpenSearchTestCase {
     @After
     public void clearSupplier() {
         AbsentIndexRoutingSuppliers.register(null);
+        IndexCatalogRegistry.register(null);
     }
 
     /**
@@ -162,13 +165,12 @@ public class ComputedCandidateRankingTests extends OpenSearchTestCase {
             .numberOfReplicas(2)
             .build();
 
-        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
-        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
-        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which OperationRouting
-        // now goes through) needs an explicit one here, same as production code gets from a real cluster
-        // state.
+        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(), registered rather
+        // than attached to this state: resolution goes through IndexCatalogRegistry now, so a hand-built
+        // state needs nothing special, only the registration a real node performs at startup. Cleared in
+        // this class's @After, since it is node-scoped and would otherwise outlive these tests.
+        IndexCatalogRegistry.register(new SupplierBackedIndexCatalog());
         RoutingTable routingTable = RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(metadata, false).build())
             .routingTable(routingTable)

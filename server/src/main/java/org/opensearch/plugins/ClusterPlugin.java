@@ -32,11 +32,10 @@
 
 package org.opensearch.plugins;
 
+import org.opensearch.cluster.metadata.IndexCatalog;
 import org.opensearch.cluster.metadata.IndexCreationStrategy;
-import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.cluster.routing.allocation.allocator.ShardsAllocator;
 import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
@@ -99,26 +98,20 @@ public interface ClusterPlugin {
     }
 
     /**
-     * A fallback for resolving an index's {@link
-     * org.opensearch.cluster.metadata.IndexMetadata} when {@link org.opensearch.cluster.metadata.Metadata}
-     * has no entry for it -- see {@link org.opensearch.cluster.metadata.IndexMetadataResolver}'s own
-     * javadoc for why this is a single seam rather than something every caller needs to know about.
-     * Empty by default, so a node without this plugin resolves exactly as it always has.
+     * A fallback for the compound question core asks about an index with no published entry -- does it
+     * exist ({@link org.opensearch.cluster.metadata.IndexMetadata}), and where do its shards live ({@link
+     * org.opensearch.cluster.routing.IndexRoutingTable}) -- plus whether that index needs published routing
+     * at all and whether the feature is currently switched on. See {@link IndexCatalog}'s own javadoc for
+     * why this is a single seam, and why it is one hook rather than the two ({@code
+     * getIndexMetadataResolver}/{@code getIndexRoutingResolver}) it replaced.
+     *
+     * <p>Empty by default, so a node without this plugin resolves exactly as it always has. At most one
+     * plugin per node may supply one; {@code Node} enforces that and registers it with {@link
+     * org.opensearch.cluster.metadata.IndexCatalogRegistry}.
      *
      * @opensearch.experimental
      */
-    default Optional<IndexMetadataResolver> getIndexMetadataResolver() {
-        return Optional.empty();
-    }
-
-    /**
-     * The routing-table counterpart to {@link
-     * #getIndexMetadataResolver()} -- see {@link IndexRoutingResolver}'s own javadoc. Empty by default,
-     * so a node without this plugin resolves exactly as it always has.
-     *
-     * @opensearch.experimental
-     */
-    default Optional<IndexRoutingResolver> getIndexRoutingResolver() {
+    default Optional<IndexCatalog> getIndexCatalog() {
         return Optional.empty();
     }
 

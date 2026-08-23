@@ -109,7 +109,6 @@ import org.opensearch.core.util.BytesRefUtils;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
-import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.EngineNativeSnapshotReleasers;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm;
@@ -119,6 +118,7 @@ import org.opensearch.index.remote.RemoteStorePathStrategy.PathInput;
 import org.opensearch.index.remote.RemoteStorePathStrategy.SnapshotShardPathInput;
 import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
+import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.snapshots.IndexShardRestoreFailedException;
 import org.opensearch.index.snapshots.IndexShardSnapshotStatus;
 import org.opensearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
@@ -4774,7 +4774,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         // beforehand would have left a surviving snapshot pointing at a generation nothing pins, i.e. an
         // unrestorable snapshot.
         //
-        // The release itself stays best-effort (see EngineFactory#releaseEngineNativeSnapshot's own
+        // The release itself stays best-effort (see ShardRecoveryStrategy.EngineNativeSnapshots#release's own
         // javadoc): a missing/failed release never blocks the delete from proceeding, it only risks the
         // producing engine retaining something it no longer needs to. The engine-native blob is included
         // in the unused-blob list computed above, so it is removed by the caller after this returns and a
@@ -4800,8 +4800,8 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
      * index- blob has been written -- i.e. once {@code removedSnapshotId} is definitively gone from the
      * shard. A missing engine-native blob (the common case -- most snapshots are classic or
      * shallow-copy) or a missing/failed release is logged and otherwise ignored: see
-     * {@link EngineFactory#releaseEngineNativeSnapshot}'s own javadoc for why release must never block a
-     * delete from proceeding.
+     * {@link ShardRecoveryStrategy.EngineNativeSnapshots#release}'s own javadoc for why release must never
+     * block a delete from proceeding.
      */
     private void releaseEngineNativeSnapshotIfPresent(BlobContainer shardContainer, SnapshotId removedSnapshotId) {
         final String blobName = ENGINE_NATIVE_SHARD_SNAPSHOT_FORMAT.blobName(removedSnapshotId.getUUID());
@@ -4814,7 +4814,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 removedSnapshotId.getUUID(),
                 namedXContentRegistry
             );
-            final Optional<EngineFactory> releaser = EngineNativeSnapshotReleasers.find(snapshot.engineId());
+            final Optional<ShardRecoveryStrategy.EngineNativeSnapshots> releaser = EngineNativeSnapshotReleasers.find(snapshot.engineId());
             if (releaser.isEmpty()) {
                 logger.warn(
                     "[{}] no releaser registered for engineId [{}] while deleting snapshot [{}] -- "
@@ -4825,7 +4825,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 );
                 return;
             }
-            releaser.get().releaseEngineNativeSnapshot(snapshot.payload());
+            releaser.get().release(snapshot.payload());
         } catch (Exception e) {
             logger.warn(
                 () -> new ParameterizedMessage(

@@ -11,8 +11,10 @@ package org.opensearch.cluster.routing;
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.SupplierBackedIndexCatalog;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
@@ -48,6 +50,7 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.registerSuspendedShards(null);
+        IndexCatalogRegistry.register(null);
     }
 
     /**
@@ -71,7 +74,7 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
      *
      * <p>Through {@code ClusterState#resolveShard}, the production shard-level read, so this state carries
      * what production states carry: the index's metadata (in production synthesised from its descriptor by
-     * the time routing resolution runs) and the {@link SupplierBackedIndexRoutingResolver} bridge.
+     * the time routing resolution runs) and a registered {@link SupplierBackedIndexCatalog}.
      */
     public void testASuspendedShardIsAbsentFromTheShardLevelRead() {
         registerPlacementFor(SHARDS);
@@ -208,12 +211,12 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
     /**
      * A state shaped like what {@code ClusterState#resolveShard} sees in production: the index's metadata
      * present (production synthesises it from the descriptor before routing resolution runs), no published
-     * routing entry, and the {@link SupplierBackedIndexRoutingResolver} bridge attached to a real
-     * (non-EMPTY_ROUTING_TABLE) instance -- attachment is deliberately a no-op on the shared singleton.
+     * routing entry, and a {@link SupplierBackedIndexCatalog} registered on the node the way {@code
+     * Node.java} registers a plugin's own. Cleared in this class's @After.
      */
     private static ClusterState stateWithMetadataAndBridge() {
+        IndexCatalogRegistry.register(new SupplierBackedIndexCatalog());
         RoutingTable routingTable = RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(indexMetadata(), false).build())
             .routingTable(routingTable)

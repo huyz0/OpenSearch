@@ -31,7 +31,7 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
  * (Tasks 1-20) is genuinely end-to-end, not just correct at each individual layer already covered
  * by this session's narrower unit/IT tests. Uses a real 2-node cluster and the plugin's real
  * {@code ObjectStoreWriterEngine}, not core's default engine (which has no split materialization
- * seam at all, per {@code EngineFactory#recoverInPlaceSplitLocalStore}'s default no-op).
+ * seam at all, per core's own {@code local-lucene} ShardRecoveryStrategy declining the split case).
  *
  * <p>Depends on Task 20's fix to {@code IndexMetadata}'s and {@code IndexRoutingTable}'s per-shard
  * invariants tolerating shard ids a split introduces beyond {@code numberOfShards} -- without it,

@@ -11,11 +11,12 @@ package org.opensearch.action.support.broadcast.node;
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.SupplierBackedIndexCatalog;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.RoutingTable;
-import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
@@ -44,6 +45,7 @@ public class BroadcastEmptinessTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
+        IndexCatalogRegistry.register(null);
     }
 
     /** The load-bearing one: an open index that contributed nothing has to be reported. */
@@ -64,6 +66,33 @@ public class BroadcastEmptinessTests extends OpenSearchTestCase {
         List<String> missing = BroadcastEmptiness.check(ACTION, state(), new String[] { OPEN_INDEX }, Set.of());
 
         assertTrue("the guard must stay silent when no placement supplier is installed", missing.isEmpty());
+    }
+
+    /**
+     * The {@code isActive()}-not-{@code isRegistered()} distinction, at one of the four call sites that
+     * depend on it. The catalog is registered in both halves of this test -- a real node registers it
+     * unconditionally at startup, whether or not the feature is on -- and only the placement supplier
+     * underneath differs. A guard that asked "is a catalog registered" would fire in both and report a
+     * false positive on every ordinary cluster running the plugin with the feature off.
+     */
+    public void testARegisteredButInactiveCatalogLeavesTheGuardOff() {
+        ClusterState state = state();
+        assertTrue("premise: a catalog is registered", IndexCatalogRegistry.isRegistered());
+        assertFalse("premise: the feature underneath it is off", IndexCatalogRegistry.isActive());
+
+        assertTrue(
+            "a registered-but-inactive catalog must leave the guard off",
+            BroadcastEmptiness.check(ACTION, state, new String[] { OPEN_INDEX }, Set.of()).isEmpty()
+        );
+
+        registerPlacement();
+
+        assertTrue("the same registered catalog must now read as active", IndexCatalogRegistry.isActive());
+        assertEquals(
+            "and the guard must now fire",
+            List.of(OPEN_INDEX),
+            BroadcastEmptiness.check(ACTION, state, new String[] { OPEN_INDEX }, Set.of())
+        );
     }
 
     /** A caller that resolved correctly must not be reported, or the guard cries wolf on every request. */
@@ -114,14 +143,13 @@ public class BroadcastEmptinessTests extends OpenSearchTestCase {
     }
 
     private static ClusterState state() {
-        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
-        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
-        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
-        // BroadcastEmptiness#check now goes through) needs an explicit one here, same as production code
-        // gets from a real cluster state. Harmless for the tests here that register nothing -- the bridge
-        // still answers false/empty with nothing registered underneath it.
+        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(), registered for
+        // every test here including the ones that register no placement supplier -- which is the point:
+        // BroadcastEmptiness#check guards on IndexCatalog#isActive(), not on a catalog being registered,
+        // so a registered catalog with nothing underneath it must still leave the guard off. Cleared in
+        // this class's @After.
+        IndexCatalogRegistry.register(new SupplierBackedIndexCatalog());
         RoutingTable routingTable = RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(
                 Metadata.builder()

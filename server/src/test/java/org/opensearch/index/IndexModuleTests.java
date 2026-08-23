@@ -688,6 +688,7 @@ public class IndexModuleTests extends OpenSearchTestCase {
             new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)),
             Collections.emptyMap(),
             storeFactories,
+            IndexModule.createBuiltInShardRecoveryStrategies(),
             null,
             null,
             Collections.emptyMap()
@@ -722,6 +723,7 @@ public class IndexModuleTests extends OpenSearchTestCase {
             new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)),
             Collections.emptyMap(),
             storeFactories,
+            IndexModule.createBuiltInShardRecoveryStrategies(),
             null,
             null,
             Collections.emptyMap()
@@ -752,6 +754,7 @@ public class IndexModuleTests extends OpenSearchTestCase {
             Collections.emptyMap(),
             () -> true,
             new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)),
+            Collections.emptyMap(),
             Collections.emptyMap(),
             Collections.emptyMap(),
             null,

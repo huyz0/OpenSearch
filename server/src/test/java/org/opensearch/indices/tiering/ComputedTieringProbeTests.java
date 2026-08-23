@@ -57,6 +57,7 @@ public class ComputedTieringProbeTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
+        org.opensearch.cluster.metadata.IndexCatalogRegistry.register(null);
     }
 
     /**
@@ -167,15 +168,11 @@ public class ComputedTieringProbeTests extends OpenSearchTestCase {
             .numberOfReplicas(0)
             .build();
 
-        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
-        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
-        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
-        // TieringRequestValidator#validateHotToWarm now goes through for shouldPublishRouting) needs an
-        // explicit one here, same as production code gets from a real cluster state. Both of this class's
-        // tests read through it: the validator via shouldPublishRouting, and the red-check probe via
-        // ClusterState#getIndexRoutingTable.
+        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(): both of this
+        // class's tests read through it -- the validator via shouldPublishRouting, and the red-check probe
+        // via ClusterState#getIndexRoutingTable. Cleared in this class's @After.
+        org.opensearch.cluster.metadata.IndexCatalogRegistry.register(new org.opensearch.cluster.metadata.SupplierBackedIndexCatalog());
         org.opensearch.cluster.routing.RoutingTable routingTable = org.opensearch.cluster.routing.RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(metadata, false).build())
             .routingTable(routingTable)

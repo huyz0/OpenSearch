@@ -24,10 +24,10 @@ import org.opensearch.indices.recovery.RecoveryState;
  * {@link IndexShard#recoverFromStore}), so the merge recovery source does not fall into that
  * method's {@code default:} "Unknown recovery source" case.
  *
- * <p>See {@code org.opensearch.index.engine.EngineFactory#recoverInPlaceMergeLocalStore} for where a
- * plugin engine would revive the parent from its children's data -- deliberately a no-op in every
- * engine today (the data-reconciliation design problem is unresolved, see the progress doc), so this
- * test only verifies that dispatch does not throw and the shard reaches STARTED.
+ * <p>See {@link ShardRecoveryStrategy#recoverLocalStore}'s {@code IN_PLACE_MERGE_SHARD} case for
+ * where a plugin strategy revives the parent from its children's data -- a no-op in core's own
+ * {@code local-lucene} strategy, so this test only verifies that dispatch does not throw and the
+ * shard reaches STARTED.
  */
 public class InPlaceMergeShardRecoveryTests extends IndexShardTestCase {
 
@@ -49,7 +49,7 @@ public class InPlaceMergeShardRecoveryTests extends IndexShardTestCase {
 
             PlainActionFuture<Boolean> future = new PlainActionFuture<>();
             shard.recoverFromStore(future);
-            assertTrue("recovery from an in-place merge recovery source must succeed with core's no-op default engine hook", future.get());
+            assertTrue("recovery from an in-place merge recovery source must succeed with core's local-lucene strategy", future.get());
 
             updateRoutingEntry(shard, ShardRoutingHelper.moveToStarted(shard.routingEntry()));
             assertEquals(IndexShardState.STARTED, shard.state());

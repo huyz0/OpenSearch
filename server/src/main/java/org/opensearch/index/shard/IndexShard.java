@@ -149,7 +149,6 @@ import org.opensearch.index.engine.SafeCommitInfo;
 import org.opensearch.index.engine.Segment;
 import org.opensearch.index.engine.SegmentsStats;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
-import org.opensearch.index.engine.exec.EngineBackedIndexerFactory;
 import org.opensearch.index.engine.exec.IndexReaderProvider;
 import org.opensearch.index.engine.exec.Indexer;
 import org.opensearch.index.engine.exec.IndexerFactory;
@@ -332,6 +331,13 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     private final Object engineMutex = new Object(); // lock ordering: engineMutex -> mutex
     private final AtomicReference<Indexer> currentEngineReference = new AtomicReference<>();
     final IndexerFactory indexerFactory;
+    /**
+     * How this shard's local store gets populated during recovery, and what is authoritative once it is -- resolved
+     * once per index from {@link org.opensearch.index.IndexModule#INDEX_RECOVERY_STRATEGY_SETTING}. Read by {@link
+     * StoreRecovery} (which is constructed per recovery attempt from this shard, so it reads it from here rather
+     * than holding its own) and by {@link #newEngineConfig} for the remote-durability question.
+     */
+    private final ShardRecoveryStrategy shardRecoveryStrategy;
     final EngineConfigFactory engineConfigFactory;
 
     private final IndexingOperationListener indexingOperationListeners;
@@ -466,7 +472,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         @Nullable final MergedSegmentPublisher mergedSegmentPublisher,
         @Nullable final ReferencedSegmentsPublisher referencedSegmentsPublisher,
         final Map<String, FormatChecksumStrategy> checksumStrategies,
-        @Nullable final DataFormatRegistry dataFormatRegistry
+        @Nullable final DataFormatRegistry dataFormatRegistry,
+        final ShardRecoveryStrategy shardRecoveryStrategy
     ) throws IOException {
         super(shardRouting.shardId(), indexSettings);
         assert shardRouting.initializing();
@@ -476,6 +483,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.similarityService = similarityService;
         Objects.requireNonNull(store, "Store must be provided to the index shard");
         this.indexerFactory = Objects.requireNonNull(indexerFactory);
+        this.shardRecoveryStrategy = Objects.requireNonNull(shardRecoveryStrategy);
         this.engineConfigFactory = Objects.requireNonNull(engineConfigFactory);
         this.codecService = engineConfigFactory.newDefaultCodecService(indexSettings, mapperService, logger);
         this.store = store;
@@ -4958,7 +4966,12 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             });
         }
 
-        if ((isRemoteStoreEnabled() || isMigratingToRemote()) && engineFactoryOwnsRemoteSegmentDurability() == false) {
+        // Skipped entirely when this shard's ShardRecoveryStrategy declares it already keeps every segment
+        // durably reachable remotely by its own mechanism -- wiring core's own upload path in on top would
+        // be pure wasted upload work, not a correctness requirement. See that method's own javadoc: it is a
+        // durability claim, so a strategy answering true when segments are NOT otherwise durable is a
+        // correctness regression, not merely a slow path.
+        if ((isRemoteStoreEnabled() || isMigratingToRemote()) && shardRecoveryStrategy.ownsRemoteSegmentDurability() == false) {
             internalRefreshListener.add(
                 new RemoteStoreRefreshListener(
                     this,
@@ -5022,21 +5035,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     private boolean isRemoteStoreEnabled() {
         return (remoteStore != null && shardRouting.primary());
-    }
-
-    /**
-     * Whether the {@code EngineFactory} backing this shard's indexer (via {@link #indexerFactory})
-     * has declared, via {@code EngineFactory#ownsRemoteSegmentDurability}, that it already keeps
-     * every segment durably reachable remotely by its own mechanism -- in which case wiring in
-     * core's own {@link RemoteStoreRefreshListener} on top would be pure wasted upload work, not a
-     * correctness requirement. Only {@link EngineBackedIndexerFactory} wraps an actual {@code
-     * EngineFactory} to ask; any other {@link IndexerFactory} (e.g. a non-Lucene {@code
-     * DataFormatAwareEngine} path) has no such factory to consult and defaults to {@code false},
-     * preserving today's behavior exactly.
-     */
-    private boolean engineFactoryOwnsRemoteSegmentDurability() {
-        return indexerFactory instanceof EngineBackedIndexerFactory engineBackedIndexerFactory
-            && engineBackedIndexerFactory.getEngineFactory().ownsRemoteSegmentDurability();
     }
 
     public boolean isRemoteTranslogEnabled() {
@@ -5623,6 +5621,14 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     IndexerFactory getIndexerFactory() {
         return indexerFactory;
+    }
+
+    /**
+     * This shard's {@link ShardRecoveryStrategy}. Package-private, for {@link StoreRecovery}: it is constructed
+     * fresh per recovery attempt from this shard and has no registry of its own to resolve one from.
+     */
+    ShardRecoveryStrategy getShardRecoveryStrategy() {
+        return shardRecoveryStrategy;
     }
 
     EngineConfigFactory getEngineConfigFactory() {

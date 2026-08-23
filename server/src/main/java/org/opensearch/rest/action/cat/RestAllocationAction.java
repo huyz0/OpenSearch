@@ -38,8 +38,8 @@ import org.opensearch.action.admin.cluster.node.stats.NodesStatsResponse;
 import org.opensearch.action.admin.cluster.state.ClusterStateRequest;
 import org.opensearch.action.admin.cluster.state.ClusterStateResponse;
 import org.opensearch.action.admin.indices.stats.CommonStatsFlags;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.Table;
 import org.opensearch.common.logging.DeprecationLogger;
@@ -91,11 +91,10 @@ public class RestAllocationAction extends AbstractCatAction {
         // As in cat shards: an index whose routing is computed exists only in metadata, so without this
         // its shards are missing from the per-node counts. Gated on registration so an ordinary cluster
         // keeps the smaller response it has always had.
-        // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not the newer IndexRoutingResolver
-        // SPI -- see TransportCatShardsAction's identical
-        // call site for why: this decides what to REQUEST, before any ClusterState exists to hold an
-        // attached resolver.
-        if (AbsentIndexRoutingSuppliers.isRegistered()) {
+        // IndexCatalog#isActive() -- see TransportCatShardsAction's identical call site: this decides what
+        // to REQUEST, before any ClusterState exists, which is one of the two reasons the catalog SPI is
+        // node-scoped and carries this question at all.
+        if (IndexCatalogRegistry.isActive()) {
             clusterStateRequest.metadata(true);
         }
         clusterStateRequest.local(request.paramAsBoolean("local", clusterStateRequest.local()));
@@ -146,9 +145,9 @@ public class RestAllocationAction extends AbstractCatAction {
     private Table buildTable(RestRequest request, final ClusterStateResponse state, final NodesStatsResponse stats) {
         final Map<String, Integer> allocs = new HashMap<>();
 
-        // state.getState().allShards() replaces the static registry's
-        // the since-deleted AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered through the
-        // resolver attached to this state's own routing table.
+        // state.getState().allShards() replaces the since-deleted
+        // AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered through the
+        // node's registered IndexCatalog.
         for (ShardRouting shard : state.getState().allShards()) {
             String nodeId = "UNASSIGNED";
 

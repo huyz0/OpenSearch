@@ -131,7 +131,7 @@ public final class InPlaceSiblingMerger {
      * SequenceNumbers#MAX_SEQ_NO}, {@link Engine#MAX_UNSAFE_AUTO_ID_TIMESTAMP_COMMIT_ID}) -- the same
      * keys {@code Store#createEmpty} seeds, so the engine can open the result. The translog UUID is
      * left for the caller to associate afterward (via {@code Store#associateIndexWithNewTranslog}),
-     * exactly as {@code WriterEngineFactory#recoverInPlaceSplitLocalStore} does for its own case.
+     * exactly as {@code ObjectStoreShardRecoveryStrategy}'s split case does for its own.
      *
      * <p>The merged {@code maxSeqNo}/{@code localCheckpoint} is the maximum across children -- a safe
      * monotonic watermark, not an exact merged-history reconstruction, matching {@link ShardShrinker}'s

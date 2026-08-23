@@ -18,7 +18,7 @@ import org.junit.After;
  * D2's final slice of {@code core-pluggability-refactor-plan.md}: {@code IndexCreationStrategy}'s two
  * methods ({@code claims(String)} and {@code skipsClusterState(IndexMetadata)}) and {@link
  * SupplierBackedIndexCreationStrategy}'s delegation to {@link DescriptorOnlyCreation} for both, mirroring
- * core's own {@code SupplierBackedIndexMetadataResolverTests} shape for the analogous C5 adapter.
+ * core's own {@code SupplierBackedIndexCatalogTests} shape for the analogous C5 adapter.
  *
  * <p>Phase D3: relocated from {@code server/src/test} into this plugin alongside both classes it tests --
  * see {@link DescriptorOnlyCreation}'s own javadoc for the full move.

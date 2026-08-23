@@ -297,30 +297,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
     private final Map<String, SortedMap<Long, String>> systemTemplatesLookup;
 
-    /**
-     * A plugin-supplied fallback {@link
-     * #index(String)} consults on a lookup miss -- see {@link IndexMetadataResolver}'s own javadoc.
-     *
-     * <p>Deliberately NOT a constructor parameter and NOT part of {@link #writeTo}/{@link #readFrom}: a
-     * resolver is a per-node, in-process callback (typically closing over a plugin's local caches), not
-     * cluster state -- it would be meaningless, and unsafely non-serializable, to send over the wire.
-     * Instead it is propagated by every code path that produces a new {@code Metadata} from an existing
-     * one on the <em>same</em> node -- {@link Builder#Builder(Metadata)} and {@link MetadataDiff#apply}
-     * both carry the previous instance's resolver forward, so once attached it survives every subsequent
-     * mutation and every diff application on that node indefinitely.
-     *
-     * <p><b>What is NOT yet wired (a deliberately deferred remaining step):</b> the single attachment
-     * point that gives a node's very first {@code ClusterState}/{@code Metadata} its resolver in the
-     * first place -- e.g. a {@code ClusterStateApplier} registered during {@code Node} construction,
-     * alongside wherever the resolved {@code ClusterPlugin} list is already collected for other hooks
-     * like {@code EnginePlugin#getEngineFactory}. Until that lands, {@link #attachIndexMetadataResolver}
-     * has no real caller and this field stays {@code null} on every node -- {@link #index(String)}
-     * behaves exactly as it did before this field existed. Landing the propagation mechanics first (this
-     * commit) and the one-time attachment point separately keeps each piece independently testable and
-     * revertable, which matters for a change this close to the hottest read path in the codebase.
-     */
-    private transient IndexMetadataResolver resolver;
-
     Metadata(
         String clusterUUID,
         boolean clusterUUIDCommitted,
@@ -509,7 +485,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 // adds/removes plain (name-only) aliases on a gated index via IndexDescriptorPublisher,
                 // entirely outside cluster state. Reporting none here (rather than resolving them through
                 // that same descriptor seam) is a completeness gap in responses like GET /index, tracked
-                // separately -- the intended fix is to give this method the same plugin-supplied resolver
+                // separately -- the intended fix is to give this method the same plugin-supplied catalog
                 // seam Metadata#index(String) is meant to get.
                 //
                 // It is NOT a filtering-safety gap: that same service now refuses any Add action
@@ -594,7 +570,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 //
                 // This was a production fault as well as a failed assertion. Assertions are off outside
                 // tests, so the next line dereferenced null and threw -- from GET /index, on a name the
-                // resolver had just accepted as valid.
+                // catalog had just accepted as valid.
                 continue;
             }
             assert index.getType() == IndexAbstraction.Type.CONCRETE_INDEX;
@@ -857,11 +833,11 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
     /**
      * {@link #index(String)}'s published-metadata-only answer, falling back to
-     * an attached {@link IndexMetadataResolver} on a miss. The design was corrected mid-development after
+     * the node's registered {@link IndexCatalog} on a miss. The design was corrected mid-development after
      * a real regression it surfaced, described below.
      *
      * <p><b>Deliberately a separate, explicitly-named method -- not folded into {@link #index(String)}
-     * itself.</b> An earlier version of this change made {@code index(String)} auto-consult the resolver for
+     * itself.</b> An earlier version of this change made {@code index(String)} auto-consult the catalog for
      * every caller, on the premise that every caller "gets it for free" instead of remembering a second
      * path. That premise turned out to be exactly backwards for a caller that relies on {@code
      * index(String)}'s null-ness as a <em>distinguishing signal</em> rather than a plain existence check --
@@ -874,27 +850,29 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
      * which is nearly every read path in the codebase, most of which were never audited for this pattern --
      * keeps exactly its pre-existing behavior, unconditionally, with no auditing required.
      *
-     * @see IndexMetadataResolver for the full resolver contract, including the guarantee that this never
+     * @see IndexCatalog for the full catalog contract, including the guarantee that this never
      *      reaches a cluster-state-mutation thread.
      */
     public IndexMetadata indexOrResolved(String index) {
         IndexMetadata published = index(index);
-        if (published != null || resolver == null) {
+        // The published map is consulted first and short-circuits before anything else is touched, so an
+        // ordinary index costs exactly what index(String) costs even on a node that has a catalog installed.
+        if (published != null || IndexCatalogRegistry.isRegistered() == false) {
             return published;
         }
-        // See ClusterStateMutationThreads' own javadoc for the deadlock this refusal prevents: a resolver
+        // See ClusterStateMutationThreads' own javadoc for the deadlock this refusal prevents: a catalog
         // may do real (e.g. remote) work to answer, and this thread needs to make progress before that work
         // could complete on the one thread this codebase already knows must never be blocked this way.
         if (ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
-            logger.debug("refusing to consult the IndexMetadataResolver for [{}] on {}", index, Thread.currentThread().getName());
+            logger.debug("refusing to consult the IndexCatalog for [{}] on {}", index, Thread.currentThread().getName());
             return null;
         }
-        return resolver.resolve(this, index);
+        return IndexCatalogRegistry.resolveMetadata(this, index);
     }
 
     /**
      * The {@link #indexOrResolved(String)} counterpart to {@link #index(Index)}: the published entry if its
-     * uuid matches, otherwise the resolver's answer if its uuid matches -- a caller with a concrete {@link
+     * uuid matches, otherwise the catalog's answer if its uuid matches -- a caller with a concrete {@link
      * Index} has already resolved a name to a uuid, and answering with metadata for a different uuid would
      * serve a request against a deleted index's successor.
      */
@@ -908,16 +886,16 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
     /**
      * Whether a name resolves to something that
-     * exists, consulting the published lookup first and an attached {@link IndexMetadataResolver} only on a
-     * miss -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#exists}.
+     * exists, consulting the published lookup first and the node's registered {@link IndexCatalog} only on
+     * a miss -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#exists}.
      *
      * <p>Deliberately composed from {@link #indexOrResolved(String)} rather than a bespoke check: {@code
      * AbsentIndexDescriptorSuppliers#exists}'s own body already collapses "no answer" and "a tombstoned
      * descriptor" into the same false, exactly what {@code indexOrResolved} already does by construction
-     * (its own resolver chain returns null for both). A caller that needs to tell those two apart, or that
+     * (its own catalog chain returns null for both). A caller that needs to tell those two apart, or that
      * needs the underlying descriptor's own fields (uuid, state, aliases), cannot use this method -- that is
      * a real, narrower set of call sites the migration deliberately left on the static registry, since {@link
-     * IndexMetadataResolver} correctly does not expose plugin-specific descriptor vocabulary.
+     * IndexCatalog} correctly does not expose plugin-specific descriptor vocabulary.
      */
     public boolean existsOrResolved(String indexName) {
         return getIndicesLookup().containsKey(indexName) || indexOrResolved(indexName) != null;
@@ -925,7 +903,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
     /**
      * The names among {@code indices} that are
-     * gated, meaning this {@link Metadata} has no entry and an attached {@link IndexMetadataResolver} does
+     * gated, meaning this {@link Metadata} has no entry and the node's registered {@link IndexCatalog} does
      * -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#gatedAmong}.
      *
      * <p>For the operations that cannot be expressed on a resolved index at all, so they can refuse clearly
@@ -943,31 +921,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             }
         }
         return gated;
-    }
-
-    /**
-     * Attaches the per-node fallback {@link #indexOrResolved(String)} consults on a miss. See {@link
-     * #resolver}'s own javadoc for why this is a mutable setter rather than a constructor parameter, and for
-     * what still has to call it before this has any effect.
-     *
-     * <p>A no-op on {@link #EMPTY_METADATA} itself: that field is a shared, JVM-wide singleton --
-     * {@link org.opensearch.cluster.ClusterState.Builder}'s default when no explicit metadata is set, and
-     * reused as a convenience placeholder throughout tests and bootstrap code -- so mutating this transient
-     * field on it would leak one caller's resolver into every other unrelated {@code ClusterState} that
-     * also defaults to it, on this node and (in tests) across the whole JVM. There is nothing to resolve
-     * against an empty placeholder anyway, so skipping the attach is behaviorally correct, not just safe.
-     */
-    public void attachIndexMetadataResolver(IndexMetadataResolver resolver) {
-        if (this == EMPTY_METADATA) {
-            return;
-        }
-        this.resolver = resolver;
-    }
-
-    /** The currently-attached resolver, or {@code null} if none is. Exposed mainly for tests and for the
-     *  code paths ({@link Builder#Builder(Metadata)}, {@link MetadataDiff#apply}) that propagate it. */
-    public IndexMetadataResolver indexMetadataResolver() {
-        return resolver;
     }
 
     /**
@@ -1353,13 +1306,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             builder.indexHolders(indices.apply(part.indices));
             builder.templates(templates.apply(part.templates.getTemplates()));
             builder.customs(customs.apply(part.customs));
-            // builder() above is the from-scratch
-            // no-arg constructor (deliberately, per the comment above), so it has no resolver to carry
-            // forward on its own -- unlike Builder(Metadata), which copies one. Diff application is the
-            // normal way cluster state propagates after the first full state, so without this line every
-            // node but the one that originally built a Metadata locally would silently lose its resolver
-            // on the very next cluster state update.
-            builder.resolver(part.resolver);
             return builder.build();
         }
     }
@@ -1621,9 +1567,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
         private Map<String, SortedMap<Long, String>> systemTemplatesLookup;
 
-        /** Carried forward to whatever this builder produces. See {@link Metadata#resolver}'s own javadoc. */
-        private IndexMetadataResolver resolver;
-
         public Builder() {
             clusterUUID = UNKNOWN_CLUSTER_UUID;
             indices = new HashMap<>();
@@ -1645,18 +1588,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             this.templates = new HashMap<>(metadata.templates.getTemplates());
             this.customs = new HashMap<>(metadata.customs);
             this.previousMetadata = metadata;
-            this.resolver = metadata.resolver;
-        }
-
-        /**
-         * Overrides the resolver this builder's {@link #build()} attaches, instead of whatever {@link
-         * #Builder(Metadata)} (if used) already copied forward. Most callers never need this -- the
-         * resolver already propagates on its own -- this exists for the one place that has to attach it
-         * in the first place (a from-scratch {@link #builder()} has nothing to copy from).
-         */
-        public Builder resolver(IndexMetadataResolver resolver) {
-            this.resolver = resolver;
-            return this;
         }
 
         /**
@@ -2168,7 +2099,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 Collections.unmodifiableSortedMap(previousMetadata.indicesLookup),
                 systemTemplatesLookup
             );
-            built.resolver = resolver;
             return built;
         }
 
@@ -2295,7 +2225,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 indicesLookup,
                 systemTemplatesLookup
             );
-            built.resolver = resolver;
             return built;
         }
 

@@ -1059,7 +1059,8 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     /**
      * This engine's own already-durable manifest publication already <em>is</em> a complete,
      * addressable point-in-time copy of this shard (the same insight {@link
-     * WriterEngineFactory#ownsRemoteSegmentDurability} documents) -- so a real {@code _snapshot} request never needs
+     * ObjectStoreShardRecoveryStrategy#ownsRemoteSegmentDurability} documents) -- so a real {@code
+     * _snapshot} request never needs
      * to copy segment bytes for this engine the way {@code Engine#acquireLastIndexCommit}-based
      * snapshotting does. This pins the latest manifest generation under {@code snapshotId} (via
      * {@link ObjectStoreCommitHeadPublisher#readLatestManifestWithPin}, the same pin-before-read

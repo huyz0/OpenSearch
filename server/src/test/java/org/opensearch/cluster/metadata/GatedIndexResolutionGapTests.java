@@ -40,6 +40,7 @@ public class GatedIndexResolutionGapTests extends OpenSearchTestCase {
     @After
     public void clearRegistrations() {
         AbsentIndexDescriptorSuppliers.register(null);
+        IndexCatalogRegistry.register(null);
     }
 
     /**
@@ -68,13 +69,11 @@ public class GatedIndexResolutionGapTests extends OpenSearchTestCase {
 
         // The seam answers, which is the premise: the descriptor is available and says the index exists.
         //
-        // A real (non-EMPTY_METADATA) instance, not the builder's default -- attachIndexMetadataResolver is
-        // deliberately a no-op on the shared EMPTY_METADATA singleton (see its own javadoc), so resolving
-        // via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
-        // IndexNameExpressionResolver#aliasOrIndexExists now goes through) needs an explicit one here, same
-        // as production code gets from a real cluster state.
+        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(): resolving via the
+        // SPI IndexNameExpressionResolver#aliasOrIndexExists goes through needs the catalog registered here,
+        // same as production code gets from Node.java at startup. Cleared in this class's @After.
+        IndexCatalogRegistry.register(new SupplierBackedIndexCatalog());
         Metadata metadata = Metadata.builder().build();
-        metadata.attachIndexMetadataResolver(new SupplierBackedIndexMetadataResolver());
         ClusterState emptyState = ClusterState.builder(ClusterName.DEFAULT).metadata(metadata).build();
         assertTrue(
             "the premise: the descriptor seam resolves this name",

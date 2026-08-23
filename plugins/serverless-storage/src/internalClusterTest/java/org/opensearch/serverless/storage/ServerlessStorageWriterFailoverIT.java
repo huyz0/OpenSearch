@@ -128,7 +128,7 @@ public class ServerlessStorageWriterFailoverIT extends ServerlessStorageIntegTes
 
         // The remaining data node is the only place this shard can go -- and it starts with a
         // completely empty local Store, exactly the scenario
-        // WriterEngineFactory#recoverMissingLocalStore and ServerlessStorageExistingShardsAllocator
+        // ObjectStoreShardRecoveryStrategy's EXISTING_STORE case and ServerlessStorageExistingShardsAllocator
         // exist for (rfc-serverless-opensearch.md &sect;7.1.2). Without either, this would either
         // never leave UNASSIGNED (no allocator willing to place it) or fail recovery outright (no
         // local commit to read) -- ensureGreen succeeding at all is most of what this test proves.

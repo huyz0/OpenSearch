@@ -720,7 +720,9 @@ found. All work compile-gated across server (main/test/internalClusterTest), plu
   are the single node-level authority per plane; the ClusterPlugin SPI is the registration front door; the
   RoutingTable/Metadata instance attachment is the state-scoped read path; the remaining direct static
   call sites are permanent by design. All four seam classes now carry one consistent architecture
-  paragraph, and "migration still coming" wording was removed.
+  paragraph, and "migration still coming" wording was removed. *(Superseded in part by the seam merge
+  below: the instance attachment is gone, and the "is the feature active" static call sites are no longer
+  permanent -- they moved onto `IndexCatalog#isActive()`. The rest stands.)*
 - **De-jargonization sweep (~110 files, comment-only):** plan-document citations, phase/area/task codes,
   and product-named phrasing in core comments replaced with self-contained neutral explanations; every
   measurement and incident story preserved.
@@ -756,3 +758,46 @@ found. All work compile-gated across server (main/test/internalClusterTest), plu
 - The relocation-handoff final-sync condition covers pluggable-format indices only; the comment now says
   so accurately, but whether vanilla remote-store REQUEST-durability indexes need the same sync remains
   undecided.
+
+## Seam merge: two resolver SPIs became one `IndexCatalog` (2026-08-23)
+
+Core never asked the two questions separately. `ClusterState#getIndexRoutingTable(String)` consults the
+metadata resolver and the routing resolver four lines apart, behind one thread guard, because routing
+resolution takes the metadata answer as its input; the same pair recurs in `IndicesClusterStateService`,
+`TransportReplicationAction`, `SnapshotsService` and `ActiveShardCount`. Delivering five core invocation
+lines cost two SPIs, two `ClusterPlugin` getters, two `SupplierBacked*` adapters over the two static
+registries, and a high-priority `ClusterStateApplier` whose only job was to attach both.
+
+**Now:** one `cluster.metadata.IndexCatalog` (`resolveMetadata`, `resolveRouting`, `shouldPublishRouting`,
+`isActive`), one `ClusterPlugin#getIndexCatalog()`, one `SupplierBackedIndexCatalog`, one node-level
+`IndexCatalogRegistry`. Deleted: `IndexMetadataResolver`, `IndexRoutingResolver`,
+`SupplierBackedIndexMetadataResolver`, `SupplierBackedIndexRoutingResolver`,
+`ResolverAttachingClusterStateApplier`, both transient `resolver` fields with their attach/accessor
+methods, both `Builder.resolver(...)` setters, and the three diff-apply propagation patches.
+
+**Two methods, not one compound return.** The halves are inherently sequential (`resolveRouting` takes
+`resolveMetadata`'s result), so a pair or lazy holder would allocate on every miss and save nothing; a
+caller wanting only metadata already pays only for metadata.
+
+**Node scope, not per-state.** A `ClusterState` never leaves the node that built it, so the propagation
+machinery bought nothing -- and it made `isActive()` inexpressible. Consequence, deliberate: a bare
+`ClusterState` built on the shared `EMPTY_METADATA`/`EMPTY_ROUTING_TABLE` singletons now resolves through
+the catalog (it previously could not, because attachment skipped those singletons). That is the same answer
+any real state gives, and the singleton-leak bug the attach guards existed to prevent is gone by
+construction.
+
+**`isActive()`.** Node-scoped and dynamically toggled: registration is a node-lifetime fact (the plugin
+always supplies a catalog), while the feature underneath toggles at runtime. The four call sites that had
+deliberately stayed on `AbsentIndexRoutingSuppliers.isRegistered()` for exactly this reason --
+`BroadcastEmptiness#check`, `ActiveShardCount#enoughShardsActive`, and the two that ask *before any
+`ClusterState` exists* to decide what to request, `TransportCatShardsAction` and `RestAllocationAction` --
+are migrated. `SupplierBackedIndexCatalog#isActive` forwards to that same registry, live per call, so the
+answers are unchanged.
+
+**Unchanged, deliberately:** the published-first fast path (both read paths return from their published map
+before touching a catalog -- pinned by `PublishedIndexNeverReachesTheCatalogTests`); `Metadata#index(String)`
+and the `indexOrResolved` opt-in-by-name split; wildcard/`_all` expansion, which is a listing operation a
+lookup-shaped SPI structurally cannot answer; and both static registries, which keep the descriptor
+vocabulary (uuid, three-way live/tombstoned/unknown, prefix expansion, suspension, memoisation) the generic
+SPI correctly does not expose, and which a handful of core call sites still consult directly for exactly
+those richer questions.

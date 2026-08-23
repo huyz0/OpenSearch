@@ -11,8 +11,8 @@ package org.opensearch.action.support.broadcast.node;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -60,16 +60,14 @@ public final class BroadcastEmptiness {
         String[] concreteIndices,
         Set<String> indicesWithShards
     ) {
-        // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not
-        // clusterState.routingTable().indexRoutingResolver() != null (an earlier attempt swapped this
-        // for checking the attached resolver and a real test caught why that's wrong):
-        // "a resolver is attached" is a node-lifetime-scoped fact, true for as long as a plugin implements
-        // the SPI at all, while this guard needs "is the underlying feature *currently active*" -- a
-        // dynamically-toggled fact the SupplierBackedIndexRoutingResolver bridge's own methods already
-        // answer correctly (they read the live static registry each call), but that isRegistered()-shaped
-        // question itself has no equivalent on the IndexRoutingResolver interface. Migrating this specific
-        // check would make the guard fire even when the underlying registry the bridge wraps is empty.
-        if (AbsentIndexRoutingSuppliers.isRegistered() == false) {
+        // IndexCatalog#isActive(), not "is a catalog registered" (an earlier attempt swapped this for
+        // checking the attached resolver of the day and a real test caught why that's wrong):
+        // registration is a node-lifetime-scoped fact, true for as long as a plugin implements the SPI at
+        // all, while this guard needs "is the underlying feature *currently active*" -- a dynamically
+        // toggled fact. The SPI now models exactly that, so this no longer has to reach past it into the
+        // static registry; SupplierBackedIndexCatalog#isActive reads that live registry on every call, so
+        // the answer here is the same one this line always gave.
+        if (IndexCatalogRegistry.isActive() == false) {
             return List.of();
         }
         List<String> missing = new ArrayList<>();

@@ -63,8 +63,8 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
  *       IndicesStatsResponse}'s {@code getRemoteSegmentStats().getUploadBytesStarted()}, reliably
  *       {@code > 0} before this was fixed. Not a correctness bug, but a real, measured cost/efficiency
  *       gap (rfc-serverless-opensearch.md &sect;18 risk #10) -- fixed by a new core seam,
- *       {@code EngineFactory#ownsRemoteSegmentDurability}, that {@link
- *       org.opensearch.serverless.storage.writerengine.WriterEngineFactory} now implements to tell
+ *       {@code ShardRecoveryStrategy#ownsRemoteSegmentDurability}, that {@link
+ *       org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy} answers to tell
  *       {@code IndexShard} its own manifest publication already is this shard's durable remote
  *       copy. This test now asserts the upload count is exactly {@code 0}.
  * </ul>
@@ -171,8 +171,8 @@ public class ServerlessStorageSearchOnlyReplicaIT extends RemoteStoreBaseIntegTe
         // The other, previously-open half of risk #10: does core's own remote segment-store upload
         // machinery run pointlessly in the background alongside this plugin's manifest/bundle
         // publication? It used to -- confirmed with real, non-zero uploadBytesStarted before
-        // WriterEngineFactory#ownsRemoteSegmentDurability existed -- but not anymore: that new
-        // EngineFactory method tells core this engine already keeps every segment durable via its
+        // ObjectStoreShardRecoveryStrategy#ownsRemoteSegmentDurability existed -- but not anymore:
+        // that answer tells core this index already keeps every segment durable via its
         // own manifest publication, so IndexShard#createEngineConfig now skips wiring in
         // RemoteStoreRefreshListener entirely for this shard. Asserting exactly 0 here, not just
         // "no exception," is what actually proves the new core seam is taking effect end-to-end,
@@ -184,7 +184,7 @@ public class ServerlessStorageSearchOnlyReplicaIT extends RemoteStoreBaseIntegTe
                 sawPrimary = true;
                 assertEquals(
                     "core's remote segment-store upload machinery must never fire for a serverless-storage "
-                        + "index's writer shard now that WriterEngineFactory#ownsRemoteSegmentDurability "
+                        + "index's writer shard now that ObjectStoreShardRecoveryStrategy#ownsRemoteSegmentDurability "
                         + "returns true (rfc-serverless-opensearch.md §18 risk #10)",
                     0L,
                     shardStats.getStats().getSegments().getRemoteSegmentStats().getUploadBytesStarted()

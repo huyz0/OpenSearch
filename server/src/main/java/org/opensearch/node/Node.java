@@ -69,7 +69,6 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.InternalClusterInfoService;
 import org.opensearch.cluster.NodeConnectionsService;
-import org.opensearch.cluster.ResolverAttachingClusterStateApplier;
 import org.opensearch.cluster.StreamNodeConnectionsService;
 import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.action.shard.LocalShardStateAction;
@@ -78,9 +77,10 @@ import org.opensearch.cluster.applicationtemplates.SystemTemplatesPlugin;
 import org.opensearch.cluster.applicationtemplates.SystemTemplatesService;
 import org.opensearch.cluster.coordination.PersistedStateRegistry;
 import org.opensearch.cluster.metadata.AliasValidator;
+import org.opensearch.cluster.metadata.IndexCatalog;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexCreationStrategy;
 import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
-import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
@@ -93,7 +93,6 @@ import org.opensearch.cluster.metadata.TemplateUpgradeService;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.routing.BatchedRerouteService;
-import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.RerouteService;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance;
@@ -178,6 +177,7 @@ import org.opensearch.index.mapper.MappingTransformerRegistry;
 import org.opensearch.index.recovery.RemoteStoreRestoreService;
 import org.opensearch.index.remote.RemoteIndexPathUploader;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
+import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.store.DefaultCompositeDirectoryFactory;
 import org.opensearch.index.store.DefaultDataFormatAwareStoreDirectoryFactory;
 import org.opensearch.index.store.IndexStoreListener;
@@ -770,40 +770,23 @@ public class Node implements Closeable {
             resourcesToClose.add(clusterService);
 
             // Give the node its plugin-supplied
-            // IndexMetadataResolver/IndexRoutingResolver, if any ClusterPlugin on this node provides
-            // one. See ResolverAttachingClusterStateApplier's own javadoc for why this attachment point
-            // -- a high-priority applier -- is the right one, and Metadata#resolver's javadoc for the
-            // propagation mechanics that carry the attached resolver forward from here.
-            List<IndexMetadataResolver> indexMetadataResolvers = clusterPlugins.stream()
-                .map(ClusterPlugin::getIndexMetadataResolver)
+            // IndexCatalog, if any ClusterPlugin on this node provides one. A one-time registration, the
+            // same shape as IndexCreationStrategy below: the catalog is node-scoped, so unlike the two
+            // per-cluster-state resolvers this replaced, there is nothing to attach to each applied state
+            // and no high-priority ClusterStateApplier needed to seed from-scratch instances. See
+            // IndexCatalogRegistry's own javadoc for why that scope is the honest one.
+            List<IndexCatalog> indexCatalogs = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexCatalog)
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .collect(toList());
-            if (indexMetadataResolvers.size() > 1) {
-                throw new IllegalStateException(
-                    "at most one ClusterPlugin may supply an IndexMetadataResolver, but found " + indexMetadataResolvers.size()
-                );
+            if (indexCatalogs.size() > 1) {
+                throw new IllegalStateException("at most one ClusterPlugin may supply an IndexCatalog, but found " + indexCatalogs.size());
             }
-            List<IndexRoutingResolver> indexRoutingResolvers = clusterPlugins.stream()
-                .map(ClusterPlugin::getIndexRoutingResolver)
-                .filter(Optional::isPresent)
-                .map(Optional::get)
-                .collect(toList());
-            if (indexRoutingResolvers.size() > 1) {
-                throw new IllegalStateException(
-                    "at most one ClusterPlugin may supply an IndexRoutingResolver, but found " + indexRoutingResolvers.size()
-                );
-            }
-            Optional<IndexMetadataResolver> indexMetadataResolver = indexMetadataResolvers.stream().findFirst();
-            Optional<IndexRoutingResolver> indexRoutingResolver = indexRoutingResolvers.stream().findFirst();
-            if (indexMetadataResolver.isPresent() || indexRoutingResolver.isPresent()) {
-                clusterService.addHighPriorityApplier(
-                    new ResolverAttachingClusterStateApplier(indexMetadataResolver, indexRoutingResolver)
-                );
-            }
+            indexCatalogs.stream().findFirst().ifPresent(IndexCatalogRegistry::register);
 
             // Give the node its plugin-supplied
-            // IndexCreationStrategy, if any ClusterPlugin on this node provides one. Unlike the resolvers
+            // IndexCreationStrategy, if any ClusterPlugin on this node provides one. Unlike the catalog
             // above, claims() is a pure, cheap, synchronous, purely-local predicate with no deadlock-safety
             // concerns and nothing to propagate through cluster state -- a one-time registration here,
             // mirroring exactly how DescriptorOnlyCreation.register(...) is called once from a plugin's own
@@ -1118,6 +1101,25 @@ public class Node implements Closeable {
                 .flatMap(m -> m.entrySet().stream())
                 .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 
+            // Core seeds its own local-lucene strategy into the very map plugins contribute to, then merges
+            // plugin contributions on top with a duplicate-name check -- the same shape RepositoriesModule uses
+            // for the fs repository and ClusterModule for the balanced allocator. A plugin claiming a name core
+            // (or another plugin) already owns fails the node at startup rather than silently winning the map.
+            final Map<String, ShardRecoveryStrategy> shardRecoveryStrategies = IndexModule.createBuiltInShardRecoveryStrategies();
+            for (IndexStorePlugin indexStorePlugin : pluginsService.filterPlugins(IndexStorePlugin.class)) {
+                for (Map.Entry<String, ShardRecoveryStrategy> entry : indexStorePlugin.getShardRecoveryStrategies().entrySet()) {
+                    if (shardRecoveryStrategies.put(entry.getKey(), entry.getValue()) != null) {
+                        throw new IllegalArgumentException(
+                            "ShardRecoveryStrategy ["
+                                + entry.getKey()
+                                + "] from ["
+                                + indexStorePlugin.getClass().getName()
+                                + "] was already defined"
+                        );
+                    }
+                }
+            }
+
             final RerouteService rerouteService = new BatchedRerouteService(clusterService, clusterModule.getAllocationService()::reroute);
             rerouteServiceReference.set(rerouteService);
             clusterService.setRerouteService(rerouteService);
@@ -1177,6 +1179,7 @@ public class Node implements Closeable {
                 searchModule.getValuesSourceRegistry(),
                 recoveryStateFactories,
                 storeFactories,
+                Map.copyOf(shardRecoveryStrategies),
                 remoteDirectoryFactory,
                 repositoriesServiceReference::get,
                 searchRequestStats,

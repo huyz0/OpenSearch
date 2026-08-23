@@ -16,8 +16,10 @@ import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.coordination.NoClusterManagerBlockService;
 import org.opensearch.cluster.health.ClusterHealthStatus;
 import org.opensearch.cluster.health.ClusterStateHealth;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.SupplierBackedIndexCatalog;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -54,6 +56,7 @@ public class ComputedActiveShardCountingTests extends OpenSearchTestCase {
     @After
     public void clearSupplier() {
         AbsentIndexRoutingSuppliers.register(null);
+        IndexCatalogRegistry.register(null);
     }
 
     /**
@@ -89,6 +92,31 @@ public class ComputedActiveShardCountingTests extends OpenSearchTestCase {
 
         assertFalse(ActiveShardCount.ONE.enoughShardsActive(state, INDEX));
         assertFalse(ActiveShardCount.ALL.enoughShardsActive(state, INDEX));
+    }
+
+    /**
+     * The {@code isActive()}-not-{@code isRegistered()} distinction, at one of the four call sites that
+     * depend on it. {@code ActiveShardCount#enoughShardsActive} asserts that an open index with no routing
+     * entry is impossible -- which it is, unless computed placement is currently on. A real node registers
+     * the catalog unconditionally at startup, so the assertion must key on the feature being active, not on
+     * a catalog existing: with a catalog registered and nothing underneath it, this state is a genuine bug
+     * and the assertion must still fire.
+     */
+    public void testTheAssertionKeysOnTheFeatureBeingActiveNotOnACatalogBeingRegistered() {
+        ClusterState state = stateWithoutRouting(1);
+        assertTrue("premise: a catalog is registered", IndexCatalogRegistry.isRegistered());
+        assertFalse("premise: the feature underneath it is off", IndexCatalogRegistry.isActive());
+
+        AssertionError caught = expectThrows(AssertionError.class, () -> ActiveShardCount.ONE.enoughShardsActive(state, INDEX));
+        assertTrue("the message must name the index: " + caught.getMessage(), caught.getMessage().contains(INDEX));
+
+        AbsentIndexRoutingSuppliers.register((s, meta) -> null);
+
+        assertTrue("the same registered catalog must now read as active", IndexCatalogRegistry.isActive());
+        assertFalse(
+            "and the same state must now read as not-ready instead of asserting",
+            ActiveShardCount.ONE.enoughShardsActive(state, INDEX)
+        );
     }
 
     /** A published index is unaffected: the supplier is consulted only where there is nothing published. */
@@ -180,20 +208,18 @@ public class ComputedActiveShardCountingTests extends OpenSearchTestCase {
     }
 
     /**
-     * A real (non-EMPTY_ROUTING_TABLE) instance with the SupplierBackedIndexRoutingResolver bridge attached
-     * -- attachIndexRoutingResolver is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see
-     * its own javadoc), so resolving via the SPI ClusterState#getIndexRoutingTable/ActiveShardCount/
-     * ClusterStateHealth already consult (Phase C4a of core-pluggability-refactor-plan.md) needs an explicit
-     * one here, same as production code gets from a real cluster state. This was a real, pre-existing gap:
-     * confirmed via git stash that testCountingSeesSuppliedShards/testHealthCountsSuppliedShardsRatherThanSkippingTheIndex/
-     * testHealthIsRedWhenComputedShardsAreUnassigned were already failing before any of this session's C4b
-     * work, because AbsentIndexRoutingSuppliers.register(...) alone was never bridged into the resolver
-     * ActiveShardCount/ClusterStateHealth have consulted since C4a.
+     * An empty routing table, plus the node-scoped registration a real node performs at startup from
+     * {@code ClusterPlugin#getIndexCatalog()}: resolving via the SPI ClusterState#getIndexRoutingTable/
+     * ActiveShardCount/ClusterStateHealth already consult needs the catalog registered, same as production.
+     * This was a real, pre-existing gap: confirmed via git stash that
+     * testCountingSeesSuppliedShards/testHealthCountsSuppliedShardsRatherThanSkippingTheIndex/
+     * testHealthIsRedWhenComputedShardsAreUnassigned were already failing before any of this session's
+     * work, because AbsentIndexRoutingSuppliers.register(...) alone was never bridged into the seam
+     * ActiveShardCount/ClusterStateHealth consult. Cleared in this class's @After.
      */
     private static RoutingTable routingTableWithBridge() {
-        RoutingTable routingTable = RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
-        return routingTable;
+        IndexCatalogRegistry.register(new SupplierBackedIndexCatalog());
+        return RoutingTable.builder().build();
     }
 
     private static IndexMetadata indexMetadata(int shards) {

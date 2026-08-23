@@ -37,8 +37,8 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
  * divergent {@code liveDocs}), before the merge folds them back together.
  *
  * <p>Uses a real 2-node cluster and the plugin's real {@code ObjectStoreWriterEngine} (core's default
- * engine has no merge materialization seam at all, per {@code
- * EngineFactory#recoverInPlaceMergeLocalStore}'s default no-op). Asserts that after the round trip
+ * engine has no merge materialization seam at all -- core's own {@code local-lucene}
+ * {@code ShardRecoveryStrategy} declines the merge case). Asserts that after the round trip
  * every document is reachable with its correct final state -- pre-split originals (updated ones with
  * their new value, deleted ones gone), plus every post-split write from both children -- via both
  * scatter-gather search and real single-shard {@code GET}-by-id routing.

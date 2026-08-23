@@ -53,17 +53,19 @@ import java.util.function.Predicate;
  * <p><b>Settled architecture: one authority per plane.</b> This static registry is the node-level
  * <em>authority</em> for computed routing -- the single place a plugin's answers live, and the seam the
  * few core internals that ask node-level questions consult directly. The {@code ClusterPlugin} SPI
- * ({@link IndexRoutingResolver}, implemented for this registry by {@link
- * SupplierBackedIndexRoutingResolver}) is the registration <em>front door</em>: how a plugin installs
- * into this authority, not a second authority. The resolver instance attached to each {@link
- * RoutingTable} is the state-scoped <em>read path</em> ({@code ClusterState#getIndexRoutingTable},
+ * ({@link org.opensearch.cluster.metadata.IndexCatalog}, implemented for this registry by {@link
+ * org.opensearch.cluster.metadata.SupplierBackedIndexCatalog}) is the registration <em>front door</em>:
+ * how a plugin installs into this authority, not a second authority. The catalog registered on the node
+ * is the <em>read path</em> ({@code ClusterState#getIndexRoutingTable},
  * {@code ClusterState#resolveShard}, {@code ClusterState#allShards}, {@code
- * RoutingTable#shouldPublishRouting}), and it answers by forwarding here. The direct static call sites
- * that remain in core -- each carrying its own comment -- are permanent by design, not a pending
- * migration: they ask "is the feature currently active on this node", a node-level fact the
- * state-attached resolver deliberately does not model (a resolver is attached for the node's lifetime;
- * this registry's contents change with the feature). Its metadata-plane counterpart, {@code
- * org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers}, follows exactly the same shape.
+ * RoutingTable#shouldPublishRouting}), and it answers by forwarding here. Its metadata-plane counterpart,
+ * {@code org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers}, follows exactly the same shape.
+ *
+ * <p><b>What is no longer a direct static call site.</b> Four core call sites used to consult {@link
+ * #isRegistered()} here because they needed "is the feature currently active on this node" and the
+ * resolver SPI of the day, being attached per cluster state, could not model it. {@link
+ * org.opensearch.cluster.metadata.IndexCatalog#isActive()} now does, and all four have migrated onto it --
+ * {@code SupplierBackedIndexCatalog#isActive} forwards straight back here, so the answers are unchanged.
  */
 public final class AbsentIndexRoutingSuppliers {
 

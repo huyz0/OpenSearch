@@ -37,11 +37,12 @@ import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.coordination.CoordinationMetadata;
 import org.opensearch.cluster.coordination.CoordinationMetadata.VotingConfigExclusion;
 import org.opensearch.cluster.coordination.CoordinationMetadata.VotingConfiguration;
+import org.opensearch.cluster.metadata.IndexCatalog;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.PlainShardsIterator;
@@ -288,9 +289,14 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
     }
 
     /**
-     * {@code routingTable().index(indexName)},
-     * falling back to the attached {@link org.opensearch.cluster.routing.IndexRoutingResolver} (see that
-     * interface's own javadoc) on a miss.
+     * {@code routingTable().index(indexName)}, falling back to the node's registered {@link IndexCatalog}
+     * (see that interface's own javadoc) on a miss.
+     *
+     * <p><b>This method is why the two resolver SPIs became one {@code IndexCatalog}.</b> It is a single
+     * compound question -- "does this index exist, and where do its shards live" -- and its body asks both
+     * halves four lines apart, behind one thread guard, because the second half needs the first half's
+     * answer as its input. The same pair recurs in {@code IndicesClusterStateService}, {@code
+     * TransportReplicationAction}, {@code SnapshotsService} and {@code ActiveShardCount}.
      *
      * <p>This -- not {@code RoutingTable#index(String)} itself -- is the seam: real routing resolution
      * needs the index's {@link org.opensearch.cluster.metadata.IndexMetadata} (at minimum its shard
@@ -298,13 +304,16 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
      * #metadata()}. Since this method is itself an explicit "please resolve" call (unlike a bare {@code
      * routingTable().index(name)}), it deliberately calls {@link Metadata#indexOrResolved(String)} rather
      * than the plain {@link Metadata#index(String)} -- see that method's own javadoc for why the two are
-     * not interchangeable. So this single method composes both resolvers correctly for any caller with a
+     * not interchangeable. So this single method composes both halves correctly for any caller with a
      * {@code ClusterState} in hand, which is nearly every core caller today ({@code OperationRouting},
      * {@code IndexNameExpressionResolver}, the action layer) -- which is what lets those call sites
      * migrate onto this one method instead of consulting the static registries directly.
      *
+     * <p>The published routing entry is returned before anything else is touched, so an ordinary index
+     * costs exactly one map lookup here whether or not a catalog is registered.
+     *
      * @return the resolved {@link org.opensearch.cluster.routing.IndexRoutingTable}, or {@code null} if
-     *         neither the routing table nor the resolver has one -- callers must treat this identically
+     *         neither the routing table nor the catalog has one -- callers must treat this identically
      *         to how they already treat a direct {@code routingTable().index(name)} miss.
      */
     @Nullable
@@ -313,12 +322,12 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
         if (published != null) {
             return published;
         }
-        IndexRoutingResolver resolver = routingTable.indexRoutingResolver();
-        if (resolver == null) {
+        IndexCatalog catalog = IndexCatalogRegistry.get();
+        if (catalog == null) {
             return null;
         }
         // See ClusterStateMutationThreads' own javadoc for why: independent of indexOrResolved(indexName)'s
-        // own identical guard below, since a resolver that answers may still do real (e.g. remote) work.
+        // own identical guard below, since a catalog that answers may still do real (e.g. remote) work.
         if (ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
             return null;
         }
@@ -326,7 +335,7 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
         if (indexMetadata == null) {
             return null;
         }
-        return resolver.resolve(this, indexMetadata);
+        return catalog.resolveRouting(this, indexMetadata);
     }
 
     /**
@@ -343,9 +352,9 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
      * #getIndexRoutingTable(String)} rather than reading {@link #routingTable()} directly -- this is the
      * batch read that replaced the static registry's since-deleted {@code allShards} helpers, and it is
      * now the only one. Composed entirely from already-wired primitives ({@link
-     * #getIndexRoutingTable(String)}, itself already resolver-aware and thread-guarded) rather than adding
-     * new {@link IndexRoutingResolver} surface -- this is a batch/predicate operation over what {@link
-     * IndexRoutingResolver#resolve} already answers per index, not a new question a resolver needs to
+     * #getIndexRoutingTable(String)}, itself already catalog-aware and thread-guarded) rather than adding
+     * new {@link IndexCatalog} surface -- this is a batch/predicate operation over what {@link
+     * IndexCatalog#resolveRouting} already answers per index, not a new question a catalog needs to
      * answer.
      *
      * <p>Falls straight through to {@link RoutingTable}'s own equivalent methods when nothing is registered
@@ -355,7 +364,7 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
      * @param includeRelocationTargets whether to add the target of a relocating shard, as recovery needs
      */
     public ShardsIterator allShards(String[] concreteIndices, Predicate<ShardRouting> predicate, boolean includeRelocationTargets) {
-        if (routingTable.indexRoutingResolver() == null) {
+        if (IndexCatalogRegistry.isRegistered() == false) {
             if (includeRelocationTargets) {
                 return routingTable.allShardsIncludingRelocationTargets(concreteIndices);
             }
@@ -407,7 +416,7 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
      * overload rather than the array form's zero-length case.
      */
     public List<ShardRouting> allShards() {
-        if (routingTable.indexRoutingResolver() == null) {
+        if (IndexCatalogRegistry.isRegistered() == false) {
             return routingTable.allShards();
         }
         List<ShardRouting> shards = new ArrayList<>(routingTable.allShards());

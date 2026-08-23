@@ -18,7 +18,6 @@ import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.RoutingTable;
-import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.test.OpenSearchTestCase;
@@ -54,6 +53,7 @@ public class ComputedReshardingRejectionTests extends OpenSearchTestCase {
     @After
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
+        IndexCatalogRegistry.register(null);
     }
 
     public void testSplitIsRejectedForAComputedIndex() {
@@ -115,16 +115,15 @@ public class ComputedReshardingRejectionTests extends OpenSearchTestCase {
     }
 
     private static ClusterState state() {
-        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
-        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
-        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
-        // MetadataInPlaceSplitShardService/MetadataInPlaceMergeShardService now go through for
-        // shouldPublishRouting) needs an explicit one here, same as production code gets from a real
-        // cluster state. Harmless for testAnOrdinaryIndexIsNotRejectedForBeingComputed, which relies on
-        // nothing being registered on AbsentIndexRoutingSuppliers, not on this routing table lacking a
-        // resolver -- the bridge still answers false with nothing registered underneath it.
+        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(), registered rather
+        // than attached to this state: resolution goes through IndexCatalogRegistry now, so a hand-built
+        // state needs nothing special, only the registration a real node performs at startup. Cleared in
+        // this class's @After, since it is node-scoped and would otherwise outlive these tests.
+        IndexCatalogRegistry.register(new SupplierBackedIndexCatalog());
+        // Harmless for testAnOrdinaryIndexIsNotRejectedForBeingComputed, which relies on nothing being
+        // registered on AbsentIndexRoutingSuppliers, not on there being no catalog -- the catalog still
+        // answers false with nothing registered underneath it.
         RoutingTable routingTable = RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(index(COMPUTED), false).build())
             .nodes(DiscoveryNodes.builder().add(node("node-1")).localNodeId("node-1").clusterManagerNodeId("node-1").build())

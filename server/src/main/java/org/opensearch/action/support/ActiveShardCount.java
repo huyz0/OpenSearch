@@ -33,8 +33,8 @@
 package org.opensearch.action.support;
 
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.common.annotation.PublicApi;
@@ -190,12 +190,11 @@ public final class ActiveShardCount implements Writeable {
                 // that the shards are not active: the caller then times out with its own message instead
                 // of an NPE thrown from a cluster state applier thread, where it would take down the
                 // listener rather than the request.
-                // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not
-                // clusterState.routingTable().indexRoutingResolver() != null -- see BroadcastEmptiness#check's
-                // own comment for why the two are not
-                // equivalent: a resolver being attached is a node-lifetime-scoped fact, not the dynamically
-                // toggled "is the underlying feature active" question this assertion actually needs.
-                assert AbsentIndexRoutingSuppliers.isRegistered() : "open index [" + indexName + "] has no routing entry";
+                // IndexCatalog#isActive(), not "is a catalog registered" -- see BroadcastEmptiness#check's
+                // own comment for why the two are not equivalent: registration is a node-lifetime-scoped
+                // fact, not the dynamically toggled "is the underlying feature active" question this
+                // assertion actually needs.
+                assert IndexCatalogRegistry.isActive() : "open index [" + indexName + "] has no routing entry";
                 return false;
             }
 

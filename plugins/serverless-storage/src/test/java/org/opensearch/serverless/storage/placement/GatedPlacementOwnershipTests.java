@@ -45,6 +45,7 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
         AbsentIndexRoutingSuppliers.clearMemos();
         org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.register(null);
         org.opensearch.cluster.metadata.IndexCreationStrategyRegistry.register(null);
+        org.opensearch.cluster.metadata.IndexCatalogRegistry.register(null);
         ComputedPlacementGate.uninstall();
     }
 
@@ -139,19 +140,18 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
     }
 
     /**
-     * The bridges a real applied state carries, attached to real (non-singleton) instances --
-     * {@code attachIndex*Resolver} is deliberately a no-op on the shared empty singletons.
+     * The bridge a real node carries. One registration now covers both halves -- the two {@code
+     * attachIndex*Resolver} calls this replaced were the metadata and routing sides of the same plugin's
+     * one answer, which is exactly why the two SPIs became one {@code IndexCatalog}. Cleared in the
+     * {@code @After} above.
      */
     private static org.opensearch.cluster.metadata.Metadata metadataWithDescriptorBridge() {
-        org.opensearch.cluster.metadata.Metadata metadata = org.opensearch.cluster.metadata.Metadata.builder().build();
-        metadata.attachIndexMetadataResolver(new org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver());
-        return metadata;
+        org.opensearch.cluster.metadata.IndexCatalogRegistry.register(new org.opensearch.cluster.metadata.SupplierBackedIndexCatalog());
+        return org.opensearch.cluster.metadata.Metadata.builder().build();
     }
 
     private static org.opensearch.cluster.routing.RoutingTable routingTableWithBridge() {
-        org.opensearch.cluster.routing.RoutingTable routingTable = org.opensearch.cluster.routing.RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
-        return routingTable;
+        return org.opensearch.cluster.routing.RoutingTable.builder().build();
     }
 
     /** The control: an ordinary serverless index with metadata is still owned and still placed. */

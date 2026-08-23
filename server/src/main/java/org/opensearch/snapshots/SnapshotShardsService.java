@@ -552,7 +552,7 @@ public class SnapshotShardsService extends AbstractLifecycleComponent implements
     private static void releaseEngineNativeSnapshotPointer(EngineNativeSnapshotPointer pointer) {
         EngineNativeSnapshotReleasers.find(pointer.engineId()).ifPresent(releaser -> {
             try {
-                releaser.releaseEngineNativeSnapshot(pointer.payload());
+                releaser.release(pointer.payload());
             } catch (Exception e) {
                 logger.warn(
                     () -> new ParameterizedMessage(

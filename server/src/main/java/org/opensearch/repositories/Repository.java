@@ -537,11 +537,10 @@ public interface Repository extends LifecycleComponent {
      * @param indexId          id for the index being snapshotted.
      * @param snapshotStatus   snapshot status.
      * @param startTime        start time of the snapshot commit.
-     * @param engineId         opaque tag identifying which {@link
-     *                         org.opensearch.index.engine.EngineFactory} produced {@code
+     * @param engineId         opaque tag identifying which engine produced {@code
      *                         snapshotPointer}, so a later delete can route release back to the
      *                         same engine's {@link
-     *                         org.opensearch.index.engine.EngineFactory#releaseEngineNativeSnapshot}.
+     *                         org.opensearch.index.shard.ShardRecoveryStrategy.EngineNativeSnapshots#release}.
      *                         Core only equality-compares this string; it never interprets it.
      * @param snapshotPointer  the exact bytes {@code Engine#attemptEngineNativeSnapshot} returned.
      * @param listener         listener invoked on completion.

@@ -79,17 +79,32 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         return clusterService;
     }
 
+    /**
+     * A serverless index's settings as a real one has them.
+     *
+     * <p>{@code index.recovery.strategy} is set alongside the opt-in because a real serverless index always
+     * carries both -- {@code ServerlessStorageIndexSettingProvider} injects the strategy at creation, and
+     * {@code getEngineFactory} refuses to build an engine without it (an index whose durable copy is in the
+     * object store cannot be recovered by core's {@code local-lucene} strategy, and the plugin fails loudly
+     * rather than let that happen quietly). Building the settings without it here would be constructing an
+     * index shape that cannot exist.
+     */
     private IndexSettings indexSettings(boolean enabled) {
         Index index = new Index("test-index", "test-index-uuid");
         Settings.Builder indexSettingsBuilder = Settings.builder();
         if (enabled) {
             indexSettingsBuilder.put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true);
+            indexSettingsBuilder.put(
+                org.opensearch.index.IndexModule.INDEX_RECOVERY_STRATEGY_SETTING.getKey(),
+                org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy.NAME
+            );
         }
         return IndexSettingsModule.newIndexSettings(
             index,
             indexSettingsBuilder.build(),
             Settings.EMPTY,
-            ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING,
+            org.opensearch.index.IndexModule.INDEX_RECOVERY_STRATEGY_SETTING
         );
     }
 

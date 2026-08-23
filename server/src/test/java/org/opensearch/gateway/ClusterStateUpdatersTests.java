@@ -242,12 +242,11 @@ public class ClusterStateUpdatersTests extends OpenSearchTestCase {
             "classic-idx",
             Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2).build()
         );
-        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
-        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
-        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md) needs an explicit one
-        // here, same as production code gets from a real cluster state.
+        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(): resolution goes
+        // through IndexCatalogRegistry now, so a hand-built state needs only the registration a real node
+        // performs at startup. Cleared at the end of this test.
+        org.opensearch.cluster.metadata.IndexCatalogRegistry.register(new org.opensearch.cluster.metadata.SupplierBackedIndexCatalog());
         final RoutingTable initialRoutingTable = RoutingTable.builder().build();
-        initialRoutingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
         final ClusterState initialState = ClusterState.builder(ClusterState.EMPTY_STATE)
             .metadata(Metadata.builder().put(computed, false).put(published, false).build())
             .routingTable(initialRoutingTable)
@@ -266,6 +265,7 @@ public class ClusterStateUpdatersTests extends OpenSearchTestCase {
             assertTrue("an ordinary index must still have its routing rebuilt", newState.routingTable().hasIndex(published.getIndex()));
         } finally {
             org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.registerUnpublished(null);
+            org.opensearch.cluster.metadata.IndexCatalogRegistry.register(null);
         }
     }
 

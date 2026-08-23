@@ -95,10 +95,12 @@ import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardClosedException;
 import org.opensearch.index.shard.IndexingOperationListener;
+import org.opensearch.index.shard.LocalLuceneShardRecoveryStrategy;
 import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.index.shard.ShardNotFoundException;
 import org.opensearch.index.shard.ShardNotInPrimaryModeException;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.similarity.SimilarityService;
 import org.opensearch.index.store.DataFormatAwareStoreDirectory;
 import org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory;
@@ -229,6 +231,12 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private volatile TimeValue refreshInterval;
     private volatile boolean shardLevelRefreshEnabled;
     private final IndexStorePlugin.StoreFactory storeFactory;
+    /**
+     * This index's resolved {@link ShardRecoveryStrategy} (see {@link IndexModule#INDEX_RECOVERY_STRATEGY_SETTING}),
+     * handed to every shard this service creates. Resolved once per index rather than per shard: it is an index-level
+     * property, exactly like {@link #storeFactory} and {@link #recoveryStateFactory} beside it.
+     */
+    private final ShardRecoveryStrategy shardRecoveryStrategy;
     private final DataFormatRegistry dataFormatRegistry;
 
     @InternalApi
@@ -254,6 +262,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         IndexStorePlugin.CompositeDirectoryFactory compositeDirectoryFactory,
         IndexStorePlugin.DirectoryFactory remoteDirectoryFactory,
         IndexStorePlugin.StoreFactory storeFactory,
+        ShardRecoveryStrategy shardRecoveryStrategy,
         IndexEventListener eventListener,
         Function<IndexService, CheckedFunction<DirectoryReader, DirectoryReader, IOException>> wrapperFactory,
         MapperRegistry mapperRegistry,
@@ -284,6 +293,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     ) {
         super(indexSettings);
         this.storeFactory = storeFactory;
+        this.shardRecoveryStrategy = Objects.requireNonNull(shardRecoveryStrategy);
         this.allowExpensiveQueries = allowExpensiveQueries;
         this.indexSettings = indexSettings;
         this.xContentRegistry = xContentRegistry;
@@ -471,6 +481,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             null,
             remoteDirectoryFactory,
             storeFactory,
+            LocalLuceneShardRecoveryStrategy.INSTANCE,
             eventListener,
             wrapperFactory,
             mapperRegistry,
@@ -901,7 +912,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 this.indexSettings.isSegRepEnabledOrRemoteNode() ? mergedSegmentPublisher : null,
                 this.indexSettings.isSegRepEnabledOrRemoteNode() ? referencedSegmentsPublisher : null,
                 checksumStrategies,
-                dataFormatRegistry
+                dataFormatRegistry,
+                shardRecoveryStrategy
             );
             eventListener.indexShardStateChanged(indexShard, null, indexShard.state(), "shard created");
             eventListener.afterIndexShardCreated(indexShard);

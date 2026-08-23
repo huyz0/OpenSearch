@@ -246,6 +246,14 @@ public abstract class IndexShardTestCase extends OpenSearchTestCase {
     };
 
     protected ThreadPool threadPool;
+    /**
+     * The {@link ShardRecoveryStrategy} every shard built by {@link #newShard} is given. Settable rather than a
+     * constructor argument threaded through all sixteen {@code newShard} overloads: the overwhelming majority of
+     * tests want core's own {@link LocalLuceneShardRecoveryStrategy}, and only the handful exercising the seam
+     * itself ({@code RecoverMissingLocalStoreTests} and friends) set it, immediately before the {@code newShard}
+     * call whose shard should get it.
+     */
+    protected ShardRecoveryStrategy shardRecoveryStrategy = LocalLuceneShardRecoveryStrategy.INSTANCE;
     protected long primaryTerm;
     protected ClusterService clusterService;
 
@@ -808,7 +816,8 @@ public abstract class IndexShardTestCase extends OpenSearchTestCase {
                 mergedSegmentPublisher,
                 ReferencedSegmentsPublisher.EMPTY,
                 Collections.emptyMap(),
-                null // TODO
+                null, // TODO
+                shardRecoveryStrategy
             );
             indexShard.addShardFailureCallback(DEFAULT_SHARD_FAILURE_HANDLER);
             if (remoteStoreStatsTrackerFactory != null) {

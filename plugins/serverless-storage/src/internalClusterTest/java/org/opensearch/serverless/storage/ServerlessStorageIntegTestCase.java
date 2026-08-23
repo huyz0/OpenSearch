@@ -253,9 +253,9 @@ public abstract class ServerlessStorageIntegTestCase extends OpenSearchIntegTest
     }
 
     /**
-     * A bare, hand-built {@link org.opensearch.cluster.ClusterState}, carrying the same
-     * {@code SupplierBackedIndexMetadataResolver} bridge a real cluster's {@code ResolverAttachingClusterStateApplier}
-     * (wired in {@code Node.java}) attaches to every applied state.
+     * A bare, hand-built {@link org.opensearch.cluster.ClusterState}, plus the same {@code
+     * SupplierBackedIndexCatalog} registration a real node performs at startup (wired in {@code Node.java}
+     * from {@code ClusterPlugin#getIndexCatalog()}).
      *
      * <p>Several tests in this suite build their own {@code ClusterState} directly, deliberately bypassing a
      * real cluster round-trip to test {@code IndexNameExpressionResolver}'s resolution logic in isolation.
@@ -263,21 +263,21 @@ public abstract class ServerlessStorageIntegTestCase extends OpenSearchIntegTest
      * the static {@code AbsentIndexDescriptorSuppliers} registry directly, which does not care which {@code
      * ClusterState}/{@code Metadata} instance is in hand. Once {@code IndexNameExpressionResolver} was
      * migrated to ask {@code Metadata#indexOrResolved}/{@code #existsOrResolved} instead, that stopped being
-     * true -- the resolver lives on the specific {@code Metadata} instance, and a hand-built one has none
-     * attached (real cluster tests here found this: {@code DescriptorGateIT}/{@code DescriptorLifecycleIT}/
+     * true (real cluster tests here found this: {@code DescriptorGateIT}/{@code DescriptorLifecycleIT}/
      * {@code GatedWildcardVisibilityIT} all failed with a spurious {@code IndexNotFoundException} until this
-     * helper existed). Use this in place of {@code ClusterState.builder(ClusterName.DEFAULT).build()}
-     * wherever a test needs a bare state that still resolves gated names correctly.
+     * helper existed). The catalog is node-scoped rather than per-state now, so what a hand-built state was
+     * missing is a registration rather than an attachment -- but a unit-scope test still has to perform it,
+     * which is what this helper does. Use this in place of {@code
+     * ClusterState.builder(ClusterName.DEFAULT).build()} wherever a test needs a bare state that still
+     * resolves gated names correctly.
      */
     protected static org.opensearch.cluster.ClusterState emptyClusterStateWithDescriptorResolver() {
-        org.opensearch.cluster.metadata.Metadata metadata = org.opensearch.cluster.metadata.Metadata.builder().build();
-        metadata.attachIndexMetadataResolver(new org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver());
-        // The routing-side bridge too, on a real (non-EMPTY_ROUTING_TABLE) instance -- attachment is a
-        // no-op on the shared singleton -- so ClusterState#getIndexRoutingTable/#resolveShard resolve a
+        // One registration covers both halves, so ClusterState#getIndexRoutingTable/#resolveShard resolve a
         // gated index's computed placement the way a real applied state does: name to descriptor to
         // synthesised metadata to supplied routing.
+        org.opensearch.cluster.metadata.IndexCatalogRegistry.register(new org.opensearch.cluster.metadata.SupplierBackedIndexCatalog());
+        org.opensearch.cluster.metadata.Metadata metadata = org.opensearch.cluster.metadata.Metadata.builder().build();
         org.opensearch.cluster.routing.RoutingTable routingTable = org.opensearch.cluster.routing.RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
         return org.opensearch.cluster.ClusterState.builder(org.opensearch.cluster.ClusterName.DEFAULT)
             .metadata(metadata)
             .routingTable(routingTable)

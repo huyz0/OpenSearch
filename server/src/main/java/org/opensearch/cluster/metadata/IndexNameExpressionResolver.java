@@ -366,8 +366,8 @@ public class IndexNameExpressionResolver {
                 // a lookup it did not pay before.
                 //
                 // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated to the
-                // resolver-seam accessors: this reads descriptor.uuid()/state() directly below,
-                // which IndexMetadataResolver's generic contract deliberately does not expose.
+                // catalog-seam accessors: this reads descriptor.uuid()/state() directly below,
+                // which IndexCatalog's generic contract deliberately does not expose.
                 IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(expression);
                 if (descriptor != null && descriptor.exists()) {
                     // The same rule shouldTrackConcreteIndex applies to a published index, applied here
@@ -1434,10 +1434,10 @@ public class IndexNameExpressionResolver {
          * hidden gated indices are therefore fetched and then discarded, which costs a field each within a
          * page that is already capped.
          */
-        // Deliberately still AbsentIndexDescriptorSuppliers directly, scoped out of the resolver-seam
+        // Deliberately still AbsentIndexDescriptorSuppliers directly, scoped out of the catalog-seam
         // migration (not attempted, not merely unfinished): this is a bulk,
         // capped prefix scan with its own result shape (PrefixMatch/PrefixExpansion), a fundamentally
-        // different question from IndexMetadataResolver#resolve's single-index "does this exist". Migrating
+        // different question from IndexCatalog#resolveMetadata's single-index "does this exist". Migrating
         // it would mean designing and adding real new SPI surface for a capability exactly one call site in
         // core uses -- the kind of interface bloat already rejected once when a
         // different SPI was narrowed. Left as a genuinely separate, scoped-out remainder.

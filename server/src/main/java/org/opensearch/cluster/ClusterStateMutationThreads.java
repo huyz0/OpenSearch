@@ -10,32 +10,31 @@ package org.opensearch.cluster;
 
 /**
  * Identifies the threads on which it is unsafe to consult a plugin-supplied {@code
- * org.opensearch.cluster.metadata.IndexMetadataResolver} or {@code
- * org.opensearch.cluster.routing.IndexRoutingResolver}.
+ * org.opensearch.cluster.metadata.IndexCatalog}.
  *
- * <p><b>The deadlock this exists to prevent.</b> A resolver may need to do real work to answer -- in the
+ * <p><b>The deadlock this exists to prevent.</b> A catalog may need to do real work to answer -- in the
  * general case this SPI is designed for, a remote lookup -- and the cluster-state-mutation threads named
  * here (the cluster applier's and the cluster manager's own single update threads) need to make progress
- * before any such work could complete. A resolver invoked from one of them while it does that work would
+ * before any such work could complete. A catalog invoked from one of them while it does that work would
  * therefore wait on itself: this node's own cluster-state processing is what would eventually let the
- * lookup finish, and the lookup is what the resolver is blocking that processing on.
+ * lookup finish, and the lookup is what the catalog is blocking that processing on.
  *
  * <p>This is not a new problem particular to this SPI -- the static registries this SPI's call-site
  * migration is meant to replace, {@code AbsentIndexDescriptorSuppliers} and {@code
  * AbsentIndexRoutingSuppliers}, discovered and solved exactly this deadlock (their own javadoc records it,
  * with real investigation history) by keeping a thread-name check identical to this one and refusing to
  * call their primary, possibly-blocking supplier from an unsafe thread -- falling back instead to a second,
- * explicitly cache-only supplier tier. The single-method {@code IndexMetadataResolver}/{@code
- * IndexRoutingResolver} contract this SPI settled on deliberately has no such second tier -- see those
- * interfaces' own javadoc -- which makes this check load-bearing rather than optional: without it, a
- * resolver that behaves exactly like the existing primary supplier (a real remote lookup) would reintroduce
- * the identical deadlock the instant a plugin registers one, since {@code Metadata#index(String)}/{@code
- * ClusterState#getIndexRoutingTable(String)} consult a resolver unconditionally otherwise.
+ * explicitly cache-only supplier tier. The {@code IndexCatalog} contract this SPI settled on deliberately
+ * has no such second tier -- see that interface's own javadoc -- which makes this check load-bearing rather
+ * than optional: without it, a catalog that behaves exactly like the existing primary supplier (a real
+ * remote lookup) would reintroduce the identical deadlock the instant a plugin registers one, since {@code
+ * Metadata#indexOrResolved(String)}/{@code ClusterState#getIndexRoutingTable(String)} consult a catalog
+ * unconditionally otherwise.
  *
- * <p>Consulted from the two resolver-consultation points core owns -- {@code Metadata#index(String)} and
- * {@code ClusterState#getIndexRoutingTable(String)} -- rather than trusted to every resolver implementation
- * individually: a plugin author forgetting this check is a production deadlock discovered on a cache miss
- * under load, not a compile error or an obvious test failure, exactly the failure mode the existing
+ * <p>Consulted from the two catalog-consultation points core owns -- {@code Metadata#indexOrResolved(String)}
+ * and {@code ClusterState#getIndexRoutingTable(String)} -- rather than trusted to every catalog
+ * implementation individually: a plugin author forgetting this check is a production deadlock discovered on
+ * a cache miss under load, not a compile error or an obvious test failure, exactly the failure mode the existing
  * registries' own history warns about. Enforcing it once, structurally, in core removes that failure mode
  * instead of documenting around it.
  */
@@ -54,7 +53,7 @@ public final class ClusterStateMutationThreads {
      * answers. This check has no second tier: its two consultation points ({@code
      * Metadata#indexOrResolved}, {@code ClusterState#getIndexRoutingTable}) return {@code null} outright
      * when it trips, which for a request coordinated on an event loop -- which is nearly all of them --
-     * would mean "no such index" for every gated index, warm or cold. Since every resolver that actually
+     * would mean "no such index" for every gated index, warm or cold. Since every catalog that actually
      * blocks reaches the object store through that registry's {@code supply}, guarding it there is what
      * removes the event-loop stall; adding the same names here would remove the feature instead.
      */
@@ -66,12 +65,12 @@ public final class ClusterStateMutationThreads {
     private ClusterStateMutationThreads() {}
 
     /**
-     * Whether the calling thread is one on which a resolver must not be consulted.
+     * Whether the calling thread is one on which a catalog must not be consulted.
      *
      * <p>Matched on thread name, mirroring how {@link org.opensearch.cluster.service.ClusterService} and
      * {@link org.opensearch.cluster.service.ClusterApplierService} already assert the same property about
      * themselves -- see {@code ClusterApplierService#assertNotCalledFromClusterStateApplier}. It is a
-     * weaker check than holding a reference to the executor, and it is the one available to a resolver
+     * weaker check than holding a reference to the executor, and it is the one available to a catalog
      * consultation point that has no services injected into it.
      */
     public static boolean blockingIsUnsafeOnCurrentThread() {

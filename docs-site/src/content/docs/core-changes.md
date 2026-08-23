@@ -69,46 +69,66 @@ This is the seam the whole writer/reader split is built on: the plugin's `getEng
 
 A classic `Engine` assumes local Lucene commits plus a local translog are the durability source of truth, and that a shard with no local commit is either brand new or corrupt. An object-store-backed engine breaks both assumptions — durability lives in a remote WAL, and a shard can legitimately have no local commit yet still hold valid remote state (a reactivating scaled-to-zero shard, or a freshly cloned split child).
 
-**`EngineFactory.java`** — before, the interface had exactly two methods (`newReadWriteEngine`, `newReadOnlyEngine`) and no recovery or durability-ownership hooks at all:
+**`ShardRecoveryStrategy.java`** (new, `org.opensearch.index.shard`) — one whole-unit swap point answering the single question "how does this shard's store get populated, and what is authoritative?". Everything on it runs in `StoreRecovery`/`IndexShard` *before* the engine exists, which is why it is not on `EngineFactory` — that interface is back to its upstream one-method `@FunctionalInterface` shape:
 
-```diff lang="java"
- public interface EngineFactory {
-     Engine newReadOnlyEngine(EngineConfig config);
-     Engine newReadWriteEngine(EngineConfig config);
-+
-+    /**
-+     * Called by StoreRecovery#internalRecoverFromStore exactly once, only when local recovery
-+     * expected an existing commit but found none on disk — the point where core would otherwise
-+     * fail the shard outright. Default false: this engine has nothing else to try. An engine whose
-+     * durability doesn't depend on this node's own local disk survival can override this to
-+     * materialize a local Lucene commit and translog from wherever its durable copy lives, and
-+     * return true so recovery proceeds normally instead of failing.
-+     */
-+    default boolean recoverMissingLocalStore(IndexShard indexShard, Store store) throws IOException {
-+        return false;
-+    }
-+
-+    /** Same shape as recoverMissingLocalStore, for a child shard of an in-place split. */
-+    default boolean recoverInPlaceSplitLocalStore(IndexShard indexShard, Store store) throws IOException {
-+        return false;
-+    }
-+
-+    /** Same shape, the reverse case: a parent shard revived by an in-place merge. */
-+    default boolean recoverInPlaceMergeLocalStore(IndexShard indexShard, Store store) throws IOException {
-+        return false;
-+    }
-+
-+    /**
-+     * Whether this engine already provides its own durable, remote copy of every segment it
-+     * writes, independent of core's own remote-store upload path. Default false: core keeps
-+     * uploading via RemoteStoreRefreshListener exactly as it always has. An engine that already
-+     * publishes its own remote manifest can opt out here to avoid duplicate upload cost.
-+     */
-+    default boolean ownsRemoteSegmentDurability() {
-+        return false;
-+    }
- }
+```java
+public interface ShardRecoveryStrategy {
+
+    String LOCAL_LUCENE = "local-lucene";
+
+    /**
+     * Called by StoreRecovery#internalRecoverFromStore at most once per recovery, when core would
+     * otherwise have nothing usable on disk to open an engine against: materialize this shard's
+     * local Lucene commit AND a matching fresh local translog from wherever the durable copy lives,
+     * then return true so recovery proceeds instead of failing. The recovery source type is the only
+     * thing distinguishing the three cases core asks about -- EXISTING_STORE (cross-node failover),
+     * IN_PLACE_SPLIT_SHARD (a split child's first-ever activation), IN_PLACE_MERGE_SHARD (a parent
+     * revived by folding both retired children back together) -- so it is a parameter, not three
+     * methods with byte-identical bodies.
+     */
+    boolean recoverLocalStore(IndexShard indexShard, Store store, RecoverySource.Type recoverySourceType) throws IOException;
+
+    /**
+     * Called when a local commit WAS readable, to ask whether it is still authoritative. Default
+     * false, because for an ordinary shard it is. The motivating case for overriding: an index
+     * closed, restored to an earlier point, and reopened on the same node, whose local files still
+     * describe the pre-restore commit -- recovering from them silently undoes the restore.
+     */
+    default boolean localStoreIsStale(IndexShard indexShard, String localSegmentsFileName) throws IOException {
+        return false;
+    }
+
+    /**
+     * Whether this strategy already provides its own durable, remote copy of every segment the
+     * shard writes, independent of core's own RemoteStoreRefreshListener upload path. Default
+     * false: core keeps uploading exactly as it always has. A strategy that already publishes its
+     * own remote manifest opts out here to avoid duplicate upload cost.
+     */
+    default boolean ownsRemoteSegmentDurability() {
+        return false;
+    }
+
+    /**
+     * Engine-native snapshot restore/release, or empty (default) if this shard's engine never
+     * produces engine-native snapshots. Presence IS the capability answer core gates its remote
+     * probe on, so the gate and the restore call cannot drift out of lockstep.
+     */
+    default Optional<EngineNativeSnapshots> engineNativeSnapshots() {
+        return Optional.empty();
+    }
+
+    interface EngineNativeSnapshots {
+        boolean restore(IndexShard indexShard, Store store, byte[] snapshotPointer) throws IOException;
+
+        /** May be called with NO live IndexShard anywhere in the cluster -- a snapshot outlives its index. */
+        void release(byte[] snapshotPointer) throws IOException;
+    }
+}
 ```
+
+Selection follows core's existing whole-unit-swap idiom exactly. `IndexStorePlugin` gained `getShardRecoveryStrategies()` alongside its existing `DirectoryFactory`/`StoreFactory`/`RecoveryStateFactory` maps; `Node` seeds core's own `local-lucene` implementation into that same map before merging plugin contributions, with a duplicate-name check — the same shape `RepositoriesModule` uses for the `fs` repository, `IndexModule.createBuiltInDirectoryFactories` for `niofs`/`mmapfs`/`hybridfs`, and `ClusterModule` for the balanced allocator. `IndexModule` resolves one strategy per index from `index.recovery.strategy` (default `local-lucene`) and hands it to `IndexService`, which hands it to every `IndexShard` it creates.
+
+`LocalLuceneShardRecoveryStrategy` is core dogfooding its own extension point: it answers "no" to everything, which is exactly what core did before this seam existed, so a stock node's behavior is unchanged.
 
 **`Engine.java`** gained, alongside the existing abstract engine surface: `engineRecoveryOperations()` (replays ops from a non-local-translog durability source through the same `applyTranslogOperation` path core already uses for ordinary translog replay — called from `IndexShard.recoverAdditionalEngineOperations()` right after normal translog recovery), `onPrimaryTermBumped(long)` (fired atomically inside `IndexShard.bumpPrimaryTerm`, propagated through `Indexer`/`EngineBackedIndexer`, so an engine can capture activation-time state such as a WAL replay-fencing position at the exact moment a term bump happens instead of racing to observe it separately), and `globalCheckpointSupplierForCombinedDeletionPolicy()` (lets an engine widen local-commit retention when a remote store, not core's usual global-checkpoint/retention-lease chain, is the actual retention authority).
 
@@ -152,7 +172,7 @@ In-place split and merge each have a window where a parent shard is still routab
 +    }
 ```
 
-`StoreRecovery`'s dispatch now routes `RecoverySource.Type.IN_PLACE_SPLIT_SHARD` / `IN_PLACE_MERGE_SHARD` through the normal `recoverFromStore` path, treating an empty local store on these recovery sources as "legitimately empty, to be materialized via the `EngineFactory` hooks above" rather than corrupt.
+`StoreRecovery`'s dispatch now routes `RecoverySource.Type.IN_PLACE_SPLIT_SHARD` / `IN_PLACE_MERGE_SHARD` through the normal `recoverFromStore` path, treating an empty local store on these recovery sources as "legitimately empty, to be materialized via `ShardRecoveryStrategy#recoverLocalStore` above" rather than corrupt.
 
 ## 4. Node wiring: activating dormant split/merge services
 
@@ -284,7 +304,7 @@ Core had split actions but no merge counterpart, so reversing a split meant noth
 
 Classic `_snapshot` reads a real local Lucene commit via `Engine#acquireLastIndexCommit` and copies its files to the repository. An engine whose durability already lives entirely in a remote object store has nothing useful to copy locally: the durable copy already exists remotely, under a different addressing scheme than the classic path assumes.
 
-**`Engine.java`** gained one new hook, mirroring the shape and contract of the `recoverMissingLocalStore` family above rather than inventing a new pattern:
+**`Engine.java`** gained one new hook. Snapshot *creation* is the one part of this that genuinely needs a live engine, which is why it stays on `Engine` while restore and release live on the recovery strategy (item 2):
 
 ```diff lang="java"
  public abstract class Engine implements Closeable {
@@ -304,46 +324,13 @@ Classic `_snapshot` reads a real local Lucene commit via `Engine#acquireLastInde
  }
 ```
 
-**`EngineFactory.java`** gained the matching restore-side and delete-side hooks:
+**`ShardRecoveryStrategy.EngineNativeSnapshots`** (item 2) is the matching restore-side and delete-side surface. It is a nested interface rather than two more `default` methods for a specific reason: `release` may run with **no live `IndexShard` anywhere in the cluster** — a snapshot routinely outlives the index, or even the node, that produced it — so it is routed through a node-level `EngineNativeSnapshotReleasers` registry the owning plugin populates at startup, not through the shard. When that registry was keyed to `EngineFactory`, the only implementation in the tree had to be an `EngineFactory` whose `newReadWriteEngine` threw, purely to satisfy a type it could never honor. Keying it to the pair of operations a releaser can actually perform removes the stub.
 
-```diff lang="java"
- public interface EngineFactory {
-     Engine newReadWriteEngine(EngineConfig config);
-     // ... recoverMissingLocalStore and friends ...
-
-+    /**
-+     * Called by StoreRecovery exactly once, only when the shard is recovering from a snapshot
-+     * this engine itself produced through attemptEngineNativeSnapshot. Default false: this engine
-+     * never produces engine-native snapshots, so it never needs to consume one.
-+     */
-+    default boolean recoverFromEngineNativeSnapshot(IndexShard indexShard, Store store, byte[] snapshotPointer) throws IOException {
-+        return false;
-+    }
-+
-+    /**
-+     * Cheap, purely local: whether this factory's engines ever produce engine-native snapshots at
-+     * all. StoreRecovery checks this before ever calling the repository's real, remote
-+     * getEngineNativeShardSnapshotMetadata probe, so a plain classic restore never pays that cost.
-+     * Default false, matching every other engine-native default here.
-+     */
-+    default boolean supportsEngineNativeSnapshots() {
-+        return false;
-+    }
-+
-+    /**
-+     * Called when a snapshot referencing a pointer this engine produced is deleted, so the engine
-+     * can release whatever it pinned to keep that pointer valid. Unlike every other hook on this
-+     * interface, this may run with no live IndexShard anywhere in the cluster: it's routed through
-+     * a node-level EngineNativeSnapshotReleasers registry the owning plugin populates at startup,
-+     * not through the shard itself. Default no-op.
-+     */
-+    default void releaseEngineNativeSnapshot(byte[] snapshotPointer) throws IOException {}
- }
-```
+The other reason it is a type and not a boolean-plus-method pair: presence *is* the capability answer, so the cheap local gate and the restore call cannot drift out of lockstep.
 
 `EngineNativeSnapshotPointer` (an engine ID tag plus opaque payload bytes) and `EngineNativeShardSnapshot` (the on-disk envelope `BlobStoreRepository` writes) are two small new types alongside these. `Repository.java` gained matching `default` methods: `snapshotEngineNative(...)` throws `UnsupportedOperationException`, mirroring `snapshotRemoteStoreIndexShard`'s own default, and `getEngineNativeShardSnapshotMetadata(...)` returns `Optional.empty()`. Both are implemented for real once on `BlobStoreRepository` and forwarded by `FilterRepository` like everything else on that interface.
 
-Restore doesn't need a new flag on `SnapshotRecoverySource` to know which format a shard used. `StoreRecovery.recoverFromEngineNativeSnapshot` first checks a cheap, purely local capability flag — `EngineFactory#supportsEngineNativeSnapshots()`, default `false` — before ever calling `getEngineNativeShardSnapshotMetadata`, which is a real remote blob-existence check. Without that gate, every classic-shaped restore across every `BlobStoreRepository`-backed deployment would pay that round trip on every shard, even though almost no engine ever produces an engine-native snapshot. Only when the local flag is `true` does it call the probe; if that comes back empty too, it falls straight through to the original, unmodified `recoverFromRepository`. `SnapshotShardsService.snapshot()` gets the mirror-image branch on the write side: it tries `IndexShard#attemptEngineNativeSnapshot` ahead of the existing classic/remote-store-shallow-copy branching, and only takes the new path if that returns a pointer — cheap by construction, since the default there is a plain in-memory `Optional.empty()`, no remote call. See [Snapshot & Restore](/design/snapshot-restore-proposal/) for the plugin-side implementation this seam supports.
+Restore doesn't need a new flag on `SnapshotRecoverySource` to know which format a shard used. `StoreRecovery.recoverFromEngineNativeSnapshot` first checks a cheap, purely local capability answer — whether the shard's `ShardRecoveryStrategy#engineNativeSnapshots()` is present at all, empty by default — before ever calling `getEngineNativeShardSnapshotMetadata`, which is a real remote blob-existence check. Without that gate, every classic-shaped restore across every `BlobStoreRepository`-backed deployment would pay that round trip on every shard, even though almost no engine ever produces an engine-native snapshot. Only when something is present does it call the probe; if that comes back empty too, it falls straight through to the original, unmodified `recoverFromRepository`. `SnapshotShardsService.snapshot()` gets the mirror-image branch on the write side: it tries `IndexShard#attemptEngineNativeSnapshot` ahead of the existing classic/remote-store-shallow-copy branching, and only takes the new path if that returns a pointer — cheap by construction, since the default there is a plain in-memory `Optional.empty()`, no remote call. See [Snapshot & Restore](/design/snapshot-restore-proposal/) for the plugin-side implementation this seam supports.
 
 ## 10. What was subsequently taken back *out* of core
 

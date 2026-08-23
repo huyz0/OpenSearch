@@ -9,14 +9,12 @@
 package org.opensearch.serverless.storage;
 
 import org.opensearch.cluster.NamedDiff;
+import org.opensearch.cluster.metadata.IndexCatalog;
 import org.opensearch.cluster.metadata.IndexCreationStrategy;
-import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
-import org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver;
-import org.opensearch.cluster.routing.IndexRoutingResolver;
+import org.opensearch.cluster.metadata.SupplierBackedIndexCatalog;
 import org.opensearch.cluster.routing.ShardRouting;
-import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
 import org.opensearch.cluster.service.ClusterService;
@@ -1307,11 +1305,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile String localNodeId = "unknown-node";
     private volatile InMemoryPlaintextBundleCache sharedBundleCache;
     /**
-     * Constructed once in {@code createComponents}, shared by every writer shard's own {@link
-     * WriterEngineFactory} for engine-native snapshot restore, and separately registered under
-     * {@link org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport#ENGINE_ID}
-     * in {@link org.opensearch.index.engine.EngineNativeSnapshotReleasers} for the release path --
-     * see that class's own javadoc for why one shared instance backs both.
+     * Constructed once in {@code createComponents}, read lazily by the node-wide {@link
+     * org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy} registered in
+     * {@link #getShardRecoveryStrategies()} (which runs before this field is populated) for the
+     * engine-native snapshot restore path, and separately registered under {@link
+     * org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport#ENGINE_ID} in {@link
+     * org.opensearch.index.engine.EngineNativeSnapshotReleasers} for the release path -- see that
+     * class's own javadoc for why one shared instance backs both.
      */
     private volatile org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport engineNativeSnapshotSupport;
     private volatile long pitrWindowMillis = -1;
@@ -1774,6 +1774,28 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
+     * Registers this plugin's {@link org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy}
+     * node-wide; {@link ServerlessStorageIndexSettingProvider} is what actually selects it, per index, for every
+     * serverless-storage index. Every index that does not select it keeps core's own {@code local-lucene}
+     * strategy, so installing this plugin changes nothing for an ordinary index on the same node.
+     *
+     * <p>Constructed here even though {@link #createComponents} has not run yet, exactly like {@link
+     * #getDirectoryFactories()} above: both arguments are lazy reads of this plugin instance rather than
+     * captured values -- see {@link #lazyDirectoryFileCacheForDirectoryFactory()}'s own javadoc for the
+     * pattern and why it is necessary here.
+     */
+    @Override
+    public Map<String, org.opensearch.index.shard.ShardRecoveryStrategy> getShardRecoveryStrategies() {
+        return Map.of(
+            org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy.NAME,
+            new org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy(
+                this::blobContainerForDirectoryFactory,
+                () -> engineNativeSnapshotSupport
+            )
+        );
+    }
+
+    /**
      * The shared {@link FileCache} {@link ServerlessStorageLazyDirectoryFactory} needs, or {@code
      * null} if the lazy directory feature is disabled on this node -- see {@link
      * #SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING}. Test-only-shaped visibility
@@ -2105,9 +2127,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 .getBytes();
         }
         // Engine-native snapshot restore/release (docs-site design/snapshot-restore-proposal.md):
-        // one shared instance, built once here rather than per-shard in getEngineFactory, since it
-        // is also registered node-wide below for the release path -- see its own class javadoc for
-        // why one instance backs both. blobContainerForDirectoryFactory's signature already matches
+        // one shared instance, built once here rather than per-shard, since restore runs off the
+        // node-wide ObjectStoreShardRecoveryStrategy and release is registered node-wide below --
+        // see its own class javadoc for why one instance backs both. blobContainerForDirectoryFactory's signature already matches
         // ShardCloner.ContainerResolver's exactly (String indexUuid, int shardId -> BlobContainer
         // throws IOException), so the method reference needs no adapting; wrapped delete-denied,
         // the same least-privilege scoping TransportShardCloneAction's own cross-index resolution
@@ -2383,11 +2405,52 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return blobContainer;
     }
 
+    /**
+     * Refuses to build an engine for a serverless index whose recovery strategy is not this plugin's.
+     *
+     * <p>Selection of {@link org.opensearch.index.shard.ShardRecoveryStrategy} is by index setting, injected by
+     * {@code ServerlessStorageIndexSettingProvider} at creation. That makes an index created through any path the
+     * provider does not cover fall back to core's {@code local-lucene} strategy -- which would then try to recover
+     * a shard whose durable copy lives in the object store from local files that are not authoritative, or fail it
+     * outright for having none. Both are silent: the engine below is still this plugin's, so the shard looks
+     * correctly configured right up until it recovers.
+     *
+     * <p>This is the one place every serverless shard passes through with its settings in hand, so it is where the
+     * mismatch can be caught. Failing here costs an unrecoverable shard with an explicit reason instead of a shard
+     * that recovers wrongly, which is the direction this plugin fails in everywhere else.
+     *
+     * <p><b>Upgrade hazard this deliberately surfaces rather than hides.</b> The setting is injected at index
+     * creation, so a serverless index created before {@code index.recovery.strategy} existed carries no value and
+     * reads the {@code local-lucene} default -- and this refuses to open it. That refusal is correct: core's
+     * strategy genuinely cannot recover such a shard, so opening it would be the silent wrong answer. But it means
+     * a cluster carrying pre-existing serverless indices needs those indices' settings updated before this change
+     * reaches it. No released build has such indices today, which is why this throws now rather than carrying a
+     * compatibility shim for a case that cannot yet exist; if that stops being true, the fix is an index-metadata
+     * upgrader that back-fills the setting, not loosening this check.
+     */
+    private static void requireObjectStoreRecoveryStrategy(IndexSettings indexSettings) {
+        String strategy = org.opensearch.index.IndexModule.INDEX_RECOVERY_STRATEGY_SETTING.get(indexSettings.getSettings());
+        if (org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy.NAME.equals(strategy) == false) {
+            throw new IllegalStateException(
+                "index ["
+                    + indexSettings.getIndex().getName()
+                    + "] has serverless storage enabled but its ["
+                    + org.opensearch.index.IndexModule.INDEX_RECOVERY_STRATEGY_SETTING.getKey()
+                    + "] is ["
+                    + strategy
+                    + "], not ["
+                    + org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy.NAME
+                    + "]; its durable copy lives in the object store and core's strategy cannot recover it"
+            );
+        }
+    }
+
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings, ShardRouting shardRouting) {
         if (SERVERLESS_STORAGE_ENABLED_SETTING.get(indexSettings.getSettings()) == false) {
             return Optional.empty();
         }
+        requireObjectStoreRecoveryStrategy(indexSettings);
 
         try {
             String indexUuid = indexSettings.getIndex().getUUID();
@@ -2544,8 +2607,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         // Straight to the raw bundle store (via the lineage-fallback-aware read path,
                         // not the possibly-cache-wrapped readPath above) -- a merge reads every input
                         // segment file exactly once, so there's no hot-rereading benefit a cache would
-                        // give, matching WriterEngineFactory's own "no caching layer needed" choice for
-                        // its own materializer.
+                        // give, matching ObjectStoreShardRecoveryStrategy's own "no caching layer needed"
+                        // choice for cross-node failover materialization.
                         new ObjectStoreCommitMaterializer(chainedBundleReadPath(scopedContainer, lineageChain)),
                         commitPublisher,
                         CompactionPolicy.withDefaults(),
@@ -2660,12 +2723,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     localNodeId,
                     pitrRetentionConfig,
                     writerWalChunkService,
-                    // Cross-node failover materializes at most once per activation (rfc-serverless-opensearch.md
-                    // &sect;7.1.2), not per-query like a reader shard -- no caching layer needed,
-                    // straight to the bundle store (via the lineage-fallback-aware read path), matching
-                    // the "caching is wired in for reader shards only" note on the reader path just
-                    // above.
-                    new ObjectStoreCommitMaterializer(chainedBundleReadPath(scopedContainer, lineageChain)),
                     // WAL-mirrored records get the same at-rest protection bundles/manifests already
                     // have when this is configured (&sect;12 bullet 1) -- null (the default) leaves
                     // WAL mirroring's own on/off switch (sharedWalChunkService being non-null) as the
@@ -2675,26 +2732,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     dedicatedWalGcConfig,
                     publicationRateLimitMillis,
                     writerPublicationNotifierForWriterEngine(),
-                    // In-place split recovery (dynamic-partitioning-plan.md Phase 0): resolves a
-                    // sibling shard's own container within this same index -- reuses
-                    // resolveBlobContainer, the exact same resolution this shard's own container
-                    // above went through, just parameterized on a different shard id. Wrapped in
-                    // UncheckedIOException since IntFunction has no checked-exception escape hatch;
-                    // ObjectStoreWriterEngine#recoverFromInPlaceSplit only ever invokes this while
-                    // already inside a context that itself declares IOException, so the unchecked
-                    // wrapper is unwrapped there rather than surfacing raw.
-                    siblingShardId -> {
-                        try {
-                            return resolveBlobContainer(indexUuid, siblingShardId);
-                        } catch (IOException e) {
-                            throw new UncheckedIOException(e);
-                        }
-                    },
                     // Same pinRegistry every other per-shard store above is scoped to -- engine-native
                     // snapshot creation pins alongside this shard's own manifests/registers, exactly
                     // like PITR's own pins do (see pinRegistry's own declaration above).
-                    pinRegistry,
-                    engineNativeSnapshotSupport
+                    // Cross-node failover / in-place split / in-place merge store population and
+                    // engine-native snapshot restore all used to be threaded in here too; they now live
+                    // on ObjectStoreShardRecoveryStrategy (registered once, node-wide, in
+                    // getShardRecoveryStrategies above) because none of them needs -- or can have -- an
+                    // engine this factory built.
+                    pinRegistry
                 )
             );
         } catch (IOException e) {
@@ -3000,20 +3046,31 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
-     * Phase C5 of {@code core-pluggability-refactor-plan.md}. Additive: {@link
-     * org.opensearch.serverless.storage.descriptor.DescriptorGate#install} still registers with {@link
-     * org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers} exactly as before -- this only adds a
-     * second, generic path, reachable exclusively through {@code Metadata#indexOrResolved(String)} (a
-     * caller has to opt in to that method by name; the plain {@code Metadata#index(String)} every existing
-     * call site uses is unaffected), which {@link SupplierBackedIndexMetadataResolver} answers by
-     * delegating straight back to that registry. See that class's own javadoc for why it is safe to return
-     * unconditionally here (including before {@code DescriptorGate.install} has run, and on a node where
-     * descriptor gating is disabled entirely): with nothing registered in the static registry yet, it
-     * resolves to {@code null}, identical to today.
+     * Phase C5 of {@code core-pluggability-refactor-plan.md}, since collapsed from two hooks into one.
+     * Additive: {@link org.opensearch.serverless.storage.descriptor.DescriptorGate#install} still registers
+     * with {@link org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers}, and {@link
+     * org.opensearch.serverless.storage.placement.ComputedPlacementGate} still registers with {@code
+     * AbsentIndexRoutingSuppliers}, exactly as before -- this only adds a second, generic path over both,
+     * reachable exclusively through {@code Metadata#indexOrResolved(String)} (a caller has to opt in to
+     * that method by name; the plain {@code Metadata#index(String)} every existing call site uses is
+     * unaffected) and {@code ClusterState#getIndexRoutingTable(String)}, which {@link
+     * SupplierBackedIndexCatalog} answers by delegating straight back to those two registries.
+     *
+     * <p>This replaces the two hooks it used to implement, {@code getIndexMetadataResolver()} and {@code
+     * getIndexRoutingResolver()}, which returned two adapter objects over the same two registries for what
+     * core asks as one question. See {@code IndexCatalog}'s own javadoc for the merge.
+     *
+     * <p>Safe to return unconditionally (including before {@code DescriptorGate.install} has run, and on a
+     * node where descriptor gating or computed placement is disabled entirely): with nothing registered in
+     * the static registries yet, the catalog resolves to {@code null} and reports {@link
+     * org.opensearch.cluster.metadata.IndexCatalog#isActive()} as {@code false}, identical to today. That
+     * last part is the whole reason {@code isActive()} exists rather than callers testing for a registered
+     * catalog: this plugin always supplies one, and only the registries underneath it say whether the
+     * feature is currently on.
      */
     @Override
-    public Optional<IndexMetadataResolver> getIndexMetadataResolver() {
-        return Optional.of(new SupplierBackedIndexMetadataResolver());
+    public Optional<IndexCatalog> getIndexCatalog() {
+        return Optional.of(new SupplierBackedIndexCatalog());
     }
 
     /**
@@ -3068,12 +3125,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.placement.ComputedPlacementMembership::fromXContent
             )
         );
-    }
-
-    /** The routing counterpart to {@link #getIndexMetadataResolver()} -- see that method's own javadoc. */
-    @Override
-    public Optional<IndexRoutingResolver> getIndexRoutingResolver() {
-        return Optional.of(new SupplierBackedIndexRoutingResolver());
     }
 
     /**

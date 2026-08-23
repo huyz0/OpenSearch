@@ -152,6 +152,7 @@ import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.index.shard.IndexingOperationListener;
 import org.opensearch.index.shard.IndexingStats;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.store.remote.filecache.NodeCacheService;
 import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
@@ -469,6 +470,7 @@ public class IndicesService extends AbstractLifecycleComponent
     private final Supplier<IngestService> ingestServiceSupplier;
     private final Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories;
     private final Map<String, IndexStorePlugin.StoreFactory> storeFactories;
+    private final Map<String, ShardRecoveryStrategy> shardRecoveryStrategies;
     final AbstractRefCounted indicesRefCount; // pkg-private for testing
     private final CountDownLatch closeLatch = new CountDownLatch(1);
     private volatile boolean idFieldDataEnabled;
@@ -529,6 +531,7 @@ public class IndicesService extends AbstractLifecycleComponent
         ValuesSourceRegistry valuesSourceRegistry,
         Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories,
         Map<String, IndexStorePlugin.StoreFactory> storeFactories,
+        Map<String, ShardRecoveryStrategy> shardRecoveryStrategies,
         IndexStorePlugin.DirectoryFactory remoteDirectoryFactory,
         Supplier<RepositoriesService> repositoriesServiceSupplier,
         SearchRequestStats searchRequestStats,
@@ -604,6 +607,7 @@ public class IndicesService extends AbstractLifecycleComponent
         this.dataFormatAwareStoreDirectoryFactories = dataFormatAwareStoreDirectoryFactories;
         this.recoveryStateFactories = recoveryStateFactories;
         this.storeFactories = storeFactories;
+        this.shardRecoveryStrategies = shardRecoveryStrategies;
         this.ingestionConsumerFactories = ingestionConsumerFactories;
         this.ingestServiceSupplier = ingestServiceSupplier;
         // doClose() is called when shutting down a node, yet there might still be ongoing requests
@@ -750,6 +754,9 @@ public class IndicesService extends AbstractLifecycleComponent
             valuesSourceRegistry,
             recoveryStateFactories,
             Collections.emptyMap(),
+            // Not emptyMap(): every index resolves a strategy by name, and core's own local-lucene has to be
+            // in the map to be found -- the same reason Node seeds it before merging plugin contributions.
+            IndexModule.createBuiltInShardRecoveryStrategies(),
             remoteDirectoryFactory,
             repositoriesServiceSupplier,
             searchRequestStats,
@@ -1431,6 +1438,7 @@ public class IndicesService extends AbstractLifecycleComponent
             indexNameExpressionResolver,
             recoveryStateFactories,
             storeFactories,
+            shardRecoveryStrategies,
             nodeCacheService,
             compositeIndexSettings,
             dataFormatAwareStoreDirectoryFactories

@@ -11,8 +11,10 @@ package org.opensearch.snapshots;
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.SupplierBackedIndexCatalog;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ComputedShardRouting;
 import org.opensearch.cluster.routing.IndexRoutingTable;
@@ -20,7 +22,6 @@ import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
-import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.test.OpenSearchTestCase;
@@ -59,6 +60,7 @@ public class ComputedRestoreCapacityTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
+        IndexCatalogRegistry.register(null);
     }
 
     /** What the capacity check used to do: miss the shard entirely, and so undercount. */
@@ -136,11 +138,11 @@ public class ComputedRestoreCapacityTests extends OpenSearchTestCase {
             .numberOfReplicas(0)
             .build();
 
-        // A real (non-EMPTY_ROUTING_TABLE) instance with the SupplierBackedIndexRoutingResolver bridge
-        // attached -- attachIndexRoutingResolver is deliberately a no-op on the shared singleton -- so
-        // ClusterState#allShards() reads through the resolver exactly as it does on a production state.
+        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(), so
+        // ClusterState#allShards() reads through it exactly as it does on a production state. Cleared in
+        // this class's @After.
+        IndexCatalogRegistry.register(new SupplierBackedIndexCatalog());
         RoutingTable routingTable = RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(metadata, false).build())
             .routingTable(routingTable)

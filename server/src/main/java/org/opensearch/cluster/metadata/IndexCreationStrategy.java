@@ -18,8 +18,8 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  *
  * <p><b>Definition only, not yet consulted anywhere.</b> Pure additive API surface -- a new type plus a new
  * default-empty {@link org.opensearch.plugins.ClusterPlugin} hook -- with the exact same "zero behavior
- * change until something implements it" shape {@link IndexMetadataResolver}/{@link
- * org.opensearch.cluster.routing.IndexRoutingResolver} had.
+ * change until something implements it" shape {@link IndexCatalog} (then still a pair of narrower
+ * resolver SPIs) had.
  *
  * <p><b>Revised down to a single method after a dedicated scoping investigation, correcting this
  * interface's own first draft.</b> That draft additionally declared {@code createIndex(ClusterState,
@@ -105,7 +105,7 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  * annotation onto a core internal request DTO -- unrelated to this SPI, and owned by services this change
  * doesn't touch -- would be a bigger and wrong-owner change than "define an empty extension point" should
  * require. This mirrors {@code ClusterPlugin}'s own existing convention: its experimental hooks (e.g. {@code
- * getIndexMetadataResolver()}) are documented experimental via {@code @opensearch.experimental} javadoc
+ * getIndexCatalog()}) are documented experimental via {@code @opensearch.experimental} javadoc
  * only, without a compiled type-level annotation on {@code ClusterPlugin} itself.
  *
  * @opensearch.experimental

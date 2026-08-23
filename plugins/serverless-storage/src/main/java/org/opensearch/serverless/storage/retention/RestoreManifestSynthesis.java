@@ -27,7 +27,7 @@ import java.util.Objects;
  * <ul>
  * <li><b>The local store.</b> Reopening on a node that still holds the pre-restore Lucene files recovers
  *     from those files and never consults the object store, so the restore is invisible to recovery. That
- *     is fixed elsewhere -- {@code EngineFactory#localStoreIsStale}, which lets an engine whose authority
+ *     is fixed elsewhere -- {@code ShardRecoveryStrategy#localStoreIsStale}, which lets a strategy whose authority
  *     lives in the object store say its local copy is out of date. <b>This is the half that measurably
  *     carries the fix</b>: the reopen test fails without it.</li>
  * <li><b>The replay floor.</b> {@code ObjectStoreCommitHeadPublisher#readLatestManifest} resolves the head,

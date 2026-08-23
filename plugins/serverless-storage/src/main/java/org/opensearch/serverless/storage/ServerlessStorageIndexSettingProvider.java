@@ -18,6 +18,7 @@ import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingSha
 import org.opensearch.serverless.storage.descriptor.DescriptorOnlyCreation;
 import org.opensearch.serverless.storage.resharding.DataStreamBackingIndexNames;
 import org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorCache;
+import org.opensearch.serverless.storage.writerengine.ObjectStoreShardRecoveryStrategy;
 
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -31,6 +32,13 @@ import java.util.OptionalInt;
  * which forbids setting it directly on index creation -- {@link IndexSettingProvider} is precisely
  * the seam for injecting a private, managed default in response to another (public) setting the
  * request already carries, the same shape core itself uses this interface for.
+ *
+ * <p>Selects this plugin's {@link ObjectStoreShardRecoveryStrategy} the same way and for the same
+ * reason: {@code index.recovery.strategy} is the seam core resolves a shard's store-population
+ * behavior through, and an operator opting an index into serverless storage should not have to know
+ * the strategy's name to get the behavior the opt-in implies. It pairs with the allocator above --
+ * that decides where a writer shard goes after a node loss, this is what lets it come back there
+ * with no peer to copy from.
  *
  * <p>Also translates {@link ServerlessStoragePlugin#SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING}
  * into {@code index.store.type} = {@link ServerlessStoragePlugin#LAZY_DIRECTORY_STORE_TYPE} --
@@ -144,7 +152,13 @@ public final class ServerlessStorageIndexSettingProvider implements IndexSetting
         }
         Settings.Builder settings = Settings.builder()
             .put(dataStreamSettings.build())
-            .put(ExistingShardsAllocator.EXISTING_SHARDS_ALLOCATOR_SETTING.getKey(), ServerlessStorageExistingShardsAllocator.NAME);
+            .put(ExistingShardsAllocator.EXISTING_SHARDS_ALLOCATOR_SETTING.getKey(), ServerlessStorageExistingShardsAllocator.NAME)
+            // Same indirection, one layer further in: an operator opting an index into serverless storage should
+            // not also have to know the name of the shard-recovery strategy that implements it. Injected here for
+            // the same reason the allocator above is -- it is a managed consequence of the public setting the
+            // request already carries, and the two are a pair: the allocator decides where a writer shard goes
+            // after a node loss, this strategy is what lets it come back with no peer to copy from.
+            .put(IndexModule.INDEX_RECOVERY_STRATEGY_SETTING.getKey(), ObjectStoreShardRecoveryStrategy.NAME);
         if (ServerlessStoragePlugin.SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING.get(templateAndRequestSettings)) {
             settings.put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), ServerlessStoragePlugin.LAZY_DIRECTORY_STORE_TYPE);
         }

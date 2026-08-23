@@ -1362,10 +1362,12 @@ public abstract class Engine implements LifecycleAware, Closeable {
      * <p>An engine that overrides this to return a non-empty {@link Optional} is asserting the
      * returned {@link EngineNativeSnapshotPointer#payload()} is sufficient, on its own, to
      * reconstruct this exact point-in-time state later via the matching {@link
-     * EngineFactory#recoverFromEngineNativeSnapshot}, including retaining/pinning whatever it
+     * org.opensearch.index.shard.ShardRecoveryStrategy.EngineNativeSnapshots#restore}, including
+     * retaining/pinning whatever it
      * references for as long as the resulting snapshot exists in the repository -- core has no
      * visibility into what the payload means and cannot pin or garbage-collect anything on the
-     * engine's behalf. {@link EngineFactory#releaseEngineNativeSnapshot} is core's corresponding
+     * engine's behalf. {@link org.opensearch.index.shard.ShardRecoveryStrategy.EngineNativeSnapshots#release}
+     * is core's corresponding
      * notification when a snapshot referencing it is deleted, resolved by the pointer's own {@link
      * EngineNativeSnapshotPointer#engineId()} tag via {@link EngineNativeSnapshotReleasers} -- an
      * engine that overrides this method is responsible for registering a matching releaser there

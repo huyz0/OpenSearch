@@ -11,15 +11,16 @@ package org.opensearch.action.admin.indices.scale.searchonly;
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.SupplierBackedIndexCatalog;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ComputedShardRouting;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RoutingTable;
-import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.test.OpenSearchTestCase;
@@ -48,6 +49,7 @@ public class ComputedScaleIndexProbeTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
+        IndexCatalogRegistry.register(null);
     }
 
     /**
@@ -141,12 +143,12 @@ public class ComputedScaleIndexProbeTests extends OpenSearchTestCase {
     }
 
     private static ClusterState stateWithoutRouting() {
-        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
-        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
-        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md) needs an explicit one
-        // here, same as production code gets from a real cluster state.
+        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(), registered rather
+        // than attached to this state: resolution goes through IndexCatalogRegistry now, so a hand-built
+        // state needs nothing special, only the registration a real node performs at startup. Cleared in
+        // this class's @After, since it is node-scoped and would otherwise outlive these tests.
+        IndexCatalogRegistry.register(new SupplierBackedIndexCatalog());
         RoutingTable routingTable = RoutingTable.builder().build();
-        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(indexMetadata(), false).build())
             .routingTable(routingTable)

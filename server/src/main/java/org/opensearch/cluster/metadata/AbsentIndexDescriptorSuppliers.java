@@ -45,14 +45,16 @@ import java.util.function.Function;
  * <p><b>Settled architecture: one authority per plane.</b> This static registry is the node-level
  * <em>authority</em> for descriptor-backed metadata -- the single place a plugin's answers live, and the
  * seam the few core internals that ask node-level or descriptor-vocabulary questions consult directly.
- * The {@code ClusterPlugin} SPI ({@link IndexMetadataResolver}, implemented for this registry by {@link
- * SupplierBackedIndexMetadataResolver}) is the registration <em>front door</em>: how a plugin installs
- * into this authority, not a second authority. The resolver instance attached to each {@link Metadata}
- * is the state-scoped <em>read path</em> ({@code Metadata#indexOrResolved}, {@code
+ * The {@code ClusterPlugin} SPI ({@link IndexCatalog}, implemented for this registry by {@link
+ * SupplierBackedIndexCatalog}) is the registration <em>front door</em>: how a plugin installs
+ * into this authority, not a second authority. The catalog registered on the node is the
+ * <em>read path</em> ({@code Metadata#indexOrResolved}, {@code
  * Metadata#existsOrResolved}), and it answers by forwarding here. The direct static call sites that
  * remain in core -- each carrying its own comment -- are permanent by design, not a pending migration:
- * they either need descriptor-level vocabulary the SPI deliberately does not expose, or ask "is the
- * feature currently active on this node", a node-level fact the state-attached resolver does not model.
+ * they need descriptor-level vocabulary the SPI deliberately does not expose (uuid, the three-way
+ * live/tombstoned/unknown distinction, prefix expansion). The other reason such call sites used to exist --
+ * "is the feature currently active on this node" -- is gone: {@link IndexCatalog#isActive()} now models it,
+ * and the four call sites that asked it here have migrated onto that.
  * Its routing-plane counterpart, {@code org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers},
  * follows exactly the same shape.
  */
