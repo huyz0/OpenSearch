@@ -141,6 +141,7 @@ public class MetadataIndexStateService {
     private final TransportVerifyShardBeforeCloseAction transportVerifyShardBeforeCloseAction;
     private final TransportVerifyShardIndexBlockAction transportVerifyShardIndexBlockAction;
     private final ActiveShardsObserver activeShardsObserver;
+    private final ClaimedIndexLifecycle claimedIndexLifecycle;
 
     @Inject
     public MetadataIndexStateService(
@@ -151,7 +152,8 @@ public class MetadataIndexStateService {
         ShardLimitValidator shardLimitValidator,
         ThreadPool threadPool,
         TransportVerifyShardBeforeCloseAction transportVerifyShardBeforeCloseAction,
-        TransportVerifyShardIndexBlockAction transportVerifyShardIndexBlockAction
+        TransportVerifyShardIndexBlockAction transportVerifyShardIndexBlockAction,
+        ClaimedIndexLifecycle claimedIndexLifecycle
     ) {
         this.indicesService = indicesService;
         this.clusterService = clusterService;
@@ -162,6 +164,7 @@ public class MetadataIndexStateService {
         this.metadataIndexUpgradeService = metadataIndexUpgradeService;
         this.shardLimitValidator = shardLimitValidator;
         this.activeShardsObserver = new ActiveShardsObserver(clusterService, threadPool);
+        this.claimedIndexLifecycle = claimedIndexLifecycle;
     }
 
     /**
@@ -1268,9 +1271,9 @@ public class MetadataIndexStateService {
      * which is precisely the failure {@code IndexDescriptor#toIndexMetadata}'s own comment records from the
      * other direction. A null return meaning "no updater installed" was indistinguishable from success too.
      *
-     * <p>Nothing blocks. {@link IndexDescriptorPublisher#updateGated} runs the read-modify-write on the
-     * store's own executor and completes the listener from there; this thread only hands the work over. That
-     * is the same arrangement {@code ClaimedIndexLifecycle} uses for a deletion's record.
+     * <p>Nothing blocks. {@link ClaimedIndexLifecycle#updateIndex} runs the read-modify-write on the plane's
+     * own executor and completes the listener from there; this thread only hands the work over. That is the
+     * same arrangement {@link ClaimedIndexLifecycle#removeIndices} uses for a deletion's record.
      *
      * <p><b>Why the new state is a mutation rather than a descriptor.</b>
      *
@@ -1302,9 +1305,12 @@ public class MetadataIndexStateService {
                     gatedIndices.size()
                 );
                 for (Index index : gatedIndices) {
-                    IndexDescriptorPublisher.updateGated(
+                    ClaimedIndexWrites.reportTo(
+                        claimedIndexLifecycle.updateIndex(
+                            index.getName(),
+                            current -> current.state() == targetState ? current : current.withState(targetState)
+                        ),
                         index.getName(),
-                        current -> current.state() == targetState ? current : current.withState(targetState),
                         perIndex
                     );
                 }

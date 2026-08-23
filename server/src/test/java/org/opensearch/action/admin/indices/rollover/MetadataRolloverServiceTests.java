@@ -44,6 +44,7 @@ import org.opensearch.cluster.DataStreamTestHelper;
 import org.opensearch.cluster.metadata.AliasAction;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.AliasValidator;
+import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
 import org.opensearch.cluster.metadata.ComponentTemplate;
 import org.opensearch.cluster.metadata.ComposableIndexTemplate;
 import org.opensearch.cluster.metadata.DataStream;
@@ -748,7 +749,8 @@ public class MetadataRolloverServiceTests extends OpenSearchTestCase {
                 indicesService,
                 new AliasValidator(),
                 null,
-                xContentRegistry()
+                xContentRegistry(),
+                ClaimedIndexLifecycle.NOOP
             );
             MetadataRolloverService rolloverService = new MetadataRolloverService(
                 testThreadPool,
@@ -888,7 +890,8 @@ public class MetadataRolloverServiceTests extends OpenSearchTestCase {
                 indicesService,
                 new AliasValidator(),
                 null,
-                xContentRegistry()
+                xContentRegistry(),
+                ClaimedIndexLifecycle.NOOP
             );
             MetadataRolloverService rolloverService = new MetadataRolloverService(
                 testThreadPool,
@@ -1068,7 +1071,8 @@ public class MetadataRolloverServiceTests extends OpenSearchTestCase {
             indicesService,
             new AliasValidator(),
             null,
-            xContentRegistry()
+            xContentRegistry(),
+            ClaimedIndexLifecycle.NOOP
         );
         MetadataRolloverService rolloverService = new MetadataRolloverService(
             testThreadPool,

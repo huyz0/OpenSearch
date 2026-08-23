@@ -383,7 +383,17 @@ public class MetadataIndexStateServiceTests extends OpenSearchTestCase {
             Index indexToDelete = cs.metadata().index(indicesToDelete.get(k)).getIndex();
             indicesToDeleteArray[k] = indexToDelete;
         }
-        MetadataIndexStateService service = new MetadataIndexStateService(clusterService, null, null, null, null, null, null, null);
+        MetadataIndexStateService service = new MetadataIndexStateService(
+            clusterService,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            ClaimedIndexLifecycle.NOOP
+        );
         CloseIndexClusterStateUpdateRequest request = new CloseIndexClusterStateUpdateRequest(0L).indices(indicesToDeleteArray);
         Exception e = expectThrows(IllegalArgumentException.class, () -> service.closeIndices(request, null));
         assertThat(
@@ -421,7 +431,8 @@ public class MetadataIndexStateServiceTests extends OpenSearchTestCase {
             null,
             threadPool,
             null,
-            verifyShardIndexBlockAction
+            verifyShardIndexBlockAction,
+            ClaimedIndexLifecycle.NOOP
         );
         final Index index = initialState.metadata().index(indexName).getIndex();
         final AddIndexBlockClusterStateUpdateRequest request = new AddIndexBlockClusterStateUpdateRequest(APIBlock.WRITE, 1L).indices(

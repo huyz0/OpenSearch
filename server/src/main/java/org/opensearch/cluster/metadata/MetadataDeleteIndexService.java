@@ -312,7 +312,7 @@ public class MetadataDeleteIndexService {
         }
         removal.whenComplete((ignored, failure) -> {
             if (failure != null) {
-                whenRemoved.onFailure(CompletionFailure.unwrap(failure));
+                whenRemoved.onFailure(ClaimedIndexWrites.unwrap(failure));
             } else {
                 whenRemoved.onResponse(null);
             }

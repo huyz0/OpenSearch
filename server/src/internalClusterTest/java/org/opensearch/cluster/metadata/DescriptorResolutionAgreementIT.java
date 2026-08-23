@@ -45,7 +45,7 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
 
     @After
     public void clearRegistrations() {
-        IndexDescriptorPublisher.register(null);
+        TestClaimedIndexLifecycle.uninstall();
         AbsentIndexDescriptorSuppliers.register(null);
         published.clear();
     }
@@ -55,7 +55,7 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
      * what cluster state holds.
      */
     public void testDescriptorsAgreeWithClusterStateForEveryIndex() throws Exception {
-        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.put(descriptor.name(), descriptor));
 
         List<String> names = new ArrayList<>();
         for (int i = 0; i < 25; i++) {
@@ -90,7 +90,7 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
      * gone, and nothing in the ordinary case would notice.
      */
     public void testAliasesAgree() throws Exception {
-        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.put(descriptor.name(), descriptor));
 
         assertAcked(
             prepareCreate("aliased-idx").setSettings(
@@ -115,7 +115,7 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
      * is how a writer gets missed, and this area has already made that mistake in another form.
      */
     public void testClosingAnIndexUpdatesItsDescriptor() throws Exception {
-        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.put(descriptor.name(), descriptor));
 
         createIndex("to-close", 1, 0);
         assertEquals("the descriptor must start open", IndexDescriptor.State.OPEN, published.get("to-close").state());
@@ -136,7 +136,7 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
      * a resolver answers from without materializing metadata.
      */
     public void testAddingAnAliasUpdatesTheDescriptor() throws Exception {
-        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.put(descriptor.name(), descriptor));
         createIndex("to-alias", 1, 0);
         assertEquals("no alias to begin with", List.of(), published.get("to-alias").aliases());
 
@@ -151,7 +151,7 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
 
     /** The seam answers for an index cluster state does not hold, using the recorded descriptors. */
     public void testTheSeamResolvesFromDescriptorsWhenTheMapMisses() throws Exception {
-        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.put(descriptor.name(), descriptor));
         createIndex("recorded", 1, 0);
 
         AbsentIndexDescriptorSuppliers.register(published::get);
@@ -179,7 +179,7 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
      * tombstone carrying only the name would say an index is gone without saying what to delete.
      */
     public void testDeletingAnIndexLeavesATombstone() throws Exception {
-        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.put(descriptor.name(), descriptor));
         createIndex("to-delete", 2, 0);
         String uuidBeforeDelete = published.get("to-delete").uuid();
 
@@ -194,7 +194,7 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
 
     /** The seam must answer no for a deleted index, which is what stops resolution resurrecting it. */
     public void testADeletedIndexDoesNotResolve() throws Exception {
-        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.put(descriptor.name(), descriptor));
         createIndex("delete-then-resolve", 1, 0);
         assertAcked(client().admin().indices().prepareDelete("delete-then-resolve"));
 

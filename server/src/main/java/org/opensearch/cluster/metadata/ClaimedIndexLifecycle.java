@@ -8,23 +8,25 @@
 
 package org.opensearch.cluster.metadata;
 
-import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.core.index.Index;
 import org.opensearch.index.IndexNotFoundException;
 
 import java.util.Collection;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.function.UnaryOperator;
 
 /**
  * What a plugin does to the records it holds for indices that live outside cluster state -- as whole
  * operations core asks for, rather than a set of hooks core calls at points of its own choosing.
  *
- * <p>Two so far, and they are the two things core cannot do for such an index because the entry it would
- * work from is not there: {@link #removeIndices} when the index is deleted, and {@link #putMapping} when its
- * mapping changes. Both were previously a protocol core ran itself against static seams -- five of them
- * between the two -- and in both cases core's remaining share is the single decision that is genuinely its
- * own: which indices cluster state cannot serve.
+ * <p>Five operations, and they are the five things core cannot do for such an index because the entry it
+ * would work from is not there: {@link #createIndex} when it is created, {@link #recordChange} when its
+ * cluster state entry changes, {@link #putMapping} when its mapping changes, {@link #updateIndex} when
+ * something else about it does, and {@link #removeIndices} when it is deleted. Every one of them was
+ * previously a protocol core ran itself against a static seam -- eight of them between the five -- and in
+ * every case core's remaining share is the single decision that is genuinely its own: which indices cluster
+ * state cannot serve.
  *
  * <p><b>What this replaces, and why the shape changed.</b> Deletion used to reach two separate seams from
  * three separate places. {@code DurableTombstones.whenDurable} was consulted twice ({@code
@@ -103,21 +105,38 @@ import java.util.concurrent.CompletionStage;
  * <p><b>Registration.</b>
  *
  * <p>Supplied by at most one {@link org.opensearch.plugins.ClusterPlugin#getClaimedIndexLifecycle()} per
- * node and injected into {@code MetadataDeleteIndexService} by {@code ClusterModule}. Deliberately not a
- * static registry, unlike the pair it replaces: the one core caller is an injectable singleton, so the
- * plane can simply be a constructor argument and there is no static holder to keep in step or to leak
- * between tests. A node with no such plugin gets {@link #NOOP} and deletes exactly as it always has.
+ * node, selected once by {@code Node} and held by {@link ClaimedIndexLifecycleRegistry}. Services that Guice
+ * constructs take it as a constructor argument, which {@code ClusterModule} binds from that same instance;
+ * the two core call sites that are static and cannot be injected -- {@code Metadata.Builder.put} and {@code
+ * MetadataCreateIndexService.clusterStateCreateIndex} -- read the registry directly. One plugin hook, one
+ * instance, two ways of reaching it, exactly as {@link IndexCatalogRegistry} already works and for the same
+ * reason.
+ *
+ * <p><b>Every method has a default, and that is deliberate.</b> An implementer overrides the operations its
+ * plane actually performs and inherits "nothing here holds such an index" for the rest, which is what {@link
+ * #NOOP} is: the whole interface, unimplemented. Each default answers the way core answered before any of
+ * these seams existed -- nothing to remove, nothing to record, and {@link
+ * org.opensearch.index.IndexNotFoundException} or a failed stage for anything that would otherwise leave a
+ * change with nowhere to go. None of them silently succeeds.
+ *
+ * <p><b>Deliberately not annotated {@code @ExperimentalApi} at the type level.</b> That annotation requires
+ * every type this interface exposes as a public member to itself be {@code @PublicApi}/{@code
+ * @ExperimentalApi}/{@code @DeprecatedApi} (enforced at compile time) -- but {@link IndexDescriptor}, which
+ * {@link #updateIndex} mutates, carries none of them. Retrofitting that annotation onto it would be a bigger
+ * and wrong-owner change than adding a method to this SPI should require, and it would freeze a record
+ * format this fork is still moving. This mirrors {@link IndexCreationStrategy}'s own precedent, which
+ * documents itself experimental through javadoc alone for exactly the same reason.
  *
  * @opensearch.experimental
  */
-@ExperimentalApi
 public interface ClaimedIndexLifecycle {
 
     /**
-     * What a node with no plugin supplying one gets: nothing to remove, and an acknowledgement that is
-     * never deferred. Identical to what the two seams this replaces answered with nothing registered.
+     * What a node with no plugin supplying one gets: the interface with nothing overridden. Every method
+     * therefore answers exactly what the static seam it replaces answered with nothing registered.
      */
-    ClaimedIndexLifecycle NOOP = indices -> CompletableFuture.completedFuture(null);
+    ClaimedIndexLifecycle NOOP = new ClaimedIndexLifecycle() {
+    };
 
     /**
      * Removes whatever this plane holds for indices core has just deleted, as one operation.
@@ -129,7 +148,9 @@ public interface ClaimedIndexLifecycle {
      *         failure; see this interface's own javadoc for why that ordering is the point, and for why any
      *         further best-effort cleanup must run after this stage is completed rather than before.
      */
-    CompletionStage<Void> removeIndices(Collection<IndexMetadata> indices);
+    default CompletionStage<Void> removeIndices(Collection<IndexMetadata> indices) {
+        return CompletableFuture.completedFuture(null);
+    }
 
     /**
      * Applies a mapping change to indices this plane holds, for a request no cluster state entry can serve.
@@ -179,4 +200,110 @@ public interface ClaimedIndexLifecycle {
             )
         );
     }
+
+    /**
+     * Creates the record that <em>is</em> a claimed index, since it will have no cluster state entry.
+     *
+     * <p><b>Separate from {@link #recordChange}, and the separation is the point.</b> The two have opposite
+     * failure semantics, and lost creations and duplicate-name acknowledgements are what happened while one
+     * stood in for the other. {@link #recordChange} records an index that already exists in cluster state,
+     * so losing the write costs a comparison and fire-and-forget is right. This is the only record the index
+     * will ever have, so it must be atomic against a competing creation and its outcome must reach the
+     * client.
+     *
+     * <p>Returns a stage rather than a boolean so the caller can defer the acknowledgement without blocking.
+     * Blocking on the cluster state thread is an established deadlock here, and the thread does not need to
+     * wait; the acknowledgement does.
+     *
+     * <p><b>Called from inside the cluster state transform</b>, so an implementation must hand the work off
+     * and return rather than blocking. Core refuses the creation outright when that transform is running on
+     * a thread where a blocking store write would self-deadlock, which is a guard core keeps because the
+     * argument that it could not happen has been wrong twice.
+     *
+     * @param indexMetadata the finished index, from which the implementation derives whatever it stores.
+     *                      Derived rather than constructed from separate inputs, so a record and a cluster
+     *                      state entry for the same index cannot disagree about what they describe.
+     * @return a stage completing {@code true} when this call created the name, {@code false} when a
+     *         competing creation won -- which core reports as {@link
+     *         org.opensearch.ResourceAlreadyExistsException}, the same answer an ordinary duplicate gets --
+     *         and exceptionally when the write could not be made. Never null.
+     */
+    default CompletionStage<Boolean> createIndex(IndexMetadata indexMetadata) {
+        return CompletableFuture.failedFuture(
+            new IllegalStateException(
+                "index ["
+                    + indexMetadata.getIndex().getName()
+                    + "] is configured to skip its cluster state entry, but nothing on this node records "
+                    + "such an index, so creating it would leave no record of it anywhere"
+            )
+        );
+    }
+
+    /**
+     * Changes a claimed index's record, against whatever this plane currently holds.
+     *
+     * <p><b>Why this takes a mutation rather than a finished record.</b> It used to take the finished one,
+     * and every caller built it the same way: resolve the current record, apply a change to it, hand the
+     * result back. Two things are wrong with that and neither is visible at the call site.
+     *
+     * <p>The resolved record is a <em>cached</em> one, up to the resolution cache's freshness window old -- a
+     * minute, by the object-store backend's own default -- and on the cluster manager's update thread it is
+     * the cached one or nothing at all, because the resolution seam refuses I/O there. So the base of the
+     * read-modify-write was routinely stale.
+     *
+     * <p>And writing the result back is unconditional, so everything that changed on the real record in the
+     * meantime is silently reverted. A close issued while a dynamic field was being added rolls the mapping
+     * back to whatever the closer's cached copy said, and the document carrying that field is then
+     * unqueryable on it -- a wrong answer that looks like a correct one.
+     *
+     * <p>Taking the mutation instead makes both impossible to express: the implementation reads the record
+     * authoritatively, applies this function to <em>that</em>, and writes it conditionally on the generation
+     * it read, retrying the whole cycle if it loses. A caller that cannot name the base value cannot clobber
+     * it.
+     *
+     * @param indexName the index whose record is to change
+     * @param mutation  applied to the record as this plane currently holds it; returning the argument
+     *                  unchanged means "nothing to write", which is how an idempotent request (adding an
+     *                  alias that is already there) says so without a write
+     * @return a stage completing {@code true} once the change is durable, {@code false} if it could not be
+     *         applied, and exceptionally if the write failed. Never null, and never silently nothing: with
+     *         no plane installed this fails, because for a claimed index this write <em>is</em> the
+     *         operation and there is no cluster state entry behind it that would still carry the change. A
+     *         null return was the old shape and it was indistinguishable from success at every one of its
+     *         call sites, all four of which discarded it entirely.
+     */
+    default CompletionStage<Boolean> updateIndex(String indexName, UnaryOperator<IndexDescriptor> mutation) {
+        return CompletableFuture.failedFuture(
+            new IllegalStateException(
+                "nothing on this node records indices held outside cluster state, so the change to ["
+                    + indexName
+                    + "] has nowhere to be recorded; the index is unchanged"
+            )
+        );
+    }
+
+    /**
+     * Records that an index's metadata changed, for a plane keeping its own copy alongside cluster state.
+     *
+     * <p>This is the dual-write half of moving index metadata off cluster state. While the cluster state
+     * entry is still being written, the record is written alongside it, deliberately redundant, so the two
+     * resolution paths can be compared against each other while the old structure is still there to be
+     * right.
+     *
+     * <p><b>This runs inside cluster state construction</b> -- on the cluster manager's single update
+     * thread, and on every other node's applier thread as that state's diff is applied. Every cluster state
+     * change queues behind that thread, so an implementation that writes synchronously here would add a
+     * round trip to every index change and serialise it against everything else; registering a blocking put
+     * hung the node rather than failing, which is how the constraint was found. Implementations must hand
+     * the record off and return. The contract is fire and forget, and it is the implementation's problem to
+     * make the write durable, not this thread's.
+     *
+     * <p><b>A failure here must not fail the change</b>, and core does not let it: an exception is logged
+     * and swallowed. During dual write the record is redundant, so losing one costs a comparison rather than
+     * an index. That inverts for {@link #createIndex}, where the record is the only one there is -- which is
+     * exactly why the two are separate methods.
+     *
+     * @param indexMetadata the index as it now stands in cluster state
+     */
+    default void recordChange(IndexMetadata indexMetadata) {}
 }

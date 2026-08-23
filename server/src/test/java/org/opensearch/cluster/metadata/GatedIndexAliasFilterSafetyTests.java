@@ -39,18 +39,25 @@ public class GatedIndexAliasFilterSafetyTests extends OpenSearchTestCase {
 
     private final AliasValidator aliasValidator = new AliasValidator();
     private final MetadataDeleteIndexService deleteIndexService = mock(MetadataDeleteIndexService.class);
+    /**
+     * Armed per test by {@link #installStore}, and handed to the service directly rather than through the
+     * registry. The service captures its lifecycle at construction, and this field initialiser runs before
+     * any test body does -- so reading the registry here would capture whatever was installed before the
+     * test armed anything, which is nothing.
+     */
+    private final TestClaimedIndexLifecycle lifecycle = new TestClaimedIndexLifecycle();
     private final MetadataIndexAliasesService service = new MetadataIndexAliasesService(
         mock(ClusterService.class),
         null,
         aliasValidator,
         deleteIndexService,
-        xContentRegistry()
+        xContentRegistry(),
+        lifecycle
     );
 
     @After
     public void clearRegistrations() {
         AbsentIndexDescriptorSuppliers.register(null);
-        IndexDescriptorPublisher.registerUpdater(null);
     }
 
     private static final String GATED_INDEX = "gated-index";
@@ -65,7 +72,7 @@ public class GatedIndexAliasFilterSafetyTests extends OpenSearchTestCase {
 
     private void installStore(IndexDescriptor initial) {
         stored = new AtomicReference<>(initial);
-        IndexDescriptorPublisher.registerUpdater((name, mutation) -> {
+        lifecycle.updating((name, mutation) -> {
             if (GATED_INDEX.equals(name) == false) {
                 return CompletableFuture.completedFuture(Boolean.FALSE);
             }
@@ -201,7 +208,7 @@ public class GatedIndexAliasFilterSafetyTests extends OpenSearchTestCase {
      */
     public void testAnAliasChangeWithNothingToRecordItFails() throws Exception {
         registerGatedDescriptor();
-        IndexDescriptorPublisher.registerUpdater(null);
+        TestClaimedIndexLifecycle.uninstall();
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
         AtomicReference<List<CompletableFuture<Boolean>>> writes = new AtomicReference<>();

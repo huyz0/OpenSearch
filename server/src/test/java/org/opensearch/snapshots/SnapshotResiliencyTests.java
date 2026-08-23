@@ -2248,7 +2248,8 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                     indicesService,
                     new AliasValidator(),
                     metadataDeleteIndexService,
-                    namedXContentRegistry
+                    namedXContentRegistry,
+                    ClaimedIndexLifecycle.NOOP
                 );
                 actions.put(
                     IndicesAliasesAction.INSTANCE,

@@ -37,6 +37,7 @@ import org.opensearch.cluster.action.index.NodeMappingRefreshAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.decommission.DecommissionAttributeMetadata;
 import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
+import org.opensearch.cluster.metadata.ClaimedIndexLifecycleRegistry;
 import org.opensearch.cluster.metadata.ComponentTemplateMetadata;
 import org.opensearch.cluster.metadata.ComposableIndexTemplateMetadata;
 import org.opensearch.cluster.metadata.DataStreamMetadata;
@@ -176,10 +177,16 @@ public class ClusterModule extends AbstractModule {
         );
         this.clusterManagerMetrics = clusterManagerMetrics;
         this.shardStateActionClass = shardStateActionClass;
-        // The one plugin-supplied removal of an index's out-of-cluster-state record, resolved here rather
-        // than in Node.java's block of registrations because unlike IndexCatalog and IndexCreationStrategy
-        // this one has an injectable caller: MetadataDeleteIndexService is bound below, so the plane can be
-        // a constructor argument and needs no static holder. See ClaimedIndexLifecycle's own javadoc.
+        // The one plugin-supplied plane for indices held outside cluster state, selected here rather than in
+        // Node.java's block of registrations because most of its callers are injectable: the four metadata
+        // services bound below take it as a constructor argument, which is better than a static holder --
+        // nothing to keep in step, nothing to leak between tests.
+        //
+        // Two core call sites cannot take it that way. Metadata.Builder.put is a method on a data-structure
+        // builder and MetadataCreateIndexService.clusterStateCreateIndex is static, and both are places an
+        // index's record has to be written from. So the same instance selected here is also handed to
+        // ClaimedIndexLifecycleRegistry, which is what those two read. One plugin hook, one object, two ways
+        // of reaching it -- see that class's own javadoc.
         List<ClaimedIndexLifecycle> lifecycles = clusterPlugins.stream()
             .map(ClusterPlugin::getClaimedIndexLifecycle)
             .filter(Optional::isPresent)
@@ -189,6 +196,10 @@ public class ClusterModule extends AbstractModule {
             throw new IllegalStateException("at most one ClusterPlugin may supply a ClaimedIndexLifecycle, but found " + lifecycles.size());
         }
         this.claimedIndexLifecycle = lifecycles.isEmpty() ? ClaimedIndexLifecycle.NOOP : lifecycles.get(0);
+        // Registered rather than left unset when empty, so a node built after one that had a plugin does not
+        // inherit the previous node's plane -- which is the one way a shared static holder goes wrong in an
+        // internal test cluster.
+        ClaimedIndexLifecycleRegistry.register(lifecycles.isEmpty() ? null : this.claimedIndexLifecycle);
     }
 
     public static List<Entry> getNamedWriteables() {

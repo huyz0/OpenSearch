@@ -11,7 +11,6 @@ package org.opensearch.serverless.storage.descriptor;
 import org.opensearch.Version;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.IndexDescriptor;
-import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
@@ -49,6 +48,26 @@ public class DescriptorChangeEmissionTests extends OpenSearchTestCase {
     private FsBlobStore descriptorStore;
     private BlobDescriptorBackend backend;
     private BlobDescriptorChangeLog changeLog;
+
+    /**
+     * The three write paths this suite covers, as one object.
+     *
+     * <p>They were three static registrations into {@code IndexDescriptorPublisher} when this suite was
+     * written, installed by {@link DescriptorGate#install} and reached through static entry points. They are
+     * three methods on this now, and it is unregistered and stateless -- it reads the gate this suite's
+     * {@code setUp} installs, live, on every call.
+     */
+    private final DescriptorBackedIndexLifecycle lifecycle = new DescriptorBackedIndexLifecycle();
+
+    /** {@link DescriptorBackedIndexLifecycle#createIndex} as something this suite can wait on. */
+    private CompletableFuture<Boolean> create(IndexMetadata indexMetadata) {
+        return lifecycle.createIndex(indexMetadata).toCompletableFuture();
+    }
+
+    /** {@link DescriptorBackedIndexLifecycle#updateIndex} as something this suite can wait on. */
+    private CompletableFuture<Boolean> update(String indexName, java.util.function.UnaryOperator<IndexDescriptor> mutation) {
+        return lifecycle.updateIndex(indexName, mutation).toCompletableFuture();
+    }
 
     @Override
     public void setUp() throws Exception {
@@ -115,7 +134,7 @@ public class DescriptorChangeEmissionTests extends OpenSearchTestCase {
      * for the whole freshness window after the index has been recreated.
      */
     public void testAGatedCreationIsRecorded() throws Exception {
-        CompletableFuture<Boolean> created = IndexDescriptorPublisher.createGated(metadata("serverless_tenant-new"));
+        CompletableFuture<Boolean> created = create(metadata("serverless_tenant-new"));
         assertNotNull("a creator must be installed, or nothing records the index at all", created);
         assertTrue(created.get(10, TimeUnit.SECONDS));
 
@@ -124,11 +143,11 @@ public class DescriptorChangeEmissionTests extends OpenSearchTestCase {
 
     /** A creation that lost the race records nothing, because it does not hold the name. */
     public void testACreationThatLostTheRaceRecordsNothing() throws Exception {
-        assertTrue(IndexDescriptorPublisher.createGated(metadata("serverless_tenant-contested")).get(10, TimeUnit.SECONDS));
+        assertTrue(create(metadata("serverless_tenant-contested")).get(10, TimeUnit.SECONDS));
         assertEquals(EnumSet.of(DescriptorChange.Kind.CREATED), kindsFor("serverless_tenant-contested"));
 
         IndexMetadata sameNameDifferentIndex = metadata("serverless_tenant-contested", "somebody-elses-uuid");
-        assertFalse(IndexDescriptorPublisher.createGated(sameNameDifferentIndex).get(10, TimeUnit.SECONDS));
+        assertFalse(create(sameNameDifferentIndex).get(10, TimeUnit.SECONDS));
 
         long recorded = changeLog.since(null).stream().filter(change -> change.name().equals("serverless_tenant-contested")).count();
         assertEquals("only the winner may record, or every node invalidates on behalf of a name it lost", 1, recorded);
@@ -144,7 +163,7 @@ public class DescriptorChangeEmissionTests extends OpenSearchTestCase {
      * index, and {@code DescriptorChangeTailer}'s delete-driven shard release was unreachable in production.
      */
     public void testAGatedDeleteIsRecordedAsDeleted() throws Exception {
-        assertTrue(IndexDescriptorPublisher.createGated(metadata("serverless_tenant-doomed")).get(10, TimeUnit.SECONDS));
+        assertTrue(create(metadata("serverless_tenant-doomed")).get(10, TimeUnit.SECONDS));
 
         new DescriptorBackedIndexLifecycle().removeIndices(List.of(metadata("serverless_tenant-doomed")))
             .toCompletableFuture()
@@ -158,11 +177,10 @@ public class DescriptorChangeEmissionTests extends OpenSearchTestCase {
 
     /** A close is recorded as a close, so a node holding the shard is told to let it go. */
     public void testAGatedCloseIsRecordedAsClosed() throws Exception {
-        assertTrue(IndexDescriptorPublisher.createGated(metadata("serverless_tenant-closing")).get(10, TimeUnit.SECONDS));
+        assertTrue(create(metadata("serverless_tenant-closing")).get(10, TimeUnit.SECONDS));
 
         assertTrue(
-            IndexDescriptorPublisher.updateGated("serverless_tenant-closing", current -> current.withState(IndexDescriptor.State.CLOSE))
-                .get(10, TimeUnit.SECONDS)
+            update("serverless_tenant-closing", current -> current.withState(IndexDescriptor.State.CLOSE)).get(10, TimeUnit.SECONDS)
         );
 
         assertTrue(kindsFor("serverless_tenant-closing").contains(DescriptorChange.Kind.CLOSED));
@@ -176,18 +194,18 @@ public class DescriptorChangeEmissionTests extends OpenSearchTestCase {
      * for it would invalidate a live cache entry on every node for no change at all.
      */
     public void testAnUpdateThatChangesNothingRecordsNothing() throws Exception {
-        assertTrue(IndexDescriptorPublisher.createGated(metadata("serverless_tenant-idle")).get(10, TimeUnit.SECONDS));
+        assertTrue(create(metadata("serverless_tenant-idle")).get(10, TimeUnit.SECONDS));
         assertEquals(EnumSet.of(DescriptorChange.Kind.CREATED), kindsFor("serverless_tenant-idle"));
         int before = changeLog.since(null).size();
 
-        assertTrue(IndexDescriptorPublisher.updateGated("serverless_tenant-idle", current -> current).get(10, TimeUnit.SECONDS));
+        assertTrue(update("serverless_tenant-idle", current -> current).get(10, TimeUnit.SECONDS));
 
         assertEquals("an already-satisfied request must not produce an entry", before, changeLog.since(null).size());
     }
 
     /** An update against a name that is not there fails rather than resurrecting it. */
     public void testUpdatingADeletedIndexFailsRatherThanRecreatingIt() throws Exception {
-        CompletableFuture<Boolean> update = IndexDescriptorPublisher.updateGated(
+        CompletableFuture<Boolean> update = update(
             "serverless_tenant-never-existed",
             current -> current.withState(IndexDescriptor.State.CLOSE)
         );
@@ -207,7 +225,7 @@ public class DescriptorChangeEmissionTests extends OpenSearchTestCase {
      * for the whole window, so a shard asking whether it is behind is told it is not.
      */
     public void testAMappingSwapIsRecorded() throws Exception {
-        assertTrue(IndexDescriptorPublisher.createGated(metadata("serverless_tenant-mapped")).get(10, TimeUnit.SECONDS));
+        assertTrue(create(metadata("serverless_tenant-mapped")).get(10, TimeUnit.SECONDS));
         DescriptorBackedMappingStore mappingStore = new DescriptorBackedMappingStore(() -> backend, null);
         DescriptorBackedMappingStore.registerDescriptor(backend.get("serverless_tenant-mapped"));
 

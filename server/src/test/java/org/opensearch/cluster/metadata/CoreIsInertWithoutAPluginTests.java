@@ -22,6 +22,9 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.instanceOf;
+
 /**
  * The guard for the requirement the whole approach is affordable under: with no plugin installed, core
  * behaves as it did before any of this existed.
@@ -57,8 +60,7 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         AbsentIndexDescriptorSuppliers.registerExpander(null);
         AbsentIndexRoutingSuppliers.register(null);
         DescriptorPrefetch.register(null);
-        IndexDescriptorPublisher.register(null);
-        IndexDescriptorPublisher.registerCreator(null);
+        TestClaimedIndexLifecycle.uninstall();
         GatedIndexRelease.register(null);
         UnknownFieldRefresh.register(null);
         GatedMappingStatsAggregator.register(null);
@@ -103,7 +105,7 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         assertFalse("wildcard expansion over gated indices", AbsentIndexDescriptorSuppliers.isExpanderRegistered());
         assertFalse("computed routing", AbsentIndexRoutingSuppliers.isRegistered());
         assertFalse("the descriptor prefetcher", DescriptorPrefetch.isRegistered());
-        assertFalse("the descriptor publisher", IndexDescriptorPublisher.isRegistered());
+        assertFalse("the descriptor publisher", ClaimedIndexLifecycleRegistry.isRegistered());
         assertFalse("the gated index releaser", GatedIndexRelease.isRegistered());
         assertFalse("the unknown field refresher", UnknownFieldRefresh.isRegistered());
         assertFalse("the gated mapping stats aggregator", GatedMappingStatsAggregator.isRegistered());
@@ -157,14 +159,28 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         );
     }
 
-    /** The publisher reports that nobody listened, rather than pretending. */
-    public void testPublishingRecordsNothingAndSaysSo() {
-        assertFalse(IndexDescriptorPublisher.publish(anIndex("ordinary")));
-        assertNull(
-            "a null future is how the creation path is told no creator exists, which it must treat as a "
-                + "failure rather than as success",
-            IndexDescriptorPublisher.createGated(anIndex("ordinary"))
+    /** The claimed-index plane reports that nobody listened, rather than pretending. */
+    public void testRecordingChangesNothingAndSaysSo() {
+        assertFalse(ClaimedIndexLifecycleRegistry.recordChange(anIndex("ordinary")));
+    }
+
+    /**
+     * A creation with nothing to record it fails, rather than reporting an index that exists nowhere.
+     *
+     * <p>The refusal used to be a {@code null} return the creation path had to remember to check for, and
+     * this asserted the null. Asserting the failure instead is the same guarantee stated where it is
+     * load-bearing: this is the outcome the whole path exists to prevent, and a caller cannot get it wrong
+     * by forgetting a null check.
+     */
+    public void testCreatingWithNothingToRecordItFails() {
+        java.util.concurrent.CompletionStage<Boolean> write = ClaimedIndexLifecycleRegistry.createIndex(anIndex("ordinary"));
+        assertNotNull("a stage rather than a null, which every caller of the old shape had to check for", write);
+        java.util.concurrent.ExecutionException failure = expectThrows(
+            java.util.concurrent.ExecutionException.class,
+            () -> write.toCompletableFuture().get()
         );
+        assertThat(failure.getCause(), instanceOf(IllegalStateException.class));
+        assertThat(failure.getCause().getMessage(), containsString("no record of it anywhere"));
     }
 
     /**

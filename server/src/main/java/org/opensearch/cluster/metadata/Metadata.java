@@ -482,7 +482,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             if (indexMetadata == null) {
                 // A gated index, which resolves by name and has no entry in this map -- and can genuinely
                 // hold aliases: MetadataIndexAliasesService#applyAliasActions has a dedicated branch that
-                // adds/removes plain (name-only) aliases on a gated index via IndexDescriptorPublisher,
+                // adds/removes plain (name-only) aliases on a gated index via ClaimedIndexLifecycle,
                 // entirely outside cluster state. Reporting none here (rather than resolving them through
                 // that same descriptor seam) is a completeness gap in responses like GET /index, tracked
                 // separately -- the intended fix is to give this method the same plugin-supplied catalog
@@ -1659,7 +1659,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             if (previousMetadata == null) {
                 return;
             }
-            IndexDescriptorPublisher.publish(indexMetadata);
+            ClaimedIndexLifecycleRegistry.recordChange(indexMetadata);
         }
 
         public IndexMetadata get(String index) {

@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * implements it as {@link BlobDescriptorBackend#create}.
  *
  * <p>The gated creation path does not call it. {@code MetadataCreateIndexService.clusterStateCreateIndex}
- * calls {@code IndexDescriptorPublisher.publish}, and {@code DescriptorGate} routes a live descriptor to
+ * calls {@code ClaimedIndexLifecycle.recordChange}, and {@code DescriptorGate} routes a live descriptor to
  * {@code putAsync}, which is a plain put. So the mechanism exists, is tested, and is not on the path it was
  * built for, which makes it the fifth thing in this area found correct and unreachable.
  *

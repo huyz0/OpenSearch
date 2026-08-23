@@ -55,8 +55,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
     @After
     public void clearRegistrations() {
         strategy.deactivate();
-        IndexDescriptorPublisher.register(null);
-        IndexDescriptorPublisher.registerCreator(null);
+        TestClaimedIndexLifecycle.uninstall();
         IndexCreationStrategyRegistry.register(null);
     }
 
@@ -70,16 +69,15 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
             ClusterState base = stateWith(population);
 
             strategy.deactivate();
-            IndexDescriptorPublisher.register(null);
-            IndexDescriptorPublisher.registerCreator(null);
+            TestClaimedIndexLifecycle.uninstall();
             double throughClusterState = time(base, "cs-" + population);
 
             AtomicInteger published = new AtomicInteger();
-            IndexDescriptorPublisher.register(descriptor -> published.incrementAndGet());
+            TestClaimedIndexLifecycle.install().recording(descriptor -> published.incrementAndGet());
             // T18 split recording from creating, and a gated index now goes through the creator only. The
             // publisher still records ordinary indices from Metadata.Builder, so counting there would count
             // zero for a gated population. The count moves to where the writes actually happen.
-            IndexDescriptorPublisher.registerCreator(descriptor -> {
+            TestClaimedIndexLifecycle.install().creating(descriptor -> {
                 published.incrementAndGet();
                 return java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE);
             });
@@ -121,11 +119,11 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
      * reading.
      */
     public void testDescriptorOnlyCreationIsFlatAgainstPopulation() {
-        IndexDescriptorPublisher.register(descriptor -> {});
+        TestClaimedIndexLifecycle.install().recording(descriptor -> {});
         // T18 split recording from creating: a gated index is created by the creator, and its
         // future is what the acknowledgement waits on. Registering only a publisher would leave
         // createGated returning null, which creation now treats as "no record anywhere".
-        IndexDescriptorPublisher.registerCreator(descriptor -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE));
+        TestClaimedIndexLifecycle.install().creating(descriptor -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE));
         strategy.activate(indexMetadata -> true);
 
         double atThousand = time(stateWith(1_000), "flat-small");
@@ -185,8 +183,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
      */
     public void testCreationRefusesWhenNothingWouldRecordTheIndex() {
         strategy.activate(indexMetadata -> true);
-        IndexDescriptorPublisher.register(null);
-        IndexDescriptorPublisher.registerCreator(null);
+        TestClaimedIndexLifecycle.uninstall();
 
         IllegalStateException failure = expectThrows(
             IllegalStateException.class,

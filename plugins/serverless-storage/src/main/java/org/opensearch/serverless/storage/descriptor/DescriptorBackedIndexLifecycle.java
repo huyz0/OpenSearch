@@ -27,17 +27,24 @@ import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.function.UnaryOperator;
 
 /**
  * Everything this plugin holds for an index that has no cluster state entry, changed and removed as the
  * whole operations core asks for.
  *
- * <p><b>What this is made of.</b> Two protocols core used to run itself. {@link #removeIndices} is the
- * deletion one; {@link #putMapping} is the mapping one, which core reached through a third static seam and
- * about a hundred lines that resolved descriptors, reduced a mapping source to fields, refused what would
- * not round-trip and then drove a compare-and-swap loop -- none of it touching cluster state, all of it
- * about records core does not own. Both are moved rather than rewritten: the same writes, in the same
- * order, with the same failure policy for each half. What changed is who sequences them.
+ * <p><b>What this is made of.</b> Everything the descriptor plane used to reach core through a static seam.
+ * {@link #removeIndices} is the deletion protocol, {@link #putMapping} the mapping one; {@link #createIndex},
+ * {@link #updateIndex} and {@link #recordChange} are the three registrations {@link DescriptorGate} used to
+ * install into {@code IndexDescriptorPublisher} -- one unit, installed together and cleared together, split
+ * three ways. All of it is moved rather than rewritten: the same writes, in the same order, with the same
+ * failure policy for each. What changed is who sequences them, and how many places a plugin has to reach
+ * into core to be heard from.
+ *
+ * <p><b>Nothing here is registered; everything reads the gate live.</b> The plugin returns this from {@code
+ * ClusterPlugin#getClaimedIndexLifecycle()} unconditionally, and each method asks {@link DescriptorGate} for
+ * the store, the prefix half and the mapping store at the moment it runs. That is the same lifetime the
+ * registrations gave these bodies -- armed exactly when the gate is -- with nothing to keep in step.
  *
  * <p><b>The deletion protocol, in detail.</b> Two things core used to run itself, in that order: the durable tombstone
  * write it deferred the acknowledgement on ({@code DurableTombstones}, a static seam this class retires),
@@ -300,5 +307,195 @@ public final class DescriptorBackedIndexLifecycle implements ClaimedIndexLifecyc
                 index.getName()
             );
         }
+    }
+
+    /**
+     * Records that an index in cluster state changed, by writing its descriptor alongside.
+     *
+     * <p>H2b dual-writes the descriptor at creation and H4 records deletions as tombstones, and neither had
+     * ever had a publisher registered, so no index creation outside a test had written a descriptor. Both go
+     * through put rather than create: this records an index that already exists, and a tombstone
+     * deliberately overwrites the live descriptor rather than racing it. The put-if-absent path is {@link
+     * #createIndex}, which is the uniqueness gate for a claimed creation and a different question from
+     * recording.
+     *
+     * <p><b>Asynchronous because this runs on the cluster state thread.</b> Core calls it while building a
+     * cluster state, so a blocking write deadlocks against the index operation it issues. Registering the
+     * blocking put hung the node instead of failing, which is how the constraint was found.
+     *
+     * <p><b>Deliberately no change log entry, which is a change and needs stating.</b> This is called from
+     * {@code Metadata.Builder.put}, which means it runs on the cluster manager's state update thread
+     * <em>and</em> on every other node's applier thread as that state's diff is applied. Appending here was
+     * therefore N nodes each writing the same entry, and each of those appends was an inline blocking
+     * {@code writeBlob} on a thread that must not do I/O -- the constraint the paragraph above records
+     * having found the hard way, honoured for the descriptor write beside it and not for the append.
+     *
+     * <p>Nothing is lost by dropping it. An index reaching here is an index that is <em>in</em> cluster
+     * state, so every node learns of the change through the state it is applying at this very moment; the
+     * change log exists for indices cluster state never mentions. Those are written by {@link #createIndex},
+     * {@link #updateIndex}, the mapping compare-and-swap and {@link #removeIndices}, and all four record.
+     */
+    @Override
+    public void recordChange(IndexMetadata indexMetadata) {
+        final DescriptorBackend store = DescriptorGate.installedStore();
+        if (store == null) {
+            return;
+        }
+        IndexDescriptor descriptor = IndexDescriptor.from(indexMetadata);
+        // Which name is being written and whether it is a tombstone. Descriptor writes are asynchronous,
+        // so they are hard to attribute after the fact: a write that lands after a test has finished
+        // shows up only as a descriptor reappearing, with nothing saying what wrote it.
+        logger.debug("publishing descriptor for [{}], exists [{}]", descriptor.name(), descriptor.exists());
+        DescriptorBackedMappingStore.registerDescriptor(descriptor);
+        if (descriptor.exists()) {
+            store.putAsync(descriptor);
+        } else {
+            store.putTombstoneAsync(descriptor);
+        }
+        // The prefix half is a separate store until the name index serves prefix resolution, and a
+        // point write to the object store leaves it not knowing the name exists. Dual-writing keeps
+        // wildcards answering while point reads move; without it, switching the backend would silently
+        // stop every wildcard from matching anything created afterwards, which is the failure T25
+        // already measured once from the other direction.
+        //
+        // Skipped when the two are the same object, which is the unswitched configuration, so an
+        // ordinary deployment does exactly one write as before.
+        DescriptorBackend prefixWrites = separatePrefixHalf(store);
+        if (prefixWrites != null) {
+            if (descriptor.exists()) {
+                prefixWrites.putAsync(descriptor);
+            } else {
+                prefixWrites.putTombstoneAsync(descriptor);
+            }
+        }
+    }
+
+    /**
+     * Creates the descriptor that <em>is</em> a claimed index.
+     *
+     * <p>T18. This is a separate operation from {@link #recordChange} because the two have opposite failure
+     * semantics, and T17 and T23 are what happened while one stood in for the other. Recording writes for an
+     * index that already exists in cluster state, so a lost write costs a comparison. This writes the only
+     * record the index will ever have, so it uses {@code op_type=create} for atomicity against a competing
+     * creation and reports its outcome to the client.
+     *
+     * <p>Dual-writes for the same reason recording does, and this half was missed. A claimed creation is the
+     * one write that never goes through the recording path, so with only the point half written a claimed
+     * index created on the blob backend was resolvable by exact name and invisible to every wildcard --
+     * permanently, since nothing else ever writes that descriptor again. The prefix write uses put rather
+     * than create: the uniqueness gate is the point half's create, and a second create here would race
+     * against it and report a spurious conflict.
+     *
+     * <p>After the point write rather than beside it, because a name that is not uniquely ours must not
+     * appear in the prefix half at all.
+     */
+    @Override
+    public CompletionStage<Boolean> createIndex(IndexMetadata indexMetadata) {
+        final DescriptorBackend store = DescriptorGate.installedStore();
+        if (store == null) {
+            // Refused rather than reported as created. An index configured to skip its cluster state entry
+            // and written nowhere is an index with no record anywhere, which is what this whole path exists
+            // to prevent -- and this is reachable only if something armed the creation strategy without
+            // arming the gate that owns it.
+            return CompletableFuture.failedFuture(
+                new IllegalStateException(
+                    "index ["
+                        + indexMetadata.getIndex().getName()
+                        + "] is configured to skip its cluster state entry, but the descriptor store is not "
+                        + "installed on this node, so creating it would leave no record of it anywhere"
+                )
+            );
+        }
+        IndexDescriptor descriptor = IndexDescriptor.from(indexMetadata);
+        DescriptorBackedMappingStore.registerDescriptor(descriptor);
+        DescriptorGate.projectMappingForStats(DescriptorGate.installedMappingStore(), descriptor);
+        CompletableFuture<Boolean> created = store.createAsync(descriptor).thenApply(won -> {
+            // The creation's change log entry, which this path never wrote.
+            //
+            // A claimed creation is the one descriptor write that goes nowhere near the recording path, so no
+            // node other than this one learned that the name now exists. Mostly that costs nothing --
+            // absence is not cached, so a cold node reads the store and finds it -- except after a
+            // delete: readFromStore answers a deleted name with its tombstone, the cache admits it, and
+            // a node that read the name while it was deleted goes on answering "deleted" for the whole
+            // freshness window after it is recreated. The local cache is handled by create() itself;
+            // this is how the other nodes hear.
+            //
+            // Only on a win. Recording a creation that lost the race would invalidate every other node's
+            // cache on behalf of a name this call does not hold.
+            if (Boolean.TRUE.equals(won)) {
+                DescriptorGate.recordChange(descriptor, DescriptorChange.Kind.CREATED);
+            }
+            return won;
+        });
+        DescriptorBackend prefixWrites = separatePrefixHalf(store);
+        if (prefixWrites == null) {
+            return created;
+        }
+        // Chained into the future the caller waits on, not fired and forgotten, and that ordering is
+        // load-bearing. Creation is acknowledged when this future completes, so a fire-and-forget prefix
+        // write can still be in flight when the client issues the delete that follows. The tombstone then
+        // lands first and the creation write overwrites it, leaving a deleted index recorded as OPEN in
+        // the half that answers wildcards -- a resurrection produced by nothing but write ordering.
+        // Observed as exactly that: a tombstoned name reading back OPEN.
+        return created.thenCompose(won -> {
+            if (Boolean.TRUE.equals(won) == false) {
+                return CompletableFuture.completedFuture(won);
+            }
+            // Failure here does not fail the creation. The point half is the record of the index; the
+            // prefix half is an index over it, and a name missing from it costs a wildcard match rather
+            // than the index.
+            return prefixWrites.createAsync(descriptor).handle((ok, failure) -> {
+                if (failure != null) {
+                    logger.warn("could not record [{}] in the prefix half; wildcards will not match it: {}", descriptor.name(), failure);
+                }
+                return won;
+            });
+        });
+    }
+
+    /**
+     * Changes a claimed index's descriptor, as a read-modify-write shaped like one.
+     *
+     * <p>It used to take a finished descriptor and put it, unconditionally. Every caller built that
+     * descriptor by resolving the current one -- from the cache, and on the cluster state thread from the
+     * cache or not at all -- changing one field and handing it back, so the write reverted anything else
+     * that had changed inside the freshness window. A close issued while a dynamic field was being added
+     * rolled that field out of the mapping and acknowledged.
+     *
+     * <p>Taking the mutation instead lets the read happen here, past the cache, and the write happen
+     * conditionally on the version that read observed. See {@link ClaimedIndexLifecycle#updateIndex}.
+     */
+    @Override
+    public CompletionStage<Boolean> updateIndex(String indexName, UnaryOperator<IndexDescriptor> mutation) {
+        final DescriptorBackend store = DescriptorGate.installedStore();
+        if (store == null) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException(
+                    "the descriptor store is not installed on this node, so the change to ["
+                        + indexName
+                        + "] has nowhere to be recorded; the index is unchanged"
+                )
+            );
+        }
+        final MappingGenerationStore.Store mappingStore = DescriptorGate.installedMappingStore();
+        return CompletableFuture.supplyAsync(
+            // On the store's own executor, because the caller may be the cluster state thread -- the
+            // alias path is -- and this both reads and writes the object store.
+            () -> DescriptorGate.applyToDescriptor(store, mappingStore, indexName, mutation),
+            DescriptorGate.writeExecutorOf(store)
+        );
+    }
+
+    /**
+     * The prefix half when it is genuinely a second store to write to, or null when there is nothing extra
+     * to do -- either because none is installed or because it is the same object as the point half, which is
+     * the unswitched configuration.
+     */
+    private static DescriptorBackend separatePrefixHalf(DescriptorBackend store) {
+        DescriptorPrefixBackend prefixBackend = DescriptorGate.installedPrefixBackend();
+        if (prefixBackend instanceof DescriptorBackend prefixWrites && prefixBackend != store) {
+            return prefixWrites;
+        }
+        return null;
     }
 }

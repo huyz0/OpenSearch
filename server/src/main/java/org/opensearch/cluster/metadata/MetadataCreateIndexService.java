@@ -533,7 +533,7 @@ public class MetadataCreateIndexService {
 
                 write.whenComplete((created, failure) -> {
                     if (failure != null) {
-                        listener.onFailure(unwrapCompletion(failure));
+                        listener.onFailure(ClaimedIndexWrites.unwrap(failure));
                     } else if (Boolean.TRUE.equals(created) == false) {
                         // the store's uniqueness gate reporting a lost race, which is the same answer an ordinary
                         // duplicate gets.
@@ -548,14 +548,6 @@ public class MetadataCreateIndexService {
                 });
             }
         });
-    }
-
-    /** Strips the wrapper the future stage adds, so the client sees the cause rather than the plumbing. */
-    private static Exception unwrapCompletion(Throwable failure) {
-        Throwable cause = failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
-            ? failure.getCause()
-            : failure;
-        return cause instanceof Exception e ? e : new OpenSearchException(cause);
     }
 
     private void onlyCreateIndex(
@@ -641,7 +633,7 @@ public class MetadataCreateIndexService {
             }
             write.whenComplete((created, failure) -> {
                 if (failure != null) {
-                    onFailure("create-index [" + request.index() + "] descriptor write", unwrap(failure));
+                    onFailure("create-index [" + request.index() + "] descriptor write", ClaimedIndexWrites.unwrap(failure));
                 } else if (Boolean.TRUE.equals(created) == false) {
                     onFailure(
                         "create-index [" + request.index() + "] descriptor write",
@@ -666,7 +658,7 @@ public class MetadataCreateIndexService {
             }
             write.whenComplete((created, failure) -> {
                 if (failure != null) {
-                    onFailure("create-index [" + request.index() + "] descriptor write", unwrap(failure));
+                    onFailure("create-index [" + request.index() + "] descriptor write", ClaimedIndexWrites.unwrap(failure));
                 } else if (Boolean.TRUE.equals(created) == false) {
                     onFailure(
                         "create-index [" + request.index() + "] descriptor write",
@@ -678,13 +670,6 @@ public class MetadataCreateIndexService {
             });
         }
 
-        /** Unwraps the CompletionException the future stage adds, so the client sees the real cause. */
-        private Exception unwrap(Throwable failure) {
-            Throwable cause = failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
-                ? failure.getCause()
-                : failure;
-            return cause instanceof Exception exception ? exception : new OpenSearchException(cause);
-        }
     }
 
     /**
@@ -2420,7 +2405,7 @@ public class MetadataCreateIndexService {
             // stands in for the argument, because the argument has been wrong twice.
             //
             // Initial creation-time mappings are carried directly in IndexDescriptor.from(indexMetadata)
-            // and written atomically to object storage by IndexDescriptorPublisher.createGated(indexMetadata),
+            // and written atomically to object storage by ClaimedIndexLifecycle.createIndex(indexMetadata),
             // avoiding system index round-trips entirely.
             //
             // The refusal itself: this comment used to describe it without the call actually being here,
@@ -2430,16 +2415,25 @@ public class MetadataCreateIndexService {
             // store write standing on the thread that would have to serve it -- this method exists to
             // refuse instead of hitting.
             refuseToWriteAMappingFromTheClusterStateThread(indexMetadata);
-            java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
-            if (write == null) {
+            // Through the registry rather than an injected field, because this method is static and is
+            // called from static contexts. See ClaimedIndexLifecycleRegistry for why that holder exists at
+            // all when most of core takes the lifecycle as a constructor argument -- and for where the
+            // "nothing is installed, so this creation would leave no record anywhere" refusal went: it is
+            // the registry's, stated in terms of the decision core made, rather than a null return this
+            // line had to check for.
+            if (ClaimedIndexLifecycleRegistry.isRegistered() == false) {
+                // Before the sink is handed anything, not after. The refusal has to be this creation's own
+                // failure, and handing a doomed stage to a sink that has its own opinion about being handed
+                // one -- the five-argument overload throws outright -- would replace this message with that
+                // one.
                 throw new IllegalStateException(
                     "index ["
                         + indexMetadata.getIndex().getName()
-                        + "] is configured to skip its cluster state entry, but no descriptor creator is "
-                        + "installed, so creating it would leave no record of it anywhere"
+                        + "] is configured to skip its cluster state entry, but no plugin records indices "
+                        + "held outside it, so creating it would leave no record of it anywhere"
                 );
             }
-            descriptorWrite.accept(write);
+            descriptorWrite.accept(ClaimedIndexLifecycleRegistry.createIndex(indexMetadata).toCompletableFuture());
             if (metadataTransformer != null) {
                 Metadata.Builder builder = Metadata.builder(currentState.metadata());
                 metadataTransformer.accept(builder, indexMetadata);

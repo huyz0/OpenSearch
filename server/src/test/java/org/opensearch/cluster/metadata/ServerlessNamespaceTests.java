@@ -65,8 +65,7 @@ public class ServerlessNamespaceTests extends OpenSearchTestCase {
     @After
     public void clearRegistrations() {
         strategy.deactivate();
-        IndexDescriptorPublisher.register(null);
-        IndexDescriptorPublisher.registerCreator(null);
+        TestClaimedIndexLifecycle.uninstall();
         IndexCreationStrategyRegistry.register(null);
     }
 

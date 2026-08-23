@@ -43,14 +43,13 @@ public class RefuseGatedWriteOnClusterStateThreadTests extends OpenSearchTestCas
     @After
     public void clearRegistrations() {
         strategy.deactivate();
-        IndexDescriptorPublisher.register(null);
-        IndexDescriptorPublisher.registerCreator(null);
+        TestClaimedIndexLifecycle.uninstall();
         IndexCreationStrategyRegistry.register(null);
     }
 
     public void testGatedCreationOnClusterStateThreadIsRefusedNotBlocked() throws Exception {
         strategy.activate(indexMetadata -> true);
-        IndexDescriptorPublisher.registerCreator(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
+        TestClaimedIndexLifecycle.install().creating(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
 
         AtomicReference<Throwable> caught = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(1);
@@ -90,7 +89,7 @@ public class RefuseGatedWriteOnClusterStateThreadTests extends OpenSearchTestCas
 
     public void testGatedCreationOffClusterStateThreadStillWorks() {
         strategy.activate(indexMetadata -> true);
-        IndexDescriptorPublisher.registerCreator(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
+        TestClaimedIndexLifecycle.install().creating(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
 
         AtomicReference<CompletableFuture<Boolean>> handedOver = new AtomicReference<>();
         ClusterState result = MetadataCreateIndexService.clusterStateCreateIndex(

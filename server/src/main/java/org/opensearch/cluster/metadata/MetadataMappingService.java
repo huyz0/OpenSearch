@@ -427,7 +427,7 @@ public class MetadataMappingService {
                 protected void doRun() {
                     claimedIndexLifecycle.putMapping(List.of(request.indices()), request.source()).whenComplete((ignored, failure) -> {
                         if (failure != null) {
-                            listener.onFailure(CompletionFailure.unwrap(failure));
+                            listener.onFailure(ClaimedIndexWrites.unwrap(failure));
                         } else {
                             listener.onResponse(new ClusterStateUpdateResponse(true));
                         }

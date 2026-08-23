@@ -295,7 +295,8 @@ public class ClusterStateChanges {
             shardLimitValidator,
             threadPool,
             transportVerifyShardBeforeCloseAction,
-            transportVerifyShardIndexBlockAction
+            transportVerifyShardIndexBlockAction,
+            ClaimedIndexLifecycle.NOOP
         );
         MetadataDeleteIndexService deleteIndexService = new MetadataDeleteIndexService(
             SETTINGS,

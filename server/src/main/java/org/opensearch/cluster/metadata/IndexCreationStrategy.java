@@ -39,10 +39,11 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  *   <li>Creation mechanics are the same story: {@code MetadataCreateIndexService#createGatedIndex}'s actual
  *       body (off-cluster-manager-thread admission, {@code applyCreateIndexRequest} validation, {@code
  *       op_type=create} atomicity reasoning, GENERIC-threadpool dispatch to avoid blocking a transport
- *       worker) hands the low-level descriptor write off through {@code IndexDescriptorPublisher}'s own
- *       {@code registerCreator}/{@code registerUpdater} static hooks -- again already generic, already
- *       working, and never touched by {@code DescriptorOnlyCreation} or by anything this interface would
- *       have added.
+ *       worker) hands the low-level descriptor write off through {@code ClaimedIndexLifecycle}'s {@code
+ *       createIndex} -- again already generic, already working, and never touched by {@code
+ *       DescriptorOnlyCreation} or by anything this interface would have added. (It was {@code
+ *       IndexDescriptorPublisher}'s {@code registerCreator}/{@code registerUpdater} static hooks when this
+ *       paragraph was first written.)
  * </ul>
  *
  * <p>What {@code DescriptorOnlyCreation} actually is, once separated from those two already-solved
@@ -117,8 +118,8 @@ public interface IndexCreationStrategy {
      * Whether this strategy claims the given index name/request -- e.g. a naming convention or a request
      * attribute a plugin recognizes. When this answers {@code true}, the index belongs to this strategy's
      * plane: {@code MetadataCreateIndexService}'s creation, deletion, and shard-lifecycle handling for it
-     * follow whatever generic hooks that behavior already runs through ({@code IndexDescriptorPublisher},
-     * {@code ClaimedIndexLifecycle}, {@code Metadata#indexOrResolved}) rather than the ordinary cluster-state
+     * follow whatever generic hooks that behavior already runs through ({@code ClaimedIndexLifecycle},
+     * {@code Metadata#indexOrResolved}) rather than the ordinary cluster-state
      * -entry path.
      *
      * <p>Defaults to {@link #claims(String)} -- every real implementation of this interface answers this

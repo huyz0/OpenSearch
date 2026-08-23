@@ -185,10 +185,12 @@ public class MetadataDeleteIndexServiceLifecycleTests extends OpenSearchTestCase
         registerCatalogForTheClaimedIndex();
         AtomicReference<Exception> failure = new AtomicReference<>();
 
-        serviceWith(indices -> { throw new IllegalStateException("the plane exploded"); }).deleteIndices(
-            requestForTheClaimedIndex(),
-            ActionListener.wrap(response -> {}, failure::set)
-        );
+        serviceWith(new ClaimedIndexLifecycle() {
+            @Override
+            public CompletionStage<Void> removeIndices(Collection<IndexMetadata> indices) {
+                throw new IllegalStateException("the plane exploded");
+            }
+        }).deleteIndices(requestForTheClaimedIndex(), ActionListener.wrap(response -> {}, failure::set));
 
         assertNotNull("a throwing plane must fail the delete rather than acknowledge it", failure.get());
         assertEquals("the plane exploded", failure.get().getMessage());

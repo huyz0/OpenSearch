@@ -24,6 +24,12 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * H2b. Whether index creation records a descriptor alongside the cluster state entry.
  *
+ * <p>Was {@code IndexDescriptorPublisherTests}, and renamed with the seam it covers: the publisher, the
+ * creator and the updater were three static registrations that {@code DescriptorGate} installed and cleared
+ * as one unit, and they are now three methods on {@link ClaimedIndexLifecycle}. Nothing this class asserts
+ * changed -- the recording path is reached the same way, from the same two {@code Metadata.Builder.put}
+ * overloads, with the same failure policy -- only what it is registered into.
+ *
  * <p>The dual write is deliberately redundant: it exists so H2c can compare the two resolution paths
  * while the old structure is still present to be the reference. Its correctness condition is therefore
  * not "a descriptor exists" but "the descriptor says the same thing the metadata says", which is asserted
@@ -34,17 +40,17 @@ import java.util.concurrent.atomic.AtomicReference;
  * when the descriptor becomes the only record, and the two phases having opposite failure semantics is
  * exactly the sort of thing that gets missed when the second is written.
  */
-public class IndexDescriptorPublisherTests extends OpenSearchTestCase {
+public class ClaimedIndexRecordingTests extends OpenSearchTestCase {
 
     @After
-    public void clearPublisher() {
-        IndexDescriptorPublisher.register(null);
+    public void clearLifecycle() {
+        TestClaimedIndexLifecycle.uninstall();
     }
 
     /** The load-bearing one: creating an index records a descriptor that agrees with the metadata. */
     public void testCreationRecordsAMatchingDescriptor() {
         AtomicReference<IndexDescriptor> recorded = new AtomicReference<>();
-        IndexDescriptorPublisher.register(recorded::set);
+        TestClaimedIndexLifecycle.install().recording(recorded::set);
 
         IndexMetadata created = indexMetadata("logs-2024", 5, 2);
         MetadataCreateIndexService.clusterStateCreateIndex(emptyState(), Set.of(), created, noReroute(), null);
@@ -58,7 +64,7 @@ public class IndexDescriptorPublisherTests extends OpenSearchTestCase {
     }
 
     /** With nothing installed, creation must behave exactly as it did before Area H existed. */
-    public void testWithoutAPublisherCreationIsUnchanged() {
+    public void testWithoutAPlaneCreationIsUnchanged() {
         ClusterState created = MetadataCreateIndexService.clusterStateCreateIndex(
             emptyState(),
             Set.of(),
@@ -67,15 +73,15 @@ public class IndexDescriptorPublisherTests extends OpenSearchTestCase {
             null
         );
 
-        assertTrue("the index must still be created when no publisher is installed", created.metadata().hasIndex("plain"));
+        assertTrue("the index must still be created when no plane is installed", created.metadata().hasIndex("plain"));
     }
 
     /**
-     * The failure semantics of this phase, which are the opposite of H3's. A publisher that throws must
+     * The failure semantics of this phase, which are the opposite of H3's. A recorder that throws must
      * not cost the user their index, because during dual write the descriptor is redundant.
      */
-    public void testAFailingPublisherDoesNotFailCreation() {
-        IndexDescriptorPublisher.register(descriptor -> { throw new IllegalStateException("publisher is broken"); });
+    public void testAFailingRecorderDoesNotFailCreation() {
+        TestClaimedIndexLifecycle.install().recording(descriptor -> { throw new IllegalStateException("the recorder is broken"); });
 
         ClusterState created = MetadataCreateIndexService.clusterStateCreateIndex(
             emptyState(),
@@ -85,16 +91,16 @@ public class IndexDescriptorPublisherTests extends OpenSearchTestCase {
             null
         );
 
-        assertTrue("a broken publisher must not prevent an index from being created", created.metadata().hasIndex("survives"));
+        assertTrue("a broken recorder must not prevent an index from being created", created.metadata().hasIndex("survives"));
     }
 
     /**
-     * One descriptor per created index, no more. A publisher invoked twice would double-write every
+     * One descriptor per created index, no more. A recorder invoked twice would double-write every
      * index in the system, which at the populations this area targets is not a rounding error.
      */
     public void testExactlyOneDescriptorPerCreation() {
         AtomicInteger published = new AtomicInteger();
-        IndexDescriptorPublisher.register(descriptor -> published.incrementAndGet());
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.incrementAndGet());
 
         MetadataCreateIndexService.clusterStateCreateIndex(emptyState(), Set.of(), indexMetadata("once", 1, 0), noReroute(), null);
 
@@ -105,11 +111,11 @@ public class IndexDescriptorPublisherTests extends OpenSearchTestCase {
      * The return value exists to distinguish "nothing installed" from "installed and did nothing", since
      * both leave no descriptor behind and a caller cannot otherwise tell them apart.
      */
-    public void testPublishReportsWhetherAnyoneWasListening() {
-        assertFalse("nothing installed means nobody was told", IndexDescriptorPublisher.publish(indexMetadata("a", 1, 0)));
+    public void testRecordChangeReportsWhetherAnyoneWasListening() {
+        assertFalse("nothing installed means nobody was told", ClaimedIndexLifecycleRegistry.recordChange(indexMetadata("a", 1, 0)));
 
-        IndexDescriptorPublisher.register(descriptor -> {});
-        assertTrue("an installed publisher must be reported as invoked", IndexDescriptorPublisher.publish(indexMetadata("b", 1, 0)));
+        TestClaimedIndexLifecycle.install().recording(descriptor -> {});
+        assertTrue("an installed plane must be reported as invoked", ClaimedIndexLifecycleRegistry.recordChange(indexMetadata("b", 1, 0)));
     }
 
     /**
@@ -123,7 +129,7 @@ public class IndexDescriptorPublisherTests extends OpenSearchTestCase {
      */
     public void testBuildingFromScratchDoesNotRepublish() {
         AtomicInteger published = new AtomicInteger();
-        IndexDescriptorPublisher.register(descriptor -> published.incrementAndGet());
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.incrementAndGet());
 
         Metadata.Builder fromScratch = Metadata.builder();
         for (int i = 0; i < 10; i++) {
@@ -143,7 +149,7 @@ public class IndexDescriptorPublisherTests extends OpenSearchTestCase {
         Metadata existing = Metadata.builder().put(indexMetadata("already-here", 1, 0), false).build();
 
         AtomicInteger published = new AtomicInteger();
-        IndexDescriptorPublisher.register(descriptor -> published.incrementAndGet());
+        TestClaimedIndexLifecycle.install().recording(descriptor -> published.incrementAndGet());
 
         Metadata.Builder incremental = Metadata.builder(existing);
         incremental.put(indexMetadata("changed", 1, 0), false);

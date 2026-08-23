@@ -56,7 +56,7 @@ import java.util.Locale;
  *
  * <p>Four indices collapsing to one value is a cluster default, not a per-index setting, and the mechanism
  * is in {@code testWhetherTheDisagreeingIndexIsEvenGated}: at creation the index is absent from cluster
- * state, and <b>after a write it is present</b>. {@code IndexDescriptorPublisher.publish} fires only from
+ * state, and <b>after a write it is present</b>. {@code ClaimedIndexLifecycle.recordChange} fires only from
  * {@code Metadata.Builder.put}, so a descriptor rewritten during a write means the index entered cluster
  * state and was rebuilt there from defaults.
  *
@@ -465,7 +465,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
         org.opensearch.cluster.metadata.IndexDescriptor descriptor = store.get(name);
 
         // Then the same two questions after a write, because the write is what corrupts the count.
-        // IndexDescriptorPublisher.publish fires only from Metadata.Builder.put, so a descriptor rewritten
+        // ClaimedIndexLifecycle.recordChange fires only from Metadata.Builder.put, so a descriptor rewritten
         // during a write means the index entered cluster state, which for a gated index it must never do.
         client().prepareIndex(name).setId("0").setSource("k", "v").get();
         client().admin().indices().prepareRefresh(name).get();

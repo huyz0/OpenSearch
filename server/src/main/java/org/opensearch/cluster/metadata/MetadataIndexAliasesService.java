@@ -80,6 +80,7 @@ public class MetadataIndexAliasesService {
     private final MetadataDeleteIndexService deleteIndexService;
 
     private final NamedXContentRegistry xContentRegistry;
+    private final ClaimedIndexLifecycle claimedIndexLifecycle;
     private final ClusterManagerTaskThrottler.ThrottlingKey indexAliasTaskKey;
 
     @Inject
@@ -88,13 +89,15 @@ public class MetadataIndexAliasesService {
         IndicesService indicesService,
         AliasValidator aliasValidator,
         MetadataDeleteIndexService deleteIndexService,
-        NamedXContentRegistry xContentRegistry
+        NamedXContentRegistry xContentRegistry,
+        ClaimedIndexLifecycle claimedIndexLifecycle
     ) {
         this.clusterService = clusterService;
         this.indicesService = indicesService;
         this.aliasValidator = aliasValidator;
         this.deleteIndexService = deleteIndexService;
         this.xContentRegistry = xContentRegistry;
+        this.claimedIndexLifecycle = claimedIndexLifecycle;
 
         // Task is onboarded for throttling, it will get retried from associated TransportClusterManagerNodeAction.
         indexAliasTaskKey = clusterService.registerClusterManagerTask(INDEX_ALIASES, true);
@@ -293,7 +296,7 @@ public class MetadataIndexAliasesService {
                             // addition most of all. The store applies this to what it actually holds, under
                             // a conditional write.
                             final String toAdd = addAction.getAlias();
-                            descriptorWrites.add(IndexDescriptorPublisher.updateGated(action.getIndex(), current -> {
+                            descriptorWrites.add(claimedIndexLifecycle.updateIndex(action.getIndex(), current -> {
                                 if (current.aliases().contains(toAdd)) {
                                     // Already there. Returning the descriptor unchanged is how this says
                                     // "nothing to write" without a write, which keeps a repeated request
@@ -303,13 +306,13 @@ public class MetadataIndexAliasesService {
                                 List<String> withAdded = new ArrayList<>(current.aliases());
                                 withAdded.add(toAdd);
                                 return current.withAliases(withAdded);
-                            }));
+                            }).toCompletableFuture());
                         } else if (action instanceof AliasAction.Remove removeAction) {
                             final String toRemove = removeAction.getAlias();
-                            descriptorWrites.add(IndexDescriptorPublisher.updateGated(action.getIndex(), current -> {
+                            descriptorWrites.add(claimedIndexLifecycle.updateIndex(action.getIndex(), current -> {
                                 List<String> withoutRemoved = new ArrayList<>(current.aliases());
                                 return withoutRemoved.remove(toRemove) ? current.withAliases(withoutRemoved) : current;
-                            }));
+                            }).toCompletableFuture());
                         }
                         continue;
                     }

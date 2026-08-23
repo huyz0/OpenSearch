@@ -69,7 +69,7 @@ import java.util.concurrent.TimeUnit;
  * update and released shards only for deletions -- it now carries {@code CLOSED}, and the tailer asks
  * {@code releasesShard()} rather than {@code !live()}, because a closed index keeps its name and loses its
  * shard. That alone changed nothing, which is how the second layer surfaced: a close is written through
- * {@code IndexDescriptorPublisher.updateGated}, and that path recorded no change of any kind, so there was
+ * {@code ClaimedIndexLifecycle.updateIndex}, and that path recorded no change of any kind, so there was
  * never an entry for the new kind to travel in. It records one now, which also means a mapping update
  * republished that way stops leaving other nodes' caches stale.
  *
@@ -128,7 +128,7 @@ public class GatedShallowSnapshotIT extends org.opensearch.serverless.storage.Se
 
     /**
      * Starts the third layer the round trip below needs: an appender was already wired ({@code
-     * IndexDescriptorPublisher.updateGated} records a change on close) and a consumer already existed
+     * ClaimedIndexLifecycle.updateIndex} records a change on close) and a consumer already existed
      * ({@code DescriptorChangeTailer} calls {@code GatedIndexRelease.release} for a change that {@code
      * releasesShard()}), but nothing in this suite had ever connected them. {@code
      * installBlobBackedDescriptorPlane} installs the descriptor store and the mapping store; it never calls

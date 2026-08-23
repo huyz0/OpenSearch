@@ -24,7 +24,7 @@ import java.util.List;
  * write is the creation, and it is the thing that must succeed", and "Failure semantics invert from H2b's
  * here. During dual write a lost descriptor cost a comparison; now it costs the index."
  *
- * <p>It then calls {@code IndexDescriptorPublisher.publish}, which returns whether a publisher was
+ * <p>It then calls {@code ClaimedIndexLifecycle.recordChange}, which returns whether a publisher was
  * <em>invoked</em>, not whether the write <em>landed</em>. The publisher registered by {@code DescriptorGate}
  * routes a live descriptor to {@code BlobDescriptorBackend.putAsync}, which submits and returns, logging
  * failures at warn.
