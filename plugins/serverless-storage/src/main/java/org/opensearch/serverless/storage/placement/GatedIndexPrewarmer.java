@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.placement;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.action.support.CoordinatorAffinityRouting;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterStateApplier;
 import org.opensearch.cluster.metadata.DescriptorPrefetch;

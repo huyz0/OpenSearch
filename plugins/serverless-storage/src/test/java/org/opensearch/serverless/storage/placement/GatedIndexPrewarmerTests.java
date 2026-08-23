@@ -9,7 +9,6 @@
 package org.opensearch.serverless.storage.placement;
 
 import org.opensearch.Version;
-import org.opensearch.action.support.CoordinatorAffinityRouting;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;

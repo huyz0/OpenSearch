@@ -9,13 +9,13 @@
 package org.opensearch.serverless.storage.resharding;
 
 import org.opensearch.action.search.SearchResponse;
-import org.opensearch.action.support.CoordinatorAffinityRouting;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+import org.opensearch.serverless.storage.placement.CoordinatorAffinityRouting;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.Before;
 

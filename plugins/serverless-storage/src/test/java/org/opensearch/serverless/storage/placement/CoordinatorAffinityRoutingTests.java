@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.action.support;
+package org.opensearch.serverless.storage.placement;
 
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;

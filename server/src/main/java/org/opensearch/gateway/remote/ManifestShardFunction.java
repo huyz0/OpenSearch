@@ -26,11 +26,11 @@ import java.util.Objects;
  *
  * <h2>Alignment with the coordinator/descriptor-cache affinity hash</h2>
  *
- * The plugin's {@code CoordinatorAffinityRouting} already rendezvous-
+ * The plugin's own affinity routing already rendezvous-
  * hashes indices onto coordinator nodes for a different reason (spreading resolver-cache warmth). If
  * the manifest's own partition function matched that one, a coordinator's warm
  * set and its manifest-shard read set would coincide -- a free win from two independent designs lining
- * up. This class deliberately does not attempt that coupling: {@code CoordinatorAffinityRouting}
+ * up. This class deliberately does not attempt that coupling: that affinity helper
  * partitions over the current, size-varying node set (rendezvous hashing is defined precisely so adding
  * or removing a node reshuffles as little as possible), while this partitions over a shard count fixed
  * in the manifest and never derived from cluster size (see this class's own {@code shardCount} contract;
