@@ -60,7 +60,6 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         GatedIndexRelease.register(null);
-        MappingGenerationStore.register(null);
         UnknownFieldRefresh.register(null);
         GatedMappingStatsAggregator.register(null);
         IndexCreationStrategyRegistry.register(null);
@@ -90,6 +89,14 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
      * The list is spelled out rather than derived by reflection. A new seam has to be added here by hand,
      * which is weaker than scanning the package and is a far clearer failure, and the thing being defended
      * against is a seam that defaults to on rather than one nobody remembered.
+     *
+     * <p>The mapping generation store used to be on this list and is not any more, because it is no longer
+     * core's to be inert about: the whole compare-and-swap protocol moved behind {@link
+     * ClaimedIndexLifecycle#putMapping}, whose unregistered answer is not a static this can interrogate but
+     * {@link ClaimedIndexLifecycle#NOOP}. What replaces the assertion is {@code
+     * GatedIndexMappingUpdateTests#testWithNoPluginAPutMappingForAnAbsentIndexIsNotFound}, which is the
+     * stronger statement anyway -- not "the seam is unregistered" but "core without a plugin gives the
+     * answer it always gave".
      */
     public void testNoSeamIsRegisteredOnAStockNode() {
         assertFalse("descriptor resolution", AbsentIndexDescriptorSuppliers.isRegistered());
@@ -98,7 +105,6 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         assertFalse("the descriptor prefetcher", DescriptorPrefetch.isRegistered());
         assertFalse("the descriptor publisher", IndexDescriptorPublisher.isRegistered());
         assertFalse("the gated index releaser", GatedIndexRelease.isRegistered());
-        assertFalse("the mapping generation store", MappingGenerationStore.isRegistered());
         assertFalse("the unknown field refresher", UnknownFieldRefresh.isRegistered());
         assertFalse("the gated mapping stats aggregator", GatedMappingStatsAggregator.isRegistered());
         assertFalse("the index-creation strategy", IndexCreationStrategyRegistry.isRegistered());

@@ -12,7 +12,6 @@ import org.opensearch.Version;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexDescriptor;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.junit.After;
 
 import java.util.List;

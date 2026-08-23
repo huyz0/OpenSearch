@@ -2147,7 +2147,8 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                 final MetadataMappingService metadataMappingService = new MetadataMappingService(
                     clusterService,
                     indicesService,
-                    threadPool
+                    threadPool,
+                    ClaimedIndexLifecycle.NOOP
                 );
                 indicesClusterStateService = new IndicesClusterStateService(
                     settings,

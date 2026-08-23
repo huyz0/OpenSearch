@@ -11,7 +11,6 @@ package org.opensearch.serverless.storage.descriptor;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.mapper.UnknownFieldRefresh;

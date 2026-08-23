@@ -9,14 +9,22 @@
 package org.opensearch.cluster.metadata;
 
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.core.index.Index;
+import org.opensearch.index.IndexNotFoundException;
 
 import java.util.Collection;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 /**
- * What a plugin does to an index's record when core removes the index -- as one operation core asks for,
- * rather than a set of hooks core calls at points of its own choosing.
+ * What a plugin does to the records it holds for indices that live outside cluster state -- as whole
+ * operations core asks for, rather than a set of hooks core calls at points of its own choosing.
+ *
+ * <p>Two so far, and they are the two things core cannot do for such an index because the entry it would
+ * work from is not there: {@link #removeIndices} when the index is deleted, and {@link #putMapping} when its
+ * mapping changes. Both were previously a protocol core ran itself against static seams -- five of them
+ * between the two -- and in both cases core's remaining share is the single decision that is genuinely its
+ * own: which indices cluster state cannot serve.
  *
  * <p><b>What this replaces, and why the shape changed.</b> Deletion used to reach two separate seams from
  * three separate places. {@code DurableTombstones.whenDurable} was consulted twice ({@code
@@ -122,4 +130,53 @@ public interface ClaimedIndexLifecycle {
      *         further best-effort cleanup must run after this stage is completed rather than before.
      */
     CompletionStage<Void> removeIndices(Collection<IndexMetadata> indices);
+
+    /**
+     * Applies a mapping change to indices this plane holds, for a request no cluster state entry can serve.
+     *
+     * <p><b>What this replaces.</b> {@code MetadataMappingService} used to carry the whole of this itself:
+     * it resolved each index's descriptor to refuse a write against an already-tombstoned uuid, parsed the
+     * request source, reduced it to a flat field map, refused the request when that reduction would have
+     * dropped something, and then drove {@code MappingGenerationStore}'s compare-and-swap loop. None of that
+     * touches cluster state. It is a storage-plane merge protocol -- reading a generation, merging fields
+     * onto it, writing conditionally, retrying on contention -- written out in core for indices core does
+     * not own, and it was the last thing keeping a mapping store in core at all.
+     *
+     * <p><b>What core keeps.</b> One decision, and it is the same one deletion makes: whether the request
+     * can be served from cluster state. Every index the request names is absent from it, so it cannot be,
+     * and the request goes here instead. Core does not ask whether a plane is installed first -- {@link
+     * #NOOP}'s answer to "apply this to indices I do not hold" is the {@link
+     * org.opensearch.index.IndexNotFoundException} the ordinary path would have raised at its own metadata
+     * lookup, so a node with no plugin fails such a request exactly as it always did, without submitting a
+     * cluster state task that was only ever going to fail.
+     *
+     * <p><b>Called off the cluster manager's update thread</b>, on {@code GENERIC}, so an implementation may
+     * block. That dispatch is not a convenience: this path used to run inside the put-mapping executor,
+     * where a store read and a store write both stood on the single thread every cluster state change
+     * queues behind, and tripped the "Expected current thread to not be the cluster-manager service thread"
+     * assertion doing it.
+     *
+     * <p><b>A change is not applied until the stage completes.</b> Core defers the client's acknowledgement
+     * on it and fails the request if it fails -- there is no cluster state entry standing behind this write
+     * that would still carry the change, so acknowledging a mapping update that did not land would be the
+     * silent success this area has produced repeatedly.
+     *
+     * @param indices       every index the request names, all of them absent from cluster state. Never
+     *                      empty.
+     * @param mappingSource the request's mapping source, verbatim, exactly as the ordinary path would have
+     *                      merged it. Passed unparsed because what a plane can represent is the plane's
+     *                      question: the one refusal core used to raise here named a limitation of a
+     *                      particular store's format, which core has no business knowing.
+     * @return a stage completing once the change is durable, or completing exceptionally if it cannot be
+     *         applied. Never null.
+     */
+    default CompletionStage<Void> putMapping(Collection<Index> indices, String mappingSource) {
+        return CompletableFuture.failedFuture(
+            new IndexNotFoundException(
+                "no plugin holds indices outside cluster state on this node, so there is nowhere for this "
+                    + "mapping change to be recorded",
+                indices.iterator().next().getName()
+            )
+        );
+    }
 }

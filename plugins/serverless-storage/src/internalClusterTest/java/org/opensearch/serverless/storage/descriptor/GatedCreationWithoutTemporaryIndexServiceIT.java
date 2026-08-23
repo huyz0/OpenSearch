@@ -282,13 +282,16 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
 
         var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("serverless_gated-mapped");
         assertNotNull("the index must still be gated", descriptor);
-        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptor.uuid());
+        var generation = org.opensearch.serverless.storage.descriptor.MappingGenerationStore.currentMapping(descriptor.uuid());
         assertNotNull(
             "the declared fields must be in the mapping store. The fast path builds no document mapper, so "
                 + "a mapping it fails to put on the metadata is accepted and then present nowhere",
             generation
         );
-        assertEquals("keyword", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(generation.fields().get("tenant")));
+        assertEquals(
+            "keyword",
+            org.opensearch.serverless.storage.descriptor.MappingGenerationStore.typeOf(generation.fields().get("tenant"))
+        );
     }
 
     /**
@@ -337,14 +340,14 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
         // satisfy both assertions above and be exactly the loss T13 and T15 were spent removing.
         var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("serverless_gated-parameterised");
         assertNotNull("the index must still be gated", descriptor);
-        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptor.uuid());
+        var generation = org.opensearch.serverless.storage.descriptor.MappingGenerationStore.currentMapping(descriptor.uuid());
         assertNotNull("the declared field must reach the store", generation);
         Object code = generation.fields().get("code");
-        assertEquals("keyword", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(code));
+        assertEquals("keyword", org.opensearch.serverless.storage.descriptor.MappingGenerationStore.typeOf(code));
         assertEquals(
             "the parameter itself must round-trip, not just the type beside it",
             256,
-            ((Map<?, ?>) org.opensearch.cluster.metadata.MappingGenerationStore.definition(code)).get("ignore_above")
+            ((Map<?, ?>) org.opensearch.serverless.storage.descriptor.MappingGenerationStore.definition(code)).get("ignore_above")
         );
     }
 

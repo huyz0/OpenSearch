@@ -16,7 +16,6 @@ import org.opensearch.action.get.GetAction;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;

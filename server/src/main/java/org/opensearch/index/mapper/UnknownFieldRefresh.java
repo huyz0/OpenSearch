@@ -8,8 +8,6 @@
 
 package org.opensearch.index.mapper;
 
-import org.opensearch.cluster.metadata.MappingGenerationStore;
-
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -51,6 +49,29 @@ public final class UnknownFieldRefresh {
         boolean refresh(MapperService mapperService, String indexUuid, String fieldName);
     }
 
+    /**
+     * A refresher's report that it could not answer, and that answering "not found" would be wrong.
+     *
+     * <p>Everything else a refresher throws degrades to "field not found" (see {@link #refreshed}), because
+     * this sits on the indexing path and a store hiccup must not turn every document carrying a new field
+     * into an error. This is the exception to that, and it needs to be one: a refresher raises it when the
+     * record it resolved for the index says the index declared fields and the place those fields live has
+     * none. Degrading there sends the caller to infer the field fresh from one document, silently replacing
+     * a mapping that exists with whatever that document happens to carry.
+     *
+     * <p><b>Why core declares this rather than naming the implementation's own exception.</b> It used to
+     * catch {@code MappingGenerationStore.MissingMappingException} by name -- a concrete class belonging to
+     * one plugin's storage protocol, imported into {@code org.opensearch.index.mapper} so that core could
+     * spell out which of a plugin's failures it must not swallow. Stating the contract instead ("a refresher
+     * may say 'do not degrade this'") is the same behaviour with the dependency the right way round, and it
+     * is what let that protocol leave core entirely.
+     */
+    public static class MappingUnavailableException extends IllegalStateException {
+        public MappingUnavailableException(String message) {
+            super(message);
+        }
+    }
+
     private static final AtomicReference<Refresher> REFRESHER = new AtomicReference<>();
 
     private UnknownFieldRefresh() {}
@@ -73,9 +94,9 @@ public final class UnknownFieldRefresh {
      * new field into an error: the caller's existing behaviour, rejecting or inferring, is a correct
      * outcome, while a failed write is not.
      *
-     * <p><b>The one exception to that, and why it has to be one.</b> {@link MappingGenerationStore.MissingMappingException}
-     * is not a store hiccup: it is the descriptor this node resolved for the index saying it declared
-     * fields, and the store answering that it has none. Swallowing that here and returning false would send
+     * <p><b>The one exception to that, and why it has to be one.</b> {@link MappingUnavailableException}
+     * is not a store hiccup: it is the record this node resolved for the index saying it declared
+     * fields, and the place those fields live answering that it has none. Swallowing that here and returning false would send
      * the caller to infer the field fresh from this one document, silently replacing whatever generation the
      * descriptor claims with whatever this document happens to carry -- the exact silent-empty-mapping shape
      * that check exists to close, reintroduced one layer up from where a plugin's field refresher raises it.
@@ -85,7 +106,7 @@ public final class UnknownFieldRefresh {
      * doing its job and disagreeing with the store.
      *
      * @return whether the field is now known, so the caller should look it up again
-     * @throws MappingGenerationStore.MissingMappingException propagated rather than swallowed; see above
+     * @throws MappingUnavailableException propagated rather than swallowed; see above
      */
     public static boolean refreshed(MapperService mapperService, String indexUuid, String fieldName) {
         Refresher refresher = REFRESHER.get();
@@ -94,7 +115,7 @@ public final class UnknownFieldRefresh {
         }
         try {
             return refresher.refresh(mapperService, indexUuid, fieldName);
-        } catch (MappingGenerationStore.MissingMappingException e) {
+        } catch (MappingUnavailableException e) {
             throw e;
         } catch (Exception e) {
             return false;

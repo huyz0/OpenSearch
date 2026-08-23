@@ -15,7 +15,6 @@ import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DescriptorPrefetch;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.index.mapper.UnknownFieldRefresh;
 import org.opensearch.serverless.storage.placement.ComputedPlacementGate;
 

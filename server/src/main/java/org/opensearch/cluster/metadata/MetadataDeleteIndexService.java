@@ -34,7 +34,6 @@ package org.opensearch.cluster.metadata;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.OpenSearchException;
 import org.opensearch.action.admin.indices.delete.DeleteIndexClusterStateUpdateRequest;
 import org.opensearch.cluster.AckedClusterStateUpdateTask;
 import org.opensearch.cluster.ClusterState;
@@ -313,19 +312,11 @@ public class MetadataDeleteIndexService {
         }
         removal.whenComplete((ignored, failure) -> {
             if (failure != null) {
-                whenRemoved.onFailure(unwrapCompletion(failure));
+                whenRemoved.onFailure(CompletionFailure.unwrap(failure));
             } else {
                 whenRemoved.onResponse(null);
             }
         });
-    }
-
-    /** Strips the wrapper the completion stage adds, so the client sees the cause rather than the plumbing. */
-    private static Exception unwrapCompletion(Throwable failure) {
-        Throwable cause = failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
-            ? failure.getCause()
-            : failure;
-        return cause instanceof Exception e ? e : new OpenSearchException(cause);
     }
 
     /**

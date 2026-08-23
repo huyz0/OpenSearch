@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 
 import java.util.concurrent.Executor;
 

@@ -482,7 +482,7 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             .compareAndSwap(
                 "geometry-uuid",
                 0L,
-                new org.opensearch.cluster.metadata.MappingGenerationStore.MappingGeneration(
+                new org.opensearch.serverless.storage.descriptor.MappingGenerationStore.MappingGeneration(
                     1L,
                     java.util.Map.of("tenant", java.util.Map.of("type", "keyword"))
                 )

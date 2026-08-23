@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.metadata;
+package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
@@ -258,7 +258,7 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
      *
      * <p>Asserted against {@link MappingGenerationStore.Store#delete} directly rather than through a static
      * entry point on this class. The one core caller of that entry point was the deletion path, and deletion
-     * now reaches a store through {@link ClaimedIndexLifecycle} instead -- so the contract that survives is
+     * now reaches a store through {@code ClaimedIndexLifecycle} instead -- so the contract that survives is
      * the one this interface states, which is what an implementer has to honour.
      */
     public void testDeletingAMappingThatWasNeverWrittenIsNotAnError() {

@@ -9,7 +9,6 @@
 package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.cluster.metadata.IndexDescriptor;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.Map;

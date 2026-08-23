@@ -144,16 +144,22 @@ public final class DescriptorRepresentable {
     /**
      * The one extraction, shared by both paths that write a gated mapping.
      *
-     * <p>{@link #fieldDefinitionsOrNull} calls it for a create-time mapping and
-     * {@code MetadataMappingService#recordGatedMapping} for a put-mapping. They used to be two
-     * implementations described as mirroring each other, and they did not: this one refused a partial
-     * result while that one skipped whatever it could not read and reported success, so an object field was
-     * refused at creation and silently dropped on update. One function is what makes the claim true.
+     * <p>{@link #fieldDefinitionsOrNull} calls it for a create-time mapping, and a {@link
+     * ClaimedIndexLifecycle} implementation calls it for a put-mapping. They used to be two implementations
+     * described as mirroring each other, and they did not: this one refused a partial result while that one
+     * skipped whatever it could not read and reported success, so an object field was refused at creation
+     * and silently dropped on update. One function is what makes the claim true.
+     *
+     * <p><b>Public, unlike its {@link IndexMetadata}-taking sibling, because the two callers now sit on
+     * opposite sides of the SPI.</b> The put-mapping half moved out of core with the rest of the mapping
+     * protocol, and the alternative to exposing this was for it to grow its own extraction again -- which is
+     * precisely the divergence the previous paragraph describes, reintroduced at a module boundary where it
+     * would be harder to notice rather than easier.
      *
      * @param properties the mapping's {@code properties} object, however the caller obtained it
      * @return name to definition for every field, or null if any of it would not round-trip
      */
-    static Map<String, Object> fieldDefinitionsOrNull(Object properties) {
+    public static Map<String, Object> fieldDefinitionsOrNull(Object properties) {
         if (properties instanceof Map == false) {
             // A mapping with no properties at all carries nothing, so there is nothing to lose.
             return Map.of();

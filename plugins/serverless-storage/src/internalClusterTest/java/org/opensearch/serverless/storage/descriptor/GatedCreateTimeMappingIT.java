@@ -11,7 +11,6 @@ package org.opensearch.serverless.storage.descriptor;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.junit.After;
@@ -347,10 +346,16 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         // only that it took the fast path; asserting the types proves the mapping was not lost on the way,
         // which is the whole question.
         String uuid = descriptorUuid("serverless_gated-mapped");
-        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(uuid);
+        var generation = org.opensearch.serverless.storage.descriptor.MappingGenerationStore.currentMapping(uuid);
         assertNotNull("the declared fields must be in the mapping store after a gated creation", generation);
-        assertEquals("keyword", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(generation.fields().get("tenant")));
-        assertEquals("double", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(generation.fields().get("amount")));
+        assertEquals(
+            "keyword",
+            org.opensearch.serverless.storage.descriptor.MappingGenerationStore.typeOf(generation.fields().get("tenant"))
+        );
+        assertEquals(
+            "double",
+            org.opensearch.serverless.storage.descriptor.MappingGenerationStore.typeOf(generation.fields().get("amount"))
+        );
     }
 
     /**
@@ -382,7 +387,9 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
             state.metadata().index("serverless_gated-object")
         );
 
-        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptorUuid("serverless_gated-object"));
+        var generation = org.opensearch.serverless.storage.descriptor.MappingGenerationStore.currentMapping(
+            descriptorUuid("serverless_gated-object")
+        );
         assertNotNull("its declared fields must be in the mapping store", generation);
         Map<String, Object> nested = generation.definitionOf("nested");
         assertNotNull("the object field must be in the store: " + generation.fields(), nested);

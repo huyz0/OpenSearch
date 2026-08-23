@@ -11,7 +11,6 @@ package org.opensearch.serverless.storage.descriptor;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.junit.After;

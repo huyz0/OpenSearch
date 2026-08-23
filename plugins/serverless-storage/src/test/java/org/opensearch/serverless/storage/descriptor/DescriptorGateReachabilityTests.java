@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DescriptorPrefetch;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.index.mapper.UnknownFieldRefresh;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;

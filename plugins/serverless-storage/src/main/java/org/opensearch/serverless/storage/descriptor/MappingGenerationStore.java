@@ -6,7 +6,9 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.metadata;
+package org.opensearch.serverless.storage.descriptor;
+
+import org.opensearch.index.mapper.UnknownFieldRefresh;
 
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -302,7 +304,7 @@ public final class MappingGenerationStore {
      * the deleted name -- the gated put-mapping refusal closed the write half of that window; this is the
      * read half.
      *
-     * <p>The fix needs no new record. {@link IndexDescriptor#mappingGeneration()} already carries what
+     * <p>The fix needs no new record. {@link org.opensearch.cluster.metadata.IndexDescriptor#mappingGeneration()} already carries what
      * settles it: a caller that resolved a descriptor to reach this point, and found it claiming generation
      * {@code expectedGeneration > 0}, knows the index declared fields. A store answering null then is not
      * "never written", it is "written and now missing", and only the caller holding that descriptor can tell
@@ -352,21 +354,30 @@ public final class MappingGenerationStore {
      * <p>Deliberately not swallowed anywhere this is thrown from: an earlier fix removed exactly this shape of failure
      * being caught and reported as "no fields", and a caller here would be reintroducing it one level up if
      * it caught this and returned null or false.
+     *
+     * <p><b>Extends {@link UnknownFieldRefresh.MappingUnavailableException}, which is how that guarantee
+     * survives core no longer knowing this class exists.</b> {@code UnknownFieldRefresh#refreshed} degrades
+     * everything a refresher throws to "field not found" except this, and it used to catch this class by
+     * name -- a core file importing one plugin's storage exception so it could name the one failure it must
+     * not swallow. Core now declares the contract and this satisfies it, which is the same behaviour with
+     * the dependency pointing the other way.
      */
-    public static final class MissingMappingException extends IllegalStateException {
+    public static final class MissingMappingException extends UnknownFieldRefresh.MappingUnavailableException {
 
         /** @param storedGeneration what the store answered with, or -1 when it answered nothing at all. */
         public MissingMappingException(String indexUuid, long expectedGeneration, long storedGeneration) {
-            super(
-                "index ["
-                    + indexUuid
-                    + "]'s descriptor claims mapping generation ["
-                    + expectedGeneration
-                    + "] but the mapping store "
-                    + (storedGeneration < 0 ? "holds no document for it" : "is at generation [" + storedGeneration + "]")
-                    + ", so the mapping is missing rather than empty; answering here would report an index "
-                    + "with declared fields as one with none"
-            );
+            super(message(indexUuid, expectedGeneration, storedGeneration));
+        }
+
+        private static String message(String indexUuid, long expectedGeneration, long storedGeneration) {
+            return "index ["
+                + indexUuid
+                + "]'s descriptor claims mapping generation ["
+                + expectedGeneration
+                + "] but the mapping store "
+                + (storedGeneration < 0 ? "holds no document for it" : "is at generation [" + storedGeneration + "]")
+                + ", so the mapping is missing rather than empty; answering here would report an index "
+                + "with declared fields as one with none";
         }
     }
 

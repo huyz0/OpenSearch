@@ -12,20 +12,34 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.action.support.GroupedActionListener;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
+import org.opensearch.cluster.metadata.DescriptorRepresentable;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.MappingGenerationStore;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.index.Index;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.index.IndexNotFoundException;
 
 import java.util.Collection;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 /**
- * Everything this plugin holds for a deleted index, removed as the one operation core asks for.
+ * Everything this plugin holds for an index that has no cluster state entry, changed and removed as the
+ * whole operations core asks for.
  *
- * <p><b>What this is made of.</b> Two things core used to run itself, in that order: the durable tombstone
+ * <p><b>What this is made of.</b> Two protocols core used to run itself. {@link #removeIndices} is the
+ * deletion one; {@link #putMapping} is the mapping one, which core reached through a third static seam and
+ * about a hundred lines that resolved descriptors, reduced a mapping source to fields, refused what would
+ * not round-trip and then drove a compare-and-swap loop -- none of it touching cluster state, all of it
+ * about records core does not own. Both are moved rather than rewritten: the same writes, in the same
+ * order, with the same failure policy for each half. What changed is who sequences them.
+ *
+ * <p><b>The deletion protocol, in detail.</b> Two things core used to run itself, in that order: the durable tombstone
  * write it deferred the acknowledgement on ({@code DurableTombstones}, a static seam this class retires),
  * and the stored-mapping prune it issued afterwards ({@code MetadataDeleteIndexService#removeStoredMappings},
  * whose body is below, javadoc and all). Both are moved rather than rewritten: the same writes in the same
@@ -157,6 +171,134 @@ public final class DescriptorBackedIndexLifecycle implements ClaimedIndexLifecyc
                     e
                 );
             }
+        }
+    }
+
+    /**
+     * Records a put-mapping's fields against each index's mapping generation.
+     *
+     * <p>Moved here whole from {@code MetadataMappingService#recordGatedMapping}, including the refusal
+     * below and the tombstone check it opens with. Core kept the one decision that is its own -- every index
+     * this request names is absent from cluster state, so cluster state cannot serve it -- and handed the
+     * rest over.
+     *
+     * <p><b>Runs on {@code GENERIC}</b>, dispatched there by core before this is called, so the blocking
+     * reads and writes below are safe. They were not always: this protocol used to run inside the
+     * put-mapping cluster state executor, two blocking round trips deep, on the single thread every cluster
+     * state change queues behind.
+     *
+     * <p><b>Extraction is {@link DescriptorRepresentable#fieldDefinitionsOrNull(Object)}</b>, the same call
+     * the creation path makes. Sharing it is the point rather than a tidy-up: these were two implementations
+     * documented as mirroring each other, and the divergence was not cosmetic -- a mapping the creation path
+     * refused outright, this one accepted and silently reduced. The call now crosses the SPI boundary, which
+     * is the reason that method is public; growing a second copy on this side would be the same divergence
+     * in a place where it is harder rather than easier to notice.
+     *
+     * <p><b>With no mapping store installed this fails rather than succeeding quietly.</b> Nothing here holds
+     * the index, so there is nowhere for the change to be recorded, and that is the {@link
+     * IndexNotFoundException} the ordinary cluster state path would have raised -- the same answer {@link
+     * ClaimedIndexLifecycle#putMapping}'s own default gives on a node with no plugin at all.
+     */
+    @Override
+    public CompletionStage<Void> putMapping(Collection<Index> indices, String mappingSource) {
+        // Asked of the registry updateMapping below actually consults, rather than of DescriptorGate's
+        // parallel copy. The two are set and cleared together by install/uninstall, so they agree in
+        // production -- but checking one and using the other is how they would stop agreeing without
+        // anything noticing.
+        if (MappingGenerationStore.isRegistered() == false) {
+            return CompletableFuture.failedFuture(
+                new IndexNotFoundException(
+                    "this node holds no mapping store, so there is nowhere for the mapping change to be recorded",
+                    indices.iterator().next().getName()
+                )
+            );
+        }
+        try {
+            for (Index index : indices) {
+                refuseIfDescriptorShowsTheIndexIsGone(index);
+            }
+            Map<String, Object> parsed = XContentHelper.convertToMap(MediaTypeRegistry.JSON.xContent(), mappingSource, false);
+            Map<String, Object> fields = DescriptorRepresentable.fieldDefinitionsOrNull(parsed.get("properties"));
+            if (fields == null) {
+                // Refused rather than partially recorded, and this is the half of the defect that was
+                // worse. The extraction here used to skip any property it could not read and record the
+                // rest, then report success -- so a put-mapping adding an object field to a gated index was
+                // acknowledged with the field silently absent. The same field at creation was refused and
+                // kept the index resident, which is exactly the "gated at creation and refused on update,
+                // or the reverse" that the shared extractor's javadoc says must not exist.
+                //
+                // There is no fallback available: the index is not in cluster state, so this cannot be
+                // applied the ordinary way. Failing is the only answer that does not lose the field.
+                throw new IllegalArgumentException(
+                    "index ["
+                        + indices.iterator().next().getName()
+                        + "] is held outside cluster state and its mapping store holds a flat map of field "
+                        + "name to type, so it cannot carry an object or nested field, or a field parameter "
+                        + "such as a date format or an analyzer. Applying this mapping would drop them"
+                );
+            }
+            if (fields.isEmpty() == false) {
+                for (Index index : indices) {
+                    MappingGenerationStore.updateMapping(index.getUUID(), fields);
+                }
+            }
+            return CompletableFuture.completedFuture(null);
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    /**
+     * Refuses a put-mapping whose index the descriptor plane no longer says is live.
+     *
+     * <p>Core decides "cluster state cannot serve this" purely from the index's absence there, and that is
+     * equally true of a live gated index and one the deletion-time prune already removed: cluster
+     * state never carried an entry for either. The uuid this request names was resolved by the
+     * coordinating node from its own descriptor cache, which invalidates on a tombstone it has seen but
+     * not on one it has not -- so a node whose cache has not yet caught up can still route a put-mapping
+     * or a dynamic field inference at a uuid whose tombstone is already durable elsewhere. Nothing
+     * previously asked the store whether that uuid was still current, so the write landed, recreated the
+     * document the deletion had pruned, and nothing was ever going to remove it again.
+     *
+     * <p><b>The contract this closes the hole by:</b> refusing here, not letting the write land and sweeping
+     * it up later. The alternative -- a second pass that prunes stray mappings after the fact -- was
+     * tried first, keyed off the tombstone the deletion already wrote, and rejected as a second writer
+     * racing the same records. This resolves the descriptor for the uuid fresh, on the thread doing the
+     * write, which is off the cluster manager's update thread already and so may block. For a live index the
+     * resolution is a cache hit against the same descriptor cache every other resolution on this path
+     * already pays for, not a new cost.
+     *
+     * <p>Skipped when descriptor resolution is not registered at all, which is not a hole: {@link
+     * DescriptorGate} registers the descriptor supplier and the mapping store together in one {@code
+     * install} call, so a node that reached this method by way of the store also has descriptor resolution
+     * to consult. A caller that registers only the store, as several tests below the descriptor plane do, is
+     * exercising the mapping store in isolation and has no tombstone to consult in the first place.
+     *
+     * <p><b>A null answer is not treated as "gone".</b> {@link AbsentIndexDescriptorSuppliers#supply}
+     * documents null as "no answer" and swallows any failure that is not a {@code
+     * DescriptorUnavailableException} into it, precisely so a resolver bug degrades a request rather than
+     * failing it -- every other caller of this seam relies on that. Refusing on null as well as on a
+     * confirmed tombstone would let that same resolver bug fail a live index's put-mapping outright,
+     * which is a regression this must not introduce to close a narrower one. It is also not what a
+     * genuine deletion looks like here: {@code BlobDescriptorBackend#get} answers a tombstoned name with
+     * the tombstone record, not null, so this only ever refuses on an answer that actually says so.
+     *
+     * <p>Deliberately still {@link AbsentIndexDescriptorSuppliers} directly, not the catalog-backed {@code
+     * Metadata} accessors: this needs the raw {@link IndexDescriptor}'s own {@code uuid()} and the
+     * three-way null/tombstoned/live distinction, which {@code IndexCatalog}'s generic, collapsed "null
+     * means absent" contract deliberately does not expose.
+     */
+    private static void refuseIfDescriptorShowsTheIndexIsGone(Index index) {
+        if (AbsentIndexDescriptorSuppliers.isRegistered() == false) {
+            return;
+        }
+        IndexDescriptor current = AbsentIndexDescriptorSuppliers.supply(index.getName());
+        if (current != null && (current.exists() == false || current.uuid().equals(index.getUUID()) == false)) {
+            throw new IndexNotFoundException(
+                "its tombstone is already durable; the mapping store refuses a write against a uuid the descriptor plane no "
+                    + "longer resolves as live",
+                index.getName()
+            );
         }
     }
 }

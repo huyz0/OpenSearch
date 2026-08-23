@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.storage;
 
-import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
@@ -21,6 +20,7 @@ import org.opensearch.serverless.storage.descriptor.DescriptorGate;
 import org.opensearch.serverless.storage.descriptor.FailableDescriptorContainer;
 import org.opensearch.serverless.storage.descriptor.IndexBackedMappingStatsAggregator;
 import org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore;
+import org.opensearch.serverless.storage.descriptor.MappingGenerationStore;
 import org.opensearch.serverless.storage.descriptor.StatsProjectingMappingStore;
 import org.opensearch.serverless.storage.descriptor.StoreBackedFieldRefresher;
 import org.opensearch.test.OpenSearchIntegTestCase;
