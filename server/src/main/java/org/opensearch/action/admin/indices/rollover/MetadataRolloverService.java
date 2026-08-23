@@ -180,15 +180,22 @@ public class MetadataRolloverService {
             return new RolloverResult(rolloverIndexName, sourceIndexName, currentState);
         }
 
-        org.opensearch.action.admin.indices.alias.Alias targetAlias = new org.opensearch.action.admin.indices.alias.Alias(aliasName).filter(
-            aliasMetadata.getFilter() != null ? aliasMetadata.getFilter().string() : null
-        )
-            .indexRouting(aliasMetadata.getIndexRouting())
-            .searchRouting(aliasMetadata.getSearchRouting())
-            .writeIndex(explicitWriteIndex ? true : null)
-            .isHidden(aliasMetadata.isHidden());
-        createIndexRequest.aliases().add(targetAlias);
-
+        // The rollover alias is deliberately NOT added to createIndexRequest. It is attached below, after the
+        // index exists, by the same alias actions upstream uses -- and doing it the other way was a defect
+        // this fork carried and has now removed.
+        //
+        // Adding it to the create request built the alias into the new index's metadata during creation,
+        // which for an alias with an explicit write index produced a cluster state where the source and the
+        // new index both claimed is_write_index: the swap that clears it from the source is one of the alias
+        // actions below, and those had not run yet. Metadata.Builder#buildIndicesLookup validates exactly
+        // that and threw "alias [...] has more than one write index", failing every rollover of an
+        // explicit-write-index alias.
+        //
+        // Nothing needed it. Baking the alias into the creation would only matter for a rollover target held
+        // outside cluster state, where the record the creation writes is the only place an alias could land
+        // -- and no rollover target can be held that way, because a rollover target needs the alias it is
+        // rolled over by and a claimed index may not carry one. TransportRolloverAction says the same thing
+        // where it removed its own off-thread branch for the same reason.
         CreateIndexClusterStateUpdateRequest createIndexClusterStateRequest = prepareCreateIndexRequest(
             unresolvedName,
             rolloverIndexName,

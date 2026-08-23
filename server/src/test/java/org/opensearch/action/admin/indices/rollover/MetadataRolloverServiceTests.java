@@ -732,7 +732,16 @@ public class MetadataRolloverServiceTests extends OpenSearchTestCase {
                 clusterService,
                 indicesService,
                 allocationService,
-                null,
+                // A real validator rather than null, which is what production has and what this test needs
+                // in order to keep failing if rolloverAlias ever again puts aliases into the create request.
+                //
+                // It did: a fork change added the rollover alias to createIndexRequest.aliases(), which took
+                // creation through resolveAndValidateAliases and straight into a null dereference here. The
+                // null hid the real defect behind an NPE -- with a validator in place the same change fails
+                // as "alias has more than one write index", because the created index carried is_write_index
+                // before the alias action that clears it from the source had run. Both are fixed; this
+                // argument is what makes the second one visible rather than the first.
+                new AliasValidator(),
                 shardLimitValidator,
                 env,
                 IndexScopedSettings.DEFAULT_SCOPED_SETTINGS,
@@ -873,7 +882,8 @@ public class MetadataRolloverServiceTests extends OpenSearchTestCase {
                 clusterService,
                 indicesService,
                 allocationService,
-                null,
+                // Not null -- see testRolloverClusterState above for what the null was hiding.
+                new AliasValidator(),
                 shardLimitValidator,
                 env,
                 IndexScopedSettings.DEFAULT_SCOPED_SETTINGS,
@@ -1054,7 +1064,7 @@ public class MetadataRolloverServiceTests extends OpenSearchTestCase {
             clusterService,
             indicesService,
             allocationService,
-            null,
+            new AliasValidator(),
             null,
             env,
             null,
