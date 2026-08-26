@@ -1,0 +1,489 @@
+# RFC: The Serverless Shell — a new node process over the existing data plane
+
+- Status: DRAFT — design record, no implementation attached
+- Branch: `feature/serverlessplusplus`, cut from `feature/serverless` at `152bfd87536`
+- Amends: nothing. Supersedes the *delivery vehicle* assumed by `rfc-serverless-opensearch.md` §2.5
+  ("delivered predominantly as a plugin/module ... core changes stay minimal") and blocks
+  `rfc-serverless-control-cell-diet.md` pending the decision here.
+- Question answered: given that the seam-carving path has been pushed about as far as it goes,
+  what exactly do we build instead — and how much of `server/` survives the change.
+
+---
+
+## 1. The decision, stated once
+
+**Keep the data plane. Replace the shell and the control plane.**
+
+Build a new node process — its own `main`, its own bootstrap, its own wiring, no Guice, no
+`Coordinator`, no `GatewayMetaState`, no `AllocationService`, no discovery — that *depends on*
+OpenSearch's indexing and search code as a library rather than being installed into it as a plugin.
+
+The thing that makes this cheap rather than heroic, and the central claim of this document:
+
+> **`ClusterState` stays. The protocol that maintains it goes.**
+
+`ClusterState` stops being a consensus object replicated to every node by a publish/diff protocol,
+and becomes a **node-local materialized view** that the shell computes from object-store truth and
+hands to the data plane through an interface that already exists and is already public. The data
+plane cannot tell the difference. That is not an aspiration — §2 is the measurement, and §5 is the
+mechanism.
+
+## 2. What was measured
+
+Every number and line reference below was read on `152bfd87536`, not assumed from public surface.
+
+### 2.1 The data plane barely knows the control plane exists
+
+| Class | Lines | `ClusterState`/`ClusterService` references | What they actually are |
+|---|---|---|---|
+| [`IndexShard`](server/src/main/java/org/opensearch/index/shard/IndexShard.java) | 6,767 | 5 | **Zero `clusterService.` calls.** Implements the `IndicesClusterStateService.Shard` *callback* interface ([:294](server/src/main/java/org/opensearch/index/shard/IndexShard.java#L294)); takes a `long applyingClusterStateVersion` — a number, not a state. |
+| [`IndexService`](server/src/main/java/org/opensearch/index/IndexService.java) | 2,034 | 6 | **One** real call: `clusterService.getClusterApplierService()` at [:911](server/src/main/java/org/opensearch/index/IndexService.java#L911), passed straight through to the shard. |
+| [`IndicesService`](server/src/main/java/org/opensearch/indices/IndicesService.java) | 2,647 | 14 | **Every** call is `getClusterSettings()`/`getSettings()` (:566–:694) — dynamic settings registration. `ClusterState` appears only as a *parameter* on methods the control plane calls inward (:1672, :1792, :1847, :2374). |
+| [`SearchService`](server/src/main/java/org/opensearch/search/SearchService.java) | 2,166 | 6 | Settings registration (:536–:607), `localNode().getId()` for task attribution, and one `state().nodes().getMinNodeVersion()` at [:1386](server/src/main/java/org/opensearch/search/SearchService.java#L1386). |
+
+The data plane's dependency on `ClusterService` is, in aggregate, **a settings bus plus local-node
+identity**. It is not a dependency on cluster state.
+
+Sizes, for scale: `index/` 212,853 + `search/` 170,087 + `indices/` 33,416 ≈ **416k lines** of data
+plane, against `cluster/` 95,710 + `gateway/` 21,068 + `discovery/` 2,298 ≈ **119k lines** of control
+plane and ~12k of shell (`node/` 6,579, `bootstrap/` 5,463).
+
+### 2.2 The one real seam is already a value-object interface
+
+`IndexShard.updateShardState(...)` ([:765](server/src/main/java/org/opensearch/index/shard/IndexShard.java#L765)) is the
+entire control-plane→shard interface:
+
+```java
+void updateShardState(ShardRouting newRouting, long newPrimaryTerm,
+                      BiConsumer<IndexShard, ActionListener<ResyncTask>> primaryReplicaSyncer,
+                      long applyingClusterStateVersion, Set<String> inSyncAllocationIds,
+                      IndexShardRoutingTable routingTable, DiscoveryNodes discoveryNodes)
+```
+
+Seven value objects. No `ClusterState`, no `ClusterService`, no publish protocol. Anything that can
+synthesize a `ShardRouting`, an `IndexShardRoutingTable` and a `DiscoveryNodes` can drive a shard
+through its full lifecycle. The shard's only other node-awareness is
+`discoveryNodes.get(nodeId).isRemoteStoreNode()` at [:651](server/src/main/java/org/opensearch/index/shard/IndexShard.java#L651).
+
+### 2.3 `ClusterService` is a local machine, not a distributed one
+
+[`ClusterService`](server/src/main/java/org/opensearch/cluster/service/ClusterService.java) is **382 lines**:
+a facade over `ClusterManagerService` + `ClusterApplierService`. Its constructor is
+`(Settings, ClusterSettings, ThreadPool)` ([:96](server/src/main/java/org/opensearch/cluster/service/ClusterService.java#L96)),
+and its `doStart()` starts those two and nothing else — **no coordinator, no discovery, no gateway**.
+
+`ClusterManagerService.doStart()` requires exactly two injected collaborators, both interfaces:
+
+```java
+Objects.requireNonNull(clusterStatePublisher, "please set a cluster state publisher before starting");
+Objects.requireNonNull(clusterStateSupplier, "please set a cluster state supplier before starting");
+```
+
+Today `Coordinator` supplies the publisher. Nothing requires that it be `Coordinator`.
+
+And [`ClusterApplier`](server/src/main/java/org/opensearch/cluster/service/ClusterApplier.java#L65) — the interface
+`ClusterApplierService` implements — exposes state injection as public API:
+
+```java
+void setInitialState(ClusterState initialState);
+void onNewClusterState(String source, Supplier<ClusterState> supplier, ClusterApplyListener listener);
+```
+
+**That pair is the entire integration point for a new control plane.** `Coordinator` is one caller of
+`onNewClusterState`. The shell becomes another.
+
+### 2.4 Guice is a service locator here, not a framework
+
+398 files import `org.opensearch.common.inject`, which looks fatal. It isn't: `Node.java`'s binding
+block ([:1857–:1990](server/src/main/java/org/opensearch/node/Node.java#L1857)) is almost entirely
+`b.bind(X.class).toInstance(alreadyConstructedX)`. Objects are built by hand in `Node`'s 2,783-line
+constructor and *then* registered for lookup. Replacing that with a plain holder record is mechanical,
+not a redesign. The Guice-shaped risk is concentrated in plugin `createComponents` contracts, not in
+core construction.
+
+### 2.5 Where the coupling genuinely is
+
+| Package | Lines | Files touching cluster state |
+|---|---|---|
+| `transport/` | 22,467 | `TransportService`: 9 refs |
+| `rest/` | 25,388 | 13 of 195 |
+| `action/` | 146,277 | **213 of 1,028** |
+
+`action/` is the real work. That is where `TransportBulkAction`, the search coordination phases, and
+every `TransportClusterManagerNodeAction` admin API live. §6.3 and §12 deal with it explicitly; it is
+the largest honest cost in this plan and the place where a rewrite could quietly become a rewrite of
+everything.
+
+## 3. Why the current path stops here
+
+Two pieces of evidence, both from this branch's own documents rather than from argument.
+
+**The cell-diet wall.** [`rfc-serverless-control-cell-diet.md`](rfc-serverless-control-cell-diet.md) §2, after
+adversarial review, concludes that making Class C metadata non-resident requires `Metadata`'s
+per-index storage to stop being `Map<String, IndexMetadata>` — across all of `server/`, on the hot
+request path, on any coordinating node — while remaining invisible to every caller that didn't opt in.
+It names the resulting shape "closer to a lazily-resolving proxy than a plain sum type," and says
+plainly that it is "not fully designed here."
+
+That difficulty is **entirely an artifact of where the work is being done**. In a shell that never
+publishes a full `Metadata` to every node, there is no residency problem to solve: no
+`IndexMetadataOrStub`, no diff-basis retention rule, no hot-path materialization contract. The design
+is hard because it is being performed inside a system whose type-level assumption is the thing being
+removed, under a constraint (constraint 1: zero change for non-opted-in indices) that exists only
+because classic and serverless share one process.
+
+**"This seam fails by succeeding."** [`HANDOFF.md`](HANDOFF.md) records eight occasions where a computed
+index made an operation return *a confident empty answer rather than an error*: refresh reaching no
+shards, field mappings reporting no fields, stats/segments/recovery/force-merge reporting nothing, cat
+listing no shard, file-cache capacity undercounting. Force merge "accepted an instruction, reported
+success, and did no work at all."
+
+This is the structural signature of a guest plugin whose indices the host control plane cannot see. It
+is not eight bugs; it is one bug with eight instances, and the count grows with every admin API
+touched. In a shell where these indices are the *only* kind that exists, the failure mode has no
+source: there is no second, authoritative view of the world to disagree with.
+
+Neither of these says the seam work was wasted — §15 argues the opposite. They say it has reached the
+point where each further seam costs more than the last and buys back a property the new shell has for free.
+
+## 4. Architecture
+
+Three planes, with a hard rule about which may depend on which.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  SHELL          ServerlessNode: main, bootstrap, wiring,    │  new
+│                 lifecycle, node roles, REST binding         │  ~5k lines
+├─────────────────────────────────────────────────────────────┤
+│  CONTROL PLANE  object-store truth: descriptors, shard-     │  new + ported
+│                 heads (CAS), node leases, directory tier,   │  from serverless-storage
+│                 reconcilers, LocalViewProjector              │
+├─────────────────────────────────────────────────────────────┤
+│  DATA PLANE     IndicesService, IndexService, IndexShard,   │  REUSED
+│                 Engine, MapperService, SearchService,        │  ~416k lines
+│                 TransportService, RestController             │  unmodified
+└─────────────────────────────────────────────────────────────┘
+```
+
+- The shell depends on both lower planes.
+- The control plane depends on the data plane's **value types** (`ShardRouting`, `IndexMetadata`,
+  `DiscoveryNodes`, `ClusterState`) and on `ClusterApplier`. Nothing else.
+- The data plane depends on **neither**. It is not modified, and it must not learn that a new shell
+  exists. Every change we are tempted to make to it is first re-examined as a shell-side change.
+
+That last rule is the one that keeps this from becoming a fork. It is also directly testable — see
+§13.2.
+
+## 5. The central move: `ClusterState` as a node-local materialized view
+
+Today: one `ClusterState` per cluster, agreed by consensus, published in full-then-diffs to every
+node, containing every index. Its cost is O(all indices) on every node — which is precisely the
+ceiling `plan-area-h-metadata-off-cluster-state.md` measured and the cell-diet RFC failed to get under.
+
+Proposed: one `ClusterState` per **node**, computed locally, containing only what that node needs —
+the indices whose shards it hosts, plus the indices it is currently coordinating requests for. It is
+a cache, not a truth. It is never published, never diffed, never agreed.
+
+```
+object store (truth)                      shell                       data plane
+─────────────────────                     ─────                       ──────────
+index descriptors (blob + CAS)  ──┐
+shard-heads (term, lease, node) ──┤
+node leases                     ──┼──►  LocalViewProjector  ──►  ClusterApplierService
+manifest / segment metadata     ──┘      builds ClusterState        .onNewClusterState(...)
+                                         for THIS node only               │
+directory tier (soft hints)     ─────►   routing hints                    ▼
+                                                              IndicesClusterStateService
+                                                              → IndexShard.updateShardState
+```
+
+Consequences, in order of how much they matter:
+
+1. **The cell-diet problem dissolves.** A node materializes an `IndexMetadata` when it starts hosting
+   or coordinating for that index, and drops it when it stops. Residency becomes proportional to
+   *working set*, not to cluster population. No new type, no proxy, no diff-basis rule.
+2. **`Metadata.Builder.build()`'s O(N) sweep stops mattering.** N is now this node's working set. The
+   superlinear creation cost measured in `plan-area-h` §H.1 is a property of a map that no longer
+   contains every index.
+3. **The data plane is unmodified.** `IndicesClusterStateService`, `IndexService`, `IndexShard` all
+   receive exactly the `ClusterState` shape they expect.
+4. **`ClusterService` is constructed for real**, not stubbed — settings bus, local node, applier — and
+   the ~400 files that reference it keep compiling and working, including plugins.
+
+### 5.1 The precise wiring
+
+```java
+// shell startup
+ClusterService clusterService = new ClusterService(settings, clusterSettings, threadPool);
+clusterService.getClusterManagerService().setClusterStatePublisher(localOnlyPublisher);
+clusterService.getClusterManagerService().setClusterStateSupplier(applier::state);
+clusterService.getClusterApplierService().setInitialState(emptyLocalState(localNode));
+clusterService.start();
+
+// steady state — driven by the metadata plane, not by a Coordinator
+projector.onTruthChanged(delta ->
+    clusterService.getClusterApplierService()
+        .onNewClusterState("local-view", () -> projector.project(delta), listener));
+```
+
+`localOnlyPublisher` applies locally and completes — there are no peers to publish to. Every node
+computes its own view from the same object-store truth; they are not required to agree, and
+divergence is resolved by CAS on shard-heads, exactly as
+[`rfc-serverless-metadata-plane.md`](rfc-serverless-metadata-plane.md) §6 already specifies.
+
+### 5.2 The risk this creates, named up front
+
+`IndicesClusterStateService` computes shard *removals* by diffing the applied state against local
+shards. A projected view that omits an index the node is still hosting will be read as "this shard
+was removed" and the shard will be closed. **The projector's correctness obligation is therefore
+one-directional and absolute: it may omit an index the node does not host; it must never omit one it
+does.** This is the single highest-risk element of the design and it is the primary thing spike S0
+(§11) must falsify. If projection cannot be made safe, the fallback is to replace
+`IndicesClusterStateService` with a shell-owned reconciler driving `updateShardState` directly (§2.2
+shows the interface supports it) — more work, no additional risk.
+
+## 6. What the shell builds, and what it never builds
+
+### 6.1 Constructed
+`ThreadPool`, `NodeEnvironment`, `PluginsService`, `SettingsModule`, `CircuitBreakerService`,
+`BigArrays`/`PageCacheRecycler`, `ScriptService`, `AnalysisRegistry`, `MapperRegistry`,
+`NamedXContentRegistry`/`NamedWriteableRegistry`, `IndicesService`, `IndexingPressureService`,
+`SearchService`, `SearchModule`, `TransportService`, `NetworkModule`, `RestController`,
+`RepositoriesService`, `ClusterService` (per §5.1), `NodeClient`.
+
+### 6.2 Never constructed
+`Coordinator` and all of `cluster/coordination/` (11,940 lines), `GatewayMetaState` and
+`gateway/local` (the object-store parts of `gateway/remote` are ported, not deleted — §15),
+`AllocationService` and `cluster/routing/allocation/`, `discovery/`, `NodeJoinController`,
+`PersistedClusterStateService`, `MetaStateService` (a no-op implementation satisfies
+`IndicesService`'s constructor), `Node`, `NodeService`, and the Guice `Injector` in its entirety.
+
+### 6.3 The `action/` question — decided, because it decides the size of this project
+
+213 of 1,028 files in `action/` touch cluster state. They are not one population:
+
+- **Data-plane actions** (`TransportShardBulkAction`, the search phases, get/mget, TransportReplicationAction
+  family). These need routing and `IndexMetadata` — both of which the projected local view supplies.
+  **Reused unmodified.** This is the bulk of the request path and the reason this plan is affordable.
+- **Cluster-manager admin actions** (`TransportClusterManagerNodeAction` subclasses — create index, put
+  mapping, settings update, cluster health, reroute). These submit `ClusterStateUpdateTask`s to an
+  elected manager that does not exist. **Not reused.** The shell re-implements the subset it needs
+  against the metadata plane (descriptor CAS), and the rest **do not exist at all** rather than
+  existing and answering emptily. §3's "fails by succeeding" is the entire reason for that emphasis:
+  *an absent API is a better failure than a confidently empty one.*
+- **Stats/cat/monitoring actions.** Case by case. Default to absent until re-implemented.
+
+The commitment: the shell's REST surface is an **explicit allowlist**, not whatever happens to route.
+An unimplemented endpoint returns 501 with the reason. Nothing silently returns an empty answer.
+
+## 7. Module layout
+
+```
+libs/                       unchanged
+server/                     unchanged — becomes a library dependency
+  └─ no edits on this branch without §4's re-examination
+
+serverless/
+  ├─ shell/                 ServerlessNode, bootstrap, wiring, roles, CLI
+  ├─ control/               descriptors, shard-heads, leases, CAS, reconcilers,
+  │                         LocalViewProjector, directory tier
+  ├─ actions/               the allowlisted REST/transport surface
+  ├─ engine/                ported from plugins/serverless-storage
+  └─ testkit/               ServerlessTestCluster (§13)
+
+distribution/serverless/    its own tarball/docker image, own main class
+```
+
+`server/` is consumed with `implementation project(':server')`. The **build enforces §4's dependency
+rule**: `serverless/*` may depend on `server`, and nothing in `server` may depend on `serverless/*`.
+That is a Gradle constraint, not a convention, and it is what prevents drift into a fork.
+
+## 8. The narrow interfaces
+
+Four, total. This is the whole contract between the new control plane and the reused data plane.
+
+| Interface | Shape | Who implements |
+|---|---|---|
+| `ClusterApplier` | exists today, unmodified ([:65](server/src/main/java/org/opensearch/cluster/service/ClusterApplier.java#L65)) | `ClusterApplierService` (reused) |
+| `ClusterStatePublisher` | exists today | shell's `LocalOnlyPublisher` |
+| `ShardStateStore` | `get`/`compareAndSet`/`renewLease` over `BlobContainer` registers | ported (`BlobContainerShardStateStore`) |
+| `DescriptorStore`-equivalent | blob GET + register CAS, per `plan-area-h` | ported (`BlobDescriptorBackend`) |
+
+Note what is *not* on this list: no new SPI in `server/`, no new extension point, no core seam. If a
+fifth interface appears, it is a signal that something is being done in the wrong plane.
+
+## 9. Control plane
+
+No new design work — [`rfc-serverless-metadata-plane.md`](rfc-serverless-metadata-plane.md) §5–§9 already
+specifies it, and this branch is where it can finally be built as designed rather than as an opt-in
+guest:
+
+- **Truth**: index descriptors as object-store blobs addressed by name, created by register CAS
+  (`plan-area-h`); per-shard heads carrying term + lease + owner (`§6`).
+- **Placement**: no allocator. Writer activation is CAS on the shard-head; readers are
+  interchangeable and need no coordination (`§6`).
+- **Liveness**: one lease object per node, heartbeat-renewed, referenced by shard-heads — one liveness
+  truth shared by activation and GC (`§6`).
+- **Routing hints**: the directory tier, soft state, cache-not-truth (`§5`).
+- **Reconciliation**: stateless background loops acting through the same CAS protocol (`§6`).
+- **Control cell**: retained for cluster config, membership arbitration and directory partition
+  assignment (`§8`) — kilobytes of state, off the data path and off the activation path.
+
+The control cell is the one place consensus survives, and §8 of that RFC is explicit that it can be
+down for minutes without ingest or search on active shards noticing. In this shell it is a separate
+small process, not a role inside every node.
+
+## 10. Node roles
+
+Four process types, per `rfc-serverless-metadata-plane.md` §8, each a different subset of §6.1:
+
+| Role | Builds | Notes |
+|---|---|---|
+| `control` | control cell only | tiny; the only consensus in the system |
+| `directory` | routing hint tier | memory-heavy, soft state, restartable with no recovery |
+| `ingest` | full data plane, writer engines | CAS-activated shard ownership |
+| `search` | full data plane, reader engines, no writer | scale-to-zero; no local durable state |
+
+`ingest` and `search` share one binary and differ by which engines and actions they register.
+
+## 11. Spike S0 — the acceptance test, before anything else
+
+**Nothing in §12 starts until S0 answers.** S0 is disposable code on a throwaway branch, and its
+purpose is to falsify §5, not to demonstrate it.
+
+> Stand up a process that opens an `IndexShard` against a local directory, applies a hand-built
+> `ClusterState` through `ClusterApplierService.onNewClusterState`, indexes a document, and answers a
+> search for it — with no `Coordinator`, no `GatewayMetaState`, no `AllocationService`, no discovery,
+> and no `Node`.
+
+Pass criteria, stated as numbers that are zero when it is broken — per `HANDOFF.md`'s own rule, since
+this spike is exactly the kind of seam that fails by succeeding:
+
+1. `getSuccessfulShards() == 1` on the search response. Not "did not throw."
+2. Hit count equals the indexed document count.
+3. The retrieved `_source` matches what was indexed, field for field.
+4. A second document, indexed after the first search, is visible to a second search after refresh.
+5. The process contains no instance of `Coordinator`, `AllocationService`, `GatewayMetaState` or
+   `Node` — asserted by reflection over the constructed object graph, not by inspection.
+
+Deliverable is a written answer to three questions:
+
+- **Q1.** What is the minimum `ClusterState` a shard will accept? (Determines the projector's schema.)
+- **Q2.** Does `IndicesClusterStateService` behave correctly on a partial view, or must it be replaced
+  (§5.2)? This is the fallback fork in the road and S0 exists mainly to find it.
+- **Q3.** What is the actual constructor closure of `IndicesService` + `SearchService` — how many of
+  its 38 parameters have no sensible serverless value?
+
+Estimated: days, not weeks. If S0 comes back "short list, concentrated in `IndicesService`," proceed.
+If it comes back "the data plane assumes a live control plane in forty unexpected places," **this RFC
+is wrong** and the seam path on `feature/serverless` resumes — including approving the cell-diet
+design it currently blocks.
+
+## 12. Phasing
+
+Each phase ends in something runnable. No phase is a refactor with no observable result.
+
+| # | Phase | Ends when |
+|---|---|---|
+| 0 | **S0 spike** (§11) | Q1–Q3 answered in writing |
+| 1 | **Shell skeleton** | `ServerlessNode` boots, binds transport + REST, serves `GET /` and a health endpoint, exits cleanly. No indices. |
+| 2 | **Local view** | `LocalViewProjector` + `LocalOnlyPublisher`; a shard is opened from a hand-written descriptor and serves a search. S0 made durable and tested. |
+| 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store. |
+| 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
+| 5 | **Search path** | `search` role: reader engines over object-store segments; scale-to-zero verified by killing every search node and restarting. |
+| 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9. |
+| 7 | **Surface** | Allowlisted admin/stats APIs, re-implemented against the metadata plane. 501 for everything else. |
+| 8 | **Directory tier & reconcilers** | Routing hints, background reconciliation, GC. |
+| 9 | **Scale validation** | The `plan-100m-index-implementation.md` targets re-measured on this shell. |
+
+Phases 1–2 are the ones that decide whether this is a two-quarter project or a two-year one. Treat
+their estimates as unknown until phase 2 lands.
+
+## 13. Testing
+
+### 13.1 The harness does not come for free
+[`InternalTestCluster`](test/framework/src/main/java/org/opensearch/test/InternalTestCluster.java) is 2,790 lines
+built on `MockNode extends Node`. It does not follow us. `serverless/testkit` needs a
+`ServerlessTestCluster` that starts N `ServerlessNode`s over a shared `FsBlobContainer` acting as the
+object store.
+
+**This is the largest single cost in the plan — larger than the shell itself.** It is also the thing
+most likely to be underestimated, because it produces no user-visible capability. Budget it explicitly
+in phase 1, not opportunistically.
+
+Partial mitigation: `plugins/serverless-storage/src/internalClusterTest/` already contains a substantial
+IT suite against object-store-backed behaviour. Those tests encode the behaviours we care about even
+though their harness changes.
+
+### 13.2 The dependency rule is a test
+A build check asserting that no `server/` class references `org.opensearch.serverless.*` — run in CI,
+failing the build. §4's rule is worth nothing as a convention.
+
+### 13.3 Inherited discipline
+`HANDOFF.md`'s finding applies with more force here than where it was written: a shell with a partial
+control plane is *made of* seams that can return confident empty answers. Every IT asserts a number
+that is zero when broken. No test asserts only the absence of an exception.
+
+## 14. Risks and open questions
+
+| # | Risk | Severity | Handling |
+|---|---|---|---|
+| R1 | Projected partial `ClusterState` closes live shards (§5.2) | **Critical** | S0/Q2; fallback is a shell-owned reconciler driving `updateShardState` |
+| R2 | Test harness cost dominates (§13.1) | High | Budgeted in phase 1; measured, not estimated |
+| R3 | `action/` re-implementation is larger than §6.3 assumes | High | Allowlist + 501 caps the surface; scope grows only by explicit decision |
+| R4 | Plugins assume Guice `createComponents` | Medium | Shell implements the plugin contract without an `Injector`; the ecosystem we must support is small |
+| R5 | Two shells to maintain until parity | Medium | `server/` stays untouched, so the cost is ours alone, not upstream's |
+| R6 | Upstream drift in the data plane's internal APIs | Medium | Only four interfaces (§8); regular merge from upstream stays possible and should be routine, not a project |
+| R7 | Snapshot/restore, security, ISM assume the old shell | Medium | Explicitly out of scope (§16); decide per feature, default absent |
+| R8 | Object-store list consistency is still unmeasured | Open | Pre-existing open item, carried in `plan-100m-index-implementation.md`; unchanged by this RFC |
+
+Open questions this document does **not** answer, and should not be read as answering:
+
+- What the wire-compatibility story is with classic OpenSearch clusters (CCS/CCR). Currently: none.
+- Whether the control cell reuses `cluster/coordination/` shrunken, or is written fresh. Deferred to
+  phase 8; both remain open.
+- How index-level security and multi-tenancy land in a shell with no security plugin.
+
+## 15. What carries over from `feature/serverless`
+
+The seam work was not wasted, and this is not a restart. It is the thing that makes S0 answerable in
+days rather than months.
+
+- **Carries over unchanged**: the object-store engine, WAL, segment bundles, block cache; descriptor
+  CAS and `BlobContainer.readRegister`/`compareAndSwapRegister`; manifest sharding; computed placement;
+  name index tier; write-partition routing; every design document.
+- **Carries over as design**: `rfc-serverless-metadata-plane.md` §5–§9 is the control plane, adopted
+  wholesale (§9).
+- **Becomes unnecessary**: the pluggability seams themselves — `EnginePlugin` per-shard-role dispatch,
+  the lifecycle SPI, the descriptor-write seams, `ShardRecoveryStrategy` validation. Not because they
+  were wrong, but because the shell chooses its implementations directly instead of negotiating for
+  the right to substitute them.
+- **Becomes moot**: `rfc-serverless-control-cell-diet.md`. §5 dissolves the problem it addresses.
+  **It should not be approved while this RFC is open** — approving `IndexMetadataOrStub` commits
+  `server/` to a pervasive type change for years, and it is the wrong thing to build if §5 holds.
+
+`feature/serverless` stays alive and unmerged until S0 answers. If S0 falsifies §5, that branch is the
+plan of record and this one is deleted.
+
+## 16. Non-goals
+
+- Replacing Lucene, the document model, the mapping system, or the query DSL.
+- Reimplementing the REST API surface in full. §6.3 is an allowlist by design.
+- Wire or index-format compatibility with classic OpenSearch beyond what the reused data plane
+  provides for free.
+- Running classic and serverless indices in one process. That constraint is what this RFC removes;
+  reintroducing it defeats the purpose.
+- Forking `server/`. Every temptation to edit it is a §4 violation until proven otherwise.
+
+## 17. Summary
+
+416k lines of data plane are almost entirely independent of the 119k lines of control plane that this
+architecture needs to replace — `IndexShard` makes zero `clusterService` calls, `IndicesService` uses
+it only as a settings bus, and the shard lifecycle interface takes value objects. `ClusterService` is
+382 lines that start without a coordinator, and `ClusterApplier.onNewClusterState` is public.
+
+So: keep the engine, delete the consensus, and let `ClusterState` become what it should have been for
+this workload all along — a node's local view of the shards it happens to be serving, computed from
+object-store truth, cheap in proportion to the working set rather than the world.
+
+S0 decides whether that paragraph is true.
