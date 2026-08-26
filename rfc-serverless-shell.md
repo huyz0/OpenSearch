@@ -93,7 +93,7 @@ a facade over `ClusterManagerService` + `ClusterApplierService`. Its constructor
 `(Settings, ClusterSettings, ThreadPool)` ([:96](server/src/main/java/org/opensearch/cluster/service/ClusterService.java#L96)),
 and its `doStart()` starts those two and nothing else — **no coordinator, no discovery, no gateway**.
 
-`ClusterManagerService.doStart()` requires exactly two injected collaborators, both interfaces:
+`ClusterManagerService.doStart()` requires two injected collaborators, both interfaces:
 
 ```java
 Objects.requireNonNull(clusterStatePublisher, "please set a cluster state publisher before starting");
@@ -101,6 +101,12 @@ Objects.requireNonNull(clusterStateSupplier, "please set a cluster state supplie
 ```
 
 Today `Coordinator` supplies the publisher. Nothing requires that it be `Coordinator`.
+
+**Correction from S0 (F1):** `ClusterApplierService.doStart()` requires a third — a
+`NodeConnectionsService` — plus a non-null initial state. An earlier draft of this section said two,
+having read `ClusterService.doStart()` without reading what its children require. In the shell the
+connections service is real, not a stub: its job is to hold transport connections to the nodes named
+in the applied state, driven by the membership view (§10).
 
 And [`ClusterApplier`](server/src/main/java/org/opensearch/cluster/service/ClusterApplier.java#L65) — the interface
 `ClusterApplierService` implements — exposes state injection as public API:
@@ -247,6 +253,7 @@ Consequences, in order of how much they matter:
 ```java
 // shell startup
 ClusterService clusterService = new ClusterService(settings, clusterSettings, threadPool);
+clusterService.setNodeConnectionsService(membershipDrivenConnections);   // F1: required to start
 clusterService.getClusterManagerService().setClusterStatePublisher(localOnlyPublisher);
 clusterService.getClusterManagerService().setClusterStateSupplier(applier::state);
 clusterService.getClusterApplierService().setInitialState(emptyLocalState(localNode));
@@ -302,7 +309,14 @@ object that arbitrates that shard), and per-shard — which is the granularity `
 actually cares about. The global cluster-state version was always a coarser proxy for it.
 
 This is the only instance found so far. It is unlikely to be the only one that exists; enumerating the
-rest is spike S0's Q4.
+rest is spike S0's Q4 — which **S0 could not answer**, being single-node, and which therefore moves to
+the two-node probe in phase 2.
+
+**S0 finding F4 makes the fix mandatory rather than preferable.** `ReplicationTracker.activatePrimaryMode`
+refuses to activate a primary at term 0 (*"primary term must be positive"*), so the data plane will not
+start a primary without a term supplied from outside. Today the elected manager bumps it on allocation.
+In this design the only remaining source is the shard-head register — so feeding its CAS generation is
+load-bearing, not an optimisation.
 
 ## 6. What the shell builds, and what it never builds
 
@@ -688,6 +702,12 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 
 ## 11. Spike S0 — the acceptance test, before anything else
 
+> **RESULT (2026-08-27): PASSED — 2 tests, 0 failures.** A shard was opened, recovered, started,
+> written to and searched with no `Coordinator`, `AllocationService`, `GatewayMetaState` or `Node`;
+> the object-graph walk visited 12,728 objects and found none of them. Full report, including four
+> findings that correct this document and one question S0 could not answer, in
+> [`s0-findings.md`](s0-findings.md). §5 is not falsified; phase 1 is unblocked.
+
 **Nothing in §12 starts until S0 answers.** S0 is disposable code on a throwaway branch, and its
 purpose is to falsify §5, not to demonstrate it.
 
@@ -773,7 +793,7 @@ that is zero when broken. No test asserts only the absence of an exception.
 
 | # | Risk | Severity | Handling |
 |---|---|---|---|
-| R1 | Projected partial `ClusterState` closes live shards (§5.2) | **Critical** | S0/Q2; fallback is a shell-owned reconciler driving `updateShardState` |
+| R1 | Projected partial `ClusterState` closes live shards (§5.2) | **Critical — still open** | S0 passed but never exercised a *partial* view. Next probe is two-node: omit an index the node still hosts, and relocate a primary (also answers Q4) |
 | R2 | Test harness cost dominates (§13.1) | High | Budgeted in phase 1; measured, not estimated |
 | R3 | `action/` re-implementation is larger than §6.3 assumes | High | Allowlist + 501 caps the surface; scope grows only by explicit decision |
 | R4 | Plugins assume Guice `createComponents` | Medium | Shell implements the plugin contract without an `Injector`; the ecosystem we must support is small |
