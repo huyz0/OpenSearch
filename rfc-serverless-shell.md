@@ -23,7 +23,8 @@ The thing that makes this cheap rather than heroic, and the central claim of thi
 > **`ClusterState` stays. The protocol that maintains it goes.**
 
 `ClusterState` stops being a consensus object replicated to every node by a publish/diff protocol,
-and becomes a **node-local materialized view** that the shell computes from object-store truth and
+and becomes a **node-local materialized view** — computed from object-store registers that are
+themselves mutated by compare-and-swap, with no consensus process anywhere in the system (§9) — that the shell computes from object-store truth and
 hands to the data plane through an interface that already exists and is already public. The data
 plane cannot tell the difference. That is not an aspiration — §2 is the measurement, and §5 is the
 mechanism.
@@ -242,6 +243,33 @@ does.** This is the single highest-risk element of the design and it is the prim
 `IndicesClusterStateService` with a shell-owned reconciler driving `updateShardState` directly (§2.2
 shows the interface supports it) — more work, no additional risk.
 
+### 5.3 `ClusterState.version()` stops being globally meaningful — and one reused class depends on it
+
+If each node computes its own view, per-node state versions are monotonic locally but **not comparable
+across nodes**. That is fine almost everywhere, and fatal in one place, found by reading
+[`ReplicationTracker`](server/src/main/java/org/opensearch/index/seqno/ReplicationTracker.java) rather than
+by assuming:
+
+- [:1461](server/src/main/java/org/opensearch/index/seqno/ReplicationTracker.java#L1461) gates every update on
+  `applyingClusterStateVersion > appliedClusterStateVersion`.
+- [:1792](server/src/main/java/org/opensearch/index/seqno/ReplicationTracker.java#L1792) ships that value inside
+  `PrimaryContext` from the relocation **source** node to the **target**, and
+  [:1840](server/src/main/java/org/opensearch/index/seqno/ReplicationTracker.java#L1840) assigns it straight into
+  the target's own `appliedClusterStateVersion`.
+
+So the version genuinely crosses a node boundary and is then compared with `>`. Feeding it a per-node
+projection counter would make primary relocation either silently drop legitimate updates or accept
+stale ones — a class of bug that produces no exception, which is exactly the failure mode `HANDOFF.md`
+warns about.
+
+**Fix, and it is a better fit than what it replaces:** feed the **shard-head register generation** as
+`applyingClusterStateVersion`. It is monotonic, globally agreed (it is the CAS generation of the single
+object that arbitrates that shard), and per-shard — which is the granularity `ReplicationTracker`
+actually cares about. The global cluster-state version was always a coarser proxy for it.
+
+This is the only instance found so far. It is unlikely to be the only one that exists; enumerating the
+rest is spike S0's Q4.
+
 ## 6. What the shell builds, and what it never builds
 
 ### 6.1 Constructed
@@ -309,42 +337,154 @@ Four, total. This is the whole contract between the new control plane and the re
 | `ShardStateStore` | `get`/`compareAndSet`/`renewLease` over `BlobContainer` registers | ported (`BlobContainerShardStateStore`) |
 | `DescriptorStore`-equivalent | blob GET + register CAS, per `plan-area-h` | ported (`BlobDescriptorBackend`) |
 
+Both of the latter two sit on `BlobContainer.readRegister`/`compareAndSwapRegister`, which already exists
+in `server/` and is already implemented against S3, GCS, Azure and Fs (§9.2). No new storage primitive
+is introduced by this RFC — the register is the whole interface to truth.
+
 Note what is *not* on this list: no new SPI in `server/`, no new extension point, no core seam. If a
 fifth interface appears, it is a signal that something is being done in the wrong plane.
 
-## 9. Control plane
+## 9. Control plane: cluster state as CAS registers
 
-No new design work — [`rfc-serverless-metadata-plane.md`](rfc-serverless-metadata-plane.md) §5–§9 already
-specifies it, and this branch is where it can finally be built as designed rather than as an opt-in
-guest:
+The truth layer is not a replicated state machine. It is a set of small object-store blobs, each
+mutated by compare-and-swap, and **there is no consensus process anywhere in the system**.
 
-- **Truth**: index descriptors as object-store blobs addressed by name, created by register CAS
-  (`plan-area-h`); per-shard heads carrying term + lease + owner (`§6`).
-- **Placement**: no allocator. Writer activation is CAS on the shard-head; readers are
-  interchangeable and need no coordination (`§6`).
-- **Liveness**: one lease object per node, heartbeat-renewed, referenced by shard-heads — one liveness
-  truth shared by activation and GC (`§6`).
-- **Routing hints**: the directory tier, soft state, cache-not-truth (`§5`).
-- **Reconciliation**: stateless background loops acting through the same CAS protocol (`§6`).
-- **Control cell**: retained for cluster config, membership arbitration and directory partition
-  assignment (`§8`) — kilobytes of state, off the data path and off the activation path.
+This is a deliberate strengthening of [`rfc-serverless-metadata-plane.md`](rfc-serverless-metadata-plane.md) §8,
+which retained a 3–5 node "control cell" for cluster config, membership arbitration and directory
+partition assignment. §9.4 argues that all three are single-object CAS problems, so the control cell
+is dissolved rather than shrunk.
 
-The control cell is the one place consensus survives, and §8 of that RFC is explicit that it can be
-down for minutes without ingest or search on active shards noticing. In this shell it is a separate
-small process, not a role inside every node.
+### 9.1 Why CAS is sufficient, and what it actually costs
+
+A linearizable compare-and-swap register has consensus number ∞: it can implement consensus among any
+number of processes. Dropping Raft/Zen2 in favour of CAS is therefore **not a weakening of the
+consistency model** — it is the same power obtained from the storage layer instead of from a quorum
+of our own processes. What is given up is not safety. It is three specific affordances:
+
+| Given up | Consequence | Handling |
+|---|---|---|
+| **Change notification** | Object stores have no watch. Nodes must poll. | §9.5 — this is the real cost, not a footnote |
+| **Multi-object atomicity** | Only single-register linearizability | Intent-object pattern (metadata-plane RFC §7), used only for rare operations |
+| **Cheap linearizable reads** | A truth read is a GET (~10–100 ms) | Never read truth on a request path; §9.3's rule |
+
+### 9.2 The primitive and the codecs both already exist
+
+Neither half of this needs to be invented, which is most of why this section is short.
+
+**The CAS primitive is production code on every real backend.**
+[`BlobContainer.readRegister`/`compareAndSwapRegister`](server/src/main/java/org/opensearch/common/blobstore/BlobContainer.java#L376)
+give generation-versioned register semantics, defaulting to `UnsupportedOperationException` so no
+existing implementer breaks — with real implementations backed by each provider's native conditional
+write:
+
+| Backend | Mechanism |
+|---|---|
+| [S3](plugins/repository-s3/src/main/java/org/opensearch/repositories/s3/S3BlobContainer.java#L1093) | `If-Match` / `If-None-Match` on `PutObject` |
+| [GCS](plugins/repository-gcs/src/main/java/org/opensearch/repositories/gcs/GoogleCloudStorageBlobContainer.java#L136) | generation preconditions |
+| [Azure](plugins/repository-azure/src/main/java/org/opensearch/repositories/azure/AzureBlobStore.java#L436) | `BlobRequestConditions` ETag `If-Match` |
+| [Fs](server/src/main/java/org/opensearch/common/blobstore/fs/FsBlobContainer.java) | filesystem atomicity |
+
+`createRegisterIfAbsent` exists as a distinct one-round-trip path because index creation is
+put-if-absent and is the operation expected to run at 10⁸.
+
+**The serialization already exists too.** `gateway/remote/model/` already decomposes `ClusterState`
+into exactly the per-entity blobs this design wants as registers — `RemotePersistentSettingsMetadata`,
+`RemoteTransientSettingsMetadata`, `RemoteCoordinationMetadata`, `RemoteTemplatesMetadata`,
+`RemoteClusterBlocks`, `RemoteDiscoveryNodes`, `RemoteCustomMetadata`, `RemoteIndexMetadata`,
+`RemoteRoutingTableBlobStore`, `RemoteHashesOfConsistentSettings`. Today these are **write-behind of a
+state consensus already decided**, tied together by a manifest. The change is to make each one
+**CAS-arbitrated truth in its own right** and delete the manifest that made them a single logical
+object. The codecs, the blob layout and the round-trip tests carry over.
+
+### 9.3 The register map, and the trap it avoids
+
+The trap is making cluster state *one* register. A single global object would serialize every mutation
+in the system through one optimistic-concurrency point — retry storms under load, and it silently
+reinstates the O(all indices) cost that §5 exists to remove. Partition by natural CAS granularity
+instead, so that **each register has a bounded, disjoint writer population**:
+
+| Register | Contents | Writers | Write rate |
+|---|---|---|---|
+| `/cluster/config` | persistent + transient settings, templates, blocks | operators | human-scale |
+| `/cluster/members/{nodeId}` | node lease: identity, roles, heartbeat, TTL | that node only | 1 per TTL, **zero contention by construction** |
+| `/indices/{name}` | index descriptor: settings, mappings ref, partition assignment | index lifecycle ops | per-index, rare |
+| `/shards/{index}/{id}/head` | term, lease ref, current owner | activation/failover | per-shard, rare |
+
+Note what has **no register at all**: the routing table and the membership list. Both are *derived* —
+membership by listing live leases, routing by reading shard-heads plus directory hints. Nothing agrees
+on them, and nothing needs to, because safety comes from shard-head CAS rather than from a shared view.
+
+Two rules that follow, and that a design review should treat as rejection criteria:
+
+1. **No CAS on a request path.** Term bumps and lease acquisitions happen at activation and failover,
+   not per request. Any design putting a register write in a bulk or search path is wrong.
+2. **A register's write rate must be bounded by design, not by hope.** If a proposed register can be
+   written by an unbounded set of nodes at an unbounded rate, it is the wrong granularity.
+
+### 9.4 Dissolving the control cell
+
+The three duties §8 of the metadata-plane RFC retained consensus for:
+
+- **Cluster config** — one register (`/cluster/config`), operator write rate, CAS on conflict. Consensus
+  buys nothing here; the write rate is human.
+- **Membership arbitration** — dissolved rather than moved. Membership is not a decision, it is a
+  derived view over live leases. Two nodes disagreeing about the member list cannot cause harm, because
+  no safety property depends on that list — shard ownership is arbitrated per-shard by CAS.
+- **Directory partition assignment** — the directory tier is soft state and a wrong hint costs a
+  retry, not correctness. Assignment can be a hash, or a register.
+
+Result: **zero consensus processes.** Nothing to bootstrap, no quorum to lose, no split-brain, no
+minimum cluster size, no seed hosts. The `control` role disappears from §10. This is a real
+simplification and not merely a relocation of the problem — but it rests entirely on the provider's
+conditional write being genuinely linearizable, which is R11.
+
+### 9.5 The honest cost: no watch
+
+This is the one place where CAS-on-blobs is *worse* than consensus, and it should not be glossed.
+
+A consensus system pushes changes. An object store must be polled. Naively, N nodes polling K
+registers at interval T is `N·K/T` GETs per second forever — at 10⁴ nodes and a 1 s interval, that is
+10⁴ GET/s to learn that nothing changed.
+
+Three mitigations, in the order they should be applied:
+
+1. **Piggyback an epoch.** Every transport response already flowing between nodes carries the sender's
+   observed `/cluster/config` generation. A node learns it is stale for free, on traffic it was already
+   sending, and only then does it GET. Polling becomes the fallback for idle nodes, not the mechanism.
+2. **Set the interval by what the register is.** Config staleness of seconds is harmless. Shard-head
+   staleness matters only at activation, which reads the head anyway. There is no register that needs
+   sub-second universal propagation, and if one appears it is a design smell.
+3. **Fan out through the directory tier** for anything genuinely hot, so the GET count scales with
+   directory nodes rather than with the fleet.
+
+### 9.6 Fencing: where this design loses data if it is wrong
+
+CAS on the shard-head establishes *who owns* a shard. It does not by itself stop a **zombie** — a
+writer whose JVM paused past its lease TTL, that does not yet know it lost ownership — from continuing
+to write segments. Ownership arbitration and byte-level fencing are different problems, and object
+store systems lose data at exactly this seam.
+
+**Rule: the term must be enforced where bytes are written, not only where ownership is claimed.**
+
+The preferred mechanism is term-scoped key paths: a writer holding term `T` writes under
+`.../t={T}/...`, and the head names the live term. A zombie at term `T-1` writes to a prefix that no
+reader ever consults, so its writes are inert rather than corrupting, and GC reclaims them as orphans.
+This costs nothing on the hot path and needs no conditional-write support for data objects — only for
+the head. Conditional writes on a per-shard manifest are the alternative, and are strictly more
+expensive.
 
 ## 10. Node roles
 
-Four process types, per `rfc-serverless-metadata-plane.md` §8, each a different subset of §6.1:
+Three process types, each a different subset of §6.1. There is no `control` role — see §9.4.
 
 | Role | Builds | Notes |
 |---|---|---|
-| `control` | control cell only | tiny; the only consensus in the system |
 | `directory` | routing hint tier | memory-heavy, soft state, restartable with no recovery |
 | `ingest` | full data plane, writer engines | CAS-activated shard ownership |
 | `search` | full data plane, reader engines, no writer | scale-to-zero; no local durable state |
 
 `ingest` and `search` share one binary and differ by which engines and actions they register.
+`directory` holds no durable state at all and may be collapsed into the other two at small scale.
 
 ## 11. Spike S0 — the acceptance test, before anything else
 
@@ -373,6 +513,10 @@ Deliverable is a written answer to three questions:
   (§5.2)? This is the fallback fork in the road and S0 exists mainly to find it.
 - **Q3.** What is the actual constructor closure of `IndicesService` + `SearchService` — how many of
   its 38 parameters have no sensible serverless value?
+- **Q4.** Beyond `ReplicationTracker` (§5.3), what else in the reused data plane compares a
+  `ClusterState` version, or any other globally-agreed number, **across nodes**? Enumerate by grepping
+  for cross-node value objects that carry a version, not by reasoning about which ones "should" matter
+  — §3's record is that every hypothesis argued from reading code was wrong and every probe was right.
 
 Estimated: days, not weeks. If S0 comes back "short list, concentrated in `IndicesService`," proceed.
 If it comes back "the data plane assumes a live control plane in forty unexpected places," **this RFC
@@ -388,12 +532,12 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 0 | **S0 spike** (§11) | Q1–Q3 answered in writing |
 | 1 | **Shell skeleton** | `ServerlessNode` boots, binds transport + REST, serves `GET /` and a health endpoint, exits cleanly. No indices. |
 | 2 | **Local view** | `LocalViewProjector` + `LocalOnlyPublisher`; a shard is opened from a hand-written descriptor and serves a search. S0 made durable and tested. |
-| 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store. |
+| 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store. Includes the §9.3 register map and the R11 per-provider CAS conformance suite — **the conformance suite gates every later phase**. |
 | 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
 | 5 | **Search path** | `search` role: reader engines over object-store segments; scale-to-zero verified by killing every search node and restarting. |
-| 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9. |
+| 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9 — including a **paused-JVM zombie test** for the §9.6 fencing rule, since kill-9 alone does not produce a zombie. |
 | 7 | **Surface** | Allowlisted admin/stats APIs, re-implemented against the metadata plane. 501 for everything else. |
-| 8 | **Directory tier & reconcilers** | Routing hints, background reconciliation, GC. |
+| 8 | **Directory tier & reconcilers** | Routing hints, background reconciliation, GC. Epoch piggybacking (§9.5) measured against naive polling. |
 | 9 | **Scale validation** | The `plan-100m-index-implementation.md` targets re-measured on this shell. |
 
 Phases 1–2 are the ones that decide whether this is a two-quarter project or a two-year one. Treat
@@ -436,12 +580,17 @@ that is zero when broken. No test asserts only the absence of an exception.
 | R6 | Upstream drift in the data plane's internal APIs | Medium | Only four interfaces (§8); regular merge from upstream stays possible and should be routine, not a project |
 | R7 | Snapshot/restore, security, ISM assume the old shell | Medium | Explicitly out of scope (§16); decide per feature, default absent |
 | R8 | Object-store list consistency is still unmeasured | Open | Pre-existing open item, carried in `plan-100m-index-implementation.md`; unchanged by this RFC |
+| R9 | **Zombie writer corrupts data past lease expiry** (§9.6) | **Critical** | Term-scoped key paths, so stale writes are inert rather than corrupting. Must be verified by a kill-9-with-paused-JVM test in phase 6, not by argument |
+| R10 | No watch primitive; polling cost at fleet scale (§9.5) | High | Epoch piggybacked on existing transport traffic; poll is the idle fallback. Measure GET/s at target fleet size in phase 9 |
+| R11 | Provider conditional writes are not as linearizable as assumed | **Critical** | The entire safety argument rests on this. Per-provider conformance suite (concurrent CAS contenders, exactly one winner) run against real S3/GCS/Azure, not against `FsBlobContainer` |
+| R12 | Cross-node version comparisons beyond `ReplicationTracker` (§5.3) | High | S0/Q4 enumerates by probe; each one found needs a truth-derived monotonic number, not a projection counter |
 
 Open questions this document does **not** answer, and should not be read as answering:
 
 - What the wire-compatibility story is with classic OpenSearch clusters (CCS/CCR). Currently: none.
-- Whether the control cell reuses `cluster/coordination/` shrunken, or is written fresh. Deferred to
-  phase 8; both remain open.
+- Whether §9.4's dissolution of the control cell survives review. It is the most aggressive claim in
+  this document, and the fallback — a small consensus group for `/cluster/config` only — is cheap
+  enough that being wrong here costs a phase, not the design.
 - How index-level security and multi-tenancy land in a shell with no security plugin.
 
 ## 15. What carries over from `feature/serverless`
@@ -482,8 +631,16 @@ architecture needs to replace — `IndexShard` makes zero `clusterService` calls
 it only as a settings bus, and the shard lifecycle interface takes value objects. `ClusterService` is
 382 lines that start without a coordinator, and `ClusterApplier.onNewClusterState` is public.
 
+And the truth those views are computed from is itself just blobs: a handful of small registers —
+config, node leases, index descriptors, shard-heads — each mutated by a compare-and-swap that S3, GCS,
+Azure and Fs already implement in this repo today, with the codecs to serialize every cluster-state
+component into them already written in `gateway/remote/model/`. A CAS register has consensus number ∞,
+so this gives up no safety relative to Raft; it gives up change notification, multi-object atomicity,
+and cheap linearizable reads, which §9.5 and §9.6 cost out rather than wave away. What it buys is
+**zero consensus processes**: nothing to elect, nothing to bootstrap, no quorum to lose.
+
 So: keep the engine, delete the consensus, and let `ClusterState` become what it should have been for
 this workload all along — a node's local view of the shards it happens to be serving, computed from
 object-store truth, cheap in proportion to the working set rather than the world.
 
-S0 decides whether that paragraph is true.
+S0 decides whether the first half of that is true. R9 and R11 decide whether the second half is.
