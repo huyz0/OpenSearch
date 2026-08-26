@@ -8,13 +8,12 @@
 
 package org.opensearch.serverless.spike;
 
-import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.NodeConnectionsService;
 import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.NodeConnectionsService;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterApplier;
@@ -32,12 +31,12 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.gateway.MetaStateService;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.analysis.AnalysisRegistry;
+import org.opensearch.index.engine.MergedSegmentWarmerFactory;
 import org.opensearch.index.seqno.RetentionLeaseSyncer;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesModule;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.recovery.DefaultRecoverySettings;
-import org.opensearch.index.engine.MergedSegmentWarmerFactory;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.fetch.FetchPhase;

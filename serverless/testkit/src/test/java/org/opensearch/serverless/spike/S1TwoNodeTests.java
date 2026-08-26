@@ -18,6 +18,7 @@ import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentType;
@@ -138,12 +139,7 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
             // But a diff-based reconciler — the shape IndicesClusterStateService uses — would close it.
             final Set<ShardId> locallyOpen = new HashSet<>();
             a.indicesService.forEach(is -> is.forEach(s -> locallyOpen.add(s.shardId())));
-            final Set<String> inView = a.clusterService.state()
-                .metadata()
-                .indices()
-                .keySet()
-                .stream()
-                .collect(Collectors.toSet());
+            final Set<String> inView = a.clusterService.state().metadata().indices().keySet().stream().collect(Collectors.toSet());
             final Set<ShardId> naiveCloseSet = locallyOpen.stream()
                 .filter(sid -> inView.contains(sid.getIndexName()) == false)
                 .collect(Collectors.toSet());
@@ -206,11 +202,7 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
             for (int i = 0; i < 5; i++) {
                 final long generation = shardHeadGeneration.incrementAndGet();
                 update(shard, routing, shardId, allocId, generation, nodes);
-                assertEquals(
-                    "a shard-head generation was ignored — the fix does not hold",
-                    generation,
-                    appliedVersion(shard)
-                );
+                assertEquals("a shard-head generation was ignored — the fix does not hold", generation, appliedVersion(shard));
             }
 
             // A relocation target reads the SAME register, so its next value is necessarily higher.
@@ -241,6 +233,7 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
         );
     }
 
+    @SuppressForbidden(reason = "reads ReplicationTracker's private applied version; the cross-node comparison in RFC §5.3 has no public accessor")
     private static long appliedVersion(IndexShard shard) throws Exception {
         final java.lang.reflect.Field tracker = IndexShard.class.getDeclaredField("replicationTracker");
         tracker.setAccessible(true);

@@ -16,9 +16,7 @@ import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlocks;
-import org.opensearch.cluster.metadata.AliasValidator;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
@@ -31,8 +29,8 @@ import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
 import org.opensearch.cluster.service.ClusterApplier;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.settings.ClusterSettings;
-import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.PageCacheRecycler;
@@ -40,16 +38,12 @@ import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.core.indices.breaker.NoneCircuitBreakerService;
-import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.env.TestEnvironment;
-import org.opensearch.gateway.MetaStateService;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.mapper.SourceToParse;
-import org.opensearch.index.seqno.RetentionLeaseSyncer;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
@@ -353,6 +347,7 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
         }
     }
 
+    @SuppressForbidden(reason = "the object-graph walk is the mechanism of RFC §11 criterion 5; reflection is the point")
     private ScanResult scan(Set<String> forbidden, Object... roots) {
         final IdentityHashMap<Object, Boolean> seen = new IdentityHashMap<>();
         final Deque<Object> queue = new ArrayDeque<>();
