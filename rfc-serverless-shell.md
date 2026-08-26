@@ -280,9 +280,18 @@ does.** This is the single highest-risk element of the design and it is the prim
 (§11) must falsify. **Update after §10.5:** the alternative — replacing `IndicesClusterStateService` with a shell-owned
 reconciler driving `updateShardState` directly (§2.2 shows the interface supports it) — is now the
 *expected* path rather than the fallback, because that class turns out to be the only place in the
-reused tree that assumes an elected cluster-manager. S0's Q2 therefore asks how large that reconciler
-is, not whether it is needed. The risk above is correspondingly reduced but not eliminated: a
-shell-owned reconciler has the same obligation about omissions, just in code we control.
+reused tree that assumes an elected cluster-manager.
+
+**Resolved by S1.** Measured, not argued: applying a view that mentions no indices at all left the
+shard `STARTED` and serving, while the close-set a diff-based reconciler *would* have computed was
+exactly the set of locally-open shards. So the fear above was mis-located — projection is harmless;
+the hazard is entirely a property of the reconciler. What was R1 is now an invariant:
+
+> **Absence from a projected view is never a removal signal.** A shard closes when the shard-head
+> register says this node no longer owns it, and never because a locally-computed view failed to
+> mention it.
+
+Phase 2 carries that as a test, not a comment.
 
 ### 5.3 `ClusterState.version()` stops being globally meaningful — and one reused class depends on it
 
@@ -707,6 +716,12 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > the object-graph walk visited 12,728 objects and found none of them. Full report, including four
 > findings that correct this document and one question S0 could not answer, in
 > [`s0-findings.md`](s0-findings.md). §5 is not falsified; phase 1 is unblocked.
+>
+> **S1 (two-node probe) RESULT: PASSED — 5 tests total, 0 failures.** Two nodes holding disjoint
+> node-local views both serve; a projected view omitting a hosted index leaves the shard STARTED and
+> serving; and the §5.3 version hazard reproduces exactly (version 4 silently ignored after 500) with
+> its fix verified. Q4 answered, R1 resolved into a reconciler contract — see
+> [`s1-findings.md`](s1-findings.md).
 
 **Nothing in §12 starts until S0 answers.** S0 is disposable code on a throwaway branch, and its
 purpose is to falsify §5, not to demonstrate it.
@@ -793,7 +808,7 @@ that is zero when broken. No test asserts only the absence of an exception.
 
 | # | Risk | Severity | Handling |
 |---|---|---|---|
-| R1 | Projected partial `ClusterState` closes live shards (§5.2) | **Critical — still open** | S0 passed but never exercised a *partial* view. Next probe is two-node: omit an index the node still hosts, and relocate a primary (also answers Q4) |
+| R1 | Projected partial `ClusterState` closes live shards (§5.2) | **Resolved (S1)** | Measured: projection alone is harmless — the shard stayed STARTED and serving. The hazard lives in the reconciler, and becomes the §5.2 contract below. Phase 2 must carry it as a test |
 | R2 | Test harness cost dominates (§13.1) | High | Budgeted in phase 1; measured, not estimated |
 | R3 | `action/` re-implementation is larger than §6.3 assumes | High | Allowlist + 501 caps the surface; scope grows only by explicit decision |
 | R4 | Plugins assume Guice `createComponents` | Medium | Shell implements the plugin contract without an `Injector`; the ecosystem we must support is small |
@@ -804,7 +819,7 @@ that is zero when broken. No test asserts only the absence of an exception.
 | R9 | **Zombie writer corrupts data past lease expiry** (§9.6) | **Critical** | Term-scoped key paths, so stale writes are inert rather than corrupting. Must be verified by a kill-9-with-paused-JVM test in phase 6, not by argument |
 | R10 | No watch primitive; polling cost at fleet scale (§9.5) | High | Epoch piggybacked on existing transport traffic; poll is the idle fallback. Measure GET/s at target fleet size in phase 9 |
 | R11 | Provider conditional writes are not as linearizable as assumed | **Critical** | The entire safety argument rests on this. Conformance suite (concurrent CAS contenders, exactly one winner) run against real S3 and GCS per D3 — passing on `FsBlobContainer` proves nothing |
-| R12 | Cross-node version comparisons beyond `ReplicationTracker` (§5.3) | High | S0/Q4 enumerates by probe; each one found needs a truth-derived monotonic number, not a projection counter |
+| R12 | Cross-node version comparisons beyond `ReplicationTracker` (§5.3) | **Confirmed and fixed in design (S1)** | Hazard reproduced (silent ignore) and the shard-head-generation fix verified. Residual exposure: any *other* cross-node number, still unenumerated |
 | R13 | Gossip is a new distributed protocol, hand-built, tuned at 10⁴ nodes (§10.3) | High | Deferred to phase 8 and gated on measurement — the design must work without it first. Vendor rather than invent if it is needed |
 | R14 | Readiness mistaken for ownership on Kubernetes (§10.1, §10.2) | **Critical** | Ownership reads the shard-head. A conformance test asserts a Ready pod with an expired lease serves nothing — this is R9 wearing a different hat |
 
