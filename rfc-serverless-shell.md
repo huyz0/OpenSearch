@@ -157,8 +157,8 @@ Three planes, with a hard rule about which may depend on which.
 │                 lifecycle, node roles, REST binding         │  ~5k lines
 ├─────────────────────────────────────────────────────────────┤
 │  CONTROL PLANE  object-store truth: descriptors, shard-     │  new + ported
-│                 heads (CAS), node leases, directory tier,   │  from serverless-storage
-│                 reconcilers, LocalViewProjector              │
+│                 heads (CAS), node leases; membership,        │  from serverless-storage
+│                 gossip, reconcilers, LocalViewProjector      │
 ├─────────────────────────────────────────────────────────────┤
 │  DATA PLANE     IndicesService, IndexService, IndexShard,   │  REUSED
 │                 Engine, MapperService, SearchService,        │  ~416k lines
@@ -193,7 +193,7 @@ shard-heads (term, lease, node) ──┤
 node leases                     ──┼──►  LocalViewProjector  ──►  ClusterApplierService
 manifest / segment metadata     ──┘      builds ClusterState        .onNewClusterState(...)
                                          for THIS node only               │
-directory tier (soft hints)     ─────►   routing hints                    ▼
+routing hints (gossip / cache)  ─────►   soft hints, never truth           ▼
                                                               IndicesClusterStateService
                                                               → IndexShard.updateShardState
 ```
@@ -239,9 +239,12 @@ shards. A projected view that omits an index the node is still hosting will be r
 was removed" and the shard will be closed. **The projector's correctness obligation is therefore
 one-directional and absolute: it may omit an index the node does not host; it must never omit one it
 does.** This is the single highest-risk element of the design and it is the primary thing spike S0
-(§11) must falsify. If projection cannot be made safe, the fallback is to replace
-`IndicesClusterStateService` with a shell-owned reconciler driving `updateShardState` directly (§2.2
-shows the interface supports it) — more work, no additional risk.
+(§11) must falsify. **Update after §10.5:** the alternative — replacing `IndicesClusterStateService` with a shell-owned
+reconciler driving `updateShardState` directly (§2.2 shows the interface supports it) — is now the
+*expected* path rather than the fallback, because that class turns out to be the only place in the
+reused tree that assumes an elected cluster-manager. S0's Q2 therefore asks how large that reconciler
+is, not whether it is needed. The risk above is correspondingly reduced but not eliminated: a
+shell-owned reconciler has the same obligation about omissions, just in code we control.
 
 ### 5.3 `ClusterState.version()` stops being globally meaningful — and one reused class depends on it
 
@@ -314,7 +317,7 @@ server/                     unchanged — becomes a library dependency
 serverless/
   ├─ shell/                 ServerlessNode, bootstrap, wiring, roles, CLI
   ├─ control/               descriptors, shard-heads, leases, CAS, reconcilers,
-  │                         LocalViewProjector, directory tier
+  │                         LocalViewProjector, membership, gossip
   ├─ actions/               the allowlisted REST/transport surface
   ├─ engine/                ported from plugins/serverless-storage
   └─ testkit/               ServerlessTestCluster (§13)
@@ -328,7 +331,7 @@ That is a Gradle constraint, not a convention, and it is what prevents drift int
 
 ## 8. The narrow interfaces
 
-Four, total. This is the whole contract between the new control plane and the reused data plane.
+Five, total. This is the whole contract between the new control plane and the reused data plane.
 
 | Interface | Shape | Who implements |
 |---|---|---|
@@ -336,13 +339,15 @@ Four, total. This is the whole contract between the new control plane and the re
 | `ClusterStatePublisher` | exists today | shell's `LocalOnlyPublisher` |
 | `ShardStateStore` | `get`/`compareAndSet`/`renewLease` over `BlobContainer` registers | ported (`BlobContainerShardStateStore`) |
 | `DescriptorStore`-equivalent | blob GET + register CAS, per `plan-area-h` | ported (`BlobDescriptorBackend`) |
+| `MembershipSource` | `current()` + `subscribe()`; §10.2 | new — blob-lease default, K8s, static |
 
 Both of the latter two sit on `BlobContainer.readRegister`/`compareAndSwapRegister`, which already exists
 in `server/` and is already implemented against S3, GCS, Azure and Fs (§9.2). No new storage primitive
 is introduced by this RFC — the register is the whole interface to truth.
 
-Note what is *not* on this list: no new SPI in `server/`, no new extension point, no core seam. If a
-fifth interface appears, it is a signal that something is being done in the wrong plane.
+Note what is *not* on this list: no new SPI in `server/`, no new extension point, no core seam. All
+five live in `serverless/`. If a sixth appears, it is a signal that something is being done in the
+wrong plane.
 
 ## 9. Control plane: cluster state as CAS registers
 
@@ -430,8 +435,9 @@ The three duties §8 of the metadata-plane RFC retained consensus for:
 - **Membership arbitration** — dissolved rather than moved. Membership is not a decision, it is a
   derived view over live leases. Two nodes disagreeing about the member list cannot cause harm, because
   no safety property depends on that list — shard ownership is arbitrated per-shard by CAS.
-- **Directory partition assignment** — the directory tier is soft state and a wrong hint costs a
-  retry, not correctness. Assignment can be a hash, or a register.
+- **Routing hint distribution** — soft state, where a wrong hint costs a retry rather than
+  correctness. §10.3 removes the dedicated tier this duty was attached to; the hints spread by gossip
+  or are simply recomputed.
 
 Result: **zero consensus processes.** Nothing to bootstrap, no quorum to lose, no split-brain, no
 minimum cluster size, no seed hosts. The `control` role disappears from §10. This is a real
@@ -454,8 +460,9 @@ Three mitigations, in the order they should be applied:
 2. **Set the interval by what the register is.** Config staleness of seconds is harmless. Shard-head
    staleness matters only at activation, which reads the head anyway. There is no register that needs
    sub-second universal propagation, and if one appears it is a design smell.
-3. **Fan out through the directory tier** for anything genuinely hot, so the GET count scales with
-   directory nodes rather than with the fleet.
+3. **Spread it epidemically.** Gossip (§10.3) generalizes mitigation 1 from "rides on traffic that
+   happened to flow" to "reaches the fleet in O(log N) rounds," and on Kubernetes the membership half
+   of the problem has a real push channel already (§10.2).
 
 ### 9.6 Fencing: where this design loses data if it is wrong
 
@@ -473,18 +480,148 @@ This costs nothing on the hot path and needs no conditional-write support for da
 the head. Conditional writes on a per-shard manifest are the alternative, and are strictly more
 expensive.
 
-## 10. Node roles
+## 10. Membership, discovery, and roles
 
-Three process types, each a different subset of §6.1. There is no `control` role — see §9.4.
+Membership is not cluster state, discovery is a plugin, propagation is gossip, and every node runs the
+same binary. Each of those is safe here for the same reason: **§9 moved safety into per-shard CAS**, so
+nothing in this section can cause harm by being wrong — only by being slow.
 
-| Role | Builds | Notes |
+That is the whole argument, and it does not transfer. In classic OpenSearch, membership *is* the safety
+boundary — quorum is computed from it — so an eventually-consistent member list would be a correctness
+bug. Here no safety property reads the member list at all.
+
+### 10.1 Membership is a derived view, not a decision
+
+§9.3 already gives membership no register of its own. It is a **LIST over `/cluster/members/`, filtered
+by lease expiry**. Two nodes holding different member lists forever is not a fault to be repaired; it is
+the normal state of the system, and it is harmless because shard ownership is arbitrated per-shard by
+CAS rather than by agreement about who exists.
+
+One distinction to hold onto, because conflating these is how object-store systems lose data:
+
+> **A node existing is not a node owning anything.** Kubernetes readiness, gossip liveness and a live
+> lease answer three different questions. Only the lease — and, for a specific shard, only that shard's
+> head — is authoritative about ownership.
+
+### 10.2 Discovery as a plugin — but not `DiscoveryPlugin`
+
+The instinct is right; the existing SPI is the wrong shape. All three of
+[`DiscoveryPlugin`](server/src/main/java/org/opensearch/plugins/DiscoveryPlugin.java)'s hooks are
+Coordinator concepts: `getSeedHostProviders` seeds unicast pinging for Zen2, `getJoinValidator` returns
+a `BiConsumer<DiscoveryNode, ClusterState>` run at join, and `getElectionStrategies` configures an
+election that no longer happens. `discovery-ec2`, `discovery-gce` and `discovery-azure-classic` all
+implement exactly one of them — `SeedHostsProvider` — which answers "who might I ping to find a
+cluster to join," a question the new shell never asks.
+
+The replacement is smaller, and it is the fifth and last interface in §8:
+
+```java
+interface MembershipSource {
+    Collection<NodeInfo> current();              // who is alive now
+    void subscribe(Consumer<MembershipDelta> l); // push, if this source can push
+}
+```
+
+| Implementation | Mechanism | Notes |
 |---|---|---|
-| `directory` | routing hint tier | memory-heavy, soft state, restartable with no recovery |
-| `ingest` | full data plane, writer engines | CAS-activated shard ownership |
-| `search` | full data plane, reader engines, no writer | scale-to-zero; no local durable state |
+| `BlobLeaseMembership` (default) | LIST `/cluster/members/`, filter by TTL | Zero new infrastructure; fate-shared with the data; works on any backend. Poll-only. |
+| `KubernetesMembership` | EndpointSlice / Pod watch | **Push.** See below. |
+| `StaticMembership` | configured list | tests, single-node dev |
 
-`ingest` and `search` share one binary and differ by which engines and actions they register.
-`directory` holds no durable state at all and may be collapsed into the other two at small scale.
+The Kubernetes case is more interesting than "another cloud discovery plugin," and it is worth naming
+why: **it supplies the watch primitive the object store lacks.** §9.5 records no-watch as the real cost
+of CAS-on-blobs, mitigated by epoch piggybacking and polling. A K8s informer is a genuine push channel
+for the membership half of that problem, and it costs the operator nothing they are not already
+running. It converts R10 from "design around polling" to "design around polling, except where the
+platform already solved it."
+
+The boundary from §10.1 still applies with full force: K8s tells you a pod is Ready. It does not tell
+you that pod still holds shard `s` — a Ready pod whose lease expired owns nothing, and a node that
+treats readiness as ownership is R9 with extra steps.
+
+### 10.3 Gossip: what it may carry, and what it must never
+
+Yes to gossip, with one boundary stated as a rule:
+
+> **Gossip carries hints and epochs. CAS carries truth.**
+
+| May carry | Why it is safe |
+|---|---|
+| Config/register epochs | A stale epoch means one extra GET, never a wrong action |
+| Routing hints, cache invalidation | A wrong hint costs a retry; the shard-head is consulted before anything is written |
+| Load and capacity for placement candidate selection | Placement *quality* is gossip's job; placement *safety* is CAS's (metadata-plane RFC §6) |
+| Liveness suspicion | A suspicion triggers a lease read, it does not evict anyone |
+
+The test for whether a proposed use is legitimate: **if two nodes hold different values for this
+forever, what breaks?** If the answer is worse than a retry or a stale read, it does not belong in
+gossip. Shard ownership, term numbers and index existence all fail that test.
+
+Given that, gossip becomes the general form of §9.5's epoch piggybacking — an epoch reaches the fleet in
+O(log N) rounds instead of riding only on traffic that happened to be flowing — and **it dissolves the
+directory tier.** §9.3's routing hints and the `directory` role existed to fan out soft state from a
+dedicated tier; gossip does that with no tier at all. The role is deleted below.
+
+Two costs, neither of which should be waved through:
+
+1. **There is no gossip implementation in this repo.** Verified, not assumed: zero hits across
+   `server/`, `modules/` and `plugins/`. SWIM/Lifeguard-style membership and failure detection has to
+   be built or vendored, and failure-detector tuning at 10⁴ nodes is real work with a long tail of
+   false-positive behaviour.
+2. **It is the only new distributed protocol this design introduces**, having just removed one. It
+   deserves the same skepticism consensus got — including the question of whether phases 1–7 need it
+   at all, or whether polling plus §10.2's K8s push carries the system until phase 8.
+
+### 10.4 One binary, equal capability, roles as lease attributes
+
+"All nodes equal" is right about deployment and wrong about scaling, and the two can be separated.
+
+Taken literally, homogeneous roles would delete independent ingest/search scaling and per-index
+search scale-to-zero — goals 2 and 3 of `rfc-serverless-opensearch.md` §2, and a large part of why any
+of this is being built. Taken as a deployment property, it is exactly right: one image, no special
+node, any pod substitutable for any other.
+
+The resolution is that **role is a dynamic attribute a node advertises in its lease, not a topology
+decision baked into a cluster**. No new mechanism is needed: `DiscoveryNode` already carries
+`getAttributes()`/`getRoles()`, and `isRemoteStoreNode()`
+([:550](server/src/main/java/org/opensearch/cluster/node/DiscoveryNode.java#L550)) is already derived from
+attributes rather than from topology.
+
+| Role | Advertised in lease as | Notes |
+|---|---|---|
+| `ingest` | accepts writer activation | CAS-acquired shard ownership |
+| `search` | accepts reader activation | scale-to-zero; no local durable state |
+
+Both from one binary. An operator gets asymmetric scaling with two Deployments differing by one
+environment variable, or a single Deployment whose nodes switch roles under load — and that becomes a
+policy question rather than an architectural one. The `directory` role from the previous draft is gone
+(§10.3).
+
+### 10.5 The one thing that must still be synthesized — and what it settles
+
+The data plane does need a `DiscoveryNodes`: `IndexShard`
+[:651](server/src/main/java/org/opensearch/index/shard/IndexShard.java#L651) calls
+`discoveryNodes.get(nodeId).isRemoteStoreNode()`, and `SearchService` needs `localNode()`. The projector
+builds one from the membership view — straightforward.
+
+Except that `DiscoveryNodes` also carries a `clusterManagerNodeId`
+([:81](server/src/main/java/org/opensearch/cluster/node/DiscoveryNodes.java#L81)), and
+`isLocalNodeElectedClusterManager()` is defined as `localNodeId.equals(clusterManagerNodeId)`. With no
+election, neither available answer is obviously safe: `null` risks NPEs in reused code, and naming the
+local node makes **every** node believe it was elected, potentially arming cluster-manager-only paths
+everywhere at once.
+
+The measurement settles it. Across `index/`, `search/` and `indices/`, every reference to
+`getClusterManagerNode()` or `isLocalNodeElectedClusterManager()` — all six — is in
+`IndicesClusterStateService` ([:404](server/src/main/java/org/opensearch/indices/cluster/IndicesClusterStateService.java#L404),
+:890, :944, :1108–1116), where they exist to report shard-failed/shard-started **back to the elected
+manager**. In this design those reports are CAS writes to the shard-head instead. `index/` and
+`search/` contain **zero** such references.
+
+So: `clusterManagerNodeId` is `null`, and `IndicesClusterStateService` is replaced rather than reused.
+That **promotes §5.2's fallback to the expected path** — a shell-owned reconciler driving
+`updateShardState` directly, which §2.2 already showed the interface supports. The class was the one
+place the data plane assumed an elected manager; not reusing it removes that assumption entirely rather
+than papering over it. S0's Q2 now asks how big that reconciler is, not whether it is needed.
 
 ## 11. Spike S0 — the acceptance test, before anything else
 
@@ -509,8 +646,9 @@ this spike is exactly the kind of seam that fails by succeeding:
 Deliverable is a written answer to three questions:
 
 - **Q1.** What is the minimum `ClusterState` a shard will accept? (Determines the projector's schema.)
-- **Q2.** Does `IndicesClusterStateService` behave correctly on a partial view, or must it be replaced
-  (§5.2)? This is the fallback fork in the road and S0 exists mainly to find it.
+- **Q2.** How large is the shell-owned reconciler that replaces `IndicesClusterStateService`? §10.5
+  settles *that* it is replaced; S0 measures the cost. Build the smallest one that passes the five
+  criteria above and report its size.
 - **Q3.** What is the actual constructor closure of `IndicesService` + `SearchService` — how many of
   its 38 parameters have no sensible serverless value?
 - **Q4.** Beyond `ReplicationTracker` (§5.3), what else in the reused data plane compares a
@@ -530,14 +668,14 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | # | Phase | Ends when |
 |---|---|---|
 | 0 | **S0 spike** (§11) | Q1–Q3 answered in writing |
-| 1 | **Shell skeleton** | `ServerlessNode` boots, binds transport + REST, serves `GET /` and a health endpoint, exits cleanly. No indices. |
+| 1 | **Shell skeleton** | `ServerlessNode` boots, binds transport + REST, serves `GET /` and a health endpoint, exits cleanly. No indices. `MembershipSource` with the blob-lease implementation only. |
 | 2 | **Local view** | `LocalViewProjector` + `LocalOnlyPublisher`; a shard is opened from a hand-written descriptor and serves a search. S0 made durable and tested. |
 | 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store. Includes the §9.3 register map and the R11 per-provider CAS conformance suite — **the conformance suite gates every later phase**. |
 | 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
 | 5 | **Search path** | `search` role: reader engines over object-store segments; scale-to-zero verified by killing every search node and restarting. |
 | 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9 — including a **paused-JVM zombie test** for the §9.6 fencing rule, since kill-9 alone does not produce a zombie. |
 | 7 | **Surface** | Allowlisted admin/stats APIs, re-implemented against the metadata plane. 501 for everything else. |
-| 8 | **Directory tier & reconcilers** | Routing hints, background reconciliation, GC. Epoch piggybacking (§9.5) measured against naive polling. |
+| 8 | **Gossip & reconcilers** | Routing hints, background reconciliation, GC. Gossip introduced **only if** phases 1–7 show polling plus K8s push is insufficient — measured, per §10.3's second cost. |
 | 9 | **Scale validation** | The `plan-100m-index-implementation.md` targets re-measured on this shell. |
 
 Phases 1–2 are the ones that decide whether this is a two-quarter project or a two-year one. Treat
@@ -584,6 +722,8 @@ that is zero when broken. No test asserts only the absence of an exception.
 | R10 | No watch primitive; polling cost at fleet scale (§9.5) | High | Epoch piggybacked on existing transport traffic; poll is the idle fallback. Measure GET/s at target fleet size in phase 9 |
 | R11 | Provider conditional writes are not as linearizable as assumed | **Critical** | The entire safety argument rests on this. Per-provider conformance suite (concurrent CAS contenders, exactly one winner) run against real S3/GCS/Azure, not against `FsBlobContainer` |
 | R12 | Cross-node version comparisons beyond `ReplicationTracker` (§5.3) | High | S0/Q4 enumerates by probe; each one found needs a truth-derived monotonic number, not a projection counter |
+| R13 | Gossip is a new distributed protocol, hand-built, tuned at 10⁴ nodes (§10.3) | High | Deferred to phase 8 and gated on measurement — the design must work without it first. Vendor rather than invent if it is needed |
+| R14 | Readiness mistaken for ownership on Kubernetes (§10.1, §10.2) | **Critical** | Ownership reads the shard-head. A conformance test asserts a Ready pod with an expired lease serves nothing — this is R9 wearing a different hat |
 
 Open questions this document does **not** answer, and should not be read as answering:
 
@@ -623,6 +763,8 @@ plan of record and this one is deleted.
 - Running classic and serverless indices in one process. That constraint is what this RFC removes;
   reintroducing it defeats the purpose.
 - Forking `server/`. Every temptation to edit it is a §4 violation until proven otherwise.
+- Depending on Kubernetes. It is one `MembershipSource` among three (§10.2); the blob-lease default
+  must remain fully supported, or the system has acquired an orchestrator dependency it does not need.
 
 ## 17. Summary
 
