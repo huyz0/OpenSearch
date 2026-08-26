@@ -29,6 +29,26 @@ hands to the data plane through an interface that already exists and is already 
 plane cannot tell the difference. That is not an aspiration — §2 is the measurement, and §5 is the
 mechanism.
 
+### 1.1 Decisions taken (2026-08-27)
+
+Four questions that measurement cannot answer were put to the owner and are settled. They are recorded
+here because later sections now assume them.
+
+| # | Decision | Effect |
+|---|---|---|
+| D1 | **S0 first, then decide.** No shell work begins until the spike reports. | §11 is a gate, not a first step. If S0 falsifies §5, this RFC is withdrawn and the cell-diet design is approved instead. |
+| D2 | **Allowlisted API surface, grown on demand.** Not a drop-in for existing clients or Dashboards. | §6.3 confirmed. Unimplemented endpoints return 501 with a reason — never an empty success. |
+| D3 | **Fs, S3 and GCS are targets. Azure is not.** | R11's conformance suite covers three backends. The in-tree Azure register implementation is left alone but untested and unsupported. |
+| D4 | **Coupling is interface-mediated, and shared interfaces are preferred over concrete-class reach-through.** `serverless/` may depend on `server`; `server` may gain narrow shared interfaces; `server` may never reference `serverless/`. | Replaces the earlier "`server/` is untouched" rule. See §4 and §8.1. |
+
+D4 deserves a word, because it is a third position rather than one of the two originally offered. The
+pristine-fork rule protected upstream merges but forced the shell to consume god objects — passing a
+whole `ClusterService` into `IndicesService` so it can read two settings. The hard-fork rule fixed the
+ergonomics and gave up the merges. D4 takes the ergonomics *and* keeps the merges by making the
+coupling an interface: the awkwardness was never the edit, it was depending on a concrete class for a
+narrow capability. §8.1 shows the resulting interface set is small, and every member of it is a change
+we would be willing to send upstream on its own merits.
+
 ## 2. What was measured
 
 Every number and line reference below was read on `152bfd87536`, not assumed from public surface.
@@ -169,11 +189,22 @@ Three planes, with a hard rule about which may depend on which.
 - The shell depends on both lower planes.
 - The control plane depends on the data plane's **value types** (`ShardRouting`, `IndexMetadata`,
   `DiscoveryNodes`, `ClusterState`) and on `ClusterApplier`. Nothing else.
-- The data plane depends on **neither**. It is not modified, and it must not learn that a new shell
-  exists. Every change we are tempted to make to it is first re-examined as a shell-side change.
+- The data plane depends on **neither**, and must never learn that a new shell exists.
 
-That last rule is the one that keeps this from becoming a fork. It is also directly testable — see
-§13.2.
+Per D4, that last rule is about **direction and shape**, not about never editing `server/`:
+
+1. **Direction is absolute.** No class in `server/` may reference `org.opensearch.serverless.*`. This is
+   Gradle-enforced and CI-failing (§13.2), and it is what keeps upstream merges routine.
+2. **Shape is preferred, not mandated.** Coupling should go through a narrow shared interface — either
+   `server` declares it and `serverless` implements it (an extension point, the shape today's plugin
+   SPIs already have), or a `server` class implements an interface the shell consumes. Reaching into a
+   concrete `server` class is permitted but is the exception, and each instance is a standing candidate
+   for promotion to an interface.
+3. **Every interface added to `server` must be one we would upstream on its own merits.** If it only
+   makes sense because serverless exists, it is the wrong interface and the coupling belongs in the
+   shell.
+
+Rule 3 is the practical test that keeps rule 1 from being eroded a commit at a time.
 
 ## 5. The central move: `ClusterState` as a node-local materialized view
 
@@ -304,15 +335,18 @@ rest is spike S0's Q4.
   *an absent API is a better failure than a confidently empty one.*
 - **Stats/cat/monitoring actions.** Case by case. Default to absent until re-implemented.
 
-The commitment: the shell's REST surface is an **explicit allowlist**, not whatever happens to route.
-An unimplemented endpoint returns 501 with the reason. Nothing silently returns an empty answer.
+The commitment, confirmed as **D2**: the shell's REST surface is an **explicit allowlist**, not whatever
+happens to route. An unimplemented endpoint returns 501 with the reason. Nothing silently returns an
+empty answer. This is not a drop-in replacement for existing OpenSearch clients, and Dashboards is not
+a target — if either becomes one later, it arrives as demand-driven additions to the allowlist, not as
+a change of posture.
 
 ## 7. Module layout
 
 ```
 libs/                       unchanged
-server/                     unchanged — becomes a library dependency
-  └─ no edits on this branch without §4's re-examination
+server/                     becomes a library dependency; may gain the §8.1
+  └─ shared interfaces, and nothing else
 
 serverless/
   ├─ shell/                 ServerlessNode, bootstrap, wiring, roles, CLI
@@ -325,9 +359,10 @@ serverless/
 distribution/serverless/    its own tarball/docker image, own main class
 ```
 
-`server/` is consumed with `implementation project(':server')`. The **build enforces §4's dependency
-rule**: `serverless/*` may depend on `server`, and nothing in `server` may depend on `serverless/*`.
-That is a Gradle constraint, not a convention, and it is what prevents drift into a fork.
+`server/` is consumed with `implementation project(':server')`. The **build enforces §4's rule 1**:
+`serverless/*` may depend on `server`, and nothing in `server` may reference `org.opensearch.serverless.*`.
+That is a Gradle constraint, not a convention, and it is what prevents drift into a fork. Per D4,
+`server/` may still change — it may gain the shared interfaces of §8.1 — it simply may never point back.
 
 ## 8. The narrow interfaces
 
@@ -348,6 +383,34 @@ is introduced by this RFC — the register is the whole interface to truth.
 Note what is *not* on this list: no new SPI in `server/`, no new extension point, no core seam. All
 five live in `serverless/`. If a sixth appears, it is a signal that something is being done in the
 wrong plane.
+
+### 8.1 The shared interfaces `server` gains (D4)
+
+The god-object coupling §2.1 measured is, capability by capability, tiny. Extracting it gives four
+narrow interfaces that `ClusterService`/`ClusterApplierService` implement unchanged, and that the
+reused data plane consumes instead of the concrete classes:
+
+| Interface | Capability | Current concrete source | Consumers found in §2.1 |
+|---|---|---|---|
+| `ClusterSettingsAccessor` | `getSettings()`, `getClusterSettings()` | `ClusterService`, `ClusterApplierService` | `IndicesService` (all 14 uses), `SearchService` (:536–:607), `IndexShard` (:559) |
+| `LocalNodeProvider` | `localNode()` | `ClusterService` | `SearchService` (:777, :1371, and four more) |
+| `ClusterStateListenerRegistry` | `addListener(ClusterStateListener)` | `ClusterApplierService` | `IngestionEngine` (:173), via `EngineConfig` |
+| `MinNodeVersionSupplier` | `state().nodes().getMinNodeVersion()` | `ClusterService` | `SearchService` (:1386) |
+
+Two things worth noticing about that table.
+
+**It is an improvement to OpenSearch independent of serverless.** "`IndicesService` needs a settings
+bus, not a cluster service" is true today, on `main`, with no serverless in the picture — which is
+exactly rule 3's test, and why these are upstreamable rather than a fork tax.
+
+**It shrinks R6.** Upstream drift against four interfaces is a much smaller surface than drift against
+`ClusterService`, `ClusterApplierService` and `EngineConfig`'s concrete shapes.
+
+The one deliberate non-extraction: `EngineConfig` currently carries a whole `ClusterApplierService`
+([:126](server/src/main/java/org/opensearch/index/engine/EngineConfig.java#L126)) whose only real consumer is
+`IngestionEngine`'s `addListener(streamPoller)`. Narrowing that field to `ClusterStateListenerRegistry`
+is the single highest-value item in the table, because it is the only one reaching into the *engine*
+layer — but it changes a public builder signature, so it is sequenced after S0 rather than assumed.
 
 ## 9. Control plane: cluster state as CAS registers
 
@@ -670,7 +733,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 0 | **S0 spike** (§11) | Q1–Q3 answered in writing |
 | 1 | **Shell skeleton** | `ServerlessNode` boots, binds transport + REST, serves `GET /` and a health endpoint, exits cleanly. No indices. `MembershipSource` with the blob-lease implementation only. |
 | 2 | **Local view** | `LocalViewProjector` + `LocalOnlyPublisher`; a shard is opened from a hand-written descriptor and serves a search. S0 made durable and tested. |
-| 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store. Includes the §9.3 register map and the R11 per-provider CAS conformance suite — **the conformance suite gates every later phase**. |
+| 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store. Includes the §9.3 register map and the R11 CAS conformance suite across **Fs, S3 and GCS** (D3) — **the conformance suite gates every later phase**. |
 | 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
 | 5 | **Search path** | `search` role: reader engines over object-store segments; scale-to-zero verified by killing every search node and restarting. |
 | 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9 — including a **paused-JVM zombie test** for the §9.6 fencing rule, since kill-9 alone does not produce a zombie. |
@@ -715,12 +778,12 @@ that is zero when broken. No test asserts only the absence of an exception.
 | R3 | `action/` re-implementation is larger than §6.3 assumes | High | Allowlist + 501 caps the surface; scope grows only by explicit decision |
 | R4 | Plugins assume Guice `createComponents` | Medium | Shell implements the plugin contract without an `Injector`; the ecosystem we must support is small |
 | R5 | Two shells to maintain until parity | Medium | `server/` stays untouched, so the cost is ours alone, not upstream's |
-| R6 | Upstream drift in the data plane's internal APIs | Medium | Only four interfaces (§8); regular merge from upstream stays possible and should be routine, not a project |
+| R6 | Upstream drift in the data plane's internal APIs | Medium→Low | §8.1's extraction narrows the coupling surface to five shell interfaces plus four shared ones. Merges stay routine; D4 rule 1 is CI-enforced |
 | R7 | Snapshot/restore, security, ISM assume the old shell | Medium | Explicitly out of scope (§16); decide per feature, default absent |
 | R8 | Object-store list consistency is still unmeasured | Open | Pre-existing open item, carried in `plan-100m-index-implementation.md`; unchanged by this RFC |
 | R9 | **Zombie writer corrupts data past lease expiry** (§9.6) | **Critical** | Term-scoped key paths, so stale writes are inert rather than corrupting. Must be verified by a kill-9-with-paused-JVM test in phase 6, not by argument |
 | R10 | No watch primitive; polling cost at fleet scale (§9.5) | High | Epoch piggybacked on existing transport traffic; poll is the idle fallback. Measure GET/s at target fleet size in phase 9 |
-| R11 | Provider conditional writes are not as linearizable as assumed | **Critical** | The entire safety argument rests on this. Per-provider conformance suite (concurrent CAS contenders, exactly one winner) run against real S3/GCS/Azure, not against `FsBlobContainer` |
+| R11 | Provider conditional writes are not as linearizable as assumed | **Critical** | The entire safety argument rests on this. Conformance suite (concurrent CAS contenders, exactly one winner) run against real S3 and GCS per D3 — passing on `FsBlobContainer` proves nothing |
 | R12 | Cross-node version comparisons beyond `ReplicationTracker` (§5.3) | High | S0/Q4 enumerates by probe; each one found needs a truth-derived monotonic number, not a projection counter |
 | R13 | Gossip is a new distributed protocol, hand-built, tuned at 10⁴ nodes (§10.3) | High | Deferred to phase 8 and gated on measurement — the design must work without it first. Vendor rather than invent if it is needed |
 | R14 | Readiness mistaken for ownership on Kubernetes (§10.1, §10.2) | **Critical** | Ownership reads the shard-head. A conformance test asserts a Ready pod with an expired lease serves nothing — this is R9 wearing a different hat |
@@ -765,6 +828,8 @@ plan of record and this one is deleted.
 - Forking `server/`. Every temptation to edit it is a §4 violation until proven otherwise.
 - Depending on Kubernetes. It is one `MembershipSource` among three (§10.2); the blob-lease default
   must remain fully supported, or the system has acquired an orchestrator dependency it does not need.
+- Azure Blob support (D3). The in-tree register implementation is left in place, untested and
+  unsupported by this work; adding it later is a conformance-suite run, not a design change.
 
 ## 17. Summary
 
