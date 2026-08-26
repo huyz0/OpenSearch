@@ -1,0 +1,58 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.build'
+
+dependencies {
+  // RFC §4 rule 1: serverless may depend on server. server may never point back.
+  implementation project(':server')
+  implementation project(':libs:opensearch-common')
+  implementation project(':libs:opensearch-core')
+}
+
+// No published artifact yet — the shell has no main class until phase 1 completes.
+test.enabled = false
+
+/*
+ * RFC §4 rule 1 / §13.2 — direction is absolute and CI-enforced.
+ *
+ * serverless/ may depend on server. server may NEVER reference serverless. This is what keeps
+ * upstream merges routine; as a convention it would erode one commit at a time, so it is a task.
+ *
+ * Deliberately lives here rather than in server/build.gradle: the rule is ours to enforce, and
+ * putting it in server/ would itself be a change to server/ that upstream never asked for.
+ */
+def serverSourceDirs = [
+  file("${rootDir}/server/src/main/java"),
+  file("${rootDir}/server/src/test/java")
+]
+
+tasks.register('checkServerDoesNotReferenceServerless') {
+  description = 'Fails if any file under server/ references org.opensearch.serverless'
+  group = 'verification'
+  doLast {
+    def offenders = []
+    serverSourceDirs.each { dir ->
+      if (dir.exists()) {
+        fileTree(dir: dir, include: '**/*.java').each { f ->
+          if (f.text.contains('org.opensearch.serverless')) {
+            offenders << f.absolutePath.replace("${rootDir}/", '')
+          }
+        }
+      }
+    }
+    if (!offenders.isEmpty()) {
+      throw new GradleException(
+        "RFC §4 rule 1 violated — server/ must never reference serverless:\n  " + offenders.join("\n  ")
+      )
+    }
+    logger.lifecycle("§4 rule 1 holds: no server/ file references org.opensearch.serverless")
+  }
+}
+
+tasks.named('check').configure { dependsOn 'checkServerDoesNotReferenceServerless' }

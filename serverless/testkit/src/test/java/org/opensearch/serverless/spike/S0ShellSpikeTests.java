@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.s0;
+package org.opensearch.serverless.spike;
 
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.Version;

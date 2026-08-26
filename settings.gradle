@@ -103,6 +103,8 @@ List projects = [
   'distribution:tools:heap-prof-cli',
   'server',
   'server:cli',
+  'serverless:shell',
+  'serverless:testkit',
   'test:framework',
   'test:fixtures:azure-fixture',
   'test:fixtures:gcs-fixture',

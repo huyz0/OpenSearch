@@ -40,6 +40,7 @@ here because later sections now assume them.
 | D2 | **Allowlisted API surface, grown on demand.** Not a drop-in for existing clients or Dashboards. | §6.3 confirmed. Unimplemented endpoints return 501 with a reason — never an empty success. |
 | D3 | **Fs, S3 and GCS are targets. Azure is not.** | R11's conformance suite covers three backends. The in-tree Azure register implementation is left alone but untested and unsupported. |
 | D4 | **Coupling is interface-mediated, and shared interfaces are preferred over concrete-class reach-through.** `serverless/` may depend on `server`; `server` may gain narrow shared interfaces; `server` may never reference `serverless/`. | Replaces the earlier "`server/` is untouched" rule. See §4 and §8.1. |
+| D5 | **R11 (provider CAS conformance) is deferred.** Not cancelled — deferred. | Phases 1 and 2 are unaffected: neither touches an object store. **Phase 3 is the consequence** — it either runs against `FsBlobContainer` only and ships behind a flag that says so, or it waits. Nothing that claims durability on S3 or GCS may ship until R11 closes. |
 
 D4 deserves a word, because it is a third position rather than one of the two originally offered. The
 pristine-fork rule protected upstream merges but forced the shell to consume god objects — passing a
@@ -768,7 +769,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 0 | **S0 spike** (§11) | Q1–Q3 answered in writing |
 | 1 | **Shell skeleton** | `ServerlessNode` boots, binds transport + REST, serves `GET /` and a health endpoint, exits cleanly. No indices. `MembershipSource` with the blob-lease implementation only. |
 | 2 | **Local view** | `LocalViewProjector` + `LocalOnlyPublisher`; a shard is opened from a hand-written descriptor and serves a search. S0 made durable and tested. |
-| 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store. Includes the §9.3 register map and the R11 CAS conformance suite across **Fs, S3 and GCS** (D3) — **the conformance suite gates every later phase**. |
+| 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store, on `FsBlobContainer`. The §9.3 register map lands here. Per **D5** the R11 conformance suite is deferred; until it runs, this phase carries no S3/GCS durability claim. |
 | 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
 | 5 | **Search path** | `search` role: reader engines over object-store segments; scale-to-zero verified by killing every search node and restarting. |
 | 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9 — including a **paused-JVM zombie test** for the §9.6 fencing rule, since kill-9 alone does not produce a zombie. |
@@ -795,9 +796,15 @@ Partial mitigation: `plugins/serverless-storage/src/internalClusterTest/` alread
 IT suite against object-store-backed behaviour. Those tests encode the behaviours we care about even
 though their harness changes.
 
-### 13.2 The dependency rule is a test
-A build check asserting that no `server/` class references `org.opensearch.serverless.*` — run in CI,
-failing the build. §4's rule is worth nothing as a convention.
+### 13.2 The dependency rule is a test — **implemented**
+`:serverless:shell:checkServerDoesNotReferenceServerless`, wired into `check`. Asserts that no file
+under `server/` references `org.opensearch.serverless.*`. §4's rule is worth nothing as a convention.
+
+It deliberately lives in `serverless/shell/build.gradle` rather than `server/build.gradle`: the rule is
+ours to enforce, and putting it in `server/` would itself be a change upstream never asked for.
+
+Verified in both directions — a planted canary class under `server/` fails the build, and removing it
+passes. A check that has never been seen to fail is not a check.
 
 ### 13.3 Inherited discipline
 `HANDOFF.md`'s finding applies with more force here than where it was written: a shell with a partial
@@ -818,7 +825,7 @@ that is zero when broken. No test asserts only the absence of an exception.
 | R8 | Object-store list consistency is still unmeasured | Open | Pre-existing open item, carried in `plan-100m-index-implementation.md`; unchanged by this RFC |
 | R9 | **Zombie writer corrupts data past lease expiry** (§9.6) | **Critical** | Term-scoped key paths, so stale writes are inert rather than corrupting. Must be verified by a kill-9-with-paused-JVM test in phase 6, not by argument |
 | R10 | No watch primitive; polling cost at fleet scale (§9.5) | High | Epoch piggybacked on existing transport traffic; poll is the idle fallback. Measure GET/s at target fleet size in phase 9 |
-| R11 | Provider conditional writes are not as linearizable as assumed | **Critical** | The entire safety argument rests on this. Conformance suite (concurrent CAS contenders, exactly one winner) run against real S3 and GCS per D3 — passing on `FsBlobContainer` proves nothing |
+| R11 | Provider conditional writes are not as linearizable as assumed | **Critical — deferred by D5** | Unchanged in severity; only its timing moved. The entire safety argument still rests on it. Phase 3 may proceed on `FsBlobContainer` alone, clearly labelled as such; no durability claim against S3 or GCS is permitted until the conformance suite runs |
 | R12 | Cross-node version comparisons beyond `ReplicationTracker` (§5.3) | **Confirmed and fixed in design (S1)** | Hazard reproduced (silent ignore) and the shard-head-generation fix verified. Residual exposure: any *other* cross-node number, still unenumerated |
 | R13 | Gossip is a new distributed protocol, hand-built, tuned at 10⁴ nodes (§10.3) | High | Deferred to phase 8 and gated on measurement — the design must work without it first. Vendor rather than invent if it is needed |
 | R14 | Readiness mistaken for ownership on Kubernetes (§10.1, §10.2) | **Critical** | Ownership reads the shard-head. A conformance test asserts a Ready pod with an expired lease serves nothing — this is R9 wearing a different hat |

@@ -1,0 +1,21 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.build'
+
+dependencies {
+  implementation project(':server')
+  implementation project(':serverless:shell')
+  testImplementation project(':test:framework')
+}
+
+// Spikes (S0, S1) live here. They are disposable probes, not a regression suite —
+// see s0-findings.md and s1-findings.md.
+tasks.named('forbiddenApisMain').configure {
+  replaceSignatureFiles 'jdk-signatures'
+}

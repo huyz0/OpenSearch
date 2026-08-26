@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.s0;
+package org.opensearch.serverless.spike;
 
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
