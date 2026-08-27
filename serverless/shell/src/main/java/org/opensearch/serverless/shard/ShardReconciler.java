@@ -162,6 +162,13 @@ public final class ShardReconciler {
         if (indexService == null) {
             indexService = indicesService.createIndex(indexMetadata, Collections.emptyList(), false);
             indexService.updateMapping(null, indexMetadata);
+        } else {
+            // The IndexService is created once per index but shards arrive one at a time, so by the time
+            // the second shard opens its metadata is stale -- in particular its per-shard primary terms.
+            // A shard created from stale metadata starts at the old term and then gets updateShardState
+            // at the new one, which the data plane rejects: "term is only increased as part of primary
+            // promotion". Found by the first multi-shard test; every earlier one had a single shard.
+            indexService.updateMetadata(indexService.getMetadata(), indexMetadata);
         }
 
         // Whether anything was published decides the recovery source, and the decision must be made

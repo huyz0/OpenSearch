@@ -39,6 +39,7 @@ public final class ShardHeadStore {
     private final BlobContainer container;
     private final LongSupplier clock;
     private final long leaseTtlMillis;
+    private final LivenessOracle oracle;
 
     /**
      * Creates a store.
@@ -48,9 +49,41 @@ public final class ShardHeadStore {
      * @param leaseTtlMillis how far ahead an acquisition or renewal stamps its lease
      */
     public ShardHeadStore(BlobContainer container, LongSupplier clock, long leaseTtlMillis) {
+        this(container, clock, leaseTtlMillis, null);
+    }
+
+    /**
+     * Creates a store whose liveness comes from node leases rather than from per-head expiry.
+     *
+     * <p>This is §7's batching. Without an oracle each head carries its own expiry and every one must be
+     * rewritten to stay alive; with one, a head is held for as long as its owner is, and a node renews
+     * once however many shards it holds. Phase 8's measurement is what says the difference is worth
+     * having: the per-shard write was the whole of the steady-state write cost.
+     *
+     * @param container the container holding the {@code shards/} prefix
+     * @param clock source of wall-clock millis
+     * @param leaseTtlMillis how far ahead an acquisition stamps its lease, still recorded for diagnosis
+     * @param oracle answers whether an owner is alive, or null for per-head expiry
+     */
+    public ShardHeadStore(BlobContainer container, LongSupplier clock, long leaseTtlMillis, LivenessOracle oracle) {
         this.container = container;
         this.clock = clock;
         this.leaseTtlMillis = leaseTtlMillis;
+        this.oracle = oracle;
+    }
+
+    /**
+     * Reports whether a head is currently held, by whichever liveness rule this store was built with.
+     *
+     * @param head the head to judge
+     * @param nowMillis the observer's clock
+     * @return true when the head has a live owner
+     */
+    public boolean isHeld(ShardHead head, long nowMillis) {
+        if (oracle == null) {
+            return head.isHeldAt(nowMillis);
+        }
+        return head.ownerNodeId() != null && oracle.isLive(head.ownerNodeId(), head.ownerEphemeralId());
     }
 
     /**
@@ -105,7 +138,7 @@ public final class ShardHeadStore {
         try (InputStream in = existing.get().value().streamInput()) {
             current = ShardHead.fromStream(in);
         }
-        if (current.isHeldAt(now) && nodeId.equals(current.ownerNodeId()) == false) {
+        if (isHeld(current, now) && nodeId.equals(current.ownerNodeId()) == false) {
             return Acquisition.heldByAnother(current);
         }
 

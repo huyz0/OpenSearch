@@ -578,15 +578,38 @@ public final class ServerlessNode implements Closeable {
         throws Exception {
         ensureStarted();
         final java.util.Set<org.opensearch.core.index.shard.ShardId> released = new java.util.LinkedHashSet<>();
+
+        if (plane.usesNodeLeaseLiveness()) {
+            // §7's batching: one renewal covers every shard this node holds, however many that is.
+            plane.membership()
+                .renew(
+                    new org.opensearch.serverless.membership.NodeLease(
+                        localNode.getId(),
+                        localNode.getEphemeralId(),
+                        localNode.getAddress().toString(),
+                        roles,
+                        0L
+                    )
+                );
+        }
+
         for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
             if (reconciler.readerShards().contains(shardId)) {
                 // Readers hold no lease, so there is nothing to renew and nothing to lose.
                 continue;
             }
-            if (plane.heads().renew(shardId.getIndexName(), shardId.id(), localNode.getId()).isEmpty()) {
-                reconciler.releaseShard(shardId, "lease lost: the shard-head no longer names " + nodeName);
-                released.add(shardId);
+            if (plane.usesNodeLeaseLiveness()) {
+                // The head still needs reading, because losing a shard is something only the head can
+                // tell us -- but it is a read, not a write, and that is the whole saving.
+                final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+                if (head.isPresent() && localNode.getId().equals(head.get().ownerNodeId())) {
+                    continue;
+                }
+            } else if (plane.heads().renew(shardId.getIndexName(), shardId.id(), localNode.getId()).isPresent()) {
+                continue;
             }
+            reconciler.releaseShard(shardId, "lease lost: the shard-head no longer names " + nodeName);
+            released.add(shardId);
         }
         return released;
     }

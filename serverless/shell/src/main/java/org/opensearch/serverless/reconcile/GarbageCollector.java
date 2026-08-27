@@ -117,6 +117,57 @@ public final class GarbageCollector {
         return deleted;
     }
 
+    /**
+     * Sweeps every shard of every index.
+     *
+     * <p>A listing plus one pass per shard. At the scale this design targets that is the wrong shape —
+     * a sweep proportional to the whole population is exactly what the metadata plane exists to avoid —
+     * and the right answer is a sharded sweep with each worker taking a slice by hash. This is the
+     * honest small-deployment version, and it is named as such rather than presented as the design.
+     *
+     * @param plane the metadata plane
+     * @return blob names deleted, keyed by {@code index#shard}
+     * @throws IOException if listing or deleting fails
+     */
+    public Map<String, List<String>> collectAll(MetadataPlane plane) throws IOException {
+        final Map<String, List<String>> deleted = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, org.opensearch.serverless.cluster.IndexDescriptor> index : plane.descriptors().listAll().entrySet()) {
+            for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
+                final List<String> orphans = collectShard(plane, index.getKey(), shard);
+                if (orphans.isEmpty() == false) {
+                    deleted.put(index.getKey() + "#" + shard, orphans);
+                }
+            }
+        }
+        return deleted;
+    }
+
+    /**
+     * Removes node leases that have expired.
+     *
+     * <p>Tidiness rather than correctness: an expired lease is already filtered out on read, so leaving
+     * it changes no answer. It is collected because a deployment that has cycled through nodes for a
+     * year should not have to list a year of dead ones to find the live few.
+     *
+     * @param plane the metadata plane
+     * @param nowMillis the observer's clock
+     * @return the node ids whose leases were removed
+     * @throws IOException if listing or deleting fails
+     */
+    public List<String> collectExpiredLeases(MetadataPlane plane, long nowMillis) throws IOException {
+        final BlobContainer members = blobStore.blobContainer(RegisterMap.members(base));
+        final List<String> removed = new ArrayList<>();
+        for (String blobName : members.listBlobsByPrefix(org.opensearch.serverless.membership.BlobLeaseMembership.LEASE_PREFIX).keySet()) {
+            final String nodeId = blobName.substring(org.opensearch.serverless.membership.BlobLeaseMembership.LEASE_PREFIX.length());
+            final var lease = plane.membership().read(nodeId);
+            if (lease.isPresent() && lease.get().isExpiredAt(nowMillis)) {
+                members.deleteBlobsIgnoringIfNotExists(List.of(blobName));
+                removed.add(nodeId);
+            }
+        }
+        return removed;
+    }
+
     private static Long parseTerm(String containerName) {
         if (containerName.startsWith("t=") == false) {
             return null;

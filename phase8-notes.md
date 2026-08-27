@@ -88,13 +88,59 @@ one shard. It counts operations, not latency, not throttling, and not what a pro
 issuing 3 × 10⁶ req/s. Phase 7's REST traffic, which §10.3 expected to be part of this evidence, is not
 in it at all.
 
-## What phase 8 does NOT establish
+## Follow-up: three of these gaps are now closed
+
+Written after the fact, when phase 8 was revisited. The measurement above is what made the first one
+worth doing, so it is recorded here rather than in a separate document.
+
+### §7's batched lease renewal — built, and re-measured
+
+A shard-head no longer has to carry its own expiry. `MetadataPlane(..., nodeLeaseLiveness = true)` gives
+`ShardHeadStore` a `LivenessOracle`, and a head is then held for exactly as long as its owner's node
+lease is. One renewal covers every shard the node holds.
+
+Re-measured at 4 shards, reads and writes separated because only the writes were ever the claim:
+
+| Mode | Reads/tick | Writes/tick |
+|---|---|---|
+| Per-shard expiry | 8 | **4** — one per shard |
+| Node-lease liveness | 8 | **1** — one per node |
+
+Writes stopped scaling with shard count, which is the whole of §7. Reads did not, and are not claimed
+to: losing a shard is something only its head can tell you, so a node still reads each one. Turning that
+into a push is what gossip would be for, and the gate above is unchanged.
+
+The oracle takes the owner's **ephemeral id** as well as its node id. A node that restarted has the same
+name and a new process, and treating it as alive would hand a shard back to something with no idea it
+ever held one. Tested directly.
+
+### A bug the multi-shard tests found
+
+Every test before this held a single shard, which hid a real defect: `IndexService` is created once per
+index but shards arrive one at a time, so by the second shard its metadata — including per-shard primary
+terms — was stale. The shard opened at the old term and `updateShardState` then rejected the new one
+with *"term is only increased as part of primary promotion"*. The reconciler now refreshes index
+metadata before opening a subsequent shard.
+
+Worth noting how it was found: not by review, but by the first test that happened to want four shards.
+
+### GC sweep and lease tidying
+
+`collectAll(plane)` sweeps every shard of every index, and `collectExpiredLeases` removes dead node
+leases. The sweep is explicitly the small-deployment shape — a pass proportional to the whole population
+is exactly what the metadata plane exists to avoid, and the right answer is a sharded sweep with each
+worker taking a slice by hash. Named as such rather than presented as the design.
+
+Lease tidying is tidiness, not correctness: an expired lease is already filtered on read, so leaving it
+changes no answer. It is collected so a deployment that has cycled nodes for a year does not list a
+year of dead ones to find the live few.
+
+## What phase 8 still does NOT establish
 
 - **Ticks are called, not scheduled** — same as phase 6. A timer would make every test time-dependent.
-- **No lease-renewal batching**, though the measurement now says exactly what it is worth.
-- **GC is per-shard and manual.** Nothing sweeps the deployment; a caller names a shard.
-- **Expired node leases are not collected.** Harmless (they are filtered on read), so it is tidiness
-  rather than correctness, and not done.
+- **The batched path is opt-in**, and every earlier test still runs on per-head expiry. Both paths are
+  live, which is one more thing than a finished system should have.
+- **The sweep is not sharded**, per above.
 - **No gossip**, by the gate above rather than by omission.
 - **Nothing about S3 or GCS** (D5/R11), unchanged — and the gossip measurement is exactly the sort of
   thing R11 would change the shape of.

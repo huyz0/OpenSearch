@@ -39,7 +39,8 @@ public final class MetadataPlane {
 
     private final DescriptorStore descriptors;
     private final ShardHeadStore heads;
-    private final BlobLeaseMembership membership;
+    private final BlobLeaseMembership membershipField;
+    private final boolean nodeLeaseLiveness;
     private final BlobStore blobStore;
     private final BlobPath base;
 
@@ -52,11 +53,57 @@ public final class MetadataPlane {
      * @param leaseTtlMillis lease duration for shard-heads and node leases
      */
     public MetadataPlane(BlobStore blobStore, BlobPath base, LongSupplier clock, long leaseTtlMillis) {
+        this(blobStore, base, clock, leaseTtlMillis, false);
+    }
+
+    /**
+     * Creates a metadata plane, optionally with §7's batched liveness.
+     *
+     * <p>With {@code nodeLeaseLiveness}, a shard-head is held for as long as its owner's node lease is,
+     * so a node renews once rather than once per shard. Phase 8 measured the difference this makes:
+     * the per-shard renewal was the entire steady-state write cost.
+     *
+     * @param blobStore the backing store
+     * @param base the deployment's base path within it
+     * @param clock source of wall-clock millis
+     * @param leaseTtlMillis lease duration
+     * @param nodeLeaseLiveness true to derive shard liveness from node leases
+     */
+    public MetadataPlane(BlobStore blobStore, BlobPath base, LongSupplier clock, long leaseTtlMillis, boolean nodeLeaseLiveness) {
+        this.nodeLeaseLiveness = nodeLeaseLiveness;
         this.descriptors = new DescriptorStore(blobStore.blobContainer(RegisterMap.indices(base)));
-        this.heads = new ShardHeadStore(blobStore.blobContainer(RegisterMap.shards(base)), clock, leaseTtlMillis);
-        this.membership = new BlobLeaseMembership(blobStore.blobContainer(RegisterMap.members(base)), clock, leaseTtlMillis);
+        final BlobLeaseMembership leases = new BlobLeaseMembership(
+            blobStore.blobContainer(RegisterMap.members(base)),
+            clock,
+            leaseTtlMillis
+        );
+        final LivenessOracle oracle = nodeLeaseLiveness ? (nodeId, ephemeralId) -> {
+            try {
+                final var lease = leases.read(nodeId);
+                // An ephemeral id that has moved on means the process that took the shard is gone, even
+                // though a node with the same name is back. It does not inherit the claim.
+                return lease.isPresent()
+                    && lease.get().isExpiredAt(clock.getAsLong()) == false
+                    && (ephemeralId == null || ephemeralId.equals(lease.get().ephemeralId()));
+            } catch (java.io.IOException e) {
+                // Unreadable is not "dead": refusing to acquire is the safe answer, since the cost is a
+                // retry and the cost of the alternative is two writers.
+                return true;
+            }
+        } : null;
+        this.heads = new ShardHeadStore(blobStore.blobContainer(RegisterMap.shards(base)), clock, leaseTtlMillis, oracle);
+        this.membershipField = leases;
         this.blobStore = blobStore;
         this.base = base;
+    }
+
+    /**
+     * Reports whether shard liveness is derived from node leases.
+     *
+     * @return true when §7's batching is in effect
+     */
+    public boolean usesNodeLeaseLiveness() {
+        return nodeLeaseLiveness;
     }
 
     /**
@@ -183,6 +230,6 @@ public final class MetadataPlane {
      * @return the membership source
      */
     public BlobLeaseMembership membership() {
-        return membership;
+        return membershipField;
     }
 }

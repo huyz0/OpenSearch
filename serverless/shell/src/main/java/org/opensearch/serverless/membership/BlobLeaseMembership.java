@@ -114,6 +114,27 @@ public final class BlobLeaseMembership implements MembershipSource {
         ownGeneration = BlobRegister.ABSENT_GENERATION;
     }
 
+    /**
+     * Reads one node's lease directly, without a listing.
+     *
+     * <p>Used to answer liveness at activation time, where freshness matters more than the cost of a
+     * read: taking a shard from a node that is actually alive is the one mistake the whole protocol
+     * exists to prevent.
+     *
+     * @param nodeId the node
+     * @return its lease, or empty if absent or unreadable
+     * @throws IOException if the register cannot be read
+     */
+    public Optional<NodeLease> read(String nodeId) throws IOException {
+        final Optional<BlobRegister> register = container.readRegister(LEASE_PREFIX + nodeId);
+        if (register.isEmpty()) {
+            return Optional.empty();
+        }
+        try (InputStream in = register.get().value().streamInput()) {
+            return Optional.of(NodeLease.fromStream(in));
+        }
+    }
+
     @Override
     public Set<NodeLease> current() {
         return observed;
