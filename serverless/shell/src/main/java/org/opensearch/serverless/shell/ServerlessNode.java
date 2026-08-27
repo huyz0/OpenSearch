@@ -609,6 +609,9 @@ public final class ServerlessNode implements Closeable {
                 continue;
             }
             reconciler.releaseShard(shardId, "lease lost: the shard-head no longer names " + nodeName);
+            // Drop the claim too. Leaving it is safe -- it is verified on read -- but a node that has
+            // churned through shards for a year should not list a year of them to find today's.
+            plane.forgetAssignment(localNode.getId(), shardId.getIndexName(), shardId.id());
             released.add(shardId);
         }
         return released;

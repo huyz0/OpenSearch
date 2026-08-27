@@ -91,6 +91,37 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns the container path listing the shards one node owns.
+     *
+     * <p>Added in phase 9, because measurement showed {@code truthFor} was reading every descriptor in
+     * the deployment to find the handful a node hosts: 401 object-store operations at 200 indices and
+     * 2,001 at 1,000, on the steady-state path, on every node, forever. That is the O(population) sweep
+     * this whole architecture exists to remove, reintroduced in its own code.
+     *
+     * <p>The listing is a <b>hint, not truth</b>. A shard-head remains the only thing that says who owns
+     * a shard; this only narrows the search from "every index" to "the ones this node last claimed", and
+     * every entry is verified against its head before being believed.
+     *
+     * @param base the deployment's base path
+     * @param nodeId the node
+     * @return the assignments container path
+     */
+    public static BlobPath assignments(BlobPath base, String nodeId) {
+        return base.add("assignments").add(nodeId);
+    }
+
+    /**
+     * Returns the blob name of an assignment within a node's assignments container.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @return the blob name
+     */
+    public static String assignmentBlob(String indexName, int shardId) {
+        return indexName + SHARD_SEPARATOR + shardId;
+    }
+
+    /**
      * Returns the blob name of an index descriptor within the descriptors container.
      *
      * @param indexName the index

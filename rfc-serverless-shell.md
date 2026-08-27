@@ -727,6 +727,13 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
+> **Phase 9 is complete (2026-08-27).** Creation cost is flat in the population — one object-store write
+> per create at every population measured — and node residency tracks the working set. The phase also
+> found what it was for: `truthFor` was doing an O(population) sweep on the steady-state path, 2N+1
+> operations per tick per node, invisible to eight phases of tests that each had a handful of indices.
+> A per-node assignment listing takes it to 3 operations regardless of population, and the listing is a
+> hint that the shard-head still overrules. See [`phase9-notes.md`](phase9-notes.md).
+>
 > **Phase 7 is complete for the admin surface (2026-08-27), built after phase 8.** Index lifecycle and
 > catalog endpoints served from the metadata plane, with `never_activated` distinguished from `unowned`
 > and `/_serverless/nodes` labelled as this node's observation rather than a cluster fact. The data
@@ -825,7 +832,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 6 | **Activation & failover** | ✅ **COMPLETE.** `activateWriter` (CAS, losing returns empty not an error) and `heartbeat` (renew what is held, release what is lost). kill-9 loses no published data. The paused-JVM zombie test walks the full sequence and separates fencing from the WAL gap. 56 tests; all three claims canary-verified. See [`phase6-notes.md`](phase6-notes.md). |
 | 7 | **Surface** | ✅ **COMPLETE (admin only).** `PUT/GET/DELETE /{index}` plus `/_serverless/{indices,shards,nodes}`, each one or two object-store reads. Absent, duplicate and unconfigured are 404/400/503 — never an empty 200; classic endpoints still 501. Both D2 properties canary-verified, and wildcard shadowing tested. **No document APIs** (`_doc`, `_bulk`, `_search`). 65 tests. See [`phase7-notes.md`](phase7-notes.md). |
 | 8 | **Gossip & reconcilers** | ✅ **COMPLETE (gossip not built, by the gate).** `BackgroundReconciler` closes phase 6's gap: a tick releases what was lost and re-acquires automatically. `GarbageCollector` collects a zombie's orphans while keeping inherited files — both rules canary-verified. `RoutingHints` are soft state that stay wrong until refreshed. Gossip gate answered with a measurement: **3.0 ops/tick/shard**, the write being per-shard lease renewal. **§7 batching then built and re-measured: writes fell from one-per-shard to one-per-node** (4→1 at 4 shards). Deployment sweep and lease tidying added. 70 tests. See [`phase8-notes.md`](phase8-notes.md). |
-| 9 | **Scale validation** | The `plan-100m-index-implementation.md` targets re-measured on this shell. |
+| 9 | **Scale validation** | ✅ **COMPLETE.** Creation measured flat: **1 op/create, times unchanged from 0 to 1,500 indices** (classic: 7.4→98.8 ms). Residency tracks the working set. **Found `truthFor` was O(population)** — 401 ops at 200 indices, 2,001 at 1,000, on every tick — and fixed it with a per-node assignment listing: **3 ops at both**. Listing is a hint; the head still decides, canary-verified. 75 tests. See [`phase9-notes.md`](phase9-notes.md). |
 
 Phases 1–2 are the ones that decide whether this is a two-quarter project or a two-year one. Treat
 their estimates as unknown until phase 2 lands.

@@ -173,7 +173,30 @@ public final class MetadataPlane {
      * @throws IOException if the register cannot be read or written
      */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId) throws IOException {
-        return heads.acquire(indexName, shardId, nodeId, ephemeralId);
+        final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId);
+        if (acquisition.acquired()) {
+            // Record the claim so this node can find it again without reading the world. Written after
+            // the compare-and-swap, never before: if the process dies in between, the node simply does
+            // not see the shard on its next read and re-acquires, which self-heals. Writing it first
+            // would instead advertise a claim that was never won.
+            blobStore.blobContainer(RegisterMap.assignments(base, nodeId))
+                .writeBlob(RegisterMap.assignmentBlob(indexName, shardId), new java.io.ByteArrayInputStream(new byte[0]), 0L, false);
+        }
+        return acquisition;
+    }
+
+    /**
+     * Forgets a node's claim on a shard. Idempotent, and safe to skip — a stale entry costs one wasted
+     * head read, because every entry is verified before it is believed.
+     *
+     * @param nodeId the node
+     * @param indexName the index
+     * @param shardId the shard number
+     * @throws IOException if the delete fails
+     */
+    public void forgetAssignment(String nodeId, String indexName, int shardId) throws IOException {
+        blobStore.blobContainer(RegisterMap.assignments(base, nodeId))
+            .deleteBlobsIgnoringIfNotExists(java.util.List.of(RegisterMap.assignmentBlob(indexName, shardId)));
     }
 
     /**
@@ -187,21 +210,42 @@ public final class MetadataPlane {
      * @throws IOException if the object store cannot be read
      */
     public Truth truthFor(String nodeId) throws IOException {
-        final Map<String, IndexDescriptor> all = descriptors.listAll();
         final Map<String, IndexDescriptor> hosted = new LinkedHashMap<>();
         final List<ShardAssignment> assignments = new ArrayList<>();
 
-        for (IndexDescriptor descriptor : all.values()) {
-            for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
-                final Optional<ShardHead> head = heads.read(descriptor.name(), shard);
-                if (head.isEmpty() || nodeId.equals(head.get().ownerNodeId()) == false) {
-                    continue;
-                }
-                // The term comes from the head, which is the one monotonic number every node touching
-                // this shard agrees on. Never a per-node counter — see s1-findings.md.
-                assignments.add(new ShardAssignment(descriptor.name(), shard, head.get().term()));
-                hosted.put(descriptor.name(), descriptor);
+        // One listing of this node's own claims, rather than a sweep of every index in the deployment.
+        // Phase 9 measured the difference: the old form cost 2N+1 operations in the population, on the
+        // steady-state path, on every node -- the exact O(population) shape this design exists to remove.
+        for (String claim : blobStore.blobContainer(RegisterMap.assignments(base, nodeId)).listBlobs().keySet()) {
+            final int separator = claim.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
+            if (separator < 0) {
+                continue;
             }
+            final String indexName = claim.substring(0, separator);
+            final int shard;
+            try {
+                shard = Integer.parseInt(claim.substring(separator + RegisterMap.SHARD_SEPARATOR.length()));
+            } catch (NumberFormatException e) {
+                continue;
+            }
+
+            // The claim is only a hint. The head decides, so a stale entry costs one read and is then
+            // ignored -- which is what makes it safe for the listing to lag reality.
+            final Optional<ShardHead> head = heads.read(indexName, shard);
+            if (head.isEmpty() || nodeId.equals(head.get().ownerNodeId()) == false) {
+                continue;
+            }
+            final Optional<IndexDescriptor> descriptor = hosted.containsKey(indexName)
+                ? Optional.of(hosted.get(indexName))
+                : descriptors.get(indexName);
+            if (descriptor.isEmpty()) {
+                // The index was deleted underneath us. Not an error: the shard is going away too.
+                continue;
+            }
+            // The term comes from the head, which is the one monotonic number every node touching this
+            // shard agrees on. Never a per-node counter -- see s1-findings.md.
+            assignments.add(new ShardAssignment(indexName, shard, head.get().term()));
+            hosted.put(indexName, descriptor.get());
         }
         return new Truth(hosted.values(), assignments);
     }
