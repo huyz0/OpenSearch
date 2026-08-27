@@ -11,9 +11,18 @@ package org.opensearch.serverless.cluster;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.xcontent.DeprecationHandler;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.indices.replication.common.ReplicationType;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -113,6 +122,126 @@ public final class IndexDescriptor {
             builder.primaryTerm(shard, primaryTerms.getOrDefault(shard, 1L));
         }
         return builder.build();
+    }
+
+    /**
+     * Returns the extra settings layered over the defaults.
+     *
+     * @return the settings
+     */
+    public Settings extraSettings() {
+        return extraSettings;
+    }
+
+    /**
+     * Returns the mapping source, or null.
+     *
+     * @return the mapping
+     */
+    public String mapping() {
+        return mapping;
+    }
+
+    /**
+     * Serializes this descriptor as the bytes of its register.
+     *
+     * <p>JSON rather than a binary form on purpose: a descriptor is the record an operator reaches for
+     * when something has gone wrong, and being able to read it with the object store's own console is
+     * worth more than the bytes it costs.
+     *
+     * @return the serialized descriptor
+     * @throws IOException if serialization fails
+     */
+    public BytesReference toBytes() throws IOException {
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+            builder.startObject();
+            builder.field("name", name);
+            builder.field("uuid", uuid);
+            builder.field("number_of_shards", numberOfShards);
+            if (mapping != null) {
+                builder.field("mapping", mapping);
+            }
+            builder.startObject("settings");
+            for (String key : extraSettings.keySet()) {
+                builder.field(key, extraSettings.get(key));
+            }
+            builder.endObject();
+            builder.endObject();
+            return BytesReference.bytes(builder);
+        }
+    }
+
+    /**
+     * Parses a descriptor from its register bytes.
+     *
+     * @param input the serialized descriptor
+     * @return the parsed descriptor
+     * @throws IOException if the bytes are not a well-formed descriptor
+     */
+    public static IndexDescriptor fromStream(InputStream input) throws IOException {
+        try (
+            XContentParser parser = XContentType.JSON.xContent()
+                .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
+        ) {
+            String name = null;
+            String uuid = null;
+            String mapping = null;
+            int shards = -1;
+            final Map<String, String> settings = new LinkedHashMap<>();
+            String field = null;
+            XContentParser.Token token;
+            while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
+                if (token == XContentParser.Token.FIELD_NAME) {
+                    field = parser.currentName();
+                } else if (token == XContentParser.Token.START_OBJECT && "settings".equals(field)) {
+                    String settingKey = null;
+                    XContentParser.Token inner;
+                    while ((inner = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                        if (inner == XContentParser.Token.FIELD_NAME) {
+                            settingKey = parser.currentName();
+                        } else if (inner.isValue() && settingKey != null) {
+                            settings.put(settingKey, parser.text());
+                        }
+                    }
+                } else if (token.isValue()) {
+                    switch (field == null ? "" : field) {
+                        case "name" -> name = parser.text();
+                        case "uuid" -> uuid = parser.text();
+                        case "mapping" -> mapping = parser.text();
+                        case "number_of_shards" -> shards = parser.intValue();
+                        default -> {
+                            // forward compatibility: a newer node may write fields we do not know
+                        }
+                    }
+                }
+            }
+            if (name == null || uuid == null || shards < 1) {
+                throw new IOException("malformed index descriptor: missing a required field");
+            }
+            final Settings.Builder extra = Settings.builder();
+            settings.forEach(extra::put);
+            return new IndexDescriptor(name, uuid, shards, mapping, extra.build());
+        }
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o instanceof IndexDescriptor other) {
+            return numberOfShards == other.numberOfShards
+                && name.equals(other.name)
+                && uuid.equals(other.uuid)
+                && Objects.equals(mapping, other.mapping)
+                && extraSettings.equals(other.extraSettings);
+        }
+        return false;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings);
     }
 
     @Override

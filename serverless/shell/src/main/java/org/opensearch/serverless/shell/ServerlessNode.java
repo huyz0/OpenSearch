@@ -13,6 +13,7 @@ import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.NodeConnectionsService;
 import org.opensearch.cluster.block.ClusterBlocks;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
@@ -406,6 +407,44 @@ public final class ServerlessNode implements Closeable {
         final ClusterState view = projector.project(descriptors, owned);
         applyLocalView(view, () -> 30_000L);
         return reconciler.ensureOpen(view, owned);
+    }
+
+    /**
+     * Reads this node's truth from the metadata plane and applies it.
+     *
+     * <p>This is the whole steady-state loop, and it replaces cluster-state publication: no node tells
+     * this one what to serve, it reads the object store and works it out. Phase 8 puts this on a timer
+     * and wakes it early on a gossip epoch; phase 3 calls it explicitly.
+     *
+     * @param plane the metadata plane to read from
+     * @return the shards opened by this call
+     * @throws Exception if reading, projection or shard opening fails
+     */
+    public java.util.Set<org.opensearch.core.index.shard.ShardId> syncFrom(org.opensearch.serverless.metadata.MetadataPlane plane)
+        throws Exception {
+        ensureStarted();
+        final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId());
+        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(truth.descriptors(), truth.assignments());
+
+        // Closing here is NOT the rule §5.2 forbids, and the difference is the input, not the code.
+        // ShardReconciler refuses to close on absence from a projected *view* because a view is a local
+        // computation that can be wrong or incomplete. This set comes from shard-heads: if truth no
+        // longer assigns a shard to this node, another node has already won it by compare-and-swap, and
+        // continuing to hold it is the actual hazard. Hence the two entry points and their two inputs:
+        // applyTruth takes a view and never closes; syncFrom takes truth and may.
+        final java.util.Set<org.opensearch.core.index.shard.ShardId> stillOwned = new java.util.HashSet<>();
+        for (ShardAssignment assignment : truth.assignments()) {
+            final IndexMetadata metadata = clusterService.state().metadata().index(assignment.indexName());
+            if (metadata != null) {
+                stillOwned.add(new org.opensearch.core.index.shard.ShardId(metadata.getIndex(), assignment.shardId()));
+            }
+        }
+        for (org.opensearch.core.index.shard.ShardId held : reconciler.openShards()) {
+            if (stillOwned.contains(held) == false) {
+                reconciler.releaseShard(held, "shard-head no longer assigns this shard to " + nodeName);
+            }
+        }
+        return opened;
     }
 
     /**

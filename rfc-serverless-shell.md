@@ -727,6 +727,12 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
+> **Phase 3 is complete (2026-08-27).** An index is created in the object store with one put-if-absent,
+> a shard is activated with one compare-and-swap, and `node.syncFrom(plane)` makes a node work out what
+> to serve with nothing telling it. 40 tests. Both safety claims — exactly one winner under contention,
+> and a live lease is never stolen — were verified by planting canaries and watching them fail. Scope
+> limits and what this does *not* establish are in [`phase3-notes.md`](phase3-notes.md).
+>
 > **Phase 2 is complete (2026-08-27).** `node.applyTruth(descriptors, assignments)` projects a
 > node-local view, applies it, and opens every owned shard, which then serves a search. §5.2's
 > invariant lives in `ShardReconciler`'s shape — there is no method that closes what a view omits — and
@@ -783,7 +789,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 0 | **S0 spike** (§11) | Q1–Q3 answered in writing |
 | 1 | **Shell skeleton** | ✅ **COMPLETE.** `ServerlessNode` boots, binds netty4 transport + HTTP on real ports, serves `GET /` and `GET /_serverless/health`, and releases its port on shutdown. `MembershipSource`/`BlobLeaseMembership` landed and read by the health endpoint. D2 enforced with explicit 501s. 20 tests; `check` green on both projects including the §13.2 direction rule. |
 | 2 | **Local view** | ✅ **COMPLETE.** `IndexDescriptor`/`ShardAssignment` truth records, `LocalViewProjector`, and `ShardReconciler` — the replacement for `IndicesClusterStateService`. A shard opens from a descriptor and serves a search through production code. §5.2's invariant is structural and verified by a planted canary. 26 tests. |
-| 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store, on `FsBlobContainer`. The §9.3 register map lands here. Per **D5** the R11 conformance suite is deferred; until it runs, this phase carries no S3/GCS durability claim. |
+| 3 | **Metadata plane** | ✅ **COMPLETE.** `DescriptorStore`, `ShardHeadStore`, `MetadataPlane`, and the §9.3 register map. Create-index is one put-if-absent; activation is one CAS; `node.syncFrom(plane)` replaces cluster-state publication. 40 tests; both CAS safety claims verified by planted canaries. Per **D5**, `FsBlobContainer` only — no S3/GCS durability claim. See [`phase3-notes.md`](phase3-notes.md). |
 | 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
 | 5 | **Search path** | `search` role: reader engines over object-store segments; scale-to-zero verified by killing every search node and restarting. |
 | 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9 — including a **paused-JVM zombie test** for the §9.6 fencing rule, since kill-9 alone does not produce a zombie. |
