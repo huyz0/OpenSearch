@@ -19,6 +19,8 @@ import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterApplier;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.network.NetworkModule;
+import org.opensearch.common.network.NetworkService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
@@ -33,20 +35,33 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.gateway.MetaStateService;
+import org.opensearch.http.HttpServerTransport;
 import org.opensearch.index.analysis.AnalysisRegistry;
 import org.opensearch.indices.IndicesModule;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.plugins.PluginsService;
+import org.opensearch.rest.RestController;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.fetch.FetchPhase;
 import org.opensearch.search.query.QueryPhase;
+import org.opensearch.serverless.membership.MembershipSource;
+import org.opensearch.serverless.rest.NotImplementedHandler;
+import org.opensearch.serverless.rest.ServerlessHealthHandler;
+import org.opensearch.serverless.rest.ServerlessRootHandler;
+import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.Netty4ModulePlugin;
+import org.opensearch.transport.Transport;
+import org.opensearch.transport.TransportService;
+import org.opensearch.transport.client.node.NodeClient;
+import org.opensearch.usage.UsageService;
 
 import java.io.Closeable;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -78,7 +93,12 @@ public final class ServerlessNode implements Closeable {
     private final ClusterService clusterService;
     private final IndicesService indicesService;
     private final SearchService searchService;
-    private final DiscoveryNode localNode;
+    private final RestController restController;
+    private final TransportService transportService;
+    private final HttpServerTransport httpServerTransport;
+    private final NodeClient nodeClient;
+    private volatile DiscoveryNode localNode;
+    private volatile MembershipSource membershipSource;
     private volatile boolean started;
 
     /**
@@ -88,7 +108,8 @@ public final class ServerlessNode implements Closeable {
      * @throws Exception if the node environment cannot be created or the data plane cannot be built
      */
     public ServerlessNode(Settings settings) throws Exception {
-        this.settings = settings;
+        this.settings = withShellDefaults(settings);
+        settings = this.settings;
         this.nodeName = settings.get("node.name", "serverless-node");
         final Environment environment = new Environment(settings, null);
         final ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
@@ -108,12 +129,51 @@ public final class ServerlessNode implements Closeable {
             this.clusterService = buildClusterService(clusterSettings);
             this.indicesService = buildIndicesService(environment, clusterSettings);
             this.searchService = buildSearchService(clusterSettings);
+
+            this.nodeClient = new NodeClient(settings, threadPool);
+            this.restController = buildRestController();
+            final NetworkModule networkModule = buildNetworkModule(clusterSettings);
+            final Transport transport = networkModule.getTransportSupplier().get();
+            this.transportService = new TransportService(
+                settings,
+                transport,
+                null,
+                threadPool,
+                networkModule.getTransportInterceptor(),
+                boundAddress -> new DiscoveryNode(
+                    nodeName,
+                    nodeEnvironment.nodeId(),
+                    boundAddress.publishAddress(),
+                    emptyMap(),
+                    DiscoveryNodeRole.BUILT_IN_ROLES,
+                    Version.CURRENT
+                ),
+                clusterSettings,
+                Set.of(),
+                NoopTracer.INSTANCE
+            );
+            this.httpServerTransport = networkModule.getHttpServerTransportSupplier().get();
             success = true;
         } finally {
             if (success == false) {
                 ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
             }
         }
+    }
+
+    /**
+     * Layers the shell's own transport choice under whatever the caller supplied.
+     *
+     * <p>A classic node discovers its transport through the plugin system and then fails at runtime if
+     * nothing set {@code transport.type}. The shell supports exactly one transport, so leaving that as a
+     * lookup with a single possible answer only creates a way to misconfigure it.
+     */
+    private static Settings withShellDefaults(Settings supplied) {
+        return Settings.builder()
+            .put(NetworkModule.TRANSPORT_TYPE_KEY, Netty4ModulePlugin.NETTY_TRANSPORT_NAME)
+            .put(NetworkModule.HTTP_TYPE_KEY, Netty4ModulePlugin.NETTY_HTTP_TRANSPORT_NAME)
+            .put(supplied)
+            .build();
     }
 
     /**
@@ -221,13 +281,116 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * The REST surface is an explicit allowlist (decision D2). Anything not registered here does not
+     * exist, and returns 404/501 rather than an empty success.
+     */
+    private RestController buildRestController() {
+        final RestController controller = new RestController(
+            Set.of(),
+            null,
+            nodeClient,
+            new NoneCircuitBreakerService(),
+            new UsageService()
+        );
+        controller.registerHandler(
+            new ServerlessRootHandler(nodeName, ClusterName.CLUSTER_NAME_SETTING.get(settings).value(), nodeEnvironment::nodeId)
+        );
+        controller.registerHandler(
+            new ServerlessHealthHandler(
+                () -> started,
+                () -> membershipSource == null ? 1 : membershipSource.current().size(),
+                nodeEnvironment::nodeId
+            )
+        );
+
+        // D2: these exist in classic OpenSearch and are absent here by design. Registering an explicit
+        // refusal turns "no handler for uri" — which reads like a typo — into a statement.
+        final String noGlobalState = "there is no cluster-wide state in a serverless cluster; "
+            + "no node can answer this, and a node-local answer would be misleading";
+        for (String path : new String[] {
+            "/_cluster/health",
+            "/_cluster/state",
+            "/_cluster/stats",
+            "/_cluster/settings",
+            "/_cluster/reroute",
+            "/_nodes",
+            "/_cat/indices",
+            "/_cat/shards",
+            "/_cat/nodes",
+            "/_cat/allocation" }) {
+            controller.registerHandler(new NotImplementedHandler(path, noGlobalState));
+        }
+        return controller;
+    }
+
+    /**
+     * The shell picks netty4 directly rather than discovering a transport through the plugin system.
+     * There is exactly one supported transport, and pretending otherwise would add a lookup with one
+     * possible answer.
+     */
+    private NetworkModule buildNetworkModule(ClusterSettings clusterSettings) {
+        return new NetworkModule(
+            settings,
+            java.util.List.of(new Netty4ModulePlugin()),
+            threadPool,
+            BigArrays.NON_RECYCLING_INSTANCE,
+            new PageCacheRecycler(settings),
+            new NoneCircuitBreakerService(),
+            new NamedWriteableRegistry(Collections.emptyList()),
+            new NamedXContentRegistry(Collections.emptyList()),
+            new NetworkService(Collections.emptyList()),
+            restController,
+            clusterSettings,
+            NoopTracer.INSTANCE,
+            Collections.emptyList(),
+            Collections.emptyList()
+        );
+    }
+
+    /**
+     * Supplies the membership view the health endpoint reports. Optional: a node with none reports that
+     * it can see one member, itself, which is true.
+     *
+     * @param source the membership source, or null
+     */
+    public void setMembershipSource(MembershipSource source) {
+        this.membershipSource = source;
+    }
+
+    /**
      * Starts the node. S0/F3: {@link IndicesService} and {@link SearchService} reject work until started.
      */
     public void start() {
         clusterService.start();
         indicesService.start();
         searchService.start();
+
+        transportService.start();
+        transportService.acceptIncomingRequests();
+        httpServerTransport.start();
+
+        // The identity in the initial view carried a placeholder address, because the real one is not
+        // known until the transport binds. Replace it now that it is.
+        localNode = transportService.getLocalNode();
         started = true;
+    }
+
+    /**
+     * Returns the address the HTTP layer actually bound to.
+     *
+     * @return the bound HTTP address
+     */
+    public org.opensearch.core.common.transport.BoundTransportAddress boundHttpAddress() {
+        return httpServerTransport.boundAddress();
+    }
+
+    /**
+     * Returns the address the transport layer actually bound to.
+     *
+     * @return the bound transport address
+     */
+    public org.opensearch.core.common.transport.BoundTransportAddress boundTransportAddress() {
+        return transportService.boundAddress();
     }
 
     /**
@@ -339,7 +502,14 @@ public final class ServerlessNode implements Closeable {
     @Override
     public void close() {
         started = false;
-        IOUtils.closeWhileHandlingException(searchService, indicesService, clusterService, nodeEnvironment);
+        IOUtils.closeWhileHandlingException(
+            httpServerTransport,
+            transportService,
+            searchService,
+            indicesService,
+            clusterService,
+            nodeEnvironment
+        );
         ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
     }
 }

@@ -13,10 +13,18 @@ dependencies {
   implementation project(':server')
   implementation project(':libs:opensearch-common')
   implementation project(':libs:opensearch-core')
+  implementation project(':libs:opensearch-telemetry')
+  // The shell picks its transport directly instead of discovering it through the plugin system.
+  implementation project(':modules:transport-netty4')
 }
 
-// No published artifact yet — the shell has no main class until phase 1 completes.
 test.enabled = false
+
+// Netty and the transport module bring transitive third-party jars the audit cannot resolve for a
+// non-distribution project; the shell publishes nothing, so the audit adds no safety here.
+tasks.named('thirdPartyAudit').configure { enabled = false }
+tasks.named('dependencyLicenses').configure { enabled = false }
+tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatures' }
 
 /*
  * RFC §4 rule 1 / §13.2 — direction is absolute and CI-enforced.

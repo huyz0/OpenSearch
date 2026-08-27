@@ -24,7 +24,14 @@ import org.opensearch.test.OpenSearchTestCase;
 public class ServerlessNodeTests extends OpenSearchTestCase {
 
     private Settings nodeSettings(String name) {
-        return Settings.builder().put("node.name", name).put("cluster.name", "serverless-test").put("path.home", createTempDir()).build();
+        return Settings.builder()
+            .put("node.name", name)
+            .put("cluster.name", "serverless-test")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .build();
     }
 
     public void testNodeBootsStartsAndStopsCleanly() throws Exception {
@@ -54,13 +61,10 @@ public class ServerlessNodeTests extends OpenSearchTestCase {
     public void testProductionNodeContainsNoControlPlane() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("phase1-b"))) {
             node.start();
-            final ControlPlaneAbsence.Result r = ControlPlaneAbsence.scan(
-                ControlPlaneAbsence.CONTROL_PLANE,
-                node.clusterService(),
-                node.indicesService(),
-                node.searchService(),
-                node.threadPool()
-            );
+            // Scanned from the node itself rather than from named services: the transport and HTTP
+            // layers added in phase 1 are reachable only through its fields, and a check that covers
+            // less than the node does would quietly stop being the assertion it claims to be.
+            final ControlPlaneAbsence.Result r = ControlPlaneAbsence.scan(ControlPlaneAbsence.CONTROL_PLANE, node);
             assertEquals("a control plane was constructed: " + r.found, java.util.Set.of(), r.found);
             assertTrue("the object-graph walk was vacuous: only " + r.visited + " objects visited", r.visited > 1000);
             logger.info("phase 1: production ServerlessNode walked {} objects, no control plane", r.visited);

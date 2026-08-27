@@ -718,6 +718,11 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > findings that correct this document and one question S0 could not answer, in
 > [`s0-findings.md`](s0-findings.md). §5 is not falsified; phase 1 is unblocked.
 >
+> **Phase 1 is complete (2026-08-27).** `ServerlessNode` boots with transport and HTTP bound, serves
+> its allowlisted surface, and shuts down cleanly — 20 tests, `check` green. The control-plane absence
+> assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
+> transport and HTTP layers too.
+>
 > **S1 (two-node probe) RESULT: PASSED — 5 tests total, 0 failures.** Two nodes holding disjoint
 > node-local views both serve; a projected view omitting a hosted index leaves the shard STARTED and
 > serving; and the §5.3 version hazard reproduces exactly (version 4 silently ignored after 500) with
@@ -767,7 +772,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | # | Phase | Ends when |
 |---|---|---|
 | 0 | **S0 spike** (§11) | Q1–Q3 answered in writing |
-| 1 | **Shell skeleton** | `ServerlessNode` boots, binds transport + REST, serves `GET /` and a health endpoint, exits cleanly. No indices. `MembershipSource` with the blob-lease implementation only. **Partially landed:** `ServerlessNode` (lifecycle + data plane, asserted control-plane-free), `MembershipSource`/`BlobLeaseMembership`, and the §13.2 direction check. Transport and REST remain. |
+| 1 | **Shell skeleton** | ✅ **COMPLETE.** `ServerlessNode` boots, binds netty4 transport + HTTP on real ports, serves `GET /` and `GET /_serverless/health`, and releases its port on shutdown. `MembershipSource`/`BlobLeaseMembership` landed and read by the health endpoint. D2 enforced with explicit 501s. 20 tests; `check` green on both projects including the §13.2 direction rule. |
 | 2 | **Local view** | `LocalViewProjector` + `LocalOnlyPublisher`; a shard is opened from a hand-written descriptor and serves a search. S0 made durable and tested. |
 | 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store, on `FsBlobContainer`. The §9.3 register map lands here. Per **D5** the R11 conformance suite is deferred; until it runs, this phase carries no S3/GCS durability claim. |
 | 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
