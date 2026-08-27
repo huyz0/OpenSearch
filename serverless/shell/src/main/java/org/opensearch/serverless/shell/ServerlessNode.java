@@ -45,10 +45,14 @@ import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.fetch.FetchPhase;
 import org.opensearch.search.query.QueryPhase;
+import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.cluster.LocalViewProjector;
+import org.opensearch.serverless.cluster.ShardAssignment;
 import org.opensearch.serverless.membership.MembershipSource;
 import org.opensearch.serverless.rest.NotImplementedHandler;
 import org.opensearch.serverless.rest.ServerlessHealthHandler;
 import org.opensearch.serverless.rest.ServerlessRootHandler;
+import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.Netty4ModulePlugin;
@@ -99,6 +103,8 @@ public final class ServerlessNode implements Closeable {
     private final NodeClient nodeClient;
     private volatile DiscoveryNode localNode;
     private volatile MembershipSource membershipSource;
+    private volatile LocalViewProjector projector;
+    private volatile ShardReconciler reconciler;
     private volatile boolean started;
 
     /**
@@ -372,7 +378,73 @@ public final class ServerlessNode implements Closeable {
         // The identity in the initial view carried a placeholder address, because the real one is not
         // known until the transport binds. Replace it now that it is.
         localNode = transportService.getLocalNode();
+
+        // Built here rather than in the constructor: both need the node identity, and the identity is
+        // not final until the transport has bound and told us the address it got.
+        projector = new LocalViewProjector(ClusterName.CLUSTER_NAME_SETTING.get(settings), localNode);
+        reconciler = new ShardReconciler(indicesService, localNode);
         started = true;
+    }
+
+    /**
+     * Projects the given truth into this node's local view, applies it, and opens every shard this node
+     * owns. Idempotent.
+     *
+     * <p>This is the whole shell loop in one call: descriptors and shard-heads in, serving shards out.
+     * Phase 3 replaces the arguments with reads from the object store; the shape does not change.
+     *
+     * @param descriptors the indices this node should know about
+     * @param owned the shards this node owns, per shard-heads
+     * @return the shards opened by this call
+     * @throws Exception if projection, application or shard opening fails
+     */
+    public java.util.Set<org.opensearch.core.index.shard.ShardId> applyTruth(
+        java.util.Collection<IndexDescriptor> descriptors,
+        java.util.Collection<ShardAssignment> owned
+    ) throws Exception {
+        ensureStarted();
+        final ClusterState view = projector.project(descriptors, owned);
+        applyLocalView(view, () -> 30_000L);
+        return reconciler.ensureOpen(view, owned);
+    }
+
+    /**
+     * Closes a shard this node has stopped owning.
+     *
+     * <p>Deliberately separate from {@link #applyTruth}: a shard is never closed because a view omitted
+     * it, only because truth says ownership is gone. See {@code ShardReconciler} and
+     * {@code s1-findings.md}.
+     *
+     * @param shardId the shard to release
+     * @param reason why, for the log
+     */
+    public void releaseShard(org.opensearch.core.index.shard.ShardId shardId, String reason) {
+        ensureStarted();
+        reconciler.releaseShard(shardId, reason);
+    }
+
+    /**
+     * Returns this node's shard reconciler.
+     *
+     * @return the reconciler, or null before {@link #start()}
+     */
+    public ShardReconciler reconciler() {
+        return reconciler;
+    }
+
+    /**
+     * Returns this node's view projector.
+     *
+     * @return the projector, or null before {@link #start()}
+     */
+    public LocalViewProjector projector() {
+        return projector;
+    }
+
+    private void ensureStarted() {
+        if (started == false) {
+            throw new IllegalStateException("node " + nodeName + " has not been started");
+        }
     }
 
     /**

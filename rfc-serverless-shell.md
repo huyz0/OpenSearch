@@ -292,7 +292,11 @@ the hazard is entirely a property of the reconciler. What was R1 is now an invar
 > register says this node no longer owns it, and never because a locally-computed view failed to
 > mention it.
 
-Phase 2 carries that as a test, not a comment.
+**Phase 2 carries it as structure, not only as a test.** `ShardReconciler.ensureOpen` has no code path
+that closes anything, and `releaseShard` takes a shard id the caller must have obtained from truth.
+There is deliberately no method that accepts a view and closes what is missing from it. The test that
+guards this was validated by planting the diff-based rule and confirming it failed with
+`expected:<STARTED> but was:<CLOSED>`.
 
 ### 5.3 `ClusterState.version()` stops being globally meaningful — and one reused class depends on it
 
@@ -723,6 +727,11 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
+> **Phase 2 is complete (2026-08-27).** `node.applyTruth(descriptors, assignments)` projects a
+> node-local view, applies it, and opens every owned shard, which then serves a search. §5.2's
+> invariant lives in `ShardReconciler`'s shape — there is no method that closes what a view omits — and
+> a planted diff-based canary was confirmed to fail the invariant test before being removed. 26 tests.
+>
 > **S1 (two-node probe) RESULT: PASSED — 5 tests total, 0 failures.** Two nodes holding disjoint
 > node-local views both serve; a projected view omitting a hosted index leaves the shard STARTED and
 > serving; and the §5.3 version hazard reproduces exactly (version 4 silently ignored after 500) with
@@ -773,7 +782,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 |---|---|---|
 | 0 | **S0 spike** (§11) | Q1–Q3 answered in writing |
 | 1 | **Shell skeleton** | ✅ **COMPLETE.** `ServerlessNode` boots, binds netty4 transport + HTTP on real ports, serves `GET /` and `GET /_serverless/health`, and releases its port on shutdown. `MembershipSource`/`BlobLeaseMembership` landed and read by the health endpoint. D2 enforced with explicit 501s. 20 tests; `check` green on both projects including the §13.2 direction rule. |
-| 2 | **Local view** | `LocalViewProjector` + `LocalOnlyPublisher`; a shard is opened from a hand-written descriptor and serves a search. S0 made durable and tested. |
+| 2 | **Local view** | ✅ **COMPLETE.** `IndexDescriptor`/`ShardAssignment` truth records, `LocalViewProjector`, and `ShardReconciler` — the replacement for `IndicesClusterStateService`. A shard opens from a descriptor and serves a search through production code. §5.2's invariant is structural and verified by a planted canary. 26 tests. |
 | 3 | **Metadata plane** | Descriptor CAS create/delete/get; shard-heads with term + lease; create-index and delete-index work end to end against the object store, on `FsBlobContainer`. The §9.3 register map lands here. Per **D5** the R11 conformance suite is deferred; until it runs, this phase carries no S3/GCS durability claim. |
 | 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
 | 5 | **Search path** | `search` role: reader engines over object-store segments; scale-to-zero verified by killing every search node and restarting. |
