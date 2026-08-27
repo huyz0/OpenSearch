@@ -66,6 +66,7 @@ import java.io.Closeable;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -111,6 +112,8 @@ public final class ServerlessNode implements Closeable {
     private volatile DiscoveryNode localNode;
     private volatile MembershipSource membershipSource;
     private final Set<String> roles;
+    private final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private volatile LocalViewProjector projector;
     private volatile ShardReconciler reconciler;
     private volatile boolean started;
@@ -262,7 +265,7 @@ public final class ServerlessNode implements Closeable {
             clusterService,
             null,                                   // Client — no node client in phase 1
             new MetaStateService(nodeEnvironment, xContentRegistry),
-            Collections.emptyList(),
+            engineFactoryProviders(),
             emptyMap(),
             null,                                   // ValuesSourceRegistry
             emptyMap(),
@@ -277,6 +280,40 @@ public final class ServerlessNode implements Closeable {
             new org.opensearch.common.cache.module.CacheModule(new ArrayList<>(), settings).getCacheService(),
             new org.opensearch.indices.RemoteStoreSettings(settings, clusterSettings)
         );
+    }
+
+    /**
+     * The node's role decides its engine, which is what makes the two shard roles asymmetric rather
+     * than merely differently labelled.
+     *
+     * <p>A node that does not accept writer activation runs {@link org.opensearch.index.engine.ReadOnlyEngine},
+     * so a reader shard is <em>structurally</em> unable to write — not merely expected not to. That
+     * matters because a reader opens a shard without acquiring its head: there is no compare-and-swap
+     * behind it, and safety comes from the engine being incapable rather than from a convention.
+     *
+     * <p>Readers needing no coordination is the point, not a shortcut.
+     * {@code rfc-serverless-metadata-plane.md} §6: readers are interchangeable caches, so any search
+     * node can serve any shard by reading its manifest, and the directory tier just learns about it.
+     */
+    private
+        java.util.Collection<
+            java.util.function.BiFunction<
+                org.opensearch.index.IndexSettings,
+                org.opensearch.cluster.routing.ShardRouting,
+                java.util.Optional<org.opensearch.index.engine.EngineFactory>>>
+        engineFactoryProviders() {
+        if (roles.contains(ROLE_INGEST)) {
+            return Collections.emptyList();   // the default read-write engine
+        }
+        final org.opensearch.index.engine.EngineFactory readOnly = config -> new org.opensearch.index.engine.ReadOnlyEngine(
+            config,
+            null,
+            null,
+            true,
+            java.util.function.Function.identity(),
+            false
+        );
+        return java.util.List.of((indexSettings, routing) -> java.util.Optional.of(readOnly));
     }
 
     private SearchService buildSearchService(ClusterSettings clusterSettings) {
@@ -462,6 +499,49 @@ public final class ServerlessNode implements Closeable {
             }
         }
         return opened;
+    }
+
+    /**
+     * Serves a shard as a reader: opens the published commit without owning the shard.
+     *
+     * <p>Reader activation is the cheap half of the design. There is no compare-and-swap and no entry in
+     * the shard-head, because a reader cannot conflict with anything — it does not write, and the node's
+     * engine is read-only when it does not accept writer activation. Any number of search nodes may
+     * serve the same shard at once.
+     *
+     * <p>Accumulating rather than replacing: a search node typically serves many shards, and each call
+     * re-projects the full set so the view keeps describing everything this node holds.
+     *
+     * @param plane the metadata plane to read from
+     * @param indexName the index to serve
+     * @param shardNumber the shard to serve
+     * @return the shard id now open as a reader
+     * @throws Exception if the index does not exist, nothing has been published, or opening fails
+     */
+    public org.opensearch.core.index.shard.ShardId serveAsReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber
+    ) throws Exception {
+        ensureStarted();
+        reconciler.setSegmentPublishers(plane::segmentPublisher);
+        final IndexDescriptor descriptor = plane.describe(indexName)
+            .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
+
+        served.put(indexName, descriptor);
+        readerShards.add(new java.util.AbstractMap.SimpleEntry<>(indexName, shardNumber));
+
+        final java.util.List<ShardAssignment> assignments = new java.util.ArrayList<>();
+        for (var entry : readerShards) {
+            final long term = plane.segmentPublisher(entry.getKey(), entry.getValue())
+                .readManifest()
+                .map(org.opensearch.serverless.store.CommitManifest::term)
+                .orElse(1L);
+            assignments.add(new ShardAssignment(entry.getKey(), entry.getValue(), term));
+        }
+        final ClusterState view = projector.project(served.values(), assignments);
+        applyLocalView(view, () -> 30_000L);
+        return reconciler.openReader(view, indexName, shardNumber);
     }
 
     /**

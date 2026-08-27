@@ -169,6 +169,14 @@ public final class SegmentPublisher {
             return Optional.empty();
         }
         for (Map.Entry<String, String> file : manifest.get().files().entrySet()) {
+            // Local disk is a cache, and a reader re-opening onto a newer commit finds files from the
+            // previous one still there. Lucene segment names restart at _0 after a history bootstrap, so
+            // a same-named file is not necessarily the same bytes; overwrite rather than trust the name.
+            try {
+                target.deleteFile(file.getKey());
+            } catch (java.io.IOException ignored) {
+                // absent, which is the normal case on a cold node
+            }
             final BlobContainer source = blobStore.blobContainer(shardBase.add(file.getValue()));
             try (InputStream in = source.readBlob(file.getKey()); IndexOutput out = target.createOutput(file.getKey(), IOContext.DEFAULT)) {
                 final byte[] buffer = new byte[8192];

@@ -65,6 +65,7 @@ public final class ShardReconciler {
     private final IndicesService indicesService;
     private final DiscoveryNode localNode;
     private final Map<ShardId, IndexShard> open = new ConcurrentHashMap<>();
+    private final Set<ShardId> readers = ConcurrentHashMap.newKeySet();
     private volatile BiFunction<String, Integer, SegmentPublisher> publishers;
 
     /**
@@ -103,6 +104,11 @@ public final class ShardReconciler {
         }
         if (publishers == null) {
             throw new IOException("cannot publish " + shardId + ": no object store configured");
+        }
+        if (readers.contains(shardId)) {
+            // The read-only engine already makes this impossible; this refuses earlier and says why,
+            // rather than surfacing as some Lucene-level complaint about a closed writer.
+            throw new IOException("cannot publish " + shardId + ": it is open as a reader and owns no head");
         }
         // A commit must exist before there is anything to publish; an unflushed shard has its data only
         // in the translog, which this does not upload.
@@ -217,6 +223,60 @@ public final class ShardReconciler {
     }
 
     /**
+     * Opens a shard as a reader: serving the published commit, owning nothing.
+     *
+     * <p>No compare-and-swap, no term bump, no entry in the shard-head. That is deliberate and is what
+     * {@code rfc-serverless-metadata-plane.md} §6 means by readers being interchangeable caches — any
+     * search node can serve any shard by reading its manifest, and no coordination is involved because
+     * nothing can go wrong if two of them do it at once.
+     *
+     * <p>The term recorded on the shard is the manifest's — the term of the writer whose commit this is
+     * serving. It is not a claim of ownership; the shard needs a positive term to start at all
+     * ({@code s0-findings.md} F4), and the commit's own term is the only honest number available.
+     *
+     * @param view the node-local view, which must describe the index
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @return the shard id now open as a reader
+     * @throws IOException if nothing has been published for the shard, or opening fails
+     */
+    public ShardId openReader(ClusterState view, String indexName, int shardNumber) throws IOException {
+        final IndexMetadata indexMetadata = view.metadata().index(indexName);
+        if (indexMetadata == null) {
+            throw new IllegalStateException("cannot open a reader for " + indexName + ": the view does not describe it");
+        }
+        if (publishers == null) {
+            throw new IOException("cannot open a reader for " + indexName + ": no object store configured");
+        }
+        final ShardId shardId = new ShardId(indexMetadata.getIndex(), shardNumber);
+        if (open.containsKey(shardId)) {
+            return shardId;
+        }
+        final CommitManifest manifest = publishers.apply(indexName, shardNumber)
+            .readManifest()
+            .orElseThrow(
+                () -> new IOException(
+                    "cannot serve "
+                        + shardId
+                        + " as a reader: nothing has been published for it. "
+                        + "An empty result here would be indistinguishable from an empty index."
+                )
+            );
+        open.put(shardId, openAndStart(indexMetadata, shardId, manifest.term(), view.nodes()));
+        readers.add(shardId);
+        return shardId;
+    }
+
+    /**
+     * Returns the shards open here as readers.
+     *
+     * @return the reader shard ids
+     */
+    public Set<ShardId> readerShards() {
+        return Set.copyOf(readers);
+    }
+
+    /**
      * Gives a restored commit a fresh, empty translog.
      *
      * <p>Restoring segments is not enough on its own: recovery reads a translog whose UUID matches the
@@ -253,6 +313,7 @@ public final class ShardReconciler {
      * @param reason why, for the log
      */
     public void releaseShard(ShardId shardId, String reason) {
+        readers.remove(shardId);
         final IndexShard shard = open.remove(shardId);
         if (shard == null) {
             return;
