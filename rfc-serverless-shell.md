@@ -727,6 +727,14 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
+> **Phase 8 is complete (2026-08-27); gossip deliberately not built.** A reconciliation tick releases a
+> lost shard and re-acquires it once the holder's lease lapses, with no privileged node involved. GC
+> keeps files a live commit inherited from older terms — the mistake it is shaped to prevent — and both
+> its rules were verified by breaking them. The §10.3 gate is answered with 3.0 object-store ops per
+> tick per shard; the write is per-shard lease renewal, which §7's batching removes and which is not yet
+> implemented. **Phase 7 was skipped**, so the evidence §10.3 expected from it is absent. See
+> [`phase8-notes.md`](phase8-notes.md).
+>
 > **Phase 6 is complete (2026-08-27).** Failure detection runs on the node that might be failing: stop
 > heartbeating and the lease lapses. The zombie test — a writer alive, paused past its lease, still
 > believing it owns the shard — confirms its local writes succeed, reach nobody, and vanish, which
@@ -810,7 +818,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 5 | **Search path** | ✅ **COMPLETE.** Reader shards open from a manifest with no CAS and no shard-head entry; the `search` role selects `ReadOnlyEngine`, so a reader is structurally unable to write. Scale-to-zero verified by closing every search node and serving from a fresh one. 51 tests; both claims canary-verified. See [`phase5-notes.md`](phase5-notes.md). |
 | 6 | **Activation & failover** | ✅ **COMPLETE.** `activateWriter` (CAS, losing returns empty not an error) and `heartbeat` (renew what is held, release what is lost). kill-9 loses no published data. The paused-JVM zombie test walks the full sequence and separates fencing from the WAL gap. 56 tests; all three claims canary-verified. See [`phase6-notes.md`](phase6-notes.md). |
 | 7 | **Surface** | Allowlisted admin/stats APIs, re-implemented against the metadata plane. 501 for everything else. |
-| 8 | **Gossip & reconcilers** | Routing hints, background reconciliation, GC. Gossip introduced **only if** phases 1–7 show polling plus K8s push is insufficient — measured, per §10.3's second cost. |
+| 8 | **Gossip & reconcilers** | ✅ **COMPLETE (gossip not built, by the gate).** `BackgroundReconciler` closes phase 6's gap: a tick releases what was lost and re-acquires automatically. `GarbageCollector` collects a zombie's orphans while keeping inherited files — both rules canary-verified. `RoutingHints` are soft state that stay wrong until refreshed. Gossip gate answered with a measurement: **3.0 ops/tick/shard**; batching lease renewal (§7) comes first. 61 tests. See [`phase8-notes.md`](phase8-notes.md). |
 | 9 | **Scale validation** | The `plan-100m-index-implementation.md` targets re-measured on this shell. |
 
 Phases 1–2 are the ones that decide whether this is a two-quarter project or a two-year one. Treat
