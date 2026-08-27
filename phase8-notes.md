@@ -79,6 +79,10 @@ per node (§7, removes the write, roughly a third of the cost) and lengthening t
 needs sub-second propagation (§9.5). The row that breaks is 10⁴ × 100 at one second, and nothing built
 so far approaches it.
 
+> **Settled since (phase 7).** Phase 7 was built after this and does not move the number: its endpoints
+> are operator-rate, not request-rate, and none runs on a data path. What is still genuinely absent from
+> the evidence is the data surface — `_bulk` and `_search` over REST — which no phase has built.
+
 **What this measurement cannot tell you:** it was taken against `FsBlobContainer` on one machine with
 one shard. It counts operations, not latency, not throttling, and not what a provider does to a client
 issuing 3 × 10⁶ req/s. Phase 7's REST traffic, which §10.3 expected to be part of this evidence, is not

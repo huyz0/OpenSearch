@@ -111,6 +111,7 @@ public final class ServerlessNode implements Closeable {
     private final NodeClient nodeClient;
     private volatile DiscoveryNode localNode;
     private volatile MembershipSource membershipSource;
+    private volatile org.opensearch.serverless.metadata.MetadataPlane metadataPlane;
     private final Set<String> roles;
     private final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
     private final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -350,6 +351,8 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(
             new ServerlessRootHandler(nodeName, ClusterName.CLUSTER_NAME_SETTING.get(settings).value(), nodeEnvironment::nodeId)
         );
+        controller.registerHandler(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane));
+        controller.registerHandler(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane));
         controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,
@@ -400,6 +403,22 @@ public final class ServerlessNode implements Closeable {
             Collections.emptyList(),
             Collections.emptyList()
         );
+    }
+
+    /**
+     * Gives this node's REST surface a metadata plane to read and write.
+     *
+     * <p>Set after construction because the plane is a deployment-level object and the REST routes are
+     * registered while the node is still being built. Until it is set, the admin endpoints answer 503
+     * saying exactly that, rather than answering as though nothing existed.
+     *
+     * @param plane the metadata plane, or null
+     */
+    public void setMetadataPlane(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        this.metadataPlane = plane;
+        if (plane != null) {
+            setMembershipSource(plane.membership());
+        }
     }
 
     /**

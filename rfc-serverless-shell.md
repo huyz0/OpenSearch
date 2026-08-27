@@ -727,6 +727,12 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
+> **Phase 7 is complete for the admin surface (2026-08-27), built after phase 8.** Index lifecycle and
+> catalog endpoints served from the metadata plane, with `never_activated` distinguished from `unowned`
+> and `/_serverless/nodes` labelled as this node's observation rather than a cluster fact. The data
+> surface — `_doc`, `_bulk`, `_search` — is still absent. See [`phase7-notes.md`](phase7-notes.md),
+> whose addendum settles the evidence gap phase 8's gossip gate flagged.
+>
 > **Phase 8 is complete (2026-08-27); gossip deliberately not built.** A reconciliation tick releases a
 > lost shard and re-acquires it once the holder's lease lapses, with no privileged node involved. GC
 > keeps files a live commit inherited from older terms — the mistake it is shaped to prevent — and both
@@ -817,7 +823,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 4 | **Write path** | ⚠️ **PARTIAL.** Segment publication and restore through the object store: failover now moves *data*, not just ownership. Term-scoped containers + manifest CAS fence a zombie (R9 partially closed, both halves canary-verified). Roles are lease attributes. **Deferred:** WAL, `TransportShardBulkAction` wiring, automatic publication — see [`phase4-notes.md`](phase4-notes.md). 45 tests. |
 | 5 | **Search path** | ✅ **COMPLETE.** Reader shards open from a manifest with no CAS and no shard-head entry; the `search` role selects `ReadOnlyEngine`, so a reader is structurally unable to write. Scale-to-zero verified by closing every search node and serving from a fresh one. 51 tests; both claims canary-verified. See [`phase5-notes.md`](phase5-notes.md). |
 | 6 | **Activation & failover** | ✅ **COMPLETE.** `activateWriter` (CAS, losing returns empty not an error) and `heartbeat` (renew what is held, release what is lost). kill-9 loses no published data. The paused-JVM zombie test walks the full sequence and separates fencing from the WAL gap. 56 tests; all three claims canary-verified. See [`phase6-notes.md`](phase6-notes.md). |
-| 7 | **Surface** | Allowlisted admin/stats APIs, re-implemented against the metadata plane. 501 for everything else. |
+| 7 | **Surface** | ✅ **COMPLETE (admin only).** `PUT/GET/DELETE /{index}` plus `/_serverless/{indices,shards,nodes}`, each one or two object-store reads. Absent, duplicate and unconfigured are 404/400/503 — never an empty 200; classic endpoints still 501. Both D2 properties canary-verified, and wildcard shadowing tested. **No document APIs** (`_doc`, `_bulk`, `_search`). 65 tests. See [`phase7-notes.md`](phase7-notes.md). |
 | 8 | **Gossip & reconcilers** | ✅ **COMPLETE (gossip not built, by the gate).** `BackgroundReconciler` closes phase 6's gap: a tick releases what was lost and re-acquires automatically. `GarbageCollector` collects a zombie's orphans while keeping inherited files — both rules canary-verified. `RoutingHints` are soft state that stay wrong until refreshed. Gossip gate answered with a measurement: **3.0 ops/tick/shard**; batching lease renewal (§7) comes first. 61 tests. See [`phase8-notes.md`](phase8-notes.md). |
 | 9 | **Scale validation** | The `plan-100m-index-implementation.md` targets re-measured on this shell. |
 
