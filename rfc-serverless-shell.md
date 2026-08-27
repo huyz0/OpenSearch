@@ -727,6 +727,11 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
+> **Phase 4 is partially complete (2026-08-27).** A document indexed on one node is served by another
+> after failover, restored from the object store with no peer recovery — the gap phase 3 named. Fencing
+> is half-built and both halves are canary-verified. WAL, bulk-action wiring and automatic publication
+> are deferred and listed in [`phase4-notes.md`](phase4-notes.md).
+>
 > **Phase 3 is complete (2026-08-27).** An index is created in the object store with one put-if-absent,
 > a shard is activated with one compare-and-swap, and `node.syncFrom(plane)` makes a node work out what
 > to serve with nothing telling it. 40 tests. Both safety claims — exactly one winner under contention,
@@ -790,7 +795,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 1 | **Shell skeleton** | ✅ **COMPLETE.** `ServerlessNode` boots, binds netty4 transport + HTTP on real ports, serves `GET /` and `GET /_serverless/health`, and releases its port on shutdown. `MembershipSource`/`BlobLeaseMembership` landed and read by the health endpoint. D2 enforced with explicit 501s. 20 tests; `check` green on both projects including the §13.2 direction rule. |
 | 2 | **Local view** | ✅ **COMPLETE.** `IndexDescriptor`/`ShardAssignment` truth records, `LocalViewProjector`, and `ShardReconciler` — the replacement for `IndicesClusterStateService`. A shard opens from a descriptor and serves a search through production code. §5.2's invariant is structural and verified by a planted canary. 26 tests. |
 | 3 | **Metadata plane** | ✅ **COMPLETE.** `DescriptorStore`, `ShardHeadStore`, `MetadataPlane`, and the §9.3 register map. Create-index is one put-if-absent; activation is one CAS; `node.syncFrom(plane)` replaces cluster-state publication. 40 tests; both CAS safety claims verified by planted canaries. Per **D5**, `FsBlobContainer` only — no S3/GCS durability claim. See [`phase3-notes.md`](phase3-notes.md). |
-| 4 | **Write path** | `ingest` role: bulk indexing through reused `TransportShardBulkAction`, writer engine, WAL and segment publication to the object store. |
+| 4 | **Write path** | ⚠️ **PARTIAL.** Segment publication and restore through the object store: failover now moves *data*, not just ownership. Term-scoped containers + manifest CAS fence a zombie (R9 partially closed, both halves canary-verified). Roles are lease attributes. **Deferred:** WAL, `TransportShardBulkAction` wiring, automatic publication — see [`phase4-notes.md`](phase4-notes.md). 45 tests. |
 | 5 | **Search path** | `search` role: reader engines over object-store segments; scale-to-zero verified by killing every search node and restarting. |
 | 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9 — including a **paused-JVM zombie test** for the §9.6 fencing rule, since kill-9 alone does not produce a zombie. |
 | 7 | **Surface** | Allowlisted admin/stats APIs, re-implemented against the metadata plane. 501 for everything else. |

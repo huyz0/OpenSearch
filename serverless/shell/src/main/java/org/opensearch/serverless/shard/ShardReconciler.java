@@ -27,14 +27,18 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason;
 import org.opensearch.indices.recovery.RecoveryState;
 import org.opensearch.serverless.cluster.ShardAssignment;
+import org.opensearch.serverless.store.CommitManifest;
+import org.opensearch.serverless.store.SegmentPublisher;
 
 import java.io.IOException;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiFunction;
 
 /**
  * Opens and closes shards on this node.
@@ -61,6 +65,7 @@ public final class ShardReconciler {
     private final IndicesService indicesService;
     private final DiscoveryNode localNode;
     private final Map<ShardId, IndexShard> open = new ConcurrentHashMap<>();
+    private volatile BiFunction<String, Integer, SegmentPublisher> publishers;
 
     /**
      * Creates a reconciler for one node.
@@ -71,6 +76,38 @@ public final class ShardReconciler {
     public ShardReconciler(IndicesService indicesService, DiscoveryNode localNode) {
         this.indicesService = indicesService;
         this.localNode = localNode;
+    }
+
+    /**
+     * Supplies the object-store publisher for each shard. Without one, shards open from local disk only,
+     * which is the phase 2 behaviour and is what the projection tests still exercise.
+     *
+     * @param publishers index name and shard number to publisher
+     */
+    public void setSegmentPublishers(BiFunction<String, Integer, SegmentPublisher> publishers) {
+        this.publishers = publishers;
+    }
+
+    /**
+     * Publishes a shard's current commit to the object store.
+     *
+     * @param shardId the shard
+     * @param term the owning writer's term, which fences a zombie
+     * @return the manifest published
+     * @throws IOException if the shard is not held here, or publication fails
+     */
+    public CommitManifest publish(ShardId shardId, long term) throws IOException {
+        final IndexShard shard = open.get(shardId);
+        if (shard == null) {
+            throw new IOException("cannot publish " + shardId + ": not open on " + localNode.getId());
+        }
+        if (publishers == null) {
+            throw new IOException("cannot publish " + shardId + ": no object store configured");
+        }
+        // A commit must exist before there is anything to publish; an unflushed shard has its data only
+        // in the translog, which this does not upload.
+        shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
+        return publishers.apply(shardId.getIndexName(), shardId.id()).publish(shard.store(), term);
     }
 
     /**
@@ -121,10 +158,16 @@ public final class ShardReconciler {
             indexService.updateMapping(null, indexMetadata);
         }
 
+        // Whether anything was published decides the recovery source, and the decision must be made
+        // before the shard is created because the source is baked into its routing entry.
+        final SegmentPublisher publisher = publishers == null ? null : publishers.apply(shardId.getIndexName(), shardId.id());
+        final Optional<CommitManifest> published = publisher == null ? Optional.empty() : publisher.readManifest();
+        final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
+
         final ShardRouting initializing = ShardRouting.newUnassigned(
             shardId,
             true,
-            RecoverySource.EmptyStoreRecoverySource.INSTANCE,
+            restoring ? RecoverySource.ExistingStoreRecoverySource.INSTANCE : RecoverySource.EmptyStoreRecoverySource.INSTANCE,
             new UnassignedInfo(UnassignedInfo.Reason.INDEX_CREATED, "serverless activation")
         ).initialize(localNode.getId(), null, ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE);
 
@@ -142,6 +185,13 @@ public final class ShardReconciler {
             null,
             null
         );
+
+        if (restoring) {
+            // Between createShard and recovery: the store exists but nothing has opened it yet. Using
+            // EMPTY_STORE here instead would call Store#createEmpty and delete exactly what this writes.
+            publisher.restoreInto(shard.store().directory(), shardId);
+            bootstrapTranslogFor(shard);
+        }
 
         shard.markAsRecovering("serverless-store", new RecoveryState(initializing, localNode, null));
         final PlainActionFuture<Boolean> recovered = PlainActionFuture.newFuture();
@@ -164,6 +214,35 @@ public final class ShardReconciler {
             nodes
         );
         return shard;
+    }
+
+    /**
+     * Gives a restored commit a fresh, empty translog.
+     *
+     * <p>Restoring segments is not enough on its own: recovery reads a translog whose UUID matches the
+     * commit, and a node taking a shard over has neither. Without this the shard fails recovery with a
+     * corrupt-translog error naming a file that was never written.
+     *
+     * <p>The sequence is the one {@code StoreRecovery} uses for snapshot restore, for the same reason —
+     * segments arrived from somewhere other than a peer, so the history has to be re-established rather
+     * than continued. Operations the previous writer had accepted but not committed are lost here; that
+     * is what a write-ahead log is for, and this phase does not have one (see phase 4's notes).
+     */
+    private void bootstrapTranslogFor(IndexShard shard) throws IOException {
+        shard.store().bootstrapNewHistory();
+        final org.apache.lucene.index.SegmentInfos segmentInfos = shard.store().readLastCommittedSegmentsInfo();
+        final long localCheckpoint = Long.parseLong(
+            segmentInfos.userData.get(org.opensearch.index.seqno.SequenceNumbers.LOCAL_CHECKPOINT_KEY)
+        );
+        final String translogUUID = segmentInfos.getUserData().get(org.opensearch.index.translog.Translog.TRANSLOG_UUID_KEY);
+        org.opensearch.index.translog.Translog.createEmptyTranslog(
+            shard.shardPath().resolveTranslog(),
+            shard.shardId(),
+            localCheckpoint,
+            shard.getPendingPrimaryTerm(),
+            translogUUID,
+            java.nio.channels.FileChannel::open
+        );
     }
 
     /**

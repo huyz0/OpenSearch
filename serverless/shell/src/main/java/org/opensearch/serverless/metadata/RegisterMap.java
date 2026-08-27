@@ -75,6 +75,22 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns the container path holding one shard's published segments.
+     *
+     * <p>A container per shard rather than a shared one with prefixed names: segment files are listed
+     * and deleted per shard, and giving each its own container keeps both operations a directory scan
+     * rather than a filter over everything.
+     *
+     * @param base the deployment's base path
+     * @param indexName the index
+     * @param shardId the shard number
+     * @return the shard data container path
+     */
+    public static BlobPath shardData(BlobPath base, String indexName, int shardId) {
+        return base.add("segments").add(indexName + SHARD_SEPARATOR + shardId);
+    }
+
+    /**
      * Returns the blob name of an index descriptor within the descriptors container.
      *
      * @param indexName the index

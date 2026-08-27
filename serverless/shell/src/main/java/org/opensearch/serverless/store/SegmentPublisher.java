@@ -1,0 +1,224 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.serverless.store;
+
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.store.Store;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * Uploads a shard's committed segments to the object store, and restores them onto a node taking over.
+ *
+ * <p>This is what makes the object store the source of truth rather than a backup. Once a commit is
+ * published, the node that wrote it holds nothing that cannot be reconstructed elsewhere, which is the
+ * property the whole architecture is for: node loss recovers by re-opening from the object store rather
+ * than by copying between peers.
+ *
+ * <p><b>Fencing (section 9.6, R9).</b> A writer holding term T writes segment blobs under
+ * {@code t=T/}, and the manifest register refuses a publish from a term older than the one it already
+ * holds. Both halves are needed and they do different jobs. The manifest CAS stops a stale writer from
+ * <em>being believed</em>; the term-scoped prefix stops it from <em>overwriting</em> anything, because
+ * the blob names it computes cannot collide with a live writer's. A zombie that resumes after a long
+ * pause therefore writes bytes nobody reads, rather than corrupting a file another node is serving.
+ */
+public final class SegmentPublisher {
+
+    /** The register naming the currently published commit. */
+    public static final String MANIFEST = "manifest";
+
+    private final BlobStore blobStore;
+    private final BlobPath shardBase;
+    private final BlobContainer container;
+
+    /**
+     * Creates a publisher for one shard.
+     *
+     * @param blobStore the backing store
+     * @param shardBase the shard's base path
+     */
+    public SegmentPublisher(BlobStore blobStore, BlobPath shardBase) {
+        this.blobStore = blobStore;
+        this.shardBase = shardBase;
+        this.container = blobStore.blobContainer(shardBase);
+    }
+
+    /**
+     * Returns the container-path segment a writer at the given term writes under.
+     *
+     * <p>A container rather than a name prefix, for the same reason {@code RegisterMap} uses
+     * {@link BlobPath} segments: hierarchy in the blob store is the container, and
+     * {@code FsBlobContainer} resolves names flatly against one directory. A blob named
+     * {@code "t=1/_0.cfe"} does not create {@code t=1/}; it fails to write. Learned twice.
+     *
+     * @param term the writer's term
+     * @return the path segment
+     */
+    public static String termSegment(long term) {
+        return "t=" + term;
+    }
+
+    /**
+     * Publishes the shard's current commit.
+     *
+     * <p>Files already named by the previous manifest are not re-uploaded: a failover inherits them at
+     * whatever blob they already occupy. Only files this commit added are written, under this writer's
+     * term prefix.
+     *
+     * @param store the shard's store, already flushed to a commit
+     * @param term the publishing writer's term
+     * @return the manifest as published
+     * @throws IOException if upload fails
+     * @throws StaleWriterException if a newer term has already published
+     */
+    public CommitManifest publish(Store store, long term) throws IOException {
+        final Optional<BlobRegister> existingRegister = container.readRegister(MANIFEST);
+        final CommitManifest existing = existingRegister.isPresent() ? parse(existingRegister.get()) : null;
+        if (existing != null && existing.term() > term) {
+            // A zombie: paused past its lease, someone else took the shard and published. Its bytes are
+            // already inert because of the term prefix; this stops it from claiming they are current.
+            throw new StaleWriterException(term, existing.term());
+        }
+
+        final Map<String, String> published = new LinkedHashMap<>();
+        final Map<String, String> inherited = existing == null ? Map.of() : existing.files();
+        final Directory directory = store.directory();
+
+        store.incRef();
+        try {
+            for (String fileName : store.getMetadata().asMap().keySet()) {
+                final String alreadyAt = inherited.get(fileName);
+                if (alreadyAt != null) {
+                    // Segment files are immutable once written; a name that is already published has the
+                    // same bytes. Re-uploading would make failover cost the size of the shard.
+                    published.put(fileName, alreadyAt);
+                    continue;
+                }
+                final String termDir = termSegment(term);
+                try (IndexInput input = directory.openInput(fileName, IOContext.READONCE)) {
+                    final long length = input.length();
+                    try (InputStream stream = new IndexInputStream(input, length)) {
+                        blobStore.blobContainer(shardBase.add(termDir)).writeBlob(fileName, stream, length, false);
+                    }
+                }
+                // The manifest records which term's container a file lives in, not a full path, so a
+                // failover can inherit files without moving them.
+                published.put(fileName, termDir);
+            }
+        } finally {
+            store.decRef();
+        }
+
+        final CommitManifest manifest = new CommitManifest(term, published);
+        final long expected = existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+        final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, manifest.toBytes());
+        if (result.applied() == false) {
+            throw new StaleWriterException(term, -1L);
+        }
+        return manifest;
+    }
+
+    /**
+     * Reads the currently published manifest.
+     *
+     * @return the manifest, or empty if nothing has been published for this shard
+     * @throws IOException if the register cannot be read
+     */
+    public Optional<CommitManifest> readManifest() throws IOException {
+        final Optional<BlobRegister> register = container.readRegister(MANIFEST);
+        if (register.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(parse(register.get()));
+    }
+
+    /**
+     * Restores the published commit into a directory, so a shard can open from it.
+     *
+     * <p>Called before the shard is recovered, and the reason recovery must then use
+     * {@code ExistingStoreRecoverySource}: {@code EMPTY_STORE} calls {@code Store#createEmpty}, which
+     * would delete exactly what this just wrote.
+     *
+     * @param target the shard's directory
+     * @param shardId for error messages
+     * @return the manifest restored, or empty if nothing was published
+     * @throws IOException if download fails
+     */
+    public Optional<CommitManifest> restoreInto(Directory target, ShardId shardId) throws IOException {
+        final Optional<CommitManifest> manifest = readManifest();
+        if (manifest.isEmpty() || manifest.get().files().isEmpty()) {
+            return Optional.empty();
+        }
+        for (Map.Entry<String, String> file : manifest.get().files().entrySet()) {
+            final BlobContainer source = blobStore.blobContainer(shardBase.add(file.getValue()));
+            try (InputStream in = source.readBlob(file.getKey()); IndexOutput out = target.createOutput(file.getKey(), IOContext.DEFAULT)) {
+                final byte[] buffer = new byte[8192];
+                int read;
+                while ((read = in.read(buffer)) > 0) {
+                    out.writeBytes(buffer, read);
+                }
+            } catch (org.apache.lucene.store.AlreadyClosedException e) {
+                throw new IOException("directory closed while restoring " + shardId, e);
+            }
+        }
+        return manifest;
+    }
+
+    private CommitManifest parse(BlobRegister register) throws IOException {
+        try (InputStream in = register.value().streamInput()) {
+            return CommitManifest.fromStream(in);
+        }
+    }
+
+    /** Adapts a Lucene {@link IndexInput} to an {@link InputStream} for blob upload. */
+    private static final class IndexInputStream extends InputStream {
+
+        private final IndexInput input;
+        private final long length;
+        private long position;
+
+        IndexInputStream(IndexInput input, long length) {
+            this.input = input;
+            this.length = length;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (position >= length) {
+                return -1;
+            }
+            position++;
+            return input.readByte() & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (position >= length) {
+                return -1;
+            }
+            final int toRead = (int) Math.min(len, length - position);
+            input.readBytes(b, off, toRead);
+            position += toRead;
+            return toRead;
+        }
+    }
+}

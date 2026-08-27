@@ -91,6 +91,12 @@ import static java.util.Collections.emptyMap;
  */
 public final class ServerlessNode implements Closeable {
 
+    /** Accepts writer activation: takes ownership of shards and indexes into them. */
+    public static final String ROLE_INGEST = "ingest";
+
+    /** Accepts reader activation: serves search from object-store-backed segments. */
+    public static final String ROLE_SEARCH = "search";
+
     private final String nodeName;
     private final Settings settings;
     private final ThreadPool threadPool;
@@ -104,6 +110,7 @@ public final class ServerlessNode implements Closeable {
     private final NodeClient nodeClient;
     private volatile DiscoveryNode localNode;
     private volatile MembershipSource membershipSource;
+    private final Set<String> roles;
     private volatile LocalViewProjector projector;
     private volatile ShardReconciler reconciler;
     private volatile boolean started;
@@ -118,6 +125,10 @@ public final class ServerlessNode implements Closeable {
         this.settings = withShellDefaults(settings);
         settings = this.settings;
         this.nodeName = settings.get("node.name", "serverless-node");
+        // §10.4: role is a runtime attribute a node advertises, not a topology decision baked into a
+        // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
+        // environment variable, and role switching under load stays a policy question.
+        this.roles = Set.copyOf(settings.getAsList("serverless.roles", java.util.List.of(ROLE_INGEST, ROLE_SEARCH)));
         final Environment environment = new Environment(settings, null);
         final ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
 
@@ -423,8 +434,14 @@ public final class ServerlessNode implements Closeable {
     public java.util.Set<org.opensearch.core.index.shard.ShardId> syncFrom(org.opensearch.serverless.metadata.MetadataPlane plane)
         throws Exception {
         ensureStarted();
+        reconciler.setSegmentPublishers(plane::segmentPublisher);
         final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId());
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(truth.descriptors(), truth.assignments());
+
+        // Phase 4 has only writer shards, and a node that does not accept writer activation must not
+        // open one. Phase 5 adds reader shards, at which point a search-only node opens those instead of
+        // opening nothing -- so this gate is on the role, not on "has any role".
+        final java.util.Collection<ShardAssignment> assignable = roles.contains(ROLE_INGEST) ? truth.assignments() : java.util.List.of();
+        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(truth.descriptors(), assignable);
 
         // Closing here is NOT the rule §5.2 forbids, and the difference is the input, not the code.
         // ShardReconciler refuses to close on absence from a projected *view* because a view is a local
@@ -433,7 +450,7 @@ public final class ServerlessNode implements Closeable {
         // continuing to hold it is the actual hazard. Hence the two entry points and their two inputs:
         // applyTruth takes a view and never closes; syncFrom takes truth and may.
         final java.util.Set<org.opensearch.core.index.shard.ShardId> stillOwned = new java.util.HashSet<>();
-        for (ShardAssignment assignment : truth.assignments()) {
+        for (ShardAssignment assignment : assignable) {
             final IndexMetadata metadata = clusterService.state().metadata().index(assignment.indexName());
             if (metadata != null) {
                 stillOwned.add(new org.opensearch.core.index.shard.ShardId(metadata.getIndex(), assignment.shardId()));
@@ -445,6 +462,29 @@ public final class ServerlessNode implements Closeable {
             }
         }
         return opened;
+    }
+
+    /**
+     * Publishes a shard's current commit to the object store, fenced by the owning term.
+     *
+     * @param shardId the shard to publish
+     * @param term the term this node owns the shard at
+     * @return the manifest published
+     * @throws java.io.IOException if the shard is not held here, or a newer term already published
+     */
+    public org.opensearch.serverless.store.CommitManifest publishShard(org.opensearch.core.index.shard.ShardId shardId, long term)
+        throws java.io.IOException {
+        ensureStarted();
+        return reconciler.publish(shardId, term);
+    }
+
+    /**
+     * Returns the roles this node advertises.
+     *
+     * @return the roles
+     */
+    public Set<String> roles() {
+        return roles;
     }
 
     /**

@@ -40,6 +40,8 @@ public final class MetadataPlane {
     private final DescriptorStore descriptors;
     private final ShardHeadStore heads;
     private final BlobLeaseMembership membership;
+    private final BlobStore blobStore;
+    private final BlobPath base;
 
     /**
      * Creates a metadata plane over a blob store.
@@ -53,6 +55,19 @@ public final class MetadataPlane {
         this.descriptors = new DescriptorStore(blobStore.blobContainer(RegisterMap.indices(base)));
         this.heads = new ShardHeadStore(blobStore.blobContainer(RegisterMap.shards(base)), clock, leaseTtlMillis);
         this.membership = new BlobLeaseMembership(blobStore.blobContainer(RegisterMap.members(base)), clock, leaseTtlMillis);
+        this.blobStore = blobStore;
+        this.base = base;
+    }
+
+    /**
+     * Returns the segment publisher for one shard.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @return the publisher
+     */
+    public org.opensearch.serverless.store.SegmentPublisher segmentPublisher(String indexName, int shardId) {
+        return new org.opensearch.serverless.store.SegmentPublisher(blobStore, RegisterMap.shardData(base, indexName, shardId));
     }
 
     /**
