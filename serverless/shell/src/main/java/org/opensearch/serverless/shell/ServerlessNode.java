@@ -502,6 +502,77 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * Takes ownership of a shard and opens it for writing.
+     *
+     * <p>One compare-and-swap, then the ordinary sync. A node that loses the race gets an empty result
+     * rather than an exception, because losing is not an error: the winner's head is in the metadata
+     * plane and the correct response is to route there, never to retry activation elsewhere.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @return the shard, or empty if another node holds a live lease on it
+     * @throws Exception if activation or opening fails
+     */
+    public java.util.Optional<org.opensearch.core.index.shard.ShardId> activateWriter(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber
+    ) throws Exception {
+        ensureStarted();
+        if (roles.contains(ROLE_INGEST) == false) {
+            throw new IllegalStateException("node " + nodeName + " does not accept writer activation; its roles are " + roles);
+        }
+        final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
+            indexName,
+            shardNumber,
+            localNode.getId(),
+            localNode.getEphemeralId()
+        );
+        if (acquisition.acquired() == false) {
+            return java.util.Optional.empty();
+        }
+        syncFrom(plane);
+        final IndexMetadata metadata = clusterService.state().metadata().index(indexName);
+        return metadata == null
+            ? java.util.Optional.empty()
+            : java.util.Optional.of(new org.opensearch.core.index.shard.ShardId(metadata.getIndex(), shardNumber));
+    }
+
+    /**
+     * Renews the leases this node holds, and lets go of anything it has lost.
+     *
+     * <p>This is the whole of failure detection, and it runs on the node that might be failing rather
+     * than on one watching it. A node whose process is paused, partitioned or dead simply stops calling
+     * this, its leases lapse, and another node acquires by compare-and-swap. Nothing needs to agree that
+     * it died.
+     *
+     * <p>The release half matters as much as the renewal half. A node that has lost a shard must stop
+     * serving it, and this is where it finds out — a renewal that comes back empty means the head no
+     * longer names this node, which happens exactly when someone else won it.
+     *
+     * @param plane the metadata plane
+     * @return the shards released because this node no longer owns them
+     * @throws Exception if the metadata plane cannot be read or written
+     */
+    public java.util.Set<org.opensearch.core.index.shard.ShardId> heartbeat(org.opensearch.serverless.metadata.MetadataPlane plane)
+        throws Exception {
+        ensureStarted();
+        final java.util.Set<org.opensearch.core.index.shard.ShardId> released = new java.util.LinkedHashSet<>();
+        for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
+            if (reconciler.readerShards().contains(shardId)) {
+                // Readers hold no lease, so there is nothing to renew and nothing to lose.
+                continue;
+            }
+            if (plane.heads().renew(shardId.getIndexName(), shardId.id(), localNode.getId()).isEmpty()) {
+                reconciler.releaseShard(shardId, "lease lost: the shard-head no longer names " + nodeName);
+                released.add(shardId);
+            }
+        }
+        return released;
+    }
+
+    /**
      * Serves a shard as a reader: opens the published commit without owning the shard.
      *
      * <p>Reader activation is the cheap half of the design. There is no compare-and-swap and no entry in

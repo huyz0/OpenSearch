@@ -727,6 +727,11 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
+> **Phase 6 is complete (2026-08-27).** Failure detection runs on the node that might be failing: stop
+> heartbeating and the lease lapses. The zombie test — a writer alive, paused past its lease, still
+> believing it owns the shard — confirms its local writes succeed, reach nobody, and vanish, which
+> separates R9's fence from phase 4's WAL gap. See [`phase6-notes.md`](phase6-notes.md).
+>
 > **Phase 5 is complete (2026-08-27).** A search node serves a shard by reading its manifest, touching
 > no register — the head's owner and term are unchanged before and after. The role selects
 > `ReadOnlyEngine`, so reader safety is structural rather than conventional. Scale-to-zero was verified
@@ -803,7 +808,7 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 | 3 | **Metadata plane** | ✅ **COMPLETE.** `DescriptorStore`, `ShardHeadStore`, `MetadataPlane`, and the §9.3 register map. Create-index is one put-if-absent; activation is one CAS; `node.syncFrom(plane)` replaces cluster-state publication. 40 tests; both CAS safety claims verified by planted canaries. Per **D5**, `FsBlobContainer` only — no S3/GCS durability claim. See [`phase3-notes.md`](phase3-notes.md). |
 | 4 | **Write path** | ⚠️ **PARTIAL.** Segment publication and restore through the object store: failover now moves *data*, not just ownership. Term-scoped containers + manifest CAS fence a zombie (R9 partially closed, both halves canary-verified). Roles are lease attributes. **Deferred:** WAL, `TransportShardBulkAction` wiring, automatic publication — see [`phase4-notes.md`](phase4-notes.md). 45 tests. |
 | 5 | **Search path** | ✅ **COMPLETE.** Reader shards open from a manifest with no CAS and no shard-head entry; the `search` role selects `ReadOnlyEngine`, so a reader is structurally unable to write. Scale-to-zero verified by closing every search node and serving from a fresh one. 51 tests; both claims canary-verified. See [`phase5-notes.md`](phase5-notes.md). |
-| 6 | **Activation & failover** | CAS activation, lease expiry, writer failover with no data loss under kill-9 — including a **paused-JVM zombie test** for the §9.6 fencing rule, since kill-9 alone does not produce a zombie. |
+| 6 | **Activation & failover** | ✅ **COMPLETE.** `activateWriter` (CAS, losing returns empty not an error) and `heartbeat` (renew what is held, release what is lost). kill-9 loses no published data. The paused-JVM zombie test walks the full sequence and separates fencing from the WAL gap. 56 tests; all three claims canary-verified. See [`phase6-notes.md`](phase6-notes.md). |
 | 7 | **Surface** | Allowlisted admin/stats APIs, re-implemented against the metadata plane. 501 for everything else. |
 | 8 | **Gossip & reconcilers** | Routing hints, background reconciliation, GC. Gossip introduced **only if** phases 1–7 show polling plus K8s push is insufficient — measured, per §10.3's second cost. |
 | 9 | **Scale validation** | The `plan-100m-index-implementation.md` targets re-measured on this shell. |
@@ -854,7 +859,7 @@ that is zero when broken. No test asserts only the absence of an exception.
 | R6 | Upstream drift in the data plane's internal APIs | Medium→Low | §8.1's extraction narrows the coupling surface to five shell interfaces plus four shared ones. Merges stay routine; D4 rule 1 is CI-enforced |
 | R7 | Snapshot/restore, security, ISM assume the old shell | Medium | Explicitly out of scope (§16); decide per feature, default absent |
 | R8 | Object-store list consistency is still unmeasured | Open | Pre-existing open item, carried in `plan-100m-index-implementation.md`; unchanged by this RFC |
-| R9 | **Zombie writer corrupts data past lease expiry** (§9.6) | **Critical** | Term-scoped key paths, so stale writes are inert rather than corrupting. Must be verified by a kill-9-with-paused-JVM test in phase 6, not by argument |
+| R9 | Zombie writer corrupts data past lease expiry (§9.6) | **Closed for published data (phase 6)** | Term-scoped containers + manifest CAS, both canary-verified. The paused-JVM test confirms a zombie's writes succeed locally, cannot be published, cannot overwrite a live writer's blobs, and vanish on release. Residual: unpublished writes are lost, which is the WAL gap, not a fence failure |
 | R10 | No watch primitive; polling cost at fleet scale (§9.5) | High | Epoch piggybacked on existing transport traffic; poll is the idle fallback. Measure GET/s at target fleet size in phase 9 |
 | R11 | Provider conditional writes are not as linearizable as assumed | **Critical — deferred by D5** | Unchanged in severity; only its timing moved. The entire safety argument still rests on it. Phase 3 may proceed on `FsBlobContainer` alone, clearly labelled as such; no durability claim against S3 or GCS is permitted until the conformance suite runs |
 | R12 | Cross-node version comparisons beyond `ReplicationTracker` (§5.3) | **Confirmed and fixed in design (S1)** | Hazard reproduced (silent ignore) and the shard-head-generation fix verified. Residual exposure: any *other* cross-node number, still unenumerated |
