@@ -727,6 +727,10 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
+> **Where this stands overall:** phases 0–9 are delivered, and **§12.1 lists what remains** — most
+> importantly that durability is "as of the last published commit" with publication still manual, and
+> that no endpoint touches a document. The green table below is not the whole picture.
+>
 > **Phase 9 is complete (2026-08-27).** Creation cost is flat in the population — one object-store write
 > per create at every population measured — and node residency tracks the working set. The phase also
 > found what it was for: `truthFor` was doing an O(population) sweep on the steady-state path, 2N+1
@@ -836,6 +840,32 @@ Each phase ends in something runnable. No phase is a refactor with no observable
 
 Phases 1–2 are the ones that decide whether this is a two-quarter project or a two-year one. Treat
 their estimates as unknown until phase 2 lands.
+
+### 12.1 Remaining milestones
+
+Phases 0–9 are done and the table above is almost entirely green, which is misleading on its own: a
+reader would conclude the project is finished and would not learn that **no endpoint touches a
+document**. Every deferred item was recorded honestly, but as prose inside seven separate
+"what this does NOT establish" sections — good provenance, useless for planning. This is that inventory
+consolidated, with nothing new added.
+
+| # | Milestone | Contents | Blocked on |
+|---|---|---|---|
+| **M10** | **Durability** | Automatic publication (today `publishShard` is called by hand, so the loss window is unbounded rather than "since the last commit"); then a WAL to close it to zero. Retires the R9 residual. | — |
+| **M11** | **The data path** | `POST /{index}/_doc`, `_bulk`, `GET /{index}/_search`. Request routing to the owning node (`RoutingHints` + transport forwarding); search fan-out across shards and readers; readers following a newer commit. This is R3. | M10 |
+| **M12** | **Provider conformance (R11)** | CAS linearizability under contention on S3 and GCS; listing bounded by `start-after`/`max-keys`; clock skew between a writer and its successor. | — |
+| **M13** | **Autonomic operation** | Scheduled ticks and heartbeats rather than called ones; automatic reactivation of an unowned shard; a scale-to-zero controller; consolidating the two liveness modes into one. | — |
+| **M14** | **Scale hardening** | Sharded GC sweep; name index / prefix search (`plan-area-a-name-index.md`); shard-count scaling and per-index memory, neither yet measured; lazy block-range reads with a file cache instead of whole-segment download. | M11 |
+| **M15** | **Production surface** | Auth and multi-tenancy — today anyone who can reach the port can delete an index. Classic create-body envelope, or an explicit decision that D2 makes it a non-goal. Delete draining a live writer. The `cluster/config` register, named in §9.3 and never built. | M11 |
+
+**Ordering.** M10 before M11, and the reason is not preference: shipping a data path first would give
+people a way to write to a system that silently drops recent writes on failover, which is worse than
+having no data path. M12 has no dependencies and gates every durability claim the project makes —
+three phases have now ended pointing at it, and phase 9 *grew* its surface from "is CAS linearizable"
+to also "does a listing actually bound", which `FsBlobContainer` cannot demonstrate at all.
+
+**What is deliberately absent rather than pending:** gossip (§10.3's gate, unmet by measurement),
+drop-in client compatibility (D2), and Azure support (D3). Those are decisions, not debt.
 
 ## 13. Testing
 
