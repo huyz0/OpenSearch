@@ -91,6 +91,8 @@ import static java.util.Collections.emptyMap;
  */
 public final class ServerlessNode implements Closeable {
 
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(ServerlessNode.class);
+
     /** Accepts writer activation: takes ownership of shards and indexes into them. */
     public static final String ROLE_INGEST = "ingest";
 
@@ -111,6 +113,7 @@ public final class ServerlessNode implements Closeable {
     private volatile DiscoveryNode localNode;
     private volatile MembershipSource membershipSource;
     private volatile org.opensearch.serverless.metadata.MetadataPlane metadataPlane;
+    private volatile org.opensearch.serverless.transport.ShardRouter router;
     private final Set<String> roles;
     private final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
     private final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -434,7 +437,37 @@ public final class ServerlessNode implements Closeable {
         this.metadataPlane = plane;
         if (plane != null) {
             setMembershipSource(plane.membership());
+            try {
+                // Publish the lease immediately. It is this node's entry in the address book that peers
+                // use to forward writes here, so a node that has not renewed yet is not merely invisible
+                // -- it is unroutable, and a client's write would be refused with nowhere to send it.
+                renewOwnLease(plane);
+            } catch (java.io.IOException e) {
+                logger.warn("could not publish this node's lease; peers will not be able to route to it", e);
+            }
         }
+    }
+
+    private void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
+        plane.membership()
+            .renew(
+                new org.opensearch.serverless.membership.NodeLease(
+                    localNode.getId(),
+                    localNode.getEphemeralId(),
+                    localNode.getAddress().toString(),
+                    roles,
+                    0L
+                )
+            );
+    }
+
+    /**
+     * Returns this node's shard router, which forwards work to the node that owns a shard.
+     *
+     * @return the router, or null before {@link #start()}
+     */
+    public org.opensearch.serverless.transport.ShardRouter router() {
+        return router;
     }
 
     /**
@@ -462,6 +495,8 @@ public final class ServerlessNode implements Closeable {
         // The identity in the initial view carried a placeholder address, because the real one is not
         // known until the transport binds. Replace it now that it is.
         localNode = transportService.getLocalNode();
+        router = new org.opensearch.serverless.transport.ShardRouter(this, transportService, () -> metadataPlane);
+        router.registerHandlers();
 
         // Built here rather than in the constructor: both need the node identity, and the identity is
         // not final until the transport has bound and told us the address it got.
@@ -596,19 +631,12 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         final java.util.Set<org.opensearch.core.index.shard.ShardId> released = new java.util.LinkedHashSet<>();
 
-        if (plane.usesNodeLeaseLiveness()) {
-            // §7's batching: one renewal covers every shard this node holds, however many that is.
-            plane.membership()
-                .renew(
-                    new org.opensearch.serverless.membership.NodeLease(
-                        localNode.getId(),
-                        localNode.getEphemeralId(),
-                        localNode.getAddress().toString(),
-                        roles,
-                        0L
-                    )
-                );
-        }
+        // Always, not only under §7's batching. Under batching this is what keeps the node's shards
+        // alive; in either mode it is what keeps the node addressable, since peers resolve a forwarding
+        // target from its lease. One write per tick per node, which is what phase 8 measured batching
+        // down to anyway -- per-shard mode now pays it too, and that is the honest cost of being
+        // reachable.
+        renewOwnLease(plane);
 
         for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
             if (reconciler.readerShards().contains(shardId)) {

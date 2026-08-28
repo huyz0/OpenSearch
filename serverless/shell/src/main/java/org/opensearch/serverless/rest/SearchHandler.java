@@ -8,26 +8,13 @@
 
 package org.opensearch.serverless.rest;
 
-import org.opensearch.action.OriginalIndices;
-import org.opensearch.action.search.SearchRequest;
-import org.opensearch.action.search.SearchShardTask;
-import org.opensearch.action.support.PlainActionFuture;
-import org.opensearch.core.common.Strings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.SearchHit;
-import org.opensearch.search.SearchPhaseResult;
-import org.opensearch.search.SearchService;
-import org.opensearch.search.builder.SearchSourceBuilder;
-import org.opensearch.search.fetch.FetchSearchResult;
-import org.opensearch.search.fetch.ShardFetchRequest;
-import org.opensearch.search.internal.AliasFilter;
-import org.opensearch.search.internal.ShardSearchRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
@@ -36,11 +23,8 @@ import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -110,22 +94,22 @@ public final class SearchHandler extends BaseRestHandler {
         final String value = q.substring(q.indexOf(':') + 1);
 
         final ServerlessNode serving = node.get();
-        final Set<ShardId> reachable = new LinkedHashSet<>();
-        for (ShardId shardId : serving.reconciler().openShards()) {
-            if (shardId.getIndexName().equals(index)) {
-                reachable.add(shardId);
-            }
-        }
-
-        final int searched = reachable.size();
         final int shards = descriptor.get().numberOfShards();
+
+        // Membership is the address book and the placement input, so refresh once per search rather
+        // than per shard.
+        try {
+            metadata.membership().refresh();
+        } catch (Exception e) {
+            logger.warn("could not refresh membership before searching", e);
+        }
 
         // Off the HTTP thread. executeQueryPhase hands work to the search pool and this waits for it;
         // waiting on the transport thread that is meant to be reading the next request resets the
         // connection, which surfaces to the client as RST_STREAM rather than as anything diagnosable.
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                respond(channel, serving, reachable, field, value, size, searched, shards);
+                respond(channel, serving, metadata, index, field, value, size, shards);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -139,21 +123,99 @@ public final class SearchHandler extends BaseRestHandler {
     private void respond(
         org.opensearch.rest.RestChannel channel,
         ServerlessNode serving,
-        Set<ShardId> reachable,
+        MetadataPlane metadata,
+        String index,
         String field,
         String value,
         int size,
-        int searched,
         int shards
     ) throws IOException {
         long total = 0;
-        final List<SearchHit> collected = new ArrayList<>();
-        for (ShardId shardId : reachable) {
-            final long[] shardTotal = new long[1];
-            collected.addAll(queryShard(serving.searchService(), shardId, field, value, size, shardTotal));
-            total += shardTotal[0];
+        int answered = 0;
+        final List<String> ids = new ArrayList<>();
+        final List<String> sources = new ArrayList<>();
+
+        for (int shard = 0; shard < shards; shard++) {
+            final ShardId local = localShard(serving, index, shard);
+            if (local != null) {
+                final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, field, value, size);
+                total += result.total();
+                for (SearchHit hit : result.hits()) {
+                    ids.add(hit.getId());
+                    sources.add(hit.getSourceAsString());
+                }
+                answered++;
+                continue;
+            }
+            // Not here. Choose a reader by placement -- NOT the shard's owner, which is the writer:
+            // routing searches to writers would couple search capacity to write capacity and make
+            // per-index search scale-to-zero meaningless. Placement is a cache-affinity hint, so the
+            // owner remains a last resort for the case where no search node exists at all.
+            final List<String> targets = new ArrayList<>(
+                org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+                    index,
+                    shard,
+                    metadata.membership().current(),
+                    ServerlessNode.ROLE_SEARCH,
+                    2
+                )
+            );
+            final var head = metadata.heads().read(index, shard);
+            head.map(h -> h.ownerNodeId()).ifPresent(owner -> {
+                if (targets.contains(owner) == false) {
+                    targets.add(owner);
+                }
+            });
+
+            boolean got = false;
+            for (String target : targets) {
+                try {
+                    if (serving.localNode().getId().equals(target)) {
+                        // We are the placement for this shard but do not hold it yet. Open it here
+                        // rather than asking ourselves over the network.
+                        final ShardId opened = serving.serveAsReader(metadata, index, shard);
+                        final var mine = org.opensearch.serverless.shard.ShardQuery.execute(
+                            serving.searchService(),
+                            opened,
+                            field,
+                            value,
+                            size
+                        );
+                        total += mine.total();
+                        for (SearchHit hit : mine.hits()) {
+                            ids.add(hit.getId());
+                            sources.add(hit.getSourceAsString());
+                        }
+                        got = true;
+                        break;
+                    }
+                    final var peer = serving.router().peer(target);
+                    if (peer.isEmpty()) {
+                        continue;
+                    }
+                    final var answer = serving.router()
+                        .forwardSearch(
+                            peer.get(),
+                            new org.opensearch.serverless.transport.ForwardedSearchRequest(index, shard, field, value, size)
+                        );
+                    total += answer.total();
+                    ids.addAll(answer.ids());
+                    sources.addAll(answer.sources());
+                    got = true;
+                    break;
+                } catch (Exception e) {
+                    // Try the next candidate. A shard that failed to answer is not a shard with no
+                    // matches, so it only counts as searched if one of them succeeded.
+                    logger.warn("shard " + shard + " of " + index + " was not served by " + target, e);
+                }
+            }
+            if (got) {
+                answered++;
+            }
         }
+
         final long hitTotal = total;
+        final int searched = answered;
         {
             try (XContentBuilder builder = channel.newBuilder()) {
                 builder.startObject();
@@ -170,11 +232,11 @@ public final class SearchHandler extends BaseRestHandler {
                 builder.field("value", hitTotal);
                 builder.endObject();
                 builder.startArray("hits");
-                for (SearchHit hit : collected) {
+                for (int i = 0; i < ids.size(); i++) {
                     builder.startObject();
-                    builder.field("_id", hit.getId());
-                    if (hit.getSourceAsString() != null) {
-                        builder.field("_source", hit.getSourceAsString());
+                    builder.field("_id", ids.get(i));
+                    if (sources.get(i) != null && sources.get(i).isEmpty() == false) {
+                        builder.field("_source", sources.get(i));
                     }
                     builder.endObject();
                 }
@@ -186,55 +248,13 @@ public final class SearchHandler extends BaseRestHandler {
         }
     }
 
-    /** Query then fetch against one shard, through the reused {@link SearchService}. */
-    private List<SearchHit> queryShard(SearchService searchService, ShardId shardId, String field, String value, int size, long[] total)
-        throws IOException {
-        final SearchRequest searchRequest = new SearchRequest(shardId.getIndexName()).allowPartialSearchResults(false)
-            .source(
-                new SearchSourceBuilder().query(QueryBuilders.matchQuery(field, value)).size(size).trackTotalHits(true).fetchSource(true)
-            );
-        final ShardSearchRequest shardRequest = new ShardSearchRequest(
-            OriginalIndices.NONE,
-            searchRequest,
-            shardId,
-            1,
-            AliasFilter.EMPTY,
-            1.0f,
-            System.currentTimeMillis(),
-            null,
-            Strings.EMPTY_ARRAY
-        );
-        final SearchShardTask task = new SearchShardTask(0, "serverless", "serverless", "serverless", null, Collections.emptyMap());
-
-        final PlainActionFuture<SearchPhaseResult> queryFuture = PlainActionFuture.newFuture();
-        // keepStatesInContext, because the fetch below needs the reader the query opened.
-        searchService.executeQueryPhase(shardRequest, true, task, queryFuture, ThreadPool.Names.SEARCH, false);
-        final SearchPhaseResult queryResult = queryFuture.actionGet();
-        total[0] = queryResult.queryResult().topDocs().topDocs.totalHits.value();
-
-        // A single-shard request resolves to query-and-fetch, so the hits are already here and the
-        // reader context has already been freed. Asking for it again produced
-        // "No search context found for id [1]" -- a 404 that reads like the document is missing rather
-        // than like the caller fetched twice.
-        if (queryResult.fetchResult() != null && queryResult.fetchResult().hits() != null) {
-            return List.of(queryResult.fetchResult().hits().getHits());
-        }
-
-        final List<Integer> docIds = new ArrayList<>();
-        for (var scoreDoc : queryResult.queryResult().topDocs().topDocs.scoreDocs) {
-            docIds.add(scoreDoc.doc);
-        }
-        if (docIds.isEmpty()) {
-            searchService.freeReaderContext(queryResult.getContextId());
-            return List.of();
-        }
-        try {
-            final PlainActionFuture<FetchSearchResult> fetchFuture = PlainActionFuture.newFuture();
-            searchService.executeFetchPhase(new ShardFetchRequest(queryResult.getContextId(), docIds, null), task, fetchFuture);
-            return List.of(fetchFuture.actionGet().hits().getHits());
-        } finally {
-            // The reader is pinned until this runs; leaking one keeps a commit's files alive forever.
-            searchService.freeReaderContext(queryResult.getContextId());
-        }
+    private static ShardId localShard(ServerlessNode serving, String index, int shard) {
+        return serving.reconciler()
+            .openShards()
+            .stream()
+            .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
+            .findFirst()
+            .orElse(null);
     }
+
 }

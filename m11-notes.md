@@ -56,12 +56,55 @@ fetch result when it is there.
 sub-phase list — the sub-phases are what load the source. Every hit came back with an id and no body,
 and nothing failed. It is now built by `SearchModule`, as `Node` does it.
 
-## What M11 does NOT establish
+## The cross-node half, and a design correction
 
-- **No cross-node forwarding.** A write to the wrong node is refused with the owner named, not proxied.
-  Transport forwarding using the address in each node's lease is the remaining half of R3.
-- **No cross-node search fan-out.** A search covers the shards *this node holds*; coverage is reported
-  precisely so that is visible rather than hidden.
+The first cut forwarded searches to `head.ownerNodeId` — the shard's **writer**. That was wrong, and
+wrong in a way the RFC had already argued against: it couples search capacity to write capacity and
+makes per-index search scale-to-zero meaningless (goals 2 and 3 of `rfc-serverless-opensearch.md` §2),
+and §6 of the metadata-plane RFC says reader activation needs no coordination at all. Routing reads to
+the writer reintroduces exactly the coupling the design removes.
+
+So searches route by **reader placement** instead:
+
+- **Rendezvous hashing** over the live `search`-role leases, not modulo. With `hash(shard) % n`, one
+  node joining reshuffles nearly every shard and discards every cache; highest-random-weight moves
+  about `1/n` of them. Since the entire point of placement is that a node keeps being asked for what it
+  already holds, that difference is the feature.
+- **Placement is a hint.** A node asked for a shard it does not hold opens it from the manifest and
+  serves. Correctness never depends on the routing being right — a stale or unlucky decision costs a
+  cold read. The moment placement became *required*, this would have reinvented the stateful cluster it
+  exists to escape: agreement on placement, drain-before-move, handoff.
+- **The owner remains a last resort**, for the case where no node advertises `search` at all.
+
+Writes still forward to the owner, which is correct: a write must reach the node holding the shard-head,
+because that is what compare-and-swap established.
+
+Peers are resolved from their **leases** — a node's lease already records the transport address it
+bound, so membership doubles as the address book and there is no separate discovery. One consequence,
+recorded because it changes a measured number: a node now renews its lease every tick in *both* liveness
+modes, not only under §7's batching, because a node that has not published its address is not merely
+invisible but unroutable. Per-shard mode therefore pays `shards + 1` writes per tick rather than
+`shards`; batched mode is unchanged at 1, and `ServerlessBatchedLeaseTests` asserts both.
+
+## Canaries — the two cross-node properties
+
+| Canary | Failure produced |
+|---|---|
+| No fan-out (local shards only) | `searched:1 ... complete:false ... value:3` of 10 |
+| A node refuses a shard it does not hold (placement becomes a requirement) | cold search node serves `value:0` |
+
+Worth noting what the failures looked like: even broken, the responses reported `complete:false` rather
+than a confident wrong total. The coverage field did its job on the way down.
+
+## What M11 does NOT establish
+- **Readers download whole segment files.** A cache miss costs a full segment rather than the few byte
+  ranges a query needs, which makes placement carry more weight than it should. Lazy block-range reads
+  with a file cache are phase 5's deferred item and the thing that would make cold reads cheap enough
+  that placement stopped mattering much.
+- **Nothing keeps a placement warm.** Readers are opened on demand and never proactively; there is no
+  controller deciding what to pre-warm or when to release a cold shard.
+- **Fan-out is sequential.** Shards are queried one after another, not in parallel, so a wide index
+  pays the sum of its shard latencies.
 - **No `_bulk`.** One document per request, and therefore one object-store PUT per document — M10's
   missing batching, now reachable from outside.
 - **`q=field:value` only.** No query DSL body, no aggregations, no sort, no pagination beyond `size`.

@@ -102,6 +102,38 @@ public final class DocumentHandler extends BaseRestHandler {
         if (shardId == null || serving.reconciler().readerShards().contains(shardId)) {
             final var head = metadata.heads().read(index, shard);
             final String owner = head.map(h -> h.ownerNodeId()).orElse(null);
+            if (owner != null) {
+                // Forward rather than refuse. The client should not have to know which node owns which
+                // shard; that is exactly the knowledge the shard-head exists to hold.
+                return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
+                    try {
+                        final var peer = serving.router().peer(owner);
+                        if (peer.isEmpty()) {
+                            channel.sendResponse(
+                                IndexAdminHandler.error(
+                                    channel,
+                                    RestStatus.SERVICE_UNAVAILABLE,
+                                    "owner_unreachable",
+                                    "shard " + shard + " is owned by " + owner + ", which has no reachable lease"
+                                )
+                            );
+                            return;
+                        }
+                        final var ack = serving.router()
+                            .forwardIndex(
+                                peer.get(),
+                                new org.opensearch.serverless.transport.ForwardedIndexRequest(index, shard, id, source, refresh)
+                            );
+                        respondCreated(channel, index, id, shard, ack.ownerNodeId());
+                    } catch (Exception e) {
+                        try {
+                            channel.sendResponse(new BytesRestResponse(channel, e));
+                        } catch (IOException nested) {
+                            logger.error("failed to report a forwarding failure", nested);
+                        }
+                    }
+                });
+            }
             return channel -> {
                 try (XContentBuilder builder = channel.newBuilder()) {
                     builder.startObject();
@@ -135,7 +167,7 @@ public final class DocumentHandler extends BaseRestHandler {
                     // hits and no error, which reads as data loss and is not.
                     serving.reconciler().shard(shardId).refresh("serverless-rest-refresh");
                 }
-                respondCreated(channel, index, id, shard);
+                respondCreated(channel, index, id, shard, serving.localNode().getId());
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -146,7 +178,8 @@ public final class DocumentHandler extends BaseRestHandler {
         });
     }
 
-    private void respondCreated(org.opensearch.rest.RestChannel channel, String index, String id, int shard) throws IOException {
+    private void respondCreated(org.opensearch.rest.RestChannel channel, String index, String id, int shard, String writtenBy)
+        throws IOException {
         {
             try (XContentBuilder builder = channel.newBuilder()) {
                 builder.startObject();
@@ -158,6 +191,9 @@ public final class DocumentHandler extends BaseRestHandler {
                 // usual meaning; here the write is in the log before this response exists, and the
                 // segment it will live in may not be published yet.
                 builder.field("durable", "write-ahead log");
+                // Which node actually holds the shard. Useful when the write was forwarded, and never
+                // misleading when it was not.
+                builder.field("_node", writtenBy);
                 builder.endObject();
                 channel.sendResponse(new BytesRestResponse(RestStatus.CREATED, builder));
             }

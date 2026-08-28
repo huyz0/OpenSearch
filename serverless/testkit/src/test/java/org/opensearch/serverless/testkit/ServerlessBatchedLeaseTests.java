@@ -196,7 +196,10 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         );
 
         // The specific claim: writes stop scaling with shard count. Reads do not, and are not claimed to.
-        assertEquals("without batching a node writes once per shard it holds", shards, perShard[1]);
+        // Both modes now also write the node's own lease every tick -- that is the address book peers
+        // resolve a forwarding target from (M11), so a node that does not publish it is unroutable.
+        // Under batching that lease IS the liveness signal, so batched stays at one write total.
+        assertEquals("without batching a node writes once per shard, plus its own lease", shards + 1, perShard[1]);
         assertEquals("with batching a node writes once, however many shards it holds", 1L, batched[1]);
         assertTrue("the total should fall too", batched[0] + batched[1] < perShard[0] + perShard[1]);
     }

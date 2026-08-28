@@ -155,8 +155,8 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         }
     }
 
-    /** A node that does not own the shard refuses and names who does. */
-    public void testANonOwnerRefusesAndNamesTheOwner() throws Exception {
+    /** A write to any node reaches the shard's owner, and the response says which node held it. */
+    public void testAWriteToTheWrongNodeIsForwardedToTheOwner() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
@@ -174,15 +174,17 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             send(ownerHttp, "PUT", "/library?shards=1", MAPPING);
             owner.activateWriter(plane, "library", 0);
 
-            final Response misdirected = send(otherHttp, "PUT", "/library/_doc/x", "{\"msg\":\"wrong node\",\"n\":1}");
-            assertEquals(421, misdirected.status());
+            // The client should not need to know which node owns which shard; that is what the
+            // shard-head is for. Sending to the wrong node must work, not merely fail helpfully.
+            final Response forwarded = send(otherHttp, "PUT", "/library/_doc/x?refresh=true", "{\"msg\":\"forwarded\",\"n\":1}");
+            assertEquals(201, forwarded.status());
             assertTrue(
-                "the refusal must name the owner so the client does not guess: " + misdirected.body(),
-                misdirected.body().contains(owner.localNode().getId())
+                "the response must say which node actually held the shard: " + forwarded.body(),
+                forwarded.body().contains(owner.localNode().getId())
             );
 
-            // And the named owner accepts it.
-            assertEquals(201, send(ownerHttp, "PUT", "/library/_doc/x?refresh=true", "{\"msg\":\"right node\",\"n\":1}").status());
+            // And the document is really on the owner, not merely acknowledged by the other node.
+            assertEquals(1L, ShardOps.hits(owner.searchService(), owner.reconciler().openShards().iterator().next(), "msg", "forwarded"));
         }
     }
 
@@ -214,6 +216,86 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             final Response all = send(http, "GET", "/spread/_search?q=msg:spread&size=20", null);
             assertTrue("every document must be findable: " + all.body(), all.body().contains("\"value\":12"));
             assertTrue(all.body().contains("\"complete\":true"));
+        }
+    }
+
+    /** The milestone's other half: a search on one node covers shards held by another. */
+    public void testSearchFansOutAcrossNodes() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = planeOver(createTempDir(), clock);
+
+        try (
+            ServerlessNode a = new ServerlessNode(nodeSettings("m11-fan-a"));
+            ServerlessNode b = new ServerlessNode(nodeSettings("m11-fan-b"))
+        ) {
+            a.start();
+            b.start();
+            a.setMetadataPlane(plane);
+            b.setMetadataPlane(plane);
+            final TransportAddress aHttp = a.boundHttpAddress().publishAddress();
+            final TransportAddress bHttp = b.boundHttpAddress().publishAddress();
+
+            send(aHttp, "PUT", "/split?shards=2", MAPPING);
+            // One shard each. Neither node can answer a whole search alone.
+            assertTrue(a.activateWriter(plane, "split", 0).isPresent());
+            assertTrue(b.activateWriter(plane, "split", 1).isPresent());
+
+            // Written through one node; forwarding puts each document on whichever node owns its shard.
+            for (int i = 0; i < 10; i++) {
+                assertEquals(
+                    201,
+                    send(aHttp, "PUT", "/split/_doc/d" + i + "?refresh=true", "{\"msg\":\"fanout\",\"n\":" + i + "}").status()
+                );
+            }
+
+            // Asked of either node, the answer covers both shards and says so.
+            for (TransportAddress http : new TransportAddress[] { aHttp, bHttp }) {
+                final Response found = send(http, "GET", "/split/_search?q=msg:fanout&size=20", null);
+                assertEquals(200, found.status());
+                assertTrue("fan-out did not cover both shards: " + found.body(), found.body().contains("\"searched\":2"));
+                assertTrue("a fully-covered search must say so: " + found.body(), found.body().contains("\"complete\":true"));
+                assertTrue("documents were lost across the fan-out: " + found.body(), found.body().contains("\"value\":10"));
+            }
+        }
+    }
+
+    /**
+     * Placement is a hint: a search node holding nothing serves a shard by opening it from the manifest.
+     *
+     * <p>This is what stops placement from becoming a requirement — and therefore from reinventing the
+     * stateful cluster this design exists to escape.
+     */
+    public void testASearchNodeHoldingNothingStillServes() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = planeOver(createTempDir(), clock);
+
+        final ServerlessNode writer = new ServerlessNode(nodeSettings("m11-w"));
+        writer.start();
+        writer.setMetadataPlane(plane);
+        final TransportAddress writerHttp = writer.boundHttpAddress().publishAddress();
+        send(writerHttp, "PUT", "/cold?shards=1", MAPPING);
+        final var shardId = writer.activateWriter(plane, "cold", 0).orElseThrow();
+        assertEquals(201, send(writerHttp, "PUT", "/cold/_doc/1?refresh=true", "{\"msg\":\"cached\",\"n\":1}").status());
+        writer.publishShard(shardId, plane.heads().read("cold", 0).orElseThrow().term());
+        writer.close();
+
+        // A search-only node that has never seen this index, and no writer is left alive.
+        final Settings searchOnly = Settings.builder()
+            .put("node.name", "m11-s")
+            .put("cluster.name", "serverless-m11")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", "search")
+            .build();
+        try (ServerlessNode searcher = new ServerlessNode(searchOnly)) {
+            searcher.start();
+            searcher.setMetadataPlane(plane);
+            final Response found = send(searcher.boundHttpAddress().publishAddress(), "GET", "/cold/_search?q=msg:cached", null);
+            assertEquals(200, found.status());
+            assertTrue("a cold search node served nothing: " + found.body(), found.body().contains("\"value\":1"));
+            assertTrue(found.body().contains("\"complete\":true"));
         }
     }
 
