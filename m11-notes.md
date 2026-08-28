@@ -97,7 +97,9 @@ Worth noting what the failures looked like: even broken, the responses reported 
 than a confident wrong total. The coverage field did its job on the way down.
 
 ## What M11 does NOT establish
-- **Readers download whole segment files.** A cache miss costs a full segment rather than the few byte
+- ~~**Readers download whole segment files.**~~ **Closed** by lazy block-range reads — a reader
+  fetches ~16% of a shard to open and answer a query, and 0 bytes on a repeat. See
+  [`block-reads-notes.md`](block-reads-notes.md).
   ranges a query needs, which makes placement carry more weight than it should. Lazy block-range reads
   with a file cache are phase 5's deferred item and the thing that would make cold reads cheap enough
   that placement stopped mattering much.
