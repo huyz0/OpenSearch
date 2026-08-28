@@ -1,0 +1,166 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.serverless.rest;
+
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.BytesRestResponse;
+import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.transport.client.node.NodeClient;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Supplier;
+
+/**
+ * {@code PUT|POST /{index}/_doc/{id}} — the durable write path, reachable by a user.
+ *
+ * <p>Everything M10 built sat behind a Java method until this existed. A write here appends to the
+ * write-ahead log before it is applied, so it survives the writer dying before the next publication.
+ *
+ * <p><b>A node that does not own the shard refuses and names the owner</b> rather than forwarding.
+ * That is the same shape as a lost activation race: losing is a routing instruction, not an error, and
+ * telling the caller who won is what stops it guessing. Forwarding over transport is the remaining half
+ * of this milestone; until it exists, a client must be able to find the right node, so the response
+ * carries it.
+ */
+public final class DocumentHandler extends BaseRestHandler {
+
+    private final Supplier<ServerlessNode> node;
+    private final Supplier<MetadataPlane> plane;
+
+    /**
+     * Creates the handler.
+     *
+     * @param node supplies the node serving the request
+     * @param plane supplies the metadata plane
+     */
+    public DocumentHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+        this.node = node;
+        this.plane = plane;
+    }
+
+    @Override
+    public String getName() {
+        return "serverless_document_action";
+    }
+
+    @Override
+    public List<Route> routes() {
+        return List.of(new Route(RestRequest.Method.PUT, "/{index}/_doc/{id}"), new Route(RestRequest.Method.POST, "/{index}/_doc/{id}"));
+    }
+
+    @Override
+    protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
+        // Read every parameter before any early return: BaseRestHandler rejects a request whose
+        // parameters were not all consumed, which would turn a deliberate refusal into a 400.
+        final String index = request.param("index");
+        final String id = request.param("id");
+        final String source = request.hasContent() ? request.content().utf8ToString() : null;
+        final boolean refresh = request.paramAsBoolean("refresh", false);
+
+        final MetadataPlane metadata = plane.get();
+        if (metadata == null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+            );
+        }
+        if (source == null || source.isBlank()) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a document body is required")
+            );
+        }
+
+        final Optional<IndexDescriptor> descriptor = metadata.describe(index);
+        if (descriptor.isEmpty()) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index)
+            );
+        }
+
+        final int shard = DocumentRouting.shardFor(descriptor.get(), id);
+        final ServerlessNode serving = node.get();
+        final ShardId shardId = serving.reconciler()
+            .openShards()
+            .stream()
+            .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
+            .findFirst()
+            .orElse(null);
+
+        if (shardId == null || serving.reconciler().readerShards().contains(shardId)) {
+            final var head = metadata.heads().read(index, shard);
+            final String owner = head.map(h -> h.ownerNodeId()).orElse(null);
+            return channel -> {
+                try (XContentBuilder builder = channel.newBuilder()) {
+                    builder.startObject();
+                    builder.field("error", "not_the_writer");
+                    builder.field("index", index);
+                    builder.field("shard", shard);
+                    // Name the owner. A bare "wrong node" makes the client guess, and guessing at
+                    // ownership is how two writers end up believing the same thing.
+                    builder.field("owner_node_id", owner);
+                    builder.field(
+                        "reason",
+                        owner == null
+                            ? "no node currently owns this shard; activate it before writing"
+                            : "this node does not own the shard; send the write to the named owner"
+                    );
+                    builder.field("status", RestStatus.MISDIRECTED_REQUEST.getStatus());
+                    builder.endObject();
+                    channel.sendResponse(new BytesRestResponse(RestStatus.MISDIRECTED_REQUEST, builder));
+                }
+            };
+        }
+
+        // Off the HTTP thread: a WAL append is an object-store write, and blocking the thread that
+        // should be reading the next request on remote IO is how a node stops answering under load.
+        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
+            try {
+                serving.index(shardId, id, source);
+                if (refresh) {
+                    // Same meaning as classic OpenSearch: make this write visible to search before
+                    // answering. Without it a caller that writes and immediately searches gets zero
+                    // hits and no error, which reads as data loss and is not.
+                    serving.reconciler().shard(shardId).refresh("serverless-rest-refresh");
+                }
+                respondCreated(channel, index, id, shard);
+            } catch (Exception e) {
+                try {
+                    channel.sendResponse(new BytesRestResponse(channel, e));
+                } catch (IOException nested) {
+                    logger.error("failed to report a write failure", nested);
+                }
+            }
+        });
+    }
+
+    private void respondCreated(org.opensearch.rest.RestChannel channel, String index, String id, int shard) throws IOException {
+        {
+            try (XContentBuilder builder = channel.newBuilder()) {
+                builder.startObject();
+                builder.field("_index", index);
+                builder.field("_id", id);
+                builder.field("_shard", shard);
+                builder.field("result", "created");
+                // Says what was actually guaranteed. "created" alone would leave a reader to assume the
+                // usual meaning; here the write is in the log before this response exists, and the
+                // segment it will live in may not be published yet.
+                builder.field("durable", "write-ahead log");
+                builder.endObject();
+                channel.sendResponse(new BytesRestResponse(RestStatus.CREATED, builder));
+            }
+        }
+    }
+}

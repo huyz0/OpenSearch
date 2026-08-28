@@ -727,10 +727,11 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
-> **Where this stands overall:** phases 0–9 and **M10 (durability)** are delivered, and **§12.1 lists
-> what remains** — most importantly that no endpoint touches a document, so the durable write path
-> exists but nothing outside a test can reach it. That is M11. The green table below is not the whole
-> picture.
+> **Where this stands overall:** phases 0–9, **M10 (durability)** and the single-node half of **M11
+> (the data path)** are delivered — a document can be written and found over HTTP, and survives its
+> node dying. **§12.1 lists what remains**; the largest single gap is now cross-node forwarding and
+> search fan-out, without which a client must reach the node that owns the shard. The green table
+> below is not the whole picture.
 >
 > **Phase 9 is complete (2026-08-27).** Creation cost is flat in the population — one object-store write
 > per create at every population measured — and node residency tracks the working set. The phase also
@@ -853,7 +854,7 @@ consolidated, with nothing new added.
 | # | Milestone | Contents | Blocked on |
 |---|---|---|---|
 | **M10** | ✅ **DONE.** Publication happens in the reconciler tick (and not on an idle shard); a document-level WAL makes a write durable before it is acknowledged. End-to-end: 5 published, 3 not, writer killed, successor serves 8. Both halves canary-isolated. **Remaining:** no batching, deletes unlogged, no `if_seq_no`. See [`m10-notes.md`](m10-notes.md). | — |
-| **M11** | **The data path** | `POST /{index}/_doc`, `_bulk`, `GET /{index}/_search`. Request routing to the owning node (`RoutingHints` + transport forwarding); search fan-out across shards and readers; readers following a newer commit. This is R3. | M10 |
+| **M11** | ⚠️ **PARTIAL.** `PUT/POST /{index}/_doc/{id}` and `GET/POST /{index}/_search` over HTTP, with routing mirroring `OperationRouting`, durability from M10, and `_shards` coverage always reported so a partial search cannot look complete. **Remaining:** cross-node forwarding and fan-out, `_bulk`, query DSL, `GET _doc/{id}`, deletes. See [`m11-notes.md`](m11-notes.md). | M10 |
 | **M12** | **Provider conformance (R11)** | CAS linearizability under contention on S3 and GCS; listing bounded by `start-after`/`max-keys`; clock skew between a writer and its successor. | — |
 | **M13** | **Autonomic operation** | Scheduled ticks and heartbeats rather than called ones; automatic reactivation of an unowned shard; a scale-to-zero controller; consolidating the two liveness modes into one. | — |
 | **M14** | **Scale hardening** | Sharded GC sweep; name index / prefix search (`plan-area-a-name-index.md`); shard-count scaling and per-index memory, neither yet measured; lazy block-range reads with a file cache instead of whole-segment download. | M11 |

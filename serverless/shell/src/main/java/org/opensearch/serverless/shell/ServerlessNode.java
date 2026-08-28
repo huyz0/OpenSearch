@@ -44,7 +44,6 @@ import org.opensearch.plugins.PluginsService;
 import org.opensearch.rest.RestController;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchService;
-import org.opensearch.search.fetch.FetchPhase;
 import org.opensearch.search.query.QueryPhase;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.LocalViewProjector;
@@ -325,7 +324,11 @@ public final class ServerlessNode implements Closeable {
             new ScriptService(settings, emptyMap(), emptyMap()),
             new BigArrays(new PageCacheRecycler(settings), null, nodeName),
             new QueryPhase(),
-            new FetchPhase(Collections.emptyList()),
+            // Built by SearchModule, not by hand. A FetchPhase with no sub-phases returns hits with an
+            // id and no _source, and reports success -- the fetch sub-phases are what load the source,
+            // highlight, and so on. Constructing it empty looked harmless and silently dropped every
+            // document body.
+            new org.opensearch.search.SearchModule(settings, java.util.List.of()).getFetchPhase(),
             new org.opensearch.node.ResponseCollectorService(clusterService),
             new NoneCircuitBreakerService(),
             null,                                   // indexSearcherExecutor — no concurrent search yet
@@ -352,6 +355,8 @@ public final class ServerlessNode implements Closeable {
             new ServerlessRootHandler(nodeName, ClusterName.CLUSTER_NAME_SETTING.get(settings).value(), nodeEnvironment::nodeId)
         );
         controller.registerHandler(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane));
+        controller.registerHandler(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane));
+        controller.registerHandler(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane));
         controller.registerHandler(
             new ServerlessHealthHandler(
