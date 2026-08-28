@@ -142,12 +142,20 @@ public final class MetadataPlane {
      * @throws IOException if the delete fails
      */
     public boolean deleteIndex(String indexName) throws IOException {
+        final long generation = descriptors.generationOf(indexName);
         final Optional<IndexDescriptor> descriptor = descriptors.get(indexName);
         if (descriptor.isEmpty()) {
             return false;
         }
+        // Order the delete against any concurrent lifecycle change before removing anything. If the
+        // descriptor moved underneath us, someone else is mid-operation and this delete loses.
+        if (descriptors.deleteIfUnchanged(indexName, generation) == false) {
+            return false;
+        }
+        // Heads only after the descriptor is ordered away: the shard count needed to enumerate them
+        // lives in the descriptor, and it is bounded by IndexDescriptor.MAX_SHARDS, so this is a
+        // bounded loop rather than a listing.
         heads.deleteAllFor(indexName, descriptor.get().numberOfShards());
-        descriptors.delete(indexName);
         return true;
     }
 

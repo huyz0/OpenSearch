@@ -365,6 +365,17 @@ public final class ServerlessNode implements Closeable {
         // refusal turns "no handler for uri" — which reads like a typo — into a statement.
         final String noGlobalState = "there is no cluster-wide state in a serverless cluster; "
             + "no node can answer this, and a node-local answer would be misleading";
+
+        // D2 and the enumeration rule together: listing a deployment's indices is an inventory
+        // operation, not a serving one. Offering it here -- even paginated -- invites a caller to walk
+        // a hundred million indices through a request path, so the request path does not offer it.
+        controller.registerHandler(
+            new NotImplementedHandler(
+                "/_serverless/indices",
+                "enumerating indices is a maintenance operation, not a serving one; "
+                    + "look an index up by name, or run an offline inventory"
+            )
+        );
         for (String path : new String[] {
             "/_cluster/health",
             "/_cluster/state",

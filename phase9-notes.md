@@ -116,6 +116,54 @@ implementation detail and pinning it would make the test fail for reasons unrela
 constant, but the population-independence assertion is exact, so if it recurs there is something real to
 find.
 
+### Second correction: pagination was still the wrong answer
+
+Raised in review, and right: a cursor walk is better than a full scan, but **the serving path should not
+offer index enumeration at all.** S3 is the model — it offers prefix listings and a scheduled inventory,
+and there is no API that counts the objects in a bucket. Enumeration is a maintenance operation.
+
+So `GET /_serverless/indices` is gone. The path is registered with an explicit refusal:
+
+```
+501  enumerating indices is a maintenance operation, not a serving one;
+     look an index up by name, or run an offline inventory
+```
+
+`listPage` survives as a **maintenance primitive** — the GC sweep uses it — not as an endpoint. Nothing
+on a request path can be pointed at a hundred million indices any more.
+
+### Third correction: lifecycle must be CAS throughout, and it was not
+
+Creation was put-if-absent and a mapping change was a compare-and-swap, but **delete was an
+unconditional blob removal**. That made it the one lifecycle operation not ordered against the others: a
+concurrent mapping update and a delete could both report success.
+
+`deleteIfUnchanged(name, expectedGeneration)` fixes it. The object store has no conditional delete, so
+it swaps the descriptor to a tombstone at the expected generation and then removes the blob — the swap
+is the linearization point, and `get`/`listPage`/`listAll` all report a tombstoned index as absent.
+Tested: a delete holding a stale generation loses to a concurrent update, and re-reading and retrying
+succeeds.
+
+### And the shard list is bounded, so it can stay self-contained
+
+Every caller already derives a shard's identity from `descriptor.numberOfShards()` rather than by
+enumerating anything — opening, collecting or describing an index's shards costs one descriptor read.
+That only holds while the list fits in an object a single compare-and-swap can replace, so
+`IndexDescriptor.MAX_SHARDS = 4096` now enforces it instead of hoping. An index that needs more shards
+wants more indices.
+
+**Ownership deliberately stays out of the descriptor.** The shard *list* belongs there — it changes only
+on lifecycle operations, one writer at a time. Per-shard *ownership* does not: its writer population is
+every node that might hold a shard of that index, and folding it into one object would put a thousand
+nodes on one register, which is precisely the contention §9.3's register map exists to avoid.
+
+### A smaller bug this turned up
+
+`/_serverless/shards/{index}` returned **400** instead of 503 on a node with no metadata plane.
+`BaseRestHandler` rejects a request whose parameters were not all consumed, and the early return bailed
+out before reading `{index}` — turning a deliberate refusal into "contains unrecognized parameter", a
+400 blaming the caller for our shortcut. Parameters are now read before any early return.
+
 ### The half that cannot be shown here
 
 A page bounds two different costs, and only one of them is demonstrated. The descriptor **reads** are

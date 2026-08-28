@@ -203,7 +203,8 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
     }
 
     /**
-     * "List every index" is not an operation at 100 million. Reading a page must cost the page.
+     * Enumeration survives only as a maintenance primitive — no serving endpoint exposes it — and even
+     * there a page must cost the page rather than the population.
      */
     public void testListingAPageCostsThePageNotThePopulation() throws Exception {
         final long atSmall = listPageOpsAtPopulation(200, 25);
@@ -232,6 +233,49 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         assertTrue("a page short of the population must report more to come", page.hasMore());
         logger.info("phase 9 listPage split at population {}: {} reads, {} writes", population, counter.reads(), counter.writes());
         return counter.total();
+    }
+
+    /** Deleting is compare-and-swap like every other lifecycle operation, so a stale delete loses. */
+    public void testDeleteIsOrderedAgainstConcurrentLifecycleChanges() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        createIndices(plane, 0, 1);
+
+        // A caller reads the descriptor, intending to delete it.
+        final long staleGeneration = plane.descriptors().generationOf("idx-0");
+
+        // Someone else changes it first -- a mapping update, say.
+        final var current = plane.describe("idx-0").orElseThrow();
+        assertTrue(
+            plane.descriptors()
+                .update(
+                    new IndexDescriptor("idx-0", current.uuid(), 1, "{\"properties\":{\"other\":{\"type\":\"long\"}}}", null),
+                    staleGeneration
+                )
+                .isPresent()
+        );
+
+        // The delete is now working from a generation that has moved on, and must lose.
+        assertFalse(
+            "a delete holding a stale generation must not remove a descriptor someone else just changed",
+            plane.descriptors().deleteIfUnchanged("idx-0", staleGeneration)
+        );
+        assertTrue("the index must still exist", plane.describe("idx-0").isPresent());
+
+        // Re-reading and retrying succeeds, which is what an ordered lifecycle looks like.
+        assertTrue(plane.descriptors().deleteIfUnchanged("idx-0", plane.descriptors().generationOf("idx-0")));
+        assertTrue("the index must be gone, tombstone or not", plane.describe("idx-0").isEmpty());
+    }
+
+    /** The shard list is self-contained in the descriptor, so it has to stay small enough to be. */
+    public void testShardCountIsBoundedSoTheDescriptorStaysSelfContained() {
+        final IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new IndexDescriptor("too-wide", UUID.randomUUID().toString(), IndexDescriptor.MAX_SHARDS + 1, MAPPING, null)
+        );
+        assertTrue("the bound must explain what it protects: " + e.getMessage(), e.getMessage().contains("enumerate shards"));
+        // And the bound itself is usable, not merely present.
+        new IndexDescriptor("wide", UUID.randomUUID().toString(), IndexDescriptor.MAX_SHARDS, MAPPING, null);
     }
 
     /** A cursor walk must visit every index exactly once, and then stop. */

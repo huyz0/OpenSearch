@@ -40,7 +40,15 @@ import java.util.Optional;
  */
 public final class DescriptorStore {
 
+    /** Marks a descriptor as deleted between the swap that orders the delete and the blob's removal. */
+    private static final byte[] TOMBSTONE = "{\"tombstone\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
     private final BlobContainer container;
+
+    private static boolean isTombstone(org.opensearch.core.common.bytes.BytesReference value) {
+        return value.length() == TOMBSTONE.length
+            && java.util.Arrays.equals(org.opensearch.core.common.bytes.BytesReference.toBytes(value), TOMBSTONE);
+    }
 
     /**
      * Creates a store over a container.
@@ -81,6 +89,10 @@ public final class DescriptorStore {
     public Optional<IndexDescriptor> get(String indexName) throws IOException {
         final Optional<BlobRegister> register = container.readRegister(RegisterMap.descriptorBlob(indexName));
         if (register.isEmpty()) {
+            return Optional.empty();
+        }
+        if (isTombstone(register.get().value())) {
+            // Deleted, and the blob has not been removed yet. Absent is the truthful answer.
             return Optional.empty();
         }
         // Absent and unreadable are different answers, and conflating them is how a deleted index and a
@@ -131,6 +143,39 @@ public final class DescriptorStore {
     }
 
     /**
+     * Deletes an index only if its descriptor still holds the generation the caller read.
+     *
+     * <p>Every other index-lifecycle operation is a compare-and-swap — creation is put-if-absent, a
+     * mapping change is {@link #update} — and delete was the one that was not. An unconditional delete
+     * races: a concurrent mapping update and a delete could both report success, with the update's
+     * write landing on an object the delete then removed, or the delete removing a descriptor the
+     * caller had never seen. Lifecycle is the one place in this design where operations on a single
+     * index are ordered, and it is only ordered if <em>all</em> of them go through the register.
+     *
+     * <p>Implemented as a swap to a tombstone followed by removal, because the object store has no
+     * conditional delete. The swap is the linearization point: after it, {@link #get} reports the index
+     * as absent whether or not the blob has actually gone yet.
+     *
+     * @param indexName the index to delete
+     * @param expectedGeneration the generation the caller read
+     * @return true if this caller deleted it; false if the descriptor changed first
+     * @throws IOException if the write fails
+     */
+    public boolean deleteIfUnchanged(String indexName, long expectedGeneration) throws IOException {
+        final String blobName = RegisterMap.descriptorBlob(indexName);
+        final BlobRegisterCasResult swapped = container.compareAndSwapRegister(
+            blobName,
+            expectedGeneration,
+            new org.opensearch.core.common.bytes.BytesArray(TOMBSTONE)
+        );
+        if (swapped.applied() == false) {
+            return false;
+        }
+        container.deleteBlobsIgnoringIfNotExists(List.of(blobName));
+        return true;
+    }
+
+    /**
      * One bounded page of descriptors, in name order.
      *
      * <p><b>This is the only enumeration a deployment at target scale may use.</b> "List every index" is
@@ -170,6 +215,10 @@ public final class DescriptorStore {
             }
             final Optional<BlobRegister> register = container.readRegister(blobName);
             if (register.isEmpty()) {
+                continue;
+            }
+            if (isTombstone(register.get().value())) {
+                last = blobName;
                 continue;
             }
             try (InputStream in = register.get().value().streamInput()) {
@@ -237,6 +286,9 @@ public final class DescriptorStore {
         for (String blobName : names) {
             final Optional<BlobRegister> register = container.readRegister(blobName);
             if (register.isEmpty()) {
+                continue;
+            }
+            if (isTombstone(register.get().value())) {
                 continue;
             }
             try (InputStream in = register.get().value().streamInput()) {

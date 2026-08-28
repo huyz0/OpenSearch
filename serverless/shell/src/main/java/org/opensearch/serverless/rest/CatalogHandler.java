@@ -34,6 +34,12 @@ import java.util.function.Supplier;
  *
  * <p>{@code /_serverless/nodes} is derived from live leases, not from a member list anyone agreed on —
  * so two nodes may legitimately return different answers, and neither is wrong.
+ *
+ * <p><b>There is no endpoint that lists indices</b>, not even a paginated one. Enumerating a deployment
+ * is an inventory operation and belongs to maintenance, the way S3 offers prefix listings and a
+ * scheduled inventory but no "count the objects in this bucket". Both endpoints here are addressed:
+ * shards are asked for by index name, and the shard list comes from that index's descriptor rather than
+ * from a listing. See {@code IndexDescriptor.MAX_SHARDS} for why that stays true.
  */
 public final class CatalogHandler extends BaseRestHandler {
 
@@ -56,7 +62,6 @@ public final class CatalogHandler extends BaseRestHandler {
     @Override
     public List<Route> routes() {
         return List.of(
-            new Route(RestRequest.Method.GET, "/_serverless/indices"),
             new Route(RestRequest.Method.GET, "/_serverless/shards/{index}"),
             new Route(RestRequest.Method.GET, "/_serverless/nodes")
         );
@@ -64,49 +69,21 @@ public final class CatalogHandler extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
+        // Read every parameter before any early return. BaseRestHandler rejects a request whose
+        // parameters were not all consumed, so bailing out before reading {index} turns a deliberate
+        // 503 into "contains unrecognized parameter" -- a 400 blaming the caller for our own shortcut.
+        final String path = request.path();
+        final String requestedIndex = request.param("index");
+
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        final String path = request.path();
-
-        if (path.endsWith("/_serverless/indices")) {
-            // A cursor walk, never a full enumeration. At the population this design targets, "list all
-            // indices" is not a slow operation -- it is not an operation: the answer does not fit in a
-            // response and is stale before it finishes. So the caller asks for a page and is told where
-            // to resume, and a caller that wants everything pays for everything, visibly.
-            final int size = Math.min(request.paramAsInt("size", 100), 1000);
-            final String after = request.param("after");
-            final var page = metadata.descriptors().listPage(after, size);
-            return channel -> {
-                try (XContentBuilder builder = channel.newBuilder()) {
-                    builder.startObject();
-                    // Deliberately no total. Counting the indices in a deployment is itself a full scan,
-                    // and it is the field that would quietly reintroduce the cost this endpoint avoids.
-                    builder.field("size", page.descriptors().size());
-                    builder.startArray("indices");
-                    for (IndexDescriptor descriptor : page.descriptors().values()) {
-                        builder.startObject();
-                        builder.field("index", descriptor.name());
-                        builder.field("uuid", descriptor.uuid());
-                        builder.field("shards", descriptor.numberOfShards());
-                        builder.endObject();
-                    }
-                    builder.endArray();
-                    builder.field("has_more", page.hasMore());
-                    if (page.hasMore()) {
-                        builder.field("next_after", page.nextAfter());
-                    }
-                    builder.endObject();
-                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-                }
-            };
-        }
 
         if (path.contains("/_serverless/shards/")) {
-            final String index = request.param("index");
+            final String index = requestedIndex;
             final Optional<IndexDescriptor> descriptor = metadata.describe(index);
             if (descriptor.isEmpty()) {
                 return channel -> channel.sendResponse(

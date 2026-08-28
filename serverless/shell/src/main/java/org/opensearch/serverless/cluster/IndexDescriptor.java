@@ -40,6 +40,21 @@ import java.util.Objects;
  */
 public final class IndexDescriptor {
 
+    /**
+     * The most shards one index may have.
+     *
+     * <p>This is a design constraint, not a tuning knob. The shard list is <b>self-contained here</b>:
+     * every caller derives a shard's identity from {@link #numberOfShards()} rather than by enumerating
+     * anything, so opening, collecting or describing an index's shards costs one descriptor read. That
+     * only stays true while the list is small enough to sit inside a single object that a
+     * compare-and-swap can replace atomically.
+     *
+     * <p>A few thousand is the right order: it is more shards than any single index needs, and it keeps
+     * the descriptor to a size where lifecycle changes are one CAS rather than a distributed
+     * transaction. An index that genuinely needs more shards wants more indices.
+     */
+    public static final int MAX_SHARDS = 4096;
+
     private final String name;
     private final String uuid;
     private final int numberOfShards;
@@ -60,6 +75,16 @@ public final class IndexDescriptor {
         this.uuid = Objects.requireNonNull(uuid);
         if (numberOfShards < 1) {
             throw new IllegalArgumentException("numberOfShards must be positive, got " + numberOfShards);
+        }
+        if (numberOfShards > MAX_SHARDS) {
+            throw new IllegalArgumentException(
+                "numberOfShards must be at most "
+                    + MAX_SHARDS
+                    + ", got "
+                    + numberOfShards
+                    + ": an index's shard list lives in this descriptor so that nothing ever has to"
+                    + " enumerate shards, and that only holds while the list stays small"
+            );
         }
         this.numberOfShards = numberOfShards;
         this.mapping = mapping;
