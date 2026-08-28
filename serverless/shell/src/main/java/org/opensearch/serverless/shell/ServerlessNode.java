@@ -121,6 +121,8 @@ public final class ServerlessNode implements Closeable {
     private final org.opensearch.serverless.store.BlockCache blockCache;
     private final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
     private final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private volatile org.opensearch.serverless.reconcile.ReconcileSignals signals =
+        org.opensearch.serverless.reconcile.ReconcileSignals.NONE;
     private volatile LocalViewProjector projector;
     private volatile ShardReconciler reconciler;
     private volatile boolean started;
@@ -513,6 +515,27 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * Registers who hears about writes and about ownership going wrong.
+     *
+     * <p>Optional. A node with no signals set still converges through the backstop pass; it just does so
+     * on the clock's schedule rather than on its own evidence.
+     *
+     * @param signals the listener, or null to go back to hearing nothing
+     */
+    public void setSignals(org.opensearch.serverless.reconcile.ReconcileSignals signals) {
+        this.signals = signals == null ? org.opensearch.serverless.reconcile.ReconcileSignals.NONE : signals;
+    }
+
+    /**
+     * Returns the signal sink, so callers on the request path can report what they saw.
+     *
+     * @return the signals, never null
+     */
+    public org.opensearch.serverless.reconcile.ReconcileSignals signals() {
+        return signals;
+    }
+
+    /**
      * Gives this node's REST surface a metadata plane to read and write.
      *
      * <p>Set after construction because the plane is a deployment-level object and the REST routes are
@@ -842,6 +865,9 @@ public final class ServerlessNode implements Closeable {
             throw new java.io.IOException("indexing " + id + " returned " + result.getResultType());
         }
         shard.sync();
+        // The edge. Fired after the write is durable and applied, so a listener that publishes on it
+        // can never publish a commit describing an operation the caller was not told about.
+        signals.wrote(shardId);
     }
 
     /**

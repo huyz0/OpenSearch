@@ -109,6 +109,10 @@ public final class DocumentHandler extends BaseRestHandler {
                     try {
                         final var peer = serving.router().peer(owner);
                         if (peer.isEmpty()) {
+                            // The head names an owner that holds no live lease. That is precisely a
+                            // dead writer nobody has noticed yet, and this request is the first thing
+                            // in the system to prove it -- so say so rather than waiting for a timer.
+                            serving.signals().ownershipDoubted(index, shard);
                             channel.sendResponse(
                                 IndexAdminHandler.error(
                                     channel,
@@ -126,6 +130,10 @@ public final class DocumentHandler extends BaseRestHandler {
                             );
                         respondCreated(channel, index, id, shard, ack.ownerNodeId());
                     } catch (Exception e) {
+                        // The owner was reachable and still refused or failed. Either it lost the shard
+                        // between our read and its receipt, or it is going away. Same conclusion: the
+                        // head we routed on is not to be trusted.
+                        serving.signals().ownershipDoubted(index, shard);
                         try {
                             channel.sendResponse(new BytesRestResponse(channel, e));
                         } catch (IOException nested) {
@@ -134,6 +142,9 @@ public final class DocumentHandler extends BaseRestHandler {
                     }
                 });
             }
+            // No owner at all. Nothing will fix this except some node activating the shard, and the
+            // only reason anyone would is that a write arrived -- which just happened.
+            serving.signals().ownershipDoubted(index, shard);
             return channel -> {
                 try (XContentBuilder builder = channel.newBuilder()) {
                     builder.startObject();

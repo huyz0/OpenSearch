@@ -43,6 +43,8 @@ public final class MetadataPlane {
     private final boolean nodeLeaseLiveness;
     private final BlobStore blobStore;
     private final BlobPath base;
+    private final long leaseTtlMillis;
+    private final LongSupplier clock;
 
     /**
      * Creates a metadata plane over a blob store.
@@ -95,6 +97,30 @@ public final class MetadataPlane {
         this.membershipField = leases;
         this.blobStore = blobStore;
         this.base = base;
+        this.leaseTtlMillis = leaseTtlMillis;
+        this.clock = clock;
+    }
+
+    /**
+     * Returns how long a lease stays valid after a renewal.
+     *
+     * <p>Exposed because the renewal schedule is derived from it and must not be guessed independently:
+     * a renewal interval chosen without reference to the TTL is a lease that lapses under a node that
+     * believes it is healthy.
+     *
+     * @return the lease TTL in milliseconds
+     */
+    public long leaseTtlMillis() {
+        return leaseTtlMillis;
+    }
+
+    /**
+     * Returns the clock this plane stamps and compares expiries with.
+     *
+     * @return the clock
+     */
+    public LongSupplier clock() {
+        return clock;
     }
 
     /**
