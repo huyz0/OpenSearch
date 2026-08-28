@@ -270,6 +270,24 @@ public final class MetadataPlane {
     }
 
     /**
+     * Returns the backing blob store, for components that address shard data directly.
+     *
+     * @return the blob store
+     */
+    public BlobStore blobStore() {
+        return blobStore;
+    }
+
+    /**
+     * Returns the deployment's base path.
+     *
+     * @return the base path
+     */
+    public BlobPath basePath() {
+        return base;
+    }
+
+    /**
      * Returns the descriptor store.
      *
      * @return the descriptor store

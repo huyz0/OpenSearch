@@ -180,7 +180,7 @@ public final class ShardReconciler {
             if (open.containsKey(shardId)) {
                 continue;
             }
-            open.put(shardId, openAndStart(indexMetadata, shardId, assignment.term(), view.nodes(), true));
+            open.put(shardId, openAndStart(indexMetadata, shardId, assignment.term(), view.nodes(), true, false));
             opened.add(shardId);
         }
         return opened;
@@ -196,7 +196,8 @@ public final class ShardReconciler {
         ShardId shardId,
         long shardHeadTerm,
         DiscoveryNodes nodes,
-        boolean replayWal
+        boolean replayWal,
+        boolean lazy
     ) throws IOException {
         final Index index = indexMetadata.getIndex();
         IndexService indexService = indicesService.indexService(index);
@@ -241,9 +242,15 @@ public final class ShardReconciler {
         );
 
         if (restoring) {
-            // Between createShard and recovery: the store exists but nothing has opened it yet. Using
-            // EMPTY_STORE here instead would call Store#createEmpty and delete exactly what this writes.
-            publisher.restoreInto(shard.store().directory(), shardId);
+            if (lazy == false) {
+                // A writer needs a local, writable copy it can merge into, so it downloads. Between
+                // createShard and recovery: the store exists but nothing has opened it yet. Using
+                // EMPTY_STORE here instead would call Store#createEmpty and delete exactly this.
+                publisher.restoreInto(shard.store().directory(), shardId);
+            }
+            // A reader skips the download entirely: its directory already sees the published files and
+            // fetches the blocks a query touches. Both still need a translog, because recovery reads
+            // one and a node taking a shard over has none.
             bootstrapTranslogFor(shard);
         }
 
@@ -339,7 +346,18 @@ public final class ShardReconciler {
                         + "An empty result here would be indistinguishable from an empty index."
                 )
             );
-        open.put(shardId, openAndStart(indexMetadata, shardId, manifest.term(), view.nodes(), false));
+        // Readers read blocks; they do not download segments. The store type is set here rather than in
+        // the descriptor because it is a property of how this node is serving the shard, not of the
+        // index -- the same index has writers that need a local, writable copy.
+        final IndexMetadata lazyMetadata = IndexMetadata.builder(indexMetadata)
+            .settings(
+                org.opensearch.common.settings.Settings.builder()
+                    .put(indexMetadata.getSettings())
+                    .put("index.store.type", org.opensearch.serverless.shell.ServerlessNode.BLOCK_CACHE_STORE_TYPE)
+                    .build()
+            )
+            .build();
+        open.put(shardId, openAndStart(lazyMetadata, shardId, manifest.term(), view.nodes(), false, true));
         readers.add(shardId);
         return shardId;
     }

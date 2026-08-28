@@ -99,6 +99,9 @@ public final class ServerlessNode implements Closeable {
     /** Accepts reader activation: serves search from object-store-backed segments. */
     public static final String ROLE_SEARCH = "search";
 
+    /** The store type that reads published segments lazily, a block at a time. */
+    public static final String BLOCK_CACHE_STORE_TYPE = "serverless_block_cache";
+
     private final String nodeName;
     private final Settings settings;
     private final ThreadPool threadPool;
@@ -115,6 +118,7 @@ public final class ServerlessNode implements Closeable {
     private volatile org.opensearch.serverless.metadata.MetadataPlane metadataPlane;
     private volatile org.opensearch.serverless.transport.ShardRouter router;
     private final Set<String> roles;
+    private final org.opensearch.serverless.store.BlockCache blockCache;
     private final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
     private final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private volatile LocalViewProjector projector;
@@ -135,6 +139,13 @@ public final class ServerlessNode implements Closeable {
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
         // environment variable, and role switching under load stays a policy question.
         this.roles = Set.copyOf(settings.getAsList("serverless.roles", java.util.List.of(ROLE_INGEST, ROLE_SEARCH)));
+        // Block size is a real tuning knob, not a constant: it trades request count against wasted
+        // bytes, and the right value depends on the object store's per-request cost and the index's
+        // access pattern. Exposed so that can be measured rather than guessed.
+        this.blockCache = new org.opensearch.serverless.store.BlockCache(
+            settings.getAsInt("serverless.block_cache.block_size", org.opensearch.serverless.store.BlockCache.DEFAULT_BLOCK_SIZE),
+            settings.getAsInt("serverless.block_cache.max_blocks", 4096)
+        );
         final Environment environment = new Environment(settings, null);
         final ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
 
@@ -269,7 +280,7 @@ public final class ServerlessNode implements Closeable {
             null,                                   // Client — no node client in phase 1
             new MetaStateService(nodeEnvironment, xContentRegistry),
             engineFactoryProviders(),
-            emptyMap(),
+            directoryFactories(),
             null,                                   // ValuesSourceRegistry
             emptyMap(),
             null,                                   // remote directory factory — serverless supplies its own
@@ -317,6 +328,83 @@ public final class ServerlessNode implements Closeable {
             false
         );
         return java.util.List.of((indexSettings, routing) -> java.util.Optional.of(readOnly));
+    }
+
+    /**
+     * The store type that makes a reader lazy.
+     *
+     * <p>Registered on every node; whether a shard uses it is decided per shard when it is opened, by
+     * {@code ShardReconciler}. A writer keeps a local copy it can merge into; a reader reads blocks.
+     */
+    private Map<String, org.opensearch.plugins.IndexStorePlugin.DirectoryFactory> directoryFactories() {
+        final org.opensearch.plugins.IndexStorePlugin.DirectoryFactory factory =
+            new org.opensearch.plugins.IndexStorePlugin.DirectoryFactory() {
+                @Override
+                public org.apache.lucene.store.Directory newDirectory(
+                    org.opensearch.index.IndexSettings indexSettings,
+                    org.opensearch.index.shard.ShardPath shardPath
+                ) throws java.io.IOException {
+                    final org.apache.lucene.store.Directory local = org.apache.lucene.store.FSDirectory.open(shardPath.resolveIndex());
+                    final var plane = metadataPlane;
+                    if (plane == null) {
+                        // No metadata plane means no manifest to read; a plain local directory is the truthful
+                        // fallback rather than a half-built remote one.
+                        return local;
+                    }
+                    final org.opensearch.core.index.shard.ShardId shardId = shardPath.getShardId();
+                    return org.opensearch.serverless.store.BlockCacheDirectory.create(
+                        local,
+                        plane.blobStore(),
+                        org.opensearch.serverless.metadata.RegisterMap.shardData(plane.basePath(), shardId.getIndexName(), shardId.id()),
+                        blockCache,
+                        shardId.getIndexName() + "#" + shardId.id()
+                    );
+                }
+
+                @Override
+                public org.apache.lucene.store.Directory newFSDirectory(
+                    java.nio.file.Path location,
+                    org.apache.lucene.store.LockFactory lockFactory,
+                    org.opensearch.index.IndexSettings indexSettings
+                ) throws java.io.IOException {
+                    // This, not newDirectory, is the path the store actually takes. It hands over a
+                    // location and settings rather than a ShardPath, so the shard identity has to be
+                    // recovered from both: the index name from the settings, the shard number from the
+                    // directory the location sits in ({data}/indices/{uuid}/{shard}/index).
+                    final org.apache.lucene.store.Directory local = org.apache.lucene.store.FSDirectory.open(location, lockFactory);
+                    final var plane = metadataPlane;
+                    if (plane == null) {
+                        return local;
+                    }
+                    final String indexName = indexSettings.getIndex().getName();
+                    final int shardNumber;
+                    try {
+                        shardNumber = Integer.parseInt(location.getParent().getFileName().toString());
+                    } catch (RuntimeException e) {
+                        // An unexpected layout means we cannot say which shard this is, and guessing would
+                        // attach one shard's directory to another's data. Local-only is the safe answer.
+                        logger.warn("could not derive a shard number from " + location + "; serving it from local disk only", e);
+                        return local;
+                    }
+                    return org.opensearch.serverless.store.BlockCacheDirectory.create(
+                        local,
+                        plane.blobStore(),
+                        org.opensearch.serverless.metadata.RegisterMap.shardData(plane.basePath(), indexName, shardNumber),
+                        blockCache,
+                        indexName + "#" + shardNumber
+                    );
+                }
+            };
+        return Map.of(BLOCK_CACHE_STORE_TYPE, factory);
+    }
+
+    /**
+     * Returns this node's block cache, whose counters say how much was actually fetched.
+     *
+     * @return the block cache
+     */
+    public org.opensearch.serverless.store.BlockCache blockCache() {
+        return blockCache;
     }
 
     private SearchService buildSearchService(ClusterSettings clusterSettings) {
@@ -541,6 +629,7 @@ public final class ServerlessNode implements Closeable {
     public java.util.Set<org.opensearch.core.index.shard.ShardId> syncFrom(org.opensearch.serverless.metadata.MetadataPlane plane)
         throws Exception {
         ensureStarted();
+        adopt(plane);
         reconciler.setSegmentPublishers(plane::segmentPublisher);
         reconciler.setWalStores(plane::walStore);
         final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId());
@@ -685,6 +774,7 @@ public final class ServerlessNode implements Closeable {
         int shardNumber
     ) throws Exception {
         ensureStarted();
+        adopt(plane);
         reconciler.setSegmentPublishers(plane::segmentPublisher);
         reconciler.setWalStores(plane::walStore);
         final IndexDescriptor descriptor = plane.describe(indexName)
@@ -808,6 +898,20 @@ public final class ServerlessNode implements Closeable {
      */
     public LocalViewProjector projector() {
         return projector;
+    }
+
+    /**
+     * Remembers the plane this node is serving.
+     *
+     * <p>The block-cache directory factory is handed a location and settings, not a metadata plane, so
+     * it has to reach one through the node. A node that had only ever been given a plane as a method
+     * argument would build local-only directories and silently serve nothing — which is how this was
+     * found.
+     */
+    private void adopt(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        if (metadataPlane == null) {
+            metadataPlane = plane;
+        }
     }
 
     private void ensureStarted() {
