@@ -67,6 +67,8 @@ public final class ShardReconciler {
     private final Map<ShardId, IndexShard> open = new ConcurrentHashMap<>();
     private final Set<ShardId> readers = ConcurrentHashMap.newKeySet();
     private volatile BiFunction<String, Integer, SegmentPublisher> publishers;
+    private volatile BiFunction<String, Integer, org.opensearch.serverless.store.WalStore> walStores;
+    private final Map<ShardId, org.opensearch.serverless.store.WalStore> walCache = new ConcurrentHashMap<>();
 
     /**
      * Creates a reconciler for one node.
@@ -87,6 +89,33 @@ public final class ShardReconciler {
      */
     public void setSegmentPublishers(BiFunction<String, Integer, SegmentPublisher> publishers) {
         this.publishers = publishers;
+    }
+
+    /**
+     * Supplies the write-ahead log for each shard. Without one, writes are durable only once published,
+     * which is the pre-M10 behaviour.
+     *
+     * @param walStores index name and shard number to WAL store
+     */
+    public void setWalStores(BiFunction<String, Integer, org.opensearch.serverless.store.WalStore> walStores) {
+        this.walStores = walStores;
+    }
+
+    /**
+     * Returns the WAL for a shard, or null if none is configured.
+     *
+     * @param shardId the shard
+     * @return the WAL store, or null
+     */
+    public org.opensearch.serverless.store.WalStore wal(ShardId shardId) {
+        if (walStores == null) {
+            return null;
+        }
+        // Memoized, and it has to be. A WalStore carries the append ordinal that orders records within a
+        // term, and the snapshot that makes truncation lag a publish cycle. Building a fresh one per
+        // call restarts the ordinal at 1, so every append overwrites the same blob and the log holds
+        // exactly the last write -- which is what happened, and what the end-to-end test caught.
+        return walCache.computeIfAbsent(shardId, id -> walStores.apply(id.getIndexName(), id.id()));
     }
 
     /**
@@ -113,7 +142,14 @@ public final class ShardReconciler {
         // A commit must exist before there is anything to publish; an unflushed shard has its data only
         // in the translog, which this does not upload.
         shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
-        return publishers.apply(shardId.getIndexName(), shardId.id()).publish(shard.store(), term);
+        final CommitManifest manifest = publishers.apply(shardId.getIndexName(), shardId.id()).publish(shard.store(), term);
+        final var walForPublish = wal(shardId);
+        if (walForPublish != null) {
+            // Only after the commit is durable in the object store. Truncation drops what the previous
+            // publish saw, never what this one did -- see WalStore for why that gap is load-bearing.
+            walForPublish.onPublished(term);
+        }
+        return manifest;
     }
 
     /**
@@ -144,7 +180,7 @@ public final class ShardReconciler {
             if (open.containsKey(shardId)) {
                 continue;
             }
-            open.put(shardId, openAndStart(indexMetadata, shardId, assignment.term(), view.nodes()));
+            open.put(shardId, openAndStart(indexMetadata, shardId, assignment.term(), view.nodes(), true));
             opened.add(shardId);
         }
         return opened;
@@ -155,8 +191,13 @@ public final class ShardReconciler {
      * not apply the mapping, and without it the first write returns MAPPING_UPDATE_REQUIRED as a
      * <em>result value</em> rather than throwing (see {@code s0-findings.md} F5).
      */
-    private IndexShard openAndStart(IndexMetadata indexMetadata, ShardId shardId, long shardHeadTerm, DiscoveryNodes nodes)
-        throws IOException {
+    private IndexShard openAndStart(
+        IndexMetadata indexMetadata,
+        ShardId shardId,
+        long shardHeadTerm,
+        DiscoveryNodes nodes,
+        boolean replayWal
+    ) throws IOException {
         final Index index = indexMetadata.getIndex();
         IndexService indexService = indicesService.indexService(index);
         if (indexService == null) {
@@ -226,6 +267,35 @@ public final class ShardReconciler {
             new IndexShardRoutingTable.Builder(shardId).addShard(started).build(),
             nodes
         );
+
+        if (replayWal && walStores != null) {
+            // Everything the previous writer acknowledged but never published. Applied after the shard
+            // is STARTED because that is when it accepts writes; replay is idempotent, so applying a
+            // record that was already in the restored commit changes nothing.
+            final var wal = wal(shardId);
+            int replayed = 0;
+            for (org.opensearch.serverless.store.WalRecord record : wal.replayable()) {
+                shard.applyIndexOperationOnPrimary(
+                    org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                    org.opensearch.index.VersionType.INTERNAL,
+                    new org.opensearch.index.mapper.SourceToParse(
+                        shardId.getIndexName(),
+                        record.id(),
+                        new org.opensearch.core.common.bytes.BytesArray(record.source()),
+                        org.opensearch.common.xcontent.XContentType.JSON
+                    ),
+                    org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                    0,
+                    org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+                    false
+                );
+                replayed++;
+            }
+            if (replayed > 0) {
+                shard.sync();
+                shard.refresh("serverless-wal-replay");
+            }
+        }
         return shard;
     }
 
@@ -269,7 +339,7 @@ public final class ShardReconciler {
                         + "An empty result here would be indistinguishable from an empty index."
                 )
             );
-        open.put(shardId, openAndStart(indexMetadata, shardId, manifest.term(), view.nodes()));
+        open.put(shardId, openAndStart(indexMetadata, shardId, manifest.term(), view.nodes(), false));
         readers.add(shardId);
         return shardId;
     }
@@ -321,6 +391,7 @@ public final class ShardReconciler {
      */
     public void releaseShard(ShardId shardId, String reason) {
         readers.remove(shardId);
+        walCache.remove(shardId);
         final IndexShard shard = open.remove(shardId);
         if (shard == null) {
             return;

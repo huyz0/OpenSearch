@@ -43,6 +43,7 @@ public final class BackgroundReconciler implements Closeable {
     private final MetadataPlane plane;
     private final RoutingHints hints = new RoutingHints();
     private final Set<Map.Entry<String, Integer>> wanted = ConcurrentHashMap.newKeySet();
+    private final Map<ShardId, Long> lastPublishedMaxSeqNo = new ConcurrentHashMap<>();
 
     /**
      * Creates a reconciler for one node.
@@ -97,13 +98,42 @@ public final class BackgroundReconciler implements Closeable {
             node.activateWriter(plane, target.getKey(), target.getValue()).ifPresent(activated::add);
         }
 
+        // Publish what has changed. Until this existed, publishShard was only ever called by hand, so
+        // the durability window was not "since the last commit" -- it was unbounded, and a node could
+        // index for hours and lose all of it. Doing it here rather than on a second timer means it
+        // inherits the tick's ordering: a node that lost a shard released it above, so it cannot reach
+        // this loop holding something it no longer owns.
+        final Set<ShardId> published = new LinkedHashSet<>();
+        for (ShardId shardId : node.reconciler().openShards()) {
+            if (node.reconciler().readerShards().contains(shardId)) {
+                continue;
+            }
+            final var shard = node.reconciler().shard(shardId);
+            if (shard == null) {
+                continue;
+            }
+            final long maxSeqNo = shard.seqNoStats().getMaxSeqNo();
+            if (maxSeqNo < 0 || maxSeqNo == lastPublishedMaxSeqNo.getOrDefault(shardId, -1L)) {
+                // Nothing new. Publishing anyway would flush a fresh commit and upload it every tick,
+                // forever, on an idle shard -- an object-store bill for saying nothing happened.
+                continue;
+            }
+            final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+            if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
+                continue;
+            }
+            node.publishShard(shardId, head.get().term());
+            lastPublishedMaxSeqNo.put(shardId, maxSeqNo);
+            published.add(shardId);
+        }
+
         final Map<String, Integer> shardCounts = new java.util.LinkedHashMap<>();
         for (Map.Entry<String, Integer> target : wanted) {
             shardCounts.merge(target.getKey(), target.getValue() + 1, Math::max);
         }
         hints.refresh(plane, shardCounts, nowMillis);
 
-        return new TickResult(released, activated, hints.size());
+        return new TickResult(released, activated, published, hints.size());
     }
 
     /**
@@ -125,12 +155,23 @@ public final class BackgroundReconciler implements Closeable {
 
         private final Set<ShardId> released;
         private final Set<ShardId> activated;
+        private final Set<ShardId> published;
         private final int hintCount;
 
-        TickResult(Set<ShardId> released, Set<ShardId> activated, int hintCount) {
+        TickResult(Set<ShardId> released, Set<ShardId> activated, Set<ShardId> published, int hintCount) {
             this.released = Set.copyOf(released);
             this.activated = Set.copyOf(activated);
+            this.published = Set.copyOf(published);
             this.hintCount = hintCount;
+        }
+
+        /**
+         * Returns shards whose commits this pass published to the object store.
+         *
+         * @return the published shards
+         */
+        public Set<ShardId> published() {
+            return published;
         }
 
         /**
@@ -162,7 +203,15 @@ public final class BackgroundReconciler implements Closeable {
 
         @Override
         public String toString() {
-            return "TickResult[released=" + released.size() + ", activated=" + activated.size() + ", hints=" + hintCount + "]";
+            return "TickResult[released="
+                + released.size()
+                + ", activated="
+                + activated.size()
+                + ", published="
+                + published.size()
+                + ", hints="
+                + hintCount
+                + "]";
         }
     }
 }

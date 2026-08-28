@@ -107,6 +107,17 @@ public final class MetadataPlane {
     }
 
     /**
+     * Returns the write-ahead log for one shard.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @return the WAL store
+     */
+    public org.opensearch.serverless.store.WalStore walStore(String indexName, int shardId) {
+        return new org.opensearch.serverless.store.WalStore(blobStore, RegisterMap.shardData(base, indexName, shardId));
+    }
+
+    /**
      * Returns the segment publisher for one shard.
      *
      * @param indexName the index

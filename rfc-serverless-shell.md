@@ -727,9 +727,10 @@ than papering over it. S0's Q2 now asks how big that reconciler is, not whether 
 > assertion now scans the whole node (11,984 objects) rather than named services, so it covers the
 > transport and HTTP layers too.
 >
-> **Where this stands overall:** phases 0–9 are delivered, and **§12.1 lists what remains** — most
-> importantly that durability is "as of the last published commit" with publication still manual, and
-> that no endpoint touches a document. The green table below is not the whole picture.
+> **Where this stands overall:** phases 0–9 and **M10 (durability)** are delivered, and **§12.1 lists
+> what remains** — most importantly that no endpoint touches a document, so the durable write path
+> exists but nothing outside a test can reach it. That is M11. The green table below is not the whole
+> picture.
 >
 > **Phase 9 is complete (2026-08-27).** Creation cost is flat in the population — one object-store write
 > per create at every population measured — and node residency tracks the working set. The phase also
@@ -851,7 +852,7 @@ consolidated, with nothing new added.
 
 | # | Milestone | Contents | Blocked on |
 |---|---|---|---|
-| **M10** | **Durability** | Automatic publication (today `publishShard` is called by hand, so the loss window is unbounded rather than "since the last commit"); then a WAL to close it to zero. Retires the R9 residual. | — |
+| **M10** | ✅ **DONE.** Publication happens in the reconciler tick (and not on an idle shard); a document-level WAL makes a write durable before it is acknowledged. End-to-end: 5 published, 3 not, writer killed, successor serves 8. Both halves canary-isolated. **Remaining:** no batching, deletes unlogged, no `if_seq_no`. See [`m10-notes.md`](m10-notes.md). | — |
 | **M11** | **The data path** | `POST /{index}/_doc`, `_bulk`, `GET /{index}/_search`. Request routing to the owning node (`RoutingHints` + transport forwarding); search fan-out across shards and readers; readers following a newer commit. This is R3. | M10 |
 | **M12** | **Provider conformance (R11)** | CAS linearizability under contention on S3 and GCS; listing bounded by `start-after`/`max-keys`; clock skew between a writer and its successor. | — |
 | **M13** | **Autonomic operation** | Scheduled ticks and heartbeats rather than called ones; automatic reactivation of an unowned shard; a scale-to-zero controller; consolidating the two liveness modes into one. | — |

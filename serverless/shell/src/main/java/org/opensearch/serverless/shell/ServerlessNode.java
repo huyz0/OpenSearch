@@ -502,6 +502,7 @@ public final class ServerlessNode implements Closeable {
         throws Exception {
         ensureStarted();
         reconciler.setSegmentPublishers(plane::segmentPublisher);
+        reconciler.setWalStores(plane::walStore);
         final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId());
 
         // Phase 4 has only writer shards, and a node that does not accept writer activation must not
@@ -652,6 +653,7 @@ public final class ServerlessNode implements Closeable {
     ) throws Exception {
         ensureStarted();
         reconciler.setSegmentPublishers(plane::segmentPublisher);
+        reconciler.setWalStores(plane::walStore);
         final IndexDescriptor descriptor = plane.describe(indexName)
             .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
 
@@ -669,6 +671,54 @@ public final class ServerlessNode implements Closeable {
         final ClusterState view = projector.project(served.values(), assignments);
         applyLocalView(view, () -> 30_000L);
         return reconciler.openReader(view, indexName, shardNumber);
+    }
+
+    /**
+     * Indexes a document durably: the write reaches the object store's log before it is acknowledged.
+     *
+     * <p>This is the ordering that closes M10's window. Appending first means a crash between the append
+     * and the apply replays a write the caller was never told about — harmless, because replay is
+     * idempotent — while the reverse order would acknowledge a write that no successor could recover.
+     * Cheap to get backwards and expensive to notice.
+     *
+     * @param shardId the shard to write to
+     * @param id the document id
+     * @param source the document source
+     * @throws java.io.IOException if the shard is not held here, or the write fails
+     */
+    public void index(org.opensearch.core.index.shard.ShardId shardId, String id, String source) throws java.io.IOException {
+        ensureStarted();
+        final var shard = reconciler.shard(shardId);
+        if (shard == null) {
+            throw new java.io.IOException("cannot index into " + shardId + ": not open on " + nodeName);
+        }
+        if (reconciler.readerShards().contains(shardId)) {
+            throw new java.io.IOException("cannot index into " + shardId + ": it is open as a reader");
+        }
+        final var wal = reconciler.wal(shardId);
+        if (wal != null) {
+            wal.append(shard.getOperationPrimaryTerm(), new org.opensearch.serverless.store.WalRecord(id, source));
+        }
+        final var result = shard.applyIndexOperationOnPrimary(
+            org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+            org.opensearch.index.VersionType.INTERNAL,
+            new org.opensearch.index.mapper.SourceToParse(
+                shardId.getIndexName(),
+                id,
+                new org.opensearch.core.common.bytes.BytesArray(source),
+                org.opensearch.common.xcontent.XContentType.JSON
+            ),
+            org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+            0,
+            org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+            false
+        );
+        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
+            // s0-findings.md F5: this is a value, not a throw. A caller that ignores it indexes nothing
+            // and reports no error.
+            throw new java.io.IOException("indexing " + id + " returned " + result.getResultType());
+        }
+        shard.sync();
     }
 
     /**
