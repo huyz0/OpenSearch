@@ -70,6 +70,60 @@ entry is verified against its head before being believed. Consequences, each tes
 Claims are dropped on release, so a node that has churned through shards does not list a year of dead
 ones to find today's.
 
+## Follow-up: "list every index" was itself the wrong operation
+
+The fix above removed the O(population) sweep from `truthFor`, but left the same sweep sitting behind
+`GET /_serverless/indices` and the GC. Raised in review, and correct: **at 100 million indices, "list all
+indices" is not a slow operation — it is not an operation.** The answer does not fit in a response,
+cannot be consumed by a caller, and is stale before it finishes. Supporting it at all is what forces the
+cost; making it faster would have been solving the wrong problem.
+
+The worst offender was a single field:
+
+```json
+{ "count": 47000000, ... }
+```
+
+A total requires a full scan by definition. It is the kind of innocuous-looking field that silently
+reintroduces exactly the cost the architecture was built to remove, and nobody can act on it anyway.
+
+### What replaced it
+
+| Operation | Shape |
+|---|---|
+| `GET /{index}` | point lookup, one read |
+| `GET /_serverless/indices?size=N&after=<cursor>` | bounded page, cursor to resume |
+| `DescriptorStore.listAll()` | offline sweeps only, documented as O(population) and barred from request paths |
+| `GarbageCollector.collectPage(after, limit)` | one slice; `collectAll` is a loop over it |
+
+The listing reports `size`, `has_more` and `next_after`. **It does not report a total**, and the test
+asserts the absence of that field rather than its value — a regression here would be a field reappearing,
+not a number changing.
+
+Measured, page size 25:
+
+| Population | Ops to read one page |
+|---|---|
+| 200 | 26 |
+| 1,000 | 26 |
+
+And the slope is exactly one read per index returned: a page of 5 costs 6, a page of 25 costs 26. The
+test asserts the *slope* (`ops(25) − ops(5) == 20`) rather than the constant, because the constant is an
+implementation detail and pinning it would make the test fail for reasons unrelated to the claim.
+
+*One unexplained observation, recorded rather than smoothed over:* an early run reported 27 rather than
+26 reads for a 25-item page, and I could not reproduce it. The slope assertion is unaffected by a
+constant, but the population-independence assertion is exact, so if it recurs there is something real to
+find.
+
+### The half that cannot be shown here
+
+A page bounds two different costs, and only one of them is demonstrated. The descriptor **reads** are
+bounded by `limit` on any backend — that is what the measurement above shows. The **listing** is bounded
+natively by S3's `ListObjectsV2` (`start-after` + `max-keys`) and GCS's equivalent; `FsBlobContainer` has
+no such primitive and enumerates the directory. So on a filesystem this is bounded in reads but not in
+the listing itself, and the missing half is R11-shaped.
+
 ## What phase 9 does NOT establish
 
 - **The measurements stop at 1,500 indices**, not 100 million. What is shown is the *shape* — flat
@@ -80,8 +134,10 @@ ones to find today's.
   very differently. This is now a reason R11 matters more, not less.
 - **No shard-count scaling.** One shard per index throughout. A node holding thousands of shards costs
   one listing plus 2 ops per shard, which is O(owned) but not free.
-- **`GarbageCollector.collectAll` is still O(population)** by construction, and says so. It is a
-  background sweep rather than a steady-state path, but it is the next thing that needs the same
-  treatment.
+- **A sweep is still proportional to the population** — correctly, since it intends to visit everything.
+  What changed is that it is now resumable and sliceable (`collectPage`), so a fleet can share it. A
+  single worker walking 100M indices is still a single worker walking 100M indices.
+- **No name index or prefix search.** `plan-area-a-name-index.md` exists for this and is not built here;
+  a cursor walk is not a substitute for finding indices by pattern.
 - **Nothing about memory.** `plan-area-h` measured heap per index (698 B for a stub) as well as time.
   Residency is asserted as a count of indices in cluster state, not as bytes.

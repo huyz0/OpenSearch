@@ -120,10 +120,10 @@ public final class GarbageCollector {
     /**
      * Sweeps every shard of every index.
      *
-     * <p>A listing plus one pass per shard. At the scale this design targets that is the wrong shape —
-     * a sweep proportional to the whole population is exactly what the metadata plane exists to avoid —
-     * and the right answer is a sharded sweep with each worker taking a slice by hash. This is the
-     * honest small-deployment version, and it is named as such rather than presented as the design.
+     * <p>Walks the whole deployment one page at a time via {@link #collectPage}. A sweep genuinely does
+     * intend to visit everything, so being proportional to the population is correct here in a way it
+     * never is on a request path — but it must still be resumable and sliceable, which is why the paged
+     * form is the real one and this is a convenience over it.
      *
      * @param plane the metadata plane
      * @return blob names deleted, keyed by {@code index#shard}
@@ -131,15 +131,40 @@ public final class GarbageCollector {
      */
     public Map<String, List<String>> collectAll(MetadataPlane plane) throws IOException {
         final Map<String, List<String>> deleted = new java.util.LinkedHashMap<>();
-        for (Map.Entry<String, org.opensearch.serverless.cluster.IndexDescriptor> index : plane.descriptors().listAll().entrySet()) {
+        String after = null;
+        do {
+            after = collectPage(plane, after, 500, deleted);
+        } while (after != null);
+        return deleted;
+    }
+
+    /**
+     * Collects one bounded slice of the deployment.
+     *
+     * <p>This is the shape a sweep at target scale has to have, and {@link #collectAll} is a loop over
+     * it kept for small deployments and tests. A real fleet runs many workers each taking a slice, which
+     * is what {@code rfc-serverless-metadata-plane.md} §6 means by control logic being many small
+     * idempotent loops: nothing here is privileged, and two workers collecting the same slice at once is
+     * wasteful rather than wrong.
+     *
+     * @param plane the metadata plane
+     * @param after resume point, or null to start
+     * @param limit how many indices this slice covers
+     * @param into accumulates deletions, keyed by {@code index#shard}
+     * @return the cursor to resume from, or null when the sweep is complete
+     * @throws IOException if listing or deleting fails
+     */
+    public String collectPage(MetadataPlane plane, String after, int limit, Map<String, List<String>> into) throws IOException {
+        final var page = plane.descriptors().listPage(after, limit);
+        for (Map.Entry<String, org.opensearch.serverless.cluster.IndexDescriptor> index : page.descriptors().entrySet()) {
             for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
                 final List<String> orphans = collectShard(plane, index.getKey(), shard);
                 if (orphans.isEmpty() == false) {
-                    deleted.put(index.getKey() + "#" + shard, orphans);
+                    into.put(index.getKey() + "#" + shard, orphans);
                 }
             }
         }
-        return deleted;
+        return page.nextAfter();
     }
 
     /**

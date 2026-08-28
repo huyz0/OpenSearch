@@ -202,6 +202,61 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * "List every index" is not an operation at 100 million. Reading a page must cost the page.
+     */
+    public void testListingAPageCostsThePageNotThePopulation() throws Exception {
+        final long atSmall = listPageOpsAtPopulation(200, 25);
+        final long atLarge = listPageOpsAtPopulation(1_000, 25);
+
+        logger.info("phase 9 listPage: {} ops at population 200, {} ops at population 1000 (page size 25)", atSmall, atLarge);
+        assertEquals("reading one page must not cost more because other indices exist: " + atSmall + " vs " + atLarge, atSmall, atLarge);
+
+        // And the cost must scale with the page, not with anything else. Measuring the slope rather
+        // than asserting an absolute constant: the constant is an implementation detail (a listing, plus
+        // the lookahead that discovers there is another page), and pinning it would make this test fail
+        // for reasons that have nothing to do with the property being claimed.
+        final long atPage5 = listPageOpsAtPopulation(1_000, 5);
+        final long atPage25 = listPageOpsAtPopulation(1_000, 25);
+        assertEquals("each extra index in a page must cost exactly one read", 20L, atPage25 - atPage5);
+    }
+
+    private long listPageOpsAtPopulation(int population, int pageSize) throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final CountingBlobStore counter = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final MetadataPlane plane = new MetadataPlane(counter, BlobPath.cleanPath(), clock::get, TTL);
+        createIndices(plane, 0, population);
+        counter.reset();
+        final var page = plane.descriptors().listPage(null, pageSize);
+        assertEquals(pageSize, page.descriptors().size());
+        assertTrue("a page short of the population must report more to come", page.hasMore());
+        logger.info("phase 9 listPage split at population {}: {} reads, {} writes", population, counter.reads(), counter.writes());
+        return counter.total();
+    }
+
+    /** A cursor walk must visit every index exactly once, and then stop. */
+    public void testPagingWalksTheWholePopulationExactlyOnce() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final int population = 137;   // deliberately not a multiple of the page size
+        createIndices(plane, 0, population);
+
+        final java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+        String after = null;
+        int pages = 0;
+        do {
+            final var page = plane.descriptors().listPage(after, 20);
+            for (String name : page.descriptors().keySet()) {
+                assertTrue("the walk returned " + name + " twice", seen.add(name));
+            }
+            after = page.nextAfter();
+            pages++;
+            assertTrue("the walk did not terminate", pages < 50);
+        } while (after != null);
+
+        assertEquals("the walk missed indices", population, seen.size());
+    }
+
     private long truthOpsAtPopulation(int population) throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final CountingBlobStore counter = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));

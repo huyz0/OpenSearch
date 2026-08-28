@@ -131,11 +131,102 @@ public final class DescriptorStore {
     }
 
     /**
+     * One bounded page of descriptors, in name order.
+     *
+     * <p><b>This is the only enumeration a deployment at target scale may use.</b> "List every index" is
+     * not a slow operation at 100 million indices; it is not an operation at all — the answer does not
+     * fit in a response, cannot be consumed by a caller, and is stale before it finishes. So the API is
+     * a cursor walk, and callers that want everything pay for everything, one page at a time, visibly.
+     *
+     * <p>Two costs, and they are bounded differently. The descriptor <b>reads</b> are bounded here by
+     * {@code limit}, on any backend. The <b>listing</b> is bounded natively by S3's
+     * {@code ListObjectsV2} {@code start-after} plus {@code max-keys} and GCS's equivalent;
+     * {@code FsBlobContainer} has no such primitive and enumerates the directory, so on a filesystem
+     * this is bounded in reads but not in the listing itself. That half cannot be demonstrated here and
+     * belongs with R11.
+     *
+     * @param after return names strictly greater than this, or null to start at the beginning
+     * @param limit maximum descriptors to return
+     * @return the page
+     * @throws IOException if listing or reading fails
+     */
+    public Page listPage(String after, int limit) throws IOException {
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be positive, got " + limit);
+        }
+        final List<String> names = new ArrayList<>(container.listBlobs().keySet());
+        names.sort(String::compareTo);
+
+        final Map<String, IndexDescriptor> page = new LinkedHashMap<>();
+        String last = null;
+        for (String blobName : names) {
+            if (after != null && blobName.compareTo(after) <= 0) {
+                continue;
+            }
+            if (page.size() >= limit) {
+                // There is more. Report a cursor rather than a total: knowing how many there are in
+                // total is itself a full scan, and is the question this API refuses to answer.
+                return new Page(page, last);
+            }
+            final Optional<BlobRegister> register = container.readRegister(blobName);
+            if (register.isEmpty()) {
+                continue;
+            }
+            try (InputStream in = register.get().value().streamInput()) {
+                final IndexDescriptor descriptor = IndexDescriptor.fromStream(in);
+                page.put(descriptor.name(), descriptor);
+                last = blobName;
+            }
+        }
+        return new Page(page, null);
+    }
+
+    /** A bounded page of descriptors, and where to resume. */
+    public static final class Page {
+
+        private final Map<String, IndexDescriptor> descriptors;
+        private final String nextAfter;
+
+        Page(Map<String, IndexDescriptor> descriptors, String nextAfter) {
+            this.descriptors = Map.copyOf(descriptors);
+            this.nextAfter = nextAfter;
+        }
+
+        /**
+         * Returns the descriptors in this page.
+         *
+         * @return descriptors by index name
+         */
+        public Map<String, IndexDescriptor> descriptors() {
+            return descriptors;
+        }
+
+        /**
+         * Returns the cursor to resume from, or null when the walk is complete.
+         *
+         * @return the next cursor, or null
+         */
+        public String nextAfter() {
+            return nextAfter;
+        }
+
+        /**
+         * Reports whether another page follows.
+         *
+         * @return true when there is more
+         */
+        public boolean hasMore() {
+            return nextAfter != null;
+        }
+    }
+
+    /**
      * Lists every descriptor.
      *
-     * <p>A bounded {@code ListObjectsV2}, not a search. At scale a caller wants a prefix or a name index
-     * rather than this; it exists because a small deployment and a test both need to enumerate, and
-     * pretending otherwise would mean neither could.
+     * <p><b>Do not put this on a request path.</b> It is O(population) by construction and phase 9
+     * measured what that costs: 2N+1 operations when it backed {@code truthFor}. It survives for offline
+     * work — a sweep that already intends to visit everything — and {@link #listPage} is what an API
+     * uses. A caller that reaches for this to answer a user is answering the wrong question.
      *
      * @return descriptors by index name
      * @throws IOException if listing or reading fails

@@ -123,9 +123,22 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
 
             final Response indices = send(http, "GET", "/_serverless/indices", null);
             assertEquals(200, indices.status());
-            assertTrue(indices.body().contains("\"count\":2"));
+            assertTrue(indices.body().contains("\"size\":2"));
             assertTrue(indices.body().contains("alpha"));
             assertTrue(indices.body().contains("beta"));
+            assertTrue("a complete page must say so", indices.body().contains("\"has_more\":false"));
+            // No total. Counting the indices in a deployment is a full scan, and this endpoint refuses
+            // to be the reason someone performs one.
+            assertFalse("the listing must not report a population-wide total", indices.body().contains("\"count\""));
+
+            // A page smaller than the population reports where to resume, and resuming reaches the rest.
+            final Response firstPage = send(http, "GET", "/_serverless/indices?size=1", null);
+            assertTrue(firstPage.body().contains("\"has_more\":true"));
+            assertTrue(firstPage.body().contains("next_after"));
+            final String cursor = firstPage.body().replaceAll(".*\"next_after\":\"([^\"]+)\".*", "$1");
+            final Response secondPage = send(http, "GET", "/_serverless/indices?size=1&after=" + cursor, null);
+            assertTrue("resuming must return the other index", secondPage.body().contains("beta"));
+            assertFalse("resuming must not repeat the first", secondPage.body().contains("\"index\":\"alpha\""));
 
             // Shards before anything is activated: a distinct, honest state.
             final Response cold = send(http, "GET", "/_serverless/shards/alpha", null);

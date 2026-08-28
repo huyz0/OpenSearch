@@ -21,7 +21,6 @@ import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -74,13 +73,21 @@ public final class CatalogHandler extends BaseRestHandler {
         final String path = request.path();
 
         if (path.endsWith("/_serverless/indices")) {
-            final Map<String, IndexDescriptor> all = metadata.descriptors().listAll();
+            // A cursor walk, never a full enumeration. At the population this design targets, "list all
+            // indices" is not a slow operation -- it is not an operation: the answer does not fit in a
+            // response and is stale before it finishes. So the caller asks for a page and is told where
+            // to resume, and a caller that wants everything pays for everything, visibly.
+            final int size = Math.min(request.paramAsInt("size", 100), 1000);
+            final String after = request.param("after");
+            final var page = metadata.descriptors().listPage(after, size);
             return channel -> {
                 try (XContentBuilder builder = channel.newBuilder()) {
                     builder.startObject();
-                    builder.field("count", all.size());
+                    // Deliberately no total. Counting the indices in a deployment is itself a full scan,
+                    // and it is the field that would quietly reintroduce the cost this endpoint avoids.
+                    builder.field("size", page.descriptors().size());
                     builder.startArray("indices");
-                    for (IndexDescriptor descriptor : all.values()) {
+                    for (IndexDescriptor descriptor : page.descriptors().values()) {
                         builder.startObject();
                         builder.field("index", descriptor.name());
                         builder.field("uuid", descriptor.uuid());
@@ -88,6 +95,10 @@ public final class CatalogHandler extends BaseRestHandler {
                         builder.endObject();
                     }
                     builder.endArray();
+                    builder.field("has_more", page.hasMore());
+                    if (page.hasMore()) {
+                        builder.field("next_after", page.nextAfter());
+                    }
                     builder.endObject();
                     channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                 }
