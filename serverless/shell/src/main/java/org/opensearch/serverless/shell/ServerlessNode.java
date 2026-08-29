@@ -449,6 +449,7 @@ public final class ServerlessNode implements Closeable {
         );
         controller.registerHandler(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane));
+        controller.registerHandler(new org.opensearch.serverless.rest.BulkHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane));
         controller.registerHandler(
@@ -923,6 +924,194 @@ public final class ServerlessNode implements Closeable {
         // nowhere but this node's disk and its log.
         signals.wrote(shardId);
         return result.isFound();
+    }
+
+    /**
+     * Applies a batch to one shard: one log append for all of it, then each operation in order.
+     *
+     * <p><b>Why this is not a loop over {@link #index} and {@link #delete}.</b> Those append one record
+     * each, so a hundred-document request would be a hundred object-store PUTs — the write path priced
+     * per document, which is what made {@code _bulk} worth building rather than worth faking. Here the
+     * whole batch is one append, and the durability contract is unchanged: every record is in the log
+     * before any of it is acknowledged, which is strictly the same promise a single write makes.
+     *
+     * <p><b>Ordering within the batch is preserved</b>, and it has to be. A batch that writes a document
+     * and then deletes it must leave it gone, and one that deletes and then rewrites must leave it
+     * present. Since a record's kind travels with it, replay reproduces the same sequence — see
+     * {@link org.opensearch.serverless.store.WalStore#append(long, java.util.List)}.
+     *
+     * <p><b>A failed operation does not roll back the ones before it</b>, exactly as in classic
+     * OpenSearch: a bulk is a batch, not a transaction. The failure is reported for its own item and the
+     * rest of the batch stands.
+     *
+     * @param shardId the shard, which this node must own as a writer
+     * @param operations the writes and deletions, in request order
+     * @return one outcome per operation, in the same order
+     * @throws java.io.IOException if the shard is not open here, is a reader, or the log append fails
+     */
+    public java.util.List<BulkOutcome> bulk(
+        org.opensearch.core.index.shard.ShardId shardId,
+        java.util.List<org.opensearch.serverless.store.WalRecord> operations
+    ) throws java.io.IOException {
+        ensureStarted();
+        final var shard = reconciler.shard(shardId);
+        if (shard == null) {
+            throw new java.io.IOException("cannot write to " + shardId + ": not open on " + nodeName);
+        }
+        if (reconciler.readerShards().contains(shardId)) {
+            throw new java.io.IOException("cannot write to " + shardId + ": it is open as a reader");
+        }
+        if (operations.isEmpty()) {
+            return java.util.List.of();
+        }
+
+        final var wal = reconciler.wal(shardId);
+        if (wal != null) {
+            // Before anything is applied, and once for the batch. If this throws, nothing was applied
+            // and nothing was acknowledged.
+            wal.append(shard.getOperationPrimaryTerm(), operations);
+        }
+
+        final java.util.List<BulkOutcome> outcomes = new java.util.ArrayList<>(operations.size());
+        for (org.opensearch.serverless.store.WalRecord operation : operations) {
+            try {
+                if (operation.isDeletion()) {
+                    final var result = shard.applyDeleteOperationOnPrimary(
+                        org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                        operation.id(),
+                        org.opensearch.index.VersionType.INTERNAL,
+                        org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        0
+                    );
+                    if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
+                        // s0-findings.md F5 again: a failure here is a value, and a caller that reads
+                        // only the exception channel reports success for an operation that did nothing.
+                        outcomes.add(BulkOutcome.failed(operation.id(), "deleting returned " + result.getResultType()));
+                        continue;
+                    }
+                    outcomes.add(BulkOutcome.deleted(operation.id(), result.isFound()));
+                } else {
+                    final var result = shard.applyIndexOperationOnPrimary(
+                        org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                        org.opensearch.index.VersionType.INTERNAL,
+                        new org.opensearch.index.mapper.SourceToParse(
+                            shardId.getIndexName(),
+                            operation.id(),
+                            new org.opensearch.core.common.bytes.BytesArray(operation.source()),
+                            org.opensearch.common.xcontent.XContentType.JSON
+                        ),
+                        org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        0,
+                        org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+                        false
+                    );
+                    if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
+                        outcomes.add(BulkOutcome.failed(operation.id(), "indexing returned " + result.getResultType()));
+                        continue;
+                    }
+                    outcomes.add(BulkOutcome.indexed(operation.id()));
+                }
+            } catch (Exception e) {
+                // One bad document does not fail the batch. A mapping conflict on item 40 is item 40's
+                // problem, and failing the other 99 would make a bulk request less useful than the loop
+                // it replaces.
+                outcomes.add(BulkOutcome.failed(operation.id(), e.getMessage() == null ? e.toString() : e.getMessage()));
+            }
+        }
+
+        // One fsync and one edge for the batch, not one per document. The edge is raised after
+        // everything is applied, so a publish it triggers describes the whole batch or none of it.
+        shard.sync();
+        signals.wrote(shardId);
+        return outcomes;
+    }
+
+    /**
+     * What one operation in a batch did.
+     *
+     * <p>A plain class rather than a record because this module's javadoc check rejects records.
+     */
+    public static final class BulkOutcome {
+
+        private final String id;
+        private final boolean deletion;
+        private final boolean found;
+        private final String failure;
+
+        private BulkOutcome(String id, boolean deletion, boolean found, String failure) {
+            this.id = id;
+            this.deletion = deletion;
+            this.found = found;
+            this.failure = failure;
+        }
+
+        /**
+         * Records a document written.
+         *
+         * @param id the document id
+         * @return the outcome
+         */
+        public static BulkOutcome indexed(String id) {
+            return new BulkOutcome(id, false, false, null);
+        }
+
+        /**
+         * Records a deletion, which may or may not have found anything.
+         *
+         * @param id the document id
+         * @param found whether the document was there
+         * @return the outcome
+         */
+        public static BulkOutcome deleted(String id, boolean found) {
+            return new BulkOutcome(id, true, found, null);
+        }
+
+        /**
+         * Records an operation the engine refused.
+         *
+         * @param id the document id
+         * @param reason why it failed
+         * @return the outcome
+         */
+        public static BulkOutcome failed(String id, String reason) {
+            return new BulkOutcome(id, false, false, reason == null ? "unknown failure" : reason);
+        }
+
+        /**
+         * Returns the document id.
+         *
+         * @return the id
+         */
+        public String id() {
+            return id;
+        }
+
+        /**
+         * Reports whether this operation removed a document rather than adding one.
+         *
+         * @return true for a deletion
+         */
+        public boolean isDeletion() {
+            return deletion;
+        }
+
+        /**
+         * Reports whether a deletion found the document. Meaningless for a write.
+         *
+         * @return true when the document was there to delete
+         */
+        public boolean found() {
+            return found;
+        }
+
+        /**
+         * Returns why the operation failed, or null if it did not.
+         *
+         * @return the failure message, or null
+         */
+        public String failure() {
+            return failure;
+        }
     }
 
     /**

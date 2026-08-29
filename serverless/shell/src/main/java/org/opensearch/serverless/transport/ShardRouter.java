@@ -87,6 +87,12 @@ public final class ShardRouter {
             this::handleIndex
         );
         transportService.registerRequestHandler(
+            ForwardedBulkRequest.ACTION,
+            ThreadPool.Names.WRITE,
+            ForwardedBulkRequest::new,
+            this::handleBulk
+        );
+        transportService.registerRequestHandler(
             ForwardedSearchRequest.ACTION,
             ThreadPool.Names.SEARCH,
             ForwardedSearchRequest::new,
@@ -111,6 +117,21 @@ public final class ShardRouter {
             node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
         }
         channel.sendResponse(new ForwardedIndexResponse(node.localNode().getId()));
+    }
+
+    private void handleBulk(ForwardedBulkRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
+        final ShardId shardId = localShard(request.index(), request.shard());
+        if (shardId == null) {
+            // Same refusal as a forwarded single write, and for the same reason: ownership moved between
+            // the sender reading the head and this arriving. Refusing the whole batch is right -- every
+            // item in it routes to this one shard, so there is no partial answer to give.
+            throw new IllegalStateException("this node does not own " + request.index() + "[" + request.shard() + "]");
+        }
+        final var outcomes = node.bulk(shardId, request.operations());
+        if (request.refresh()) {
+            node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
+        }
+        channel.sendResponse(new ForwardedBulkResponse(node.localNode().getId(), outcomes));
     }
 
     private void handleSearch(ForwardedSearchRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
@@ -236,6 +257,31 @@ public final class ShardRouter {
             request,
             TransportRequestOptions.builder().withTimeout(timeout).build(),
             new Handler<>(future, ForwardedIndexResponse::new)
+        );
+        return future.actionGet(timeout);
+    }
+
+    /**
+     * Sends a whole batch to the node that owns the shard and waits for its per-item answer.
+     *
+     * <p>Bounded by the same deadline a single forwarded write uses. A batch does more work on the far
+     * side than one document does, so this is the place where that bound is most likely to be the wrong
+     * shape -- recorded rather than tuned, because a number picked without a measurement is not better
+     * than the one already justified.
+     *
+     * @param peer the owning node
+     * @param request the batch
+     * @return the owner's per-item outcomes
+     */
+    public ForwardedBulkResponse forwardBulk(DiscoveryNode peer, ForwardedBulkRequest request) {
+        final PlainActionFuture<ForwardedBulkResponse> future = PlainActionFuture.newFuture();
+        final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
+        transportService.sendRequest(
+            peer,
+            ForwardedBulkRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedBulkResponse::new)
         );
         return future.actionGet(timeout);
     }

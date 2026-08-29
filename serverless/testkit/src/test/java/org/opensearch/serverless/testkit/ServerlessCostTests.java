@@ -400,4 +400,89 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             }
         }
     }
+
+    /**
+     * What a batch costs, against the number this suite already records for a single document.
+     *
+     * <p>{@code testWhatADocumentCosts} asserts one object-store write per document, measured before
+     * publication. That was the honest price of a write path with no group commit, and it is the number
+     * {@code _bulk} exists to change. Measured the same way, on both stores, so the comparison is against
+     * this suite's own baseline rather than against an argument.
+     */
+    public void testWhatABatchCosts() throws Exception {
+        for (boolean onBucket : new boolean[] { false, true }) {
+            if (onBucket) {
+                assumeEndpoint();
+            }
+            final CountingBlobStore store = onBucket ? bucket() : filesystem();
+            final String label = onBucket ? "s3" : "fs";
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+            try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-bulk-" + label))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+                loop.want("alpha", 0);
+                loop.tick(System.currentTimeMillis());
+                final ShardId shardId = node.reconciler().openShards().iterator().next();
+
+                final int documents = 50;
+
+                // The baseline, re-measured here rather than quoted: one document at a time.
+                store.reset();
+                for (int i = 0; i < documents; i++) {
+                    node.index(shardId, "single-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
+                }
+                final long oneAtATime = store.blobWrites();
+
+                // The same documents, as one request.
+                final StringBuilder body = new StringBuilder();
+                for (int i = 0; i < documents; i++) {
+                    body.append("{\"index\":{\"_id\":\"batched-").append(i).append("\"}}\n");
+                    body.append("{\"msg\":\"cost\",\"n\":").append(i).append("}\n");
+                }
+                store.reset();
+                final var response = bulk(node, body.toString());
+                final long batched = store.blobWrites();
+
+                assertEquals("on " + label + ", the batch should be accepted: " + response, 200, statusOf(response));
+                // Writes only, and deliberately no wall-clock. The baseline calls the node directly while
+                // the batch goes over HTTP, so a time comparison between them would be measuring the
+                // presence of a network hop and reporting it as the cost of batching. The request count
+                // is the number that transfers anyway -- it is the same against S3, and it is the bill.
+                logger.info(
+                    "cost[{}]: {} documents cost {} writes one at a time, {} write(s) as one batch",
+                    label,
+                    documents,
+                    oneAtATime,
+                    batched
+                );
+
+                assertEquals("on " + label + ", the per-document baseline should be one write each", documents, oneAtATime);
+                // The whole claim, and it is an equality rather than a ratio: a batch on one shard is one
+                // log append, not a smaller number of them.
+                assertEquals("on " + label + ", a batch on one shard must cost exactly one object-store write", 1, batched);
+            }
+        }
+    }
+
+    private static int statusOf(String response) {
+        return response.startsWith("200 ") ? 200 : -1;
+    }
+
+    /** Sends a bulk body over HTTP and returns "status body". */
+    private static String bulk(ServerlessNode node, String body) throws Exception {
+        final var address = node.boundHttpAddress().publishAddress();
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
+            final HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + "/alpha/_bulk"))
+                .timeout(Duration.ofSeconds(120))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+            final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            return response.statusCode() + " " + response.body();
+        }
+    }
 }

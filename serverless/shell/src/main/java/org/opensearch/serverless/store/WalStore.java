@@ -47,9 +47,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * cycle elapsed and the record was applied and committed. Replaying a few extra records costs nothing
  * because replay is idempotent — see {@link WalRecord}.
  *
- * <p><b>One blob per record</b>, which is the obvious thing to batch and is not batched. The design's
- * own principle is "batch writes, stream reads"; a group commit belongs here and is not built, so a
- * write costs an object-store PUT.
+ * <p><b>One blob per append, and an append may be a batch.</b> A single write still costs one PUT; a
+ * bulk request landing on one shard costs one PUT for the whole batch rather than one per document.
+ * See {@link #append(long, List)} for the container format and why an older writer's log still reads.
  */
 public final class WalStore {
 
@@ -84,9 +84,47 @@ public final class WalStore {
      * @throws IOException if the append fails
      */
     public void append(long term, WalRecord record) throws IOException {
-        final byte[] bytes = org.opensearch.core.common.bytes.BytesReference.toBytes(record.toBytes());
+        append(term, List.of(record));
+    }
+
+    /**
+     * Appends a batch as <em>one</em> blob, durably, before the caller applies any of it.
+     *
+     * <p>This is the group commit the class documentation used to say belonged here and was not built.
+     * A bulk request landing on one shard costs one object-store PUT rather than one per document, which
+     * is the difference between a write path priced per document and one priced per request.
+     *
+     * <p><b>All of it is durable before any of it is applied</b>, which is the same contract a single
+     * write has and not a weaker one. A failure between the append and the application replays the whole
+     * batch, and replay is an idempotent redo of state.
+     *
+     * <p><b>The container is newline-delimited JSON, and that is chosen rather than convenient.</b> A
+     * serialized record cannot contain a raw newline -- a document's source is a JSON string, so any
+     * newline inside it is escaped -- so the delimiter cannot collide with the content. It also makes a
+     * one-record blob byte-identical to what this class wrote before batching existed, so a log written
+     * by an older writer is read by this one with no version field, no migration and no special case.
+     *
+     * @param term the writing node's term
+     * @param records the writes, in the order they must replay
+     * @throws IOException if the append fails
+     */
+    public void append(long term, List<WalRecord> records) throws IOException {
+        if (records.isEmpty()) {
+            // Not an error, and not a blob. An empty batch is what a bulk request whose items all belong
+            // to other shards leaves for this one, and a PUT for it would say nothing.
+            return;
+        }
+        final java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+        for (WalRecord record : records) {
+            if (buffer.size() > 0) {
+                buffer.write('\n');
+            }
+            buffer.write(org.opensearch.core.common.bytes.BytesReference.toBytes(record.toBytes()));
+        }
+        final byte[] bytes = buffer.toByteArray();
         // Zero-padded so a lexicographic listing is a chronological one. Within a term there is exactly
-        // one writer, so the ordinal needs no coordination.
+        // one writer, so the ordinal needs no coordination. A batch takes one ordinal and its records
+        // replay in the order they were written, so the total order over a term is (ordinal, position).
         final String name = String.format(java.util.Locale.ROOT, "%020d", ordinal.incrementAndGet());
         containerFor(term).writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, false);
     }
@@ -117,7 +155,7 @@ public final class WalStore {
             names.sort(Comparator.naturalOrder());
             for (String name : names) {
                 try (InputStream in = container.readBlob(name)) {
-                    records.add(WalRecord.fromStream(in));
+                    records.addAll(parseBatch(in.readAllBytes()));
                 } catch (IOException e) {
                     // A name that matches ours and does not parse is corruption, and it propagates --
                     // naming the blob, because a parse failure that does not say which record failed
@@ -128,6 +166,31 @@ public final class WalStore {
                     throw new IOException("unreadable WAL record at " + container.path().buildAsString() + name, e);
                 }
             }
+        }
+        return records;
+    }
+
+    /**
+     * Parses one blob, which holds a single record or a batch of them, one per line.
+     *
+     * <p>Splitting on the newline byte is safe on UTF-8 without decoding first: {@code 0x0A} cannot
+     * appear inside a multi-byte sequence, so a byte-level split cannot land mid-character.
+     *
+     * @param blob the blob's bytes
+     * @return the records it holds, in order
+     * @throws IOException if a line does not parse
+     */
+    private static List<WalRecord> parseBatch(byte[] blob) throws IOException {
+        final List<WalRecord> records = new ArrayList<>();
+        int start = 0;
+        for (int i = 0; i <= blob.length; i++) {
+            if (i != blob.length && blob[i] != '\n') {
+                continue;
+            }
+            if (i > start) {
+                records.add(WalRecord.fromStream(new java.io.ByteArrayInputStream(blob, start, i - start)));
+            }
+            start = i + 1;
         }
         return records;
     }
