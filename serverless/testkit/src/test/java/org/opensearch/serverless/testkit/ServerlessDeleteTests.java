@@ -237,6 +237,235 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A deletion survives a garbage collection sweep that has something to sweep.
+     *
+     * <p><b>The failover is the test.</b> A first version of this published twice under one term and swept;
+     * it passed, and it passed with the collector's manifest check deleted, because every live file sat in
+     * the <em>current</em> term container and the sweep skips that container entirely. It exercised
+     * nothing.
+     *
+     * <p>Publication after a failover is what creates the dangerous shape: a successor inherits its
+     * predecessor's files rather than re-uploading them, so the live commit at term 2 names files that
+     * live under {@code t=1} — collectable by term, and saved only by the manifest naming them. A
+     * tombstone is the least obvious of those files, and if the deletion were not part of the commit the
+     * sweep would be free to reclaim what carries it.
+     */
+    public void testADeletionSurvivesASweepOfInheritedFiles() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Path objectStore = createTempDir();
+        final MetadataPlane plane = freshIndex(clock, objectStore);
+        final var store = new FsBlobStore(1024, objectStore, false);
+        final var gc = new org.opensearch.serverless.reconcile.GarbageCollector(store, BlobPath.cleanPath());
+
+        final ServerlessNode a = new ServerlessNode(nodeSettings("del-gc"));
+        a.start();
+        final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
+        loopA.want("alpha", 0);
+        loopA.tick(clock.get());
+        final ShardId shardId = a.reconciler().openShards().iterator().next();
+        for (int i = 1; i <= 6; i++) {
+            a.index(shardId, String.valueOf(i), "{\"msg\":\"swept\",\"n\":" + i + "}");
+        }
+        loopA.tick(clock.get() + 1_000);
+        final long firstTerm = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow().term();
+        a.close();
+        clock.set(clock.get() + TTL + 1);
+
+        try (ServerlessNode b = new ServerlessNode(nodeSettings("del-gc-successor"))) {
+            b.start();
+            final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
+            loopB.want("alpha", 0);
+            loopB.tick(clock.get());
+            final ShardId recovered = b.reconciler().openShards().iterator().next();
+
+            assertTrue("the successor should delete a document it inherited", b.delete(recovered, "3"));
+            b.reconciler().shard(recovered).refresh("test");
+            loopB.tick(clock.get() + 1_000);   // publish at the new term, inheriting the old files
+
+            final var manifest = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
+            assertTrue("the successor must have published at a higher term", manifest.term() > firstTerm);
+            final long inherited = manifest.files()
+                .values()
+                .stream()
+                .filter(container -> container.equals(org.opensearch.serverless.store.SegmentPublisher.termSegment(firstTerm)))
+                .count();
+            logger.info(
+                "delete + gc: live commit at term {} names {} file(s) inherited from term {}",
+                manifest.term(),
+                inherited,
+                firstTerm
+            );
+            assertTrue("the live commit must inherit files from the older term, or the sweep has nothing dangerous to do", inherited > 0);
+
+            final var collected = gc.collectShard(plane, "alpha", 0);
+            logger.info("delete + gc: swept {} orphaned blobs", collected.size());
+            for (var file : manifest.files().entrySet()) {
+                assertTrue(
+                    "the sweep deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
+                    store.blobContainer(
+                        org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), "alpha", 0).add(file.getValue())
+                    ).blobExists(file.getKey())
+                );
+            }
+            b.reconciler().shard(recovered).refresh("test");
+            assertEquals("and the deletion must have survived it", 5, hits(b, recovered, "msg", "swept"));
+        }
+    }
+
+    /**
+     * A deletion written under one term still applies after two more handovers.
+     *
+     * <p>Records are replayed across every term a shard has ever had, in term order — the log is trimmed
+     * per term, and a dead predecessor's records are never trimmed by anyone, so a successor replays them
+     * for as long as they exist. That makes cross-term ordering load-bearing: a write at term 1 and a
+     * delete at term 2 replayed in the wrong order resurrects the document, and nothing else in the suite
+     * exercises a delete that outlives the writer that made it.
+     */
+    public void testADeletionOutlivesTheTermItWasMadeIn() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = freshIndex(clock, createTempDir());
+
+        final ServerlessNode a = new ServerlessNode(nodeSettings("del-t1"));
+        a.start();
+        final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
+        loopA.want("alpha", 0);
+        loopA.tick(clock.get());
+        a.index(a.reconciler().openShards().iterator().next(), "x", "{\"msg\":\"chain\",\"n\":1}");
+        a.index(a.reconciler().openShards().iterator().next(), "y", "{\"msg\":\"chain\",\"n\":2}");
+        a.close();
+        clock.set(clock.get() + TTL + 1);
+
+        final ServerlessNode b = new ServerlessNode(nodeSettings("del-t2"));
+        b.start();
+        final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
+        loopB.want("alpha", 0);
+        loopB.tick(clock.get());
+        final ShardId atB = b.reconciler().openShards().iterator().next();
+        assertTrue("b should have recovered x before deleting it", b.delete(atB, "x"));
+        b.close();
+        clock.set(clock.get() + TTL + 1);
+
+        try (ServerlessNode c = new ServerlessNode(nodeSettings("del-t3"))) {
+            c.start();
+            final BackgroundReconciler loopC = new BackgroundReconciler(c, plane);
+            loopC.want("alpha", 0);
+            loopC.tick(clock.get());
+            final ShardId atC = c.reconciler().openShards().iterator().next();
+            c.reconciler().shard(atC).refresh("test");
+
+            final long term = plane.heads().read("alpha", 0).orElseThrow().term();
+            logger.info("delete across terms: third owner at term {} sees {} documents", term, hits(c, atC, "msg", "chain"));
+            assertEquals("a deletion made at an earlier term must still apply two handovers later", 1, hits(c, atC, "msg", "chain"));
+        }
+    }
+
+    /**
+     * Replay order holds past ten records, where a naive ordinal would stop sorting correctly.
+     *
+     * <p>Record names are zero-padded to twenty digits precisely so string order is numeric order. Nothing
+     * asserted that, and every other test in this suite writes fewer than ten records to a term — which is
+     * exactly the range where {@code "10" < "2"} does not bite. A delete replayed before the write it
+     * removes would resurrect the document, and only a repeated document id can show it.
+     */
+    public void testReplayOrderHoldsPastTenRecords() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = freshIndex(clock, createTempDir());
+
+        final ServerlessNode a = new ServerlessNode(nodeSettings("del-ordinal"));
+        a.start();
+        final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
+        loopA.want("alpha", 0);
+        loopA.tick(clock.get());
+        final ShardId shardId = a.reconciler().openShards().iterator().next();
+
+        // Eight fillers take ordinals 1-8, so the write lands on 9 and the delete on 10. That straddle is
+        // the whole point and it is easy to miss by one: with ordinals 10 and 11 an unpadded name still
+        // sorts "10" before "11", the delete still follows the write, and the test passes while proving
+        // nothing. It has to be 9 and 10, where "10" sorts before "9" and the delete arrives first.
+        for (int i = 0; i < 8; i++) {
+            a.index(shardId, "filler-" + i, "{\"msg\":\"ordinal\",\"n\":" + i + "}");
+        }
+        a.index(shardId, "target", "{\"msg\":\"ordinal\",\"n\":100}");   // ordinal 9
+        assertTrue(a.delete(shardId, "target"));                             // ordinal 10
+        a.close();
+        clock.set(clock.get() + TTL + 1);
+
+        try (ServerlessNode b = new ServerlessNode(nodeSettings("del-ordinal-successor"))) {
+            b.start();
+            final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
+            loopB.want("alpha", 0);
+            loopB.tick(clock.get());
+            final ShardId recovered = b.reconciler().openShards().iterator().next();
+            b.reconciler().shard(recovered).refresh("test");
+
+            assertEquals("the eight filler documents must survive", 8, hits(b, recovered, "msg", "ordinal"));
+            assertEquals("and the target, deleted at ordinal 10, must not come back", 0, hits(b, recovered, "n", "100"));
+        }
+    }
+
+    /**
+     * A sweep must not eat the log. Unpublished records are the only copy of writes a successor needs, and
+     * they live under the shard's own path — one directory away from what the collector walks.
+     */
+    public void testAGarbageCollectionSweepDoesNotTouchTheWriteAheadLog() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Path objectStore = createTempDir();
+        final MetadataPlane plane = freshIndex(clock, objectStore);
+        final var store = new FsBlobStore(1024, objectStore, false);
+        final var gc = new org.opensearch.serverless.reconcile.GarbageCollector(store, BlobPath.cleanPath());
+
+        final ServerlessNode a = new ServerlessNode(nodeSettings("del-wal-gc"));
+        a.start();
+        final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
+        loopA.want("alpha", 0);
+        loopA.tick(clock.get());
+        final ShardId shardId = a.reconciler().openShards().iterator().next();
+
+        a.index(shardId, "published", "{\"msg\":\"waltest\",\"n\":1}");
+        loopA.tick(clock.get() + 1_000);   // publish, so a later term exists to sweep against
+
+        // Unpublished, and deliberately so: these exist only in the log.
+        a.index(shardId, "unpublished", "{\"msg\":\"waltest\",\"n\":2}");
+        assertTrue(a.delete(shardId, "published"));
+        a.close();
+        clock.set(clock.get() + TTL + 1);
+
+        try (ServerlessNode b = new ServerlessNode(nodeSettings("del-wal-gc-successor"))) {
+            b.start();
+            final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
+            loopB.want("alpha", 0);
+            loopB.tick(clock.get());
+            // Sweep after the successor took the shard and bumped the term, which is when older term
+            // containers become collectable and the log is at its most vulnerable.
+            loopB.tick(clock.get() + 1_000);
+            final var collected = gc.collectShard(plane, "alpha", 0);
+            logger.info("wal + gc: swept {} blobs after failover", collected.size());
+            assertFalse(
+                "the sweep must not collect write-ahead log records: " + collected,
+                collected.stream().anyMatch(name -> name.contains("wal"))
+            );
+
+            // Directly observable, rather than trusting the returned list. The log lives at wal/t=N,
+            // one level deeper than the sweep looks, so it is protected by nesting as well as by the
+            // term-name check -- and a sweep later made recursive would sail past both. This is what
+            // notices that.
+            final var walRoot = store.blobContainer(
+                org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), "alpha", 0).add("wal")
+            );
+            long recordsLeft = 0;
+            for (var termDir : walRoot.children().values()) {
+                recordsLeft += termDir.listBlobs().keySet().stream().filter(n -> n.matches("\\d{20}")).count();
+            }
+            logger.info("wal + gc: {} log record(s) survive the sweep", recordsLeft);
+            assertTrue("the sweep must leave the log intact", recordsLeft > 0);
+
+            final ShardId recovered = b.reconciler().openShards().iterator().next();
+            b.reconciler().shard(recovered).refresh("test");
+            assertEquals("the unpublished write survived the sweep, and the deletion applied", 1, hits(b, recovered, "msg", "waltest"));
+        }
+    }
+
     private int hits(ServerlessNode node, ShardId shardId, String field, String value) throws Exception {
         return (int) org.opensearch.serverless.shard.ShardQuery.execute(node.searchService(), shardId, field, value, 100).total();
     }
