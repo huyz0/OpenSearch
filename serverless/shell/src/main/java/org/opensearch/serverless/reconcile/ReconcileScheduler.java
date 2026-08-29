@@ -16,6 +16,8 @@ import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
+import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -68,8 +70,17 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      */
     public static final int RENEWALS_PER_TTL = 3;
 
+    /**
+     * How far either side of the renewal interval each renewal is spread, to keep a co-started fleet
+     * from renewing in lockstep.
+     */
+    public static final double JITTER_FRACTION = 0.2;
+
     /** How long writes are gathered before one publish covers them all. */
     public static final TimeValue DEFAULT_PUBLISH_DEBOUNCE = TimeValue.timeValueMillis(500);
+
+    /** How many distinct doubted shards are remembered between activation passes. */
+    public static final int MAX_PENDING_DOUBTS = 1024;
 
     /** How often the full pass runs regardless of what any edge did or failed to do. */
     public static final TimeValue DEFAULT_BACKSTOP_INTERVAL = TimeValue.timeValueSeconds(30);
@@ -83,12 +94,13 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     private final AtomicBoolean publishPending = new AtomicBoolean();
     private final AtomicBoolean activationPending = new AtomicBoolean();
+    private final java.util.Set<Map.Entry<String, Integer>> doubted = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final AtomicLong renewals = new AtomicLong();
     private final AtomicLong publishes = new AtomicLong();
     private final AtomicLong activations = new AtomicLong();
     private final AtomicLong backstops = new AtomicLong();
 
-    private volatile Scheduler.Cancellable renewalTask;
+    private volatile Scheduler.ScheduledCancellable renewalTask;
     private volatile Scheduler.Cancellable backstopTask;
     private volatile boolean closed;
 
@@ -171,7 +183,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return this, for chaining onto a constructor
      */
     public ReconcileScheduler start() {
-        renewalTask = threadPool.scheduleWithFixedDelay(this::renewNow, renewalInterval, ThreadPool.Names.GENERIC);
+        scheduleNextRenewal();
         if (backstopInterval != null) {
             backstopTask = threadPool.scheduleWithFixedDelay(this::backstopNow, backstopInterval, ThreadPool.Names.GENERIC);
         }
@@ -182,6 +194,46 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             backstopInterval == null ? "disabled" : backstopInterval
         );
         return this;
+    }
+
+    /**
+     * Returns the delay until the next renewal: the interval, spread by up to {@link #JITTER_FRACTION}
+     * either side.
+     *
+     * <p>Without this, a thousand nodes started by the same orchestrator in the same second renew in the
+     * same millisecond, forever — the interval is fixed, so nothing ever pulls them apart. That is a
+     * thundering herd against the object store every {@code ttl/3}, and it gets worse as the fleet grows,
+     * which is exactly when it is least affordable.
+     *
+     * <p>Re-jittered on <em>every</em> renewal rather than only the first, so nodes keep drifting apart
+     * instead of locking back into step after a shared pause.
+     *
+     * @return the delay to use for the next renewal
+     */
+    public TimeValue nextRenewalDelay() {
+        final long base = renewalInterval.millis();
+        final long spread = (long) (base * JITTER_FRACTION);
+        if (spread <= 0) {
+            return renewalInterval;
+        }
+        // Never below 1ms, and never so long that the jitter itself could outlive the lease: the spread
+        // is a fraction of an interval that is already a fraction of the TTL.
+        return TimeValue.timeValueMillis(Math.max(1L, base + ThreadLocalRandom.current().nextLong(-spread, spread + 1)));
+    }
+
+    private void scheduleNextRenewal() {
+        if (closed) {
+            return;
+        }
+        renewalTask = threadPool.schedule(() -> {
+            try {
+                renewNow();
+            } finally {
+                // In a finally, and renewNow never throws: a renewal loop that stops rescheduling
+                // because one pass failed is a node that looks alive until its lease lapses.
+                scheduleNextRenewal();
+            }
+        }, nextRenewalDelay(), ThreadPool.Names.GENERIC);
     }
 
     @Override
@@ -196,9 +248,12 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     @Override
     public void ownershipDoubted(String indexName, int shardNumber) {
-        // The shard is not recorded. Activation is over the whole wanted set and is a compare-and-swap
-        // per shard, so a doubt about one shard costs the same pass as a doubt about all of them, and
-        // remembering which one bought nothing.
+        // Which shard is remembered, because under demand-driven activation the pass needs to try the
+        // shard nobody wants -- not only the ones this node was told to want. Bounded because a storm of
+        // doubts about a dead node must cost one pass, not one per request.
+        if (doubted.size() < MAX_PENDING_DOUBTS) {
+            doubted.add(Map.entry(indexName, shardNumber));
+        }
         if (closed == false && activationPending.compareAndSet(false, true)) {
             threadPool.schedule(this::activateNow, TimeValue.ZERO, ThreadPool.Names.GENERIC);
         }
@@ -257,8 +312,14 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     public java.util.Set<ShardId> activateNow() {
         activationPending.set(false);
         activations.incrementAndGet();
+        // Drained before the work, for the same reason the dirty set is: a doubt raised mid-pass must
+        // get its own pass rather than being swallowed by this one.
+        final java.util.Set<Map.Entry<String, Integer>> pending = new java.util.LinkedHashSet<>(doubted);
+        doubted.removeAll(pending);
         try {
-            return loop.activateWanted();
+            final java.util.Set<ShardId> taken = new java.util.LinkedHashSet<>(loop.activateWanted());
+            taken.addAll(loop.activateOnDemand(pending));
+            return taken;
         } catch (Exception e) {
             logger.warn("failure-triggered activation failed; the backstop will retry", e);
             return java.util.Set.of();

@@ -108,21 +108,64 @@ earlier assertion was checking it had been released — two claims racing inside
 `...AsksForActivation` (`assertBusy`, because handing the work off is the behaviour under test). The
 race was real, not a flake: the fix was in the test, and the code was right.
 
+## Jitter
+
+Renewal moved off `scheduleWithFixedDelay` onto a self-rescheduling `schedule()` that re-draws a ±20%
+offset **every renewal, not just the first**. A fixed interval never pulls co-started nodes apart: a
+thousand nodes launched by the same orchestrator in the same second renew in the same millisecond
+forever, which is a thundering herd against the object store every `ttl/3` — worst exactly when the
+fleet is largest. Re-jittering each time also means nodes that shared a pause drift apart again instead
+of locking back into step.
+
+Measured: **159 distinct delays over 200 draws, spanning 801–1199 ms** on a 1000 ms interval. The
+assertion is phrased as the number that is 1 when jitter is broken.
+
+The reschedule sits in a `finally`, and `renewNow` never throws. A renewal loop that stops rescheduling
+because one pass failed is a node that looks alive right up until its lease lapses —
+`testLeasesAreRenewedWithoutAnybodyTicking` catches that, because it asserts renewal *repeats* rather
+than merely happens.
+
+## Demand-driven activation, and why it had to be decided here
+
+`main()` turned out to be blocked on this rather than adjacent to it. A booted node has to know what to
+serve, and there is no allocator to tell it — so "what does a fresh node do?" is not a question a
+bootstrap can dodge.
+
+Two answers, and they are genuinely different systems:
+
+- **Take only what you were told to want** (the behaviour up to now). Placement is somebody else's
+  decision, which means something outside the system assigns shards — the controller this whole design
+  deleted, reintroduced at the edge.
+- **Take an unowned shard somebody asked for.** Placement becomes "whichever node the client happened to
+  ask". No allocator exists at all; capacity appears where load appears.
+
+Built as a switch, **default off**, so the existing behaviour is preserved and turning it on is visible
+rather than a drift. `testByDefaultANodeDoesNotTakeAShardNobodyToldItToWant` pins the default: three
+writes arrive, three are refused, an activation pass demonstrably runs, and the shard stays unowned.
+
+Safe under races either way, because acquisition is a compare-and-swap: two nodes reaching for the same
+unowned shard produce one owner and one node that forwards.
+
+**The cap is what makes it safe to leave on.** Past `maxShardsHeld` a node refuses, the caller still sees
+no owner, and the next node asked takes it instead — admission control without an admission controller.
+Refusing is logged as a routing outcome, not an error, because a node that is full and a node that is
+broken should not page the same person. The default of 1000 is reasoned, not measured: phase 9 measured
+index residency and never shard-count scaling, so nothing here knows what a node can actually hold.
+
 ## What this does NOT establish
 
 - **There is still no `main()`.** The shell has no process bootstrap; nodes are constructed by tests.
   `startFor` is the call a bootstrap would make, and nothing calls it outside a test. "A node runs by
-  itself once something builds one" is what was delivered; "a node exists as a process" was not.
-- **No automatic reactivation beyond the `wanted` set.** A node takes a shard it was told to want. A
-  shard nobody wants stays unowned no matter how many writes arrive for it — activation is
-  failure-*triggered*, not failure-*driven placement*. Deciding that any node receiving a write should
-  take the shard is a placement policy change, not a scheduling one, and was deliberately not smuggled
-  in here.
+  itself once something builds one" is what was delivered; "a node exists as a process" was not. The
+  placement question that blocked it is now answered, so this is buildable.
+- **Demand-driven activation is off by default and unmeasured.** The mechanism exists and is tested;
+  no deployment has run with it on, its cap is a guess, and nothing balances shards across nodes once
+  they are taken — a node that receives a burst of first-writes takes all of them up to its cap while
+  its neighbours stay empty.
 - **No scale-to-zero controller**, and the two liveness modes (opt-in batched vs per-head) still both
   exist. Both remain open in M13.
-- **No jitter.** Every node renews on its own fixed delay from its own start time, which spreads by
-  accident rather than by design. A thousand nodes started by the same orchestrator at the same instant
-  would renew in lockstep. Untested and unaddressed.
+- **Jitter is unvalidated at fleet scale.** ±20% spreads 200 draws from one node; nothing has observed
+  a thousand nodes actually failing to collide, and the fraction is a guess.
 - **Intervals are unmeasured.** `RENEWALS_PER_TTL = 3`, a 500 ms debounce and a 30 s backstop are
   reasoned defaults, not measured ones. The reasoning is written down above; no experiment backs the
   numbers.

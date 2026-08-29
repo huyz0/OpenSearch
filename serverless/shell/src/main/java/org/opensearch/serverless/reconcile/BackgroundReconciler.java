@@ -47,6 +47,15 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class BackgroundReconciler implements Closeable {
 
+    /**
+     * How many shards a node takes on demand before refusing. A reasoned bound, not a measured one:
+     * phase 9 measured index residency, never shard-count scaling, so nothing here knows what a node can
+     * actually hold.
+     */
+    public static final int DEFAULT_MAX_SHARDS_HELD = 1000;
+
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(BackgroundReconciler.class);
+
     private final ServerlessNode node;
     private final MetadataPlane plane;
     private final RoutingHints hints = new RoutingHints();
@@ -54,6 +63,8 @@ public final class BackgroundReconciler implements Closeable {
     private final Map<ShardId, Long> lastPublishedMaxSeqNo = new ConcurrentHashMap<>();
     private final Set<ShardId> dirty = ConcurrentHashMap.newKeySet();
     private final Set<ShardId> fenced = ConcurrentHashMap.newKeySet();
+    private volatile boolean demandDriven;
+    private volatile int maxShardsHeld = DEFAULT_MAX_SHARDS_HELD;
 
     /**
      * Creates a reconciler for one node.
@@ -140,6 +151,84 @@ public final class BackgroundReconciler implements Closeable {
             node.activateWriter(plane, target.getKey(), target.getValue()).ifPresent(activated::add);
         }
         return activated;
+    }
+
+    /**
+     * Takes shards nobody owns, on evidence that somebody wants them.
+     *
+     * <p><b>This is a placement policy, and it is off by default.</b> Everywhere else in this class a
+     * node takes only what it was told to want. Here it takes a shard because a request for that shard
+     * arrived and the head named no live owner — which makes placement "whoever the client happened to
+     * ask" rather than a decision anyone made.
+     *
+     * <p>That is not obviously wrong; it may be the point. Without it, a shard nobody was told to want
+     * stays unowned however many writes arrive for it, and something outside the system has to assign
+     * shards — which is the controller this whole design deleted. With it, capacity appears where load
+     * appears and no allocator exists at all. But it is a different decision from scheduling, so it is a
+     * switch rather than a default, and {@link #setMaxShardsHeld} bounds it: past the cap a node refuses,
+     * the caller still sees no owner, and the next node to be asked takes it instead. Admission control
+     * without an admission controller.
+     *
+     * <p>Safe under races regardless: acquisition is a compare-and-swap, so two nodes reaching for the
+     * same unowned shard produce one owner and one node that forwards.
+     *
+     * @param candidates the (index, shard) pairs somebody has asked for
+     * @return the shards actually taken
+     * @throws Exception if the metadata plane cannot be reached
+     */
+    public Set<ShardId> activateOnDemand(Collection<Map.Entry<String, Integer>> candidates) throws Exception {
+        if (demandDriven == false) {
+            return Set.of();
+        }
+        final Set<ShardId> taken = new LinkedHashSet<>();
+        for (Map.Entry<String, Integer> candidate : candidates) {
+            if (node.reconciler().openShards().size() >= maxShardsHeld) {
+                // Refusing is a routing outcome, not an error. Saying so is the difference between a
+                // node that is full and a node that is broken, and only one of them should page anyone.
+                logger.info(
+                    "not taking {}[{}] on demand: already holding {} shards, the cap",
+                    candidate.getKey(),
+                    candidate.getValue(),
+                    maxShardsHeld
+                );
+                continue;
+            }
+            final boolean alreadyHeld = node.reconciler()
+                .openShards()
+                .stream()
+                .anyMatch(s -> s.getIndexName().equals(candidate.getKey()) && s.id() == candidate.getValue());
+            if (alreadyHeld) {
+                continue;
+            }
+            node.activateWriter(plane, candidate.getKey(), candidate.getValue()).ifPresent(taken::add);
+        }
+        return taken;
+    }
+
+    /**
+     * Turns on taking unowned shards that somebody has asked for.
+     *
+     * @param demandDriven whether to take shards on demand
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setDemandDrivenActivation(boolean demandDriven) {
+        this.demandDriven = demandDriven;
+        return this;
+    }
+
+    /**
+     * Sets how many shards this node will hold before refusing to take more on demand.
+     *
+     * <p>Bounds only demand-driven activation. A shard this node was explicitly told to want is taken
+     * regardless — the cap is protection against unbounded growth from traffic, not a quota on
+     * deliberate placement.
+     *
+     * @param maxShardsHeld the cap
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setMaxShardsHeld(int maxShardsHeld) {
+        this.maxShardsHeld = maxShardsHeld;
+        return this;
     }
 
     /**

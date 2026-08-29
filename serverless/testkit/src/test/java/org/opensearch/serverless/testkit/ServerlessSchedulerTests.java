@@ -25,6 +25,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -372,6 +373,159 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 assertEquals("the write after activation must succeed: " + accepted.body(), 201, accepted.status());
                 assertEquals("and no backstop pass was involved", 0L, scheduler.counts().backstops());
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- jitter
+
+    /**
+     * Renewals must not land on a fixed cadence. A thousand nodes started by the same orchestrator in
+     * the same second would otherwise renew in the same millisecond forever, because a fixed interval
+     * never pulls them apart — a thundering herd against the object store every {@code ttl/3}, worst
+     * exactly when the fleet is largest.
+     */
+    public void testRenewalsAreSpreadSoACoStartedFleetDoesNotRenewInLockstep() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-jitter"))) {
+            node.start();
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            final TimeValue interval = TimeValue.timeValueMillis(1_000);
+
+            try (
+                ReconcileScheduler scheduler = new ReconcileScheduler(
+                    loop,
+                    node.threadPool(),
+                    clock::get,
+                    interval,
+                    TimeValue.timeValueHours(1),
+                    null
+                )
+            ) {
+                final java.util.Set<Long> seen = new java.util.HashSet<>();
+                long min = Long.MAX_VALUE;
+                long max = Long.MIN_VALUE;
+                for (int i = 0; i < 200; i++) {
+                    final long delay = scheduler.nextRenewalDelay().millis();
+                    seen.add(delay);
+                    min = Math.min(min, delay);
+                    max = Math.max(max, delay);
+                }
+                logger.info("m13 jitter over 200 draws: {} distinct, min {}ms, max {}ms", seen.size(), min, max);
+
+                // The number that is 1 when jitter is broken.
+                assertTrue("renewal delays must vary; a single value is lockstep", seen.size() > 1);
+
+                final long spread = (long) (interval.millis() * ReconcileScheduler.JITTER_FRACTION);
+                assertTrue("jitter must stay within the declared fraction, low side", min >= interval.millis() - spread);
+                assertTrue("jitter must stay within the declared fraction, high side", max <= interval.millis() + spread);
+                assertTrue("and must actually spread, not cluster on one side", max - min > spread);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- demand-driven placement
+
+    /**
+     * The default: a node takes what it was told to want, and nothing else. A write for a shard nobody
+     * wants leaves that shard unowned however many times it arrives.
+     *
+     * <p>This is the behaviour {@code activateOnDemand} changes, asserted here so that turning the
+     * switch on is visibly a decision rather than a drift.
+     */
+    public void testByDefaultANodeDoesNotTakeAShardNobodyToldItToWant() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-nodemand"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            // Note: no want() at all.
+
+            try (ReconcileScheduler scheduler = edgesOnly(node, loop, clock, TimeValue.timeValueMillis(50))) {
+                scheduler.start();
+                node.setSignals(scheduler);
+                final var http = node.boundHttpAddress().publishAddress();
+
+                for (int i = 0; i < 3; i++) {
+                    assertEquals(421, send(http, "PUT", "/alpha/_doc/" + i, "{\"msg\":\"x\",\"n\":1}").status());
+                }
+                assertBusy(
+                    () -> assertTrue("an activation pass must have run", scheduler.counts().activations() >= 1),
+                    10,
+                    java.util.concurrent.TimeUnit.SECONDS
+                );
+                assertTrue("but it must not have taken a shard nobody asked this node to hold", node.reconciler().openShards().isEmpty());
+            }
+        }
+    }
+
+    /**
+     * With demand-driven activation on, the same write that was refused is what makes the shard get
+     * taken — by whichever node the client happened to ask.
+     *
+     * <p>Without this, a shard nobody was told to want stays unowned forever and something outside the
+     * system has to assign shards, which is the controller this design deleted.
+     */
+    public void testOnDemandANodeTakesAnUnownedShardSomebodyAskedFor() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-demand"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
+
+            try (ReconcileScheduler scheduler = edgesOnly(node, loop, clock, TimeValue.timeValueMillis(50))) {
+                scheduler.start();
+                node.setSignals(scheduler);
+                final var http = node.boundHttpAddress().publishAddress();
+
+                assertEquals(421, send(http, "PUT", "/alpha/_doc/1", "{\"msg\":\"first\",\"n\":1}").status());
+                assertBusy(
+                    () -> assertFalse(
+                        "the refused write should have caused this node to take it",
+                        node.reconciler().openShards().isEmpty()
+                    ),
+                    10,
+                    java.util.concurrent.TimeUnit.SECONDS
+                );
+
+                final Response accepted = send(http, "PUT", "/alpha/_doc/2?refresh=true", "{\"msg\":\"second\",\"n\":2}");
+                assertEquals("the next write must succeed: " + accepted.body(), 201, accepted.status());
+                assertEquals("and no backstop was involved", 0L, scheduler.counts().backstops());
+            }
+        }
+    }
+
+    /**
+     * The cap. A node that takes every shard asked of it grows without bound; past the cap it refuses,
+     * the caller still sees no owner, and the next node asked takes it instead. Admission control
+     * without an admission controller.
+     */
+    public void testOnDemandActivationStopsAtTheCap() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = freshIndex(clock, createTempDir(), 4);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-cap"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true).setMaxShardsHeld(2);
+
+            final java.util.Set<Map.Entry<String, Integer>> all = new java.util.LinkedHashSet<>();
+            for (int i = 0; i < 4; i++) {
+                all.add(Map.entry("alpha", i));
+            }
+
+            final Set<ShardId> taken = loop.activateOnDemand(all);
+            logger.info("m13 cap 2, asked for 4, took {}", taken.size());
+            assertEquals("a node must stop at its cap, not take everything asked of it", 2, taken.size());
+            assertEquals("and hold exactly that many", 2, node.reconciler().openShards().size());
+
+            assertTrue("asking again must not push it past the cap", loop.activateOnDemand(all).isEmpty());
+            assertEquals("still at the cap", 2, node.reconciler().openShards().size());
         }
     }
 
