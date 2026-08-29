@@ -93,6 +93,12 @@ public final class ShardRouter {
             this::handleBulk
         );
         transportService.registerRequestHandler(
+            ForwardedGetRequest.ACTION,
+            ThreadPool.Names.GET,
+            ForwardedGetRequest::new,
+            this::handleGet
+        );
+        transportService.registerRequestHandler(
             ForwardedSearchRequest.ACTION,
             ThreadPool.Names.SEARCH,
             ForwardedSearchRequest::new,
@@ -132,6 +138,19 @@ public final class ShardRouter {
             node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
         }
         channel.sendResponse(new ForwardedBulkResponse(node.localNode().getId(), outcomes));
+    }
+
+    private void handleGet(ForwardedGetRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
+        final ShardId shardId = localShard(request.index(), request.shard());
+        if (shardId == null) {
+            // Refuse rather than open it as a reader, which is what handleSearch does here and is right
+            // there. A get was forwarded to this node precisely because the shard-head named it the
+            // owner; if the shard is not open as a writer, that head is stale, and answering from a
+            // published commit would return a stale document to a caller that asked for a fresh one.
+            // Failing sends the caller back to re-read the head, which is the only thing that fixes it.
+            throw new IllegalStateException("this node does not own " + request.index() + "[" + request.shard() + "]");
+        }
+        channel.sendResponse(new ForwardedGetResponse(node.localNode().getId(), node.get(shardId, request.id())));
     }
 
     private void handleSearch(ForwardedSearchRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
@@ -193,6 +212,15 @@ public final class ShardRouter {
         }
         final var lease = metadata.membership().read(nodeId);
         if (lease.isEmpty()) {
+            return Optional.empty();
+        }
+        if (lease.get().isExpiredAt(metadata.clock().getAsLong())) {
+            // Expired, which this did not check until a get exposed it -- the method's own documentation
+            // has always said "no live lease", and it was reading the blob and never the clock. A lease
+            // outlives its holder until the sweep collects it, so without this a forward to a node that
+            // died an hour ago is indistinguishable from one to a node that died a moment ago: both burn
+            // the full connect timeout before failing, and both report a failed forward rather than the
+            // truth, which is that nothing has been alive there for an hour.
             return Optional.empty();
         }
         final TransportAddress address;
@@ -282,6 +310,28 @@ public final class ShardRouter {
             request,
             TransportRequestOptions.builder().withTimeout(timeout).build(),
             new Handler<>(future, ForwardedBulkResponse::new)
+        );
+        return future.actionGet(timeout);
+    }
+
+    /**
+     * Sends a read by id to the node that owns the shard and waits for the answer.
+     *
+     * @param peer the owning node
+     * @param request the read
+     * @return what the owner found
+     */
+    public ForwardedGetResponse forwardGet(DiscoveryNode peer, ForwardedGetRequest request) {
+        final PlainActionFuture<ForwardedGetResponse> future = PlainActionFuture.newFuture();
+        // The write bound, not the search one. A get is a point lookup on the owner rather than a fan-out,
+        // so it is the cheaper of the two and has no reason to wait as long as a query.
+        final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
+        transportService.sendRequest(
+            peer,
+            ForwardedGetRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedGetResponse::new)
         );
         return future.actionGet(timeout);
     }

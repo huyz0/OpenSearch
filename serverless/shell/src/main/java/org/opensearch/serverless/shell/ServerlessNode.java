@@ -450,6 +450,7 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.BulkHandler(() -> this, () -> metadataPlane));
+        controller.registerHandler(new org.opensearch.serverless.rest.GetHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane));
         controller.registerHandler(
@@ -1111,6 +1112,106 @@ public final class ServerlessNode implements Closeable {
          */
         public String failure() {
             return failure;
+        }
+    }
+
+    /**
+     * Reads one document by id, from this node's own copy of the shard.
+     *
+     * <p><b>Realtime, and that is the whole reason this exists separately from search.</b> A write is
+     * applied to the engine and durable in the log before it is acknowledged, but it is not searchable
+     * until a refresh and not in the object store until a publish. A get that went through the search
+     * path would therefore fail to find a document the caller had just been told was written — which
+     * reads as data loss and is not. This reads the live version map, so it sees the write.
+     *
+     * <p>Whether the answer is realtime depends on which copy this is, and the caller is the one that
+     * knows: a writer's copy includes everything acknowledged, a reader's copy includes only what was
+     * published. This method does not choose between them — {@code GetHandler} does, and says which it
+     * used in the response.
+     *
+     * @param shardId the shard, open on this node
+     * @param id the document id
+     * @return what was found, which may be nothing
+     * @throws java.io.IOException if the shard is not open here
+     */
+    public Document get(org.opensearch.core.index.shard.ShardId shardId, String id) throws java.io.IOException {
+        ensureStarted();
+        final var shard = reconciler.shard(shardId);
+        if (shard == null) {
+            throw new java.io.IOException("cannot read from " + shardId + ": not open on " + nodeName);
+        }
+        final var result = shard.getService()
+            .get(
+                id,
+                null,
+                true,
+                org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                org.opensearch.index.VersionType.INTERNAL,
+                org.opensearch.search.fetch.subphase.FetchSourceContext.FETCH_SOURCE
+            );
+        // No searcher to release here: ShardGetService acquires and closes its own, and GetResult is a
+        // value rather than a handle.
+        if (result.isExists() == false) {
+            return Document.absent(id);
+        }
+        return new Document(id, true, result.sourceAsString());
+    }
+
+    /** One document, or the fact that there is none. */
+    public static final class Document {
+
+        private final String id;
+        private final boolean found;
+        private final String source;
+
+        /**
+         * Creates a found document.
+         *
+         * @param id the document id
+         * @param found whether it exists
+         * @param source its source, or null when it does not
+         */
+        public Document(String id, boolean found, String source) {
+            this.id = id;
+            this.found = found;
+            this.source = source;
+        }
+
+        /**
+         * Records that no such document exists.
+         *
+         * @param id the document id
+         * @return the absence
+         */
+        public static Document absent(String id) {
+            return new Document(id, false, null);
+        }
+
+        /**
+         * Returns the document id.
+         *
+         * @return the id
+         */
+        public String id() {
+            return id;
+        }
+
+        /**
+         * Reports whether the document exists.
+         *
+         * @return true when it does
+         */
+        public boolean found() {
+            return found;
+        }
+
+        /**
+         * Returns the document source, or null when there is none.
+         *
+         * @return the source
+         */
+        public String source() {
+            return source;
         }
     }
 
