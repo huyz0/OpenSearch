@@ -143,6 +143,34 @@ TTL to finish quickly put the system in a regime where it legitimately thrashes.
 assertions made to converge rather than demand instant correctness, and the production default left at
 30 seconds — which is what the short TTLs were pretending to be a faster version of.
 
+## And then removing per-head liveness entirely
+
+Making batching the default left two modes with one in use. Removing the other one is what actually
+resolves §12.1's item, and it is a smaller change than it sounds because the hard part — discovering what
+per-head had been hiding — was done by making it non-default first.
+
+What went:
+
+- `MetadataPlane`'s mode flag and `usesNodeLeaseLiveness()`.
+- `ShardHeadStore`'s no-oracle constructor. An oracle is now required and passing null **throws**, because
+  a null oracle used to silently mean per-head expiry and silence is how a deleted mode comes back.
+- The `if (plane.usesNodeLeaseLiveness())` branches in `ServerlessNode`, including the else-branch that
+  renewed each head individually.
+- The `serverless.lease.node_liveness` setting.
+
+What stayed, and why the removal is safe: the head's stamped expiry, acting as a floor. It is the thing
+that makes acquisition exclusive in the window before a lease exists, and it costs nothing because it is
+never renewed.
+
+Two tests changed shape rather than being deleted. `testBatchingRemovesThePerShardWrite` compared the two
+modes; with nothing to compare against it now asserts the surviving claim absolutely — one write per tick
+at one shard and at four — which is the stronger form. And the test that guarded "the default is batched"
+became meaningless once there was no alternative, so it was replaced by one that pins the *removal*: a
+`ShardHeadStore` built without an oracle must refuse.
+
+The design is simpler by one axis. There is now exactly one answer to "how does a node prove a shard is
+still its own", and it is the one that was measured.
+
 ## What this does NOT establish
 
 - **MinIO on loopback is not S3 over a network.** Every latency here is a lower bound and probably a

@@ -31,7 +31,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Phase 8 measured 3 object-store operations per reconciliation tick per shard and observed that the
  * single write was a per-shard lease renewal — a node holding a hundred shards paying a hundred writes
- * per TTL to say one thing, that it was still there. This is that measurement acted on, and re-measured.
+ * per TTL to say one thing, that it was still there. This is that measurement acted on, re-measured, and
+ * finally made unconditional: per-head expiry is no longer a mode a deployment can be in.
  *
  * <p><b>D5:</b> {@code FsBlobContainer} only.
  */
@@ -60,8 +61,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
     public void testOneRenewalKeepsEveryShard() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final BlobStore store = new FsBlobStore(1024, createTempDir(), false);
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL, true);
-        assertTrue(plane.usesNodeLeaseLiveness());
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 4, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-a")); ServerlessNode b = new ServerlessNode(nodeSettings("p8b-b"))) {
@@ -88,7 +88,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
     public void testOneLapsedLeaseReleasesEveryShard() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final BlobStore store = new FsBlobStore(1024, createTempDir(), false);
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL, true);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 3, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-l1")); ServerlessNode b = new ServerlessNode(nodeSettings("p8b-l2"))) {
@@ -116,7 +116,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
     public void testARestartedNodeDoesNotInheritTheOldProcessesClaim() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final BlobStore store = new FsBlobStore(1024, createTempDir(), false);
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL, true);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-r"))) {
@@ -188,40 +188,44 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         assertTrue("the writer's expired lease must be collected too", plane.membership().read(writerNodeId).isEmpty());
     }
 
-    /** Re-measure: the write per shard should be gone, and the saving should grow with shard count. */
-    public void testBatchingRemovesThePerShardWrite() throws Exception {
-        final int shards = 4;
-        final long[] perShard = measureOps(false, shards);
-        final long[] batched = measureOps(true, shards);
+    /**
+     * The surviving half of what this test used to check: a node writes <b>once</b> per tick however many
+     * shards it holds.
+     *
+     * <p>It used to measure both modes and compare them. There is no longer another mode to compare
+     * against — per-head liveness was removed once the measurement showed what it cost — so the claim is
+     * now absolute rather than relative, which is the stronger form anyway. Held at one shard and at four.
+     *
+     * <p>Reads still scale, and are not claimed not to. The single write is the node's own lease, which is
+     * both the liveness signal and the address book peers resolve a forwarding target from.
+     */
+    public void testANodeWritesOncePerTickHoweverManyShardsItHolds() throws Exception {
+        final long[] one = measureOps(1);
+        final long[] four = measureOps(4);
 
         logger.info(
-            "phase 8 re-measurement at {} shards -- per-shard: {} reads + {} writes; batched: {} reads + {} writes (per tick)",
-            shards,
-            perShard[0],
-            perShard[1],
-            batched[0],
-            batched[1]
+            "batched renewal -- 1 shard: {} reads + {} writes; 4 shards: {} reads + {} writes (per tick)",
+            one[0],
+            one[1],
+            four[0],
+            four[1]
         );
 
-        // The specific claim: writes stop scaling with shard count. Reads do not, and are not claimed to.
-        // Both modes now also write the node's own lease every tick -- that is the address book peers
-        // resolve a forwarding target from (M11), so a node that does not publish it is unroutable.
-        // Under batching that lease IS the liveness signal, so batched stays at one write total.
-        assertEquals("without batching a node writes once per shard, plus its own lease", shards + 1, perShard[1]);
-        assertEquals("with batching a node writes once, however many shards it holds", 1L, batched[1]);
-        assertTrue("the total should fall too", batched[0] + batched[1] < perShard[0] + perShard[1]);
+        assertEquals("one shard should cost one write per tick", 1L, one[1]);
+        assertEquals("and four shards should cost the same one write", 1L, four[1]);
+        assertTrue("reads are expected to scale with shard count, and do", four[0] > one[0]);
     }
 
     /**
      * @return reads and writes per tick, in that order
      */
-    private long[] measureOps(boolean batched, int shards) throws Exception {
+    private long[] measureOps(int shards) throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final CountingBlobStore counter = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));
-        final MetadataPlane plane = new MetadataPlane(counter, BlobPath.cleanPath(), clock::get, TTL, batched);
+        final MetadataPlane plane = new MetadataPlane(counter, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
-        try (ServerlessNode node = new ServerlessNode(nodeSettings("p8b-m-" + batched))) {
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("p8b-m-" + shards))) {
             node.start();
             plane.membership().renew(leaseFor(node));
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);

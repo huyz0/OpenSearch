@@ -40,23 +40,25 @@ public final class MetadataPlane {
     private final DescriptorStore descriptors;
     private final ShardHeadStore heads;
     private final BlobLeaseMembership membershipField;
-    private final boolean nodeLeaseLiveness;
     private final BlobStore blobStore;
     private final BlobPath base;
     private final long leaseTtlMillis;
     private final LongSupplier clock;
 
     /**
-     * Creates a metadata plane over a blob store, with §7's batched liveness.
+     * Creates a metadata plane over a blob store.
      *
-     * <p><b>Batched is the default.</b> It was not, and the reason it changed is a measurement rather
-     * than a preference: per-head liveness compare-and-swaps once per shard per tick, and batched
-     * renews once for the whole node. At eight shards that is 34 implied S3 requests per idle tick
-     * against 18 — and a compare-and-swap is two HTTP requests where a read is one. The cheaper mode
-     * being opt-in meant every node built the ordinary way paid the higher bill.
+     * <p><b>Liveness comes from node leases. There is no longer another way.</b> Shard-heads used to be
+     * able to carry their own renewable expiry, which cost a compare-and-swap per shard per tick — 34
+     * implied S3 requests at eight shards against 18 — for a guarantee one node-lease renewal already
+     * provides. Two modes meant two sets of failure behaviour to reason about and only one of them was
+     * ever measured; the expensive one was also, for most of this project's life, the default.
      *
-     * <p>See {@code m14-cost-notes.md}. The saving is a constant, not an order: each held head is still
-     * read every tick, because losing a shard is something only the head can report.
+     * <p>The head still stamps an expiry and it is still load-bearing, as a <em>floor</em>: a head is held
+     * if that stamp has not passed or its owner's lease says the owner is alive. The stamp covers the
+     * moments between winning a head and publishing a lease — without it, two contenders holding no
+     * leases both win — and the lease covers everything after it lapses. The stamp is never renewed,
+     * which is what keeps one renewal covering every shard.
      *
      * @param blobStore the backing store
      * @param base the deployment's base path within it
@@ -64,31 +66,14 @@ public final class MetadataPlane {
      * @param leaseTtlMillis lease duration for shard-heads and node leases
      */
     public MetadataPlane(BlobStore blobStore, BlobPath base, LongSupplier clock, long leaseTtlMillis) {
-        this(blobStore, base, clock, leaseTtlMillis, true);
-    }
 
-    /**
-     * Creates a metadata plane, optionally with §7's batched liveness.
-     *
-     * <p>With {@code nodeLeaseLiveness}, a shard-head is held for as long as its owner's node lease is,
-     * so a node renews once rather than once per shard. Phase 8 measured the difference this makes:
-     * the per-shard renewal was the entire steady-state write cost.
-     *
-     * @param blobStore the backing store
-     * @param base the deployment's base path within it
-     * @param clock source of wall-clock millis
-     * @param leaseTtlMillis lease duration
-     * @param nodeLeaseLiveness true to derive shard liveness from node leases
-     */
-    public MetadataPlane(BlobStore blobStore, BlobPath base, LongSupplier clock, long leaseTtlMillis, boolean nodeLeaseLiveness) {
-        this.nodeLeaseLiveness = nodeLeaseLiveness;
         this.descriptors = new DescriptorStore(blobStore.blobContainer(RegisterMap.indices(base)));
         final BlobLeaseMembership leases = new BlobLeaseMembership(
             blobStore.blobContainer(RegisterMap.members(base)),
             clock,
             leaseTtlMillis
         );
-        final LivenessOracle oracle = nodeLeaseLiveness ? (nodeId, ephemeralId) -> {
+        final LivenessOracle oracle = (nodeId, ephemeralId) -> {
             try {
                 final var lease = leases.read(nodeId);
                 // An ephemeral id that has moved on means the process that took the shard is gone, even
@@ -101,7 +86,7 @@ public final class MetadataPlane {
                 // retry and the cost of the alternative is two writers.
                 return true;
             }
-        } : null;
+        };
         this.heads = new ShardHeadStore(blobStore.blobContainer(RegisterMap.shards(base)), clock, leaseTtlMillis, oracle);
         this.membershipField = leases;
         this.blobStore = blobStore;
@@ -130,15 +115,6 @@ public final class MetadataPlane {
      */
     public LongSupplier clock() {
         return clock;
-    }
-
-    /**
-     * Reports whether shard liveness is derived from node leases.
-     *
-     * @return true when §7's batching is in effect
-     */
-    public boolean usesNodeLeaseLiveness() {
-        return nodeLeaseLiveness;
     }
 
     /**

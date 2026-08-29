@@ -706,16 +706,15 @@ public final class ServerlessNode implements Closeable {
         if (roles.contains(ROLE_INGEST) == false) {
             throw new IllegalStateException("node " + nodeName + " does not accept writer activation; its roles are " + roles);
         }
-        if (plane.usesNodeLeaseLiveness()) {
+        {
             // The lease first, and it has to be first. Under batched liveness a shard-head is not
             // self-describing: it names an owner, and whether that ownership is live is a fact stored in
             // the owner's node lease. A node that acquired a shard before publishing a lease would hold a
             // head that every peer reads as dead, and the shard would be stolen out from under it
             // immediately -- with both nodes believing they had won it fairly.
             //
-            // Per-head liveness never had this problem, because the head carries its own expiry. This is
-            // the cost of the cheaper mode, and it is why making it the default is a change to the write
-            // path and not only to a constructor argument.
+            // The head's own stamp is a floor that covers this window, but only just: publishing the
+            // lease first is what makes the invariant hold rather than merely usually hold.
             renewOwnLease(plane);
         }
         final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
@@ -767,14 +766,11 @@ public final class ServerlessNode implements Closeable {
                 // Readers hold no lease, so there is nothing to renew and nothing to lose.
                 continue;
             }
-            if (plane.usesNodeLeaseLiveness()) {
-                // The head still needs reading, because losing a shard is something only the head can
-                // tell us -- but it is a read, not a write, and that is the whole saving.
-                final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
-                if (head.isPresent() && localNode.getId().equals(head.get().ownerNodeId())) {
-                    continue;
-                }
-            } else if (plane.heads().renew(shardId.getIndexName(), shardId.id(), localNode.getId()).isPresent()) {
+            // The head still needs reading, because losing a shard is something only the head can tell
+            // us -- but it is a read, not a write, and that is the whole saving. This used to have an
+            // else-branch that renewed each head individually; that mode is gone.
+            final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+            if (head.isPresent() && localNode.getId().equals(head.get().ownerNodeId())) {
                 continue;
             }
             reconciler.releaseShard(shardId, "lease lost: the shard-head no longer names " + nodeName);

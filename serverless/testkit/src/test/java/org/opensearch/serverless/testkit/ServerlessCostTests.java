@@ -93,11 +93,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
 
     /** What one node holding {@code shards} shards spends on a tick that has nothing to do. */
     private long[] steadyStateTick(CountingBlobStore store, String label, int shards, int ticks) throws Exception {
-        return steadyStateTick(store, label, shards, ticks, false);
-    }
-
-    private long[] steadyStateTick(CountingBlobStore store, String label, int shards, int ticks, boolean batchedLeases) throws Exception {
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL, batchedLeases);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-" + label + "-" + shards))) {
@@ -130,22 +126,30 @@ public class ServerlessCostTests extends OpenSearchTestCase {
     }
 
     /**
-     * The default is batched liveness, and this is the test that actually says so.
+     * There is only one liveness mode, and a store cannot be built without it.
      *
-     * <p>An earlier test claimed to be the notification that §12.1's "two liveness modes still coexist"
-     * had been resolved: it measured per-head mode and asserted the cost grows, and its comment said it
-     * would fail once batching became the default. **It would not have.** It passes {@code false}
-     * explicitly, so it pins the behaviour of a *mode*, not the behaviour of the *default*. Nothing
-     * guarded the default at all, and the claim that something did was worse than no claim.
+     * <p>This replaces two earlier tests. One measured per-head liveness and claimed, wrongly, that it
+     * would fail when batching became the default — it passed {@code false} explicitly, so it pinned a
+     * mode rather than a default and would have gone on passing. The other asked a plane whether it
+     * batched, which stopped being a question once the alternative was deleted.
      *
-     * <p>This one builds a plane the ordinary way and asks it.
+     * <p>What is left to guard is that the alternative cannot come back by accident: a {@code
+     * ShardHeadStore} built without a liveness oracle used to silently mean per-head expiry, and now
+     * refuses.
      */
-    public void testTheDefaultLivenessModeIsBatched() throws Exception {
-        final MetadataPlane plane = new MetadataPlane(filesystem(), BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+    public void testPerHeadLivenessCannotBeReintroducedByPassingNoOracle() {
+        final IllegalArgumentException refused = expectThrows(
+            IllegalArgumentException.class,
+            () -> new org.opensearch.serverless.metadata.ShardHeadStore(
+                new FsBlobStore(1024, createTempDir(), false).blobContainer(BlobPath.cleanPath()),
+                System::currentTimeMillis,
+                TTL,
+                null
+            )
+        );
         assertTrue(
-            "a plane built the ordinary way should batch leases; per-head costs a compare-and-swap per "
-                + "shard per tick, which is 34 implied S3 requests at 8 shards against 18",
-            plane.usesNodeLeaseLiveness()
+            "the refusal should say what is no longer supported: " + refused.getMessage(),
+            refused.getMessage().contains("per-head")
         );
     }
 
@@ -163,8 +167,8 @@ public class ServerlessCostTests extends OpenSearchTestCase {
      * and the only one that is genuinely constant.
      */
     public void testBatchedLeasesMakeThePerTickWriteCostIndependentOfShardCount() throws Exception {
-        final long[] one = steadyStateTick(filesystem(), "fs-batched", 1, 10, true);
-        final long[] eight = steadyStateTick(filesystem(), "fs-batched", 8, 10, true);
+        final long[] one = steadyStateTick(filesystem(), "fs-batched", 1, 10);
+        final long[] eight = steadyStateTick(filesystem(), "fs-batched", 8, 10);
 
         final double casAtOne = one[3] / 10.0;
         final double casAtEight = eight[3] / 10.0;
@@ -185,43 +189,6 @@ public class ServerlessCostTests extends OpenSearchTestCase {
         assertTrue(
             "register reads are expected to scale with shard count even when batched: " + readsAtOne + " -> " + readsAtEight,
             readsAtEight > readsAtOne
-        );
-    }
-
-    /**
-     * And the same measurement in the mode a node gets by <b>default</b>, which is the one without
-     * batching. Here the compare-and-swap count grows with shard count, which is precisely the cost §7
-     * exists to remove — and the mode that removes it is not the default.
-     *
-     * <p>This asserts that the cost <em>does</em> grow, which is a strange thing to want until you notice
-     * what it is for: the number is a design fact, and pinning it down makes the gap between the two
-     * modes visible instead of theoretical.
-     *
-     * <p>It is <b>no longer the default</b> — {@link #testTheDefaultLivenessModeIsBatched} guards that,
-     * and this one now documents the cost of the mode that remains available for a deployment whose
-     * nodes do not publish leases.
-     */
-    public void testPerHeadLivenessCostsACompareAndSwapPerShardPerTick() throws Exception {
-        final long[] one = steadyStateTick(filesystem(), "fs-per-head", 1, 10, false);
-        final long[] eight = steadyStateTick(filesystem(), "fs-per-head", 8, 10, false);
-
-        final double casAtOne = one[3] / 10.0;
-        final double casAtEight = eight[3] / 10.0;
-        logger.info(
-            "cost: WITHOUT batching, compare-and-swaps per tick {} -> {} for 1 to 8 shards; total requests {} -> {}",
-            casAtOne,
-            casAtEight,
-            one[1] / 10.0,
-            eight[1] / 10.0
-        );
-        assertTrue(
-            "the default mode is expected to compare-and-swap per shard; if it no longer does, batching "
-                + "became the default and this test should go with the mode it describes ("
-                + casAtOne
-                + " -> "
-                + casAtEight
-                + ")",
-            casAtEight > casAtOne * 3
         );
     }
 

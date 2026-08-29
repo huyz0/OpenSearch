@@ -49,28 +49,19 @@ public final class ShardHeadStore {
     /**
      * Creates a store.
      *
-     * @param container the container holding the {@code shards/} prefix
-     * @param clock source of wall-clock millis, injected so tests need not sleep
-     * @param leaseTtlMillis how far ahead an acquisition or renewal stamps its lease
-     */
-    public ShardHeadStore(BlobContainer container, LongSupplier clock, long leaseTtlMillis) {
-        this(container, clock, leaseTtlMillis, null);
-    }
-
-    /**
-     * Creates a store whose liveness comes from node leases rather than from per-head expiry.
-     *
-     * <p>This is §7's batching. Without an oracle each head carries its own expiry and every one must be
-     * rewritten to stay alive; with one, a head is held for as long as its owner is, and a node renews
-     * once however many shards it holds. Phase 8's measurement is what says the difference is worth
-     * having: the per-shard write was the whole of the steady-state write cost.
+     * <p>The oracle is required. Heads used to be able to carry their own renewable expiry instead, which
+     * meant rewriting every one of them to stay alive — the per-shard write that was the whole of the
+     * steady-state write cost. A node now renews once however many shards it holds.
      *
      * @param container the container holding the {@code shards/} prefix
      * @param clock source of wall-clock millis
      * @param leaseTtlMillis how far ahead an acquisition stamps its lease, still recorded for diagnosis
-     * @param oracle answers whether an owner is alive, or null for per-head expiry
+     * @param oracle answers whether an owner is alive; required
      */
     public ShardHeadStore(BlobContainer container, LongSupplier clock, long leaseTtlMillis, LivenessOracle oracle) {
+        if (oracle == null) {
+            throw new IllegalArgumentException("a liveness oracle is required; per-head expiry is no longer a mode");
+        }
         this.container = container;
         this.clock = clock;
         this.leaseTtlMillis = leaseTtlMillis;
@@ -85,9 +76,6 @@ public final class ShardHeadStore {
      * @return true when the head has a live owner
      */
     public boolean isHeld(ShardHead head, long nowMillis) {
-        if (oracle == null) {
-            return head.isHeldAt(nowMillis);
-        }
         if (head.ownerNodeId() == null) {
             return false;
         }
