@@ -75,6 +75,32 @@ test harness.** That is why this file reports requests.
   that costs 1.08 operations per document for no reason. The count has to be taken before the publish,
   because "what a document costs" and "what a batch costs to publish" are different questions.
 
+## Two things the full build found afterwards
+
+Running everything at once — unit, process and S3 suites together on one machine — made the fleet tests
+fail intermittently with `searched:3, unreachable:1`. Both causes were mine, and neither was a flake.
+
+**One decision that should have been two.** I had bounded *every* forward by the lease TTL, with the
+reasoning that there is no point waiting longer than the lease. That is right for a write: ownership may
+already have moved, and a stale write is dangerous. It is wrong for a search, where a slow peer is slow
+rather than wrong, and giving up at the TTL converts a complete answer into an incomplete one for no
+correctness benefit. Search forwards now have their own, longer bound.
+
+**A test tuned for speed that manufactured failures.** The fleet tests ran a three-second lease TTL. Under
+a loaded machine a healthy node misses a renewal at that TTL, its lease genuinely lapses, and its peers
+correctly stop believing in it — the system behaving exactly as designed, reported honestly as
+`complete:false`, and asserted against by a test demanding *instant* complete coverage. The real property
+is that a healthy fleet **converges**, so the coverage assertions are now `assertBusy`.
+
+Relaxing a deadline is one edit away from deleting a test, so the fan-out defect was re-planted against
+the relaxed version: a search that only ever looks at local shards never becomes complete, so it times out
+rather than passing. **The deadline moved; the property did not.**
+
+A third thing, smaller and worth fixing anyway: the node that knew why a shard was unreachable had logged
+it inside a forked JVM whose output the harness captured and only printed on startup failure. Fleet
+assertions now attach the relevant node's log tail when they report an incomplete answer, because the
+interesting evidence is always in a process other than the one asserting.
+
 ## What this does NOT establish
 
 - **MinIO on loopback is not S3 over a network.** Every latency here is a lower bound and probably a

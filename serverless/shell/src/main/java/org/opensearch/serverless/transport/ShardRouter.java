@@ -11,6 +11,7 @@ package org.opensearch.serverless.transport;
 import org.opensearch.Version;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
@@ -44,6 +45,21 @@ public final class ShardRouter {
 
     /** Used only when no metadata plane is attached and the lease TTL is therefore unknown. */
     private static final long DEFAULT_FORWARD_TIMEOUT_MILLIS = 30_000L;
+
+    /**
+     * How long a search may wait on a peer.
+     *
+     * <p>Deliberately not the lease TTL, which bounds a <em>write</em> forward. The two have different
+     * stakes. Waiting past the lease to write is pointless and unsafe: ownership may already have moved,
+     * and the right answer is to re-read the head. A search has no such problem — a slow peer is slow,
+     * not wrong — so giving up at the TTL converts a complete answer into an incomplete one for no
+     * correctness benefit.
+     *
+     * <p>Found by a four-node herd test failing under load with {@code searched:0, unreachable:1}: a busy
+     * peer missed a three-second window and the coverage report said so honestly. Bounding both kinds of
+     * forward by the same number was one decision that should have been two.
+     */
+    private static final TimeValue SEARCH_FORWARD_TIMEOUT = TimeValue.timeValueSeconds(30);
 
     private final ServerlessNode node;
     private final TransportService transportService;
@@ -134,6 +150,18 @@ public final class ShardRouter {
      * @throws IOException if the lease cannot be read
      */
     public Optional<DiscoveryNode> peer(String nodeId) throws IOException {
+        return peer(nodeId, forwardTimeout());
+    }
+
+    /**
+     * Resolves a peer, bounding connection establishment by an explicit timeout.
+     *
+     * @param nodeId the node to reach
+     * @param timeout how long to allow for connecting and handshaking
+     * @return the peer, or empty if it has no live lease or an unusable address
+     * @throws IOException if the lease cannot be read
+     */
+    public Optional<DiscoveryNode> peer(String nodeId, TimeValue timeout) throws IOException {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return Optional.empty();
@@ -171,7 +199,6 @@ public final class ShardRouter {
             // default 30 seconds, before a single byte of the write has been sent and before any
             // per-request timeout can apply. The request timeout below was not enough on its own; this
             // was found by measuring how long a write to a SIGSTOPped owner took to come back.
-            final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
             transportService.connectToNode(
                 peer,
                 new org.opensearch.transport.ConnectionProfile.Builder(
@@ -218,7 +245,7 @@ public final class ShardRouter {
      */
     public ForwardedSearchResponse forwardSearch(DiscoveryNode peer, ForwardedSearchRequest request) {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
-        final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
+        final TimeValue timeout = searchForwardTimeout();
         transportService.sendRequest(
             peer,
             ForwardedSearchRequest.ACTION,
@@ -243,11 +270,19 @@ public final class ShardRouter {
      *
      * @return the timeout
      */
-    private org.opensearch.common.unit.TimeValue forwardTimeout() {
+    private TimeValue forwardTimeout() {
         final MetadataPlane metadata = plane.get();
-        return org.opensearch.common.unit.TimeValue.timeValueMillis(
-            metadata == null ? DEFAULT_FORWARD_TIMEOUT_MILLIS : Math.max(1_000L, metadata.leaseTtlMillis())
-        );
+        return TimeValue.timeValueMillis(metadata == null ? DEFAULT_FORWARD_TIMEOUT_MILLIS : Math.max(1_000L, metadata.leaseTtlMillis()));
+    }
+
+    /**
+     * How long a search forward may wait: the longer of the write bound and {@link #SEARCH_FORWARD_TIMEOUT}.
+     *
+     * @return the timeout
+     */
+    public TimeValue searchForwardTimeout() {
+        final TimeValue write = forwardTimeout();
+        return write.millis() > SEARCH_FORWARD_TIMEOUT.millis() ? write : SEARCH_FORWARD_TIMEOUT;
     }
 
     /** Bridges a transport response into a future the calling thread can wait on. */

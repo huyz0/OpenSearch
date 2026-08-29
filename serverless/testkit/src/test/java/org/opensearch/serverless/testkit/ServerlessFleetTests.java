@@ -45,7 +45,15 @@ import java.util.concurrent.TimeUnit;
 public class ServerlessFleetTests extends OpenSearchTestCase {
 
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
-    private static final String TTL = "3000";
+    /**
+     * Long enough that a loaded machine does not expire a healthy node's lease.
+     *
+     * <p>At three seconds these tests failed intermittently under a full build with
+     * {@code searched:3, unreachable:1} — and not because of a bug: a node missed a renewal because the
+     * machine was busy, its lease genuinely lapsed, and its peers correctly stopped believing in it. A
+     * TTL tuned to make tests finish quickly had become a TTL that manufactures failures.
+     */
+    private static final String TTL = "10000";
     private static final int SHARDS = 4;
 
     /** Capped at two shards each, so four shards cannot fit on one node. */
@@ -95,17 +103,26 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
                 send(reader, "POST", "/alpha/_refresh", null);
             }
             for (NodeProcess reader : fleet) {
-                final Response found = search(reader, "msg:spread");
-                assertEquals(200, found.status());
-                assertTrue(
-                    "a partial answer must not be reported as complete: " + found.body(),
-                    found.body().contains("\"complete\":true")
-                );
-                assertEquals(
-                    "every node must answer for the whole index; " + reader.name() + " returned: " + found.body(),
-                    expected,
-                    hitCount(found.body())
-                );
+                // Converges, rather than instantly correct. A shard whose owner's lease lapsed is
+                // re-acquired and served again; demanding completeness on the first attempt is demanding
+                // zero-latency convergence, which the design does not offer and never claimed to.
+                //
+                // The deadline is what is relaxed, not the property. A fan-out that only searched local
+                // shards never becomes complete, so it times out here rather than passing -- confirmed by
+                // planting exactly that defect.
+                assertBusy(() -> {
+                    final Response found = search(reader, "msg:spread");
+                    assertEquals(200, found.status());
+                    assertTrue(
+                        "a partial answer must not be reported as complete: " + found.body() + diagnose(reader, found),
+                        found.body().contains("\"complete\":true")
+                    );
+                    assertEquals(
+                        "every node must answer for the whole index; " + reader.name() + " returned: " + found.body(),
+                        expected,
+                        hitCount(found.body())
+                    );
+                }, 60, TimeUnit.SECONDS);
             }
         }
     }
@@ -188,13 +205,19 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
 
             send(a, "POST", "/alpha/_refresh", null);
             for (NodeProcess reader : herd) {
-                final Response found = search(reader, "msg:herd");
-                assertEquals(200, found.status());
-                assertEquals(
-                    "no write may be lost to the arbitration; " + reader.name() + " returned: " + found.body(),
-                    herd.size() * perNode,
-                    hitCount(found.body())
-                );
+                assertBusy(() -> {
+                    final Response found = search(reader, "msg:herd");
+                    assertEquals(200, found.status());
+                    assertEquals(
+                        "no write may be lost to the arbitration; "
+                            + reader.name()
+                            + " returned: "
+                            + found.body()
+                            + diagnose(reader, found),
+                        herd.size() * perNode,
+                        hitCount(found.body())
+                    );
+                }, 60, TimeUnit.SECONDS);
             }
         }
     }
@@ -296,6 +319,30 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
             thread.join(TimeUnit.MINUTES.toMillis(4));
         }
         assertEquals("every write must be accepted by one node or another: " + failures, List.of(), failures);
+    }
+
+    /**
+     * Adds the node's own log tail to a failure message when it could not reach a shard.
+     *
+     * <p>A four-node herd test once failed with {@code searched:0, unreachable:1} and nothing else to go
+     * on: the node that knew why had logged it, in a forked JVM whose output the harness captured and
+     * only ever printed when startup failed. An incomplete answer is a report about a node that did not
+     * respond, so the interesting evidence is always in a process other than the one asserting.
+     *
+     * @param reader the node that answered
+     * @param response its answer
+     * @return log lines worth reading, or empty if the answer was complete
+     */
+    private String diagnose(NodeProcess reader, Response response) {
+        if (response.body().contains("\"complete\":false") == false) {
+            return "";
+        }
+        final List<String> output = reader.output();
+        final List<String> interesting = output.stream()
+            .filter(line -> line.contains("was not served") || line.contains("WARN") || line.contains("Exception"))
+            .toList();
+        final List<String> tail = interesting.isEmpty() ? output.subList(Math.max(0, output.size() - 15), output.size()) : interesting;
+        return "\n--- " + reader.name() + " said ---\n" + String.join("\n", tail);
     }
 
     private MetadataPlane plane(Path store) throws Exception {

@@ -189,7 +189,9 @@ public final class SearchHandler extends BaseRestHandler {
                         got = true;
                         break;
                     }
-                    final var peer = serving.router().peer(target);
+                    // The search bound, not the write bound: a peer that is merely busy should cost
+                    // latency, not coverage.
+                    final var peer = serving.router().peer(target, serving.router().searchForwardTimeout());
                     if (peer.isEmpty()) {
                         continue;
                     }
