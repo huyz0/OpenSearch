@@ -99,10 +99,51 @@ successor's *current* term, and `SegmentPublisher`'s `existing.term() > term` co
 ownership recheck and term fencing are **complementary, not layered**: fencing covers the race between the
 recheck and the write; the recheck covers everything before it. Neither is a backstop for the other.
 
+## Three and four processes: what two could not show
+
+With two nodes every interesting question degenerates. One owns and one forwards, so "does a search
+gather from several owners" is really "does it gather from one", and "can a shard move *again*" cannot be
+asked at all — there is nobody left to move it to.
+
+**Ownership is spread deterministically rather than hoped for.** Each node is capped at two shards, so a
+four-shard index cannot land on one node however the writes happen to arrive. Without the cap, a run
+where one node took everything would pass while testing nothing, and would do so silently.
+
+| Test | What only three-plus processes can show |
+|---|---|
+| Fleet spreads shards, every node answers for the whole index | A search is a real gather across processes, not a local lookup dressed up as one. |
+| A shard survives being handed over **twice** (A→B→C) | Takeover is *repeatable*: the successor's own recovered state is itself recoverable, and terms keep advancing rather than resetting. A recovery path that works once and corrupts on the second pass looks perfectly healthy with two nodes. |
+| A herd of four reaching for one shard | Three of four must lose and turn that loss into a forward. Arbitration that is merely usually-right starts producing two owners here, not at two contenders. |
+| A search missing a shard says so | The failure that matters more than a wrong count: a wrong count **presented as authoritative**. |
+
+### The coverage-honesty test, and why it needed constructing
+
+A caller reading only the hits cannot tell an answer computed over the whole index from one computed over
+three quarters of it — a silently dropped shard reads exactly like a query with fewer matches.
+
+Making a shard *genuinely* unreachable takes care, and the first attempt at this canary was not caught
+for a good reason: in a healthy fleet every shard is reachable, so hardcoding `complete: true` changes
+nothing. The scenario needs:
+
+- **Nothing published.** The nodes get a publish debounce they never reach, so a survivor asked for the
+  dead node's shard cannot fall back to opening the published commit — there is no published commit.
+  Otherwise the fleet heals itself and there is nothing to be honest about.
+- **A prompt search, inside the lease.** Once a successor takes over it replays the write-ahead log and
+  the data comes back. That is the system working, and not what this test is about.
+
+The assertion is a conjunction rather than a fixed expectation, because both outcomes are legitimate:
+if it claims completeness it must have everything; if it does not, it must name what it could not reach
+*and* actually be missing something — otherwise "incomplete" is a lie in the other direction.
+
+Six canaries planted against these four tests and all six caught: fan-out restricted to local shards,
+completeness hardcoded, `unreachable` zeroed, takeover not bumping the term, WAL replay disabled, and a
+live lease being stealable.
+
 ## What this does NOT establish
 
 - **Nothing about zombie publish fencing across processes**, per above.
-- **Two processes, not many.** No test runs three or more, and nothing exercises a shard moving twice.
+- **Four processes at most, on one machine.** Nothing has been run at a scale where the object store is
+  contended by more than a handful of writers, and every node shares one kernel, one disk and one clock.
 - **One observed flake.** The warm-connection frozen-owner test timed out once at ~30s in roughly five
   runs, then passed three consecutive full runs. Not reproduced, not explained, not to be treated as
   stable.

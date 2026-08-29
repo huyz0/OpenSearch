@@ -27,12 +27,14 @@ tasks.named('forbiddenApisMain').configure {
 // module losing it, so everything that does not need to fork keeps the guard.
 tasks.named('test').configure {
   exclude '**/ServerlessContentionTests.class'
+  exclude '**/ServerlessFleetTests.class'
 }
 
 tasks.register('processTest', Test) {
   testClassesDirs = sourceSets.test.output.classesDirs
   classpath = sourceSets.test.runtimeClasspath
   include '**/ServerlessContentionTests.class'
+  include '**/ServerlessFleetTests.class'
   systemProperty 'tests.system_call_filter', 'false'
   // The forked node must run a PRODUCTION classpath. OpenSearch's Randomness decides it is "running
   // tests" purely by whether randomizedtesting is loadable, and then demands a test context that a real
