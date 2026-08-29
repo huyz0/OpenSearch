@@ -16,6 +16,10 @@ dependencies {
   implementation project(':libs:opensearch-telemetry')
   // The shell picks its transport directly instead of discovering it through the plugin system.
   implementation project(':modules:transport-netty4')
+  // Object storage. Used through RepositoryPlugin#getRepositories, the supported API, rather than by
+  // reaching into the plugin's package-private constructors -- which is what the R11 test harness had to
+  // do and is not something production code should copy.
+  implementation project(':plugins:repository-s3')
 }
 
 test.enabled = false

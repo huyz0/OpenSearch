@@ -11,7 +11,6 @@ package org.opensearch.serverless.shell;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
@@ -95,12 +94,20 @@ public final class ServerlessBootstrap implements Closeable {
     private final MetadataPlane plane;
     private final BackgroundReconciler loop;
     private final ReconcileScheduler scheduler;
+    private final org.opensearch.serverless.store.ObjectStores.Handle store;
 
-    private ServerlessBootstrap(ServerlessNode node, MetadataPlane plane, BackgroundReconciler loop, ReconcileScheduler scheduler) {
+    private ServerlessBootstrap(
+        ServerlessNode node,
+        MetadataPlane plane,
+        BackgroundReconciler loop,
+        ReconcileScheduler scheduler,
+        org.opensearch.serverless.store.ObjectStores.Handle store
+    ) {
         this.node = node;
         this.plane = plane;
         this.loop = loop;
         this.scheduler = scheduler;
+        this.store = store;
     }
 
     /**
@@ -116,21 +123,30 @@ public final class ServerlessBootstrap implements Closeable {
      * @throws Exception if any part of startup fails
      */
     public static ServerlessBootstrap start(Settings settings) throws Exception {
-        final String storePath = settings.get(STORE_PATH);
-        if (storePath == null || storePath.isBlank()) {
+        final String storeType = settings.get(org.opensearch.serverless.store.ObjectStores.TYPE, "fs");
+        if ("fs".equals(storeType) && (settings.get(STORE_PATH) == null || settings.get(STORE_PATH).isBlank())) {
             throw new IllegalArgumentException(STORE_PATH + " is required: it is where the metadata plane and segments live");
         }
         final long ttl = settings.getAsLong(LEASE_TTL, DEFAULT_LEASE_TTL_MILLIS);
+
+        // The node comes first now, and it has to: an s3 store is built through the repository plugin,
+        // which wants a ClusterService, and the node is what owns one. The plane is attached immediately
+        // afterwards, so nothing observable happens in between.
+        final ServerlessNode node = new ServerlessNode(settings);
+        node.start();
+
+        final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(
+            settings,
+            node.clusterService(),
+            node.nodeEnvironment().nodeDataPaths()[0]
+        );
         final MetadataPlane plane = new MetadataPlane(
-            new FsBlobStore(8192, Path.of(storePath), false),
+            store.blobStore(),
             BlobPath.cleanPath(),
             System::currentTimeMillis,
             ttl,
             settings.getAsBoolean(NODE_LEASE_LIVENESS, false)
         );
-
-        final ServerlessNode node = new ServerlessNode(settings);
-        node.start();
         node.setMetadataPlane(plane);
 
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(
@@ -151,14 +167,14 @@ public final class ServerlessBootstrap implements Closeable {
         scheduler.start();
 
         logger.info(
-            "serverless node [{}] running: store {}, lease ttl {}ms, http {}, on-demand activation {}",
+            "serverless node [{}] running: {} store, lease ttl {}ms, http {}, on-demand activation {}",
             node.localNode().getName(),
-            storePath,
+            storeType,
             ttl,
             node.boundHttpAddress().publishAddress(),
             settings.getAsBoolean(ON_DEMAND, true)
         );
-        return new ServerlessBootstrap(node, plane, loop, scheduler);
+        return new ServerlessBootstrap(node, plane, loop, scheduler, store);
     }
 
     /**
@@ -221,6 +237,12 @@ public final class ServerlessBootstrap implements Closeable {
             logger.warn("could not release this node's lease; peers will treat it as alive until the TTL elapses", e);
         }
         node.close();
+        try {
+            // Last, because everything above may still be talking to it.
+            store.close();
+        } catch (Exception e) {
+            logger.warn("could not close the object store cleanly", e);
+        }
     }
 
     /**

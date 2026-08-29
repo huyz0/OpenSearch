@@ -12,8 +12,11 @@
 ## Running it against MinIO
 
 ```
+# The KMS key is not optional: MinIO's SSE-S3 is KMS-backed and the s3 repository defaults
+# server_side_encryption_type to AES256, so without one every upload gets a 501.
 docker run -d --name serverless-minio -p 9000:9000 \
   -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  -e "MINIO_KMS_SECRET_KEY=serverless-key:$(openssl rand -base64 32)" \
   quay.io/minio/minio server /data
 
 ./gradlew :serverless:testkit:s3Test
