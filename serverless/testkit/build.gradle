@@ -13,6 +13,8 @@ dependencies {
   implementation project(':serverless:shell')
   implementation project(':modules:transport-netty4')
   testImplementation project(':test:framework')
+  // R11 against a real S3 API: the conformance suite needs the container production would use.
+  testImplementation project(':plugins:repository-s3')
 }
 
 // Spikes (S0, S1) live here. They are disposable probes, not a regression suite —
@@ -28,6 +30,18 @@ tasks.named('forbiddenApisMain').configure {
 tasks.named('test').configure {
   exclude '**/ServerlessContentionTests.class'
   exclude '**/ServerlessFleetTests.class'
+  exclude '**/MinioBlobContainerConformanceTests.class'
+}
+
+// R11 against a real S3 API. Its own task because it needs a running endpoint and because the AWS SDK v2
+// insists on a config path -- S3Service hands System.getProperty("opensearch.path.conf") straight to
+// System.setProperty, which throws NPE when it is unset. The rest of the module should not carry either.
+tasks.register('s3Test', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/MinioBlobContainerConformanceTests.class'
+  systemProperty 'opensearch.path.conf', 'config'
+  systemProperty 'tests.security.manager', 'false'
 }
 
 tasks.register('processTest', Test) {
@@ -46,4 +60,7 @@ tasks.register('processTest', Test) {
 
 tasks.named('check').configure {
   dependsOn 'processTest'
+  // Safe to always depend on: with no endpoint reachable the tests assume-skip rather than fail, so a
+  // developer without a container gets a loud skip instead of a red build.
+  dependsOn 's3Test'
 }
