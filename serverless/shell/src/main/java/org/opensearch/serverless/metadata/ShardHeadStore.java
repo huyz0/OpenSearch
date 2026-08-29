@@ -26,6 +26,11 @@ import java.util.function.LongSupplier;
  * are made safe by the register rather than by agreement. Placement <em>quality</em> is somebody else's
  * problem — load-aware candidate selection, gossip hints. Placement <em>safety</em> is entirely here.
  *
+ * <p><b>Liveness has two sources under batching, and the safe one wins.</b> A head is held if its own
+ * stamped expiry has not passed <em>or</em> its owner's node lease says the owner is alive. The stamp
+ * covers the moments after acquisition, before a lease exists; the lease covers everything after the
+ * stamp lapses, which is what makes one renewal cover every shard a node holds.
+ *
  * <p><b>Rule: a live lease is not stolen.</b> If the head is held and unexpired by another node, this
  * refuses and returns the winner's head so the caller can route to it. The alternative — retrying
  * elsewhere — produces exactly the ping-pong the RFC warns about, where two nodes take turns owning a
@@ -83,7 +88,21 @@ public final class ShardHeadStore {
         if (oracle == null) {
             return head.isHeldAt(nowMillis);
         }
-        return head.ownerNodeId() != null && oracle.isLive(head.ownerNodeId(), head.ownerEphemeralId());
+        if (head.ownerNodeId() == null) {
+            return false;
+        }
+        // The head's own stamp is a floor, not decoration. Under batched liveness the expiry is never
+        // renewed -- that is the whole saving -- so after one TTL it lapses and the oracle governs, which
+        // is the intended behaviour. Before then it protects the window that batching would otherwise
+        // open: a node that has just won a head and not yet published a lease.
+        //
+        // Without this, two contenders that hold no leases both read the head as dead and both acquire.
+        // That is not hypothetical; it is what the concurrency test reported the moment batching became
+        // the default, and "exactly one winner" is the one property this store exists to provide.
+        if (head.isHeldAt(nowMillis)) {
+            return true;
+        }
+        return oracle.isLive(head.ownerNodeId(), head.ownerEphemeralId());
     }
 
     /**

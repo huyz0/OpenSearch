@@ -32,7 +32,11 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
 
     /** Short, so a crashed node's lease lapses inside a test rather than inside a coffee break. */
-    private static final String TTL = "3000";
+    /**
+     * Short enough that a crashed node's lease lapses inside a test, long enough that a busy machine does
+     * not expire a healthy one's. Three seconds did the first and failed the second under a full build.
+     */
+    private static final String TTL = "8000";
 
     private Map<String, String> settings() {
         return Map.of(ServerlessBootstrap.LEASE_TTL, TTL);

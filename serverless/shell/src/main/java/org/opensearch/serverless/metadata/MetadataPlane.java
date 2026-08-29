@@ -47,7 +47,16 @@ public final class MetadataPlane {
     private final LongSupplier clock;
 
     /**
-     * Creates a metadata plane over a blob store.
+     * Creates a metadata plane over a blob store, with §7's batched liveness.
+     *
+     * <p><b>Batched is the default.</b> It was not, and the reason it changed is a measurement rather
+     * than a preference: per-head liveness compare-and-swaps once per shard per tick, and batched
+     * renews once for the whole node. At eight shards that is 34 implied S3 requests per idle tick
+     * against 18 — and a compare-and-swap is two HTTP requests where a read is one. The cheaper mode
+     * being opt-in meant every node built the ordinary way paid the higher bill.
+     *
+     * <p>See {@code m14-cost-notes.md}. The saving is a constant, not an order: each held head is still
+     * read every tick, because losing a shard is something only the head can report.
      *
      * @param blobStore the backing store
      * @param base the deployment's base path within it
@@ -55,7 +64,7 @@ public final class MetadataPlane {
      * @param leaseTtlMillis lease duration for shard-heads and node leases
      */
     public MetadataPlane(BlobStore blobStore, BlobPath base, LongSupplier clock, long leaseTtlMillis) {
-        this(blobStore, base, clock, leaseTtlMillis, false);
+        this(blobStore, base, clock, leaseTtlMillis, true);
     }
 
     /**

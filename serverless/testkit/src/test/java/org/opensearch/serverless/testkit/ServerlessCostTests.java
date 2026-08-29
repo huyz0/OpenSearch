@@ -130,6 +130,26 @@ public class ServerlessCostTests extends OpenSearchTestCase {
     }
 
     /**
+     * The default is batched liveness, and this is the test that actually says so.
+     *
+     * <p>An earlier test claimed to be the notification that §12.1's "two liveness modes still coexist"
+     * had been resolved: it measured per-head mode and asserted the cost grows, and its comment said it
+     * would fail once batching became the default. **It would not have.** It passes {@code false}
+     * explicitly, so it pins the behaviour of a *mode*, not the behaviour of the *default*. Nothing
+     * guarded the default at all, and the claim that something did was worse than no claim.
+     *
+     * <p>This one builds a plane the ordinary way and asks it.
+     */
+    public void testTheDefaultLivenessModeIsBatched() throws Exception {
+        final MetadataPlane plane = new MetadataPlane(filesystem(), BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+        assertTrue(
+            "a plane built the ordinary way should batch leases; per-head costs a compare-and-swap per "
+                + "shard per tick, which is 34 implied S3 requests at 8 shards against 18",
+            plane.usesNodeLeaseLiveness()
+        );
+    }
+
+    /**
      * §7's claim, measured: batched leases make the per-tick <b>write</b> cost independent of how many
      * shards a node holds. One lease renewal covers all of them.
      *
@@ -175,10 +195,13 @@ public class ServerlessCostTests extends OpenSearchTestCase {
      *
      * <p>This asserts that the cost <em>does</em> grow, which is a strange thing to want until you notice
      * what it is for: the number is a design fact, and pinning it down makes the gap between the two
-     * modes visible instead of theoretical. If someone makes batching the default, this test fails, and
-     * that failure is the notification that §12.1's "two liveness modes still coexist" is resolved.
+     * modes visible instead of theoretical.
+     *
+     * <p>It is <b>no longer the default</b> — {@link #testTheDefaultLivenessModeIsBatched} guards that,
+     * and this one now documents the cost of the mode that remains available for a deployment whose
+     * nodes do not publish leases.
      */
-    public void testTheDefaultLivenessModeCostsACompareAndSwapPerShardPerTick() throws Exception {
+    public void testPerHeadLivenessCostsACompareAndSwapPerShardPerTick() throws Exception {
         final long[] one = steadyStateTick(filesystem(), "fs-per-head", 1, 10, false);
         final long[] eight = steadyStateTick(filesystem(), "fs-per-head", 8, 10, false);
 

@@ -101,6 +101,48 @@ it inside a forked JVM whose output the harness captured and only printed on sta
 assertions now attach the relevant node's log tail when they report an incomplete answer, because the
 interesting evidence is always in a process other than the one asserting.
 
+## Making batching the default was not a one-line change
+
+Flipping the constructor argument broke six tests, and the breakage was the point: it exposed a real
+property of batched liveness that per-head mode had been hiding.
+
+**A shard-head stops being self-describing.** Under per-head liveness a head carries its own expiry, so it
+says on its face whether it is held. Under batching the expiry is never renewed — that is the saving — and
+liveness comes from the owner's node lease. A head therefore names an owner while the fact of ownership
+lives somewhere else, and if that lease is missing the head reads as dead.
+
+Two consequences, one of them serious:
+
+- **A node could acquire a shard before publishing a lease**, leaving a head every peer read as dead. The
+  shard would be stolen out from under it immediately, with both nodes believing they had won fairly.
+  `activateWriter` now renews the node's own lease *before* acquiring, so the invariant "a node that owns
+  a shard has a lease" holds from the instant of acquisition.
+- **Two contenders with no leases both won.** `testConcurrentActivationHasExactlyOneWinner` reported two
+  winners the moment batching became the default — and "exactly one winner" is the single property the
+  shard-head store exists to provide. The fix is to treat the head's own stamp as a **floor**: a head is
+  held if its stamped expiry has not passed *or* its owner's lease says the owner is alive. The stamp
+  covers the moments after acquisition; the lease covers everything after the stamp lapses, which is what
+  makes one renewal cover every shard. The saving is untouched, because the stamp is still never renewed.
+
+Both were found by tests failing, not by review, and neither would have been visible while the cheaper
+mode was opt-in and nothing used it.
+
+### The notification that wasn't
+
+The previous commit claimed `testTheDefaultLivenessModeCostsACompareAndSwapPerShardPerTick` would fail
+once batching became the default, and called that the notification that §12.1's item was resolved. **It
+would not have.** It passes `false` explicitly, so it pins the behaviour of a *mode*, not of the
+*default* — nothing guarded the default at all, and claiming something did was worse than claiming
+nothing. There is now a test that builds a plane the ordinary way and asks it.
+
+### A load characteristic worth stating
+
+The process and bucket suites failed under a full concurrent build and passed in isolation. Not flakes:
+**a node that cannot renew within its TTL loses its shards**, and suites running a three- or four-second
+TTL to finish quickly put the system in a regime where it legitimately thrashes. TTLs raised, coverage
+assertions made to converge rather than demand instant correctness, and the production default left at
+30 seconds — which is what the short TTLs were pretending to be a faster version of.
+
 ## What this does NOT establish
 
 - **MinIO on loopback is not S3 over a network.** Every latency here is a lower bound and probably a

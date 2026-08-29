@@ -706,6 +706,18 @@ public final class ServerlessNode implements Closeable {
         if (roles.contains(ROLE_INGEST) == false) {
             throw new IllegalStateException("node " + nodeName + " does not accept writer activation; its roles are " + roles);
         }
+        if (plane.usesNodeLeaseLiveness()) {
+            // The lease first, and it has to be first. Under batched liveness a shard-head is not
+            // self-describing: it names an owner, and whether that ownership is live is a fact stored in
+            // the owner's node lease. A node that acquired a shard before publishing a lease would hold a
+            // head that every peer reads as dead, and the shard would be stolen out from under it
+            // immediately -- with both nodes believing they had won it fairly.
+            //
+            // Per-head liveness never had this problem, because the head carries its own expiry. This is
+            // the cost of the cheaper mode, and it is why making it the default is a change to the write
+            // path and not only to a constructor argument.
+            renewOwnLease(plane);
+        }
         final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
             indexName,
             shardNumber,

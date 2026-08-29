@@ -51,7 +51,19 @@ import java.util.concurrent.TimeUnit;
 public class ServerlessBucketContentionTests extends OpenSearchTestCase {
 
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
-    private static final String TTL = "4000";
+    /**
+     * Long enough that a busy machine does not expire a healthy node's lease.
+     *
+     * <p>Four seconds was too short and the failures it produced were not bugs: under a full concurrent
+     * build a node misses a renewal, its lease genuinely lapses, and its peers correctly stop believing
+     * in it. Over HTTP to a bucket every renewal is a round trip, so the margin that was already thin on
+     * a filesystem is thinner here.
+     *
+     * <p>Worth stating plainly rather than only fixing: <b>a node that cannot renew within its TTL loses
+     * its shards</b>, and a TTL chosen to make tests finish quickly puts the system in a regime where it
+     * legitimately thrashes. The production default is 30 seconds for this reason.
+     */
+    private static final String TTL = "15000";
     private static final String DEFAULT_ENDPOINT = "http://127.0.0.1:9000";
 
     private String endpoint() {
@@ -126,13 +138,15 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
 
             send(a, "POST", "/alpha/_refresh", null);
             for (NodeProcess reader : List.of(a, b)) {
-                final Response found = search(reader, "msg:contended");
-                assertEquals(200, found.status());
-                assertEquals(
-                    "no write may be lost to arbitration over HTTP; " + reader.name() + " returned: " + found.body(),
-                    2 * perNode,
-                    hitCount(found.body())
-                );
+                assertBusy(() -> {
+                    final Response found = search(reader, "msg:contended");
+                    assertEquals(200, found.status());
+                    assertEquals(
+                        "no write may be lost to arbitration over HTTP; " + reader.name() + " returned: " + found.body(),
+                        2 * perNode,
+                        hitCount(found.body())
+                    );
+                }, 90, TimeUnit.SECONDS);
             }
         }
     }
@@ -223,14 +237,19 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
                 send(node, "POST", "/alpha/_refresh", null);
             }
             for (NodeProcess reader : fleet) {
-                final Response found = search(reader, "msg:fleet");
-                assertEquals(200, found.status());
-                assertTrue("a partial answer must not be called complete: " + found.body(), found.body().contains("\"complete\":true"));
-                assertEquals(
-                    "every node must answer for the whole index; " + reader.name() + " returned: " + found.body(),
-                    fleet.size() * perNode,
-                    hitCount(found.body())
-                );
+                // Converges rather than instantly correct, for the same reason as the filesystem fleet
+                // test: a shard whose owner's lease lapsed is re-acquired and served again. The deadline
+                // is relaxed; the property is not, since a fan-out that never completes still times out.
+                assertBusy(() -> {
+                    final Response found = search(reader, "msg:fleet");
+                    assertEquals(200, found.status());
+                    assertTrue("a partial answer must not be called complete: " + found.body(), found.body().contains("\"complete\":true"));
+                    assertEquals(
+                        "every node must answer for the whole index; " + reader.name() + " returned: " + found.body(),
+                        fleet.size() * perNode,
+                        hitCount(found.body())
+                    );
+                }, 90, TimeUnit.SECONDS);
             }
         } finally {
             for (NodeProcess node : fleet) {

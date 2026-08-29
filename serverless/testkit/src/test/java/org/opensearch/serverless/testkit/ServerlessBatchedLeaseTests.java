@@ -153,8 +153,10 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         // A sweep over a deployment with nothing published must delete nothing and must not throw.
         assertTrue(gc.collectAll(plane).isEmpty());
 
+        final String writerNodeId;
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-sweep"))) {
             a.start();
+            writerNodeId = a.localNode().getId();
             final ShardId shardId = a.activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"kept\"}");
             a.reconciler().shard(shardId).refresh("p8b");
@@ -176,8 +178,14 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         plane.membership().renew(new NodeLease("dead-node", "eph", "127.0.0.1:9300", Set.of("ingest"), 0L));
         assertTrue("a live lease must survive collection", gc.collectExpiredLeases(plane, clock.get()).isEmpty());
         clock.set(1_000L + TTL);
-        assertEquals(List.of("dead-node"), gc.collectExpiredLeases(plane, clock.get()));
+
+        // Two, not one. The writer above published a lease of its own -- acquiring a shard requires it,
+        // because under batched liveness a head names an owner and the lease is what says that owner is
+        // alive. Closing a ServerlessNode does not release it: only ServerlessBootstrap.close does that,
+        // so a node shut down the short way leaves a lease to expire exactly like a crashed one.
+        assertEquals(Set.of("dead-node", writerNodeId), Set.copyOf(gc.collectExpiredLeases(plane, clock.get())));
         assertTrue(plane.membership().read("dead-node").isEmpty());
+        assertTrue("the writer's expired lease must be collected too", plane.membership().read(writerNodeId).isEmpty());
     }
 
     /** Re-measure: the write per shard should be gone, and the saving should grow with shard count. */

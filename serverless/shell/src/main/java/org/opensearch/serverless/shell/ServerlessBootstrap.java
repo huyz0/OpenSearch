@@ -63,7 +63,11 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static final String PUBLISH_DEBOUNCE = "serverless.publish.debounce_millis";
 
-    /** Whether shard liveness is derived from node leases rather than per-head expiry. */
+    /**
+     * Whether shard liveness is derived from node leases rather than per-head expiry. Defaults to true:
+     * per-head liveness costs a compare-and-swap per shard per tick, and a node renewing once for all of
+     * them is the same guarantee for roughly half the requests.
+     */
     public static final String NODE_LEASE_LIVENESS = "serverless.lease.node_liveness";
 
     /** The first token of the readiness line, so the file is self-describing. */
@@ -167,7 +171,7 @@ public final class ServerlessBootstrap implements Closeable {
             BlobPath.cleanPath(),
             System::currentTimeMillis,
             ttl,
-            complete.getAsBoolean(NODE_LEASE_LIVENESS, false)
+            complete.getAsBoolean(NODE_LEASE_LIVENESS, true)
         );
         node.setMetadataPlane(plane);
 
