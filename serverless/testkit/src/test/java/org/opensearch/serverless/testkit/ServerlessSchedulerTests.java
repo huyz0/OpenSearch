@@ -529,6 +529,58 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         }
     }
 
+    // ---------------------------------------------------------------- the activation window
+
+    /**
+     * A node whose shard-head names it but whose shard is not open must say "not yet", not forward the
+     * write to itself.
+     *
+     * <p>{@code activateWriter} wins the compare-and-swap before it opens the shard, so between those two
+     * steps the head is true and the node is not ready. A write arriving in that window used to read the
+     * head, see itself as the owner, forward to itself over the transport, and get refused by its own
+     * receiving handler — surfacing as a 500 for a normal, brief, self-resolving state.
+     *
+     * <p>Found by a two-process test, where it is a race that reproduces on a cold JVM and not a warm
+     * one. Reproduced here deliberately instead: take the shard, then close it locally without touching
+     * the head, which is exactly the state activation passes through.
+     */
+    public void testANodeNamedByTheHeadButNotYetOpenSaysNotYetRatherThanForwardingToItself() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-selfforward"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+
+            final ShardId shardId = node.reconciler().openShards().iterator().next();
+            assertEquals(
+                "this node should own the shard",
+                node.localNode().getId(),
+                plane.heads().read("alpha", 0).orElseThrow().ownerNodeId()
+            );
+
+            // The head still names this node; the shard is no longer open here. That is the activation
+            // window, held open.
+            node.reconciler().releaseShard(shardId, "simulating the gap between winning the CAS and opening");
+            assertTrue("the shard must be closed locally", node.reconciler().openShards().isEmpty());
+            assertEquals(
+                "and the head must still name this node -- otherwise this is not the window under test",
+                node.localNode().getId(),
+                plane.heads().read("alpha", 0).orElseThrow().ownerNodeId()
+            );
+
+            final Response response = send(node.boundHttpAddress().publishAddress(), "PUT", "/alpha/_doc/1", "{\"msg\":\"x\",\"n\":1}");
+            assertEquals("a node must not forward a write to itself: " + response.body(), 503, response.status());
+            assertTrue(
+                "and must say why, in terms a client can retry on: " + response.body(),
+                response.body().contains("activation_in_progress")
+            );
+        }
+    }
+
     // ---------------------------------------------------------------- the backstop is not optional
 
     /**

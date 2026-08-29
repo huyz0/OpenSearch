@@ -42,6 +42,9 @@ import java.util.function.Supplier;
  */
 public final class ShardRouter {
 
+    /** Used only when no metadata plane is attached and the lease TTL is therefore unknown. */
+    private static final long DEFAULT_FORWARD_TIMEOUT_MILLIS = 30_000L;
+
     private final ServerlessNode node;
     private final TransportService transportService;
     private final Supplier<MetadataPlane> plane;
@@ -163,7 +166,18 @@ public final class ShardRouter {
             Version.CURRENT
         );
         if (transportService.nodeConnected(peer) == false) {
-            transportService.connectToNode(peer);
+            // Bounded, and the connect is where this actually bites. A frozen process still has an open
+            // listening socket, so TCP succeeds and the transport handshake is what hangs -- for the
+            // default 30 seconds, before a single byte of the write has been sent and before any
+            // per-request timeout can apply. The request timeout below was not enough on its own; this
+            // was found by measuring how long a write to a SIGSTOPped owner took to come back.
+            final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
+            transportService.connectToNode(
+                peer,
+                new org.opensearch.transport.ConnectionProfile.Builder(
+                    org.opensearch.transport.ConnectionProfile.buildDefaultConnectionProfile(org.opensearch.common.settings.Settings.EMPTY)
+                ).setConnectTimeout(timeout).setHandshakeTimeout(timeout).build()
+            );
         }
         return Optional.of(peer);
     }
@@ -184,14 +198,15 @@ public final class ShardRouter {
      */
     public ForwardedIndexResponse forwardIndex(DiscoveryNode peer, ForwardedIndexRequest request) {
         final PlainActionFuture<ForwardedIndexResponse> future = PlainActionFuture.newFuture();
+        final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
         transportService.sendRequest(
             peer,
             ForwardedIndexRequest.ACTION,
             request,
-            TransportRequestOptions.EMPTY,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
             new Handler<>(future, ForwardedIndexResponse::new)
         );
-        return future.actionGet();
+        return future.actionGet(timeout);
     }
 
     /**
@@ -203,14 +218,36 @@ public final class ShardRouter {
      */
     public ForwardedSearchResponse forwardSearch(DiscoveryNode peer, ForwardedSearchRequest request) {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
+        final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
         transportService.sendRequest(
             peer,
             ForwardedSearchRequest.ACTION,
             request,
-            TransportRequestOptions.EMPTY,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
             new Handler<>(future, ForwardedSearchResponse::new)
         );
-        return future.actionGet();
+        return future.actionGet(timeout);
+    }
+
+    /**
+     * How long to wait for the node the shard-head named.
+     *
+     * <p>Bounded by the lease TTL, and that is the principled number rather than a round one: there is no
+     * value in waiting longer than the lease, because a peer that has not answered within it is a peer
+     * whose lease is lapsing, and the correct move then is to re-read the head rather than keep holding a
+     * thread open.
+     *
+     * <p>Found by freezing a node with SIGSTOP. Unbounded, a paused owner — a stop-the-world GC, a stuck
+     * disk, a suspended container — wedges every writer that routes to it, forever, and takes the whole
+     * write thread pool with it. The node doing the waiting is healthy; it just never stops waiting.
+     *
+     * @return the timeout
+     */
+    private org.opensearch.common.unit.TimeValue forwardTimeout() {
+        final MetadataPlane metadata = plane.get();
+        return org.opensearch.common.unit.TimeValue.timeValueMillis(
+            metadata == null ? DEFAULT_FORWARD_TIMEOUT_MILLIS : Math.max(1_000L, metadata.leaseTtlMillis())
+        );
     }
 
     /** Bridges a transport response into a future the calling thread can wait on. */

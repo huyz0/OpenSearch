@@ -58,8 +58,20 @@ public final class ServerlessBootstrap implements Closeable {
     /** How many shards this node will take on demand before refusing. */
     public static final String MAX_SHARDS = "serverless.activation.max_shards";
 
+    /**
+     * How long writes are gathered before one publish covers them all. Exposed because it is the knob
+     * that decides how much a crashed node leaves for its successor to replay from the log.
+     */
+    public static final String PUBLISH_DEBOUNCE = "serverless.publish.debounce_millis";
+
     /** Whether shard liveness is derived from node leases rather than per-head expiry. */
     public static final String NODE_LEASE_LIVENESS = "serverless.lease.node_liveness";
+
+    /** The first token of the readiness line, so the file is self-describing. */
+    public static final String READY_MARKER = "SERVERLESS_READY";
+
+    /** Where to write the readiness line once the node is serving. Optional. */
+    public static final String READY_FILE = "serverless.ready.file";
 
     /** The default lease TTL: long enough to survive a slow object store, short enough to fail over. */
     public static final long DEFAULT_LEASE_TTL_MILLIS = 30_000L;
@@ -125,7 +137,18 @@ public final class ServerlessBootstrap implements Closeable {
             settings.getAsBoolean(ON_DEMAND, true)
         ).setMaxShardsHeld(settings.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD));
 
-        final ReconcileScheduler scheduler = ReconcileScheduler.startFor(node, plane, loop);
+        final ReconcileScheduler scheduler = new ReconcileScheduler(
+            loop,
+            node.threadPool(),
+            plane.clock(),
+            org.opensearch.common.unit.TimeValue.timeValueMillis(Math.max(1L, ttl / ReconcileScheduler.RENEWALS_PER_TTL)),
+            org.opensearch.common.unit.TimeValue.timeValueMillis(
+                settings.getAsLong(PUBLISH_DEBOUNCE, ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
+            ),
+            ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
+        );
+        node.setSignals(scheduler);
+        scheduler.start();
 
         logger.info(
             "serverless node [{}] running: store {}, lease ttl {}ms, http {}, on-demand activation {}",
@@ -222,6 +245,26 @@ public final class ServerlessBootstrap implements Closeable {
         }
 
         final ServerlessBootstrap bootstrap = start(settings.build());
+
+        // A readiness file, the way a daemon tells an orchestrator it is up. Written last, after the node
+        // is actually serving, so its existence means something. A file rather than a line on stdout
+        // because stdout is forbidden in production code here -- and it is the better mechanism anyway:
+        // it does not race with log output and it survives whatever is or is not tailing the process.
+        final String readyFile = System.getProperty(READY_FILE);
+        if (readyFile != null) {
+            java.nio.file.Files.writeString(
+                Path.of(readyFile),
+                READY_MARKER
+                    + " http="
+                    + bootstrap.node().boundHttpAddress().publishAddress()
+                    + " transport="
+                    + bootstrap.node().boundTransportAddress().publishAddress()
+                    + " node="
+                    + bootstrap.node().localNode().getId()
+                    + System.lineSeparator()
+            );
+        }
+
         final CountDownLatch stopped = new CountDownLatch(1);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             // Closing here rather than only counting down: a node killed without releasing its lease

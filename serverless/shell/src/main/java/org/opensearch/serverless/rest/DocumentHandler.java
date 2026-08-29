@@ -102,6 +102,23 @@ public final class DocumentHandler extends BaseRestHandler {
         if (shardId == null || serving.reconciler().readerShards().contains(shardId)) {
             final var head = metadata.heads().read(index, shard);
             final String owner = head.map(h -> h.ownerNodeId()).orElse(null);
+            if (owner != null && owner.equals(serving.localNode().getId())) {
+                // The head names this node and this node has no open shard. That is not a routing
+                // problem, it is the gap inside activation: activateWriter wins the compare-and-swap
+                // before it opens the shard, so for a moment the head is true and the node is not ready.
+                //
+                // Forwarding here would send the write to ourselves, and the receiving side would
+                // correctly refuse it -- a 500 for what is a normal, brief, self-resolving state. Say
+                // "not yet" instead, which is a status a client retries.
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.SERVICE_UNAVAILABLE,
+                        "activation_in_progress",
+                        "this node is acquiring shard " + shard + " of " + index + "; retry"
+                    )
+                );
+            }
             if (owner != null) {
                 // Forward rather than refuse. The client should not have to know which node owns which
                 // shard; that is exactly the knowledge the shard-head exists to hold.
@@ -135,7 +152,18 @@ public final class DocumentHandler extends BaseRestHandler {
                         // head we routed on is not to be trusted.
                         serving.signals().ownershipDoubted(index, shard);
                         try {
-                            channel.sendResponse(new BytesRestResponse(channel, e));
+                            // 503, not the exception's own status. A forward that fails means routing was
+                            // stale, and stale routing is a retry -- rendering it as a 500 tells a client
+                            // the write is hopeless when the correct answer is "ask again in a moment".
+                            // The cause is carried in the message so nothing is hidden by saying so.
+                            channel.sendResponse(
+                                IndexAdminHandler.error(
+                                    channel,
+                                    RestStatus.SERVICE_UNAVAILABLE,
+                                    "forward_failed",
+                                    "could not forward to " + owner + ", which the shard-head named as owner: " + e.getMessage()
+                                )
+                            );
                         } catch (IOException nested) {
                             logger.error("failed to report a forwarding failure", nested);
                         }

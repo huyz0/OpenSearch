@@ -20,3 +20,28 @@ dependencies {
 tasks.named('forbiddenApisMain').configure {
   replaceSignatureFiles 'jdk-signatures'
 }
+
+// Multi-process tests fork real JVMs. The test framework installs a seccomp system-call filter that
+// blocks execve -- deliberately, since a node has no business spawning children -- so these cannot run
+// under the ordinary `test` task. They get their own task with the filter off rather than the whole
+// module losing it, so everything that does not need to fork keeps the guard.
+tasks.named('test').configure {
+  exclude '**/ServerlessContentionTests.class'
+}
+
+tasks.register('processTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/ServerlessContentionTests.class'
+  systemProperty 'tests.system_call_filter', 'false'
+  // The forked node must run a PRODUCTION classpath. OpenSearch's Randomness decides it is "running
+  // tests" purely by whether randomizedtesting is loadable, and then demands a test context that a real
+  // main() has no way to provide -- so a child on the test classpath dies inside NodeEnvironment. The
+  // main source set's runtime classpath is server + shell + netty4 without the test framework, which is
+  // also simply the more faithful thing to fork.
+  systemProperty 'serverless.node.classpath', sourceSets.main.runtimeClasspath.asPath
+}
+
+tasks.named('check').configure {
+  dependsOn 'processTest'
+}
