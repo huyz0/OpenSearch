@@ -18,13 +18,18 @@ import java.io.IOException;
 public final class ForwardedIndexRequest extends TransportRequest {
 
     /** The transport action name. */
-    public static final String ACTION = "internal:serverless/document/index";
+    /**
+     * Named for writing rather than indexing, because it carries deletions too. A delete is routed,
+     * forwarded, fenced and logged exactly like an index operation; only the terminal call differs.
+     */
+    public static final String ACTION = "internal:serverless/document/write";
 
     private final String index;
     private final int shard;
     private final String id;
     private final String source;
     private final boolean refresh;
+    private final boolean deletion;
 
     /**
      * Creates a request.
@@ -36,6 +41,21 @@ public final class ForwardedIndexRequest extends TransportRequest {
      * @param refresh whether to make the write visible before answering
      */
     public ForwardedIndexRequest(String index, int shard, String id, String source, boolean refresh) {
+        this(index, shard, id, source, refresh, false);
+    }
+
+    /**
+     * Creates a forwarded write.
+     *
+     * @param index the index
+     * @param shard the shard
+     * @param id the document id
+     * @param source the document source, empty for a deletion
+     * @param refresh whether to make the change visible before answering
+     * @param deletion whether this removes the document rather than adding it
+     */
+    public ForwardedIndexRequest(String index, int shard, String id, String source, boolean refresh, boolean deletion) {
+        this.deletion = deletion;
         this.index = index;
         this.shard = shard;
         this.id = id;
@@ -56,6 +76,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
         this.id = in.readString();
         this.source = in.readString();
         this.refresh = in.readBoolean();
+        this.deletion = in.readBoolean();
     }
 
     @Override
@@ -66,6 +87,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
         out.writeString(id);
         out.writeString(source);
         out.writeBoolean(refresh);
+        out.writeBoolean(deletion);
     }
 
     /**
@@ -102,6 +124,15 @@ public final class ForwardedIndexRequest extends TransportRequest {
      */
     public String source() {
         return source;
+    }
+
+    /**
+     * Returns whether this removes the document rather than adding it.
+     *
+     * @return true for a deletion
+     */
+    public boolean deletion() {
+        return deletion;
     }
 
     /**

@@ -59,7 +59,13 @@ public final class DocumentHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.PUT, "/{index}/_doc/{id}"), new Route(RestRequest.Method.POST, "/{index}/_doc/{id}"));
+        return List.of(
+            new Route(RestRequest.Method.PUT, "/{index}/_doc/{id}"),
+            new Route(RestRequest.Method.POST, "/{index}/_doc/{id}"),
+            // A deletion routes, forwards and logs exactly like a write, so it belongs on the same
+            // handler rather than in a parallel one that would have to be kept in step with it.
+            new Route(RestRequest.Method.DELETE, "/{index}/_doc/{id}")
+        );
     }
 
     @Override
@@ -70,6 +76,7 @@ public final class DocumentHandler extends BaseRestHandler {
         final String id = request.param("id");
         final String source = request.hasContent() ? request.content().utf8ToString() : null;
         final boolean refresh = request.paramAsBoolean("refresh", false);
+        final boolean deletion = request.method() == RestRequest.Method.DELETE;
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
@@ -77,7 +84,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        if (source == null || source.isBlank()) {
+        if (deletion == false && (source == null || source.isBlank())) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a document body is required")
             );
@@ -143,9 +150,16 @@ public final class DocumentHandler extends BaseRestHandler {
                         final var ack = serving.router()
                             .forwardIndex(
                                 peer.get(),
-                                new org.opensearch.serverless.transport.ForwardedIndexRequest(index, shard, id, source, refresh)
+                                new org.opensearch.serverless.transport.ForwardedIndexRequest(
+                                    index,
+                                    shard,
+                                    id,
+                                    source == null ? "" : source,
+                                    refresh,
+                                    deletion
+                                )
                             );
-                        respondCreated(channel, index, id, shard, ack.ownerNodeId());
+                        respond(channel, index, id, shard, ack.ownerNodeId(), deletion, true);
                     } catch (Exception e) {
                         // The owner was reachable and still refused or failed. Either it lost the shard
                         // between our read and its receipt, or it is going away. Same conclusion: the
@@ -199,14 +213,17 @@ public final class DocumentHandler extends BaseRestHandler {
         // should be reading the next request on remote IO is how a node stops answering under load.
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             try {
-                serving.index(shardId, id, source);
+                final boolean removed = deletion ? serving.delete(shardId, id) : true;
+                if (deletion == false) {
+                    serving.index(shardId, id, source);
+                }
                 if (refresh) {
                     // Same meaning as classic OpenSearch: make this write visible to search before
                     // answering. Without it a caller that writes and immediately searches gets zero
                     // hits and no error, which reads as data loss and is not.
                     serving.reconciler().shard(shardId).refresh("serverless-rest-refresh");
                 }
-                respondCreated(channel, index, id, shard, serving.localNode().getId());
+                respond(channel, index, id, shard, serving.localNode().getId(), deletion, removed);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -217,24 +234,36 @@ public final class DocumentHandler extends BaseRestHandler {
         });
     }
 
-    private void respondCreated(org.opensearch.rest.RestChannel channel, String index, String id, int shard, String writtenBy)
-        throws IOException {
+    private void respond(
+        org.opensearch.rest.RestChannel channel,
+        String index,
+        String id,
+        int shard,
+        String writtenBy,
+        boolean deletion,
+        boolean found
+    ) throws IOException {
         {
             try (XContentBuilder builder = channel.newBuilder()) {
                 builder.startObject();
                 builder.field("_index", index);
                 builder.field("_id", id);
                 builder.field("_shard", shard);
-                builder.field("result", "created");
+                builder.field("result", deletion ? (found ? "deleted" : "not_found") : "created");
                 // Says what was actually guaranteed. "created" alone would leave a reader to assume the
                 // usual meaning; here the write is in the log before this response exists, and the
                 // segment it will live in may not be published yet.
+                // Says what was actually guaranteed, and it matters most for a deletion: the tombstone is
+                // in the log before this response exists, so a successor replaying that log removes the
+                // document again rather than resurrecting it.
                 builder.field("durable", "write-ahead log");
                 // Which node actually holds the shard. Useful when the write was forwarded, and never
                 // misleading when it was not.
                 builder.field("_node", writtenBy);
                 builder.endObject();
-                channel.sendResponse(new BytesRestResponse(RestStatus.CREATED, builder));
+                channel.sendResponse(
+                    new BytesRestResponse(deletion ? (found ? RestStatus.OK : RestStatus.NOT_FOUND) : RestStatus.CREATED, builder)
+                );
             }
         }
     }

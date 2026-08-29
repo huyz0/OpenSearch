@@ -35,14 +35,36 @@ public final class WalRecord {
 
     private final String id;
     private final String source;
+    private final boolean deletion;
 
     /**
-     * Creates a record.
+     * Creates a record for a deletion.
+     *
+     * <p>A delete has to be in the log for the same reason a write does, and the consequence of leaving
+     * it out is worse. Replay is an idempotent redo of state: a successor rebuilds what its predecessor
+     * had by applying every record it finds. A deletion that was acknowledged and not logged is simply
+     * absent from that reconstruction, so the document it removed <em>comes back</em> — and it comes back
+     * during a recovery that reports success.
+     *
+     * @param id the document deleted
+     * @return the record
+     */
+    public static WalRecord deletion(String id) {
+        return new WalRecord(id, "", true);
+    }
+
+    /**
+     * Creates a record for an indexed document.
      *
      * @param id the document id
      * @param source the document source
      */
     public WalRecord(String id, String source) {
+        this(id, source, false);
+    }
+
+    private WalRecord(String id, String source, boolean deletion) {
+        this.deletion = deletion;
         this.id = Objects.requireNonNull(id);
         this.source = Objects.requireNonNull(source);
     }
@@ -66,6 +88,15 @@ public final class WalRecord {
     }
 
     /**
+     * Reports whether this record removes a document rather than adding one.
+     *
+     * @return true for a deletion
+     */
+    public boolean isDeletion() {
+        return deletion;
+    }
+
+    /**
      * Serializes this record.
      *
      * @return the blob bytes
@@ -76,6 +107,12 @@ public final class WalRecord {
             builder.startObject();
             builder.field("id", id);
             builder.field("source", source);
+            if (deletion) {
+                // Written only for deletions, so a log produced before deletes existed parses unchanged
+                // and means what it always meant. A reader that has never heard of this field reads such
+                // a record as an index operation, which is exactly what it is.
+                builder.field("deleted", true);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -95,6 +132,7 @@ public final class WalRecord {
         ) {
             String id = null;
             String source = null;
+            boolean deleted = false;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
@@ -105,18 +143,20 @@ public final class WalRecord {
                         id = parser.text();
                     } else if ("source".equals(field)) {
                         source = parser.text();
+                    } else if ("deleted".equals(field)) {
+                        deleted = parser.booleanValue();
                     }
                 }
             }
             if (id == null || source == null) {
                 throw new IOException("malformed WAL record");
             }
-            return new WalRecord(id, source);
+            return new WalRecord(id, source, deleted);
         }
     }
 
     @Override
     public String toString() {
-        return "WalRecord[" + id + "]";
+        return (deletion ? "WalDelete[" : "WalRecord[") + id + "]";
     }
 }

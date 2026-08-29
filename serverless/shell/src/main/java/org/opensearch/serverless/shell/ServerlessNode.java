@@ -879,6 +879,53 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * Deletes a document durably: the deletion reaches the object store's log before it is acknowledged.
+     *
+     * <p>Same ordering as {@link #index}, and for a sharper reason. A write lost between acknowledgement
+     * and publication is a write the caller was told about and cannot find — bad. A <em>deletion</em>
+     * lost the same way is worse than bad: replay rebuilds the shard from the log, and a deletion missing
+     * from the log means the document it removed reappears, during a recovery that reports success. The
+     * caller is told the delete worked, the failover is told the recovery worked, and the document is
+     * there.
+     *
+     * @param shardId the shard to delete from
+     * @param id the document id
+     * @return true if a document was actually removed, false if there was nothing to remove
+     * @throws java.io.IOException if the shard is not held here, or the delete fails
+     */
+    public boolean delete(org.opensearch.core.index.shard.ShardId shardId, String id) throws java.io.IOException {
+        ensureStarted();
+        final var shard = reconciler.shard(shardId);
+        if (shard == null) {
+            throw new java.io.IOException("cannot delete from " + shardId + ": not open on " + nodeName);
+        }
+        if (reconciler.readerShards().contains(shardId)) {
+            throw new java.io.IOException("cannot delete from " + shardId + ": it is open as a reader");
+        }
+        final var wal = reconciler.wal(shardId);
+        if (wal != null) {
+            wal.append(shard.getOperationPrimaryTerm(), org.opensearch.serverless.store.WalRecord.deletion(id));
+        }
+        final var result = shard.applyDeleteOperationOnPrimary(
+            org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+            id,
+            org.opensearch.index.VersionType.INTERNAL,
+            org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+            0
+        );
+        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
+            // A value, not a throw -- the same trap s0-findings.md F5 recorded for indexing.
+            throw new java.io.IOException("deleting " + id + " returned " + result.getResultType());
+        }
+        shard.sync();
+        // The same edge a write raises: a deletion changes the shard as surely as an addition, and a
+        // shard whose only recent change was a delete still needs publishing or the tombstone lives
+        // nowhere but this node's disk and its log.
+        signals.wrote(shardId);
+        return result.isFound();
+    }
+
+    /**
      * Publishes a shard's current commit to the object store, fenced by the owning term.
      *
      * @param shardId the shard to publish

@@ -102,7 +102,11 @@ public final class ShardRouter {
             // one outcome that would be unsafe.
             throw new IllegalStateException("this node does not own " + request.index() + "[" + request.shard() + "]");
         }
-        node.index(shardId, request.id(), request.source());
+        if (request.deletion()) {
+            node.delete(shardId, request.id());
+        } else {
+            node.index(shardId, request.id(), request.source());
+        }
         if (request.refresh()) {
             node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
         }

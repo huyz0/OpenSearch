@@ -282,6 +282,21 @@ public final class ShardReconciler {
             final var wal = wal(shardId);
             int replayed = 0;
             for (org.opensearch.serverless.store.WalRecord record : wal.replayable()) {
+                if (record.isDeletion()) {
+                    // Replayed in order with the writes, which is the only thing that makes the result
+                    // correct: a document written, deleted, and written again must end up present, and a
+                    // document written and deleted must end up gone. Applying all the writes and then all
+                    // the deletes would get the first case wrong.
+                    shard.applyDeleteOperationOnPrimary(
+                        org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                        record.id(),
+                        org.opensearch.index.VersionType.INTERNAL,
+                        org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        0
+                    );
+                    replayed++;
+                    continue;
+                }
                 shard.applyIndexOperationOnPrimary(
                     org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
                     org.opensearch.index.VersionType.INTERNAL,
