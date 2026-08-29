@@ -217,4 +217,99 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             );
         }
     }
+
+    /**
+     * The other half of the fence: a loser that read the manifest <em>before</em> its successor published.
+     *
+     * <p>{@link #testAZombieWriterCannotCorruptTheShardItLost} covers the term check — a zombie that finds
+     * a newer term already in the manifest is refused. That check cannot help here. Publishing is
+     * read-manifest, upload-segments, compare-and-swap, and a writer that read while it was still the
+     * newest term holds a manifest that is genuinely older than itself. By the time it swaps, a successor
+     * has published. Nothing about the term says no; only the compare-and-swap on the manifest generation
+     * does.
+     *
+     * <p><b>This window is the width of a segment upload, which is why it had never been tested.</b> On a
+     * filesystem it is microseconds and effectively unreachable, so the branch that protects it ran in no
+     * test — the code was there and the evidence was not. {@link PausingBlobStore} holds it open on
+     * demand instead of racing and hoping.
+     *
+     * <p>The stakes are the whole of §9.6: without the swap, the loser's manifest replaces the winner's,
+     * and every document the winner wrote stops existing as far as any future reader is concerned.
+     */
+    public void testAWriterThatReadTheManifestBeforeItsSuccessorPublishedIsStillFenced() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Path objectStore = createTempDir();
+        final PausingBlobStore store = new PausingBlobStore(new FsBlobStore(1024, objectStore, false));
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode loser = new ServerlessNode(nodeSettings("p6-window-loser", "ingest"));
+            ServerlessNode winner = new ServerlessNode(nodeSettings("p6-window-winner", "ingest"))
+        ) {
+            loser.start();
+            winner.start();
+
+            final ShardId onLoser = loser.activateWriter(plane, "alpha", 0).orElseThrow();
+            final long loserTerm = plane.heads().read("alpha", 0).orElseThrow().term();
+            ShardOps.indexDoc(loser.reconciler().shard(onLoser), "1", "{\"msg\":\"from the loser\",\"n\":1}");
+            loser.reconciler().shard(onLoser).refresh("p6");
+
+            // The loser starts publishing and parks inside the upload, having already read a manifest
+            // that names no newer term -- because at that instant there was none.
+            store.pauseNextSegmentWrite();
+            final java.util.concurrent.atomic.AtomicReference<Throwable> thrown = new java.util.concurrent.atomic.AtomicReference<>();
+            final Thread publishing = new Thread(() -> {
+                try {
+                    loser.publishShard(onLoser, loserTerm);
+                } catch (Throwable t) {
+                    thrown.set(t);
+                }
+            }, "loser-publish");
+            publishing.start();
+            assertTrue(
+                "the loser never reached the upload, so no window was opened",
+                store.awaitPaused(60, java.util.concurrent.TimeUnit.SECONDS)
+            );
+
+            // While it is parked, its lease lapses and a successor takes the shard and publishes.
+            clock.set(1_000L + TTL);
+            final ShardId onWinner = winner.activateWriter(plane, "alpha", 0).orElseThrow();
+            final long winnerTerm = plane.heads().read("alpha", 0).orElseThrow().term();
+            assertTrue("the successor must hold a higher term", winnerTerm > loserTerm);
+            ShardOps.indexDoc(winner.reconciler().shard(onWinner), "2", "{\"msg\":\"from the winner\",\"n\":2}");
+            winner.reconciler().shard(onWinner).refresh("p6");
+            winner.publishShard(onWinner, winnerTerm);
+
+            // Now the loser wakes up and finishes a publish it began when it was still the owner.
+            store.release();
+            publishing.join(java.util.concurrent.TimeUnit.MINUTES.toMillis(2));
+            assertNotNull("the loser's publish must not succeed: it began before the winner's and ends after it", thrown.get());
+            assertTrue(
+                "and it must be refused as a stale writer, not fail for some other reason: " + thrown.get(),
+                thrown.get() instanceof StaleWriterException
+            );
+            // WHICH half refused it, said out loud. The term check reports the term it lost to; the
+            // compare-and-swap reports a concurrent change. Without this the test would also pass if the
+            // term check had done the work, and the branch it exists to cover would still be untested.
+            assertTrue(
+                "the compare-and-swap must be what refused this, not the term check: " + thrown.get().getMessage(),
+                thrown.get().getMessage().contains("changed concurrently")
+            );
+
+            assertEquals(
+                "the manifest must still be the winner's",
+                winnerTerm,
+                plane.segmentPublisher("alpha", 0).readManifest().orElseThrow().term()
+            );
+        }
+
+        // The reader is the assertion that matters: a lost swap here would not look like an error, it
+        // would look like the winner's document having never been written.
+        try (ServerlessNode reader = new ServerlessNode(nodeSettings("p6-window-verify", "search"))) {
+            reader.start();
+            final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
+            assertEquals("the winner's document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "winner"));
+        }
+    }
 }

@@ -285,4 +285,105 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             return new Response(response.statusCode(), response.body());
         }
     }
+
+    /**
+     * Fencing, on the transport where the fence is an HTTP conditional write.
+     *
+     * <p>Both halves of §9.6 have only ever been demonstrated on a filesystem, where a compare-and-swap is
+     * a rename and a segment upload is a memcpy. The claim the project actually makes is about an object
+     * store: that a writer which lost its shard cannot make anyone believe its commit. That rests on
+     * {@code compareAndSwapRegister} being linearizable over HTTP, which a filesystem cannot demonstrate —
+     * and the precedent for the transport revealing what disk hides is {@code IndexInputStream}, which had
+     * no mark support, so publishing a segment was impossible on S3 and perfect on disk.
+     *
+     * <p>The race window is held open deliberately rather than raced for. See
+     * {@link ServerlessFailoverTests#testAWriterThatReadTheManifestBeforeItsSuccessorPublishedIsStillFenced}
+     * for why the term check cannot cover this case and the swap must.
+     */
+    public void testAStaleWriterIsFencedByAConditionalWriteOverHttp() throws Exception {
+        assumeEndpoint();
+        final String bucket = freshBucket();
+        final long ttl = 3_000L;
+        final java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong(1_000L);
+        final PausingBlobStore store = new PausingBlobStore(
+            org.opensearch.repositories.s3.MinioBlobStores.create(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir())
+        );
+        final var plane = new org.opensearch.serverless.metadata.MetadataPlane(
+            store,
+            org.opensearch.common.blobstore.BlobPath.cleanPath(),
+            clock::get,
+            ttl
+        );
+        plane.createIndex(new org.opensearch.serverless.cluster.IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            org.opensearch.serverless.shell.ServerlessNode loser = new org.opensearch.serverless.shell.ServerlessNode(
+                s3Settings("fence-loser", bucket)
+            );
+            org.opensearch.serverless.shell.ServerlessNode winner = new org.opensearch.serverless.shell.ServerlessNode(
+                s3Settings("fence-winner", bucket)
+            )
+        ) {
+            loser.start();
+            winner.start();
+
+            final ShardId onLoser = loser.activateWriter(plane, "alpha", 0).orElseThrow();
+            final long loserTerm = plane.heads().read("alpha", 0).orElseThrow().term();
+            ShardOps.indexDoc(loser.reconciler().shard(onLoser), "1", "{\"msg\":\"from the loser\",\"n\":1}");
+            loser.reconciler().shard(onLoser).refresh("fence");
+
+            // The loser begins publishing and parks inside the upload, holding a manifest it read while
+            // it was still, genuinely, the newest term.
+            store.pauseNextSegmentWrite();
+            final java.util.concurrent.atomic.AtomicReference<Throwable> thrown = new java.util.concurrent.atomic.AtomicReference<>();
+            final Thread publishing = new Thread(() -> {
+                try {
+                    loser.publishShard(onLoser, loserTerm);
+                } catch (Throwable t) {
+                    thrown.set(t);
+                }
+            }, "fence-loser-publish");
+            publishing.start();
+            assertTrue("the loser never reached the upload, so no window was opened", store.awaitPaused(2, TimeUnit.MINUTES));
+
+            clock.set(1_000L + ttl);
+            final ShardId onWinner = winner.activateWriter(plane, "alpha", 0).orElseThrow();
+            final long winnerTerm = plane.heads().read("alpha", 0).orElseThrow().term();
+            assertTrue("the successor must hold a higher term", winnerTerm > loserTerm);
+            ShardOps.indexDoc(winner.reconciler().shard(onWinner), "2", "{\"msg\":\"from the winner\",\"n\":2}");
+            winner.reconciler().shard(onWinner).refresh("fence");
+            winner.publishShard(onWinner, winnerTerm);
+
+            store.release();
+            publishing.join(TimeUnit.MINUTES.toMillis(3));
+            assertNotNull("the loser's publish must be refused, on a bucket as on a disk", thrown.get());
+            assertTrue(
+                "and refused as a stale writer: " + thrown.get(),
+                thrown.get() instanceof org.opensearch.serverless.store.StaleWriterException
+            );
+            // The conditional write, not the term check. Over HTTP that is a GET for the ETag and a PUT
+            // carrying it, which is the pair of requests this whole design rests on.
+            assertTrue(
+                "the conditional write must be what refused it: " + thrown.get().getMessage(),
+                thrown.get().getMessage().contains("changed concurrently")
+            );
+            assertEquals(
+                "the manifest in the bucket must still be the winner's",
+                winnerTerm,
+                plane.segmentPublisher("alpha", 0).readManifest().orElseThrow().term()
+            );
+        }
+
+        // Read back out of the bucket by a node that never held the shard: a lost swap would not look
+        // like an error here, it would look like the winner's document having never been written.
+        try (
+            org.opensearch.serverless.shell.ServerlessNode reader = new org.opensearch.serverless.shell.ServerlessNode(
+                s3Settings("fence-verify", bucket)
+            )
+        ) {
+            reader.start();
+            final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
+            assertEquals("the winner's document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "winner"));
+        }
+    }
 }
