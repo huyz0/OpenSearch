@@ -85,6 +85,10 @@ final class NodeProcess implements Closeable {
         command.add("-Dio.netty.noKeySetOptimization=true");
         command.add("-Dio.netty.recycler.maxCapacityPerThread=0");
         command.add("-Dopensearch.set.netty.runtime.available.processors=false");
+        // What a real launcher script sets. The AWS SDK v2 is given this to keep it off the home
+        // directory, and the s3 plugin hands it straight to System.setProperty -- so when it is missing a
+        // node dies in main() with a bare NullPointerException and no clue as to why.
+        command.add("-Dopensearch.path.conf=" + home.resolve("config"));
 
         final Map<String, String> settings = new java.util.LinkedHashMap<>();
         settings.put("node.name", name);
@@ -94,7 +98,10 @@ final class NodeProcess implements Closeable {
         settings.put("http.port", "0");
         settings.put("transport.port", "0");
         settings.put("serverless.roles", "ingest");
-        settings.put(ServerlessBootstrap.STORE_PATH, store.toString());
+        settings.put("path.conf", home.resolve("config").toString());
+        if (store != null) {
+            settings.put(ServerlessBootstrap.STORE_PATH, store.toString());
+        }
         final Path readyFile = home.resolve("ready");
         settings.put(ServerlessBootstrap.READY_FILE, readyFile.toString());
         settings.putAll(extra);
@@ -200,6 +207,28 @@ final class NodeProcess implements Closeable {
     void killHard() throws InterruptedException {
         process.destroyForcibly();
         assert process.waitFor(30, TimeUnit.SECONDS) : "node " + name + " would not die";
+    }
+
+    /**
+     * Writes an {@code opensearch.keystore} the forked node will load at startup.
+     *
+     * <p>Object-store credentials are {@code SecureSetting}s, so they cannot be passed as {@code -D}
+     * properties the way every other setting here is. That is not a test inconvenience: it is the reason
+     * a deployed node could not be given S3 credentials at all until the bootstrap learned to read a
+     * keystore, and this is the other half of that change being exercised.
+     *
+     * @param home the node's path.home; the keystore goes in its config directory
+     * @param entries secure settings to store
+     * @throws Exception if the keystore cannot be written
+     */
+    static void writeKeystore(Path home, Map<String, String> entries) throws Exception {
+        final Path configDir = home.resolve("config");
+        java.nio.file.Files.createDirectories(configDir);
+        final org.opensearch.common.settings.KeyStoreWrapper keystore = org.opensearch.common.settings.KeyStoreWrapper.create();
+        for (Map.Entry<String, String> entry : entries.entrySet()) {
+            keystore.setString(entry.getKey(), entry.getValue().toCharArray());
+        }
+        keystore.save(configDir, new char[0]);
     }
 
     /**

@@ -70,17 +70,57 @@ answers searches with nothing on local disk that matters. A successor with its o
 never sees the first node's disk, rebuilds from the bucket alone — a published commit composed with a
 write-ahead log, which is the case that actually happens rather than the easy one.
 
+## Contention and object storage, together
+
+The last pair of halves that had never met. Ownership, fencing and recovery were tested across processes
+on a local filesystem; the object store was tested on its own. **On a filesystem a compare-and-swap is
+instant and the window between reading a shard-head and writing to it is microseconds. Over HTTP it is
+milliseconds** — and that window is precisely where two nodes can both believe they own a shard. Every
+correctness claim in this project had been measured on the version of the world where the gap barely
+exists.
+
+Three tests now run real forked JVMs against a real bucket:
+
+| Test | What is new about it |
+|---|---|
+| Two processes racing over HTTP | The read-then-write of a shard-head is no longer effectively atomic. Deleting "a live lease is not stolen" makes it fail. |
+| A killed node's data rebuilt by a node that never saw its disk | On a shared directory a successor reads files its predecessor left behind. Here the dead node's disk is gone and irrelevant — everything recovered came out of object storage. |
+| A three-node fleet on one bucket | A fan-out across processes over shards whose segments live in S3, which is the arrangement the design is actually for. |
+
+Four canaries, all caught: a stealable live lease, WAL replay disabled, fan-out restricted to local shards,
+and the keystore ignored.
+
+### The gap that made this a feature, not test plumbing
+
+Object-store credentials are `SecureSetting`s, read from a keystore in the config directory. The bootstrap
+only ever read system properties — so **a deployed node had no way to be given S3 credentials at all**.
+The shell could talk to S3 in a test that handed it `MockSecureSettings`, and nowhere else. It now loads
+`opensearch.keystore` the way a real node does:
+
+- an absent keystore is not an error, because a filesystem-backed node needs no secrets and demanding one
+  would make the simplest configuration the one that fails;
+- a keystore that exists and cannot be read **is** an error, because the alternative is a node that
+  silently cannot reach its store and only says so on the first write;
+- a password-protected keystore is refused outright rather than half-supported, since this bootstrap has
+  nowhere to prompt.
+
+A second, smaller version of the same problem: an s3 store needs `opensearch.path.conf` set, because the
+s3 plugin passes it straight to `System.setProperty` and the AWS SDK NPEs on null. A launcher script
+normally sets it; without it a node died in `main()` with a bare `NullPointerException` and no clue.
+The bootstrap now refuses to start with a message that names the property.
+
 ## What this does NOT establish
 
 - **MinIO is not AWS S3.** Conditional-write linearizability under real contention, listing bounds, and
   the behaviour of S3/GCS/R2 remain unproven.
-- **The failover test uses a clean stop**, and says so. Crash semantics — `kill -9`, a lapsed lease, a
-  zombie resuming — are covered across real processes in `ServerlessContentionTests`, on a filesystem.
-  Nothing has yet crashed a node whose data was in a bucket.
-- **One node at a time.** The multi-process and fleet tests still run on a local directory; nothing has
-  put contention and object storage together.
+- **No zombie test on a bucket.** `kill -9` and recovery are now covered against S3; a SIGSTOPped node
+  resuming after its lease lapsed is still only covered on a filesystem.
 - **Nothing is measured.** No latency, no throughput, no request counts. A local MinIO over loopback is
   not a network, and the block cache and read amplification numbers in `block-reads-notes.md` were all
-  taken against a filesystem.
+  taken against a filesystem. The cost model that justifies the architecture — 3 operations per tick per
+  node — has never been counted against a store that charges per request.
+- **The timings say something anyway, and it is not flattering.** The three-node fleet test takes 69
+  seconds against a bucket where its filesystem twin takes 6. Nothing here is tuned for an object store's
+  latency, and no one has looked at why.
 - **Credentials come from the node keystore** under `s3.client.default.*`, which is the s3 plugin's own
   convention. Nothing here has been run with real IAM, instance roles, or credential rotation.

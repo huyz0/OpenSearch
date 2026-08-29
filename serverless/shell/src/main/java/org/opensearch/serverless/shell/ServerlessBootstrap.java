@@ -72,6 +72,11 @@ public final class ServerlessBootstrap implements Closeable {
     /** Where to write the readiness line once the node is serving. Optional. */
     public static final String READY_FILE = "serverless.ready.file";
 
+    /**
+     * Where {@code opensearch.keystore} lives. Defaults to {@code path.home/config}, as for a real node.
+     */
+    public static final String CONFIG_PATH = "path.conf";
+
     /** The default lease TTL: long enough to survive a slow object store, short enough to fail over. */
     public static final long DEFAULT_LEASE_TTL_MILLIS = 30_000L;
 
@@ -124,34 +129,51 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static ServerlessBootstrap start(Settings settings) throws Exception {
         final String storeType = settings.get(org.opensearch.serverless.store.ObjectStores.TYPE, "fs");
+        if ("s3".equals(storeType) && System.getProperty("opensearch.path.conf") == null) {
+            // The AWS SDK v2 is told where the node's config lives so it does not go looking in the home
+            // directory, and the s3 plugin passes that property straight into System.setProperty. Unset,
+            // it throws a bare NullPointerException from inside the SDK during client construction, which
+            // says nothing about the cause. A launcher script normally sets it; say so rather than let a
+            // node die anonymously.
+            throw new IllegalStateException(
+                "an s3 store requires the system property opensearch.path.conf to be set (the launcher normally sets it); "
+                    + "start this process with -Dopensearch.path.conf=<config dir>"
+            );
+        }
         if ("fs".equals(storeType) && (settings.get(STORE_PATH) == null || settings.get(STORE_PATH).isBlank())) {
             throw new IllegalArgumentException(STORE_PATH + " is required: it is where the metadata plane and segments live");
         }
         final long ttl = settings.getAsLong(LEASE_TTL, DEFAULT_LEASE_TTL_MILLIS);
 
-        // The node comes first now, and it has to: an s3 store is built through the repository plugin,
-        // which wants a ClusterService, and the node is what owns one. The plane is attached immediately
+        // Secure settings, before anything reads them. An object store's credentials are SecureSettings
+        // and live in the keystore, so without this a deployed node has no way to be given any: the shell
+        // could talk to S3 in a test that supplied MockSecureSettings by hand, and not in production.
+        final Path configPath = configPath(settings);
+        final Settings complete = withSecureSettings(settings, configPath);
+
+        // The node comes first, and it has to: an s3 store is built through the repository plugin, which
+        // wants a ClusterService, and the node is what owns one. The plane is attached immediately
         // afterwards, so nothing observable happens in between.
-        final ServerlessNode node = new ServerlessNode(settings);
+        final ServerlessNode node = new ServerlessNode(complete);
         node.start();
 
         final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(
-            settings,
+            complete,
             node.clusterService(),
-            node.nodeEnvironment().nodeDataPaths()[0]
+            configPath
         );
         final MetadataPlane plane = new MetadataPlane(
             store.blobStore(),
             BlobPath.cleanPath(),
             System::currentTimeMillis,
             ttl,
-            settings.getAsBoolean(NODE_LEASE_LIVENESS, false)
+            complete.getAsBoolean(NODE_LEASE_LIVENESS, false)
         );
         node.setMetadataPlane(plane);
 
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(
-            settings.getAsBoolean(ON_DEMAND, true)
-        ).setMaxShardsHeld(settings.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD));
+            complete.getAsBoolean(ON_DEMAND, true)
+        ).setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD));
 
         final ReconcileScheduler scheduler = new ReconcileScheduler(
             loop,
@@ -159,7 +181,7 @@ public final class ServerlessBootstrap implements Closeable {
             plane.clock(),
             org.opensearch.common.unit.TimeValue.timeValueMillis(Math.max(1L, ttl / ReconcileScheduler.RENEWALS_PER_TTL)),
             org.opensearch.common.unit.TimeValue.timeValueMillis(
-                settings.getAsLong(PUBLISH_DEBOUNCE, ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
+                complete.getAsLong(PUBLISH_DEBOUNCE, ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
             ),
             ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
         );
@@ -172,9 +194,40 @@ public final class ServerlessBootstrap implements Closeable {
             storeType,
             ttl,
             node.boundHttpAddress().publishAddress(),
-            settings.getAsBoolean(ON_DEMAND, true)
+            complete.getAsBoolean(ON_DEMAND, true)
         );
         return new ServerlessBootstrap(node, plane, loop, scheduler, store);
+    }
+
+    private static Path configPath(Settings settings) {
+        final String configured = settings.get(CONFIG_PATH);
+        if (configured != null && configured.isBlank() == false) {
+            return Path.of(configured);
+        }
+        return Path.of(settings.get("path.home")).resolve("config");
+    }
+
+    /**
+     * Folds the keystore into the settings, if there is one.
+     *
+     * <p>Absent keystore is not an error: a node backed by the filesystem needs no secrets, and demanding
+     * one would make the simplest configuration the one that fails. A keystore that exists and cannot be
+     * read <em>is</em> an error, because the alternative is starting a node that silently cannot reach
+     * its object store and only says so on the first write.
+     */
+    private static Settings withSecureSettings(Settings settings, Path configPath) throws Exception {
+        final org.opensearch.common.settings.KeyStoreWrapper keystore = org.opensearch.common.settings.KeyStoreWrapper.load(configPath);
+        if (keystore == null) {
+            return settings;
+        }
+        if (keystore.hasPassword()) {
+            throw new IllegalStateException(
+                "the keystore at " + configPath + " is password-protected, and this bootstrap has no way to prompt for one"
+            );
+        }
+        keystore.decrypt(new char[0]);
+        logger.info("loaded {} secure setting(s) from {}", keystore.getSettingNames().size(), configPath);
+        return Settings.builder().put(settings).setSecureSettings(keystore).build();
     }
 
     /**

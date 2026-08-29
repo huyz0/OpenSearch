@@ -32,6 +32,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessFleetTests.class'
   exclude '**/MinioBlobContainerConformanceTests.class'
   exclude '**/ServerlessOnObjectStoreTests.class'
+  exclude '**/ServerlessBucketContentionTests.class'
 }
 
 // R11 against a real S3 API. Its own task because it needs a running endpoint and because the AWS SDK v2
@@ -54,6 +55,10 @@ tasks.register('processTest', Test) {
   classpath = sourceSets.test.runtimeClasspath
   include '**/ServerlessContentionTests.class'
   include '**/ServerlessFleetTests.class'
+  // Forks real JVMs *and* talks to S3, so it needs both this task's seccomp exemption and the config
+  // path the AWS SDK insists on.
+  include '**/ServerlessBucketContentionTests.class'
+  systemProperty 'opensearch.path.conf', 'config'
   systemProperty 'tests.system_call_filter', 'false'
   // The forked node must run a PRODUCTION classpath. OpenSearch's Randomness decides it is "running
   // tests" purely by whether randomizedtesting is loadable, and then demands a test context that a real
