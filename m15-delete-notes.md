@@ -94,6 +94,76 @@ delete suite produced it.
 - **No `if_seq_no` / version-conditional delete.** A delete removes whatever is there.
 - **Not tested on a bucket or across processes.** The failover tests run nodes in one JVM against a local
   directory; the bucket and multi-process suites still delete nothing.
-- **The log is never reclaimed across terms.** `onPublished` trims only the publishing writer's own term,
-  so a dead predecessor's records are trimmed by nobody and replayed by every successor forever. Harmless
-  today because replay is ordered and idempotent, and unbounded growth all the same.
+- ~~**The log is never reclaimed across terms.**~~ Closed below.
+
+# Reclaiming the log across terms
+
+The gap above, closed. `onPublished` still trims the publishing writer's own term a cycle late, and now
+also drops every record under a term strictly below it.
+
+## Why a lower term is safe to drop outright when the current one is not
+
+The same-term rule is conservative because records are appended *before* being applied, so a record
+present at the moment of a flush is not necessarily in that flush. That window does not exist for another
+writer's term: a successor replays every older record **before** it starts, so by the time it publishes at
+term T those records are in the engine and therefore in the commit.
+
+The case that looks uncovered is covered by ordering rather than by timing. A zombie still appending under
+its old term after the successor replayed has records that are genuinely not in the commit — and deleting
+them loses nothing, because they were already destined to lose. Replay is ordered term-then-ordinal, so
+`t=1` is always applied before `t=2`: for a shared document id the zombie's write is overwritten anyway,
+and for an unshared one it wrote to a shard it no longer owned. That is what fencing means.
+
+## Three canaries, all caught
+
+| Planted defect | Caught by |
+|---|---|
+| No cross-term drop at all | both new reclamation tests |
+| Drop the publishing writer's own term too (`>` instead of `>=`) | the existing one-cycle-lag test, and the new test's own-term assertion |
+| A successor tidies up the log it just replayed (drop moved into `replayable()`) | `testReclaimedRecordsAreAlreadyInACommit`, and **only** that one |
+
+The third is the one worth having. It is the tempting version of this change — clean up after reading —
+and no test written before this round noticed it, including the end-to-end failover test. It is caught by
+going three failovers deep with the middle two activating *without* publishing, which is only possible
+because `activateWriter` and a reconcile tick differ: a tick publishes in the same pass it activates in.
+
+## A test that had stopped meaning anything
+
+`testAGarbageCollectionSweepDoesNotTouchTheWriteAheadLog` broke, correctly. It asserted the log was
+non-empty after a sweep — but the log is now legitimately empty by then, reclaimed by the publish, and the
+assertion could no longer tell that from a sweep having eaten it. Its other assertion, that no collected
+name contains `"wal"`, never could: the collector names what it deletes `t=N/blob`.
+
+Rewritten, it says less than it looked like it said, and that is the honest reading. The sweep skips any
+container at or above the live manifest's term, so the **only** log records it could ever reach are ones a
+publish has already superseded — exactly the ones `WalStore` deletes itself. Collecting them would lose
+nothing. What the test defends is ownership, not data: two components must not both reclaim the log when
+only one of them states a rule for when that is safe. It now plants a stale-term record, counts before and
+after, and is checked against a sweep made recursive.
+
+## What it costs
+
+Measured, both stores, as listings on a publish carrying one document:
+
+| | publish that reclaimed 3 dead terms | the next publish |
+|---|---|---|
+| s3 (MinIO) | 4 | **1** |
+| fs | 4 | **4** |
+
+On a bucket, emptying a prefix makes it stop existing, so a reclaimed term is not there to be listed again
+and the cost falls by exactly one listing per dead term. On a filesystem the emptied directories remain and
+are re-listed on every publish forever. That is a recurring toll, and it is tolerable only because the
+filesystem store is a test fixture (D5) where a listing is a system call rather than a billed request. Both
+numbers are asserted, so the fixture's behaviour cannot change quietly.
+
+The first version of that measurement compared the activation tick against the following tick and reported
+35 requests against 4. The difference was entirely a publish happening versus not happening — publication
+is edge-triggered, and the second tick had nothing dirty. Both measurements are now publishes.
+
+## Still open
+
+- Nothing reclaims a shard's log if **no successor ever publishes** — an index written once and abandoned
+  keeps its records until the index is deleted. Bounded by what was written, not growing, so it is a
+  tidiness problem rather than a correctness one.
+- A persistent zombie appending under an old term is reclaimed only when the live writer next publishes.
+  Bounded by the publish interval, and every record it writes is one that loses on replay.

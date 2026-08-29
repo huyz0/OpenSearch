@@ -306,4 +306,98 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             return false;
         }
     }
+
+    /**
+     * Reclaiming a dead predecessor's log costs listings once, and on a bucket it does not cost them again.
+     *
+     * <p>Cross-term reclamation makes every publish list the log's term containers so it can drop the ones
+     * below its own. That is a new object-store operation on the publish path, and the question a count
+     * answers and an argument does not is whether it is paid once per dead term or once per publish, for
+     * the life of the shard.
+     *
+     * <p><b>The answer differs by store, and both answers are asserted.</b> On a bucket, emptying a prefix
+     * makes it stop existing, so a reclaimed term is not there to be listed next time and the second publish
+     * is exactly {@code deadTerms} listings cheaper. On a filesystem the emptied directories remain, are
+     * re-listed on every publish forever, and the cost does not fall — which is a recurring toll, and
+     * tolerable only because the filesystem store is a test fixture (D5) and its listings are system calls
+     * rather than billed requests. Pinned here so that if the fixture ever becomes something people run on,
+     * this is a measured number rather than a surprise.
+     *
+     * <p>Both measurements are publishes carrying one document, so the difference between them is the
+     * reclamation and nothing else. The first version of this test compared the activation tick against the
+     * next tick and found 35 requests against 4 — a difference that was entirely a publish happening versus
+     * not happening, since publication is edge-triggered and the second tick had nothing dirty to publish.
+     */
+    public void testReclaimingTheLogCostsListingsOncePerDeadTerm() throws Exception {
+        for (boolean onBucket : new boolean[] { false, true }) {
+            if (onBucket) {
+                assumeEndpoint();
+            }
+            final CountingBlobStore store = onBucket ? bucket() : filesystem();
+            final String label = onBucket ? "s3" : "fs";
+            final java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong(1_000L);
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+            // Three writers that took the shard and died. Simulated at the plane rather than with three
+            // real nodes: what is measured is the cost of the containers they leave behind, and a
+            // container does not remember how it was filled.
+            final int deadTerms = 3;
+            final java.util.List<Long> ghostTerms = new java.util.ArrayList<>();
+            for (int i = 0; i < deadTerms; i++) {
+                clock.addAndGet(TTL + 1);
+                ghostTerms.add(plane.activate("alpha", 0, "ghost-" + i, "ephemeral-" + i).head().term());
+            }
+
+            clock.addAndGet(TTL + 1);
+            try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-reclaim-" + label))) {
+                node.start();
+                final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+                loop.want("alpha", 0);
+                loop.tick(clock.get());   // activates, and publishes in the same pass
+                final ShardId shardId = node.reconciler().openShards().iterator().next();
+
+                // The dead terms' records are appended now rather than earlier, because the activation
+                // above would otherwise have reclaimed them before anything was being counted. Written
+                // at a term below the live one, which is what a zombie that has not noticed it lost the
+                // shard produces, and the only state a publish can find to reclaim.
+                for (long ghost : ghostTerms) {
+                    plane.walStore("alpha", 0)
+                        .append(ghost, new org.opensearch.serverless.store.WalRecord("g" + ghost, "{\"msg\":\"ghost\"}"));
+                }
+
+                node.index(shardId, "one", "{\"msg\":\"cost\",\"n\":1}");
+                store.reset();
+                assertEquals(1, loop.tick(clock.addAndGet(1_000)).published().size());
+                final long reclaiming = store.listings();
+
+                node.index(shardId, "two", "{\"msg\":\"cost\",\"n\":2}");
+                store.reset();
+                assertEquals(1, loop.tick(clock.addAndGet(1_000)).published().size());
+                final long afterwards = store.listings();
+
+                logger.info(
+                    "cost[{}]: the publish that reclaimed {} dead terms did {} listings; the next publish did {}",
+                    label,
+                    deadTerms,
+                    reclaiming,
+                    afterwards
+                );
+
+                if (onBucket) {
+                    assertEquals(
+                        "on s3, reclaiming " + deadTerms + " dead terms should stop costing listings once they are gone",
+                        reclaiming - deadTerms,
+                        afterwards
+                    );
+                } else {
+                    assertEquals(
+                        "on fs, emptied term directories remain and are re-listed; if that changed, say so here",
+                        reclaiming,
+                        afterwards
+                    );
+                }
+            }
+        }
+    }
 }

@@ -35,7 +35,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * appending after it lost the shard writes where the successor is not reading, for the same reason and
  * by the same mechanism as §9.6's fencing of segment blobs.
  *
- * <p><b>Truncation is deliberately conservative.</b> Records are appended <em>before</em> being applied
+ * <p><b>Truncation happens on two different rules, and they are not the same rule.</b> Records under the
+ * publishing writer's own term are trimmed a cycle late, for the reason below. Records under
+ * <em>older</em> terms are dropped outright, because a successor replays them all before it starts and
+ * a publish at a higher term therefore contains every one of them.
+ *
+ * <p><b>Same-term truncation is deliberately conservative.</b> Records are appended <em>before</em> being applied
  * to the engine, so a record present at the moment of a flush is not necessarily <em>in</em> that
  * flush. Deleting what the current publish snapshotted could therefore drop a write that had not landed
  * yet. Instead each publish deletes what the <em>previous</em> publish saw, which guarantees a full
@@ -148,7 +153,49 @@ public final class WalStore {
             container.deleteBlobsIgnoringIfNotExists(toDelete);
         }
         previousSnapshot = current;
-        return toDelete.size();
+        return toDelete.size() + dropOlderTerms(term);
+    }
+
+    /**
+     * Drops every record belonging to a term older than the one that just published.
+     *
+     * <p>Without this the log only ever grows. The conservative rule above trims the publishing writer's
+     * own term and nothing else, so a dead predecessor's records are trimmed by nobody and replayed by
+     * every successor for the life of the shard.
+     *
+     * <p><b>Why a full publish at a higher term makes them safe to drop</b>, where the same-term rule has
+     * to wait a cycle: a successor replays every older record <em>before</em> it starts, so by the time it
+     * publishes at term T those records are in the engine and therefore in the commit. There is no
+     * appended-but-not-yet-applied window for another writer's term, because this writer applied all of
+     * them at once and then flushed.
+     *
+     * <p><b>And the one case that is not covered is covered anyway.</b> A zombie still appending under its
+     * old term after the successor replayed has records that are <em>not</em> in the commit — and deleting
+     * them loses nothing, because they were already destined to lose. Replay is ordered by term and then
+     * ordinal, so a record under {@code t=1} is always applied before one under {@code t=2}: the zombie's
+     * late write is overwritten by the successor's for any document they share, and for any document they
+     * do not, the zombie wrote to a shard it no longer owned. That is what fencing means.
+     *
+     * @param term the term that just published
+     * @return how many records were dropped
+     * @throws IOException if listing or deleting fails
+     */
+    private int dropOlderTerms(long term) throws IOException {
+        final BlobContainer walRoot = blobStore.blobContainer(shardBase.add("wal"));
+        int dropped = 0;
+        for (Map.Entry<String, BlobContainer> child : walRoot.children().entrySet()) {
+            final Long childTerm = parseTerm(child.getKey());
+            if (childTerm == null || childTerm >= term) {
+                continue;
+            }
+            final List<String> ours = new ArrayList<>(child.getValue().listBlobs().keySet());
+            ours.removeIf(name -> RECORD_NAME.matcher(name).matches() == false);
+            if (ours.isEmpty() == false) {
+                child.getValue().deleteBlobsIgnoringIfNotExists(ours);
+                dropped += ours.size();
+            }
+        }
+        return dropped;
     }
 
     /**
