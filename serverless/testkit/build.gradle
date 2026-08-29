@@ -33,6 +33,7 @@ tasks.named('test').configure {
   exclude '**/MinioBlobContainerConformanceTests.class'
   exclude '**/ServerlessOnObjectStoreTests.class'
   exclude '**/ServerlessBucketContentionTests.class'
+  exclude '**/ServerlessCostTests.class'
 }
 
 // R11 against a real S3 API. Its own task because it needs a running endpoint and because the AWS SDK v2
@@ -43,6 +44,7 @@ tasks.register('s3Test', Test) {
   classpath = sourceSets.test.runtimeClasspath
   include '**/MinioBlobContainerConformanceTests.class'
   include '**/ServerlessOnObjectStoreTests.class'
+  include '**/ServerlessCostTests.class'
   systemProperty 'opensearch.path.conf', 'config'
   systemProperty 'tests.security.manager', 'false'
   // Netty refuses a second attempt to set its global processor count, and both the node's transport and
