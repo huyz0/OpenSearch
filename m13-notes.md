@@ -152,12 +152,50 @@ Refusing is logged as a routing outcome, not an error, because a node that is fu
 broken should not page the same person. The default of 1000 is reasoned, not measured: phase 9 measured
 index residency and never shard-count scaling, so nothing here knows what a node can actually hold.
 
+## A node as a process
+
+`ServerlessBootstrap` is the last of the headline gap. The scheduler made a node *capable* of running
+unattended; until this existed nothing ever built one outside a test method, so the claim was true of an
+arrangement that only occurred inside JUnit.
+
+`main()` reads settings from system properties — no configuration format invented before there is
+anything to configure — installs a shutdown hook, and blocks. `start(Settings)` is the same path, usable
+from a test, which is how the tests below drive it.
+
+Two ordering decisions that are not tidiness:
+
+- **The scheduler starts last**, after the node is serving and the plane is attached. A renewal that ran
+  earlier would advertise a lease pointing at an address that refuses connections — and peers resolve
+  forwarding targets from exactly that lease.
+- **Shutdown stops the clocks first**, then releases the lease. A renewal racing the release would put
+  the lease back after it was dropped.
+
+**The daemon's default for on-demand activation is the opposite of the library's, deliberately.** A
+library that silently changed placement policy would be a trap; a daemon that started owning nothing and
+never acquired anything would be useless. Both defaults are visible and
+`serverless.activation.on_demand` controls the process one.
+
+### The vacuous assertion this found
+
+`testACleanShutdownDoesNotLeaveAGhostBehind` first asserted the lease was *not live 60 seconds from now*.
+With a 600 ms test TTL that is true whether or not shutdown does anything — it was measuring the clock,
+not the code. Checking revealed why it passed: `BlobLeaseMembership.release` existed and **nothing in
+production called it**. So a node that shut down cleanly stayed alive to every peer for a full TTL, and
+its shards were unowned and unclaimable that whole time, because a live lease is never stolen.
+
+Fixed both ends: the bootstrap now releases on close, and the assertion is *absence*, which is the one
+that fails when it does not. Releasing is what makes a restart a handover rather than a failover, and it
+costs one delete.
+
 ## What this does NOT establish
 
-- **There is still no `main()`.** The shell has no process bootstrap; nodes are constructed by tests.
-  `startFor` is the call a bootstrap would make, and nothing calls it outside a test. "A node runs by
-  itself once something builds one" is what was delivered; "a node exists as a process" was not. The
-  placement question that blocked it is now answered, so this is buildable.
+- **The process is filesystem-backed only (D5).** `serverless.store.path` is a local directory standing
+  in for an object store. `ServerlessBootstrap` is a real process but not a deployment story, and R11 is
+  what would lift that. Accepting an S3 bucket it has never been run against would be worse than saying
+  what it is.
+- **Nothing has run more than one process at a time.** Every bootstrap test starts one node. Two nodes
+  contending for a shard, a real kill -9 rather than `close()`, and a restart taking its own shards back
+  are all untested at the process level.
 - **Demand-driven activation is off by default and unmeasured.** The mechanism exists and is tested;
   no deployment has run with it on, its cap is a guess, and nothing balances shards across nodes once
   they are taken — a node that receives a burst of first-writes takes all of them up to its cap while
