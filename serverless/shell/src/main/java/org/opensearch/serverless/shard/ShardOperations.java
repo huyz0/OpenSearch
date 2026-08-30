@@ -298,6 +298,95 @@ public final class ShardOperations {
         }
     }
 
+    /** What a whole search found, and how much of the index it managed to look at. */
+    public static final class SearchOutcome {
+
+        private final long total;
+        private final java.util.List<org.opensearch.search.SearchHit> hits;
+        private final int shards;
+        private final int answered;
+
+        /**
+         * Creates the outcome.
+         *
+         * @param total how many matched
+         * @param hits the merged page
+         * @param shards how many shards the index has
+         * @param answered how many answered
+         */
+        public SearchOutcome(long total, java.util.List<org.opensearch.search.SearchHit> hits, int shards, int answered) {
+            this.total = total;
+            this.hits = hits;
+            this.shards = shards;
+            this.answered = answered;
+        }
+
+        /**
+         * Returns how many documents matched, summed over the shards that answered.
+         *
+         * @return the total
+         */
+        public long total() {
+            return total;
+        }
+
+        /**
+         * Returns the page of hits, merged across shards and cut to the requested window.
+         *
+         * @return the hits
+         */
+        public java.util.List<org.opensearch.search.SearchHit> hits() {
+            return hits;
+        }
+
+        /**
+         * Returns how many shards the index has.
+         *
+         * @return the shard count
+         */
+        public int shards() {
+            return shards;
+        }
+
+        /**
+         * Returns how many of them answered.
+         *
+         * @return the answered count
+         */
+        public int answered() {
+            return answered;
+        }
+
+        /**
+         * Reports whether every shard answered.
+         *
+         * <p>Stated rather than implied: a caller reading only {@link #total()} has no way to tell a
+         * complete answer from one computed over a fraction of the index.
+         *
+         * @return true when the whole index was searched
+         */
+        public boolean complete() {
+            return answered == shards;
+        }
+    }
+
+    /**
+     * Runs a search across every shard of an index and merges the answers.
+     *
+     * <p>Lifted out of {@code SearchHandler} unchanged so that the REST layer and a plugin's
+     * {@code Client} run the same fan-out, the same merge and the same window. A search that behaved one
+     * way for a user and another for a plugin would be two search engines wearing one name.
+     *
+     * @param index the index
+     * @param source the query, with its own from and size
+     * @return what was found and how completely
+     * @throws IOException if the search fails outright
+     */
+    public SearchOutcome search(String index, org.opensearch.search.builder.SearchSourceBuilder source) throws IOException {
+        final IndexDescriptor descriptor = plane.describe(index).orElseThrow(() -> new NoSuchIndexException(index));
+        return org.opensearch.serverless.rest.SearchFanout.run(node, plane, index, descriptor.numberOfShards(), source);
+    }
+
     /**
      * Writes one document, durably, wherever it belongs.
      *

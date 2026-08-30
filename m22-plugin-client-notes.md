@@ -73,10 +73,33 @@ not count as caught. Replaced with one that does.
 - **No plugin has been loaded.** `PluginsService` is still constructed with an empty list. This is the
   interface a plugin would use, tested directly; the lifecycle (`createComponents` without Guice, REST
   handler registration, the handler-wrapper slot) is the next piece.
-- **No search, no bulk, no update, no admin beyond create-index.** Refused by name. Search in particular
-  is a plugin's normal way to load all of its config docs, so it is the first to add.
+- **No bulk, no update, no admin beyond create-index.** Refused by name.
 - **No system-index semantics.** `.plugin_config` is an ordinary index here — not hidden from listings,
   not protected from deletion, not auto-created from a `SystemIndexPlugin` descriptor.
 - **`ActionFilter`s remain impossible**, so a plugin's authorization cannot work. Unchanged by this and
   unchanged by anything short of rebuilding `action/`.
 - **Nothing measured.** What a client call costs against an object store is unknown.
+
+# Addendum: search, and the third copy of the fan-out
+
+Search is now served too, which completes the minimum a plugin needs: it is how a plugin like Security
+loads its whole config at startup.
+
+Doing it removed the routing duplicate this milestone was about. The fan-out — ask every shard, merge by
+score, cut to the window — lived in `SearchHandler`; a client search would have been a second copy of it.
+`SearchFanout` is that logic once, and `SearchHandler` is now formatting over it. **A plugin's search and
+a user's search are the same code**, which matters more than it sounds: a second implementation would be
+the untested one, and it would be the one a plugin depends on.
+
+That also means the refusals come free. A plugin asking for an aggregation gets the same 501-shaped answer
+a user does, because there is one place that decides.
+
+| Planted defect | Caught by |
+|---|---|
+| Fan out to only the first shard | the client's search test **and** two REST search tests |
+
+One shared path, one canary, three tests notice — which is the argument for the extraction stated as a
+number.
+
+The client test uses a **two-shard** index deliberately. A client search that only worked where a single
+shard answered alone would pass against a one-shard fixture and fail on the first real deployment.

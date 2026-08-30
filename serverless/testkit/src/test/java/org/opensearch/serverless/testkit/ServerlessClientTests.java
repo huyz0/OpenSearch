@@ -134,9 +134,12 @@ public class ServerlessClientTests extends OpenSearchTestCase {
             node.setMetadataPlane(metadata);
             metadata.createIndex(new IndexDescriptor(".plugin_config", "uuid-cfg-000000000", 1, MAPPING, null));
 
-            final var failure = expectThrows(Exception.class, () -> node.client().search(new SearchRequest(".plugin_config")).actionGet());
+            final var failure = expectThrows(
+                Exception.class,
+                () -> node.client().bulk(new org.opensearch.action.bulk.BulkRequest()).actionGet()
+            );
             final String message = failure.getMessage() == null ? failure.toString() : failure.getMessage();
-            assertTrue("the refusal must name the action it refused: " + message, message.contains("indices:data/read/search"));
+            assertTrue("the refusal must name the action it refused: " + message, message.contains("indices:data/write/bulk"));
             assertTrue("and say who refused it: " + message, message.contains("serverless shell"));
         }
     }
@@ -197,6 +200,54 @@ public class ServerlessClientTests extends OpenSearchTestCase {
 
             final var fromOwner = owner.client().get(new GetRequest(".plugin_config", "k")).actionGet();
             assertTrue("and the owner must have it too", fromOwner.isExists());
+        }
+    }
+
+    /**
+     * A plugin loads all of its state with a search, through the same fan-out a user's search uses.
+     *
+     * <p>Reading every config document is how a plugin like Security starts up. Two shards, so the merge
+     * is exercised rather than a single shard answering alone — a client search that only worked on
+     * one-shard indices would work for the fixture and fail on the first real deployment.
+     */
+    public void testAPluginCanLoadAllOfItsStateWithASearch() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane metadata = plane(clock);
+        metadata.createIndex(new IndexDescriptor(".plugin_config", "uuid-cfg-000000000", 2, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("client-search"))) {
+            node.start();
+            node.setMetadataPlane(metadata);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, metadata);
+            loop.want(".plugin_config", 0);
+            loop.want(".plugin_config", 1);
+            loop.tick(clock.get());
+            assertEquals("both shards must be held for the merge to be exercised", 2, node.reconciler().openShards().size());
+
+            final Client client = node.client();
+            for (int i = 0; i < 8; i++) {
+                client.index(
+                    new IndexRequest(".plugin_config").id("cfg" + i)
+                        .source("{\"msg\":\"config\",\"n\":" + i + "}", XContentType.JSON)
+                        .setRefreshPolicy(org.opensearch.action.support.WriteRequest.RefreshPolicy.IMMEDIATE)
+                ).actionGet();
+            }
+
+            final var found = client.search(
+                new SearchRequest(".plugin_config").source(
+                    new org.opensearch.search.builder.SearchSourceBuilder().query(
+                        org.opensearch.index.query.QueryBuilders.matchQuery("msg", "config")
+                    ).size(20)
+                )
+            ).actionGet();
+
+            assertEquals("every config document must come back: " + found, 8L, found.getHits().getTotalHits().value());
+            assertEquals("and the page must hold them all", 8, found.getHits().getHits().length);
+            assertEquals("both shards must have answered", 2, found.getSuccessfulShards());
+            assertTrue(
+                "and a hit must carry its source: " + found.getHits().getHits()[0].getSourceAsString(),
+                found.getHits().getHits()[0].getSourceAsString().contains("config")
+            );
         }
     }
 }

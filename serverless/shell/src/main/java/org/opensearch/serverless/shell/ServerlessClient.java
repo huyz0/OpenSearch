@@ -113,6 +113,9 @@ public final class ServerlessClient extends AbstractClient {
         if (CreateIndexAction.INSTANCE.name().equals(action.name())) {
             return createIndex((CreateIndexRequest) request, metadata);
         }
+        if (org.opensearch.action.search.SearchAction.INSTANCE.name().equals(action.name())) {
+            return search((org.opensearch.action.search.SearchRequest) request, operations);
+        }
         throw new UnsupportedOperationException(
             "the serverless shell does not implement action ["
                 + action.name()
@@ -122,8 +125,10 @@ public final class ServerlessClient extends AbstractClient {
                 + GetAction.INSTANCE.name()
                 + ", "
                 + DeleteAction.INSTANCE.name()
-                + " and "
+                + ", "
                 + CreateIndexAction.INSTANCE.name()
+                + " and "
+                + org.opensearch.action.search.SearchAction.INSTANCE.name()
         );
     }
 
@@ -172,6 +177,45 @@ public final class ServerlessClient extends AbstractClient {
             0L,
             1L,
             found
+        );
+    }
+
+    /**
+     * Runs a search through the same fan-out a user's search uses.
+     *
+     * <p>This is how a plugin loads all of its state — Security reads its whole config that way — so it
+     * matters that it is the same code path and not a second one. What cannot be merged across shards is
+     * refused by {@code SearchHandler} for REST callers and by the fan-out for everyone; a plugin asking
+     * for an aggregation gets the same answer a user does.
+     */
+    private org.opensearch.action.search.SearchResponse search(
+        org.opensearch.action.search.SearchRequest request,
+        ShardOperations operations
+    ) throws Exception {
+        final var source = request.source() == null
+            ? new org.opensearch.search.builder.SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.matchAllQuery())
+            : request.source();
+        if (source.size() < 0) {
+            source.size(10);
+        }
+        if (source.from() < 0) {
+            source.from(0);
+        }
+        final var outcome = operations.search(request.indices()[0], source);
+        final org.opensearch.search.SearchHits hits = new org.opensearch.search.SearchHits(
+            outcome.hits().toArray(new org.opensearch.search.SearchHit[0]),
+            new org.apache.lucene.search.TotalHits(outcome.total(), org.apache.lucene.search.TotalHits.Relation.EQUAL_TO),
+            outcome.hits().isEmpty() ? Float.NaN : outcome.hits().get(0).getScore()
+        );
+        return new org.opensearch.action.search.SearchResponse(
+            new org.opensearch.action.search.SearchResponseSections(hits, null, null, false, false, null, 1),
+            null,
+            outcome.shards(),
+            outcome.answered(),
+            0,
+            0L,
+            org.opensearch.action.search.ShardSearchFailure.EMPTY_ARRAY,
+            org.opensearch.action.search.SearchResponse.Clusters.EMPTY
         );
     }
 
