@@ -159,6 +159,7 @@ public final class ShardRouter {
             // unlucky routing decision costs a cold read and never a wrong answer.
             shardId = node.serveAsReader(plane.get(), request.index(), request.shard());
         }
+        node.markUsed(shardId);
         final ShardQuery.Result result = ShardQuery.execute(node.searchService(), shardId, request.source());
         channel.sendResponse(new ForwardedSearchResponse(result.total(), result.hits()));
     }

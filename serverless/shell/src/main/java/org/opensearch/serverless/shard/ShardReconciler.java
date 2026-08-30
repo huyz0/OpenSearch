@@ -191,6 +191,9 @@ public final class ShardReconciler {
      * not apply the mapping, and without it the first write returns MAPPING_UPDATE_REQUIRED as a
      * <em>result value</em> rather than throwing (see {@code s0-findings.md} F5).
      */
+    /** When each open shard was last touched by a request. */
+    private final java.util.concurrent.ConcurrentHashMap<ShardId, Long> lastUsed = new java.util.concurrent.ConcurrentHashMap<>();
+
     /** One monitor per index, guarding the create-or-update of its {@link IndexService}. */
     private final java.util.concurrent.ConcurrentHashMap<Index, Object> indexLocks = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -438,6 +441,7 @@ public final class ShardReconciler {
     public void releaseShard(ShardId shardId, String reason) {
         readers.remove(shardId);
         walCache.remove(shardId);
+        lastUsed.remove(shardId);
         final IndexShard shard = open.remove(shardId);
         if (shard == null) {
             return;
@@ -460,6 +464,39 @@ public final class ShardReconciler {
      */
     public IndexShard shard(ShardId shardId) {
         return open.get(shardId);
+    }
+
+    /**
+     * Records that something a user asked for touched this shard.
+     *
+     * <p><b>Called from the request paths and nowhere else</b>, which is the whole point. The obvious
+     * place to put this is {@link #shard(ShardId)}, and that would be wrong: publication, heartbeats and
+     * the garbage collector all reach for a shard, so a shard would count as busy because the node was
+     * maintaining it. Only work somebody asked for should keep a shard resident.
+     *
+     * @param shardId the shard used
+     * @param nowMillis when
+     */
+    public void markUsed(ShardId shardId, long nowMillis) {
+        if (open.containsKey(shardId)) {
+            lastUsed.put(shardId, nowMillis);
+        }
+    }
+
+    /**
+     * When this shard was last used by a request, or empty if it has never been.
+     *
+     * <p>A shard that was opened and never asked for anything has no entry, and is treated as having been
+     * used when it opened — see {@code BackgroundReconciler#releaseIdle}. Reporting "never" as "infinitely
+     * idle" would release a shard the instant after activating it, which is the loop a demand-driven node
+     * would then spin in forever.
+     *
+     * @param shardId the shard
+     * @return the timestamp, or empty
+     */
+    public java.util.OptionalLong lastUsed(ShardId shardId) {
+        final Long at = lastUsed.get(shardId);
+        return at == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(at);
     }
 
     /**

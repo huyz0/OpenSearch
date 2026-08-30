@@ -58,6 +58,15 @@ public final class ServerlessBootstrap implements Closeable {
     public static final String MAX_SHARDS = "serverless.activation.max_shards";
 
     /**
+     * How long a shard may go unused before this node lets go of it. Zero never releases.
+     *
+     * <p>On here and off in the library, the same split {@link #ON_DEMAND} has. A node running unattended
+     * that only ever acquires shards is not serverless in any sense its users would recognise — it is a
+     * process that grows until it hits {@link #MAX_SHARDS} and then starts refusing.
+     */
+    public static final String IDLE_AFTER = "serverless.activation.idle_after_millis";
+
+    /**
      * How long writes are gathered before one publish covers them all. Exposed because it is the knob
      * that decides how much a crashed node leaves for its successor to replay from the log.
      */
@@ -164,7 +173,9 @@ public final class ServerlessBootstrap implements Closeable {
 
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(
             complete.getAsBoolean(ON_DEMAND, true)
-        ).setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD));
+        )
+            .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
+            .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS));
 
         final ReconcileScheduler scheduler = new ReconcileScheduler(
             loop,

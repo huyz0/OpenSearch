@@ -67,6 +67,23 @@ public final class BackgroundReconciler implements Closeable {
     private volatile int maxShardsHeld = DEFAULT_MAX_SHARDS_HELD;
 
     /**
+     * How long a shard may go unused before a node lets go of it, when idle release is enabled.
+     *
+     * <p>Five minutes. Derived rather than picked: re-opening costs about 41 object-store requests and
+     * holding costs a few reads per tick, so the break-even is on the order of a minute at the default
+     * backstop interval. Five sits an order of magnitude above the noise in that estimate, because the
+     * asymmetry is not symmetric — holding a shard too long wastes a little money, and releasing one that
+     * was about to be used again costs a cold open and the latency a user sees.
+     */
+    public static final long DEFAULT_IDLE_AFTER_MILLIS = 300_000L;
+
+    /** Zero disables it, which is the library default; {@code ServerlessBootstrap} turns it on. */
+    private volatile long idleAfterMillis = 0L;
+
+    /** When each shard was opened, so one that has never been used is not instantly idle. */
+    private final java.util.Map<ShardId, Long> openedAt = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
      * Creates a reconciler for one node.
      *
      * @param node the node whose shards this manages
@@ -109,10 +126,107 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public TickResult tick(long nowMillis) throws Exception {
-        final Set<ShardId> released = renewLeases();
+        final Set<ShardId> released = new java.util.LinkedHashSet<>(renewLeases());
         final Set<ShardId> activated = activateWanted();
         final Set<ShardId> published = publishAll();
+        // After publishing, so a shard released for idleness has just had its chance to flush.
+        released.addAll(releaseIdle(nowMillis));
         return new TickResult(released, activated, published, refreshHints(nowMillis));
+    }
+
+    /**
+     * Lets go of shards nobody has asked about, so that a node can shrink instead of only ever growing.
+     *
+     * <p><b>Until this existed, nothing ever released a shard voluntarily.</b> A shard was let go only
+     * when ownership was taken away — fenced, reassigned, or the lease lost — so a node that answered one
+     * query for an index held that shard for the life of the process, and {@code maxShardsHeld} was a
+     * refusal rather than an eviction. "Scale to zero" was something an operator did by killing the
+     * process, not something the system did.
+     *
+     * <p><b>The trade is measured on both sides</b> ({@code m20-fanout-notes.md}). Holding an idle shard
+     * costs reads on every reconcile tick, in proportion to how many are held. Releasing one and opening
+     * it again costs about 41 object-store requests, of which 12 are data. So releasing pays as soon as a
+     * shard stays cold for longer than the re-open cost divided by the per-tick holding cost, and the
+     * default below is chosen to sit well beyond that rather than at it — a shard released a moment before
+     * it was wanted costs both numbers and gains nothing.
+     *
+     * <p><b>The order is the correctness argument, and it is not the obvious one.</b> A writer publishes,
+     * <em>then</em> releases its head, <em>then</em> closes. Publishing first is not what makes the data
+     * safe — the log already does that, and a successor would replay it — it is what stops the release
+     * handing the next owner a log to replay for no reason. Releasing the head before closing is the part
+     * that matters: a node that closed a shard while the head still named it would answer 503 for that
+     * shard until its lease lapsed, having volunteered to become the thing failover exists to route
+     * around. If the head cannot be released, the shard is kept.
+     *
+     * <p>A shard that has never been asked for anything is treated as used when it opened, not as
+     * infinitely idle — otherwise a demand-driven node would release each shard immediately after taking
+     * it and spin.
+     *
+     * @param nowMillis the observer's clock
+     * @return the shards released for idleness
+     */
+    public Set<ShardId> releaseIdle(long nowMillis) {
+        final Set<ShardId> letGo = new java.util.LinkedHashSet<>();
+        if (idleAfterMillis <= 0) {
+            return letGo;
+        }
+        for (ShardId shardId : node.reconciler().openShards()) {
+            final long lastUsed = node.reconciler().lastUsed(shardId).orElse(openedAt.getOrDefault(shardId, nowMillis));
+            if (nowMillis - lastUsed < idleAfterMillis) {
+                continue;
+            }
+            try {
+                if (node.reconciler().readerShards().contains(shardId)) {
+                    // A reader holds no head and no claim on anything. Closing it loses nothing at all.
+                    node.reconciler().releaseShard(shardId, "idle for " + (nowMillis - lastUsed) + "ms");
+                    letGo.add(shardId);
+                    continue;
+                }
+                final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+                if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
+                    // Not ours any more; renewLeases will deal with it and this must not race it.
+                    continue;
+                }
+                node.publishShard(shardId, head.get().term());
+                if (plane.heads().release(shardId.getIndexName(), shardId.id(), node.localNode().getId()) == false) {
+                    // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
+                    // closing it while the head still points here is the one outcome to avoid.
+                    logger.warn("could not release the head for {} while idle; keeping it open", shardId);
+                    continue;
+                }
+                node.reconciler().releaseShard(shardId, "idle for " + (nowMillis - lastUsed) + "ms");
+                letGo.add(shardId);
+            } catch (Exception e) {
+                // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
+                // logged and retried on the next pass rather than propagated into the tick.
+                logger.warn("could not release idle shard " + shardId, e);
+            }
+        }
+        for (ShardId shardId : letGo) {
+            openedAt.remove(shardId);
+            // Stop trying to take it straight back. A demand-driven node re-acquires on the next write or
+            // read for it, which is the point; a node that was told to want it keeps wanting it.
+            if (demandDriven) {
+                wanted.remove(Map.entry(shardId.getIndexName(), shardId.id()));
+            }
+        }
+        return letGo;
+    }
+
+    /**
+     * Sets how long a shard may go unused before it is released, or zero to never release.
+     *
+     * <p>Off by default in the library and on in the daemon, the same split
+     * {@link #setDemandDrivenActivation(boolean)} uses and for the same reason: a test that drives ticks
+     * by hand should not have shards disappearing underneath it, and a node running unattended should not
+     * grow forever.
+     *
+     * @param idleAfterMillis the idle threshold, or 0 to disable
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setIdleAfterMillis(long idleAfterMillis) {
+        this.idleAfterMillis = idleAfterMillis;
+        return this;
     }
 
     /**
@@ -148,7 +262,12 @@ public final class BackgroundReconciler implements Closeable {
             if (alreadyHeld) {
                 continue;
             }
-            node.activateWriter(plane, target.getKey(), target.getValue()).ifPresent(activated::add);
+            node.activateWriter(plane, target.getKey(), target.getValue()).ifPresent(shardId -> {
+                activated.add(shardId);
+                // Its idle clock starts here, so a shard just taken is not immediately a candidate for
+                // being given straight back.
+                openedAt.put(shardId, plane.clock().getAsLong());
+            });
         }
         return activated;
     }

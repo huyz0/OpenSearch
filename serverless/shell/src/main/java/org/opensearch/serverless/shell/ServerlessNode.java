@@ -856,6 +856,7 @@ public final class ServerlessNode implements Closeable {
         if (reconciler.readerShards().contains(shardId)) {
             throw new java.io.IOException("cannot index into " + shardId + ": it is open as a reader");
         }
+        markUsed(shardId);
         final var wal = reconciler.wal(shardId);
         if (wal != null) {
             wal.append(shard.getOperationPrimaryTerm(), new org.opensearch.serverless.store.WalRecord(id, source));
@@ -909,6 +910,7 @@ public final class ServerlessNode implements Closeable {
         if (reconciler.readerShards().contains(shardId)) {
             throw new java.io.IOException("cannot delete from " + shardId + ": it is open as a reader");
         }
+        markUsed(shardId);
         final var wal = reconciler.wal(shardId);
         if (wal != null) {
             wal.append(shard.getOperationPrimaryTerm(), org.opensearch.serverless.store.WalRecord.deletion(id));
@@ -970,6 +972,7 @@ public final class ServerlessNode implements Closeable {
         if (operations.isEmpty()) {
             return java.util.List.of();
         }
+        markUsed(shardId);
 
         final var wal = reconciler.wal(shardId);
         if (wal != null) {
@@ -1155,6 +1158,22 @@ public final class ServerlessNode implements Closeable {
     private volatile org.opensearch.core.xcontent.NamedXContentRegistry searchRegistry;
 
     /**
+     * Records that a request touched this shard, on the clock the reconciler will compare against.
+     *
+     * <p><b>The plane's clock, not the wall clock, and that is not a detail.</b> Idle release compares a
+     * stamp made here against the time a reconcile pass was given, and a test drives that pass from a
+     * clock it controls. Stamping {@code System.currentTimeMillis()} instead makes every shard look as
+     * though it were used far in the future, so nothing is ever idle — which is exactly how the first run
+     * of these tests failed, with a controller that was working and a stamp that was not comparable.
+     *
+     * @param shardId the shard a request used
+     */
+    public void markUsed(org.opensearch.core.index.shard.ShardId shardId) {
+        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
+        reconciler.markUsed(shardId, plane == null ? System.currentTimeMillis() : plane.clock().getAsLong());
+    }
+
+    /**
      * Reads one document by id, from this node's own copy of the shard.
      *
      * <p><b>Realtime, and that is the whole reason this exists separately from search.</b> A write is
@@ -1179,6 +1198,7 @@ public final class ServerlessNode implements Closeable {
         if (shard == null) {
             throw new java.io.IOException("cannot read from " + shardId + ": not open on " + nodeName);
         }
+        markUsed(shardId);
         final var result = shard.getService()
             .get(
                 id,

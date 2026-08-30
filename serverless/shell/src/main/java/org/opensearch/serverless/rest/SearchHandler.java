@@ -355,6 +355,7 @@ public final class SearchHandler extends BaseRestHandler {
     ) throws IOException {
         final ShardId local = localShard(serving, index, shard);
         if (local != null) {
+            serving.markUsed(local);
             final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard);
             return new ShardAnswer(result.total(), result.hits());
         }
@@ -383,6 +384,7 @@ public final class SearchHandler extends BaseRestHandler {
                     // We are the placement for this shard but do not hold it yet. Open it here rather
                     // than asking ourselves over the network.
                     final ShardId opened = serving.serveAsReader(metadata, index, shard);
+                    serving.markUsed(opened);
                     final var mine = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), opened, perShard);
                     return new ShardAnswer(mine.total(), mine.hits());
                 }
