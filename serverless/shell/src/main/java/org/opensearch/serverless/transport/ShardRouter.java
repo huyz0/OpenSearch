@@ -25,8 +25,6 @@ import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
 import java.net.InetAddress;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -161,20 +159,8 @@ public final class ShardRouter {
             // unlucky routing decision costs a cold read and never a wrong answer.
             shardId = node.serveAsReader(plane.get(), request.index(), request.shard());
         }
-        final ShardQuery.Result result = ShardQuery.execute(
-            node.searchService(),
-            shardId,
-            request.field(),
-            request.value(),
-            request.size()
-        );
-        final List<String> ids = new ArrayList<>();
-        final List<String> sources = new ArrayList<>();
-        for (var hit : result.hits()) {
-            ids.add(hit.getId());
-            sources.add(hit.getSourceAsString() == null ? "" : hit.getSourceAsString());
-        }
-        channel.sendResponse(new ForwardedSearchResponse(result.total(), ids, sources));
+        final ShardQuery.Result result = ShardQuery.execute(node.searchService(), shardId, request.source());
+        channel.sendResponse(new ForwardedSearchResponse(result.total(), result.hits()));
     }
 
     private ShardId localShard(String index, int shard) {

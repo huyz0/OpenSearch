@@ -11,28 +11,35 @@ package org.opensearch.serverless.transport;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.transport.TransportResponse;
+import org.opensearch.search.SearchHit;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
-/** One shard's answer: how many matched, and the hits themselves. */
+/**
+ * One shard's answer: how many matched, and the hits themselves.
+ *
+ * <p><b>Whole hits, not parallel lists of ids and sources.</b> The earlier shape carried an id list and a
+ * source list and nothing else, which meant a score never crossed the network — so the coordinating node
+ * had nothing to merge on and concatenated shards in whatever order it visited them. A {@link SearchHit}
+ * is already {@code Writeable} and already carries the score, the source and the sort values, so sending
+ * it is both less code and the only version that can be merged correctly.
+ */
 public final class ForwardedSearchResponse extends TransportResponse {
 
     private final long total;
-    private final List<String> ids;
-    private final List<String> sources;
+    private final List<SearchHit> hits;
 
     /**
      * Creates a response.
      *
      * @param total how many documents matched in this shard
-     * @param ids the ids of the returned hits
-     * @param sources the sources of the returned hits, positionally matching the ids
+     * @param hits the returned hits, in this shard's own order
      */
-    public ForwardedSearchResponse(long total, List<String> ids, List<String> sources) {
+    public ForwardedSearchResponse(long total, List<SearchHit> hits) {
         this.total = total;
-        this.ids = List.copyOf(ids);
-        this.sources = List.copyOf(sources);
+        this.hits = List.copyOf(hits);
     }
 
     /**
@@ -43,15 +50,21 @@ public final class ForwardedSearchResponse extends TransportResponse {
      */
     public ForwardedSearchResponse(StreamInput in) throws IOException {
         this.total = in.readVLong();
-        this.ids = in.readStringList();
-        this.sources = in.readStringList();
+        final int count = in.readVInt();
+        final List<SearchHit> read = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            read.add(new SearchHit(in));
+        }
+        this.hits = List.copyOf(read);
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeVLong(total);
-        out.writeStringCollection(ids);
-        out.writeStringCollection(sources);
+        out.writeVInt(hits.size());
+        for (SearchHit hit : hits) {
+            hit.writeTo(out);
+        }
     }
 
     /**
@@ -64,20 +77,11 @@ public final class ForwardedSearchResponse extends TransportResponse {
     }
 
     /**
-     * Returns the hit ids.
+     * Returns the shard's hits.
      *
-     * @return the ids
+     * @return the hits
      */
-    public List<String> ids() {
-        return ids;
-    }
-
-    /**
-     * Returns the hit sources.
-     *
-     * @return the sources
-     */
-    public List<String> sources() {
-        return sources;
+    public List<SearchHit> hits() {
+        return hits;
     }
 }

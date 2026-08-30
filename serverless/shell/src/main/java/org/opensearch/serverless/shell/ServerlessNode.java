@@ -421,7 +421,7 @@ public final class ServerlessNode implements Closeable {
             // id and no _source, and reports success -- the fetch sub-phases are what load the source,
             // highlight, and so on. Constructing it empty looked harmless and silently dropped every
             // document body.
-            new org.opensearch.search.SearchModule(settings, java.util.List.of()).getFetchPhase(),
+            searchModule().getFetchPhase(),
             new org.opensearch.node.ResponseCollectorService(clusterService),
             new NoneCircuitBreakerService(),
             null,                                   // indexSearcherExecutor — no concurrent search yet
@@ -505,7 +505,12 @@ public final class ServerlessNode implements Closeable {
             BigArrays.NON_RECYCLING_INSTANCE,
             new PageCacheRecycler(settings),
             new NoneCircuitBreakerService(),
-            new NamedWriteableRegistry(Collections.emptyList()),
+            // Not empty, and it took a forwarded query to find out why. A search body crossing the
+            // network is a SearchSourceBuilder, and its query serializes as a named writeable -- so an
+            // empty registry reads it back as "Unknown NamedWriteable category [QueryBuilder]" on the
+            // receiving node. Local shards answered fine and remote ones silently dropped out of the
+            // coverage count, which is the shape of failure this design reports rather than hides.
+            new NamedWriteableRegistry(searchModule().getNamedWriteables()),
             new NamedXContentRegistry(Collections.emptyList()),
             new NetworkService(Collections.emptyList()),
             restController,
@@ -1114,6 +1119,40 @@ public final class ServerlessNode implements Closeable {
             return failure;
         }
     }
+
+    private volatile org.opensearch.search.SearchModule searchModule;
+
+    /**
+     * The one {@link org.opensearch.search.SearchModule} this node builds, memoized.
+     *
+     * <p>It was constructed inline for its fetch phase and thrown away. It also carries the parsers for
+     * every query, aggregation and suggester in the codebase, which is what a real query body needs to be
+     * read at all — so it is kept rather than rebuilt per request.
+     */
+    private synchronized org.opensearch.search.SearchModule searchModule() {
+        if (searchModule == null) {
+            searchModule = new org.opensearch.search.SearchModule(settings, java.util.List.of());
+        }
+        return searchModule;
+    }
+
+    /**
+     * The registry that can read a search body.
+     *
+     * <p>Separate from the node's other registry, which is deliberately empty: nothing else in the shell
+     * parses user-supplied structured content, and an empty registry is the honest default for a surface
+     * that is an allowlist. A search body is the one place that needs the full set.
+     *
+     * @return a registry containing the search parsers
+     */
+    public synchronized org.opensearch.core.xcontent.NamedXContentRegistry searchXContentRegistry() {
+        if (searchRegistry == null) {
+            searchRegistry = new org.opensearch.core.xcontent.NamedXContentRegistry(searchModule().getNamedXContents());
+        }
+        return searchRegistry;
+    }
+
+    private volatile org.opensearch.core.xcontent.NamedXContentRegistry searchRegistry;
 
     /**
      * Reads one document by id, from this node's own copy of the shard.

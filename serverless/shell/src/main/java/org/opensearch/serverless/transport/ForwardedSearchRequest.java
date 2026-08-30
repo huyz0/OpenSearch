@@ -10,11 +10,19 @@ package org.opensearch.serverless.transport;
 
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.transport.TransportRequest;
 
 import java.io.IOException;
 
-/** A query for one shard, sent to the node holding it. */
+/**
+ * A query handed to a node that can serve one shard.
+ *
+ * <p><b>Carries the whole search source</b> rather than a field, a value and a size. Those three were
+ * enough for the one query the shell could express; they are not enough for a query language, and
+ * unpacking a body into them on the coordinating node and re-packing it on the far side would mean the
+ * remote shard answering a different question from the local one.
+ */
 public final class ForwardedSearchRequest extends TransportRequest {
 
     /** The transport action name. */
@@ -22,25 +30,19 @@ public final class ForwardedSearchRequest extends TransportRequest {
 
     private final String index;
     private final int shard;
-    private final String field;
-    private final String value;
-    private final int size;
+    private final SearchSourceBuilder source;
 
     /**
      * Creates a request.
      *
      * @param index the index
      * @param shard the shard to query
-     * @param field the field to match
-     * @param value the text to match
-     * @param size the maximum hits to return
+     * @param source the query as the client sent it
      */
-    public ForwardedSearchRequest(String index, int shard, String field, String value, int size) {
+    public ForwardedSearchRequest(String index, int shard, SearchSourceBuilder source) {
         this.index = index;
         this.shard = shard;
-        this.field = field;
-        this.value = value;
-        this.size = size;
+        this.source = source;
     }
 
     /**
@@ -53,9 +55,7 @@ public final class ForwardedSearchRequest extends TransportRequest {
         super(in);
         this.index = in.readString();
         this.shard = in.readVInt();
-        this.field = in.readString();
-        this.value = in.readString();
-        this.size = in.readVInt();
+        this.source = new SearchSourceBuilder(in);
     }
 
     @Override
@@ -63,9 +63,7 @@ public final class ForwardedSearchRequest extends TransportRequest {
         super.writeTo(out);
         out.writeString(index);
         out.writeVInt(shard);
-        out.writeString(field);
-        out.writeString(value);
-        out.writeVInt(size);
+        source.writeTo(out);
     }
 
     /**
@@ -87,29 +85,11 @@ public final class ForwardedSearchRequest extends TransportRequest {
     }
 
     /**
-     * Returns the field to match.
+     * Returns the search source.
      *
-     * @return the field
+     * @return the source
      */
-    public String field() {
-        return field;
-    }
-
-    /**
-     * Returns the value to match.
-     *
-     * @return the value
-     */
-    public String value() {
-        return value;
-    }
-
-    /**
-     * Returns the maximum hits requested.
-     *
-     * @return the size
-     */
-    public int size() {
-        return size;
+    public SearchSourceBuilder source() {
+        return source;
     }
 }
