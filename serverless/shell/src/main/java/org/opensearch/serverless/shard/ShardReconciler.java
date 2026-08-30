@@ -191,6 +191,9 @@ public final class ShardReconciler {
      * not apply the mapping, and without it the first write returns MAPPING_UPDATE_REQUIRED as a
      * <em>result value</em> rather than throwing (see {@code s0-findings.md} F5).
      */
+    /** One monitor per index, guarding the create-or-update of its {@link IndexService}. */
+    private final java.util.concurrent.ConcurrentHashMap<Index, Object> indexLocks = new java.util.concurrent.ConcurrentHashMap<>();
+
     private IndexShard openAndStart(
         IndexMetadata indexMetadata,
         ShardId shardId,
@@ -200,17 +203,27 @@ public final class ShardReconciler {
         boolean lazy
     ) throws IOException {
         final Index index = indexMetadata.getIndex();
-        IndexService indexService = indicesService.indexService(index);
-        if (indexService == null) {
-            indexService = indicesService.createIndex(indexMetadata, Collections.emptyList(), false);
-            indexService.updateMapping(null, indexMetadata);
-        } else {
-            // The IndexService is created once per index but shards arrive one at a time, so by the time
-            // the second shard opens its metadata is stale -- in particular its per-shard primary terms.
-            // A shard created from stale metadata starts at the old term and then gets updateShardState
-            // at the new one, which the data plane rejects: "term is only increased as part of primary
-            // promotion". Found by the first multi-shard test; every earlier one had a single shard.
-            indexService.updateMetadata(indexService.getMetadata(), indexMetadata);
+        final IndexService indexService;
+        // Locked per index, because this is a check-then-act and shards of one index now open at the same
+        // time. Sequentially it was safe by luck; the moment the search fan-out became concurrent, three
+        // shards of one index raced here and two lost with ResourceAlreadyExistsException -- reported as
+        // two unreachable shards, which reads like a routing problem and is not one. IndexService.createShard
+        // is itself synchronized, so only this acquisition needs guarding and shard opening stays parallel.
+        synchronized (indexLocks.computeIfAbsent(index, ignored -> new Object())) {
+            IndexService existing = indicesService.indexService(index);
+            if (existing == null) {
+                existing = indicesService.createIndex(indexMetadata, Collections.emptyList(), false);
+                existing.updateMapping(null, indexMetadata);
+            } else {
+                // The IndexService is created once per index but shards arrive one at a time, so by the
+                // time the second shard opens its metadata is stale -- in particular its per-shard primary
+                // terms. A shard created from stale metadata starts at the old term and then gets
+                // updateShardState at the new one, which the data plane rejects: "term is only increased
+                // as part of primary promotion". Found by the first multi-shard test; every earlier one
+                // had a single shard.
+                existing.updateMetadata(existing.getMetadata(), indexMetadata);
+            }
+            indexService = existing;
         }
 
         // Whether anything was published decides the recovery source, and the decision must be made

@@ -299,4 +299,67 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
             return new Response(response.statusCode(), response.body());
         }
     }
+
+    /**
+     * The shards of one search run at the same time, not one after another.
+     *
+     * <p><b>Asserted as a rendezvous, not as a stopwatch.</b> Each shard's first read blocks until every
+     * shard has arrived; sequential fan-out therefore cannot get past the first one, and concurrent
+     * fan-out cannot fail. There is no threshold to tune — see {@link RendezvousBlobStore} for why timing
+     * this instead would have been a coin flip.
+     *
+     * <p>The shards have to be opened from the object store for there to be a read to meet on, so nobody
+     * owns them and the searching node carries the {@code search} role, which is the scale-to-zero path.
+     */
+    public void testTheShardsOfOneSearchRunAtTheSameTime() throws Exception {
+        final int shards = 3;
+        final org.opensearch.common.blobstore.fs.FsBlobStore disk = new FsBlobStore(1024, createTempDir(), false);
+        // Generous: the point is that a sequential fan-out cannot finish at all, not that it is slow.
+        final RendezvousBlobStore store = new RendezvousBlobStore(disk, shards, 5_000L);
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
+
+        final ServerlessNode writer = new ServerlessNode(nodeSettings("fanout-writer"));
+        writer.start();
+        writer.setMetadataPlane(plane);
+        final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
+        for (int shard = 0; shard < shards; shard++) {
+            loop.want("alpha", shard);
+        }
+        loop.tick(clock.get());
+        for (int i = 0; i < 30; i++) {
+            index(writer, "f" + i, "{\"msg\":\"fanout\",\"n\":" + i + ",\"tag\":\"t\"}");
+        }
+        loop.tick(clock.get() + 1_000);   // publish, so there is something for a reader to open
+        for (int shard = 0; shard < shards; shard++) {
+            assertTrue(plane.heads().release("alpha", shard, writer.localNode().getId()));
+        }
+        writer.close();
+
+        try (ServerlessNode reader = new ServerlessNode(searchNodeSettings("fanout-reader"))) {
+            reader.start();
+            reader.setMetadataPlane(plane);
+            final Response got = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"fanout\"}},\"size\":5}");
+            assertEquals("the search should have been answered: " + got.body(), 200, got.status());
+            assertTrue(
+                "every shard must have answered -- a sequential fan-out leaves the later ones stuck at the rendezvous: " + got.body(),
+                got.body().contains("\"complete\":true")
+            );
+            assertTrue("and the shards must actually have met: they did not all arrive together", store.everyoneArrived());
+            assertTrue("the search must still return results: " + got.body(), got.body().contains("\"value\":30"));
+        }
+    }
+
+    private Settings searchNodeSettings(String name) {
+        return Settings.builder()
+            .put("node.name", name)
+            .put("cluster.name", "serverless-query")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", "search")
+            .build();
+    }
 }

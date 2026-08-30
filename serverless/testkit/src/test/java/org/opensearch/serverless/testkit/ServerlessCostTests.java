@@ -63,6 +63,18 @@ public class ServerlessCostTests extends OpenSearchTestCase {
         return System.getProperty(MinioBlobContainerConformanceTests.ENDPOINT, DEFAULT_ENDPOINT);
     }
 
+    private Settings nodeSettings(String name, String roles) {
+        return Settings.builder()
+            .put("node.name", name)
+            .put("cluster.name", "serverless-cost")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", roles)
+            .build();
+    }
+
     private Settings nodeSettings(String name) {
         return Settings.builder()
             .put("node.name", name)
@@ -483,6 +495,192 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 .build();
             final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
             return response.statusCode() + " " + response.body();
+        }
+    }
+
+    /**
+     * What a query costs, which this suite had never counted.
+     *
+     * <p>Writes were counted and idle ticks were counted; the number that decides whether search is
+     * affordable was not. Three cases, because they are three different prices and conflating them is how
+     * the first version of this test went wrong — it called a node "cold" while another node was still the
+     * live owner, so it measured forwarding and reported it as the cost of opening a shard.
+     *
+     * <ol>
+     * <li><b>Warm</b> — the shards are open here. Local Lucene; the object store should not be touched
+     *     for data at all.</li>
+     * <li><b>Forwarded</b> — someone else owns them. Per shard: find the owner, find its lease, ask it.</li>
+     * <li><b>Cold reader</b> — nobody owns them, so this node opens each shard from the published commit.
+     *     This is the price of the first query after a scale-to-zero, and until now it was a guess.</li>
+     * </ol>
+     */
+    public void testWhatASearchCosts() throws Exception {
+        for (boolean onBucket : new boolean[] { false, true }) {
+            if (onBucket) {
+                assumeEndpoint();
+            }
+            final CountingBlobStore store = onBucket ? bucket() : filesystem();
+            final String label = onBucket ? "s3" : "fs";
+            final int shards = 3;
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
+
+            final ServerlessNode writer = new ServerlessNode(nodeSettings("cost-search-" + label));
+            writer.start();
+            writer.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
+            for (int shard = 0; shard < shards; shard++) {
+                loop.want("alpha", shard);
+            }
+            loop.tick(System.currentTimeMillis());
+            assertEquals("the writer must hold every shard", shards, writer.reconciler().openShards().size());
+            for (int i = 0; i < 60; i++) {
+                writer.index(shardOf(writer, "alpha", i), String.valueOf(i), "{\"msg\":\"searchcost\",\"n\":" + i + "}");
+            }
+            loop.tick(System.currentTimeMillis());   // publish, so a reader has something to open
+
+            // 1. Warm.
+            store.reset();
+            long startedAt = System.nanoTime();
+            final Response warm = search(writer, "/alpha/_search?q=msg:searchcost&size=10");
+            final long warmMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+            final long warmRequests = store.impliedS3Requests();
+            final long warmBlobReads = store.blobReads();
+            assertEquals("the warm search should have been answered: " + warm.body(), 200, warm.status());
+            assertTrue(
+                "the warm search must cover every shard, or this measures the cost of not answering: " + warm.body(),
+                warm.body().contains("\"complete\":true")
+            );
+            logger.info(
+                "cost[{}]: warm search over {} locally-held shards -> {} requests, {}ms  [{}]",
+                label,
+                shards,
+                warmRequests,
+                warmMillis,
+                store.breakdown()
+            );
+            assertEquals(
+                "on " + label + ", a query against shards this node already holds must not fetch data from the object store",
+                0,
+                warmBlobReads
+            );
+
+            // 2. Forwarded: a second node while the writer still owns everything.
+            try (ServerlessNode idle = new ServerlessNode(nodeSettings("cost-search-fwd-" + label))) {
+                idle.start();
+                idle.setMetadataPlane(plane);
+                store.reset();
+                startedAt = System.nanoTime();
+                final Response forwarded = search(idle, "/alpha/_search?q=msg:searchcost&size=10");
+                final long forwardedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+                assertEquals("the forwarded search should have been answered: " + forwarded.body(), 200, forwarded.status());
+                assertTrue(
+                    "the forwarded search must cover every shard, or this measures the cost of not answering: " + forwarded.body(),
+                    forwarded.body().contains("\"complete\":true")
+                );
+                logger.info(
+                    "cost[{}]: forwarded search over {} shards -> {} requests ({} per shard), {}ms  [{}]",
+                    label,
+                    shards,
+                    store.impliedS3Requests(),
+                    store.impliedS3Requests() / (double) shards,
+                    forwardedMillis,
+                    store.breakdown()
+                );
+                assertEquals(
+                    "on " + label + ", forwarding must not fetch data either -- the owner answers from its own copy",
+                    0,
+                    store.blobReads()
+                );
+            }
+
+            // 3. Cold reader: nobody owns the shards at all.
+            for (int shard = 0; shard < shards; shard++) {
+                assertTrue(plane.heads().release("alpha", shard, writer.localNode().getId()));
+            }
+            writer.close();
+
+            // The search role, because reader placement only ever chooses among nodes that have it. Without
+            // it this node is not a candidate for a shard nobody owns, the fan-out finds no target, and the
+            // search returns an empty but honest answer -- which the completeness assertions below catch.
+            try (ServerlessNode cold = new ServerlessNode(nodeSettings("cost-search-cold-" + label, "search"))) {
+                cold.start();
+                cold.setMetadataPlane(plane);
+                store.reset();
+                startedAt = System.nanoTime();
+                final Response first = search(cold, "/alpha/_search?q=msg:searchcost&size=10");
+                final long coldMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+                final long coldRequests = store.impliedS3Requests();
+                final long coldBlobReads = store.blobReads();
+                assertEquals("the cold search should have been answered: " + first.body(), 200, first.status());
+                assertTrue(
+                    "the cold search must cover every shard, or this measures the cost of not answering: " + first.body(),
+                    first.body().contains("\"complete\":true")
+                );
+                logger.info(
+                    "cost[{}]: FIRST search on a node holding nothing, nobody owning -> {} requests ({} per shard), {} of them data reads, {}ms  [{}]",
+                    label,
+                    coldRequests,
+                    coldRequests / (double) shards,
+                    coldBlobReads,
+                    coldMillis,
+                    store.breakdown()
+                );
+                assertTrue(
+                    "on " + label + ", opening a shard from a published commit must actually read it: " + store.breakdown(),
+                    coldBlobReads > 0
+                );
+
+                // The same query again, with the shards now open here.
+                store.reset();
+                final Response second = search(cold, "/alpha/_search?q=msg:searchcost&size=10");
+                assertEquals(200, second.status());
+                assertTrue("the second search must cover every shard: " + second.body(), second.body().contains("\"complete\":true"));
+                logger.info(
+                    "cost[{}]: second search on the same node -> {} requests, {} of them data reads",
+                    label,
+                    store.impliedS3Requests(),
+                    store.blobReads()
+                );
+                assertTrue(
+                    "on "
+                        + label
+                        + ", the first query pays for opening and the second must not: "
+                        + coldRequests
+                        + " then "
+                        + store.impliedS3Requests(),
+                    store.impliedS3Requests() < coldRequests
+                );
+            }
+        }
+    }
+
+    private static ShardId shardOf(ServerlessNode node, String index, int i) {
+        final String id = String.valueOf(i);
+        for (ShardId shardId : node.reconciler().openShards()) {
+            if (shardId.getIndexName().equals(index)
+                && shardId.id() == Math.floorMod(org.opensearch.cluster.routing.Murmur3HashFunction.hash(id), 3)) {
+                return shardId;
+            }
+        }
+        throw new AssertionError("no open shard for " + id);
+    }
+
+    /** One response, status and body. */
+    private record Response(int status, String body) {
+    }
+
+    private static Response search(ServerlessNode node, String path) throws Exception {
+        final var address = node.boundHttpAddress().publishAddress();
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
+            final HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + path))
+                .timeout(Duration.ofSeconds(120))
+                .header("Content-Type", "application/json")
+                .GET()
+                .build();
+            final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            return new Response(response.statusCode(), response.body());
         }
     }
 }

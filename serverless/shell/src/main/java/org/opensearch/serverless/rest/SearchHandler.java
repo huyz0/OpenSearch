@@ -239,78 +239,35 @@ public final class SearchHandler extends BaseRestHandler {
         perShard.from(0);
         perShard.size(from + size);
 
+        // Every shard at once, up to a bound. This loop used to run the shards one after another, so a
+        // query's latency was the sum of its shards rather than the slowest of them -- and the shape of
+        // the loop was the only reason. Each task answers for exactly one shard and swallows nothing: a
+        // shard that cannot be reached comes back null and shows up in the coverage this already reports.
+        final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>(shards);
+        for (int shard = 0; shard < shards; shard++) {
+            final int number = shard;
+            tasks.add(() -> askOneShard(serving, metadata, index, number, perShard));
+        }
+        final List<ShardAnswer> answers;
+        try {
+            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), Fanout.DEFAULT_CONCURRENCY, tasks);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while searching " + index, e);
+        }
+
         long total = 0;
         int answered = 0;
         final List<SearchHit> merged = new ArrayList<>();
-
-        for (int shard = 0; shard < shards; shard++) {
-            final ShardId local = localShard(serving, index, shard);
-            if (local != null) {
-                final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard);
-                total += result.total();
-                merged.addAll(result.hits());
-                answered++;
+        for (ShardAnswer answer : answers) {
+            if (answer == null) {
                 continue;
             }
-            // Not here. Choose a reader by placement -- NOT the shard's owner, which is the writer:
-            // routing searches to writers would couple search capacity to write capacity and make
-            // per-index search scale-to-zero meaningless. Placement is a cache-affinity hint, so the
-            // owner remains a last resort for the case where no search node exists at all.
-            final List<String> targets = new ArrayList<>(
-                org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
-                    index,
-                    shard,
-                    metadata.membership().current(),
-                    ServerlessNode.ROLE_SEARCH,
-                    2
-                )
-            );
-            final var head = metadata.heads().read(index, shard);
-            head.map(h -> h.ownerNodeId()).ifPresent(owner -> {
-                if (targets.contains(owner) == false) {
-                    targets.add(owner);
-                }
-            });
-
-            boolean got = false;
-            for (String target : targets) {
-                try {
-                    if (serving.localNode().getId().equals(target)) {
-                        // We are the placement for this shard but do not hold it yet. Open it here
-                        // rather than asking ourselves over the network.
-                        final ShardId opened = serving.serveAsReader(metadata, index, shard);
-                        final var mine = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), opened, perShard);
-                        total += mine.total();
-                        merged.addAll(mine.hits());
-                        got = true;
-                        break;
-                    }
-                    // The search bound, not the write bound: a peer that is merely busy should cost
-                    // latency, not coverage.
-                    final var peer = serving.router().peer(target, serving.router().searchForwardTimeout());
-                    if (peer.isEmpty()) {
-                        continue;
-                    }
-                    final var answer = serving.router()
-                        .forwardSearch(peer.get(), new org.opensearch.serverless.transport.ForwardedSearchRequest(index, shard, perShard));
-                    total += answer.total();
-                    merged.addAll(answer.hits());
-                    got = true;
-                    break;
-                } catch (Exception e) {
-                    // Try the next candidate. A shard that failed to answer is not a shard with no
-                    // matches, so it only counts as searched if one of them succeeded.
-                    logger.warn("shard " + shard + " of " + index + " was not served by " + target, e);
-                }
-            }
-            if (got) {
-                answered++;
-            }
+            total += answer.total;
+            merged.addAll(answer.hits);
+            answered++;
         }
 
-        // Descending by score. An unscored hit sorts last rather than unpredictably: a shard that
-        // returned hits with no score should not be able to take the top of the page from one that
-        // scored them.
         merged.sort((a, b) -> Float.compare(score(b), score(a)));
         final List<SearchHit> page = merged.stream().skip(from).limit(size).collect(java.util.stream.Collectors.toList());
 
@@ -360,6 +317,91 @@ public final class SearchHandler extends BaseRestHandler {
 
     private static float score(SearchHit hit) {
         return Float.isNaN(hit.getScore()) ? Float.NEGATIVE_INFINITY : hit.getScore();
+    }
+
+    /** One shard's contribution: what it matched, and what it returned. */
+    private static final class ShardAnswer {
+        private final long total;
+        private final List<SearchHit> hits;
+
+        ShardAnswer(long total, List<SearchHit> hits) {
+            this.total = total;
+            this.hits = hits;
+        }
+    }
+
+    private static final org.apache.logging.log4j.Logger LOG = org.apache.logging.log4j.LogManager.getLogger(SearchHandler.class);
+
+    /**
+     * Answers for exactly one shard, wherever it happens to live.
+     *
+     * <p>Lifted out of the fan-out loop unchanged in behaviour: serve it here if it is open here,
+     * otherwise pick a reader by placement, otherwise fall back to the shard's owner.
+     *
+     * @param serving the node running the search
+     * @param metadata the metadata plane
+     * @param index the index
+     * @param shard the shard number
+     * @param perShard the query, sized to cover the whole window on its own
+     * @return what the shard answered, or null if no candidate could answer for it
+     * @throws IOException if the shard is here and querying it fails
+     */
+    private static ShardAnswer askOneShard(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        String index,
+        int shard,
+        SearchSourceBuilder perShard
+    ) throws IOException {
+        final ShardId local = localShard(serving, index, shard);
+        if (local != null) {
+            final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard);
+            return new ShardAnswer(result.total(), result.hits());
+        }
+        // Not here. Choose a reader by placement -- NOT the shard's owner, which is the writer: routing
+        // searches to writers would couple search capacity to write capacity and make per-index search
+        // scale-to-zero meaningless. Placement is a cache-affinity hint, so the owner remains a last
+        // resort for the case where no search node exists at all.
+        final List<String> targets = new ArrayList<>(
+            org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+                index,
+                shard,
+                metadata.membership().current(),
+                ServerlessNode.ROLE_SEARCH,
+                2
+            )
+        );
+        metadata.heads().read(index, shard).map(h -> h.ownerNodeId()).ifPresent(owner -> {
+            if (owner != null && targets.contains(owner) == false) {
+                targets.add(owner);
+            }
+        });
+
+        for (String target : targets) {
+            try {
+                if (serving.localNode().getId().equals(target)) {
+                    // We are the placement for this shard but do not hold it yet. Open it here rather
+                    // than asking ourselves over the network.
+                    final ShardId opened = serving.serveAsReader(metadata, index, shard);
+                    final var mine = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), opened, perShard);
+                    return new ShardAnswer(mine.total(), mine.hits());
+                }
+                // The search bound, not the write bound: a peer that is merely busy should cost latency,
+                // not coverage.
+                final var peer = serving.router().peer(target, serving.router().searchForwardTimeout());
+                if (peer.isEmpty()) {
+                    continue;
+                }
+                final var answer = serving.router()
+                    .forwardSearch(peer.get(), new org.opensearch.serverless.transport.ForwardedSearchRequest(index, shard, perShard));
+                return new ShardAnswer(answer.total(), answer.hits());
+            } catch (Exception e) {
+                // Try the next candidate. A shard that failed to answer is not a shard with no matches,
+                // so it only counts as searched if one of them succeeded.
+                LOG.warn("shard " + shard + " of " + index + " was not served by " + target, e);
+            }
+        }
+        return null;
     }
 
     private static ShardId localShard(ServerlessNode serving, String index, int shard) {

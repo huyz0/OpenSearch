@@ -129,7 +129,11 @@ public final class BulkHandler extends BaseRestHandler {
         }
 
         final ServerlessNode serving = node.get();
-        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
+        // The coordinator runs on GENERIC and the per-shard groups run on WRITE. It used to be the other
+        // way round for a moment, with both on WRITE, which is a deadlock waiting for enough concurrent
+        // bulk requests: every request thread would be holding a WRITE slot while waiting for group tasks
+        // that need WRITE slots to start. Nothing on WRITE now waits on WRITE.
+        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             final long startedAt = System.nanoTime();
             try {
                 route(serving, metadata, items);
@@ -173,7 +177,15 @@ public final class BulkHandler extends BaseRestHandler {
         }
     }
 
-    /** Applies each shard's group once, locally or over transport, and records the outcomes in place. */
+    /**
+     * Applies each shard's group once, locally or over transport, and records the outcomes in place.
+     *
+     * <p><b>Groups run concurrently.</b> They used to run one after another, so a batch spanning three
+     * remote shards was three round trips end to end — the whole point of batching is to stop paying per
+     * document, and paying per shard instead was the same mistake one level up. Each group touches only
+     * its own items, so they do not interact; the outcomes are written into the items themselves and read
+     * back after every group has finished.
+     */
     private void dispatch(ServerlessNode serving, List<Item> items, boolean refresh) throws IOException {
         final Map<String, List<Item>> groups = new LinkedHashMap<>();
         for (Item item : items) {
@@ -181,8 +193,25 @@ public final class BulkHandler extends BaseRestHandler {
                 groups.computeIfAbsent(item.index + "[" + item.shard + "]", key -> new ArrayList<>()).add(item);
             }
         }
+        final List<java.util.concurrent.Callable<Void>> tasks = new ArrayList<>(groups.size());
         for (List<Item> group : groups.values()) {
-            applyGroup(serving, group, refresh);
+            tasks.add(() -> {
+                applyGroup(serving, group, refresh);
+                return null;
+            });
+        }
+        try {
+            Fanout.run(serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE), Fanout.DEFAULT_CONCURRENCY, tasks);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while writing a batch", e);
+        }
+        // A group whose task died before recording anything would leave its items with no outcome at all,
+        // which would serialize as a success with no result. Say so instead.
+        for (Item item : items) {
+            if (item.failed() == false && item.status == null) {
+                item.fail(RestStatus.INTERNAL_SERVER_ERROR, "no_outcome", "the writer returned no outcome for this operation");
+            }
         }
     }
 
