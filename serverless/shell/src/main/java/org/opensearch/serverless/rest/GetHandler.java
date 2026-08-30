@@ -9,7 +9,6 @@
 package org.opensearch.serverless.rest;
 
 import org.opensearch.common.xcontent.XContentType;
-import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
@@ -122,75 +121,25 @@ public final class GetHandler extends BaseRestHandler {
         int shard,
         boolean bodyless
     ) throws Exception {
-        final ShardId writable = serving.reconciler()
-            .openShards()
-            .stream()
-            .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
-            .filter(s -> serving.reconciler().readerShards().contains(s) == false)
-            .findFirst()
-            .orElse(null);
-        if (writable != null) {
-            respond(channel, index, shard, serving.get(writable, id), serving.localNode().getId(), true, bodyless);
-            return;
-        }
-
-        final var head = metadata.heads().read(index, shard);
-        final String owner = head.map(h -> h.ownerNodeId()).orElse(null);
-        if (owner != null && owner.equals(serving.localNode().getId())) {
-            // The head names this node and the shard is not open here as a writer: the activation window,
-            // brief and self-resolving. Reading a published commit instead would be answering from a copy
-            // this node is in the middle of superseding.
+        final var operations = new org.opensearch.serverless.shard.ShardOperations(serving, metadata);
+        try {
+            final var read = operations.get(index, id);
+            respond(channel, index, shard, read.document(), read.servedBy(), read.realtime(), bodyless);
+        } catch (org.opensearch.serverless.shard.ShardOperations.NotHereException e) {
+            // Every "not here" is a 503 for a get, and deliberately so: the alternative is answering from
+            // a published commit that a live writer is already ahead of, which is a stale document -- or a
+            // 404 for a document that exists -- reported as success.
             channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
                     RestStatus.SERVICE_UNAVAILABLE,
-                    "activation_in_progress",
-                    "this node is acquiring shard " + shard + " of " + index + "; retry"
+                    e.owner() != null && e.owner().equals(serving.localNode().getId())
+                        ? "activation_in_progress"
+                        : (e.getMessage().contains("could not forward") ? "forward_failed" : "owner_unreachable"),
+                    e.getMessage()
                 )
             );
-            return;
         }
-        if (owner != null) {
-            try {
-                final var peer = serving.router().peer(owner);
-                if (peer.isEmpty()) {
-                    // A head naming an owner with no live lease is a dead writer nobody has noticed, and
-                    // this read is the first thing to prove it. Say so, and do not answer from a commit
-                    // that a live writer may already be ahead of.
-                    serving.signals().ownershipDoubted(index, shard);
-                    channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.SERVICE_UNAVAILABLE,
-                            "owner_unreachable",
-                            "shard " + shard + " is owned by " + owner + ", which has no reachable lease"
-                        )
-                    );
-                    return;
-                }
-                final var response = serving.router()
-                    .forwardGet(peer.get(), new org.opensearch.serverless.transport.ForwardedGetRequest(index, shard, id));
-                respond(channel, index, shard, response.document(), response.ownerNodeId(), true, bodyless);
-            } catch (Exception e) {
-                // 503 rather than the exception's own status, and rather than a fallback: a forward that
-                // failed means the routing was stale, which is a retry, not a reason to read a staler copy.
-                serving.signals().ownershipDoubted(index, shard);
-                channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.SERVICE_UNAVAILABLE,
-                        "forward_failed",
-                        "could not forward to " + owner + ", which the shard-head named as owner: " + e.getMessage()
-                    )
-                );
-            }
-            return;
-        }
-
-        // Nobody owns the shard, so there is no writer holding unpublished writes and the published
-        // commit is the current state. Opening it here is what a search would do, for the same reason.
-        final ShardId reader = serving.serveAsReader(plane.get(), index, shard);
-        respond(channel, index, shard, serving.get(reader, id), serving.localNode().getId(), false, bodyless);
     }
 
     private void respond(

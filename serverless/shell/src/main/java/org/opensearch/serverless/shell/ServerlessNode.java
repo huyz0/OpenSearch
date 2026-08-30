@@ -1157,6 +1157,23 @@ public final class ServerlessNode implements Closeable {
 
     private volatile org.opensearch.core.xcontent.NamedXContentRegistry searchRegistry;
 
+    private volatile ServerlessClient client;
+
+    /**
+     * The {@link org.opensearch.transport.client.Client} this node offers to plugins.
+     *
+     * <p>Not the {@code NodeClient} the REST layer is handed, which has no action registry and never has
+     * had one. This is the shell's own operations behind the interface every plugin expects.
+     *
+     * @return the client
+     */
+    public synchronized org.opensearch.transport.client.Client client() {
+        if (client == null) {
+            client = new ServerlessClient(settings, threadPool, () -> this, () -> metadataPlane);
+        }
+        return client;
+    }
+
     /**
      * Records that a request touched this shard, on the clock the reconciler will compare against.
      *
