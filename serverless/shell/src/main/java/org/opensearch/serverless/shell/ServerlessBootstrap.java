@@ -83,6 +83,17 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static final String CONFIG_PATH = "path.conf";
 
+    /**
+     * Plugin classes to run, by name.
+     *
+     * <p><b>This is not loading a plugin from disk, and calling it that would be a lie.</b> There is no
+     * separate classloader, no {@code plugin-descriptor.properties} and no dependency resolution: the class
+     * must already be on the node's classpath. What it does buy is that a plugin can be turned on by
+     * configuration rather than by editing the shell, which is the difference between authentication that
+     * exists in a test and authentication an operator can switch on.
+     */
+    public static final String PLUGINS = "serverless.plugins";
+
     /** The default lease TTL: long enough to survive a slow object store, short enough to fail over. */
     public static final long DEFAULT_LEASE_TTL_MILLIS = 30_000L;
 
@@ -160,7 +171,7 @@ public final class ServerlessBootstrap implements Closeable {
         // The node comes first, and it has to: an s3 store is built through the repository plugin, which
         // wants a ClusterService, and the node is what owns one. The plane is attached immediately
         // afterwards, so nothing observable happens in between.
-        final ServerlessNode node = new ServerlessNode(complete);
+        final ServerlessNode node = new ServerlessNode(complete, loadPlugins(complete));
         node.start();
 
         final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(
@@ -199,6 +210,61 @@ public final class ServerlessBootstrap implements Closeable {
             complete.getAsBoolean(ON_DEMAND, true)
         );
         return new ServerlessBootstrap(node, plane, loop, scheduler, store);
+    }
+
+    /**
+     * Constructs the plugins named in {@link #PLUGINS}.
+     *
+     * <p>A name that does not resolve, or a class that is not a plugin, stops the node. Skipping it would
+     * mean starting a node without something an operator asked for and being told about it only in a log
+     * line -- and the thing most likely to be listed here is the thing enforcing authentication.
+     *
+     * @param settings the node settings
+     * @return the plugins, in the order they were named
+     */
+    private static java.util.List<org.opensearch.plugins.Plugin> loadPlugins(Settings settings) {
+        final java.util.List<org.opensearch.plugins.Plugin> loaded = new java.util.ArrayList<>();
+        for (String name : settings.getAsList(PLUGINS)) {
+            final String className = name.trim();
+            if (className.isEmpty()) {
+                continue;
+            }
+            final Class<?> type;
+            try {
+                type = Class.forName(className);
+            } catch (ClassNotFoundException e) {
+                throw new IllegalArgumentException("[" + PLUGINS + "] names [" + className + "], which is not on this node's classpath", e);
+            }
+            if (org.opensearch.plugins.Plugin.class.isAssignableFrom(type) == false) {
+                throw new IllegalArgumentException("[" + PLUGINS + "] names [" + className + "], which is not an OpenSearch plugin");
+            }
+            try {
+                java.lang.reflect.Constructor<?> constructor;
+                try {
+                    // The convention classic OpenSearch uses, and the one a plugin needing configuration
+                    // has to have.
+                    constructor = type.getConstructor(Settings.class);
+                } catch (NoSuchMethodException e) {
+                    constructor = type.getConstructor();
+                }
+                loaded.add(
+                    (org.opensearch.plugins.Plugin) (constructor.getParameterCount() == 1
+                        ? constructor.newInstance(settings)
+                        : constructor.newInstance())
+                );
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                // The plugin's own constructor refused -- a missing keystore entry, say. Its message is the
+                // useful one, so it is the cause and not a wrapper's paraphrase.
+                throw new IllegalStateException("plugin [" + className + "] refused to start", e.getCause());
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException(
+                    "plugin [" + className + "] has no usable constructor; a plugin needs either (Settings) or no arguments",
+                    e
+                );
+            }
+            logger.info("loaded plugin {}", className);
+        }
+        return loaded;
     }
 
     private static Path configPath(Settings settings) {

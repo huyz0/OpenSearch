@@ -162,6 +162,19 @@ public final class BulkHandler extends BaseRestHandler {
                 item.fail(RestStatus.BAD_REQUEST, "missing_index", "no index given for this item and none in the path");
                 continue;
             }
+            if (serving.isSystemIndex(item.index)) {
+                // The one place the registration-time guard cannot reach: a bulk request names its indices
+                // in the body, so the path a request arrived on says nothing about what it touches. Without
+                // this, a plugin's system index would be readable and writable by anyone who could spell
+                // _bulk -- which for the authentication plugin's accounts means writing a password record
+                // of your choosing under somebody else's name.
+                item.fail(
+                    RestStatus.FORBIDDEN,
+                    "system_index",
+                    "[" + item.index + "] belongs to a plugin and is not reachable through the request path"
+                );
+                continue;
+            }
             final Optional<IndexDescriptor> descriptor = described.computeIfAbsent(item.index, name -> {
                 try {
                     return metadata.describe(name);

@@ -98,7 +98,34 @@ public final class ServerlessClient extends AbstractClient {
         });
     }
 
+    /**
+     * Runs one action, and translates the shell's failures into the ones a plugin already catches.
+     *
+     * <p><b>Why the translation exists.</b> {@link ShardOperations} throws its own types, which is right
+     * for the shell: they carry the owner and whether a retry is worth it, and the REST layer renders
+     * them into a 421 or a 503. A plugin cannot catch them — the shell is deliberately not on its
+     * classpath — so across this boundary they would arrive as an anonymous {@code IOException} whose
+     * meaning is only in its message. Writing the shell's own authentication as a plugin is what made
+     * that concrete: it had to decide "index missing" from "index unreadable" by matching prose.
+     *
+     * <p>Core's exceptions are the shared vocabulary both sides do have.
+     * {@link org.opensearch.index.IndexNotFoundException} means the index is not there and asking again
+     * will not help; {@link org.opensearch.action.NoShardAvailableActionException} means no copy can
+     * answer right now, which is exactly what "not here" means to somebody who cannot do anything about
+     * ownership.
+     */
     private ActionResponse run(ActionType<?> action, ActionRequest request, ServerlessNode serving, MetadataPlane metadata)
+        throws Exception {
+        try {
+            return dispatch(action, request, serving, metadata);
+        } catch (ShardOperations.NoSuchIndexException e) {
+            throw new org.opensearch.index.IndexNotFoundException(e.index());
+        } catch (ShardOperations.NotHereException e) {
+            throw new org.opensearch.action.NoShardAvailableActionException(null, e.getMessage(), e);
+        }
+    }
+
+    private ActionResponse dispatch(ActionType<?> action, ActionRequest request, ServerlessNode serving, MetadataPlane metadata)
         throws Exception {
         final ShardOperations operations = new ShardOperations(serving, metadata);
         if (IndexAction.INSTANCE.name().equals(action.name())) {

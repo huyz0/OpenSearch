@@ -82,6 +82,8 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
     private static final AtomicLong SAW = new AtomicLong();
     /** When true, the wrapper refuses everything — standing in for a failed authentication. */
     private static final AtomicBoolean REFUSE = new AtomicBoolean();
+    /** Set when the plugin is closed, which is how a plugin releases anything it holds. */
+    private static final AtomicBoolean CLOSED = new AtomicBoolean();
 
     /** A plugin that keeps state, serves a route, and sees every request. */
     public static final class TestPlugin extends Plugin implements ActionPlugin {
@@ -104,6 +106,11 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
             // works, so the state it keeps has somewhere to go.
             STARTED.set(client != null && threadPool != null);
             return List.of(new Object());
+        }
+
+        @Override
+        public void close() {
+            CLOSED.set(true);
         }
 
         @Override
@@ -167,6 +174,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
         STARTED.set(false);
         SAW.set(0);
         REFUSE.set(false);
+        CLOSED.set(false);
     }
 
     /** All three hooks, on one node, in one run. */
@@ -248,6 +256,22 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
         );
         final String message = failure.getMessage() == null ? failure.toString() : failure.getMessage();
         assertTrue("the refusal must explain itself: " + message, message.contains("wrap every request"));
+    }
+
+    /**
+     * A plugin is closed when the node is, so whatever it holds is released.
+     *
+     * <p>Worth a test of its own rather than trusting the call site. {@code closeAll} was written when the
+     * host was built and nothing ever called it, which stayed invisible for as long as every plugin was a
+     * test plugin holding nothing; the first one that owned a thread pool leaked it out of every node that
+     * ran it. A plugin's resources are exactly the kind of thing nobody notices until production.
+     */
+    public void testAPluginIsClosedWithTheNode() throws Exception {
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-close"), List.of(new TestPlugin()))) {
+            node.start();
+            assertFalse("not while the node is running", CLOSED.get());
+        }
+        assertTrue("a plugin must be closed when its node is", CLOSED.get());
     }
 
     private record Response(int status, String body) {

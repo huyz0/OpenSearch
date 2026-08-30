@@ -103,6 +103,7 @@ List projects = [
   'distribution:tools:heap-prof-cli',
   'server',
   'server:cli',
+  'serverless:auth',
   'serverless:shell',
   'serverless:testkit',
   'test:framework',

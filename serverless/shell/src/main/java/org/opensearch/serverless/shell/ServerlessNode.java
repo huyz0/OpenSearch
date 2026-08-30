@@ -111,6 +111,7 @@ public final class ServerlessNode implements Closeable {
     private final ClusterService clusterService;
     private final IndicesService indicesService;
     private final SearchService searchService;
+    private org.opensearch.serverless.rest.SystemIndices systemIndices;
     private final RestController restController;
     private final TransportService transportService;
     private final HttpServerTransport httpServerTransport;
@@ -189,7 +190,33 @@ public final class ServerlessNode implements Closeable {
             this.indicesService = buildIndicesService(environment, clusterSettings);
             this.searchService = buildSearchService(clusterSettings);
 
-            this.nodeClient = new NodeClient(settings, threadPool);
+            // The client every REST handler is handed, wired to the shell's own operations.
+            //
+            // It used to be a bare NodeClient with no action registry, which the shell's own handlers
+            // could ignore because they reach the node directly. A plugin's handler cannot: getRestHandlers
+            // gives it this and nothing else, and every REST handler in the OpenSearch ecosystem is written
+            // against it. Left unwired it would have thrown on the first call a real plugin made -- found
+            // by writing the shell's authentication as a plugin, whose user-management endpoint needs to
+            // write to an index from inside a handler.
+            //
+            // Overriding doExecute rather than calling initialize(...) is the point: initialize wants a map
+            // of ActionType to TransportAction, which is the action layer S6.3 decided not to build. This
+            // delegates to the same allowlist ServerlessClient enforces, so a plugin's handler and a
+            // plugin's component get identical answers, including identical refusals.
+            this.nodeClient = new NodeClient(settings, threadPool) {
+                @Override
+                public <
+                    Request extends org.opensearch.action.ActionRequest,
+                    Response extends org.opensearch.core.action.ActionResponse> void doExecute(
+                        org.opensearch.action.ActionType<Response> action,
+                        Request request,
+                        org.opensearch.core.action.ActionListener<Response> listener
+                    ) {
+                    client().execute(action, request, listener);
+                }
+            };
+            // Before the controller, because every handler it registers is wrapped in this.
+            this.systemIndices = new org.opensearch.serverless.rest.SystemIndices(this.plugins.systemIndexPatterns(settings));
             this.restController = buildRestController(clusterSettings);
             final NetworkModule networkModule = buildNetworkModule(clusterSettings);
             final Transport transport = networkModule.getTransportSupplier().get();
@@ -474,13 +501,19 @@ public final class ServerlessNode implements Closeable {
             new NoneCircuitBreakerService(),
             new UsageService()
         );
+        // Every shell handler is registered behind the system-index guard, rather than each one checking:
+        // a guard a handler has to remember to call is a guard that one handler will not call.
+        final java.util.function.UnaryOperator<org.opensearch.rest.RestHandler> guarded =
+            handler -> org.opensearch.serverless.rest.SystemIndices.guard(handler, systemIndices);
         controller.registerHandler(
-            new ServerlessRootHandler(nodeName, ClusterName.CLUSTER_NAME_SETTING.get(settings).value(), nodeEnvironment::nodeId)
+            guarded.apply(
+                new ServerlessRootHandler(nodeName, ClusterName.CLUSTER_NAME_SETTING.get(settings).value(), nodeEnvironment::nodeId)
+            )
         );
-        controller.registerHandler(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane));
-        controller.registerHandler(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane));
-        controller.registerHandler(new org.opensearch.serverless.rest.BulkHandler(() -> this, () -> metadataPlane));
-        controller.registerHandler(new org.opensearch.serverless.rest.GetHandler(() -> this, () -> metadataPlane));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.BulkHandler(() -> this, () -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.GetHandler(() -> this, () -> metadataPlane)));
         // Plugin routes last, so a plugin cannot take over an endpoint the shell has already claimed:
         // RestController refuses a duplicate path rather than replacing it, and refusing loudly at boot
         // is the right answer -- a plugin that silently replaced the write path would be a system whose
@@ -488,8 +521,8 @@ public final class ServerlessNode implements Closeable {
         for (org.opensearch.rest.RestHandler handler : plugins.restHandlers(settings, controller, clusterSettings)) {
             controller.registerHandler(handler);
         }
-        controller.registerHandler(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane));
-        controller.registerHandler(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane)));
         controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,
@@ -1206,13 +1239,15 @@ public final class ServerlessNode implements Closeable {
     private volatile ServerlessClient client;
 
     /**
-     * The {@link org.opensearch.transport.client.Client} this node offers to plugins.
+     * Reports whether an index belongs to a plugin, and is therefore not reachable through REST.
      *
-     * <p>Not the {@code NodeClient} the REST layer is handed, which has no action registry and never has
-     * had one. This is the shell's own operations behind the interface every plugin expects.
-     *
-     * @return the client
+     * @param index the index name
+     * @return true if it is a system index
      */
+    public boolean isSystemIndex(String index) {
+        return systemIndices != null && systemIndices.contains(index);
+    }
+
     /**
      * Returns the plugins this node is running.
      *
@@ -1237,8 +1272,9 @@ public final class ServerlessNode implements Closeable {
     /**
      * The {@link org.opensearch.transport.client.Client} this node offers to plugins.
      *
-     * <p>Not the {@code NodeClient} the REST layer is handed, which has no action registry and never has
-     * had one. This is the shell's own operations behind the interface every plugin expects.
+     * <p>The shell's own operations behind the interface every plugin expects. The {@code NodeClient} the
+     * REST layer hands to handlers delegates here, so there is one allowlist and one set of answers no
+     * matter which door a plugin came in by.
      *
      * @return the client
      */
@@ -1569,14 +1605,15 @@ public final class ServerlessNode implements Closeable {
     @Override
     public void close() {
         started = false;
-        IOUtils.closeWhileHandlingException(
-            httpServerTransport,
-            transportService,
-            searchService,
-            indicesService,
-            clusterService,
-            nodeEnvironment
-        );
+        // Stop accepting requests first, then close the plugins that were serving them, then the services
+        // those plugins were given.
+        //
+        // Nothing called this until now: M23 wrote ServerlessPlugins#closeAll and never invoked it, which
+        // was invisible while every plugin in existence was a test plugin holding nothing. The first plugin
+        // that owned a thread pool leaked it out of every node, and the leak detector said so.
+        IOUtils.closeWhileHandlingException(httpServerTransport);
+        ServerlessPlugins.closeAll(plugins.plugins());
+        IOUtils.closeWhileHandlingException(transportService, searchService, indicesService, clusterService, nodeEnvironment);
         ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
     }
 }

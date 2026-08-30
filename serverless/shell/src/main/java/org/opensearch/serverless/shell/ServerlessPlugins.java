@@ -216,11 +216,34 @@ public final class ServerlessPlugins {
     }
 
     /**
+     * Collects the indices the plugins declare as their own.
+     *
+     * <p>Read from {@code SystemIndexPlugin#getSystemIndexDescriptors}, which is how every OpenSearch
+     * plugin already says this, so a plugin does not have to know it is running on the shell. What the
+     * shell does with the answer is refuse to route to them at all — see
+     * {@link org.opensearch.serverless.rest.SystemIndices}.
+     *
+     * @param settings the node settings, which core's hook takes
+     * @return the declared index patterns
+     */
+    public List<String> systemIndexPatterns(Settings settings) {
+        final List<String> patterns = new ArrayList<>();
+        for (Plugin plugin : plugins) {
+            if (plugin instanceof org.opensearch.plugins.SystemIndexPlugin systemIndexPlugin) {
+                for (org.opensearch.indices.SystemIndexDescriptor descriptor : systemIndexPlugin.getSystemIndexDescriptors(settings)) {
+                    patterns.add(descriptor.getIndexPattern());
+                }
+            }
+        }
+        return patterns;
+    }
+
+    /**
      * Closes every plugin, reporting failures rather than letting one stop the rest.
      *
      * @param plugins the plugins to close
      */
-    static void closeAll(Collection<Plugin> plugins) {
+    public static void closeAll(Collection<Plugin> plugins) {
         for (Plugin plugin : plugins) {
             try {
                 plugin.close();
