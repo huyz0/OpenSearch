@@ -104,6 +104,8 @@ public final class ServerlessNode implements Closeable {
 
     private final String nodeName;
     private final Settings settings;
+    private final ServerlessPlugins plugins;
+    private volatile org.opensearch.identity.IdentityService identityService;
     private final ThreadPool threadPool;
     private final NodeEnvironment nodeEnvironment;
     private final ClusterService clusterService;
@@ -134,6 +136,22 @@ public final class ServerlessNode implements Closeable {
      * @throws Exception if the node environment cannot be created or the data plane cannot be built
      */
     public ServerlessNode(Settings settings) throws Exception {
+        this(settings, java.util.List.of());
+    }
+
+    /**
+     * Creates a node running the given plugins.
+     *
+     * <p>Plugin instances rather than a directory scan, because that is the shape a test and a daemon can
+     * both use: {@code ServerlessBootstrap} can load from disk and hand the instances here, and a test can
+     * pass one it wrote. Loading is not this constructor's business.
+     *
+     * @param settings the node settings
+     * @param plugins the plugins to run
+     * @throws Exception if the node cannot be built
+     */
+    public ServerlessNode(Settings settings, java.util.List<org.opensearch.plugins.Plugin> plugins) throws Exception {
+        this.plugins = new ServerlessPlugins(plugins);
         this.settings = withShellDefaults(settings);
         settings = this.settings;
         this.nodeName = settings.get("node.name", "serverless-node");
@@ -153,8 +171,12 @@ public final class ServerlessNode implements Closeable {
 
         this.threadPool = new ThreadPool(settings);
         boolean success = false;
+        NodeEnvironment openedEnvironment = null;
         try {
-            this.nodeEnvironment = new NodeEnvironment(settings, environment);
+            // Held in a local as well, because the failure path below cannot read a blank final -- and it
+            // has to close this one thing above all others: NodeEnvironment holds node.lock.
+            openedEnvironment = new NodeEnvironment(settings, environment);
+            this.nodeEnvironment = openedEnvironment;
             this.localNode = new DiscoveryNode(
                 nodeName,
                 nodeEnvironment.nodeId(),
@@ -168,7 +190,7 @@ public final class ServerlessNode implements Closeable {
             this.searchService = buildSearchService(clusterSettings);
 
             this.nodeClient = new NodeClient(settings, threadPool);
-            this.restController = buildRestController();
+            this.restController = buildRestController(clusterSettings);
             final NetworkModule networkModule = buildNetworkModule(clusterSettings);
             final Transport transport = networkModule.getTransportSupplier().get();
             this.transportService = new TransportService(
@@ -193,6 +215,11 @@ public final class ServerlessNode implements Closeable {
             success = true;
         } finally {
             if (success == false) {
+                // The node environment too, not just the thread pool. It was missing, and a constructor
+                // that threw after taking node.lock leaked the file handle for the life of the process --
+                // which on a real node means the data directory stays locked and a restart cannot use it.
+                // Found by a test that makes construction fail on purpose; nothing before it did.
+                IOUtils.closeWhileHandlingException(openedEnvironment);
                 ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
             }
         }
@@ -436,10 +463,13 @@ public final class ServerlessNode implements Closeable {
      * The REST surface is an explicit allowlist (decision D2). Anything not registered here does not
      * exist, and returns 404/501 rather than an empty success.
      */
-    private RestController buildRestController() {
+    private RestController buildRestController(ClusterSettings clusterSettings) {
         final RestController controller = new RestController(
             Set.of(),
-            null,
+            // The seam a plugin authenticates on: it sees every request before the handler does, can
+            // refuse it, and can leave an identity in the ThreadContext. Passed here because the
+            // controller takes it at construction, which is why plugins are held before this runs.
+            plugins.restHandlerWrapper(threadPool.getThreadContext(), Set.of()),
             nodeClient,
             new NoneCircuitBreakerService(),
             new UsageService()
@@ -451,6 +481,13 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.BulkHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.GetHandler(() -> this, () -> metadataPlane));
+        // Plugin routes last, so a plugin cannot take over an endpoint the shell has already claimed:
+        // RestController refuses a duplicate path rather than replacing it, and refusing loudly at boot
+        // is the right answer -- a plugin that silently replaced the write path would be a system whose
+        // behaviour depends on registration order.
+        for (org.opensearch.rest.RestHandler handler : plugins.restHandlers(settings, controller, clusterSettings)) {
+            controller.registerHandler(handler);
+        }
         controller.registerHandler(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane));
         controller.registerHandler(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane));
         controller.registerHandler(
@@ -621,6 +658,15 @@ public final class ServerlessNode implements Closeable {
         projector = new LocalViewProjector(ClusterName.CLUSTER_NAME_SETTING.get(settings), localNode);
         reconciler = new ShardReconciler(indicesService, localNode);
         started = true;
+
+        // Last, and after `started`, because a plugin's createComponents may use the client -- which
+        // refuses to work on a node that has not started. Everything a plugin can reach now exists.
+        try {
+            plugins.createComponents(this, new org.opensearch.env.Environment(settings, null));
+        } catch (Exception e) {
+            started = false;
+            throw new IllegalStateException("a plugin failed to start; the node will not serve", e);
+        }
     }
 
     /**
@@ -1158,6 +1204,35 @@ public final class ServerlessNode implements Closeable {
     private volatile org.opensearch.core.xcontent.NamedXContentRegistry searchRegistry;
 
     private volatile ServerlessClient client;
+
+    /**
+     * The {@link org.opensearch.transport.client.Client} this node offers to plugins.
+     *
+     * <p>Not the {@code NodeClient} the REST layer is handed, which has no action registry and never has
+     * had one. This is the shell's own operations behind the interface every plugin expects.
+     *
+     * @return the client
+     */
+    /**
+     * Returns the plugins this node is running.
+     *
+     * @return the plugin host
+     */
+    public ServerlessPlugins plugins() {
+        return plugins;
+    }
+
+    /**
+     * Returns the identity service, which is core's no-op unless a plugin supplied one.
+     *
+     * @return the identity service
+     */
+    public synchronized org.opensearch.identity.IdentityService identityService() {
+        if (identityService == null) {
+            identityService = plugins.identityService(settings, threadPool);
+        }
+        return identityService;
+    }
 
     /**
      * The {@link org.opensearch.transport.client.Client} this node offers to plugins.
