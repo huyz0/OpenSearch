@@ -101,6 +101,34 @@ Core is right to refuse; `testAnIncompleteInstallationIsRefused` asserts that be
 fix is therefore to stop injecting it randomly, with `@SuppressFileSystems("ExtrasFS")` — which is what
 core's own `PluginsServiceTests` does, for the same reason. Four consecutive clean runs after.
 
+## All three extension points, each with a control
+
+Wiring three things identically and testing one of them is how the other two turn out to be quietly wrong,
+so each has an end-to-end test and each has a control that fails without the plugin.
+
+| Point | Proof | Control |
+| --- | --- | --- |
+| `AnalysisPlugin` | `analysis-icu` installed; `Résumé` matches a search for `resume` because `icu_folding` ran | a second index without the filter does not match |
+| `MapperPlugin` | `mapper-murmur3` installed; a document with a `murmur3` field is written and searched | a node with nothing installed refuses the same mapping — `murmur3` is not a type core knows |
+| `SearchPlugin` | a compiled plugin registering a `matches_nothing` query; the shell parses it, builds it and runs it | a node without it answers 400, because the body is not a query it knows |
+
+Both real plugins are installed on the same node, which also covers a node running more than one — nothing
+else did.
+
+**The search one is the case where being wired wrongly would have been hardest to notice**, because a
+custom query has to reach two separate registries: the `NamedXContentRegistry` that parses a search body
+and the `SearchModule` that owns the query. Either could have been left with an empty plugin list
+independently of the other.
+
+It is also the only `SearchPlugin` contribution this shell can reach at all. Aggregations, suggesters,
+highlighting and rescoring are refused with 501, so a plugin offering one of those would be wired correctly
+and still have nothing to show — which is why the test uses a plugin written for the purpose rather than an
+in-tree one. There is no in-tree `SearchPlugin` whose contribution the shell's search surface can use.
+
+The control for `mapper-murmur3` needed its own metadata plane. Pointed at the first node's plane, the
+second node loses the activation race, never opens the shard, and never reaches the mapping — a test that
+would have passed whatever the mapper registry contained.
+
 ## Canaries
 
 | Defect | Caught by |
@@ -108,15 +136,16 @@ core's own `PluginsServiceTests` does, for the same reason. Four consecutive cle
 | One resolver method left inherited from core | `testEveryResolverMethodThatTouchesClusterStateIsOverridden` |
 | The watcher and script services are null again | 2 tests |
 | Analysis plugins are not given to the analysis module | `testAnInstalledAnalysisPluginActuallyAnalyses` |
+| Mapper plugins are not given to the indices module | `testAnInstalledMapperPluginProvidesItsFieldType` |
+| Search plugins are not given to the search module | `testAnInstalledSearchPluginsQueryIsParsedAndRun` |
 | Descriptor settings go back to the flat string form | `testADescriptorCarriesListValuedSettings`, the real-plugin test |
 
 ## What is still missing
 
 - **`ActionFilter`s remain impossible**, so plugin *authorization* cannot work — for the shell's own
   authentication plugin or for anyone else's. This is now the largest single gap in the host.
-- **`MapperPlugin` and `SearchPlugin` are wired but untested.** The analysis path has an end-to-end proof;
-  the other two are one-line changes of the same shape with no test behind them, which is exactly the kind
-  of thing that is quietly wrong. `mapper-murmur3` and a `SearchPlugin` would close that.
+- **Most of what a `SearchPlugin` can offer is still unreachable**, because aggregations, suggesters,
+  highlighting and rescoring are 501. A custom query is the whole of the usable surface.
 - **`onIndexModule` fires only for installed plugins**, not for instances passed to the constructor: the
   `PluginsService` core builds knows about the former and cannot be told about the latter.
 - **`RepositoriesService` is still a supplier returning null**, because snapshots are out of scope (R7).
@@ -124,5 +153,5 @@ core's own `PluginsServiceTests` does, for the same reason. Four consecutive cle
   it cannot enforce anything, so the useful form of that exercise is a spike reporting what breaks, not a
   milestone claiming support.
 
-238 tests green across `test` (204), `pluginTest` (1), `processTest` (13) and `s3Test` (20), none skipped,
+240 tests green across `test` (205), `pluginTest` (2), `processTest` (13) and `s3Test` (20), none skipped,
 MinIO live. `server/` untouched; §4 rule 1 verified.

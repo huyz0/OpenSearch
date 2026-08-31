@@ -45,7 +45,8 @@ tasks.named('test').configure {
  * analysis-icu is chosen for what it drags with it: a 14MB icu4j and a Lucene analysis jar, so the loader
  * is exercised on a plugin that brings dependencies rather than on a single class a test compiled. It is
  * also an AnalysisPlugin, so the test can prove the shell honours an extension point rather than merely
- * loading something.
+ * loading something. mapper-murmur3 is the second extension point -- a field type -- and installing both at
+ * once also covers a node running more than one installed plugin, which nothing else does.
  *
  * Its own task because it reads that zip out of the build tree, which the test framework's security
  * manager denies -- rightly, since reading build artefacts is not something a node does. One test loses
@@ -59,7 +60,11 @@ tasks.register('pluginTest', Test) {
   classpath = sourceSets.test.runtimeClasspath
   include '**/ServerlessRealPluginTests.class'
   dependsOn ':plugins:analysis-icu:bundlePlugin'
-  systemProperty 'tests.serverless.plugin.dist', project(':plugins:analysis-icu').projectDir.toString() + '/build/distributions'
+  dependsOn ':plugins:mapper-murmur3:bundlePlugin'
+  systemProperty 'tests.serverless.plugin.dists', [
+    project(':plugins:analysis-icu').projectDir.toString() + '/build/distributions',
+    project(':plugins:mapper-murmur3').projectDir.toString() + '/build/distributions'
+  ].join(File.pathSeparator)
   systemProperty 'tests.security.manager', 'false'
 }
 

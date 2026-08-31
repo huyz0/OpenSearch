@@ -159,6 +159,100 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
         }
         """;
 
+    private static final String QUERY_PLUGIN_CLASS = PLUGIN_PACKAGE + ".NothingQueryPlugin";
+
+    /**
+     * A plugin that registers a query.
+     *
+     * <p>A custom query is the one {@code SearchPlugin} contribution the shell's search surface can
+     * actually reach: aggregations, suggesters, highlighting and rescoring are all refused with 501, so a
+     * plugin offering one of those would be wired correctly and still have nothing to show. This one is
+     * deliberately trivial — it matches nothing — because the point is whether the shell parsed it, built
+     * it and ran it, not what it computes.
+     */
+    private static final String QUERY_SOURCE = """
+        package org.opensearch.serverless.installed;
+
+        import org.apache.lucene.search.MatchNoDocsQuery;
+        import org.apache.lucene.search.Query;
+        import org.opensearch.common.settings.Settings;
+        import org.opensearch.core.common.io.stream.StreamInput;
+        import org.opensearch.core.common.io.stream.StreamOutput;
+        import org.opensearch.core.xcontent.ToXContent;
+        import org.opensearch.core.xcontent.XContentBuilder;
+        import org.opensearch.core.xcontent.XContentParser;
+        import org.opensearch.index.query.AbstractQueryBuilder;
+        import org.opensearch.index.query.QueryShardContext;
+        import org.opensearch.plugins.Plugin;
+        import org.opensearch.plugins.SearchPlugin;
+
+        import java.io.IOException;
+        import java.util.List;
+
+        public class NothingQueryPlugin extends Plugin implements SearchPlugin {
+
+            public NothingQueryPlugin(Settings settings) {
+            }
+
+            @Override
+            public List<QuerySpec<?>> getQueries() {
+                return List.of(
+                    new QuerySpec<>(NothingQueryBuilder.NAME, NothingQueryBuilder::new, NothingQueryBuilder::fromXContent)
+                );
+            }
+
+            public static class NothingQueryBuilder extends AbstractQueryBuilder<NothingQueryBuilder> {
+
+                public static final String NAME = "matches_nothing";
+
+                public NothingQueryBuilder() {
+                }
+
+                public NothingQueryBuilder(StreamInput in) throws IOException {
+                    super(in);
+                }
+
+                @Override
+                protected void doWriteTo(StreamOutput out) throws IOException {
+                }
+
+                @Override
+                protected void doXContent(XContentBuilder builder, ToXContent.Params params) throws IOException {
+                    builder.startObject(NAME);
+                    printBoostAndQueryName(builder);
+                    builder.endObject();
+                }
+
+                public static NothingQueryBuilder fromXContent(XContentParser parser) throws IOException {
+                    while (parser.nextToken() != XContentParser.Token.END_OBJECT) {
+                        // a query with no options; anything inside is ignored
+                    }
+                    return new NothingQueryBuilder();
+                }
+
+                @Override
+                protected Query doToQuery(QueryShardContext context) throws IOException {
+                    return new MatchNoDocsQuery();
+                }
+
+                @Override
+                protected boolean doEquals(NothingQueryBuilder other) {
+                    return true;
+                }
+
+                @Override
+                protected int doHashCode() {
+                    return 0;
+                }
+
+                @Override
+                public String getWriteableName() {
+                    return NAME;
+                }
+            }
+        }
+        """;
+
     private Settings nodeSettings(String name, Path home) {
         return Settings.builder()
             .put("node.name", name)
@@ -230,6 +324,66 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * An installed search plugin's query is parsed, built and run.
+     *
+     * <p>The third extension point, and the one where being wired wrongly would be hardest to notice: a
+     * custom query has to reach two separate registries — the {@code NamedXContentRegistry} that parses a
+     * search body and the {@code SearchModule} that owns the query itself — and either could have been
+     * left with an empty plugin list independently of the other.
+     *
+     * <p>The query matches nothing on purpose. Against an index holding one document, {@code match_all}
+     * finds it and this finds none: the difference is the plugin's code running, and no wiring accident
+     * produces it.
+     */
+    public void testAnInstalledSearchPluginsQueryIsParsedAndRun() throws Exception {
+        final Path home = createTempDir();
+        install(home, "nothing-query", Version.CURRENT.toString(), QUERY_SOURCE, QUERY_PLUGIN_CLASS);
+
+        final java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong(1_000L);
+        final org.opensearch.serverless.metadata.MetadataPlane plane = new org.opensearch.serverless.metadata.MetadataPlane(
+            new org.opensearch.common.blobstore.fs.FsBlobStore(1024, createTempDir(), false),
+            org.opensearch.common.blobstore.BlobPath.cleanPath(),
+            clock::get,
+            30_000L
+        );
+        plane.createIndex(
+            new org.opensearch.serverless.cluster.IndexDescriptor(
+                "docs",
+                "uuid-docs-0000000000",
+                1,
+                "{\"properties\":{\"msg\":{\"type\":\"text\"}}}",
+                null
+            )
+        );
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("query-plugin", home))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final var loop = new org.opensearch.serverless.reconcile.BackgroundReconciler(node, plane);
+            loop.want("docs", 0);
+            loop.tick(clock.get());
+
+            assertEquals(201, send(node, "PUT", "/docs/_doc/1?refresh=true", "{\"msg\":\"here\"}").status());
+            assertTrue(
+                "the document must be there for the comparison to mean anything",
+                send(node, "POST", "/docs/_search", "{\"query\":{\"match_all\":{}}}").body().contains("\"value\":1")
+            );
+
+            final Response custom = send(node, "POST", "/docs/_search", "{\"query\":{\"matches_nothing\":{}}}");
+            assertEquals("a plugin's query must be parsed rather than rejected: " + custom.body(), 200, custom.status());
+            assertTrue("and must actually run: " + custom.body(), custom.body().contains("\"value\":0"));
+        }
+
+        // The control: without the plugin the same body is not a query this node knows.
+        try (ServerlessNode bare = new ServerlessNode(nodeSettings("query-none", createTempDir()))) {
+            bare.start();
+            bare.setMetadataPlane(plane);
+            final Response rejected = send(bare, "POST", "/docs/_search", "{\"query\":{\"matches_nothing\":{}}}");
+            assertEquals("without the plugin the query must be refused: " + rejected.body(), 400, rejected.status());
+        }
+    }
+
     /** A node whose home has no plugins directory at all is unaffected, which is nearly every node. */
     public void testANodeWithNoPluginsDirectoryIsUnchanged() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("installed-none", createTempDir()))) {
@@ -251,6 +405,10 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
 
     /** Writes a complete installation: a directory, a descriptor, and a jar built from {@link #SOURCE}. */
     private void install(Path home, String name, String opensearchVersion) throws Exception {
+        install(home, name, opensearchVersion, SOURCE, PLUGIN_CLASS);
+    }
+
+    private void install(Path home, String name, String opensearchVersion, String source, String className) throws Exception {
         final Path pluginDir = home.resolve("plugins").resolve(name);
         Files.createDirectories(pluginDir);
         Files.writeString(
@@ -262,25 +420,28 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
                 "version=1.0.0",
                 "opensearch.version=" + opensearchVersion,
                 "java.version=" + System.getProperty("java.specification.version"),
-                "classname=" + PLUGIN_CLASS
+                "classname=" + className
             ),
             StandardCharsets.UTF_8
         );
-        jar(compile(), pluginDir.resolve(name + ".jar"));
+        jar(compile(source, className), pluginDir.resolve(name + ".jar"));
     }
 
     /** Compiles {@link #SOURCE} against this JVM's classpath and returns the directory of class files. */
-    private Path compile() throws IOException {
+    private Path compile(String source, String className) throws IOException {
         final JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         assertNotNull("this test needs a JDK, not a JRE: no system java compiler is available", compiler);
 
         final Path classes = createTempDir();
         try (StandardJavaFileManager files = compiler.getStandardFileManager(null, null, StandardCharsets.UTF_8)) {
             files.setLocation(StandardLocation.CLASS_OUTPUT, List.of(classes.toFile()));
-            final var unit = new SimpleJavaFileObject(URI.create("string:///GreetingPlugin.java"), javax.tools.JavaFileObject.Kind.SOURCE) {
+            final var unit = new SimpleJavaFileObject(
+                URI.create("string:///" + className.substring(className.lastIndexOf('.') + 1) + ".java"),
+                javax.tools.JavaFileObject.Kind.SOURCE
+            ) {
                 @Override
                 public CharSequence getCharContent(boolean ignoreEncodingErrors) {
-                    return SOURCE;
+                    return source;
                 }
             };
             final var task = compiler.getTask(
@@ -311,13 +472,20 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
     }
 
     private static Response send(ServerlessNode node, String method, String path) throws Exception {
+        return send(node, method, path, null);
+    }
+
+    private static Response send(ServerlessNode node, String method, String path, String body) throws Exception {
         final var address = node.boundHttpAddress().publishAddress();
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
             final HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + path))
                 .timeout(Duration.ofSeconds(60))
                 .header("Content-Type", "application/json")
-                .method(method, HttpRequest.BodyPublishers.noBody())
+                .method(
+                    method,
+                    body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)
+                )
                 .build();
             final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
             return new Response(response.statusCode(), response.body());

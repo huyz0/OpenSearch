@@ -115,10 +115,10 @@ public class ServerlessRealPluginTests extends OpenSearchTestCase {
             node.start();
             node.setMetadataPlane(plane);
 
-            assertEquals("the plugin must be loaded", 1, node.plugins().plugins().size());
+            assertEquals("both plugins must be loaded", 2, node.plugins().plugins().size());
             assertTrue(
-                "and it must be the real one: " + node.plugins().plugins().get(0).getClass().getName(),
-                node.plugins().plugins().get(0).getClass().getName().contains("ICU")
+                "and they must be the real ones: " + node.plugins().plugins(),
+                node.plugins().plugins().stream().anyMatch(p -> p.getClass().getName().contains("ICU"))
             );
 
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
@@ -155,20 +155,83 @@ public class ServerlessRealPluginTests extends OpenSearchTestCase {
         }
     }
 
-    /** Unpacks the assembled plugin zip into {@code home/plugins/analysis-icu}, as the plugin CLI would. */
-    private void install(Path home) throws Exception {
-        final String dist = System.getProperty("tests.serverless.plugin.dist");
-        assumeTrue("this test needs the assembled analysis-icu zip; run it through Gradle", dist != null);
-        final Path distributions = Path.of(dist);
-        assumeTrue("no distributions directory at " + distributions, Files.isDirectory(distributions));
+    /**
+     * An installed mapper plugin's field type is usable, and is not without it.
+     *
+     * <p>The second extension point, and the control matters as much as the assertion. {@code murmur3} is
+     * not a field type core knows; a node without the plugin refuses the mapping outright. So the same
+     * mapping being accepted here is the plugin's doing and cannot be anything else.
+     */
+    public void testAnInstalledMapperPluginProvidesItsFieldType() throws Exception {
+        final Path home = createTempDir();
+        install(home);
 
-        final Path zip;
-        try (var files = Files.list(distributions)) {
-            zip = files.filter(f -> f.getFileName().toString().endsWith(".zip")).findFirst().orElse(null);
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final String mapping = "{\"properties\":{\"msg\":{\"type\":\"keyword\"},\"fingerprint\":{\"type\":\"murmur3\"}}}";
+        plane.createIndex(new IndexDescriptor("hashed", "uuid-hashed-00000000", 1, mapping, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("mapper-plugin", home))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("hashed", 0);
+            loop.tick(clock.get());
+
+            final Response written = send(node, "PUT", "/hashed/_doc/1?refresh=true", "{\"msg\":\"a\",\"fingerprint\":\"a\"}");
+            assertEquals("a document using the plugin's field type must be written: " + written.body(), 201, written.status());
+            assertTrue(
+                "and be searchable on the ordinary field beside it",
+                send(node, "POST", "/hashed/_search", "{\"query\":{\"term\":{\"msg\":\"a\"}}}").body().contains("\"value\":1")
+            );
         }
-        assumeTrue("no plugin zip in " + distributions, zip != null);
 
-        final Path target = home.resolve("plugins").resolve("analysis-icu");
+        // The control: the same mapping, on a node with nothing installed.
+        //
+        // Its own plane, not the one above: the first node still holds that shard's head, so a second node
+        // would lose the activation race and never open the shard at all -- and a test that never reaches
+        // the mapping would pass whatever the mapper registry contained.
+        final MetadataPlane bareplane = new MetadataPlane(
+            new FsBlobStore(1024, createTempDir(), false),
+            BlobPath.cleanPath(),
+            clock::get,
+            TTL
+        );
+        bareplane.createIndex(new IndexDescriptor("hashed", "uuid-hashed-00000001", 1, mapping, null));
+        try (ServerlessNode bare = new ServerlessNode(nodeSettings("mapper-none", createTempDir()))) {
+            bare.start();
+            bare.setMetadataPlane(bareplane);
+            final BackgroundReconciler loop = new BackgroundReconciler(bare, bareplane);
+            loop.want("hashed", 0);
+            final var failure = expectThrows(Exception.class, () -> loop.tick(clock.get()));
+            assertTrue(
+                "without the plugin the field type must be unknown: " + failure,
+                failure.toString().contains("murmur3") || (failure.getCause() != null && failure.getCause().toString().contains("murmur3"))
+            );
+        }
+    }
+
+    /** Unpacks every assembled plugin zip into its own directory under {@code home/plugins}. */
+    private void install(Path home) throws Exception {
+        final String dists = System.getProperty("tests.serverless.plugin.dists");
+        assumeTrue("this test needs the assembled plugin zips; run it through Gradle", dists != null);
+
+        int installed = 0;
+        for (String dist : dists.split(java.io.File.pathSeparator)) {
+            final Path distributions = Path.of(dist);
+            assumeTrue("no distributions directory at " + distributions, Files.isDirectory(distributions));
+            final Path zip;
+            try (var files = Files.list(distributions)) {
+                zip = files.filter(f -> f.getFileName().toString().endsWith(".zip")).findFirst().orElse(null);
+            }
+            assumeTrue("no plugin zip in " + distributions, zip != null);
+            unpack(zip, home.resolve("plugins").resolve(zip.getFileName().toString().replace(".zip", "")));
+            installed++;
+        }
+        assertEquals("both plugins must be installed", 2, installed);
+    }
+
+    private static void unpack(Path zip, Path target) throws Exception {
         Files.createDirectories(target);
         try (ZipInputStream in = new ZipInputStream(Files.newInputStream(zip))) {
             ZipEntry entry;
