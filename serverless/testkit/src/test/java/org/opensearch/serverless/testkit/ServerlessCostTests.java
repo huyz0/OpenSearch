@@ -609,6 +609,153 @@ public class ServerlessCostTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * What reading one document by id costs, in each of the three shapes a get has.
+     *
+     * <p>Writes, batches, searches and aggregations are all measured and a get was not, which on a design
+     * whose entire argument is object-store cost is a gap rather than an oversight. A get is also the one
+     * operation with three genuinely different costs depending on who is asked: the owner has it in memory,
+     * a peer has to be told who the owner is and then ask them, and a shard nobody owns has to be opened
+     * from a published commit before anybody can answer at all.
+     *
+     * <p>The numbers are logged rather than asserted exactly, because they are a property of the design and
+     * not a contract; what is asserted is the shape — that answering from the owner touches no data, that
+     * forwarding does not either, and that the scale-to-zero read is the only one that pays for segments.
+     *
+     * <p>A multi-get of ten documents is measured against ten single gets, because "batching is cheaper" is
+     * a claim and this is the number behind it.
+     */
+    public void testWhatAGetCosts() throws Exception {
+        for (boolean onBucket : new boolean[] { false, true }) {
+            if (onBucket) {
+                assumeEndpoint();
+            }
+            final CountingBlobStore store = onBucket ? bucket() : filesystem();
+            final String label = onBucket ? "s3" : "fs";
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+            // Three shards, because the helper that routes a document by id assumes three and one place
+            // knowing the shard count is better than two that can disagree.
+            final int shards = 3;
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
+
+            final ServerlessNode writer = new ServerlessNode(nodeSettings("cost-get-" + label));
+            writer.start();
+            writer.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
+            for (int shard = 0; shard < shards; shard++) {
+                loop.want("alpha", shard);
+            }
+            loop.tick(System.currentTimeMillis());
+            for (int i = 0; i < 20; i++) {
+                writer.index(shardOf(writer, "alpha", i), String.valueOf(i), "{\"msg\":\"getcost\",\"n\":" + i + "}");
+            }
+            loop.tick(System.currentTimeMillis());   // publish, so a cold reader has something to open
+
+            // 1. From the owner.
+            store.reset();
+            long startedAt = System.nanoTime();
+            final Response warm = search(writer, "/alpha/_doc/1");
+            final long warmMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+            assertEquals("the owner should have answered: " + warm.body(), 200, warm.status());
+            assertTrue("and in realtime: " + warm.body(), warm.body().contains("\"realtime\":true"));
+            logger.info(
+                "cost[{}]: get from the shard's owner -> {} requests, {}ms  [{}]",
+                label,
+                store.impliedS3Requests(),
+                warmMillis,
+                store.breakdown()
+            );
+            assertEquals("on " + label + ", the owner has the document already and must not fetch it", 0, store.blobReads());
+
+            // 2. Ten of them, one at a time, against one multi-get.
+            store.reset();
+            startedAt = System.nanoTime();
+            for (int i = 0; i < 10; i++) {
+                assertEquals(200, search(writer, "/alpha/_doc/" + i).status());
+            }
+            final long tenSingly = store.impliedS3Requests();
+            final long tenSinglyMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+
+            store.reset();
+            startedAt = System.nanoTime();
+            final Response batched = post(
+                writer,
+                "/alpha/_mget",
+                "{\"ids\":[\"0\",\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\"]}"
+            );
+            final long tenTogether = store.impliedS3Requests();
+            final long tenTogetherMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+            assertEquals(batched.body(), 200, batched.status());
+            assertFalse("every document must have been found: " + batched.body(), batched.body().contains("\"found\":false"));
+            logger.info(
+                "cost[{}]: ten documents singly -> {} requests {}ms; the same ten as one multi-get -> {} requests {}ms",
+                label,
+                tenSingly,
+                tenSinglyMillis,
+                tenTogether,
+                tenTogetherMillis
+            );
+            assertTrue(
+                "on " + label + ", a multi-get must not cost more than the same documents fetched one at a time",
+                tenTogether <= tenSingly
+            );
+
+            // 3. Forwarded: a peer while the writer still owns the shard.
+            try (ServerlessNode idle = new ServerlessNode(nodeSettings("cost-get-fwd-" + label))) {
+                idle.start();
+                idle.setMetadataPlane(plane);
+                store.reset();
+                startedAt = System.nanoTime();
+                final Response forwarded = search(idle, "/alpha/_doc/1");
+                final long forwardedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+                assertEquals("the peer should have forwarded and answered: " + forwarded.body(), 200, forwarded.status());
+                assertTrue(
+                    "still in realtime, because the owner answered: " + forwarded.body(),
+                    forwarded.body().contains("\"realtime\":true")
+                );
+                logger.info(
+                    "cost[{}]: get forwarded to the shard's owner -> {} requests, {}ms  [{}]",
+                    label,
+                    store.impliedS3Requests(),
+                    forwardedMillis,
+                    store.breakdown()
+                );
+                assertEquals("on " + label + ", forwarding must not fetch data either -- the owner answers", 0, store.blobReads());
+            }
+
+            // 4. Scale to zero: nobody owns the shard, so it is opened from its published commit.
+            for (int shard = 0; shard < shards; shard++) {
+                assertTrue(plane.heads().release("alpha", shard, writer.localNode().getId()));
+            }
+            writer.close();
+
+            try (ServerlessNode cold = new ServerlessNode(nodeSettings("cost-get-cold-" + label))) {
+                cold.start();
+                cold.setMetadataPlane(plane);
+                store.reset();
+                startedAt = System.nanoTime();
+                final Response fromCommit = search(cold, "/alpha/_doc/1");
+                final long coldMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+                assertEquals("a get must work against an index nobody is serving: " + fromCommit.body(), 200, fromCommit.status());
+                // Not realtime, and it says so: there is no writer, so the commit is the whole truth and
+                // the answer is honest about which copy it came from.
+                assertTrue("and say it was not realtime: " + fromCommit.body(), fromCommit.body().contains("\"realtime\":false"));
+                logger.info(
+                    "cost[{}]: get against a shard nobody owns -> {} requests ({} data reads), {}ms  [{}]",
+                    label,
+                    store.impliedS3Requests(),
+                    store.blobReads(),
+                    coldMillis,
+                    store.breakdown()
+                );
+                assertTrue(
+                    "on " + label + ", the scale-to-zero read is the one that pays for segments, and it must",
+                    store.blobReads() > 0
+                );
+            }
+        }
+    }
+
     public void testWhatASearchCosts() throws Exception {
         for (boolean onBucket : new boolean[] { false, true }) {
             if (onBucket) {
