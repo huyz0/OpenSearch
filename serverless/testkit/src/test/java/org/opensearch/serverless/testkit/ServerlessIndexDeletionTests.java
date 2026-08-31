@@ -150,6 +150,62 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * The bytes an interrupted delete left behind are eventually collected.
+     *
+     * <p>Under uuid-keyed storage those bytes are unreachable rather than dangerous — nothing will ever
+     * read them, and nothing will ever reuse that path — which is exactly why nothing would ever notice
+     * them either. A leak that cannot cause a wrong answer is a leak that gets paid for indefinitely.
+     *
+     * <p>The live index in the same fixture is the assertion that matters as much as the deleted one: a
+     * sweep that removed the orphan and also the index still serving traffic would pass a test that only
+     * looked at the orphan.
+     */
+    public void testTheSweepCollectsShardsNoIndexOwns() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final java.nio.file.Path store = createTempDir();
+        final FsBlobStore blobs = new FsBlobStore(1024, store, false);
+        final MetadataPlane plane = new MetadataPlane(blobs, BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("orphaned", "uuid-orphaned-first", 1, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("keeper", "uuid-keeper-0000000", 1, MAPPING, null));
+
+        final java.nio.file.Path orphanData = store.resolve("segments").resolve("orphaned#uuid-orphaned-first#0");
+        final java.nio.file.Path keeperData = store.resolve("segments").resolve("keeper#uuid-keeper-0000000#0");
+        final java.nio.file.Path saved = createTempDir().resolve("saved");
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("delete-sweep"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("orphaned", 0);
+            loop.want("keeper", 0);
+            loop.tick(clock.get());
+
+            assertEquals(201, send(node, "PUT", "/orphaned/_doc/1?refresh=true", "{\"msg\":\"doomed\"}").status());
+            assertEquals(201, send(node, "PUT", "/keeper/_doc/1?refresh=true", "{\"msg\":\"kept\"}").status());
+            loop.tick(clock.get());
+
+            copyTree(orphanData, saved);
+            assertEquals(200, send(node, "DELETE", "/orphaned", null).status());
+            loop.tick(clock.get());
+            // What a writer finishing a publish after the delete's sweep leaves on the store.
+            copyTree(saved, orphanData);
+            assertTrue("the fixture must leave an orphan", java.nio.file.Files.isDirectory(orphanData));
+
+            final var swept = new org.opensearch.serverless.reconcile.GarbageCollector(blobs, BlobPath.cleanPath()).collectOrphanedShards(
+                plane
+            );
+
+            assertEquals("exactly the orphan, by name: " + swept, java.util.List.of("orphaned#uuid-orphaned-first#0"), swept);
+            assertFalse("and its bytes are gone", java.nio.file.Files.exists(orphanData));
+            assertTrue("while the live index is untouched", java.nio.file.Files.isDirectory(keeperData));
+            assertTrue(
+                "and still serving",
+                send(node, "POST", "/keeper/_search", "{\"query\":{\"match_all\":{}}}").body().contains("kept")
+            );
+        }
+    }
+
     /** Copies a directory tree, so a test can put back what a delete removed. */
     private static void copyTree(java.nio.file.Path from, java.nio.file.Path to) throws java.io.IOException {
         try (var walk = java.nio.file.Files.walk(from)) {

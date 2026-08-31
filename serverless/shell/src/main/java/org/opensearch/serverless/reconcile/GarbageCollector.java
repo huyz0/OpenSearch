@@ -168,6 +168,65 @@ public final class GarbageCollector {
     }
 
     /**
+     * Deletes the storage of shards no index owns any more.
+     *
+     * <p><b>What leaves an orphan.</b> Publishing is fenced by the manifest register's term, not by the
+     * shard-head, so a writer that has lost its head can still finish a publish it had already begun — and
+     * land bytes after the delete that removed the index swept its container. Those bytes are under the
+     * dead index's uuid, so nothing will ever read them and nothing will ever reuse that path. Without this
+     * they are paid for forever.
+     *
+     * <p><b>Absent means absent.</b> A container is deleted only when the register for its index says the
+     * index is not there, or is there under a different uuid. A register read that fails throws rather than
+     * answering "absent", so a store having a bad minute cannot be mistaken for an index having been
+     * deleted — which is the mistake that would turn a garbage collector into data loss.
+     *
+     * <p><b>A container this does not recognise is left alone.</b> Anything whose name is not
+     * {@code index#uuid#shard} was not written by this system, and a sweep that deletes what it cannot
+     * parse is a sweep that eventually deletes somebody else's bucket.
+     *
+     * <p><b>This lists every shard container in the deployment</b>, which is proportional to the population
+     * and is the thing §6.3 forbids on a request path. It is allowed here for the same reason
+     * {@link #collectAll} is: a sweep genuinely intends to visit everything, and nothing waits on it. What
+     * it is not is resumable, unlike the per-shard sweep — the object-store listing API this is built on
+     * offers children, not pages of them, so a deployment large enough for that to matter needs a listing
+     * that can be sliced before this can be.
+     *
+     * @param plane the metadata plane
+     * @return the container names deleted
+     * @throws IOException if listing fails
+     */
+    public List<String> collectOrphanedShards(MetadataPlane plane) throws IOException {
+        final BlobContainer segments = blobStore.blobContainer(base.add("segments"));
+        final List<String> deleted = new ArrayList<>();
+        for (Map.Entry<String, BlobContainer> child : segments.children().entrySet()) {
+            final String container = child.getKey();
+            // index#uuid#shard, split from the right, because an index name may contain the separator in
+            // no version of this system but the uuid and shard cannot.
+            final int lastSeparator = container.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
+            final int uuidSeparator = lastSeparator < 0 ? -1 : container.lastIndexOf(RegisterMap.SHARD_SEPARATOR, lastSeparator - 1);
+            if (uuidSeparator <= 0) {
+                continue;
+            }
+            final String indexName = container.substring(0, uuidSeparator);
+            final String uuid = container.substring(uuidSeparator + 1, lastSeparator);
+            try {
+                Integer.parseInt(container.substring(lastSeparator + 1));
+            } catch (NumberFormatException e) {
+                continue;
+            }
+
+            final Optional<org.opensearch.serverless.cluster.IndexDescriptor> descriptor = plane.describe(indexName);
+            if (descriptor.isPresent() && descriptor.get().uuid().equals(uuid)) {
+                continue;
+            }
+            child.getValue().delete();
+            deleted.add(container);
+        }
+        return deleted;
+    }
+
+    /**
      * Removes node leases that have expired.
      *
      * <p>Tidiness rather than correctness: an expired lease is already filtered out on read, so leaving

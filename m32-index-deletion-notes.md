@@ -57,9 +57,21 @@ head can still finish a publish it had already begun and leave blobs behind the 
 name-keyed storage those blobs were a correctness problem, waiting for somebody to reuse the name. Under
 uuid-keyed storage they are unreferenced bytes under a dead uuid: a leak, and only a leak.
 
-A sweep that enumerates live indices and deletes shard containers whose uuid is not among them would
-reclaim them. Enumeration is allowed offline and refused on the request path (§6.3), so that belongs to the
-garbage collector.
+`GarbageCollector#collectOrphanedShards` reclaims them: it lists every shard container, and deletes one
+whose index's register says the index is not there, or is there under a different uuid.
+
+**Absent means absent.** A register read that fails throws rather than answering "absent", so a store having
+a bad minute cannot be mistaken for an index having been deleted — which is the mistake that turns a
+garbage collector into data loss. A container whose name it cannot parse is left alone, because a sweep
+that deletes what it does not recognise eventually deletes somebody else's bucket.
+
+The test keeps a live index in the same fixture, and asserts it is untouched and still serving. A sweep
+that removed the orphan and the live index would pass a test that only looked at the orphan.
+
+Unlike the per-shard sweep this is not resumable: the listing API offers children, not pages of them, so a
+deployment large enough for that to matter needs a sliceable listing before this can be sliced. It is
+proportional to the population, which is what §6.3 forbids on a request path and permits here, where
+nothing waits on it.
 
 ## What was already right
 
@@ -76,12 +88,12 @@ correct" is only knowable once something asserts it.
 
 ## What is still missing
 
-- **No sweep for orphans.** Bytes left by the residual publish race are never reclaimed now, because
-  nothing will ever reuse that uuid. The garbage collector is where that belongs.
+- **The orphan sweep is not resumable**, as above, and nothing runs it on a schedule — it is a maintenance
+  entry point, not a background loop.
 - **Deletion is not fenced against a live writer**, only raced with. Making a publish check the head would
   close it and would put an extra register read on the publish path.
 - **No migration.** This changes where shards are stored, so an existing deployment's data is not found by
   a node running this build. Pre-release, and stated rather than discovered.
 
-263 tests green across `test` (228), `pluginTest` (2), `processTest` (13) and `s3Test` (20), none skipped,
+264 tests green across `test` (229), `pluginTest` (2), `processTest` (13) and `s3Test` (20), none skipped,
 MinIO live. `server/` untouched.
