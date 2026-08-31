@@ -1,5 +1,10 @@
 # RFC: The Serverless Shell — a new node process over the existing data plane
 
+
+> **Current state:** the per-milestone notes below record what was true when each was written; several of their
+> "still missing" lists have since been closed. [`serverless-status.md`](serverless-status.md) is the single
+> up-to-date statement of what the shell does, what it deliberately refuses, and what is genuinely missing.
+
 - Status: DRAFT — design record, no implementation attached
 - Branch: `feature/serverlessplusplus`, cut from `feature/serverless` at `152bfd87536`
 - Amends: nothing. Supersedes the *delivery vehicle* assumed by `rfc-serverless-opensearch.md` §2.5

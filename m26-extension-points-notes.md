@@ -142,6 +142,9 @@ would have passed whatever the mapper registry contained.
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **`ActionFilter`s remain impossible**, so plugin *authorization* cannot work — for the shell's own
   authentication plugin or for anyone else's. This is now the largest single gap in the host.
 - **Most of what a `SearchPlugin` can offer is still unreachable**, because aggregations, suggesters,

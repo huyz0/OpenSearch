@@ -83,6 +83,9 @@ otherwise still be describing a surface that has moved.
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **Accuracy is core's, including its limits.** A terms aggregation over high cardinality is approximate in
   the same way and for the same reasons it is on a classic node; `doc_count_error_upper_bound` is reduced
   and reported by core, not by anything here.

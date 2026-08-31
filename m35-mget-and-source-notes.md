@@ -60,6 +60,9 @@ rather than likely — which is what the test meant all along.
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **`_mget` does not honour `_source` filtering per item**, which the real API allows. The single get does
   not either, so this is consistent rather than an omission introduced here.
 - **No `docs[]._routing`**, because the shell routes by id and nothing else.

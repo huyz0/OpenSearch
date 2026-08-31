@@ -96,6 +96,9 @@ that only shows up outside a test. It is the argument for doing it at all.
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **`createComponents` is still passed four nulls** — `ResourceWatcherService`, `ScriptService`,
   `NamedWriteableRegistry`, `IndexNameExpressionResolver`. This is now the largest gap, and the real
   security plugin uses several of them. A plugin that touches one gets an NPE rather than a refusal, which

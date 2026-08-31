@@ -72,6 +72,9 @@ transport with client certificates has earned the right to do it; the shell has 
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **No `Transport` has been substituted**, so TLS through a plugin is enabled rather than demonstrated.
 - **`onIndexModule` still fires only for installed plugins**, the one remaining place where how a plugin
   arrived changes what it gets.

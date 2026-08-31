@@ -109,6 +109,9 @@ at.
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **Filters see requests, not responses.** Response-shaping filters — document-level security, field
   redaction — cannot work. Only admission decisions can.
 - **Node-to-node forwarding still carries no identity**, so filters run on the coordinating node only.

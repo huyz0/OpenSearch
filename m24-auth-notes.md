@@ -203,6 +203,9 @@ rather than papered over.
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **No disk loading.** Named classes off the classpath is not a classloader, a descriptor, or dependency
   jars. This is still the largest gap between the host and a real plugin installation.
 - **`createComponents` is still passed four nulls** — `ResourceWatcherService`, `ScriptService`,

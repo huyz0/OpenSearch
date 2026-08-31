@@ -52,6 +52,9 @@ was no exception — no node serving any shard at all — the message says that 
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **Nothing exercises the parent breaker or field data**, only the request child. The others are core's and
   are now wired, which is a different claim from tested.
 - **The bulk and write paths are unaccounted.** A write allocates through the engine, which has its own

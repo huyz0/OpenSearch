@@ -88,6 +88,9 @@ correct" is only knowable once something asserts it.
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **The orphan sweep is not resumable**, as above, and nothing runs it on a schedule — it is a maintenance
   entry point, not a background loop.
 - **Deletion is not fenced against a live writer**, only raced with. Making a publish check the head would

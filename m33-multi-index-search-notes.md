@@ -57,6 +57,9 @@ actually came from, over the wire as well: `SearchShardTarget` is serialised wit
 
 ## What is still missing
 
+*Written at the time. For the current position, which later milestones have moved, see
+[`serverless-status.md`](serverless-status.md).*
+
 - **No `ignore_unavailable`**, deliberately, until there is a reason to distinguish "I know one of these
   might not exist" from a typo.
 - **No aliases**, which are the other way a caller names a set of indices, and which would need somewhere
