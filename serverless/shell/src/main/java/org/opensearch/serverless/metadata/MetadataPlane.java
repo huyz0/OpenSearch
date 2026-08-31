@@ -261,6 +261,49 @@ public final class MetadataPlane {
     }
 
     /**
+     * Creates an alias standing for some indices.
+     *
+     * <p>Refused if the name is taken by an index or another alias, which the object store decides rather
+     * than a check here — see {@link DescriptorStore#createAlias}.
+     *
+     * @param alias the alias to create
+     * @return the generation the register now holds
+     * @throws IOException if the write fails
+     */
+    public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
+        return descriptors.createAlias(alias);
+    }
+
+    /**
+     * Reads what a name stands for: an index, an alias, or nothing.
+     *
+     * @param name the name
+     * @return what it names
+     * @throws IOException if the read fails
+     */
+    public DescriptorStore.Resolution resolve(String name) throws IOException {
+        return descriptors.resolve(name);
+    }
+
+    /**
+     * Removes an alias.
+     *
+     * <p>Nothing to clean up behind it: an alias owns no shards and no bytes, which is the difference
+     * between deleting one and deleting an index.
+     *
+     * @param name the alias
+     * @return true if there was one
+     * @throws IOException if the delete fails
+     */
+    public boolean deleteAlias(String name) throws IOException {
+        final long generation = descriptors.generationOf(name);
+        if (descriptors.resolve(name).alias() == null) {
+            return false;
+        }
+        return descriptors.deleteIfUnchanged(name, generation);
+    }
+
+    /**
      * Reads an index descriptor.
      *
      * @param indexName the index

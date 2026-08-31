@@ -95,10 +95,120 @@ public final class DescriptorStore {
             // Deleted, and the blob has not been removed yet. Absent is the truthful answer.
             return Optional.empty();
         }
+        if (isAlias(register.get().value())) {
+            // The name is taken by an alias, so there is no index by that name. Empty rather than an
+            // error: a caller asking whether an index exists has its answer, and one that wants to know
+            // what the name does resolve to asks resolve().
+            return Optional.empty();
+        }
         // Absent and unreadable are different answers, and conflating them is how a deleted index and a
         // corrupt one become indistinguishable. A parse failure propagates.
         try (InputStream in = register.get().value().streamInput()) {
             return Optional.of(IndexDescriptor.fromStream(in));
+        }
+    }
+
+    /**
+     * Creates an alias, failing if the name is taken by anything.
+     *
+     * <p>The same put-if-absent an index uses, against the same key, so an alias and an index cannot share
+     * a name — not because anything checks, but because the second one to arrive is refused by the object
+     * store.
+     *
+     * @param alias the alias to write
+     * @return the generation the register now holds
+     * @throws IndexAlreadyExistsException if the name is already an index or an alias
+     * @throws IOException if the write fails
+     */
+    public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
+        final BlobRegisterCasResult result = container.createRegisterIfAbsent(RegisterMap.descriptorBlob(alias.name()), alias.toBytes());
+        if (result.applied() == false) {
+            throw new IndexAlreadyExistsException(alias.name());
+        }
+        return result.currentGeneration();
+    }
+
+    /**
+     * Reads what a name stands for: an index, an alias, or nothing.
+     *
+     * <p>One register read for both, which is the point of them sharing a namespace.
+     *
+     * @param name the name to resolve
+     * @return what it names
+     * @throws IOException if the register cannot be read or parsed
+     */
+    public Resolution resolve(String name) throws IOException {
+        final Optional<BlobRegister> register = container.readRegister(RegisterMap.descriptorBlob(name));
+        if (register.isEmpty() || isTombstone(register.get().value())) {
+            return new Resolution(null, null);
+        }
+        if (isAlias(register.get().value())) {
+            try (InputStream in = register.get().value().streamInput()) {
+                return new Resolution(null, org.opensearch.serverless.cluster.AliasRecord.fromStream(in));
+            }
+        }
+        try (InputStream in = register.get().value().streamInput()) {
+            return new Resolution(IndexDescriptor.fromStream(in), null);
+        }
+    }
+
+    /**
+     * Whether a stored value is an alias record rather than an index descriptor.
+     *
+     * <p>By parsing the object and looking for the field, not by looking at where it happens to appear in
+     * the bytes: a mapping can contain the word "alias" anywhere, and a discriminator that a document's
+     * own contents can forge is not a discriminator. The record is small and this is one read's worth of
+     * parsing on a path already doing a round trip to an object store.
+     */
+    private static boolean isAlias(org.opensearch.core.common.bytes.BytesReference value) throws IOException {
+        try (
+            org.opensearch.core.xcontent.XContentParser parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
+                .createParser(
+                    org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
+                    org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                    value.streamInput()
+                )
+        ) {
+            return parser.map().containsKey(org.opensearch.serverless.cluster.AliasRecord.DISCRIMINATOR);
+        }
+    }
+
+    /** What a name turned out to be. */
+    public static final class Resolution {
+
+        private final IndexDescriptor index;
+        private final org.opensearch.serverless.cluster.AliasRecord alias;
+
+        Resolution(IndexDescriptor index, org.opensearch.serverless.cluster.AliasRecord alias) {
+            this.index = index;
+            this.alias = alias;
+        }
+
+        /**
+         * Returns the index, if the name is one.
+         *
+         * @return the descriptor, or null
+         */
+        public IndexDescriptor index() {
+            return index;
+        }
+
+        /**
+         * Returns the alias, if the name is one.
+         *
+         * @return the alias, or null
+         */
+        public org.opensearch.serverless.cluster.AliasRecord alias() {
+            return alias;
+        }
+
+        /**
+         * Reports whether the name stands for nothing at all.
+         *
+         * @return true if absent
+         */
+        public boolean absent() {
+            return index == null && alias == null;
         }
     }
 

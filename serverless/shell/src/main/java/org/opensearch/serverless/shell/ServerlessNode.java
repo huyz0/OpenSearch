@@ -641,6 +641,7 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> this)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> metadataPlane)));
         controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,

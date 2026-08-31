@@ -179,8 +179,12 @@ public final class SearchHandler extends BaseRestHandler {
         final java.util.LinkedHashMap<String, Integer> indices = new java.util.LinkedHashMap<>();
         final java.util.List<String> skipped = new java.util.ArrayList<>();
         for (String name : names) {
-            final Optional<IndexDescriptor> found = metadata.describe(name);
-            if (found.isEmpty()) {
+            // One read tells us whether the name is an index or an alias, because both live in the same
+            // register. An alias is expanded here rather than deeper down, so everything below this line
+            // deals only in indices and a shard count -- searching through an alias and searching the
+            // indices it stands for are the same code path, which is the only way they cannot drift.
+            final var resolved = metadata.resolve(name);
+            if (resolved.absent()) {
                 if (ignoreUnavailable) {
                     skipped.add(name);
                     continue;
@@ -189,7 +193,33 @@ public final class SearchHandler extends BaseRestHandler {
                     IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name)
                 );
             }
-            indices.put(name, found.get().numberOfShards());
+            if (resolved.index() != null) {
+                indices.put(name, resolved.index().numberOfShards());
+                continue;
+            }
+            for (String target : resolved.alias().indices()) {
+                final Optional<IndexDescriptor> behind = metadata.describe(target);
+                if (behind.isEmpty()) {
+                    // An alias outliving one of its indices is ordinary: somebody deleted an index and did
+                    // not update the alias. Skipping it silently would make a search over an alias quietly
+                    // narrower than the caller believes, so it is refused unless they said to ignore what
+                    // is missing -- the same rule a named index gets, since an alias is a way of naming
+                    // indices and not a way of relaxing what naming one means.
+                    if (ignoreUnavailable) {
+                        skipped.add(target);
+                        continue;
+                    }
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_FOUND,
+                            "index_not_found",
+                            "alias [" + name + "] names [" + target + "], which does not exist"
+                        )
+                    );
+                }
+                indices.put(target, behind.get().numberOfShards());
+            }
         }
         if (indices.isEmpty()) {
             // Every name was absent. Answering 200 with no hits here would be the very thing the flag is
