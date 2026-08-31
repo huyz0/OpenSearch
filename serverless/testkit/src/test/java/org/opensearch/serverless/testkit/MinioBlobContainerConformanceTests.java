@@ -55,22 +55,37 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
 
     private static final String DEFAULT_ENDPOINT = "http://127.0.0.1:9000";
 
+    /** The endpoint this target uses, so a second S3-compatible implementation can subclass. */
+    protected String endpoint() {
+        return System.getProperty(ENDPOINT, DEFAULT_ENDPOINT);
+    }
+
+    /** How to start the endpoint, quoted in the skip when it is not there. */
+    protected String howToStart() {
+        return "docker run -d --name serverless-minio -p 9000:9000 "
+            + "-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio server /data";
+    }
+
+    /** The access key for this target. */
+    protected String accessKey() {
+        return "minioadmin";
+    }
+
+    /** The secret key for this target. */
+    protected String secretKey() {
+        return "minioadmin";
+    }
+
     @Override
     protected BlobContainer newContainer() throws Exception {
-        final String endpoint = System.getProperty(ENDPOINT, DEFAULT_ENDPOINT);
-        assumeTrue(
-            "no S3-compatible endpoint at "
-                + endpoint
-                + "; start one with: docker run -d --name serverless-minio -p 9000:9000 "
-                + "-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio server /data",
-            reachable(endpoint)
-        );
+        final String endpoint = endpoint();
+        assumeTrue("no S3-compatible endpoint at " + endpoint + "; start one with: " + howToStart(), reachable(endpoint));
 
         // A bucket per run. The suite deletes what it writes, but a shared bucket would let one run's
         // leftovers decide another run's listing assertions, and a listing assertion that depends on
         // history is not an assertion.
         final String bucket = "r11-" + randomAlphaOfLength(12).toLowerCase(java.util.Locale.ROOT);
-        final var store = MinioBlobStores.create(endpoint, "minioadmin", "minioadmin", bucket, createTempDir());
+        final var store = MinioBlobStores.create(endpoint, accessKey(), secretKey(), bucket, createTempDir());
         return store.blobContainer(BlobPath.cleanPath().add("conformance"));
     }
 

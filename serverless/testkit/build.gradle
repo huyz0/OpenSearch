@@ -33,6 +33,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessContentionTests.class'
   exclude '**/ServerlessFleetTests.class'
   exclude '**/MinioBlobContainerConformanceTests.class'
+  exclude '**/SeaweedBlobContainerConformanceTests.class'
   exclude '**/ServerlessOnObjectStoreTests.class'
   exclude '**/ServerlessBucketContentionTests.class'
   exclude '**/ServerlessCostTests.class'
@@ -76,6 +77,7 @@ tasks.register('s3Test', Test) {
   testClassesDirs = sourceSets.test.output.classesDirs
   classpath = sourceSets.test.runtimeClasspath
   include '**/MinioBlobContainerConformanceTests.class'
+  include '**/SeaweedBlobContainerConformanceTests.class'
   include '**/ServerlessOnObjectStoreTests.class'
   include '**/ServerlessCostTests.class'
   systemProperty 'opensearch.path.conf', 'config'

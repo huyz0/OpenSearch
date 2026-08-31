@@ -128,9 +128,17 @@ These are decisions, not gaps. Each answers 501 with a reason.
 **Blocked on something I do not have:**
 
 - **R11 — provider CAS linearizability — remains the top risk and is unclosed.** The whole safety argument
-  rests on `compareAndSwapRegister` being genuinely linearizable. The conformance suite runs against MinIO
-  and passes; it has never run against real S3, GCS or R2, and that needs credentials. Everything else in
-  this document is downstream of that assumption.
+  rests on `compareAndSwapRegister` being genuinely linearizable. What exists now: a linearizability
+  checker that records a concurrent history and asks whether any sequential order explains it — the
+  question itself rather than a proxy for it — canaried against stores that really misbehave, and passing
+  against two unrelated S3 implementations (MinIO and SeaweedFS). What does not exist is an account. No
+  fake can close this; pointing the checker at a real provider is the whole remaining cost.
+
+  The blast radius is now measured rather than assumed (`ServerlessStoreDeviationTests`). A stale head
+  read costs nothing, because ownership is decided by the swap. An ambiguous outcome costs liveness. Two
+  winners on one generation cost data — and that measurement found that the publish fence only refused a
+  *strictly newer* term, so a second writer at the same term could produce a commit assembled from two
+  nodes' segments. A manifest now records who wrote it and refuses a foreign writer at the same term.
 
 ## Decisions a reader should know about
 
@@ -144,7 +152,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-318 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+351 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against a
 live MinIO) — none skipped.
 
