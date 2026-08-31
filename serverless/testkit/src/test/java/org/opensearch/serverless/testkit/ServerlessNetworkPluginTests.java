@@ -290,7 +290,9 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
 
             // Through the node that does not own the shard, so the write has to cross the transport the
             // plugin supplied.
-            other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"substituted\",\"n\":1}", XContentType.JSON)).actionGet();
+            other.client()
+                .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"substituted\",\"n\":1}", XContentType.JSON))
+                .actionGet();
             assertTrue("and it must actually carry traffic", other.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
         }
     }

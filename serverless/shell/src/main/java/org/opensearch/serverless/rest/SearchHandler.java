@@ -141,6 +141,38 @@ public final class SearchHandler extends BaseRestHandler {
             );
         }
 
+        // A frozen view answers for itself: it already knows which index and which shards, so none of the
+        // name resolution below applies to it.
+        final String pitId = request.param("pit");
+        if (pitId != null) {
+            final var pit = metadata.pointInTime(pitId);
+            if (pit.isEmpty() || pit.get().expiredAt(metadata.clock().getAsLong())) {
+                // Expired and never-existed are the same answer to a caller: the view is not there. Saying
+                // which would be more useful and would also be a way to find out whether an id was ever
+                // valid, and there is no reason to offer that.
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.NOT_FOUND,
+                        "pit_not_found",
+                        "no such point in time, or it has expired: " + pitId
+                    )
+                );
+            }
+            final var frozen = pit.get();
+            return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+                try {
+                    respondFrozen(channel, serving, metadata, frozen, source);
+                } catch (Exception e) {
+                    try {
+                        channel.sendResponse(new BytesRestResponse(channel, e));
+                    } catch (IOException nested) {
+                        logger.error("failed to report a frozen search failure", nested);
+                    }
+                }
+            });
+        }
+
         // Several indices, named one by one.
         //
         // A comma-separated list is resolved by looking each name up, which costs one register read per
@@ -344,6 +376,22 @@ public final class SearchHandler extends BaseRestHandler {
         }
     }
 
+    private void respondFrozen(
+        org.opensearch.rest.RestChannel channel,
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        org.opensearch.serverless.metadata.PointInTime pit,
+        SearchSourceBuilder source
+    ) throws IOException {
+        final var outcome = gated(
+            serving,
+            java.util.List.of(pit.index()),
+            source,
+            () -> SearchFanout.runFrozen(serving, metadata, pit, source)
+        );
+        render(channel, java.util.Map.of(pit.index(), pit.shards().size()), java.util.List.of(), outcome);
+    }
+
     private void respond(
         org.opensearch.rest.RestChannel channel,
         ServerlessNode serving,
@@ -355,6 +403,22 @@ public final class SearchHandler extends BaseRestHandler {
         // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
         // fan-out rather than going through ShardOperations, so the gate has to meet it where it works.
         final var outcome = gated(serving, indices.keySet(), source, () -> SearchFanout.run(serving, metadata, indices, source));
+        render(channel, indices, skipped, outcome);
+    }
+
+    /**
+     * Writes the answer, wherever it came from.
+     *
+     * <p>Shared by the ordinary search and the frozen one, because a caller must not be able to tell which
+     * path answered from the shape of the response — the difference between them is which commits were
+     * read, not what a result looks like.
+     */
+    private void render(
+        org.opensearch.rest.RestChannel channel,
+        java.util.Map<String, Integer> indices,
+        java.util.List<String> skipped,
+        org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome
+    ) throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.startObject("_shards");

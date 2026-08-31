@@ -69,14 +69,49 @@ public final class BlockCacheDirectory extends FilterDirectory {
      */
     public static BlockCacheDirectory create(Directory local, BlobStore blobStore, BlobPath shardBase, BlockCache cache, String cacheScope)
         throws IOException {
+        return create(
+            local,
+            blobStore,
+            shardBase,
+            cache,
+            cacheScope,
+            new SegmentPublisher(blobStore, shardBase).readManifest().orElse(null)
+        );
+    }
+
+    /**
+     * Opens a directory over a commit chosen by the caller rather than the current one.
+     *
+     * <p>For a frozen view, which exists precisely because the current commit has moved on. Passing the
+     * manifest in rather than reading it is the whole difference: reading would read the one this is meant
+     * not to see.
+     *
+     * @param local the shard's local directory
+     * @param blobStore the object store
+     * @param shardBase the shard's container
+     * @param cache the block cache
+     * @param cacheScope a key distinguishing this shard's blocks from another's
+     * @param manifest the commit to expose, or null for an empty one
+     * @return the directory
+     * @throws java.io.IOException if it cannot be built
+     */
+    public static BlockCacheDirectory create(
+        Directory local,
+        BlobStore blobStore,
+        BlobPath shardBase,
+        BlockCache cache,
+        String cacheScope,
+        org.opensearch.serverless.store.CommitManifest manifest
+    ) throws java.io.IOException {
+        final var present = java.util.Optional.ofNullable(manifest);
         final Map<String, RemoteFile> files = new LinkedHashMap<>();
-        final var manifest = new SegmentPublisher(blobStore, shardBase).readManifest();
-        if (manifest.isPresent()) {
+
+        if (present.isPresent()) {
             // One listing per term container rather than a length lookup per file: the manifest records
             // where each file lives but not how long it is, and Lucene needs the length before it will
             // read a byte.
             final Map<String, Map<String, Long>> lengthsByTerm = new LinkedHashMap<>();
-            for (Map.Entry<String, String> entry : manifest.get().files().entrySet()) {
+            for (Map.Entry<String, String> entry : present.get().files().entrySet()) {
                 final String termDir = entry.getValue();
                 final Map<String, Long> lengths = lengthsByTerm.computeIfAbsent(termDir, dir -> {
                     final Map<String, Long> found = new LinkedHashMap<>();

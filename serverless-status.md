@@ -1,6 +1,6 @@
 # The serverless shell: where it actually is
 
-Per-milestone notes (`m10`…`m36`) record what was true when each was written, which is the point of them.
+Per-milestone notes (`m10`…`m37`) record what was true when each was written, which is the point of them.
 Their "what is still missing" sections do not — those age badly, and several had been closed by later work
 while still reading as open. **This document supersedes all of them.** If a milestone note and this
 disagree, this is right.
@@ -17,9 +17,22 @@ scaled to zero.
 **Search.** The full query DSL, sorting, aggregations, `search_after`, `_source` filtering, and several
 indices named in one request. Shards fan out concurrently; the window is cut once over everything; coverage
 (`_shards` and `complete`) is reported on every answer, and a search *no* shard could answer is an error
-rather than an empty result.
+rather than an empty result. `ignore_unavailable` turns a named index that cannot be reached into a
+`skipped` entry rather than a failure, and only when the caller asked for that.
 
-**Indices.** Create, describe, delete. Storage is keyed by index uuid, so a name reused after a delete
+**Point in time.** `POST /{index}/_pit` freezes each shard's commit into a record and returns an id; a
+search quoting it reads that commit however far the writer has moved on, which is what makes paging with
+`search_after` return a consistent result set rather than a moving one. The garbage collector treats a
+live view's blobs as referenced — without that the sweep would collect a caller's commit halfway through
+their paging. The keep-alive is absolute rather than sliding, and a released or expired view answers 404
+rather than emptily.
+
+**Aliases.** A name that stands for some indices, created in the same register namespace as an index
+descriptor — so an index and an alias cannot take the same name, and resolving a name is one read rather
+than a miss on one namespace followed by a lookup in another. One level; an alias does not name another
+alias.
+
+**Indices.** Create, describe, delete, alias. Storage is keyed by index uuid, so a name reused after a delete
 cannot inherit the previous index's data. Deletion reclaims the bytes, and a sweep collects shard
 containers no index owns.
 
@@ -40,7 +53,9 @@ proved by a reader being denied a write an administrator is allowed.
 
 **Bounds.** Real circuit breakers, so an aggregation past the limit is refused and the node keeps serving;
 and core's indexing pressure on the write paths, so a batch larger than the node's budget is rejected with
-a 429 rather than accepted into memory it does not have.
+a 429 rather than accepted into memory it does not have. A node at its shard limit evicts its least
+recently used idle shard to make room rather than refusing, and `GET /_serverless/stats` reports the
+counters those refusals are decided from — breakers, in-flight write bytes, and what the node is holding.
 
 ## What is deliberately refused
 
@@ -61,19 +76,26 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 **Open, and mine to do:**
 
-- No `Transport` has been substituted, so TLS through a plugin is *enabled* rather than demonstrated. This
-  is the single largest gap in hosting OpenSearch Security: the shell can carry the parts of it that
-  decide, and not the parts that protect the wire.
 - Node-to-node forwarding carries no identity, so filters run on the coordinating node only and the
   transport port must be treated as trusted infrastructure. Making identity travel without node
   authentication would make that assumption load-bearing.
 - Filters see requests, not responses — so document-level security and field redaction cannot work.
 - No action registry, so a plugin's own transport actions (Security's config-update API) cannot run.
-- No aliases, no `ignore_unavailable`, no point-in-time readers.
-- `onIndexModule` fires only for plugins loaded from disk.
-- The orphan sweep is not resumable and nothing runs it on a schedule.
-- No `_nodes/stats`, so an operator can see a refusal and not the trend that led to it.
-- `maxShardsHeld` refuses rather than evicting.
+- A plugin supplying the node's transport is demonstrated, but with a substitute that delegates to netty4.
+  No TLS stack has been run on it, so TLS through a plugin is *shown to be wireable* rather than shown to
+  work.
+- A point in time is node-local once opened: the record is in the object store and any node can serve it,
+  but two nodes serving one view open it twice. No slicing.
+- Nothing runs the orphan sweep on a schedule.
+
+**Out of scope while `server/` may not change:**
+
+- `onIndexModule` fires only for plugins loaded from disk. Firing it for a plugin passed in as an instance
+  needs `PluginsService` to accept instances.
+- The orphan sweep is not resumable; making it so needs paged `children()` on `BlobContainer`.
+- `/_nodes/stats` stays refused with the rest of the cluster surface — a node cannot speak for another
+  without cluster-wide state. `GET /_serverless/stats` answers for the node it was sent to, which is the
+  honest scope.
 
 **Blocked on something I do not have:**
 
@@ -94,7 +116,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-285 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+302 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs) and `s3Test` (against a live MinIO) — none skipped.
 
 Every load-bearing claim has a planted-defect canary: the defect is introduced, the failing test is watched,

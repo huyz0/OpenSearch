@@ -392,7 +392,11 @@ public final class BackgroundReconciler implements Closeable {
         }
         final Set<ShardId> taken = new LinkedHashSet<>();
         for (Map.Entry<String, Integer> candidate : candidates) {
-            if (node.reconciler().openShards().size() >= maxShardsHeld && makeRoom() == false) {
+            // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
+            // it counts against the bound. makeRoom only ever considers openShards, so counting one here
+            // can refuse an activation the node has no room for -- which is the point -- but can never
+            // take a view away from the caller holding it.
+            if (node.reconciler().heldShards().size() >= maxShardsHeld && makeRoom() == false) {
                 // Refusing is a routing outcome, not an error. Saying so is the difference between a
                 // node that is full and a node that is broken, and only one of them should page anyone.
                 //

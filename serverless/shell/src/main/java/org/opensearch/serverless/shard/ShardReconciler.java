@@ -208,6 +208,25 @@ public final class ShardReconciler {
         boolean replayWal,
         boolean lazy
     ) throws IOException {
+        return openAndStart(indexMetadata, shardId, shardHeadTerm, nodes, replayWal, lazy, null);
+    }
+
+    /**
+     * @param knownCommit the commit to recover from, when the caller already knows it; null to ask the
+     *     publisher for the current one. A frozen view has to pass it, for two reasons: the commit it
+     *     wants is by definition not the current one, and its synthetic index uuid has no manifest
+     *     register of its own, so asking would answer "nothing published" and start an empty shard --
+     *     which is a wrong answer that looks exactly like a right one.
+     */
+    private IndexShard openAndStart(
+        IndexMetadata indexMetadata,
+        ShardId shardId,
+        long shardHeadTerm,
+        DiscoveryNodes nodes,
+        boolean replayWal,
+        boolean lazy,
+        CommitManifest knownCommit
+    ) throws IOException {
         final Index index = indexMetadata.getIndex();
         final IndexService indexService;
         // Locked per index, because this is a check-then-act and shards of one index now open at the same
@@ -235,7 +254,9 @@ public final class ShardReconciler {
         // Whether anything was published decides the recovery source, and the decision must be made
         // before the shard is created because the source is baked into its routing entry.
         final SegmentPublisher publisher = publishers == null ? null : publishers.apply(shardId);
-        final Optional<CommitManifest> published = publisher == null ? Optional.empty() : publisher.readManifest();
+        final Optional<CommitManifest> published = knownCommit != null
+            ? Optional.of(knownCommit)
+            : (publisher == null ? Optional.empty() : publisher.readManifest());
         final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
 
         final ShardRouting initializing = ShardRouting.newUnassigned(
@@ -397,6 +418,80 @@ public final class ShardReconciler {
     }
 
     /**
+     * Opens a shard at a commit that is not the current one, under an identity of its own.
+     *
+     * <p><b>Why a separate identity.</b> A node holds at most one shard per {@code ShardId}, and it may
+     * well already be serving the live one — the whole point of a frozen view is to read it while writing
+     * continues. So the view is opened as an index whose uuid is the view's identifier, which makes it a
+     * different shard as far as everything below here is concerned. The bytes still live under the real
+     * index's uuid, which is why the shard carries
+     * {@link org.opensearch.serverless.shell.ServerlessNode#STORAGE_UUID_SETTING}.
+     *
+     * <p><b>And why the manifest is passed in rather than read.</b> Reading it here would read the current
+     * one, which is the thing this exists not to do.
+     *
+     * @param indexMetadata the index this is a view of
+     * @param viewId the view's identifier, which becomes the synthetic index uuid
+     * @param shardNumber the shard
+     * @param manifest the commit to open
+     * @param nodes the node view the shard is started against
+     * @return the shard id the view was opened under
+     * @throws IOException if the shard cannot be opened
+     */
+    public ShardId openFrozenReader(
+        IndexMetadata indexMetadata,
+        String viewId,
+        int shardNumber,
+        CommitManifest manifest,
+        DiscoveryNodes nodes
+    ) throws IOException {
+        final org.opensearch.core.index.Index viewIndex = new org.opensearch.core.index.Index(indexMetadata.getIndex().getName(), viewId);
+        final ShardId shardId = new ShardId(viewIndex, shardNumber);
+        if (open.containsKey(shardId)) {
+            return shardId;
+        }
+        // Built from the given metadata rather than from a fresh builder, so the per-shard primary terms
+        // survive. A fresh builder gave every shard but this one a term of zero, and opening the second
+        // shard of a view then rewrote the first one's term downwards -- "term is only increased as part
+        // of primary promotion", from a code path that never promotes anything.
+        final IndexMetadata frozen = IndexMetadata.builder(indexMetadata)
+            .settings(
+                org.opensearch.common.settings.Settings.builder()
+                    .put(indexMetadata.getSettings())
+                    .put(IndexMetadata.SETTING_INDEX_UUID, viewId)
+                    .put("index.store.type", org.opensearch.serverless.shell.ServerlessNode.BLOCK_CACHE_STORE_TYPE)
+                    .put(org.opensearch.serverless.shell.ServerlessNode.STORAGE_UUID_SETTING, indexMetadata.getIndexUUID())
+                    .build()
+            )
+            .build();
+        open.put(shardId, openAndStart(frozen, shardId, manifest.term(), nodes, false, true, manifest));
+        readers.add(shardId);
+        frozenViews.add(shardId);
+        return shardId;
+    }
+
+    /**
+     * Closes a frozen view, releasing the shards it opened.
+     *
+     * @param viewId the view's identifier
+     * @return how many shards were closed
+     */
+    public int closeFrozenReader(String viewId) {
+        int closed = 0;
+        for (ShardId shardId : Set.copyOf(frozenViews)) {
+            if (shardId.getIndex().getUUID().equals(viewId) == false) {
+                continue;
+            }
+            releaseShard(shardId, "the frozen view it served was released");
+            frozenViews.remove(shardId);
+            closed++;
+        }
+        return closed;
+    }
+
+    private final Set<ShardId> frozenViews = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
      * Returns the shards open here as readers.
      *
      * @return the reader shard ids
@@ -503,11 +598,48 @@ public final class ShardReconciler {
     }
 
     /**
-     * Returns the shards currently open on this node.
+     * Returns the shards this node is serving as itself.
      *
-     * @return the open shard ids
+     * <p><b>Frozen views are not among them, and leaving them in was a bug with a long reach.</b> Every
+     * caller of this finds a shard by index name and shard number, because until a view existed a node
+     * could not hold two shards of one index name. A view has the name of the index it is a view of, so
+     * a document write looking for "shard 0 of paged" could match the view instead -- a reader -- and
+     * conclude the node was not serving the shard it had been writing to a moment earlier. It answered
+     * "activation in progress, retry" for a shard that was open, owned, and healthy, and only sometimes,
+     * because it depended on which of the two a set iterated first.
+     *
+     * <p>Fixing the seven lookups would have left the eighth to write. This is the one definition they
+     * all read, so it is the one that changes: a view is not something this node serves, it is something
+     * a caller is holding, and {@link #frozenShards()} is where it is counted.
+     *
+     * @return the open shard ids, excluding frozen views
      */
     public Set<ShardId> openShards() {
+        final Set<ShardId> serving = new java.util.HashSet<>(open.keySet());
+        serving.removeAll(frozenViews);
+        return Set.copyOf(serving);
+    }
+
+    /**
+     * Returns the frozen views open on this node.
+     *
+     * <p>They are held, they cost memory and file handles, and nothing releases them but the caller or
+     * expiry -- so they are counted against what a node is holding even though they are never a candidate
+     * for eviction. Evicting one would be sound (it can be reopened from the record), but it would also
+     * be pointless churn: the caller is by definition still using it.
+     *
+     * @return the shard ids of open frozen views
+     */
+    public Set<ShardId> frozenShards() {
+        return Set.copyOf(frozenViews);
+    }
+
+    /**
+     * Returns every shard open on this node, views included.
+     *
+     * @return all held shard ids
+     */
+    public Set<ShardId> heldShards() {
         return Set.copyOf(open.keySet());
     }
 }

@@ -65,6 +65,20 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns the container path holding frozen views of an index.
+     *
+     * <p>Its own container because the sweep has to list them all, and a listing that also had to step over
+     * every index descriptor in the deployment would make the collector's cost depend on the population it
+     * is collecting for.
+     *
+     * @param base the deployment's base path
+     * @return the points-in-time container path
+     */
+    public static BlobPath pointsInTime(BlobPath base) {
+        return base.add("pits");
+    }
+
+    /**
      * Returns the container path holding node leases.
      *
      * @param base the deployment's base path

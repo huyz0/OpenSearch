@@ -35,7 +35,8 @@ import java.util.Set;
  *
  * <ol>
  *   <li>it lives in a term container <em>strictly older</em> than the published manifest's term, and</li>
- *   <li>the manifest does not name it.</li>
+ *   <li>nothing names it: not the published manifest, and not any frozen view somebody may still be
+ *       paging through.</li>
  * </ol>
  *
  * <p>Condition 1 exists because publishing is not atomic: a writer uploads files and <em>then</em>
@@ -89,6 +90,23 @@ public final class GarbageCollector {
         final Set<String> referenced = new HashSet<>();
         for (Map.Entry<String, String> file : manifest.get().files().entrySet()) {
             referenced.add(file.getValue() + "/" + file.getKey());
+        }
+
+        // And what any frozen view is still holding.
+        //
+        // <b>This is the second half of the safety rule and it is not optional.</b> The sweep deletes a
+        // blob when it is unreferenced by the live commit and belongs to a dead term -- which is exactly
+        // what the files of a point in time are, a few seconds after the writer publishes again. Without
+        // this, a caller paging through a frozen view would find it dissolving underneath them, and the
+        // failure would look like corruption rather than like a deletion.
+        //
+        // Read once per sweep of a shard rather than once per blob, and read *before* the listing below:
+        // a view taken while this sweep is running is one whose files this sweep may already have listed
+        // as orphans, so it must be seen first or not at all.
+        for (org.opensearch.serverless.metadata.PointInTime pit : plane.livePointsInTime(plane.clock().getAsLong())) {
+            if (pit.index().equals(indexName) || pit.index().isEmpty()) {
+                referenced.addAll(pit.referencedBlobs(shardId));
+            }
         }
 
         final List<String> deleted = new ArrayList<>();

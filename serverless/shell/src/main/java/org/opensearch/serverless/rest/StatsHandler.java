@@ -80,6 +80,10 @@ public final class StatsHandler extends BaseRestHandler {
                 builder.field("open", open.size());
                 builder.field("readers", readers.size());
                 builder.field("writers", open.size() - readers.size());
+                // Counted apart from both: a frozen view is a reader that no policy will take away, so
+                // folding it into the reader count would make a node look like it had readers it could
+                // shed.
+                builder.field("frozen_views", serving.reconciler().frozenShards().size());
                 builder.endObject();
 
                 builder.startArray("roles");

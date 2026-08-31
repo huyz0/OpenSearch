@@ -304,6 +304,113 @@ public final class MetadataPlane {
     }
 
     /**
+     * Freezes the current commit of every shard of an index.
+     *
+     * <p>Written before it is used and read by the collector, which is the ordering that matters: a view
+     * that existed only in the memory of the node that took it would be a promise the sweep never heard.
+     *
+     * @param pit the view to record
+     * @throws IOException if the write fails
+     */
+    public void createPointInTime(PointInTime pit) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
+        final var bytes = pit.toBytes();
+        container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), true);
+    }
+
+    /**
+     * Reads a frozen view.
+     *
+     * @param id the identifier
+     * @return the view, or empty if it never existed or has been released
+     * @throws IOException if the read fails
+     */
+    public java.util.Optional<PointInTime> pointInTime(String id) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
+        if (container.blobExists(id) == false) {
+            return java.util.Optional.empty();
+        }
+        try (java.io.InputStream in = container.readBlob(id)) {
+            return java.util.Optional.of(PointInTime.fromStream(in));
+        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
+            // Released between the check and the read, which is ordinary rather than exceptional.
+            return java.util.Optional.empty();
+        }
+    }
+
+    /**
+     * Releases a frozen view, so the collector stops holding its files.
+     *
+     * @param id the identifier
+     * @return true if there was one
+     * @throws IOException if the delete fails
+     */
+    public boolean releasePointInTime(String id) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
+        if (container.blobExists(id) == false) {
+            return false;
+        }
+        container.deleteBlobsIgnoringIfNotExists(java.util.List.of(id));
+        return true;
+    }
+
+    /**
+     * Reads every frozen view that has not expired.
+     *
+     * <p>For the collector, which has to know what is being held before it deletes anything. Expired ones
+     * are skipped rather than deleted here: deciding they are gone and removing them are two different
+     * jobs, and doing both in a method a sweep calls would mean a read path with a side effect.
+     *
+     * @param nowMillis the current time
+     * @return the live views
+     * @throws IOException if listing or reading fails
+     */
+    public java.util.List<PointInTime> livePointsInTime(long nowMillis) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
+        final java.util.List<PointInTime> live = new java.util.ArrayList<>();
+        for (String name : container.listBlobs().keySet()) {
+            try (java.io.InputStream in = container.readBlob(name)) {
+                final PointInTime pit = PointInTime.fromStream(in);
+                if (pit.expiredAt(nowMillis) == false) {
+                    live.add(pit);
+                }
+            } catch (Exception e) {
+                // A view the collector cannot read is one it must assume is holding something, because the
+                // alternative is deleting files somebody is paging through. Treated as live and left for a
+                // human, rather than swept because it was unreadable.
+                LOGGER.warn("could not read the point in time " + name + "; treating it as live", e);
+                live.add(new PointInTime(name, "", Long.MAX_VALUE, java.util.Map.of()));
+            }
+        }
+        return live;
+    }
+
+    /**
+     * Removes frozen views that have expired.
+     *
+     * @param nowMillis the current time
+     * @return how many were removed
+     * @throws IOException if listing or deleting fails
+     */
+    public int reapPointsInTime(long nowMillis) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
+        final java.util.List<String> expired = new java.util.ArrayList<>();
+        for (String name : container.listBlobs().keySet()) {
+            try (java.io.InputStream in = container.readBlob(name)) {
+                if (PointInTime.fromStream(in).expiredAt(nowMillis)) {
+                    expired.add(name);
+                }
+            } catch (Exception e) {
+                LOGGER.warn("could not read the point in time " + name + "; leaving it alone", e);
+            }
+        }
+        if (expired.isEmpty() == false) {
+            container.deleteBlobsIgnoringIfNotExists(expired);
+        }
+        return expired.size();
+    }
+
+    /**
      * Reads an index descriptor.
      *
      * @param indexName the index

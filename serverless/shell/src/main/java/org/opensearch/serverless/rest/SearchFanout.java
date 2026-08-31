@@ -74,6 +74,85 @@ public final class SearchFanout {
      * @return what was found and how completely
      * @throws IOException if the search fails outright
      */
+    /**
+     * Runs one search over a frozen view rather than over whatever the shards hold now.
+     *
+     * <p>Every shard is opened here, on this node, at the commit the view froze — none of it is forwarded.
+     * Forwarding would mean asking the shard's owner, and the owner answers from its live engine, which is
+     * the one thing a frozen view exists not to read. It costs this node the work of opening the commits;
+     * what it buys is that page two of a paged search sees what page one saw.
+     *
+     * @param serving the node coordinating the search
+     * @param metadata the metadata plane
+     * @param pit the frozen view
+     * @param source the query, with its own from and size
+     * @return what was found and how completely
+     * @throws IOException if the search fails outright
+     */
+    public static ShardOperations.SearchOutcome runFrozen(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        org.opensearch.serverless.metadata.PointInTime pit,
+        SearchSourceBuilder source
+    ) throws IOException {
+        final int from = Math.max(0, source.from());
+        final int size = Math.max(0, source.size());
+        final SearchSourceBuilder perShard = source.shallowCopy();
+        perShard.from(0);
+        perShard.size(from + size);
+
+        // The same reason the live fan-out keeps its first failure: a view that cannot be opened must say
+        // why. Without this the response was "no shard could be opened" with nothing behind it, which is
+        // the shape of an answer and none of the content.
+        final java.util.concurrent.atomic.AtomicReference<Exception> firstFailure = new java.util.concurrent.atomic.AtomicReference<>();
+        final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>();
+        for (Integer shard : pit.shards().keySet()) {
+            tasks.add(() -> {
+                try {
+                    final var shardId = serving.openFrozenView(metadata, pit, shard);
+                    final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard);
+                    return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+                } catch (Exception e) {
+                    firstFailure.compareAndSet(null, e);
+                    throw e;
+                }
+            });
+        }
+        final List<ShardAnswer> answers;
+        try {
+            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), Fanout.DEFAULT_CONCURRENCY, tasks);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while searching the point in time " + pit.id(), e);
+        }
+
+        long total = 0;
+        int answered = 0;
+        final List<SearchHit> merged = new ArrayList<>();
+        final List<org.opensearch.search.aggregations.InternalAggregations> shardAggregations = new ArrayList<>();
+        for (ShardAnswer answer : answers) {
+            if (answer == null) {
+                continue;
+            }
+            total += answer.total;
+            merged.addAll(answer.hits);
+            if (answer.aggregations != null) {
+                shardAggregations.add(answer.aggregations);
+            }
+            answered++;
+        }
+        if (answered == 0) {
+            final Exception cause = firstFailure.get();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IOException("no shard of the point in time " + pit.id() + " could be opened", cause);
+        }
+        merged.sort(order(source));
+        final List<SearchHit> page = merged.stream().skip(from).limit(size).collect(java.util.stream.Collectors.toList());
+        return new ShardOperations.SearchOutcome(total, page, pit.shards().size(), answered, reduce(serving, source, shardAggregations));
+    }
+
     public static ShardOperations.SearchOutcome run(
         ServerlessNode serving,
         MetadataPlane metadata,

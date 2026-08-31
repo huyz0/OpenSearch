@@ -428,7 +428,7 @@ public final class ServerlessNode implements Closeable {
             new IndicesModule(this.plugins.filter(org.opensearch.plugins.MapperPlugin.class)).getMapperRegistry(),
             new NamedWriteableRegistry(Collections.emptyList()),
             threadPool,
-            new IndexScopedSettings(settings, IndexScopedSettings.BUILT_IN_INDEX_SETTINGS),
+            indexScopedSettings(),
             circuitBreakerService(),
             bigArrays(),
             scriptService(),
@@ -495,6 +495,63 @@ public final class ServerlessNode implements Closeable {
      * <p>Registered on every node; whether a shard uses it is decided per shard when it is opened, by
      * {@code ShardReconciler}. A writer keeps a local copy it can merge into; a reader reads blocks.
      */
+    /**
+     * Where a shard's bytes live, which is not always where its index identity says.
+     *
+     * <p>A frozen view is opened as an index of its own, because a node cannot hold two shards with the
+     * same identity and it may well already be serving the live one. That synthetic identity has a uuid
+     * nothing ever wrote under, so the path has to come from the index it is a view <em>of</em> — carried
+     * as a setting on the shard the reader opens.
+     *
+     * <p>Absent for every ordinary shard, which is the overwhelming majority, and then this is the index's
+     * own uuid exactly as before.
+     */
+    static String storageUuidOf(org.opensearch.index.IndexSettings indexSettings) {
+        final String source = indexSettings.getSettings().get(STORAGE_UUID_SETTING);
+        return source == null ? indexSettings.getIndex().getUUID() : source;
+    }
+
+    /**
+     * Core's index settings plus the shell's own.
+     *
+     * <p>Core validates every index setting against a registry and refuses one it has never heard of, which
+     * is right — a typo in a setting name that was silently accepted would be a setting that silently did
+     * nothing. The shell has exactly one of its own, so it registers it rather than turning the validation
+     * off.
+     *
+     * <p>Private, because nothing outside this node should be setting it: it names where a shard reads its
+     * bytes, and a caller who could set it could point one index's shard at another's data.
+     *
+     * @return the settings a shard is validated against
+     */
+    private IndexScopedSettings indexScopedSettings() {
+        final java.util.Set<org.opensearch.common.settings.Setting<?>> known = new java.util.HashSet<>(
+            IndexScopedSettings.BUILT_IN_INDEX_SETTINGS
+        );
+        known.add(
+            org.opensearch.common.settings.Setting.simpleString(
+                STORAGE_UUID_SETTING,
+                org.opensearch.common.settings.Setting.Property.IndexScope,
+                org.opensearch.common.settings.Setting.Property.PrivateIndex
+            )
+        );
+        return new IndexScopedSettings(settings, known);
+    }
+
+    /** Names the index whose storage a shard should read, when that is not the index it belongs to. */
+    public static final String STORAGE_UUID_SETTING = "index.serverless.storage_uuid";
+
+    /**
+     * The frozen view a shard is serving, if it is serving one.
+     *
+     * <p>A view is opened as an index of its own whose uuid is the view's identifier, and it is the only
+     * kind of shard that carries {@link #STORAGE_UUID_SETTING} — so the presence of that setting is what
+     * distinguishes one, and its own uuid is the identifier.
+     */
+    static String frozenViewIdOf(org.opensearch.index.IndexSettings indexSettings) {
+        return indexSettings.getSettings().get(STORAGE_UUID_SETTING) == null ? null : indexSettings.getIndex().getUUID();
+    }
+
     private Map<String, org.opensearch.plugins.IndexStorePlugin.DirectoryFactory> directoryFactories() {
         final org.opensearch.plugins.IndexStorePlugin.DirectoryFactory factory =
             new org.opensearch.plugins.IndexStorePlugin.DirectoryFactory() {
@@ -503,25 +560,10 @@ public final class ServerlessNode implements Closeable {
                     org.opensearch.index.IndexSettings indexSettings,
                     org.opensearch.index.shard.ShardPath shardPath
                 ) throws java.io.IOException {
-                    final org.apache.lucene.store.Directory local = org.apache.lucene.store.FSDirectory.open(shardPath.resolveIndex());
-                    final var plane = metadataPlane;
-                    if (plane == null) {
-                        // No metadata plane means no manifest to read; a plain local directory is the truthful
-                        // fallback rather than a half-built remote one.
-                        return local;
-                    }
-                    final org.opensearch.core.index.shard.ShardId shardId = shardPath.getShardId();
-                    return org.opensearch.serverless.store.BlockCacheDirectory.create(
-                        local,
-                        plane.blobStore(),
-                        org.opensearch.serverless.metadata.RegisterMap.shardData(
-                            plane.basePath(),
-                            shardId.getIndexName(),
-                            shardId.getIndex().getUUID(),
-                            shardId.id()
-                        ),
-                        blockCache,
-                        shardId.getIndexName() + "#" + shardId.id()
+                    return open(
+                        org.apache.lucene.store.FSDirectory.open(shardPath.resolveIndex()),
+                        indexSettings,
+                        shardPath.getShardId().id()
                     );
                 }
 
@@ -531,16 +573,10 @@ public final class ServerlessNode implements Closeable {
                     org.apache.lucene.store.LockFactory lockFactory,
                     org.opensearch.index.IndexSettings indexSettings
                 ) throws java.io.IOException {
-                    // This, not newDirectory, is the path the store actually takes. It hands over a
-                    // location and settings rather than a ShardPath, so the shard identity has to be
-                    // recovered from both: the index name from the settings, the shard number from the
-                    // directory the location sits in ({data}/indices/{uuid}/{shard}/index).
+                    // This hands over a location rather than a ShardPath, so the shard number has to be
+                    // recovered from the directory the location sits in
+                    // ({data}/indices/{uuid}/{shard}/index).
                     final org.apache.lucene.store.Directory local = org.apache.lucene.store.FSDirectory.open(location, lockFactory);
-                    final var plane = metadataPlane;
-                    if (plane == null) {
-                        return local;
-                    }
-                    final String indexName = indexSettings.getIndex().getName();
                     final int shardNumber;
                     try {
                         shardNumber = Integer.parseInt(location.getParent().getFileName().toString());
@@ -550,21 +586,73 @@ public final class ServerlessNode implements Closeable {
                         logger.warn("could not derive a shard number from " + location + "; serving it from local disk only", e);
                         return local;
                     }
-                    return org.opensearch.serverless.store.BlockCacheDirectory.create(
-                        local,
-                        plane.blobStore(),
-                        org.opensearch.serverless.metadata.RegisterMap.shardData(
-                            plane.basePath(),
-                            indexName,
-                            indexSettings.getIndex().getUUID(),
-                            shardNumber
-                        ),
-                        blockCache,
-                        indexName + "#" + shardNumber
-                    );
+                    return open(local, indexSettings, shardNumber);
                 }
             };
         return Map.of(BLOCK_CACHE_STORE_TYPE, factory);
+    }
+
+    /**
+     * Builds one shard's directory, whichever way the store asked for it.
+     *
+     * <p><b>Both entry points come here, and that is the point.</b> They were written separately, and the
+     * one core happened to call for a live shard grew the logic while the other kept deriving the storage
+     * path from the shard's own uuid. That is right for every ordinary shard and silently wrong for a
+     * frozen view, whose uuid is the view's and under which nothing was ever written — the view opened
+     * onto an empty directory and reported an index with no segments, which reads like a corrupted shard
+     * rather than a shell bug. Whatever decides which method core calls, it cannot decide correctness.
+     *
+     * @param local the shard's local directory
+     * @param indexSettings the shard's settings, which say whose bytes it reads
+     * @param shardNumber the shard
+     * @return the directory to serve it from
+     * @throws java.io.IOException if the manifest or its term containers cannot be read
+     */
+    private org.apache.lucene.store.Directory open(
+        org.apache.lucene.store.Directory local,
+        org.opensearch.index.IndexSettings indexSettings,
+        int shardNumber
+    ) throws java.io.IOException {
+        final var plane = metadataPlane;
+        if (plane == null) {
+            // No metadata plane means no manifest to read; a plain local directory is the truthful
+            // fallback rather than a half-built remote one.
+            return local;
+        }
+        final String indexName = indexSettings.getIndex().getName();
+        final var shardBase = org.opensearch.serverless.metadata.RegisterMap.shardData(
+            plane.basePath(),
+            indexName,
+            storageUuidOf(indexSettings),
+            shardNumber
+        );
+        // A frozen view opens the commit it froze, which is not the one the manifest register holds now --
+        // that is the entire point of it. The view's identifier is this index's uuid, so the record is one
+        // lookup away.
+        final String viewId = frozenViewIdOf(indexSettings);
+        if (viewId != null) {
+            final var pit = plane.pointInTime(viewId);
+            if (pit.isEmpty()) {
+                // Released or expired between the search resolving it and the shard opening. An empty
+                // directory here would look like an empty index; refusing says what happened.
+                throw new java.io.IOException("the point in time [" + viewId + "] is no longer held");
+            }
+            return org.opensearch.serverless.store.BlockCacheDirectory.create(
+                local,
+                plane.blobStore(),
+                shardBase,
+                blockCache,
+                viewId + "#" + shardNumber,
+                pit.get().shards().get(shardNumber)
+            );
+        }
+        return org.opensearch.serverless.store.BlockCacheDirectory.create(
+            local,
+            plane.blobStore(),
+            shardBase,
+            blockCache,
+            indexName + "#" + shardNumber
+        );
     }
 
     /**
@@ -642,6 +730,7 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,
@@ -833,6 +922,48 @@ public final class ServerlessNode implements Closeable {
         // And then tell them the node is up. A plugin that has to read its own index cannot do it while
         // components are being built; this is the event it waits for.
         plugins.onNodeStarted(localNode);
+    }
+
+    /**
+     * Opens one shard of a frozen view, so a search can read the commit it froze.
+     *
+     * <p>The view is opened as an index of its own — see
+     * {@link org.opensearch.serverless.shard.ShardReconciler#openFrozenReader} for why it has to be — which
+     * means a node can serve a frozen view of a shard it is at the same time writing to.
+     *
+     * @param plane the metadata plane
+     * @param pit the frozen view
+     * @param shardNumber the shard
+     * @return the shard id the view was opened under
+     * @throws Exception if the shard cannot be opened
+     */
+    public org.opensearch.core.index.shard.ShardId openFrozenView(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        org.opensearch.serverless.metadata.PointInTime pit,
+        int shardNumber
+    ) throws Exception {
+        ensureStarted();
+        adopt(plane);
+        reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        final IndexDescriptor descriptor = plane.describe(pit.index())
+            .orElseThrow(() -> new IllegalArgumentException("no such index: " + pit.index()));
+        final var manifest = pit.shards().get(shardNumber);
+        if (manifest == null) {
+            throw new IllegalArgumentException("the point in time [" + pit.id() + "] did not freeze shard " + shardNumber);
+        }
+        // Every shard's term, not just this one's: the view's IndexService is created once and updated as
+        // each shard opens, and metadata that knew only one shard's term would push the others back to
+        // zero.
+        final java.util.Map<Integer, Long> terms = new java.util.HashMap<>();
+        pit.shards().forEach((shard, commit) -> terms.put(shard, commit.term()));
+        return reconciler.openFrozenReader(
+            descriptor.toIndexMetadata(terms),
+            pit.id(),
+            shardNumber,
+            manifest,
+            DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()).build()
+        );
     }
 
     /**
