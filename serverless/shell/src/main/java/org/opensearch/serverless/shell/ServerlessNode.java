@@ -31,7 +31,6 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.transport.TransportAddress;
-import org.opensearch.core.indices.breaker.NoneCircuitBreakerService;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
@@ -430,7 +429,7 @@ public final class ServerlessNode implements Closeable {
             new NamedWriteableRegistry(Collections.emptyList()),
             threadPool,
             new IndexScopedSettings(settings, IndexScopedSettings.BUILT_IN_INDEX_SETTINGS),
-            new NoneCircuitBreakerService(),
+            circuitBreakerService(),
             bigArrays(),
             scriptService(),
             clusterService,
@@ -594,7 +593,7 @@ public final class ServerlessNode implements Closeable {
             // document body.
             searchModule().getFetchPhase(),
             new org.opensearch.node.ResponseCollectorService(clusterService),
-            new NoneCircuitBreakerService(),
+            circuitBreakerService(),
             null,                                   // indexSearcherExecutor — no concurrent search yet
             new org.opensearch.tasks.TaskResourceTrackingService(settings, clusterSettings, threadPool),
             Collections.emptyList(),
@@ -615,7 +614,7 @@ public final class ServerlessNode implements Closeable {
             // controller takes it at construction, which is why plugins are held before this runs.
             plugins.restHandlerWrapper(threadPool.getThreadContext(), Set.of()),
             nodeClient,
-            new NoneCircuitBreakerService(),
+            circuitBreakerService(),
             new UsageService()
         );
         // Every shell handler is registered behind the system-index guard, rather than each one checking:
@@ -701,7 +700,7 @@ public final class ServerlessNode implements Closeable {
             threadPool,
             bigArrays(),
             new PageCacheRecycler(settings),
-            new NoneCircuitBreakerService(),
+            circuitBreakerService(),
             // Not empty, and it took a forwarded query to find out why. A search body crossing the
             // network is a SearchSourceBuilder, and its query serializes as a named writeable -- so an
             // empty registry reads it back as "Unknown NamedWriteable category [QueryBuilder]" on the
@@ -1436,6 +1435,33 @@ public final class ServerlessNode implements Closeable {
 
     private volatile ActionGate actionGate;
     private volatile BigArrays bigArrays;
+    private volatile org.opensearch.core.indices.breaker.CircuitBreakerService circuitBreakerService;
+
+    /**
+     * The node's circuit breakers.
+     *
+     * <p><b>Real ones, and they were not.</b> Every component here was given a
+     * {@code NoneCircuitBreakerService}, which accounts nothing and refuses nothing. That was invisible
+     * while the shell's surface allocated nothing worth bounding, and stopped being invisible when
+     * aggregations arrived: an aggregation over a high-cardinality field is the ordinary way to exhaust a
+     * node's heap, and a node that dies is worse for every other request than one that refuses this one.
+     *
+     * <p>Core's own hierarchy, with core's own defaults, deliberately — the parent limit, the request and
+     * field-data children and the thresholds between them are numbers OpenSearch has tuned against real
+     * workloads, and inventing different ones here would be inventing a different product.
+     *
+     * @return the breaker service
+     */
+    public synchronized org.opensearch.core.indices.breaker.CircuitBreakerService circuitBreakerService() {
+        if (circuitBreakerService == null) {
+            circuitBreakerService = new org.opensearch.indices.breaker.HierarchyCircuitBreakerService(
+                settings,
+                java.util.List.of(),
+                new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
+            );
+        }
+        return circuitBreakerService;
+    }
 
     /**
      * The node's array allocator.
@@ -1445,9 +1471,8 @@ public final class ServerlessNode implements Closeable {
      * {@code NullPointerException} rather than an array. Nothing noticed for as long as nothing allocated:
      * a query needs no scratch space, and an aggregation is the first thing here that does.
      *
-     * <p>The breaker is {@code NoneCircuitBreakerService}, so nothing is bounded — which is honest for a
-     * node whose memory limits are not modelled anywhere, and different from being unable to allocate at
-     * all.
+     * <p>It accounts against the node's real breakers, so an allocation that would take the node past its
+     * request limit is refused rather than granted.
      *
      * @return the allocator
      */
@@ -1455,7 +1480,7 @@ public final class ServerlessNode implements Closeable {
         if (bigArrays == null) {
             bigArrays = new BigArrays(
                 new PageCacheRecycler(settings),
-                new NoneCircuitBreakerService(),
+                circuitBreakerService(),
                 org.opensearch.core.common.breaker.CircuitBreaker.REQUEST
             );
         }

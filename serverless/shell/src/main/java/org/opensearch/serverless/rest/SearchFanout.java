@@ -93,12 +93,25 @@ public final class SearchFanout {
         // the loop was the only reason. Each task answers for exactly one shard and swallows nothing: a
         // shard that cannot be reached comes back null and shows up in the coverage this already reports.
         int shards = 0;
+        // Why a shard did not answer, kept rather than only logged. A fan-out treats an unanswered shard as
+        // a hole in the coverage it reports, which is right while some other shard did answer. When none
+        // did there is no answer to report coverage over, and "0 hits" with a flag beside it is exactly the
+        // confident empty answer this surface exists to avoid -- so the first failure is carried out and
+        // becomes the response.
+        final java.util.concurrent.atomic.AtomicReference<Exception> firstFailure = new java.util.concurrent.atomic.AtomicReference<>();
         final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>();
         for (java.util.Map.Entry<String, Integer> index : indices.entrySet()) {
             for (int shard = 0; shard < index.getValue(); shard++) {
                 final int number = shard;
                 final String name = index.getKey();
-                tasks.add(() -> askOneShard(serving, metadata, name, number, perShard));
+                tasks.add(() -> {
+                    try {
+                        return askOneShard(serving, metadata, name, number, perShard);
+                    } catch (Exception e) {
+                        firstFailure.compareAndSet(null, e);
+                        throw e;
+                    }
+                });
                 shards++;
             }
         }
@@ -124,6 +137,19 @@ public final class SearchFanout {
                 shardAggregations.add(answer.aggregations);
             }
             answered++;
+        }
+
+        if (answered == 0 && shards > 0) {
+            final Exception cause = firstFailure.get();
+            if (cause instanceof RuntimeException runtime) {
+                // Rethrown as itself, so a circuit-breaking exception still answers 429 and a security
+                // refusal still answers 403 rather than every failure collapsing into one status.
+                throw runtime;
+            }
+            if (cause != null) {
+                throw new IOException("no shard of " + indices.keySet() + " could answer this search", cause);
+            }
+            throw new IOException("no shard of " + indices.keySet() + " could answer this search; no node is serving them");
         }
 
         merged.sort(order(source));
