@@ -153,8 +153,25 @@ public final class ServerlessNode implements Closeable {
      * @throws Exception if the node cannot be built
      */
     public ServerlessNode(Settings settings, java.util.List<org.opensearch.plugins.Plugin> plugins) throws Exception {
-        this.settings = withShellDefaults(settings);
+        // Plugins first, before the settings are settled, because a plugin gets to contribute to them.
+        //
+        // The order is load-bearing. PluginsService is built from what the caller supplied, so a plugin is
+        // constructed with the operator's configuration; updatedSettings then layers each plugin's
+        // additionalSettings underneath it, so an explicit setting always beats a plugin's; and the shell's
+        // own defaults go underneath both, so they apply only when nobody else had an opinion. Putting the
+        // shell's transport choice on top -- which is where it used to be -- would have made
+        // additionalSettings decorative for the one thing plugins most use it for.
+        this.pluginsService = buildPluginsService(settings, new Environment(settings, null));
+        final java.util.List<org.opensearch.plugins.Plugin> installed = new java.util.ArrayList<>(
+            pluginsService.filterPlugins(org.opensearch.plugins.Plugin.class)
+        );
+        // Ones handed to this constructor come after the installed ones, so an operator's installation is
+        // not silently outranked by something a test or an embedder passed in.
+        installed.addAll(plugins);
+        this.plugins = new ServerlessPlugins(installed);
+        this.settings = withShellDefaults(this.plugins.settingsWith(settings));
         settings = this.settings;
+
         this.nodeName = settings.get("node.name", "serverless-node");
         // §10.4: role is a runtime attribute a node advertises, not a topology decision baked into a
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
@@ -167,20 +184,10 @@ public final class ServerlessNode implements Closeable {
             settings.getAsInt("serverless.block_cache.block_size", org.opensearch.serverless.store.BlockCache.DEFAULT_BLOCK_SIZE),
             settings.getAsInt("serverless.block_cache.max_blocks", 4096)
         );
+        // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
+        // below.
         final Environment environment = new Environment(settings, null);
         final ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
-
-        // Plugins first, from disk, through core's own loader -- see buildPluginsService. Everything after
-        // this can depend on the plugin list: the REST controller takes a plugin's request wrapper in its
-        // constructor, and the system-index guard is built from what plugins declare.
-        this.pluginsService = buildPluginsService(settings, environment);
-        final java.util.List<org.opensearch.plugins.Plugin> installed = new java.util.ArrayList<>(
-            pluginsService.filterPlugins(org.opensearch.plugins.Plugin.class)
-        );
-        // Ones handed to this constructor come after the installed ones, so an operator's installation is
-        // not silently outranked by something a test or an embedder passed in.
-        installed.addAll(plugins);
-        this.plugins = new ServerlessPlugins(installed);
 
         this.threadPool = new ThreadPool(settings);
         boolean success = false;
@@ -408,7 +415,7 @@ public final class ServerlessNode implements Closeable {
         // built-in analyzers, which AnalysisModule registers as a matter of course.
         final AnalysisRegistry analysisRegistry = new org.opensearch.indices.analysis.AnalysisModule(
             environment,
-            pluginsService.filterPlugins(org.opensearch.plugins.AnalysisPlugin.class)
+            this.plugins.filter(org.opensearch.plugins.AnalysisPlugin.class)
         ).getAnalysisRegistry();
         // S0/F2: mandatory — DataFormatRegistry calls filterPlugins() during construction. It is now the
         // real one rather than an empty stub, so an installed plugin gets onIndexModule like it would on a
@@ -420,7 +427,7 @@ public final class ServerlessNode implements Closeable {
             xContentRegistry,
             analysisRegistry,
             new IndexNameExpressionResolver(new ThreadContext(settings)),
-            new IndicesModule(pluginsService.filterPlugins(org.opensearch.plugins.MapperPlugin.class)).getMapperRegistry(),
+            new IndicesModule(this.plugins.filter(org.opensearch.plugins.MapperPlugin.class)).getMapperRegistry(),
             new NamedWriteableRegistry(Collections.emptyList()),
             threadPool,
             new IndexScopedSettings(settings, IndexScopedSettings.BUILT_IN_INDEX_SETTINGS),
@@ -663,9 +670,19 @@ public final class ServerlessNode implements Closeable {
      * possible answer.
      */
     private NetworkModule buildNetworkModule(ClusterSettings clusterSettings) {
+        // Netty first, then whatever plugins were installed.
+        //
+        // Core's NetworkModule resolves transport.type and http.type by name across every NetworkPlugin it
+        // is given, and composes their transport interceptors. Handing it only Netty meant an installed
+        // NetworkPlugin was loaded and then not asked -- which for the OpenSearch security plugin is the
+        // difference between installing its TLS transport and not. The shell still supplies netty4 as the
+        // default, so a node with no such plugin is unchanged.
+        final java.util.List<org.opensearch.plugins.NetworkPlugin> networkPlugins = new java.util.ArrayList<>();
+        networkPlugins.add(new Netty4ModulePlugin());
+        networkPlugins.addAll(plugins.filter(org.opensearch.plugins.NetworkPlugin.class));
         return new NetworkModule(
             settings,
-            java.util.List.of(new Netty4ModulePlugin()),
+            networkPlugins,
             threadPool,
             BigArrays.NON_RECYCLING_INSTANCE,
             new PageCacheRecycler(settings),
@@ -1314,10 +1331,7 @@ public final class ServerlessNode implements Closeable {
         if (searchModule == null) {
             // A SearchPlugin's queries, aggregations and suggesters come in here. Same argument as
             // analysis: a plugin whose extension point is ignored has not been hosted.
-            searchModule = new org.opensearch.search.SearchModule(
-                settings,
-                pluginsService.filterPlugins(org.opensearch.plugins.SearchPlugin.class)
-            );
+            searchModule = new org.opensearch.search.SearchModule(settings, plugins.filter(org.opensearch.plugins.SearchPlugin.class));
         }
         return searchModule;
     }

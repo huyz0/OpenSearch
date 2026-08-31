@@ -228,6 +228,66 @@ public final class ServerlessPlugins {
     }
 
     /**
+     * Returns every loaded plugin of a given type.
+     *
+     * <p><b>This rather than {@code PluginsService#filterPlugins}, and the difference is not cosmetic.</b>
+     * Core's loader knows the plugins it loaded from disk and cannot be told about one handed to the node's
+     * constructor. Filtering through it meant a plugin's extension points were honoured or ignored
+     * depending on how the plugin arrived — an installed {@code AnalysisPlugin} contributed its analyzers
+     * and the same class passed to a test did not. One list, one set of answers.
+     *
+     * @param type the plugin interface
+     * @param <T> the plugin interface
+     * @return the plugins implementing it, in load order
+     */
+    public <T> List<T> filter(Class<T> type) {
+        final List<T> matching = new ArrayList<>();
+        for (Plugin plugin : plugins) {
+            if (type.isInstance(plugin)) {
+                matching.add(type.cast(plugin));
+            }
+        }
+        return matching;
+    }
+
+    /**
+     * Layers every plugin's {@code additionalSettings} under the settings an operator supplied.
+     *
+     * <p>Core's {@code PluginsService#updatedSettings} does this for the plugins it loaded; this does it for
+     * all of them, by the same rules. Two plugins contributing the same key is an error rather than a
+     * silent winner — which key wins would otherwise depend on load order, and load order is not something
+     * an operator chose.
+     *
+     * <p>The supplied settings go on top, so a plugin can offer a default and never override a decision.
+     *
+     * @param supplied the settings the node was constructed with
+     * @return the merged settings
+     */
+    public Settings settingsWith(Settings supplied) {
+        final java.util.Map<String, String> contributedBy = new java.util.HashMap<>();
+        final Settings.Builder merged = Settings.builder();
+        for (Plugin plugin : plugins) {
+            final Settings additional = plugin.additionalSettings();
+            for (String key : additional.keySet()) {
+                final String earlier = contributedBy.put(key, plugin.getClass().getName());
+                if (earlier != null) {
+                    throw new IllegalArgumentException(
+                        "two plugins both contribute the setting ["
+                            + key
+                            + "] -- "
+                            + earlier
+                            + " and "
+                            + plugin.getClass().getName()
+                            + "; which one applies would depend on load order"
+                    );
+                }
+            }
+            merged.put(additional);
+        }
+        return merged.put(supplied).build();
+    }
+
+    /**
      * Tells the plugins the node is serving.
      *
      * <p><b>Not the same event as {@code createComponents}, and plugins rely on the difference.</b> A
