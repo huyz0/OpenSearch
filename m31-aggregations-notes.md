@@ -78,21 +78,26 @@ filtered query and asserts it counts the matches rather than the index.
 assert sort and aggregations were — updated rather than deleted, because that test is the one that would
 otherwise still be describing a surface that has moved.
 
+*(`search_after` was itself removed from that list by [M36](m36-search-after-notes.md); `collapse`,
+`suggest` and `profile` are the whole of what remains refused.)*
+
 ## What is still missing
 
 - **Accuracy is core's, including its limits.** A terms aggregation over high cardinality is approximate in
   the same way and for the same reasons it is on a classic node; `doc_count_error_upper_bound` is reduced
   and reported by core, not by anything here.
-- **No memory bound.** The breaker is a no-op, so a large aggregation can exhaust the heap rather than being
-  refused. That is the same position the node was already in for everything else, now reachable by a new
-  route.
+- ~~No memory bound.~~ **Closed by [M34](m34-circuit-breakers-notes.md)**: the breaker was a no-op, so a
+  large aggregation could exhaust the heap rather than being refused. Real breakers are wired now, and an
+  aggregation past the limit is refused while the node keeps serving.
 - ~~Cost unmeasured.~~ **Measured**: over three locally-held shards, a search costs **3 object-store
   requests and the same search with two aggregations costs 3** — identical on a filesystem and on a bucket,
   with zero data-blob reads. Which is the claim the design makes: the reduce runs on the coordinating node
   over answers the shards computed from segments they were already reading, so it adds nothing to what the
   deployment pays its object store. Measured against the same search *without* the aggregations, because
   "3 requests" means nothing alone and "the same 3" means everything.
-- **`_mget`, `_source` filtering and multi-index search** remain absent.
+- ~~`_mget`, `_source` filtering and multi-index search remain absent.~~ **All three are in**: multi-index
+  search in [M33](m33-multi-index-search-notes.md), and `_mget` — plus the discovery that `_source`
+  filtering had always worked — in [M35](m35-mget-and-source-notes.md).
 
 259 tests green across `test` (224), `pluginTest` (2), `processTest` (13) and `s3Test` (20), none skipped,
 MinIO live. `server/` untouched.
