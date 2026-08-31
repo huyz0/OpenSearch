@@ -209,15 +209,27 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started("query-refuse", plane, 2)) {
             index(node, "1", "{\"msg\":\"refuse\",\"n\":1,\"tag\":\"a\"}");
 
+            // Aggregations were on this list until the fan-out learned to reduce them, and sort until the
+            // merge learned to order on sort keys. Both are asserted the other way round now, here rather
+            // than only in their own suites, because this is the test that would otherwise still be
+            // describing a surface that has moved.
             final Response aggregated = send(
                 node,
                 "POST",
                 "/alpha/_search",
-                "{\"query\":{\"match_all\":{}},\"aggs\":{\"tags\":{\"terms\":{\"field\":\"tag\"}}}}"
+                "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"tags\":{\"terms\":{\"field\":\"tag\"}}}}"
             );
-            assertEquals("an aggregation must be refused, not silently dropped: " + aggregated.body(), 501, aggregated.status());
-            assertTrue("and named: " + aggregated.body(), aggregated.body().contains("unsupported_search"));
-            assertTrue("and explained: " + aggregated.body(), aggregated.body().contains("aggregations"));
+            assertEquals("an aggregation is reduced now, not refused: " + aggregated.body(), 200, aggregated.status());
+            assertTrue("and comes back: " + aggregated.body(), aggregated.body().contains("\"tags\""));
+
+            final Response collapsed = send(
+                node,
+                "POST",
+                "/alpha/_search",
+                "{\"query\":{\"match_all\":{}},\"collapse\":{\"field\":\"tag\"}}"
+            );
+            assertEquals("collapse is still refused: " + collapsed.body(), 501, collapsed.status());
+            assertTrue("and named: " + collapsed.body(), collapsed.body().contains("unsupported_search"));
 
             // Sort was on this list until the merge learned to do it. It is asserted the other way round
             // now, here rather than only in ServerlessSortTests, because this is the test that would

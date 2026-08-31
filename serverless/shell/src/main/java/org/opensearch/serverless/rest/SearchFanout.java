@@ -80,18 +80,66 @@ public final class SearchFanout {
         long total = 0;
         int answered = 0;
         final List<SearchHit> merged = new ArrayList<>();
+        final List<org.opensearch.search.aggregations.InternalAggregations> shardAggregations = new ArrayList<>();
         for (ShardAnswer answer : answers) {
             if (answer == null) {
                 continue;
             }
             total += answer.total;
             merged.addAll(answer.hits);
+            if (answer.aggregations != null) {
+                shardAggregations.add(answer.aggregations);
+            }
             answered++;
         }
 
         merged.sort(order(source));
         final List<SearchHit> page = merged.stream().skip(from).limit(size).collect(java.util.stream.Collectors.toList());
-        return new ShardOperations.SearchOutcome(total, page, shards, answered);
+        return new ShardOperations.SearchOutcome(total, page, shards, answered, reduce(serving, source, shardAggregations));
+    }
+
+    /**
+     * Combines what each shard counted into one answer.
+     *
+     * <p><b>This is the reduce phase, and it is core's own.</b> A shard's terms aggregation holds that
+     * shard's top terms and that shard's counts; adding them is not summing numbers but merging ordered
+     * buckets, deciding which terms survive, and propagating the error bounds that say how wrong the result
+     * might be. {@code InternalAggregations#topLevelReduce} is the code a classic node runs for exactly
+     * this, and writing a second one would have been a promise to keep it correct forever.
+     *
+     * <p><b>Reduced once, finally, rather than in stages.</b> A classic coordinator reduces in batches as
+     * shard results arrive, to bound memory. This fan-out already holds every shard's answer before it
+     * merges hits, so a partial reduction would save nothing and add a state machine — and the shard counts
+     * are bounded by the fan-out's own concurrency rather than by cluster size.
+     *
+     * <p>Pipeline aggregations come from the request's own tree, so a pipeline the caller asked for runs
+     * rather than silently disappearing.
+     *
+     * @param serving the coordinating node
+     * @param source what the client asked for
+     * @param perShard each shard's unreduced aggregations
+     * @return the combined aggregations, or null when none were asked for
+     */
+    private static org.opensearch.search.aggregations.InternalAggregations reduce(
+        ServerlessNode serving,
+        SearchSourceBuilder source,
+        List<org.opensearch.search.aggregations.InternalAggregations> perShard
+    ) {
+        if (perShard.isEmpty()) {
+            return null;
+        }
+        final org.opensearch.search.aggregations.pipeline.PipelineAggregator.PipelineTree pipelines = source.aggregations() == null
+            ? org.opensearch.search.aggregations.pipeline.PipelineAggregator.PipelineTree.EMPTY
+            : source.aggregations().buildPipelineTree();
+        return org.opensearch.search.aggregations.InternalAggregations.topLevelReduce(
+            perShard,
+            org.opensearch.search.aggregations.InternalAggregation.ReduceContext.forFinalReduction(
+                serving.bigArrays(),
+                serving.scriptService(),
+                count -> {},
+                pipelines
+            )
+        );
     }
 
     /**
@@ -180,10 +228,12 @@ public final class SearchFanout {
     private static final class ShardAnswer {
         private final long total;
         private final List<SearchHit> hits;
+        private final org.opensearch.search.aggregations.InternalAggregations aggregations;
 
-        ShardAnswer(long total, List<SearchHit> hits) {
+        ShardAnswer(long total, List<SearchHit> hits, org.opensearch.search.aggregations.InternalAggregations aggregations) {
             this.total = total;
             this.hits = hits;
+            this.aggregations = aggregations;
         }
     }
 
@@ -214,7 +264,7 @@ public final class SearchFanout {
         if (local != null) {
             serving.markUsed(local);
             final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard);
-            return new ShardAnswer(result.total(), result.hits());
+            return new ShardAnswer(result.total(), result.hits(), result.aggregations());
         }
         // Not here. Choose a reader by placement -- NOT the shard's owner, which is the writer: routing
         // searches to writers would couple search capacity to write capacity and make per-index search
@@ -243,7 +293,7 @@ public final class SearchFanout {
                     final ShardId opened = serving.serveAsReader(metadata, index, shard);
                     serving.markUsed(opened);
                     final var mine = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), opened, perShard);
-                    return new ShardAnswer(mine.total(), mine.hits());
+                    return new ShardAnswer(mine.total(), mine.hits(), mine.aggregations());
                 }
                 // The search bound, not the write bound: a peer that is merely busy should cost latency,
                 // not coverage.
@@ -253,7 +303,7 @@ public final class SearchFanout {
                 }
                 final var answer = serving.router()
                     .forwardSearch(peer.get(), new org.opensearch.serverless.transport.ForwardedSearchRequest(index, shard, perShard));
-                return new ShardAnswer(answer.total(), answer.hits());
+                return new ShardAnswer(answer.total(), answer.hits(), answer.aggregations());
             } catch (Exception e) {
                 // Try the next candidate. A shard that failed to answer is not a shard with no matches,
                 // so it only counts as searched if one of them succeeded.

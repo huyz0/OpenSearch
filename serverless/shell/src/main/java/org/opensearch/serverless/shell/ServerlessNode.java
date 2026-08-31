@@ -42,7 +42,6 @@ import org.opensearch.indices.IndicesModule;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.plugins.PluginsService;
 import org.opensearch.rest.RestController;
-import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.query.QueryPhase;
 import org.opensearch.serverless.cluster.IndexDescriptor;
@@ -432,14 +431,17 @@ public final class ServerlessNode implements Closeable {
             threadPool,
             new IndexScopedSettings(settings, IndexScopedSettings.BUILT_IN_INDEX_SETTINGS),
             new NoneCircuitBreakerService(),
-            BigArrays.NON_RECYCLING_INSTANCE,
+            bigArrays(),
             scriptService(),
             clusterService,
             null,                                   // Client — no node client in phase 1
             new MetaStateService(nodeEnvironment, xContentRegistry),
             engineFactoryProviders(),
             directoryFactories(),
-            null,                                   // ValuesSourceRegistry
+            // Aggregations resolve a field's values source through this. It was null, which was invisible
+            // for as long as aggregations were refused at the REST layer and became a NullPointerException
+            // from inside QueryShardContext the moment one reached a shard.
+            searchModule().getValuesSourceRegistry(),
             emptyMap(),
             null,                                   // remote directory factory — serverless supplies its own
             () -> null,                             // RepositoriesService
@@ -570,8 +572,11 @@ public final class ServerlessNode implements Closeable {
             clusterService,
             indicesService,
             threadPool,
-            new ScriptService(settings, emptyMap(), emptyMap()),
-            new BigArrays(new PageCacheRecycler(settings), null, nodeName),
+            scriptService(),
+            // The node's allocator, not one built here with a null breaker service. An aggregator asks its
+            // search context's BigArrays for the breaker and calls getBreaker on it before it has counted a
+            // single document, so a null one is a NullPointerException at the top of every aggregation.
+            bigArrays(),
             new QueryPhase(),
             // Built by SearchModule, not by hand. A FetchPhase with no sub-phases returns hits with an
             // id and no _source, and reports success -- the fetch sub-phases are what load the source,
@@ -684,7 +689,7 @@ public final class ServerlessNode implements Closeable {
             settings,
             networkPlugins,
             threadPool,
-            BigArrays.NON_RECYCLING_INSTANCE,
+            bigArrays(),
             new PageCacheRecycler(settings),
             new NoneCircuitBreakerService(),
             // Not empty, and it took a forwarded query to find out why. A search body crossing the
@@ -1420,6 +1425,32 @@ public final class ServerlessNode implements Closeable {
     }
 
     private volatile ActionGate actionGate;
+    private volatile BigArrays bigArrays;
+
+    /**
+     * The node's array allocator.
+     *
+     * <p><b>Not {@code BigArrays.NON_RECYCLING_INSTANCE}, which cannot allocate.</b> That constant is built
+     * with a null circuit-breaker service, so the first component to actually ask it for an array gets a
+     * {@code NullPointerException} rather than an array. Nothing noticed for as long as nothing allocated:
+     * a query needs no scratch space, and an aggregation is the first thing here that does.
+     *
+     * <p>The breaker is {@code NoneCircuitBreakerService}, so nothing is bounded — which is honest for a
+     * node whose memory limits are not modelled anywhere, and different from being unable to allocate at
+     * all.
+     *
+     * @return the allocator
+     */
+    public synchronized BigArrays bigArrays() {
+        if (bigArrays == null) {
+            bigArrays = new BigArrays(
+                new PageCacheRecycler(settings),
+                new NoneCircuitBreakerService(),
+                org.opensearch.core.common.breaker.CircuitBreaker.REQUEST
+            );
+        }
+        return bigArrays;
+    }
 
     /**
      * The gate every operation passes through, where a plugin's {@code ActionFilter}s decide.

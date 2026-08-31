@@ -161,7 +161,7 @@ public final class ShardRouter {
         }
         node.markUsed(shardId);
         final ShardQuery.Result result = ShardQuery.execute(node.searchService(), shardId, request.source());
-        channel.sendResponse(new ForwardedSearchResponse(result.total(), result.hits()));
+        channel.sendResponse(new ForwardedSearchResponse(result.total(), result.hits(), result.aggregations()));
     }
 
     private ShardId localShard(String index, int shard) {

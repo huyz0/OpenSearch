@@ -191,9 +191,6 @@ public final class SearchHandler extends BaseRestHandler {
      * @return why it cannot be served, or null
      */
     private static String whatCannotBeMerged(SearchSourceBuilder source) {
-        if (source.aggregations() != null) {
-            return "aggregations are not supported: results from several shards would have to be reduced, and this does not reduce them";
-        }
         if (source.searchAfter() != null) {
             return "search_after is not supported";
         }
@@ -292,6 +289,12 @@ public final class SearchHandler extends BaseRestHandler {
             }
             builder.endArray();
             builder.endObject();
+            if (outcome.aggregations() != null) {
+                // Rendered by the aggregations themselves, which is the only way the shape matches what a
+                // classic node returns: every aggregation type knows its own output, and a hand-written
+                // renderer would agree with them until somebody used one it had not met.
+                outcome.aggregations().toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+            }
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }

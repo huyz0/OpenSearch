@@ -30,6 +30,7 @@ public final class ForwardedSearchResponse extends TransportResponse {
 
     private final long total;
     private final List<SearchHit> hits;
+    private final org.opensearch.search.aggregations.InternalAggregations aggregations;
 
     /**
      * Creates a response.
@@ -38,8 +39,26 @@ public final class ForwardedSearchResponse extends TransportResponse {
      * @param hits the returned hits, in this shard's own order
      */
     public ForwardedSearchResponse(long total, List<SearchHit> hits) {
+        this(total, hits, null);
+    }
+
+    /**
+     * Creates a response carrying this shard's unreduced aggregations.
+     *
+     * <p><b>Unreduced, and that is what makes them worth sending.</b> A shard's terms aggregation holds
+     * that shard's counts; combining them is the coordinating node's job, and a shard that reduced its own
+     * would be sending an answer computed over a fraction of the index. {@code InternalAggregations} is
+     * {@code Writeable} and its concrete types are in the node's named-writeable registry, which the
+     * transport was already given, so this costs a field rather than a serialisation format.
+     *
+     * @param total how many documents matched in this shard
+     * @param hits the returned hits, in this shard's own order
+     * @param aggregations this shard's aggregations, or null if none were asked for
+     */
+    public ForwardedSearchResponse(long total, List<SearchHit> hits, org.opensearch.search.aggregations.InternalAggregations aggregations) {
         this.total = total;
         this.hits = List.copyOf(hits);
+        this.aggregations = aggregations;
     }
 
     /**
@@ -56,6 +75,7 @@ public final class ForwardedSearchResponse extends TransportResponse {
             read.add(new SearchHit(in));
         }
         this.hits = List.copyOf(read);
+        this.aggregations = in.readBoolean() ? org.opensearch.search.aggregations.InternalAggregations.readFrom(in) : null;
     }
 
     @Override
@@ -65,6 +85,19 @@ public final class ForwardedSearchResponse extends TransportResponse {
         for (SearchHit hit : hits) {
             hit.writeTo(out);
         }
+        out.writeBoolean(aggregations != null);
+        if (aggregations != null) {
+            aggregations.writeTo(out);
+        }
+    }
+
+    /**
+     * Returns this shard's unreduced aggregations.
+     *
+     * @return the aggregations, or null
+     */
+    public org.opensearch.search.aggregations.InternalAggregations aggregations() {
+        return aggregations;
     }
 
     /**

@@ -46,10 +46,29 @@ public final class ShardQuery {
 
         private final long total;
         private final List<SearchHit> hits;
+        private final org.opensearch.search.aggregations.InternalAggregations aggregations;
 
         Result(long total, List<SearchHit> hits) {
+            this(total, hits, null);
+        }
+
+        Result(long total, List<SearchHit> hits, org.opensearch.search.aggregations.InternalAggregations aggregations) {
             this.total = total;
             this.hits = hits;
+            this.aggregations = aggregations;
+        }
+
+        /**
+         * Returns this shard's unreduced aggregations, or null if the request asked for none.
+         *
+         * <p>Unreduced is the point: a shard's terms aggregation holds that shard's counts, and adding two
+         * of them together is the coordinating node's job. Returning them already combined would be
+         * returning an answer computed over a third of the index.
+         *
+         * @return the aggregations, or null
+         */
+        public org.opensearch.search.aggregations.InternalAggregations aggregations() {
+            return aggregations;
         }
 
         /**
@@ -144,7 +163,13 @@ public final class ShardQuery {
     public static Result execute(SearchService searchService, ShardId shardId, SearchSourceBuilder source) throws IOException {
         final SearchRequest searchRequest = new SearchRequest(shardId.getIndexName()).allowPartialSearchResults(false).source(source);
         final ShardSearchRequest shardRequest = new ShardSearchRequest(
-            OriginalIndices.NONE,
+            // The index this request came for, rather than OriginalIndices.NONE.
+            //
+            // NONE was fine for as long as the request was only ever read in this process. The shard
+            // request cache serialises it to build a cache key -- which it does for a size:0 aggregation,
+            // exactly the shape most aggregations have -- and writing NONE trips an assertion inside
+            // OriginalIndices. Naming the index is also simply what the request is: a search of one index.
+            new OriginalIndices(new String[] { shardId.getIndexName() }, org.opensearch.action.support.IndicesOptions.strictExpandOpen()),
             searchRequest,
             shardId,
             1,
@@ -166,8 +191,13 @@ public final class ShardQuery {
         // a 404 that reads like a missing document rather than like a double fetch.
         final org.apache.lucene.search.ScoreDoc[] scoreDocs = queryResult.queryResult().topDocs().topDocs.scoreDocs;
         final org.opensearch.search.DocValueFormat[] sortFormats = queryResult.queryResult().sortValueFormats();
+        // Taken before anything else touches the result: consumeAggs is single-use and throws on a second
+        // call, which is how it makes "who owns these" unambiguous.
+        final org.opensearch.search.aggregations.InternalAggregations aggregations = queryResult.queryResult().hasAggs()
+            ? queryResult.queryResult().consumeAggs().expand()
+            : null;
         if (queryResult.fetchResult() != null && queryResult.fetchResult().hits() != null) {
-            return new Result(total, withScores(queryResult.fetchResult().hits().getHits(), scoreDocs, sortFormats));
+            return new Result(total, withScores(queryResult.fetchResult().hits().getHits(), scoreDocs, sortFormats), aggregations);
         }
 
         final List<Integer> docIds = new ArrayList<>();
@@ -176,12 +206,14 @@ public final class ShardQuery {
         }
         if (docIds.isEmpty()) {
             searchService.freeReaderContext(queryResult.getContextId());
-            return new Result(total, List.of());
+            // No hits does not mean no aggregations: a terms aggregation over an index with size 0 is the
+            // ordinary way to ask for one.
+            return new Result(total, List.of(), aggregations);
         }
         try {
             final PlainActionFuture<FetchSearchResult> fetchFuture = PlainActionFuture.newFuture();
             searchService.executeFetchPhase(new ShardFetchRequest(queryResult.getContextId(), docIds, null), task, fetchFuture);
-            return new Result(total, withScores(fetchFuture.actionGet().hits().getHits(), scoreDocs, sortFormats));
+            return new Result(total, withScores(fetchFuture.actionGet().hits().getHits(), scoreDocs, sortFormats), aggregations);
         } finally {
             // The reader is pinned until this runs; leaking one keeps a commit's files alive forever.
             searchService.freeReaderContext(queryResult.getContextId());

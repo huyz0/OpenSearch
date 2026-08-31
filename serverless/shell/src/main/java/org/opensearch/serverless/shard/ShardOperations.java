@@ -351,6 +351,7 @@ public final class ShardOperations {
         private final java.util.List<org.opensearch.search.SearchHit> hits;
         private final int shards;
         private final int answered;
+        private final org.opensearch.search.aggregations.InternalAggregations aggregations;
 
         /**
          * Creates the outcome.
@@ -361,10 +362,39 @@ public final class ShardOperations {
          * @param answered how many answered
          */
         public SearchOutcome(long total, java.util.List<org.opensearch.search.SearchHit> hits, int shards, int answered) {
+            this(total, hits, shards, answered, null);
+        }
+
+        /**
+         * Creates the outcome, with the reduced aggregations.
+         *
+         * @param total how many matched
+         * @param hits the merged page
+         * @param shards how many shards the index has
+         * @param answered how many answered
+         * @param aggregations the combined aggregations, or null if none were asked for
+         */
+        public SearchOutcome(
+            long total,
+            java.util.List<org.opensearch.search.SearchHit> hits,
+            int shards,
+            int answered,
+            org.opensearch.search.aggregations.InternalAggregations aggregations
+        ) {
             this.total = total;
             this.hits = hits;
             this.shards = shards;
             this.answered = answered;
+            this.aggregations = aggregations;
+        }
+
+        /**
+         * Returns the aggregations, already combined across shards.
+         *
+         * @return the aggregations, or null
+         */
+        public org.opensearch.search.aggregations.InternalAggregations aggregations() {
+            return aggregations;
         }
 
         /**
