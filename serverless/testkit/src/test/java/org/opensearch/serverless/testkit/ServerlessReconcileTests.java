@@ -397,6 +397,47 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
     // ---- the gossip gate (§10.3) -----------------------------------------------------------------
 
     /**
+     * A pass does not go looking for points in time on every tick.
+     *
+     * <p><b>A listing is the most expensive shape of request the design makes</b>, and reaping expired
+     * views needs one across the whole deployment. Doing it every pass would mean every node paying a
+     * listing every thirty seconds to be told that a feature nobody in the deployment has used is still
+     * not being used — a fleet of a thousand nodes turning that into millions of requests a day for
+     * nothing. A keep-alive is measured in minutes, so a reap every tenth pass is soon enough.
+     *
+     * <p>The in-memory half — closing views this node is holding whose record has gone — still runs every
+     * pass, because it costs nothing on a node holding none.
+     *
+     * <p>Measured rather than asserted about the constant, so the test fails if the gate is removed rather
+     * than if the number is retuned.
+     */
+    public void testAPassDoesNotListPointsInTimeEveryTick() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Deployment d = deploy(createTempDir(), clock, true);
+        final CountingBlobStore counter = (CountingBlobStore) d.store;
+        d.plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (ServerlessNode a = new ServerlessNode(nodeSettings("p8-pit-cost"))) {
+            a.start();
+            final BackgroundReconciler loop = new BackgroundReconciler(a, d.plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+
+            counter.reset();
+            final int passes = 10;
+            for (int i = 0; i < passes; i++) {
+                clock.set(clock.get() + 1_000L);
+                loop.tick(clock.get());
+            }
+
+            assertTrue(
+                "ten idle passes must not cost ten listings: " + counter.listings() + " of them, " + counter.breakdown(),
+                counter.listings() <= 2
+            );
+        }
+    }
+
+    /**
      * §10.3 builds gossip only if polling turns out to be insufficient, measured rather than assumed.
      * This produces the number that decision needs: object-store operations per reconciliation pass.
      */

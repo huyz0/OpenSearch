@@ -142,7 +142,15 @@ public final class BackgroundReconciler implements Closeable {
         released.addAll(releaseIdle(nowMillis));
         // And after that, so a reader this node has just let go of for idleness is not looked up again.
         released.addAll(refreshReaders());
-        reapExpiredViews();
+        // Views this node is holding for a record that has gone: in-memory to decide, so it costs nothing
+        // on a node holding none, and it must not wait for the reaping cadence below.
+        closeReleasedViews();
+        // The deployment-wide reap is a listing, and every node would otherwise pay one every pass to be
+        // told that a feature nobody used is still not being used. A keep-alive is minutes; this is
+        // seconds times a small number, which is soon enough and is a fraction of the cost.
+        if (passes++ % REAP_EVERY_PASSES == 0) {
+            reapExpiredViews();
+        }
         // Only what was published, so the sweep costs nothing at all on a shard nobody is writing to.
         sweepPublished(published);
         return new TickResult(released, activated, published, refreshHints(nowMillis));
@@ -318,18 +326,37 @@ public final class BackgroundReconciler implements Closeable {
         } catch (Exception e) {
             logger.warn("could not reap expired points in time; the next pass will retry", e);
         }
+        closeReleasedViews();
+        return reaped;
+    }
+
+    /** How many passes between deployment-wide reaps of expired views. */
+    public static final int REAP_EVERY_PASSES = 10;
+
+    private long passes;
+
+    /**
+     * Closes the frozen views this node is holding whose record has gone.
+     *
+     * <p>Separate from the reap because it is the half with no listing in it: it asks only about views this
+     * node has open, so a node holding none does nothing and pays nothing.
+     *
+     * @return how many views were closed
+     */
+    public int closeReleasedViews() {
+        int closed = 0;
         for (ShardId view : node.reconciler().frozenShards()) {
             final String viewId = view.getIndex().getUUID();
             try {
                 final var record = plane.pointInTime(viewId);
                 if (record.isEmpty() || record.get().expiredAt(plane.clock().getAsLong())) {
-                    node.reconciler().closeFrozenReader(viewId);
+                    closed += node.reconciler().closeFrozenReader(viewId);
                 }
             } catch (Exception e) {
                 logger.warn("could not check whether the view " + viewId + " is still held; keeping its shards", e);
             }
         }
-        return reaped;
+        return closed;
     }
 
     /**

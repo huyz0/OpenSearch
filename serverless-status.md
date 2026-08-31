@@ -41,8 +41,10 @@ publishes commits to the object store, and releases shards that have gone idle. 
 manager, no consensus process, and no cluster-wide state.
 
 **Maintenance the deployment does for itself.** A reconcile pass lets go of readers whose commit has been
-superseded, so nothing serves a stale commit indefinitely; reaps expired points in time and closes the
-shards held for them; and sweeps the garbage left by what it has just published. The sweep waits until a
+superseded, so nothing serves a stale commit indefinitely; closes the shards it is holding for a view whose record has gone, every pass and
+for nothing when it holds none; reaps expired point-in-time records every tenth pass, because that half is
+a listing across the whole deployment and paying one every thirty seconds per node to be told a feature is
+unused is a bill rather than a safeguard; and sweeps the garbage left by what it has just published. The sweep waits until a
 blob has been unreferenced across two passes, because a reader may still be reading it — the grace is what
 makes running the collector on a schedule different from running it by hand.
 
@@ -142,7 +144,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-316 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+317 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against a
 live MinIO) — none skipped.
 
