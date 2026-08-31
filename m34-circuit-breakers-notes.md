@@ -57,8 +57,15 @@ was no exception — no node serving any shard at all — the message says that 
 
 - **Nothing exercises the parent breaker or field data**, only the request child. The others are core's and
   are now wired, which is a different claim from tested.
-- **The bulk and write paths are unaccounted.** A write allocates through the engine, which has its own
-  accounting, but nothing here adds a request-level estimate the way an aggregation does.
+- ~~The bulk and write paths are unaccounted.~~ **Closed**: both now account their bytes against core's
+  `IndexingPressure` — a different bound from the breaker and both are needed, because the breaker accounts
+  what a request allocates while computing an answer and this accounts the bytes of the writes themselves,
+  which are in memory from the moment a batch is parsed until it has been applied. Core's own setting,
+  `indexing_pressure.memory.limit`, ten per cent of the heap by default, and the 429 an operator has seen
+  before. **Finding a test that could catch a leaked release took two goes**: the first suite only ever made
+  writes that were *refused*, and a refused write never takes the budget in the first place, so the canary
+  for never releasing it passed. Forty successful small writes and ten small batches against a budget that
+  fits a handful now run the budget out if the release leaks.
 - **No `_nodes/stats` to read the breakers from**, so an operator can see a refusal and not the trend that
   led to it.
 

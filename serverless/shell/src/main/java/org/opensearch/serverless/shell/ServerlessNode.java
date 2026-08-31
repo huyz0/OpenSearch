@@ -1437,6 +1437,28 @@ public final class ServerlessNode implements Closeable {
     private volatile ActionGate actionGate;
     private volatile BigArrays bigArrays;
     private volatile org.opensearch.core.indices.breaker.CircuitBreakerService circuitBreakerService;
+    private volatile org.opensearch.index.IndexingPressure indexingPressure;
+
+    /**
+     * What bounds the memory a node's in-flight writes are holding.
+     *
+     * <p><b>Not the circuit breaker, and the difference is not pedantic.</b> The breaker accounts what a
+     * request allocates while computing an answer; indexing pressure accounts the bytes of the writes
+     * themselves, which are in memory from the moment a batch is parsed until it has been applied. A node
+     * with no bound on that is one large enough batch, or enough concurrent ones, away from dying — and
+     * dying loses every other request as well.
+     *
+     * <p>Core's own, with core's own setting: {@code indexing_pressure.memory.limit}, ten per cent of the
+     * heap by default, and a rejection an operator has seen before rather than one this shell invented.
+     *
+     * @return the accounting
+     */
+    public synchronized org.opensearch.index.IndexingPressure indexingPressure() {
+        if (indexingPressure == null) {
+            indexingPressure = new org.opensearch.index.IndexingPressure(settings);
+        }
+        return indexingPressure;
+    }
 
     /**
      * The node's circuit breakers.

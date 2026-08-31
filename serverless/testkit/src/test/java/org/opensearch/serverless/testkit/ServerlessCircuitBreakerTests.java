@@ -169,6 +169,142 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A write larger than the node's indexing budget is rejected, and the node keeps serving.
+     *
+     * <p>Indexing pressure is a different bound from the circuit breaker and both are needed. The breaker
+     * accounts what a request allocates while computing an answer; this accounts the bytes of the writes
+     * themselves, which are in memory from the moment a batch is parsed until it has been applied. A node
+     * with no bound on that is one large enough batch — or enough concurrent ones — away from dying, and
+     * dying loses every other request as well.
+     *
+     * <p>The limit is set to a few bytes by configuration, for the same reason the breaker's is: a test
+     * that has to allocate a real tenth of a heap to prove a point is a test that intermittently exhausts
+     * the build's.
+     */
+    public void testAWriteBeyondTheIndexingBudgetIsRejected() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("pressed", "uuid-pressed-000000", 1, MAPPING, null));
+
+        final Settings settings = Settings.builder()
+            .put(nodeSettings("pressure", null))
+            .put("indexing_pressure.memory.limit", "8b")
+            .build();
+
+        try (ServerlessNode node = new ServerlessNode(settings)) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("pressed", 0);
+            loop.tick(clock.get());
+
+            final Response tooBig = send(
+                node,
+                "PUT",
+                "/pressed/_doc/1?refresh=true",
+                "{\"msg\":\"far more than eight bytes of document\"}"
+            );
+            assertEquals("a write past the budget must be rejected: " + tooBig.body(), 429, tooBig.status());
+            assertTrue(
+                "and say it was the indexing budget, not a mystery: " + tooBig.body(),
+                tooBig.body().contains("coordinating") || tooBig.body().contains("rejected execution")
+            );
+
+            final Response batchTooBig = send(
+                node,
+                "POST",
+                "/_bulk",
+                "{\"index\":{\"_index\":\"pressed\",\"_id\":\"b1\"}}\n{\"msg\":\"also far more than eight bytes\"}\n"
+            );
+            assertEquals("a batch past the budget too: " + batchTooBig.body(), 429, batchTooBig.status());
+
+            final Response ordinary = send(node, "POST", "/pressed/_search", "{\"query\":{\"match_all\":{}}}");
+            assertEquals("and the node still serves reads: " + ordinary.body(), 200, ordinary.status());
+        }
+    }
+
+    /**
+     * The budget is given back when a write finishes.
+     *
+     * <p>Accounting that only ever adds is a node that stops accepting writes after a while and never says
+     * why — the worst shape a bound can have, because it looks like a limit that is simply too low.
+     *
+     * <p>The budget here fits a handful of these documents at a time, and forty are written one after
+     * another. Every one has to succeed: if the release leaked, the sixth or so would be rejected and every
+     * write after it. The first version of this suite could not have caught that, because it only ever made
+     * writes that were *refused* — and a refused write never took the budget in the first place. The canary
+     * for a leaked release passed, which is how the gap was found.
+     */
+    public void testTheIndexingBudgetIsReleasedWhenAWriteFinishes() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("recycled", "uuid-recycled-00000", 1, MAPPING, null));
+
+        final Settings settings = Settings.builder()
+            .put(nodeSettings("pressure-release", null))
+            // Room for a few of these at once and nothing like the total, so a leak runs out well before
+            // the end and a working release never does: forty writes of about 35 bytes and ten batches of
+            // about 200 are several times this, and every one of them has to succeed.
+            .put("indexing_pressure.memory.limit", "400b")
+            .build();
+
+        try (ServerlessNode node = new ServerlessNode(settings)) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("recycled", 0);
+            loop.tick(clock.get());
+
+            for (int i = 0; i < 40; i++) {
+                final Response written = send(node, "PUT", "/recycled/_doc/r" + i, "{\"msg\":\"m\",\"colour\":\"c\"}");
+                assertEquals(
+                    "write " + i + " must succeed; a budget that is never given back runs out: " + written.body(),
+                    201,
+                    written.status()
+                );
+            }
+
+            final StringBuilder batch = new StringBuilder();
+            for (int i = 0; i < 3; i++) {
+                batch.append("{\"index\":{\"_index\":\"recycled\",\"_id\":\"s")
+                    .append(i)
+                    .append("\"}}\n{\"msg\":\"m\",\"colour\":\"c\"}\n");
+            }
+            for (int round = 0; round < 10; round++) {
+                final Response bulk = send(node, "POST", "/_bulk", batch.toString());
+                assertEquals("batch " + round + " must succeed for the same reason: " + bulk.body(), 200, bulk.status());
+                assertFalse("and none of its items rejected: " + bulk.body(), bulk.body().contains("\"error\""));
+            }
+        }
+    }
+
+    /** With no limit configured, core's default applies and ordinary writes are unaffected. */
+    public void testTheDefaultIndexingBudgetDoesNotRejectOrdinaryWrites() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("plenty", "uuid-plenty-0000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("pressure-default", null))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("plenty", 0);
+            loop.tick(clock.get());
+
+            for (int i = 0; i < 25; i++) {
+                assertEquals(201, send(node, "PUT", "/plenty/_doc/p" + i + "?refresh=true", "{\"msg\":\"m\",\"colour\":\"c\"}").status());
+            }
+            final StringBuilder batch = new StringBuilder();
+            for (int i = 0; i < 25; i++) {
+                batch.append("{\"index\":{\"_index\":\"plenty\",\"_id\":\"q").append(i).append("\"}}\n{\"msg\":\"m\",\"colour\":\"c\"}\n");
+            }
+            final Response bulk = send(node, "POST", "/_bulk?refresh=true", batch.toString());
+            assertEquals("real accounting must not refuse ordinary writes: " + bulk.body(), 200, bulk.status());
+            assertFalse("and none of them individually: " + bulk.body(), bulk.body().contains("\"error\""));
+        }
+    }
+
     private record Response(int status, String body) {
     }
 

@@ -140,9 +140,18 @@ public final class BulkHandler extends BaseRestHandler {
         // way round for a moment, with both on WRITE, which is a deadlock waiting for enough concurrent
         // bulk requests: every request thread would be holding a WRITE slot while waiting for group tasks
         // that need WRITE slots to start. Nothing on WRITE now waits on WRITE.
+        // What this batch is holding in memory, for as long as it holds it.
+        final long inFlightBytes = request.content().length();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             final long startedAt = System.nanoTime();
-            try {
+            // Accounted before any work, released when the batch is done however it ends. A node with no
+            // bound here is one large enough batch away from dying, and dying loses every other request
+            // too; rejecting this one is the cheaper failure. Core's own accounting, so the rejection is
+            // the 429 an operator has seen before.
+            try (
+                org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
+                    .markCoordinatingOperationStarted(inFlightBytes, false)
+            ) {
                 route(serving, metadata, items);
                 // One gate call for the whole batch, under the bulk action, rather than one per item.
                 //

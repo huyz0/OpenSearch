@@ -221,8 +221,14 @@ public final class DocumentHandler extends BaseRestHandler {
 
         // Off the HTTP thread: a WAL append is an object-store write, and blocking the thread that
         // should be reading the next request on remote IO is how a node stops answering under load.
+        // A single write is accounted the same way a batch is, for the same reason: a flood of large
+        // documents is a flood of large documents whether or not they arrived together.
+        final long inFlightBytes = source == null ? 0L : source.length();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
-            try {
+            try (
+                org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
+                    .markCoordinatingOperationStarted(inFlightBytes, false)
+            ) {
                 final boolean removed = gated(serving, deletion, index, id, source, () -> {
                     final boolean found = deletion ? serving.delete(shardId, id) : true;
                     if (deletion == false) {

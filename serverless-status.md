@@ -36,7 +36,9 @@ salted PBKDF2, one configured account in the keystore checked before the store s
 store is not a locked door. A separate plugin's `ActionFilter`s can refuse by action name and caller —
 proved by a reader being denied a write an administrator is allowed.
 
-**Bounds.** Real circuit breakers, so an aggregation past the limit is refused and the node keeps serving.
+**Bounds.** Real circuit breakers, so an aggregation past the limit is refused and the node keeps serving;
+and core's indexing pressure on the write paths, so a batch larger than the node's budget is rejected with
+a 429 rather than accepted into memory it does not have.
 
 ## What is deliberately refused
 
@@ -68,7 +70,6 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - No aliases, no `ignore_unavailable`, no point-in-time readers.
 - `onIndexModule` fires only for plugins loaded from disk.
 - The orphan sweep is not resumable and nothing runs it on a schedule.
-- The write path has no request-level breaker accounting.
 - No `_nodes/stats`, so an operator can see a refusal and not the trend that led to it.
 - `maxShardsHeld` refuses rather than evicting.
 
@@ -91,7 +92,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-279 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+283 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs) and `s3Test` (against a live MinIO) — none skipped.
 
 Every load-bearing claim has a planted-defect canary: the defect is introduced, the failing test is watched,
