@@ -84,9 +84,17 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
     private static final AtomicBoolean REFUSE = new AtomicBoolean();
     /** Set when the plugin is closed, which is how a plugin releases anything it holds. */
     private static final AtomicBoolean CLOSED = new AtomicBoolean();
+    /** Set when the node tells the plugin it is serving, with the node identity it was given. */
+    private static final java.util.concurrent.atomic.AtomicReference<String> STARTED_NODE =
+        new java.util.concurrent.atomic.AtomicReference<>();
 
     /** A plugin that keeps state, serves a route, and sees every request. */
-    public static final class TestPlugin extends Plugin implements ActionPlugin {
+    public static final class TestPlugin extends Plugin implements ActionPlugin, org.opensearch.plugins.ClusterPlugin {
+
+        @Override
+        public void onNodeStarted(org.opensearch.cluster.node.DiscoveryNode localNode) {
+            STARTED_NODE.set(localNode.getId());
+        }
 
         @Override
         public Collection<Object> createComponents(
@@ -175,6 +183,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
         SAW.set(0);
         REFUSE.set(false);
         CLOSED.set(false);
+        STARTED_NODE.set(null);
     }
 
     /** All three hooks, on one node, in one run. */
@@ -256,6 +265,22 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
         );
         final String message = failure.getMessage() == null ? failure.toString() : failure.getMessage();
         assertTrue("the refusal must explain itself: " + message, message.contains("wrap every request"));
+    }
+
+    /**
+     * A plugin is told when the node is serving, with the node's identity.
+     *
+     * <p>A separate event from {@code createComponents} and plugins depend on the separation: work that
+     * needs a running node — the OpenSearch security plugin reads its own configuration index here — cannot
+     * happen while components are still being built. A host that never fires it leaves such a plugin loaded,
+     * constructed and never started, with nothing in any log to say so.
+     */
+    public void testAPluginIsToldWhenTheNodeIsServing() throws Exception {
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-started"), List.of(new TestPlugin()))) {
+            assertNull("not before start", STARTED_NODE.get());
+            node.start();
+            assertEquals("a plugin must be told the node is serving, and which node it is", node.localNode().getId(), STARTED_NODE.get());
+        }
     }
 
     /**

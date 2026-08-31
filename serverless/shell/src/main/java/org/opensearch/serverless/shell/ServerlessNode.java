@@ -795,6 +795,10 @@ public final class ServerlessNode implements Closeable {
             started = false;
             throw new IllegalStateException("a plugin failed to start; the node will not serve", e);
         }
+
+        // And then tell them the node is up. A plugin that has to read its own index cannot do it while
+        // components are being built; this is the event it waits for.
+        plugins.onNodeStarted(localNode);
     }
 
     /**

@@ -228,6 +228,33 @@ public final class ServerlessPlugins {
     }
 
     /**
+     * Tells the plugins the node is serving.
+     *
+     * <p><b>Not the same event as {@code createComponents}, and plugins rely on the difference.</b> A
+     * plugin builds its state when components are created and cannot use the node yet; {@code onNodeStarted}
+     * is where it does the work that needs a running node — the OpenSearch security plugin initialises its
+     * configuration repository here, which is to say it reads its own index. Never calling it leaves such a
+     * plugin loaded, constructed, and never actually started.
+     *
+     * <p>A failure is logged rather than fatal, unlike {@code createComponents}. By this point the node is
+     * serving: taking it down would turn a plugin's late-initialisation problem into an outage, and the
+     * plugin had its chance to refuse loudly earlier.
+     *
+     * @param localNode the node's identity, now that the transport has bound
+     */
+    public void onNodeStarted(org.opensearch.cluster.node.DiscoveryNode localNode) {
+        for (Plugin plugin : plugins) {
+            if (plugin instanceof org.opensearch.plugins.ClusterPlugin clusterPlugin) {
+                try {
+                    clusterPlugin.onNodeStarted(localNode);
+                } catch (Exception e) {
+                    logger.error("plugin " + plugin.getClass().getName() + " failed on node start", e);
+                }
+            }
+        }
+    }
+
+    /**
      * Collects the plugins' action filters, which is where authorization lives.
      *
      * @return the filters, in the order the plugins were loaded
