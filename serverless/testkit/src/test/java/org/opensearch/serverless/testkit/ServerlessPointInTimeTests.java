@@ -309,11 +309,16 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         final var container = store.blobContainer(org.opensearch.serverless.metadata.RegisterMap.pointsInTime(BlobPath.cleanPath()));
 
+        // Not named "extra0", although that is the name that found this: ExtrasFS creates that file
+        // itself often enough that writing it here fails with FileAlreadyExists about one run in three.
+        // A fixture that collides with the thing it is imitating is a flaky test rather than a stricter
+        // one.
+        final String stray = "somebody-elses-file.txt";
         final var junk = new org.opensearch.core.common.bytes.BytesArray("not a point in time");
-        container.writeBlob("extra0", junk.streamInput(), junk.length(), true);
+        container.writeBlob(stray, junk.streamInput(), junk.length(), true);
         assertEquals("a name this system would never mint must be ignored", java.util.List.of(), plane.livePointsInTime(clock.get()));
         assertEquals("and must not be deleted either", 0, plane.reapPointsInTime(clock.get()));
-        assertTrue("it is somebody else's file and stays where it is", container.blobExists("extra0"));
+        assertTrue("it is somebody else's file and stays where it is", container.blobExists(stray));
 
         // A record with a name we did mint, whose bytes are unreadable: that is the half-written case, and
         // it must pin until a human looks at it.
