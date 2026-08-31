@@ -630,6 +630,7 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.BulkHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.GetHandler(() -> this, () -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MultiGetHandler(() -> this, () -> metadataPlane)));
         // Plugin routes last, so a plugin cannot take over an endpoint the shell has already claimed:
         // RestController refuses a duplicate path rather than replacing it, and refusing loudly at boot
         // is the right answer -- a plugin that silently replaced the write path would be a system whose

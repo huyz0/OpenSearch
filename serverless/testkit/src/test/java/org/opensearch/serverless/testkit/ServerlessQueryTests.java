@@ -385,4 +385,43 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
             .put("serverless.roles", "search")
             .build();
     }
+
+    /**
+     * {@code _source} filtering works, and nothing here made it work.
+     *
+     * <p>It comes free from running a shard's half of a search through the same {@code SearchService} a
+     * classic node uses: the fetch phase applies {@code FetchSourceContext} before the hit is ever
+     * returned, so the coordinating node has nothing to filter and no way to get it wrong.
+     *
+     * <p>Which is exactly why it is worth a test. "It works because we reused the engine" is a claim about
+     * a code path nobody has run, and this surface is an allowlist — an untested feature is
+     * indistinguishable from one that quietly stopped working.
+     */
+    public void testSourceFilteringIsHonoured() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = freshIndex(clock, 2);
+        try (ServerlessNode node = started("query-source", plane, 2)) {
+            index(node, "1", "{\"msg\":\"filtered\",\"n\":7,\"tag\":\"keep\"}");
+            index(node, "2", "{\"msg\":\"filtered\",\"n\":8,\"tag\":\"keep\"}");
+
+            final Response none = send(node, "POST", "/alpha/_search", "{\"query\":{\"match_all\":{}},\"_source\":false}");
+            assertEquals(none.body(), 200, none.status());
+            assertTrue("both documents must still be found: " + none.body(), none.body().contains("\"value\":2"));
+            assertFalse("and no source returned at all: " + none.body(), none.body().contains("_source"));
+
+            final Response included = send(node, "POST", "/alpha/_search", "{\"query\":{\"match_all\":{}},\"_source\":[\"msg\"]}");
+            assertTrue("the named field comes back: " + included.body(), included.body().contains("\"msg\":\"filtered\""));
+            assertFalse("and the others do not: " + included.body(), included.body().contains("\"tag\""));
+            assertFalse(included.body().contains("\"n\":"));
+
+            final Response excluded = send(
+                node,
+                "POST",
+                "/alpha/_search",
+                "{\"query\":{\"match_all\":{}},\"_source\":{\"excludes\":[\"tag\"]}}"
+            );
+            assertTrue("what was not excluded stays: " + excluded.body(), excluded.body().contains("\"msg\":\"filtered\""));
+            assertFalse("and what was excluded goes: " + excluded.body(), excluded.body().contains("\"tag\""));
+        }
+    }
 }

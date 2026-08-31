@@ -55,7 +55,21 @@ public class ServerlessGetTests extends OpenSearchTestCase {
 
     private MetadataPlane freshIndex(AtomicLong clock, java.nio.file.Path dir, int shards) throws Exception {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, dir, false), BlobPath.cleanPath(), clock::get, TTL);
-        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
+        plane.createIndex(
+            new IndexDescriptor(
+                "alpha",
+                "uuid-alpha-00000000",
+                shards,
+                MAPPING,
+                // No scheduled refresh, because the tests below turn on a write *not* being searchable yet
+                // and the default interval is one second. Left on, the timer occasionally refreshed inside
+                // the window between the write and the search, and the fixture's own assertion -- "this is
+                // meaningless unless the write really is unsearchable" -- failed about one full run in
+                // fifteen. A test that proves nothing one run in fifteen is a test that lies one run in
+                // fifteen; making the refresh explicit is what the test meant all along.
+                Settings.builder().put("index.refresh_interval", "-1").build()
+            )
+        );
         return plane;
     }
 
