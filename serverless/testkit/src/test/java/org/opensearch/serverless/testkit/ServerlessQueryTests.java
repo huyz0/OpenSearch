@@ -219,8 +219,19 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
             assertTrue("and named: " + aggregated.body(), aggregated.body().contains("unsupported_search"));
             assertTrue("and explained: " + aggregated.body(), aggregated.body().contains("aggregations"));
 
+            // Sort was on this list until the merge learned to do it. It is asserted the other way round
+            // now, here rather than only in ServerlessSortTests, because this is the test that would
+            // otherwise still be describing the surface as it used to be.
             final Response sorted = send(node, "POST", "/alpha/_search", "{\"query\":{\"match_all\":{}},\"sort\":[{\"n\":\"asc\"}]}");
-            assertEquals("a sort must be refused while the merge is by score: " + sorted.body(), 501, sorted.status());
+            assertEquals("a sort is merged now, not refused: " + sorted.body(), 200, sorted.status());
+
+            final Response after = send(
+                node,
+                "POST",
+                "/alpha/_search",
+                "{\"query\":{\"match_all\":{}},\"sort\":[{\"n\":\"asc\"}],\"search_after\":[1]}"
+            );
+            assertEquals("search_after is still refused: " + after.body(), 501, after.status());
         }
     }
 

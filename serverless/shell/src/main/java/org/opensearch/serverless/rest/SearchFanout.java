@@ -89,12 +89,86 @@ public final class SearchFanout {
             answered++;
         }
 
-        // Descending by score. An unscored hit sorts last rather than unpredictably: a shard that
-        // returned hits with no score should not be able to take the top of the page from one that
-        // scored them.
-        merged.sort((a, b) -> Float.compare(score(b), score(a)));
+        merged.sort(order(source));
         final List<SearchHit> page = merged.stream().skip(from).limit(size).collect(java.util.stream.Collectors.toList());
         return new ShardOperations.SearchOutcome(total, page, shards, answered);
+    }
+
+    /**
+     * How hits from different shards are ranked against each other.
+     *
+     * <p>By score unless the client asked for a sort, in which case by the sort keys each shard attached to
+     * its hits. That is the whole of what "sort is not supported" used to mean: every shard could already
+     * sort itself — the query goes through the same {@code SearchService} a classic node uses — and the
+     * missing piece was a comparator here. Merging sorted shards by score would have returned the right
+     * documents in the wrong order, which is worse than refusing.
+     *
+     * @param source what the client asked for
+     * @return the comparator to merge with
+     */
+    private static java.util.Comparator<SearchHit> order(SearchSourceBuilder source) {
+        if (source.sorts() == null || source.sorts().isEmpty()) {
+            // Descending by score. An unscored hit sorts last rather than unpredictably: a shard that
+            // returned hits with no score should not be able to take the top of the page from one that
+            // scored them.
+            return (a, b) -> Float.compare(score(b), score(a));
+        }
+        // Which way round each key runs comes from the request, not from the hits: a hit carries its sort
+        // values and no idea whether smaller means earlier.
+        final boolean[] descending = new boolean[source.sorts().size()];
+        for (int i = 0; i < descending.length; i++) {
+            descending[i] = source.sorts().get(i).order() == org.opensearch.search.sort.SortOrder.DESC;
+        }
+        return (a, b) -> compareSortValues(a, b, descending);
+    }
+
+    /**
+     * Compares two hits on their sort keys, in order, until one differs.
+     *
+     * <p><b>A hit with no sort values sorts last</b>, for the same reason an unscored one does: a shard
+     * that answered without them must not be able to take the top of the page from one that did. That can
+     * happen where it should not — a shard running an older build, a field missing from one shard's mapping
+     * — and the failure it prevents is a page that silently begins in the wrong place.
+     */
+    private static int compareSortValues(SearchHit a, SearchHit b, boolean[] descending) {
+        final Object[] left = a.getRawSortValues();
+        final Object[] right = b.getRawSortValues();
+        if (left == null || left.length == 0) {
+            return (right == null || right.length == 0) ? 0 : 1;
+        }
+        if (right == null || right.length == 0) {
+            return -1;
+        }
+        for (int i = 0; i < left.length && i < right.length; i++) {
+            final int comparison = compareOne(left[i], right[i]);
+            if (comparison != 0) {
+                return i < descending.length && descending[i] ? -comparison : comparison;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Compares one pair of sort values.
+     *
+     * <p>They arrive as whatever Lucene sorted on — a {@code Long} for a date or a number, a
+     * {@code BytesRef} for a keyword — and both sides of a comparison are the same kind because they came
+     * from the same field. A missing value sorts last, which is Lucene's own convention for one.
+     */
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    private static int compareOne(Object left, Object right) {
+        if (left == null) {
+            return right == null ? 0 : 1;
+        }
+        if (right == null) {
+            return -1;
+        }
+        if (left instanceof Comparable comparable && left.getClass() == right.getClass()) {
+            return comparable.compareTo(right);
+        }
+        // Different types for the same key means the shards disagree about the field. Ordering them by
+        // their rendered form is arbitrary but stable, which beats an exception in the middle of a merge.
+        return String.valueOf(left).compareTo(String.valueOf(right));
     }
 
     /** An unscored hit sorts last rather than unpredictably. */

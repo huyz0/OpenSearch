@@ -194,9 +194,6 @@ public final class SearchHandler extends BaseRestHandler {
         if (source.aggregations() != null) {
             return "aggregations are not supported: results from several shards would have to be reduced, and this does not reduce them";
         }
-        if (source.sorts() != null && source.sorts().isEmpty() == false) {
-            return "sort is not supported: hits from several shards are merged by score, and a custom sort would need its own merge";
-        }
         if (source.searchAfter() != null) {
             return "search_after is not supported";
         }

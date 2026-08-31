@@ -105,9 +105,20 @@ public final class ShardQuery {
      * @param scoreDocs the top docs they were fetched for
      * @return the same hits, scored
      */
-    private static List<SearchHit> withScores(SearchHit[] hits, org.apache.lucene.search.ScoreDoc[] scoreDocs) {
+    private static List<SearchHit> withScores(
+        SearchHit[] hits,
+        org.apache.lucene.search.ScoreDoc[] scoreDocs,
+        org.opensearch.search.DocValueFormat[] sortFormats
+    ) {
         for (int i = 0; i < hits.length && i < scoreDocs.length; i++) {
             hits[i].score(scoreDocs[i].score);
+            // And its sort values, when the query was sorted. Lucene hands each hit's sort keys back on the
+            // FieldDoc; without copying them here the coordinating node would have nothing to merge shards
+            // on but score, which for a sorted query is the wrong key entirely. They travel with the hit,
+            // because SearchHit serialises them itself.
+            if (scoreDocs[i] instanceof org.apache.lucene.search.FieldDoc fieldDoc && sortFormats != null) {
+                hits[i].sortValues(new org.opensearch.search.SearchSortValues(fieldDoc.fields, sortFormats));
+            }
         }
         return List.of(hits);
     }
@@ -154,8 +165,9 @@ public final class ShardQuery {
         // reader context has already been freed. Asking for it again produced "No search context found",
         // a 404 that reads like a missing document rather than like a double fetch.
         final org.apache.lucene.search.ScoreDoc[] scoreDocs = queryResult.queryResult().topDocs().topDocs.scoreDocs;
+        final org.opensearch.search.DocValueFormat[] sortFormats = queryResult.queryResult().sortValueFormats();
         if (queryResult.fetchResult() != null && queryResult.fetchResult().hits() != null) {
-            return new Result(total, withScores(queryResult.fetchResult().hits().getHits(), scoreDocs));
+            return new Result(total, withScores(queryResult.fetchResult().hits().getHits(), scoreDocs, sortFormats));
         }
 
         final List<Integer> docIds = new ArrayList<>();
@@ -169,7 +181,7 @@ public final class ShardQuery {
         try {
             final PlainActionFuture<FetchSearchResult> fetchFuture = PlainActionFuture.newFuture();
             searchService.executeFetchPhase(new ShardFetchRequest(queryResult.getContextId(), docIds, null), task, fetchFuture);
-            return new Result(total, withScores(fetchFuture.actionGet().hits().getHits(), scoreDocs));
+            return new Result(total, withScores(fetchFuture.actionGet().hits().getHits(), scoreDocs, sortFormats));
         } finally {
             // The reader is pinned until this runs; leaking one keeps a commit's files alive forever.
             searchService.freeReaderContext(queryResult.getContextId());
