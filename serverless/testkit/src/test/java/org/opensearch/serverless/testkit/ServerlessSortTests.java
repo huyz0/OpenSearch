@@ -219,6 +219,96 @@ public class ServerlessSortTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * {@code search_after} walks a sorted result set page by page, across shards.
+     *
+     * <p>The cursor is the sort values of the last hit of the previous page, which is what makes deep
+     * paging cost the same at page one thousand as at page one: no shard is asked to produce and discard
+     * everything before the window. That is the whole reason it exists over {@code from}, so the test walks
+     * the entire set in pages and asserts the concatenation is the same sequence a single large page gives,
+     * with nothing repeated and nothing skipped at a page boundary.
+     *
+     * <p>The boundaries are where a cursor goes wrong, and three shards means every page boundary falls
+     * between documents that came from different shards.
+     */
+    public void testSearchAfterWalksTheWholeSetAcrossShards() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("walked", "uuid-walked-0000000", SHARDS, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("sort-after"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, "walked");
+
+            for (int rank = 1; rank <= 12; rank++) {
+                assertEquals(201, send(node, "PUT", "/walked/_doc/w" + rank + "?refresh=true", body(rank)).status());
+            }
+            assertTrue("the fixture is pointless unless the documents spread", spreadAcrossShards(node));
+
+            final List<Long> walked = new ArrayList<>();
+            Long cursor = null;
+            for (int page = 0; page < 6; page++) {
+                final String body = cursor == null
+                    ? "{\"size\":3,\"sort\":[{\"rank\":\"asc\"}]}"
+                    : "{\"size\":3,\"sort\":[{\"rank\":\"asc\"}],\"search_after\":[" + cursor + "]}";
+                final Response got = send(node, "POST", "/walked/_search", body);
+                assertEquals(got.body(), 200, got.status());
+                final List<Long> ranks = ranksIn(got.body());
+                if (ranks.isEmpty()) {
+                    break;
+                }
+                walked.addAll(ranks);
+                cursor = ranks.get(ranks.size() - 1);
+            }
+
+            assertEquals(
+                "paging with a cursor must walk the set exactly once, in order",
+                List.of(1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L, 11L, 12L),
+                walked
+            );
+        }
+    }
+
+    /** A cursor without a sort, or beside a from, is refused rather than quietly meaning something else. */
+    public void testSearchAfterIsRefusedWhereItCannotMeanAnything() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("strict", "uuid-strict-0000000", SHARDS, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("sort-after-bad"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, "strict");
+            assertEquals(201, send(node, "PUT", "/strict/_doc/1?refresh=true", body(1)).status());
+
+            final Response noSort = send(node, "POST", "/strict/_search", "{\"size\":3,\"search_after\":[1]}");
+            assertEquals("a cursor with no order to be a position in: " + noSort.body(), 501, noSort.status());
+            assertTrue(noSort.body().contains("needs a sort"));
+
+            final Response withFrom = send(
+                node,
+                "POST",
+                "/strict/_search",
+                "{\"size\":3,\"from\":5,\"sort\":[{\"rank\":\"asc\"}],\"search_after\":[1]}"
+            );
+            assertEquals("two ways of saying where to start: " + withFrom.body(), 501, withFrom.status());
+
+            final Response wrongWidth = send(
+                node,
+                "POST",
+                "/strict/_search",
+                "{\"size\":3,\"sort\":[{\"rank\":\"asc\"}],\"search_after\":[1,2]}"
+            );
+            assertEquals("a cursor that does not match the sort: " + wrongWidth.body(), 501, wrongWidth.status());
+        }
+    }
+
+    /** A document with a given rank. */
+    private static String body(int rank) {
+        return "{\"msg\":\"doc\",\"rank\":" + rank + ",\"name\":\"n\"}";
+    }
+
     /** Opens every shard of an index on this node. */
     private void hold(ServerlessNode node, MetadataPlane plane, AtomicLong clock, String index) throws Exception {
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);

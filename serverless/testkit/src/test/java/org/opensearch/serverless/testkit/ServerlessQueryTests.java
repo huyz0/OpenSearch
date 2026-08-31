@@ -243,7 +243,15 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
                 "/alpha/_search",
                 "{\"query\":{\"match_all\":{}},\"sort\":[{\"n\":\"asc\"}],\"search_after\":[1]}"
             );
-            assertEquals("search_after is still refused: " + after.body(), 501, after.status());
+            assertEquals("search_after is a cursor now, not a refusal: " + after.body(), 200, after.status());
+
+            final Response suggested = send(
+                node,
+                "POST",
+                "/alpha/_search",
+                "{\"query\":{\"match_all\":{}},\"suggest\":{\"s\":{\"text\":\"x\",\"term\":{\"field\":\"msg\"}}}}"
+            );
+            assertEquals("suggest is still refused: " + suggested.body(), 501, suggested.status());
         }
     }
 

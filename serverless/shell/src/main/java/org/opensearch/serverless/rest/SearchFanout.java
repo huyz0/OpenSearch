@@ -84,6 +84,11 @@ public final class SearchFanout {
         final int size = Math.max(0, source.size());
         // What each shard is asked for. A shard cannot know how its hits rank against another's, so it
         // has to offer enough to cover the whole window on its own.
+        //
+        // A cursored search needs nothing special here, and a branch for it was written and deleted: every
+        // hit past a cursor is already past it, so a shard need only offer its own next page -- and since
+        // search_after and from are refused together, from is zero and from + size is already exactly that.
+        // The canary for the branch could not fail, which is how it was found to be doing nothing.
         final SearchSourceBuilder perShard = source.shallowCopy();
         perShard.from(0);
         perShard.size(from + size);

@@ -221,7 +221,21 @@ public final class SearchHandler extends BaseRestHandler {
      */
     private static String whatCannotBeMerged(SearchSourceBuilder source) {
         if (source.searchAfter() != null) {
-            return "search_after is not supported";
+            // The two things that make a cursor a cursor. Without a sort there is no order for "after" to
+            // be after, and OpenSearch's own answer to search_after with from is the same refusal: the
+            // cursor is the offset, and having both is a request that means two different things at once.
+            if (source.sorts() == null || source.sorts().isEmpty()) {
+                return "search_after needs a sort: without one there is no order for a cursor to be a position in";
+            }
+            if (source.from() > 0) {
+                return "search_after and from cannot both be given: the cursor is the offset";
+            }
+            if (source.searchAfter().length != source.sorts().size()) {
+                return "search_after must carry one value per sort key, and this carries "
+                    + source.searchAfter().length
+                    + " for "
+                    + source.sorts().size();
+            }
         }
         if (source.collapse() != null) {
             return "collapse is not supported: it would have to be applied across shards, not within one";
