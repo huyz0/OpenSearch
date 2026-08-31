@@ -86,7 +86,12 @@ otherwise still be describing a surface that has moved.
 - **No memory bound.** The breaker is a no-op, so a large aggregation can exhaust the heap rather than being
   refused. That is the same position the node was already in for everything else, now reachable by a new
   route.
-- **Cost unmeasured.** An aggregation's object-store cost has not been counted the way search and get were.
+- ~~Cost unmeasured.~~ **Measured**: over three locally-held shards, a search costs **3 object-store
+  requests and the same search with two aggregations costs 3** — identical on a filesystem and on a bucket,
+  with zero data-blob reads. Which is the claim the design makes: the reduce runs on the coordinating node
+  over answers the shards computed from segments they were already reading, so it adds nothing to what the
+  deployment pays its object store. Measured against the same search *without* the aggregations, because
+  "3 requests" means nothing alone and "the same 3" means everything.
 - **`_mget`, `_source` filtering and multi-index search** remain absent.
 
 259 tests green across `test` (224), `pluginTest` (2), `processTest` (13) and `s3Test` (20), none skipped,

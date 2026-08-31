@@ -514,6 +514,101 @@ public class ServerlessCostTests extends OpenSearchTestCase {
      *     This is the price of the first query after a scale-to-zero, and until now it was a guess.</li>
      * </ol>
      */
+    /**
+     * What an aggregation costs, against what the same search costs without one.
+     *
+     * <p>Aggregations were the last thing the search surface refused, and the reason it refused was that
+     * combining shards is a reduce rather than a concatenation. That reduce happens on the coordinating
+     * node, over answers the shards had to compute anyway — so the claim worth checking is that it adds
+     * <em>no object-store requests at all</em>: a terms aggregation reads the same segments the query
+     * reads, and the buckets are built in memory from them.
+     *
+     * <p>Measured against the same search without the aggregation, on the same data, because "42 requests"
+     * means nothing on its own and "the same 42" means everything.
+     */
+    public void testWhatAnAggregationCosts() throws Exception {
+        for (boolean onBucket : new boolean[] { false, true }) {
+            if (onBucket) {
+                assumeEndpoint();
+            }
+            final CountingBlobStore store = onBucket ? bucket() : filesystem();
+            final String label = onBucket ? "s3" : "fs";
+            final int shards = 3;
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+            plane.createIndex(
+                new IndexDescriptor(
+                    "aggs",
+                    "uuid-aggs-0000000000",
+                    shards,
+                    "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"},\"colour\":{\"type\":\"keyword\"}}}",
+                    null
+                )
+            );
+
+            try (ServerlessNode writer = new ServerlessNode(nodeSettings("cost-aggs-" + label))) {
+                writer.start();
+                writer.setMetadataPlane(plane);
+                final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
+                for (int shard = 0; shard < shards; shard++) {
+                    loop.want("aggs", shard);
+                }
+                loop.tick(System.currentTimeMillis());
+                for (int i = 0; i < 60; i++) {
+                    writer.index(
+                        shardOf(writer, "aggs", i),
+                        String.valueOf(i),
+                        "{\"msg\":\"aggcost\",\"n\":" + i + ",\"colour\":\"c" + (i % 4) + "\"}"
+                    );
+                }
+                loop.tick(System.currentTimeMillis());
+
+                store.reset();
+                long startedAt = System.nanoTime();
+                final Response plain = search(writer, "/aggs/_search?q=msg:aggcost&size=0");
+                final long plainMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+                final long plainRequests = store.impliedS3Requests();
+                assertEquals(plain.body(), 200, plain.status());
+                assertTrue("the plain search must cover every shard: " + plain.body(), plain.body().contains("\"complete\":true"));
+
+                store.reset();
+                startedAt = System.nanoTime();
+                final Response aggregated = post(
+                    writer,
+                    "/aggs/_search",
+                    "{\"size\":0,\"query\":{\"match\":{\"msg\":\"aggcost\"}},"
+                        + "\"aggs\":{\"by_colour\":{\"terms\":{\"field\":\"colour\"}},\"total\":{\"sum\":{\"field\":\"n\"}}}}"
+                );
+                final long aggregatedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+                final long aggregatedRequests = store.impliedS3Requests();
+                assertEquals(aggregated.body(), 200, aggregated.status());
+                assertTrue("the aggregation must cover every shard: " + aggregated.body(), aggregated.body().contains("\"complete\":true"));
+                assertTrue("and must have aggregated something: " + aggregated.body(), aggregated.body().contains("by_colour"));
+
+                logger.info(
+                    "cost[{}]: over {} locally-held shards, search -> {} requests {}ms; the same search with two "
+                        + "aggregations -> {} requests {}ms  [{}]",
+                    label,
+                    shards,
+                    plainRequests,
+                    plainMillis,
+                    aggregatedRequests,
+                    aggregatedMillis,
+                    store.breakdown()
+                );
+
+                // The claim. A reduce runs on the coordinating node over answers the shards computed from
+                // segments they were reading anyway, so it must add nothing to what the deployment pays
+                // its object store.
+                assertEquals(
+                    "on " + label + ", aggregating must not cost object-store requests beyond the search itself",
+                    plainRequests,
+                    aggregatedRequests
+                );
+                assertEquals("and must read no data blobs, having held the shards already", 0, store.blobReads());
+            }
+        }
+    }
+
     public void testWhatASearchCosts() throws Exception {
         for (boolean onBucket : new boolean[] { false, true }) {
             if (onBucket) {
@@ -668,6 +763,20 @@ public class ServerlessCostTests extends OpenSearchTestCase {
 
     /** One response, status and body. */
     private record Response(int status, String body) {
+    }
+
+    private static Response post(ServerlessNode node, String path, String body) throws Exception {
+        final var address = node.boundHttpAddress().publishAddress();
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
+            final HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + path))
+                .timeout(Duration.ofSeconds(120))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body, java.nio.charset.StandardCharsets.UTF_8))
+                .build();
+            final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            return new Response(response.statusCode(), response.body());
+        }
     }
 
     private static Response search(ServerlessNode node, String path) throws Exception {
