@@ -76,12 +76,53 @@ public final class GarbageCollector {
      * @throws IOException if listing or deleting fails
      */
     public List<String> collectShard(MetadataPlane plane, String indexName, int shardId) throws IOException {
+        // No grace: everything unreferenced goes now. Right for a sweep an operator asked for, and for
+        // one that follows a deletion, where there is nothing left to be reading.
+        return sweepShard(plane, indexName, shardId, null).deleted();
+    }
+
+    /**
+     * What one sweep of a shard did, and what it is watching.
+     *
+     * @param deleted the blobs deleted, qualified by term container
+     * @param candidates the blobs that were unreferenced this time, which a later sweep may delete
+     */
+    public record ShardSweep(List<String> deleted, Set<String> candidates) {
+    }
+
+    /**
+     * Sweeps one shard, deleting only what was already unreferenced last time.
+     *
+     * <p><b>Why a blob has to be unreferenced twice before it goes.</b> A reader is a cache of one commit,
+     * and it goes on serving that commit until a reconcile pass notices the commit has moved and lets it
+     * go. In between, files the current commit no longer names are still being read — and those files are
+     * exactly what the rule in this class marks as collectable. Sweeping on a schedule would turn that
+     * into a reader failing mid-query, which looks like corruption and is not.
+     *
+     * <p>So a blob must be seen unreferenced by two consecutive sweeps of the same shard. The interval
+     * between them is the grace, and it is set by whatever drives the sweep — which must be at least the
+     * interval on which readers refresh, or the grace is not one.
+     *
+     * <p><b>The candidate set is deliberately in memory and deliberately per-owner.</b> A node that has
+     * just taken the shard over starts with nothing, so its first sweep deletes nothing: a new owner
+     * cannot know how long a blob has been unreferenced, and assuming "long enough" is the one assumption
+     * that loses data. Forgetting always delays a deletion and never causes one.
+     *
+     * @param plane the metadata plane, for the shard's manifest
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param previousCandidates what the last sweep of this shard found unreferenced, or null to delete
+     *     everything unreferenced now
+     * @return what was deleted, and what to pass in next time
+     * @throws IOException if listing or deleting fails
+     */
+    public ShardSweep sweepShard(MetadataPlane plane, String indexName, int shardId, Set<String> previousCandidates) throws IOException {
         final SegmentPublisher publisher = plane.segmentPublisher(indexName, shardId);
         final Optional<CommitManifest> manifest = publisher.readManifest();
         if (manifest.isEmpty()) {
             // Nothing published means nothing is safe to judge: a writer may be mid-first-publish, and
             // every file present is a candidate for the commit it is about to make.
-            return List.of();
+            return new ShardSweep(List.of(), Set.of());
         }
         final long liveTerm = manifest.get().term();
 
@@ -110,6 +151,7 @@ public final class GarbageCollector {
         }
 
         final List<String> deleted = new ArrayList<>();
+        final Set<String> candidates = new HashSet<>();
         final BlobContainer shardContainer = blobStore.blobContainer(plane.shardData(indexName, shardId));
         for (Map.Entry<String, BlobContainer> child : shardContainer.children().entrySet()) {
             final String termDir = child.getKey();
@@ -121,7 +163,12 @@ public final class GarbageCollector {
             }
             final List<String> orphans = new ArrayList<>();
             for (String blobName : child.getValue().listBlobs().keySet()) {
-                if (referenced.contains(termDir + "/" + blobName) == false) {
+                final String qualified = termDir + "/" + blobName;
+                if (referenced.contains(qualified)) {
+                    continue;
+                }
+                candidates.add(qualified);
+                if (previousCandidates == null || previousCandidates.contains(qualified)) {
                     orphans.add(blobName);
                 }
             }
@@ -132,7 +179,9 @@ public final class GarbageCollector {
                 }
             }
         }
-        return deleted;
+        // What was deleted is not watched any more; what survived is what the next sweep compares against.
+        candidates.removeAll(deleted);
+        return new ShardSweep(deleted, candidates);
     }
 
     /**

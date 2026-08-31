@@ -233,4 +233,66 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
             );
         }
     }
+
+    /**
+     * A reconcile pass lets go of a reader whose commit has moved on, so nothing serves a stale one
+     * forever.
+     *
+     * <p><b>This is the half that was missing, and it was missing quietly.</b> A reader is a cache of one
+     * commit and nothing ever invalidated it: a search node that opened shard 0 kept answering from the
+     * commit it opened, for as long as it held the shard, however much the writer published afterwards.
+     * The test above records that behaviour at the shard level and calls reopening manual; at the
+     * deployment level it means a search can return last hour's data with no error, no flag and no
+     * coverage gap — the confident wrong answer this design refuses everywhere else.
+     *
+     * <p>The pass releases rather than reopens. Reopening in place would mean handing a live
+     * {@code ReadOnlyEngine} a different commit, which core does not offer and should not; releasing
+     * costs the next search an open, and the next search is the only thing that proves the shard is
+     * wanted at all.
+     *
+     * <p>It also costs one register read per reader per pass, which is the same price the design already
+     * pays to hold a shard, and it acts only when the commit actually changed — an idle index publishes
+     * nothing and so churns nothing.
+     */
+    public void testAReconcilePassLetsGoOfAStaleReader() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = planeOver(createTempDir(), clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+        writeAndPublish(plane, null, 2);
+
+        try (ServerlessNode reader = new ServerlessNode(nodeSettings("p5-stale", "search"))) {
+            reader.start();
+            final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
+            assertEquals(2L, ShardOps.hits(reader.searchService(), shardId, "msg", "searchable"));
+
+            try (var loop = new org.opensearch.serverless.reconcile.BackgroundReconciler(reader, plane)) {
+                // Nothing has changed, so nothing is given up: a pass that released a reader every time
+                // would turn a warm cache into a cold one on a schedule.
+                assertEquals(java.util.Set.of(), loop.refreshReaders());
+                assertTrue(reader.reconciler().readerShards().contains(shardId));
+
+                clock.set(1_000L + TTL);
+                try (ServerlessNode writer2 = new ServerlessNode(nodeSettings("p5-stale-writer", "ingest"))) {
+                    writer2.start();
+                    final long term = plane.activate("alpha", 0, writer2.localNode().getId(), writer2.localNode().getEphemeralId())
+                        .head()
+                        .term();
+                    final ShardId onWriter = writer2.syncFrom(plane).iterator().next();
+                    ShardOps.indexDoc(writer2.reconciler().shard(onWriter), "3", "{\"msg\":\"searchable\",\"n\":3}");
+                    writer2.reconciler().shard(onWriter).refresh("p5");
+                    writer2.publishShard(onWriter, term);
+                }
+
+                assertEquals("the pass must let go of the stale reader", java.util.Set.of(shardId), loop.refreshReaders());
+                assertFalse("and it must actually be closed", reader.reconciler().readerShards().contains(shardId));
+            }
+
+            final ShardId reopened = reader.serveAsReader(plane, "alpha", 0);
+            assertEquals(
+                "and what is served after the pass is the newer commit",
+                3L,
+                ShardOps.hits(reader.searchService(), reopened, "msg", "searchable")
+            );
+        }
+    }
 }

@@ -140,7 +140,207 @@ public final class BackgroundReconciler implements Closeable {
         final Set<ShardId> published = publishAll();
         // After publishing, so a shard released for idleness has just had its chance to flush.
         released.addAll(releaseIdle(nowMillis));
+        // And after that, so a reader this node has just let go of for idleness is not looked up again.
+        released.addAll(refreshReaders());
+        reapExpiredViews();
+        // Only what was published, so the sweep costs nothing at all on a shard nobody is writing to.
+        sweepPublished(published);
         return new TickResult(released, activated, published, refreshHints(nowMillis));
+    }
+
+    /**
+     * Lets go of readers whose commit has moved on, so nothing serves a stale one forever.
+     *
+     * <p><b>A reader is a cache of one commit, and until this existed nothing invalidated it.</b> A search
+     * node that opened shard 0 went on answering from the commit it opened for as long as it held the
+     * shard, however much the writer published afterwards — no error, no flag, no gap in the coverage it
+     * reported. That is the confident wrong answer this design refuses everywhere else, and it was the one
+     * place it was being given.
+     *
+     * <p><b>Release, not reopen.</b> Moving an open reader onto a newer commit would mean handing a live
+     * {@code ReadOnlyEngine} a different commit, which core does not offer and should not. Releasing costs
+     * the next search an open — and the next search is the only thing that proves the shard is still
+     * wanted at all, so a reader nobody comes back for costs one release and then nothing.
+     *
+     * <p><b>The cost is one register read per reader per pass</b>, which is the price the design already
+     * pays to hold a shard at all, and it acts only when the commit has actually changed: an idle index
+     * publishes nothing, so nothing is given up and nothing is reopened.
+     *
+     * <p>Frozen views are exempt, and that is not an optimisation. A view exists precisely to go on serving
+     * a commit the writer has moved past; refreshing one would be the feature deleting itself.
+     *
+     * @return the readers released
+     */
+    public Set<ShardId> refreshReaders() {
+        final Set<ShardId> stale = new LinkedHashSet<>();
+        final Set<ShardId> views = node.reconciler().frozenShards();
+        for (ShardId shardId : node.reconciler().readerShards()) {
+            if (views.contains(shardId)) {
+                continue;
+            }
+            final var opened = node.reconciler().readerCommit(shardId);
+            if (opened.isEmpty()) {
+                continue;
+            }
+            try {
+                final var current = plane.segmentPublisher(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id())
+                    .readManifest();
+                if (current.isEmpty()) {
+                    // The commit this reader is serving is no longer published at all -- a deleted index,
+                    // most likely. Nothing good comes of guessing; the next search will say what is true.
+                    continue;
+                }
+                if (sameCommit(opened.get(), current.get())) {
+                    continue;
+                }
+                node.reconciler().releaseShard(shardId, "the commit it was serving has been superseded");
+                stale.add(shardId);
+            } catch (Exception e) {
+                // Refreshing is an optimisation over being wrong, not a correctness step of its own: a
+                // failure here leaves the reader exactly where it was, which is where it would have been
+                // if this method did not exist.
+                logger.warn("could not check whether the reader for " + shardId + " is stale; keeping it", e);
+            }
+        }
+        return stale;
+    }
+
+    /** How many sweeps a blob must be seen unreferenced by before it is deleted. */
+    public static final int DEFAULT_SWEEP_GRACE_PASSES = 2;
+
+    private int sweepGracePasses = DEFAULT_SWEEP_GRACE_PASSES;
+
+    /** Per shard, how many consecutive sweeps have found each blob unreferenced. */
+    private final Map<ShardId, Map<String, Integer>> unreferencedFor = new ConcurrentHashMap<>();
+
+    /**
+     * Sets how many sweeps a blob must be seen unreferenced by before it is deleted.
+     *
+     * @param sweepGracePasses the count; zero deletes on the first sweep
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setSweepGracePasses(int sweepGracePasses) {
+        this.sweepGracePasses = sweepGracePasses;
+        return this;
+    }
+
+    /**
+     * Collects unreferenced segment blobs for the shards this node has just published.
+     *
+     * <p><b>Until this existed, nothing in a running deployment ever ran the collector.</b> It was reachable
+     * from tests and from an operator, and the garbage a failover leaves — a zombie's unpublishable files,
+     * segments a merge superseded — accumulated for the life of the deployment. Storage that only grows is
+     * not a bug anybody is paged for, which is why it lasted this long.
+     *
+     * <p><b>Driven by publishing rather than by holding.</b> A shard that nobody is writing to produces no
+     * garbage, so sweeping every held shard on a schedule would pay a listing per shard per pass to be told
+     * nothing had changed. This sweeps what was just published, and what a previous sweep is still watching
+     * — so the cost follows write activity, and an idle deployment pays nothing.
+     *
+     * <p><b>And only shards this node owns.</b> Two nodes sweeping one shard is not unsafe — the rule is
+     * the same for both — but the owner is the only node that knows the shard is not mid-publish somewhere,
+     * and the owner is the node whose publishing created the garbage.
+     *
+     * @param published the shards published by this pass
+     * @return the blobs deleted, qualified by term container
+     */
+    public Set<String> sweepPublished(Collection<ShardId> published) {
+        final Set<String> deleted = new LinkedHashSet<>();
+        if (plane.blobStore() == null) {
+            return deleted;
+        }
+        final GarbageCollector collector = new GarbageCollector(plane.blobStore(), plane.basePath());
+        final Set<ShardId> toSweep = new LinkedHashSet<>(published);
+        toSweep.addAll(unreferencedFor.keySet());
+        for (ShardId shardId : toSweep) {
+            if (node.reconciler().openShards().contains(shardId) == false || node.reconciler().readerShards().contains(shardId)) {
+                // Not ours to sweep any more. Forgetting what we had seen is the safe direction: the next
+                // owner starts again from nothing and simply deletes later than it could have.
+                unreferencedFor.remove(shardId);
+                continue;
+            }
+            final Map<String, Integer> seen = unreferencedFor.getOrDefault(shardId, Map.of());
+            // Null means "everything unreferenced, now". Building the eligible set from what a previous
+            // sweep saw would make a grace of zero delete nothing on the first sweep and everything on the
+            // second -- a knob that looks like it is off and is really set to one.
+            Set<String> eligible = null;
+            if (sweepGracePasses > 0) {
+                eligible = new java.util.HashSet<>();
+                for (Map.Entry<String, Integer> entry : seen.entrySet()) {
+                    if (entry.getValue() >= sweepGracePasses) {
+                        eligible.add(entry.getKey());
+                    }
+                }
+            }
+            try {
+                final var swept = collector.sweepShard(plane, shardId.getIndexName(), shardId.id(), eligible);
+                deleted.addAll(swept.deleted());
+                final Map<String, Integer> next = new java.util.HashMap<>();
+                for (String candidate : swept.candidates()) {
+                    next.put(candidate, seen.getOrDefault(candidate, 0) + 1);
+                }
+                if (next.isEmpty()) {
+                    unreferencedFor.remove(shardId);
+                } else {
+                    unreferencedFor.put(shardId, next);
+                }
+            } catch (Exception e) {
+                // Reclaiming space is the one job here whose failure costs only money, so it never
+                // interrupts a pass and never escalates.
+                logger.warn("could not sweep " + shardId + "; the next pass will try again", e);
+            }
+        }
+        return deleted;
+    }
+
+    /**
+     * Removes frozen views that have expired, and closes what this node was holding for them.
+     *
+     * <p><b>Expiry existed as an answer to a request and not as a thing that happened.</b> A search
+     * quoting a view past its keep-alive was refused, which is the visible half; the record stayed in the
+     * object store pinning its blobs against the sweep, and the shards a node had opened for it stayed
+     * open — counted against the node's bound, never a candidate for eviction, serving a commit nobody
+     * could still ask for. A keep-alive that only stops answering is not a keep-alive.
+     *
+     * <p>Every node runs this, and that is safe because it is idempotent: deleting a record twice is
+     * deleting it once, and the second node's list simply comes back shorter.
+     *
+     * <p>Closing local shards is done by asking what this node holds rather than by acting on what this
+     * pass deleted — another node may have reaped the record, and this node's shards would then be held
+     * against a view that no longer exists anywhere.
+     *
+     * @return how many records were removed by this pass
+     */
+    public int reapExpiredViews() {
+        int reaped = 0;
+        try {
+            reaped = plane.reapPointsInTime(plane.clock().getAsLong());
+        } catch (Exception e) {
+            logger.warn("could not reap expired points in time; the next pass will retry", e);
+        }
+        for (ShardId view : node.reconciler().frozenShards()) {
+            final String viewId = view.getIndex().getUUID();
+            try {
+                final var record = plane.pointInTime(viewId);
+                if (record.isEmpty() || record.get().expiredAt(plane.clock().getAsLong())) {
+                    node.reconciler().closeFrozenReader(viewId);
+                }
+            } catch (Exception e) {
+                logger.warn("could not check whether the view " + viewId + " is still held; keeping its shards", e);
+            }
+        }
+        return reaped;
+    }
+
+    /**
+     * Compares two commits by what they name rather than by identity.
+     *
+     * <p>The term alone is not enough: a writer publishes many commits at one term, which is the ordinary
+     * case rather than an edge one. The file set alone is not enough either — a failover can produce the
+     * same file names in a different term container, and those are different bytes.
+     */
+    private static boolean sameCommit(org.opensearch.serverless.store.CommitManifest a, org.opensearch.serverless.store.CommitManifest b) {
+        return a.term() == b.term() && a.files().equals(b.files());
     }
 
     /**

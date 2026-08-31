@@ -196,6 +196,169 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A reconcile pass sweeps what it published — after a grace, so a reader cannot lose the commit it is
+     * reading.
+     *
+     * <p><b>Nothing in a running deployment ever ran the collector.</b> It was reachable from a test and
+     * from an operator, and the garbage a failover leaves accumulated for the life of the deployment.
+     * Storage that only grows is not something anybody is paged for, which is why it lasted.
+     *
+     * <p><b>The grace is the part that needs a test rather than a comment.</b> A reader serves the commit
+     * it opened until a pass notices that commit has moved on, and the files it is reading in the meantime
+     * are exactly what the collector's rule marks as collectable. Deleting on the first sweep would turn
+     * that into a reader failing mid-query. So a blob must be seen unreferenced by two consecutive sweeps,
+     * and the interval between them is the grace.
+     */
+    public void testAPassSweepsWhatItPublishedOnlyAfterAGrace() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Deployment d = deploy(createTempDir(), clock, false);
+        d.plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode zombie = new ServerlessNode(nodeSettings("p8-sweep-z"));
+            ServerlessNode successor = new ServerlessNode(nodeSettings("p8-sweep-s"))
+        ) {
+            zombie.start();
+            successor.start();
+
+            final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
+            ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
+            zombie.reconciler().shard(onZombie).refresh("p8");
+            zombie.publishShard(onZombie, term1);
+
+            clock.set(1_000L + TTL);
+            final ShardId onSuccessor = successor.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
+            ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
+            successor.reconciler().shard(onSuccessor).refresh("p8");
+            final CommitManifest liveCommit = successor.publishShard(onSuccessor, term2);
+
+            // The zombie wakes and writes. It cannot publish, so these are orphans in a dead term.
+            ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
+            zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
+
+            try (BackgroundReconciler loop = new BackgroundReconciler(successor, d.plane)) {
+                assertEquals(
+                    "the first sighting must delete nothing",
+                    java.util.Set.of(),
+                    loop.sweepPublished(java.util.Set.of(onSuccessor))
+                );
+                assertEquals("nor the second", java.util.Set.of(), loop.sweepPublished(java.util.Set.of(onSuccessor)));
+
+                final java.util.Set<String> swept = loop.sweepPublished(java.util.Set.of(onSuccessor));
+                assertFalse("a blob unreferenced across the grace must eventually go: " + swept, swept.isEmpty());
+
+                // And what the live commit names is still there, which is the whole safety rule.
+                for (Map.Entry<String, String> file : liveCommit.files().entrySet()) {
+                    assertTrue(
+                        "the sweep deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
+                        d.store.blobContainer(d.plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
+                    );
+                }
+                assertEquals(
+                    "and the successor still serves its data",
+                    2L,
+                    ShardOps.hits(successor.searchService(), onSuccessor, "msg", "kept")
+                );
+
+                // Nothing is left watched, so the next pass costs nothing.
+                assertEquals(java.util.Set.of(), loop.sweepPublished(java.util.Set.of()));
+            }
+        }
+    }
+
+    /**
+     * And the full pass does it, not just the method.
+     *
+     * <p>The test above proves the sweep works when called; this proves something calls it. That gap is
+     * the one a canary found — removing the call from {@code tick} broke nothing, because every test drove
+     * the sweep directly. A correct method nothing runs is the same as no method.
+     */
+    public void testTheBackstopPassSweeps() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Deployment d = deploy(createTempDir(), clock, false);
+        d.plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode zombie = new ServerlessNode(nodeSettings("p8-tick-z"));
+            ServerlessNode successor = new ServerlessNode(nodeSettings("p8-tick-s"))
+        ) {
+            zombie.start();
+            successor.start();
+            final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
+            ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
+            zombie.reconciler().shard(onZombie).refresh("p8");
+            zombie.publishShard(onZombie, term1);
+
+            clock.set(1_000L + TTL);
+            final ShardId onSuccessor = successor.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
+            ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
+            successor.reconciler().shard(onSuccessor).refresh("p8");
+            final CommitManifest liveCommit = successor.publishShard(onSuccessor, term2);
+
+            ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
+            zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
+            final var deadTerm = d.store.blobContainer(d.plane.shardData("alpha", 0).add("t=" + term1));
+            final int before = deadTerm.listBlobs().size();
+
+            try (BackgroundReconciler loop = new BackgroundReconciler(successor, d.plane)) {
+                loop.want("alpha", 0);
+                // Three passes: one to see the orphans, one for the grace, one to delete them.
+                for (int pass = 0; pass < 3; pass++) {
+                    loop.tick(clock.get());
+                }
+            }
+
+            assertTrue(
+                "the backstop pass must have swept: " + before + " blobs before, " + deadTerm.listBlobs().size() + " after",
+                deadTerm.listBlobs().size() < before
+            );
+            for (Map.Entry<String, String> file : liveCommit.files().entrySet()) {
+                assertTrue(
+                    "the pass deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
+                    d.store.blobContainer(d.plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
+                );
+            }
+        }
+    }
+
+    /** With no grace configured, the first sweep is the sweep -- the knob is real and does something. */
+    public void testAGraceOfZeroSweepsImmediately() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Deployment d = deploy(createTempDir(), clock, false);
+        d.plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode zombie = new ServerlessNode(nodeSettings("p8-grace0-z"));
+            ServerlessNode successor = new ServerlessNode(nodeSettings("p8-grace0-s"))
+        ) {
+            zombie.start();
+            successor.start();
+            final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
+            ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
+            zombie.reconciler().shard(onZombie).refresh("p8");
+            zombie.publishShard(onZombie, term1);
+
+            clock.set(1_000L + TTL);
+            final ShardId onSuccessor = successor.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
+            ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
+            successor.reconciler().shard(onSuccessor).refresh("p8");
+            successor.publishShard(onSuccessor, term2);
+            ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
+            zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
+
+            try (BackgroundReconciler loop = new BackgroundReconciler(successor, d.plane).setSweepGracePasses(0)) {
+                assertFalse("with no grace the first sweep must delete", loop.sweepPublished(java.util.Set.of(onSuccessor)).isEmpty());
+            }
+        }
+    }
+
     public void testGcLeavesTheLiveTermAloneAndNoOpsWithNothingPublished() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final Deployment d = deploy(createTempDir(), clock, false);

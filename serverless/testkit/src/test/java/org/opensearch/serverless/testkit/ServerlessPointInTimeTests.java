@@ -227,7 +227,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
 
             // And the collector reaps it, so its files stop being held.
             assertEquals("the expired view must be reaped", 1, plane.reapPointsInTime(clock.get()));
-            assertTrue("and nothing is held any more", plane.livePointsInTime(clock.get()).isEmpty());
+            assertEquals("and nothing is held any more", java.util.List.of(), plane.livePointsInTime(clock.get()));
         }
     }
 
@@ -246,6 +246,46 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
             assertEquals("nothing published, nothing to freeze: " + tooSoon.body(), 409, tooSoon.status());
             assertTrue(tooSoon.body().contains("published nothing yet"));
             assertEquals(404, send(node, "POST", "/absent/_pit", null).status());
+        }
+    }
+
+    /**
+     * A reconcile pass reaps expired views and closes what this node was holding for them.
+     *
+     * <p><b>Nothing did either, and the second half is the one that leaks.</b> Releasing a view over REST
+     * closes its shards on the node that opened them; letting one expire closed nothing at all, so a node
+     * that had served one search over a view held those shards for the life of the process — counted
+     * against its bound, never a candidate for eviction, serving a commit nobody could still ask for.
+     * Expiry existed as an answer to a request and not as a thing that happened.
+     */
+    public void testAPassReapsExpiredViewsAndClosesTheirShards() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("reaped", "uuid-reaped-0000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("pit-reap"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = hold(node, plane, clock, "reaped", 1);
+            assertEquals(201, send(node, "PUT", "/reaped/_doc/1?refresh=true", body(1)).status());
+            loop.tick(clock.get());
+
+            final String pit = field(send(node, "POST", "/reaped/_pit?keep_alive=1m", null).body(), "pit_id");
+            assertEquals(200, send(node, "POST", "/reaped/_search?pit=" + pit, "{\"query\":{\"match_all\":{}}}").status());
+            assertEquals("the search must have opened the view here", 1, node.reconciler().frozenShards().size());
+
+            // Nothing has expired yet, so the pass leaves it exactly alone.
+            assertEquals(0, loop.reapExpiredViews());
+            assertEquals(1, node.reconciler().frozenShards().size());
+
+            clock.addAndGet(120_000L);
+            assertEquals("the expired view must be reaped", 1, loop.reapExpiredViews());
+            assertTrue("and its record is gone", plane.livePointsInTime(clock.get()).isEmpty());
+            assertEquals("and the node stops holding its shards", 0, node.reconciler().frozenShards().size());
+            assertTrue(
+                "with nothing left open under the view's identity",
+                node.reconciler().heldShards().stream().noneMatch(s -> s.getIndex().getUUID().equals(pit))
+            );
         }
     }
 

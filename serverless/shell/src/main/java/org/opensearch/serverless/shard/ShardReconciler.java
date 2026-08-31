@@ -414,7 +414,24 @@ public final class ShardReconciler {
             .build();
         open.put(shardId, openAndStart(lazyMetadata, shardId, manifest.term(), view.nodes(), false, true));
         readers.add(shardId);
+        // What it is a cache of. A reader never changes commit while it is open -- a ReadOnlyEngine is
+        // opened on one and core offers no way to move it -- so the only way to notice the commit has
+        // moved on is to remember which one this is and compare.
+        readerCommits.put(shardId, manifest);
         return shardId;
+    }
+
+    /** The commit each reader was opened at, so a pass can tell when it has gone stale. */
+    private final java.util.Map<ShardId, CommitManifest> readerCommits = new ConcurrentHashMap<>();
+
+    /**
+     * Returns the commit a reader is serving.
+     *
+     * @param shardId the shard
+     * @return the commit it was opened at, or empty if it is not a reader
+     */
+    public Optional<CommitManifest> readerCommit(ShardId shardId) {
+        return Optional.ofNullable(readerCommits.get(shardId));
     }
 
     /**
@@ -466,6 +483,11 @@ public final class ShardReconciler {
             .build();
         open.put(shardId, openAndStart(frozen, shardId, manifest.term(), nodes, false, true, manifest));
         readers.add(shardId);
+        // A view serves a commit like any other reader, so it records which one. It is exempt from the
+        // staleness pass because it is a view, not because it forgot -- and the difference matters: the
+        // exemption was at first protected only by this line's absence, which is an accident rather than a
+        // guarantee and the canary for it could not fail.
+        readerCommits.put(shardId, manifest);
         frozenViews.add(shardId);
         return shardId;
     }
@@ -538,6 +560,7 @@ public final class ShardReconciler {
      */
     public void releaseShard(ShardId shardId, String reason) {
         readers.remove(shardId);
+        readerCommits.remove(shardId);
         walCache.remove(shardId);
         lastUsed.remove(shardId);
         final IndexShard shard = open.remove(shardId);

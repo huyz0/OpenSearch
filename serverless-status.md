@@ -1,6 +1,6 @@
 # The serverless shell: where it actually is
 
-Per-milestone notes (`m10`…`m37`) record what was true when each was written, which is the point of them.
+Per-milestone notes (`m10`…`m38`) record what was true when each was written, which is the point of them.
 Their "what is still missing" sections do not — those age badly, and several had been closed by later work
 while still reading as open. **This document supersedes all of them.** If a milestone note and this
 disagree, this is right.
@@ -39,6 +39,12 @@ containers no index owns.
 **Scaling to zero and back.** A node takes a shard by compare-and-swap on a register, renews a lease,
 publishes commits to the object store, and releases shards that have gone idle. There is no cluster
 manager, no consensus process, and no cluster-wide state.
+
+**Maintenance the deployment does for itself.** A reconcile pass lets go of readers whose commit has been
+superseded, so nothing serves a stale commit indefinitely; reaps expired points in time and closes the
+shards held for them; and sweeps the garbage left by what it has just published. The sweep waits until a
+blob has been unreferenced across two passes, because a reader may still be reading it — the grace is what
+makes running the collector on a schedule different from running it by hand.
 
 **Plugins.** Installed from `plugins/` through core's own loader, or named on the classpath by
 configuration. `createComponents`, REST handlers, the request wrapper, `onNodeStarted`, analysis, mappers,
@@ -86,7 +92,9 @@ These are decisions, not gaps. Each answers 501 with a reason.
   work.
 - A point in time is node-local once opened: the record is in the object store and any node can serve it,
   but two nodes serving one view open it twice. No slicing.
-- Nothing runs the orphan sweep on a schedule.
+- The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
+  runs on every pass. A reader whose node cannot reach the object store for longer than the grace can lose
+  the commit it is reading — it fails with an error rather than answering wrongly, but it is a real limit.
 
 **Out of scope while `server/` may not change:**
 
@@ -116,7 +124,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-302 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+307 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs) and `s3Test` (against a live MinIO) — none skipped.
 
 Every load-bearing claim has a planted-defect canary: the defect is introduced, the failing test is watched,
