@@ -45,10 +45,14 @@ import java.util.function.UnaryOperator;
  * {@code getRestHandlerWrapper} lets it see every request before the handler does, which is where
  * authentication belongs and is exactly what the security plugin uses it for.
  *
- * <p><b>What is deliberately absent</b> is the action layer: no {@code ActionFilter}, no
- * {@code TransportAction} registration, and therefore no privilege evaluation keyed on action names. That
- * is §6.3's boundary, and honouring it is what keeps this a plugin host rather than a second copy of the
- * node it replaced.
+ * <p><b>What is deliberately absent</b> is the action layer: no {@code TransportAction} registration, no
+ * action-name routing, no {@code action/} package. That is §6.3's boundary, and honouring it is what keeps
+ * this a plugin host rather than a second copy of the node it replaced.
+ *
+ * <p><b>{@code ActionFilter}s are the exception, and not a retreat from that.</b> A filter needs two things
+ * — an action name and a request — and both can be produced where the shell does its work, without any of
+ * the machinery above. {@link ActionGate} does exactly that, so a plugin's privilege evaluation runs
+ * unmodified while the action layer stays unbuilt.
  */
 public final class ServerlessPlugins {
 
@@ -221,6 +225,21 @@ public final class ServerlessPlugins {
             }
         }
         return new org.opensearch.identity.IdentityService(settings, threadPool, identityPlugins);
+    }
+
+    /**
+     * Collects the plugins' action filters, which is where authorization lives.
+     *
+     * @return the filters, in the order the plugins were loaded
+     */
+    public List<org.opensearch.action.support.ActionFilter> actionFilters() {
+        final List<org.opensearch.action.support.ActionFilter> filters = new ArrayList<>();
+        for (Plugin plugin : plugins) {
+            if (plugin instanceof ActionPlugin actionPlugin) {
+                filters.addAll(actionPlugin.getActionFilters());
+            }
+        }
+        return filters;
     }
 
     /**

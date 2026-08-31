@@ -266,6 +266,35 @@ public final class ShardOperations {
      * @throws IOException if the read fails or no copy can answer
      */
     public Read get(String index, String id) throws IOException {
+        return gated(org.opensearch.action.get.GetAction.NAME, new org.opensearch.action.get.GetRequest(index, id), () -> doGet(index, id));
+    }
+
+    /**
+     * Runs one operation through the plugins' action filters.
+     *
+     * <p>Wrapped here rather than at each REST handler because this is the funnel: a get through the REST
+     * surface, a get through a plugin's {@code Client} and a get from the shell's own code are all this
+     * method. A guard placed in a handler is a guard the next handler forgets.
+     *
+     * <p>The checked-exception dance exists because these operations declare {@code IOException} and the
+     * gate declares {@code Exception}; a filter's own refusal is a runtime exception and passes through
+     * unchanged, carrying the plugin's status rather than one invented here.
+     */
+    private <T> T gated(
+        String action,
+        org.opensearch.action.ActionRequest request,
+        org.opensearch.common.CheckedSupplier<T, Exception> work
+    ) throws IOException {
+        try {
+            return node.actionGate().run(action, request, work);
+        } catch (IOException | RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
+    private Read doGet(String index, String id) throws IOException {
         final Placement placement = place(index, id);
         if (placement.local() != null) {
             return new Read(node.get(placement.local(), id), node.localNode().getId(), true);
@@ -400,8 +429,14 @@ public final class ShardOperations {
      * @throws IOException if the search fails outright
      */
     public SearchOutcome search(String index, org.opensearch.search.builder.SearchSourceBuilder source) throws IOException {
-        final IndexDescriptor descriptor = plane.describe(index).orElseThrow(() -> new NoSuchIndexException(index));
-        return org.opensearch.serverless.rest.SearchFanout.run(node, plane, index, descriptor.numberOfShards(), source);
+        return gated(
+            org.opensearch.action.search.SearchAction.NAME,
+            new org.opensearch.action.search.SearchRequest(new String[] { index }, source),
+            () -> {
+                final IndexDescriptor descriptor = plane.describe(index).orElseThrow(() -> new NoSuchIndexException(index));
+                return org.opensearch.serverless.rest.SearchFanout.run(node, plane, index, descriptor.numberOfShards(), source);
+            }
+        );
     }
 
     /**
@@ -415,7 +450,11 @@ public final class ShardOperations {
      * @throws IOException if the write fails or no node can take it
      */
     public String index(String index, String id, String source, boolean refresh) throws IOException {
-        return write(index, id, source, refresh, false);
+        return gated(
+            org.opensearch.action.index.IndexAction.NAME,
+            new org.opensearch.action.index.IndexRequest(index).id(id).source(source, org.opensearch.common.xcontent.XContentType.JSON),
+            () -> write(index, id, source, refresh, false)
+        );
     }
 
     /**
@@ -428,6 +467,14 @@ public final class ShardOperations {
      * @throws IOException if the delete fails or no node can take it
      */
     public boolean delete(String index, String id, boolean refresh) throws IOException {
+        return gated(
+            org.opensearch.action.delete.DeleteAction.NAME,
+            new org.opensearch.action.delete.DeleteRequest(index, id),
+            () -> doDelete(index, id, refresh)
+        );
+    }
+
+    private boolean doDelete(String index, String id, boolean refresh) throws IOException {
         final Placement placement = place(index, id);
         if (placement.local() != null) {
             final boolean found = node.delete(placement.local(), id);

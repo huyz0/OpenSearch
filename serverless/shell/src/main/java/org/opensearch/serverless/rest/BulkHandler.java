@@ -137,7 +137,18 @@ public final class BulkHandler extends BaseRestHandler {
             final long startedAt = System.nanoTime();
             try {
                 route(serving, metadata, items);
-                dispatch(serving, items, refresh);
+                // One gate call for the whole batch, under the bulk action, rather than one per item.
+                //
+                // A privilege evaluator written for OpenSearch expects to see indices:data/write/bulk with
+                // a BulkRequest whose indices() covers the batch; filtering each document under
+                // indices:data/write/index instead would be stricter but would show a filter an action name
+                // it never registered for, which for a filter that only guards bulk is a hole rather than a
+                // difference. The request is built from the items that survived routing, so a filter sees
+                // the indices actually about to be written.
+                serving.actionGate().run(org.opensearch.action.bulk.BulkAction.NAME, bulkRequestFor(items), () -> {
+                    dispatch(serving, items, refresh);
+                    return null;
+                });
                 respond(channel, items, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt));
             } catch (Exception e) {
                 try {
@@ -152,6 +163,28 @@ public final class BulkHandler extends BaseRestHandler {
     /**
      * Decides, per item, which shard it belongs to and who owns it — or records why it cannot be placed.
      */
+    /**
+     * Describes the batch to an action filter, in the request type a filter expects.
+     *
+     * <p>Only what a filter needs: which indices, and which operations. Sources are not copied — a bulk of
+     * ten thousand documents would be duplicated in memory to tell a privilege evaluator something it does
+     * not read.
+     */
+    private static org.opensearch.action.bulk.BulkRequest bulkRequestFor(List<Item> items) {
+        final org.opensearch.action.bulk.BulkRequest request = new org.opensearch.action.bulk.BulkRequest();
+        for (Item item : items) {
+            if (item.failed() || item.index == null) {
+                continue;
+            }
+            if (item.operation.isDeletion()) {
+                request.add(new org.opensearch.action.delete.DeleteRequest(item.index, item.operation.id()));
+            } else {
+                request.add(new org.opensearch.action.index.IndexRequest(item.index).id(item.operation.id()));
+            }
+        }
+        return request;
+    }
+
     private void route(ServerlessNode serving, MetadataPlane metadata, List<Item> items) throws IOException {
         final Map<String, Optional<IndexDescriptor>> described = new HashMap<>();
         for (Item item : items) {

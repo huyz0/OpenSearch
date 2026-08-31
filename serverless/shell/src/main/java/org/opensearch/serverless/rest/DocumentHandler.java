@@ -147,18 +147,28 @@ public final class DocumentHandler extends BaseRestHandler {
                             );
                             return;
                         }
-                        final var ack = serving.router()
-                            .forwardIndex(
-                                peer.get(),
-                                new org.opensearch.serverless.transport.ForwardedIndexRequest(
-                                    index,
-                                    shard,
-                                    id,
-                                    source == null ? "" : source,
-                                    refresh,
-                                    deletion
+                        // Filtered here, on the coordinating node, before the write leaves it. The owner
+                        // has no idea who the caller is -- an internal transport request carries no
+                        // identity -- so this is the only node where the question can be asked.
+                        final var ack = gated(
+                            serving,
+                            deletion,
+                            index,
+                            id,
+                            source,
+                            () -> serving.router()
+                                .forwardIndex(
+                                    peer.get(),
+                                    new org.opensearch.serverless.transport.ForwardedIndexRequest(
+                                        index,
+                                        shard,
+                                        id,
+                                        source == null ? "" : source,
+                                        refresh,
+                                        deletion
+                                    )
                                 )
-                            );
+                        );
                         respond(channel, index, id, shard, ack.ownerNodeId(), deletion, true);
                     } catch (Exception e) {
                         // The owner was reachable and still refused or failed. Either it lost the shard
@@ -213,10 +223,13 @@ public final class DocumentHandler extends BaseRestHandler {
         // should be reading the next request on remote IO is how a node stops answering under load.
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             try {
-                final boolean removed = deletion ? serving.delete(shardId, id) : true;
-                if (deletion == false) {
-                    serving.index(shardId, id, source);
-                }
+                final boolean removed = gated(serving, deletion, index, id, source, () -> {
+                    final boolean found = deletion ? serving.delete(shardId, id) : true;
+                    if (deletion == false) {
+                        serving.index(shardId, id, source);
+                    }
+                    return found;
+                });
                 if (refresh) {
                     // Same meaning as classic OpenSearch: make this write visible to search before
                     // answering. Without it a caller that writes and immediately searches gets zero
@@ -232,6 +245,37 @@ public final class DocumentHandler extends BaseRestHandler {
                 }
             }
         });
+    }
+
+    /**
+     * Runs a write through the plugins' action filters.
+     *
+     * <p><b>Here rather than in {@code ShardOperations}, and that is worth explaining.</b> This handler
+     * predates that class and still carries its own routing, forwarding and response vocabulary — a 421
+     * naming the owner, a {@code durable} field, the node that actually wrote. Rewriting it onto the shared
+     * operations would change what callers see, so the gate comes to it instead. What keeps that from
+     * becoming a place somebody forgets is a test that walks every endpoint which reads or changes data and
+     * asserts an action name reached a filter for each one.
+     */
+    private static <T> T gated(
+        ServerlessNode serving,
+        boolean deletion,
+        String index,
+        String id,
+        String source,
+        org.opensearch.common.CheckedSupplier<T, Exception> work
+    ) throws Exception {
+        final org.opensearch.action.ActionRequest request;
+        final String action;
+        if (deletion) {
+            action = org.opensearch.action.delete.DeleteAction.NAME;
+            request = new org.opensearch.action.delete.DeleteRequest(index, id);
+        } else {
+            action = org.opensearch.action.index.IndexAction.NAME;
+            request = new org.opensearch.action.index.IndexRequest(index).id(id)
+                .source(source == null ? "{}" : source, org.opensearch.common.xcontent.XContentType.JSON);
+        }
+        return serving.actionGate().run(action, request, work);
     }
 
     private void respond(

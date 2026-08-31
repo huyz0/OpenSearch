@@ -605,7 +605,7 @@ public final class ServerlessNode implements Closeable {
                 new ServerlessRootHandler(nodeName, ClusterName.CLUSTER_NAME_SETTING.get(settings).value(), nodeEnvironment::nodeId)
             )
         );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.BulkHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.GetHandler(() -> this, () -> metadataPlane)));
@@ -1399,6 +1399,20 @@ public final class ServerlessNode implements Closeable {
             indexNameExpressionResolver = new RefusingIndexNameExpressionResolver(threadPool.getThreadContext());
         }
         return indexNameExpressionResolver;
+    }
+
+    private volatile ActionGate actionGate;
+
+    /**
+     * The gate every operation passes through, where a plugin's {@code ActionFilter}s decide.
+     *
+     * @return the gate, which is empty and free when no plugin installed a filter
+     */
+    public synchronized ActionGate actionGate() {
+        if (actionGate == null) {
+            actionGate = new ActionGate(plugins.actionFilters());
+        }
+        return actionGate;
     }
 
     /**

@@ -221,6 +221,32 @@ public final class SearchHandler extends BaseRestHandler {
      * that was neither the first page nor relevance-ranked. Each shard is asked for {@code from + size}
      * because any one of them might own the whole page, and the global window is applied here, once.
      */
+    /**
+     * Runs a search through the plugins' action filters.
+     *
+     * @throws IOException if the search fails; a filter's own refusal is a runtime exception and passes
+     *     through carrying the plugin's status
+     */
+    private static <T> T gated(
+        ServerlessNode serving,
+        String index,
+        SearchSourceBuilder source,
+        org.opensearch.common.CheckedSupplier<T, Exception> work
+    ) throws IOException {
+        try {
+            return serving.actionGate()
+                .run(
+                    org.opensearch.action.search.SearchAction.NAME,
+                    new org.opensearch.action.search.SearchRequest(new String[] { index }, source),
+                    work
+                );
+        } catch (IOException | RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
     private void respond(
         org.opensearch.rest.RestChannel channel,
         ServerlessNode serving,
@@ -229,7 +255,9 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         int shards
     ) throws IOException {
-        final var outcome = SearchFanout.run(serving, metadata, index, shards, source);
+        // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
+        // fan-out rather than going through ShardOperations, so the gate has to meet it where it works.
+        final var outcome = gated(serving, index, source, () -> SearchFanout.run(serving, metadata, index, shards, source));
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.startObject("_shards");
