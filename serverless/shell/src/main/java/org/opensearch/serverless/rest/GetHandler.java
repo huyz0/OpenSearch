@@ -83,6 +83,10 @@ public final class GetHandler extends BaseRestHandler {
         final String index = request.param("index");
         final String id = request.param("id");
         final boolean bodyless = request.method() == RestRequest.Method.HEAD;
+        // What the caller wants back. Shapes the response only -- the document is fetched whole either
+        // way; see SourceFiltering.
+        final org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource = org.opensearch.search.fetch.subphase.FetchSourceContext
+            .parseFromRestRequest(request);
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
@@ -101,7 +105,7 @@ public final class GetHandler extends BaseRestHandler {
         final ServerlessNode serving = node.get();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GET).execute(() -> {
             try {
-                answer(channel, serving, metadata, index, id, shard, bodyless);
+                answer(channel, serving, metadata, index, id, shard, bodyless, fetchSource);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -119,12 +123,13 @@ public final class GetHandler extends BaseRestHandler {
         String index,
         String id,
         int shard,
-        boolean bodyless
+        boolean bodyless,
+        org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource
     ) throws Exception {
         final var operations = new org.opensearch.serverless.shard.ShardOperations(serving, metadata);
         try {
             final var read = operations.get(index, id);
-            respond(channel, index, shard, read.document(), read.servedBy(), read.realtime(), bodyless);
+            respond(channel, index, shard, read.document(), read.servedBy(), read.realtime(), bodyless, fetchSource);
         } catch (org.opensearch.serverless.shard.ShardOperations.NotHereException e) {
             // Every "not here" is a 503 for a get, and deliberately so: the alternative is answering from
             // a published commit that a live writer is already ahead of, which is a stale document -- or a
@@ -149,7 +154,8 @@ public final class GetHandler extends BaseRestHandler {
         ServerlessNode.Document document,
         String servedBy,
         boolean realtime,
-        boolean bodyless
+        boolean bodyless,
+        org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource
     ) throws IOException {
         final RestStatus status = document.found() ? RestStatus.OK : RestStatus.NOT_FOUND;
         if (bodyless) {
@@ -169,12 +175,9 @@ public final class GetHandler extends BaseRestHandler {
             // is writing. A client that cares about the difference should not have to guess.
             builder.field("realtime", realtime);
             builder.field("_node", servedBy);
-            if (document.found()) {
-                builder.rawField(
-                    "_source",
-                    new ByteArrayInputStream(document.source().getBytes(StandardCharsets.UTF_8)),
-                    XContentType.JSON
-                );
+            final String source = document.found() ? SourceFiltering.apply(document.source(), fetchSource) : null;
+            if (source != null) {
+                builder.rawField("_source", new ByteArrayInputStream(source.getBytes(StandardCharsets.UTF_8)), XContentType.JSON);
             }
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(status, builder));

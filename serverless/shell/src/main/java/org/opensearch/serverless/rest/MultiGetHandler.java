@@ -83,13 +83,15 @@ public final class MultiGetHandler extends BaseRestHandler {
     private static final class Item {
         private final String index;
         private final String id;
+        private final org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource;
         private ServerlessNode.Document document;
         private String failureType;
         private String failureReason;
 
-        Item(String index, String id) {
+        Item(String index, String id, org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource) {
             this.index = index;
             this.id = id;
+            this.fetchSource = fetchSource;
         }
 
         void fail(String type, String reason) {
@@ -103,6 +105,9 @@ public final class MultiGetHandler extends BaseRestHandler {
         // Every parameter before any early return, or BaseRestHandler turns a deliberate refusal into a
         // 400 about an unconsumed parameter.
         final String defaultIndex = request.param("index");
+        // What the request as a whole asked for, which an individual document may override.
+        final org.opensearch.search.fetch.subphase.FetchSourceContext requestSource =
+            org.opensearch.search.fetch.subphase.FetchSourceContext.parseFromRestRequest(request);
         if (request.hasContentOrSourceParam() == false) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a multi-get needs a body naming the documents")
@@ -110,7 +115,7 @@ public final class MultiGetHandler extends BaseRestHandler {
         }
 
         final List<Item> items = new ArrayList<>();
-        final String malformed = parse(request, defaultIndex, items);
+        final String malformed = parse(request, defaultIndex, requestSource, items);
         if (malformed != null) {
             return channel -> channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_request", malformed));
         }
@@ -149,7 +154,12 @@ public final class MultiGetHandler extends BaseRestHandler {
      *
      * @return a reason the body could not be read, or null
      */
-    private String parse(RestRequest request, String defaultIndex, List<Item> items) throws IOException {
+    private String parse(
+        RestRequest request,
+        String defaultIndex,
+        org.opensearch.search.fetch.subphase.FetchSourceContext requestSource,
+        List<Item> items
+    ) throws IOException {
         try (XContentParser parser = request.contentOrSourceParamParser()) {
             final var body = parser.map();
             if (body.get("docs") instanceof List<?> docs) {
@@ -163,7 +173,10 @@ public final class MultiGetHandler extends BaseRestHandler {
                     if (index == null || id == null) {
                         return "every document needs an _id, and an _index unless the request path names one";
                     }
-                    items.add(new Item(index.toString(), id.toString()));
+                    // A document may name its own _source, which is the whole reason a multi-get takes
+                    // objects rather than ids: one request can want the body of one document and only the
+                    // field names of another.
+                    items.add(new Item(index.toString(), id.toString(), perDocumentSource(doc.get("_source"), requestSource)));
                 }
                 return null;
             }
@@ -172,7 +185,7 @@ public final class MultiGetHandler extends BaseRestHandler {
                     return "a bare list of ids needs an index in the request path";
                 }
                 for (Object id : ids) {
-                    items.add(new Item(defaultIndex, String.valueOf(id)));
+                    items.add(new Item(defaultIndex, String.valueOf(id), requestSource));
                 }
                 return null;
             }
@@ -180,6 +193,49 @@ public final class MultiGetHandler extends BaseRestHandler {
         } catch (Exception e) {
             return "the body could not be read: " + e.getMessage();
         }
+    }
+
+    /**
+     * Reads one document's {@code _source} instruction, falling back to the request's.
+     *
+     * <p>The three shapes the real API takes: a boolean, a list of includes, or an object with includes and
+     * excludes. Anything else is left to the request's own setting rather than guessed at.
+     */
+    private static org.opensearch.search.fetch.subphase.FetchSourceContext perDocumentSource(
+        Object declared,
+        org.opensearch.search.fetch.subphase.FetchSourceContext fallback
+    ) {
+        if (declared == null) {
+            return fallback;
+        }
+        if (declared instanceof Boolean wanted) {
+            return new org.opensearch.search.fetch.subphase.FetchSourceContext(wanted);
+        }
+        if (declared instanceof List<?> includes) {
+            return new org.opensearch.search.fetch.subphase.FetchSourceContext(
+                true,
+                strings(includes),
+                org.opensearch.core.common.Strings.EMPTY_ARRAY
+            );
+        }
+        if (declared instanceof java.util.Map<?, ?> object) {
+            final Object includes = object.get("includes") == null ? object.get("include") : object.get("includes");
+            final Object excludes = object.get("excludes") == null ? object.get("exclude") : object.get("excludes");
+            return new org.opensearch.search.fetch.subphase.FetchSourceContext(
+                true,
+                includes instanceof List<?> list ? strings(list) : org.opensearch.core.common.Strings.EMPTY_ARRAY,
+                excludes instanceof List<?> list ? strings(list) : org.opensearch.core.common.Strings.EMPTY_ARRAY
+            );
+        }
+        return fallback;
+    }
+
+    private static String[] strings(List<?> values) {
+        final String[] out = new String[values.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = String.valueOf(values.get(i));
+        }
+        return out;
     }
 
     /** Fetches every item at once, up to the fan-out's bound. */
@@ -235,12 +291,9 @@ public final class MultiGetHandler extends BaseRestHandler {
                 }
                 final boolean found = item.document != null && item.document.found();
                 builder.field("found", found);
-                if (found) {
-                    builder.rawField(
-                        "_source",
-                        new ByteArrayInputStream(item.document.source().getBytes(StandardCharsets.UTF_8)),
-                        XContentType.JSON
-                    );
+                final String source = found ? SourceFiltering.apply(item.document.source(), item.fetchSource) : null;
+                if (source != null) {
+                    builder.rawField("_source", new ByteArrayInputStream(source.getBytes(StandardCharsets.UTF_8)), XContentType.JSON);
                 }
                 builder.endObject();
             }

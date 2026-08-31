@@ -63,8 +63,17 @@ rather than likely — which is what the test meant all along.
 *Written at the time. For the current position, which later milestones have moved, see
 [`serverless-status.md`](serverless-status.md).*
 
-- **`_mget` does not honour `_source` filtering per item**, which the real API allows. The single get does
-  not either, so this is consistent rather than an omission introduced here.
+- ~~`_mget` does not honour `_source` filtering per item.~~ **Closed**: both the single get and each
+  multi-get item honour `_source`, `_source_includes` and `_source_excludes`, and a document in a multi-get
+  may name its own — which is the reason that API takes objects rather than ids, since one request can want
+  the body of one document and only a field of another. Core's own `XContentMapValues.filter` does the
+  work, so wildcards and dotted paths behave as they do everywhere else.
+
+  **It shapes the response and does not make the read cheaper**, and the test says so alongside the rest.
+  The document is fetched whole either way; for a forwarded get the whole source has already crossed the
+  internal network before any filtering runs. A search is the other way round — filtering there happens
+  inside the shard's fetch phase, before a hit is ever returned. That asymmetry is real and cannot be fixed
+  without pushing the context through the forwarded-get request.
 - **No `docs[]._routing`**, because the shell routes by id and nothing else.
 - **`search_after`, aliases and `ignore_unavailable`** remain absent.
 

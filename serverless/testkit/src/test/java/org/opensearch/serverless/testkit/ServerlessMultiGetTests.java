@@ -46,6 +46,8 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
 
     private static final long TTL = 30_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
+    private static final String WIDE_MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},"
+        + "\"tag\":{\"type\":\"keyword\"},\"big\":{\"type\":\"keyword\"}}}";
 
     private Settings nodeSettings(String name) {
         return Settings.builder()
@@ -208,6 +210,67 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
             values.add(matcher.group(1));
         }
         return values;
+    }
+
+    /**
+     * A get and a multi-get return only the fields asked for.
+     *
+     * <p><b>It shapes the response and does not make the read cheaper</b>, which is worth asserting
+     * alongside because the two are easy to conflate. The document is fetched whole either way — a get is
+     * answered by the shard's owner and, when forwarded, the whole source has already crossed the internal
+     * network before any of this runs. What the caller stops paying for is the bytes back to them.
+     *
+     * <p>A search is the other way round: filtering there happens inside the shard's fetch phase, before a
+     * hit is ever returned, so it saves the transfer too.
+     */
+    public void testSourceFilteringOnAGetAndAMultiGet() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("shaped", "uuid-shaped-0000000", 1, WIDE_MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-source"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "shaped");
+            assertEquals(
+                201,
+                send(node, "PUT", "/shaped/_doc/1?refresh=true", "{\"msg\":\"body\",\"tag\":\"t\",\"big\":\"padding\"}").status()
+            );
+
+            final Response whole = send(node, "GET", "/shaped/_doc/1", null);
+            assertTrue("everything by default: " + whole.body(), whole.body().contains("\"big\""));
+
+            final Response none = send(node, "GET", "/shaped/_doc/1?_source=false", null);
+            assertTrue("the document is still found: " + none.body(), none.body().contains("\"found\":true"));
+            assertFalse("and carries no source at all: " + none.body(), none.body().contains("_source"));
+
+            final Response some = send(node, "GET", "/shaped/_doc/1?_source=msg", null);
+            assertTrue("the field asked for: " + some.body(), some.body().contains("\"msg\":\"body\""));
+            assertFalse("and not the others: " + some.body(), some.body().contains("\"big\""));
+
+            final Response excluded = send(node, "GET", "/shaped/_doc/1?_source_excludes=big", null);
+            assertTrue("what was not excluded stays: " + excluded.body(), excluded.body().contains("\"tag\""));
+            assertFalse("and what was excluded goes: " + excluded.body(), excluded.body().contains("\"big\""));
+
+            // Per document, which is the reason a multi-get takes objects rather than ids: one request can
+            // want the body of one document and only a field of another.
+            assertEquals(
+                201,
+                send(node, "PUT", "/shaped/_doc/2?refresh=true", "{\"msg\":\"other\",\"tag\":\"u\",\"big\":\"padding\"}").status()
+            );
+            final Response mixed = send(
+                node,
+                "POST",
+                "/_mget",
+                "{\"docs\":[{\"_index\":\"shaped\",\"_id\":\"1\",\"_source\":[\"msg\"]},"
+                    + "{\"_index\":\"shaped\",\"_id\":\"2\",\"_source\":false}]}"
+            );
+            assertEquals(mixed.body(), 200, mixed.status());
+            assertTrue("the first document's chosen field: " + mixed.body(), mixed.body().contains("\"msg\":\"body\""));
+            assertFalse("and not its other fields: " + mixed.body(), mixed.body().contains("padding"));
+            assertFalse("and nothing at all from the second: " + mixed.body(), mixed.body().contains("\"msg\":\"other\""));
+            assertEquals("both still answered for", 2, idsIn(mixed.body()).size());
+        }
     }
 
     private record Response(int status, String body) {

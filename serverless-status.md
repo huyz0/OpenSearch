@@ -7,7 +7,7 @@ disagree, this is right.
 
 ## What works
 
-**Documents.** Write, get, delete, `_bulk`, `_mget`. A write is durable in a write-ahead log before it is
+**Documents.** Write, get, delete, `_bulk`, `_mget`, with `_source` filtering on reads. A write is durable in a write-ahead log before it is
 acknowledged, and replayed by a successor. A get is routed to the shard's owner so it sees writes a search
 cannot yet; an unowned shard is served from its published commit, so a get works against an index that has
 scaled to zero.
@@ -92,7 +92,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-283 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+284 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs) and `s3Test` (against a live MinIO) — none skipped.
 
 Every load-bearing claim has a planted-defect canary: the defect is introduced, the failing test is watched,
