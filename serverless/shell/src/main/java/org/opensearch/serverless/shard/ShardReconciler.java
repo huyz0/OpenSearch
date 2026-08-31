@@ -145,7 +145,9 @@ public final class ShardReconciler {
         // A commit must exist before there is anything to publish; an unflushed shard has its data only
         // in the translog, which this does not upload.
         shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
-        final CommitManifest manifest = publishers.apply(shardId).publish(shard.store(), term);
+        // Named, so a manifest says who wrote it. A term is not an identity: the publish fence refuses a
+        // newer term and cannot tell two nodes holding the same one apart.
+        final CommitManifest manifest = publishers.apply(shardId).publish(shard.store(), term, localNode.getId());
         final var walForPublish = wal(shardId);
         if (walForPublish != null) {
             // Only after the commit is durable in the object store. Truncation drops what the previous

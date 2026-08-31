@@ -26,6 +26,15 @@ public class StaleWriterException extends IOException {
      * @param attemptedTerm the term that tried to publish
      * @param currentTerm the term already published, or -1 if a concurrent swap was detected
      */
+    /**
+     * Creates the exception from a message, for a subclass that has a more specific diagnosis.
+     *
+     * @param message what happened
+     */
+    protected StaleWriterException(String message) {
+        super(message);
+    }
+
     public StaleWriterException(long attemptedTerm, long currentTerm) {
         super(
             "refusing to publish at term "

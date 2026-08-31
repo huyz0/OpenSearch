@@ -91,12 +91,40 @@ public final class SegmentPublisher {
      * @throws StaleWriterException if a newer term has already published
      */
     public CommitManifest publish(Store store, long term) throws IOException {
+        return publish(store, term, null);
+    }
+
+    /**
+     * Publishes the shard's current commit, recording which node did it.
+     *
+     * @param store the shard's store, already flushed to a commit
+     * @param term the publishing writer's term
+     * @param writerId the publishing node, recorded in the manifest and checked against the one already
+     *     there; null to skip both
+     * @return the manifest as published
+     * @throws IOException if upload fails
+     * @throws StaleWriterException if a newer term has already published, or another node has published at
+     *     this one
+     */
+    public CommitManifest publish(Store store, long term, String writerId) throws IOException {
         final Optional<BlobRegister> existingRegister = container.readRegister(MANIFEST);
         final CommitManifest existing = existingRegister.isPresent() ? parse(existingRegister.get()) : null;
         if (existing != null && existing.term() > term) {
             // A zombie: paused past its lease, someone else took the shard and published. Its bytes are
             // already inert because of the term prefix; this stops it from claiming they are current.
             throw new StaleWriterException(term, existing.term());
+        }
+        if (existing != null
+            && existing.term() == term
+            && existing.writer() != null
+            && writerId != null
+            && existing.writer().equals(writerId) == false) {
+            // Two nodes holding one term. That cannot happen while the shard-head's compare-and-swap
+            // behaves, and if it ever does not, this is the difference between a loud refusal and a commit
+            // silently assembled from two nodes' segments: the inherit-by-name step below would take this
+            // writer's file names, find them already published by the other one, and skip the upload -- so
+            // the surviving manifest would name segments that never existed together.
+            throw new ForeignWriterException(term, existing.writer(), writerId);
         }
 
         final Map<String, String> published = new LinkedHashMap<>();
@@ -128,7 +156,7 @@ public final class SegmentPublisher {
             store.decRef();
         }
 
-        final CommitManifest manifest = new CommitManifest(term, published);
+        final CommitManifest manifest = new CommitManifest(term, published, writerId);
         final long expected = existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, manifest.toBytes());
         if (result.applied() == false) {

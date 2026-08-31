@@ -34,16 +34,47 @@ public final class CommitManifest {
 
     private final long term;
     private final Map<String, String> files;
+    private final String writer;
+
+    /**
+     * Creates a manifest whose writer is not recorded.
+     *
+     * @param term the term of the writer that published it
+     * @param files segment file name to the blob it lives at
+     */
+    public CommitManifest(long term, Map<String, String> files) {
+        this(term, files, null);
+    }
 
     /**
      * Creates a manifest.
      *
      * @param term the term of the writer that published it
      * @param files segment file name to the blob it lives at
+     * @param writer the node that published it, or null if unrecorded
      */
-    public CommitManifest(long term, Map<String, String> files) {
+    public CommitManifest(long term, Map<String, String> files, String writer) {
         this.term = term;
         this.files = Map.copyOf(files);
+        this.writer = writer;
+    }
+
+    /**
+     * Returns the node that published this commit.
+     *
+     * <p><b>Recorded because a term is not an identity.</b> The publish fence refuses a <em>newer</em>
+     * term, which is right for a zombie and says nothing about two writers holding the same term at once.
+     * That cannot happen while the shard-head's compare-and-swap behaves — and if it ever does not, this is
+     * what turns a commit silently assembled from two nodes' segments into a refusal.
+     *
+     * <p>Null for a manifest written before this field existed, which is treated as "cannot tell" rather
+     * than as a mismatch: refusing every publish onto an older manifest would be a worse failure than the
+     * one this guards against.
+     *
+     * @return the publishing node's id, or null
+     */
+    public String writer() {
+        return writer;
     }
 
     /**
@@ -74,6 +105,9 @@ public final class CommitManifest {
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject();
             builder.field("term", term);
+            if (writer != null) {
+                builder.field("writer", writer);
+            }
             builder.startObject("files");
             for (Map.Entry<String, String> e : files.entrySet()) {
                 builder.field(e.getKey(), e.getValue());
@@ -97,6 +131,7 @@ public final class CommitManifest {
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
         ) {
             long term = -1;
+            String writer = null;
             final Map<String, String> files = new LinkedHashMap<>();
             String field = null;
             XContentParser.Token token;
@@ -115,17 +150,19 @@ public final class CommitManifest {
                     }
                 } else if (token.isValue() && "term".equals(field)) {
                     term = parser.longValue();
+                } else if (token.isValue() && "writer".equals(field)) {
+                    writer = parser.text();
                 }
             }
             if (term < 0) {
                 throw new IOException("malformed commit manifest: no term");
             }
-            return new CommitManifest(term, files);
+            return new CommitManifest(term, files, writer);
         }
     }
 
     @Override
     public String toString() {
-        return "CommitManifest[term=" + term + ", files=" + files.size() + "]";
+        return "CommitManifest[term=" + term + ", writer=" + writer + ", files=" + files.size() + "]";
     }
 }

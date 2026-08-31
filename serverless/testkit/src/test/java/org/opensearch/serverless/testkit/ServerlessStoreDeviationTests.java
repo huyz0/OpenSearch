@@ -16,6 +16,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.store.ForeignWriterException;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.concurrent.atomic.AtomicLong;
@@ -155,40 +156,30 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
     }
 
     /**
-     * Two winners: both nodes serve the shard, and the published commit ends up being neither node's.
+     * Two winners at one term are refused at publish, loudly.
      *
-     * <p>This is the measurement the file exists for, and the answer is worse than the one expected.
+     * <p><b>What this measured before the guard existed.</b> Both nodes are told they own the shard at term
+     * 1, and nothing at activation could have caught it. Both accept writes. Then both published — because
+     * the manifest's fence refuses a <em>strictly newer</em> term and says nothing about two writers
+     * sharing one. The second publish inherited the first's file names and skipped uploading them, on the
+     * grounds that a published name has the same bytes: true under one writer per term, false here. The
+     * second node's acknowledged write vanished, with no error anywhere and nothing in the commit to say a
+     * second writer had ever existed.
      *
-     * <p><b>Setting it up faithfully needs two views, not one broken store.</b> Two winners is not a store
-     * behaving badly in isolation — each side is atomic and honours its own preconditions — it is one
-     * register having diverged, so a claim impossible against the true state is legal against the local
-     * one. So each node gets its own view over shared bytes, and one of them is partitioned on exactly the
-     * shard-head register: one key wide, as a replica that has missed one write is.
+     * <p>A manifest now records which node wrote it, and a publish from a different node at the same term
+     * is refused. The data is still lost — nothing can un-acknowledge a write — but the node is told, and
+     * an operator gets a message naming the object store rather than a silent hole in an index.
      *
-     * <p><b>What happens.</b> Both nodes are told they own the shard at term 1, and nothing at activation
-     * could have caught it. Both accept writes. Then both publish — and the manifest does <em>not</em>
-     * fence the second, because its guard is a <em>strictly newer</em> term and these two share one. The
-     * second publish inherits the first's file list by name, skipping the upload of any name already
-     * published on the grounds that "a name already published has the same bytes" — which is true under
-     * one writer per term and false here, where both shards started empty and independently produced
-     * segments called {@code _0.cfs}.
-     *
-     * <p>So the surviving commit names the second writer's segments and points at the first writer's
-     * bytes. Not divergence, and not the bounded loss of one node's unpublished writes: a commit neither
-     * node ever had.
-     *
-     * <p>This is the sharpest statement available of why R11 matters, and it is a statement about this
-     * design rather than about any provider. It also names the exact line that turns a control-plane
-     * deviation into a data-plane one — the inherit-by-name optimisation in {@code SegmentPublisher} —
-     * which is a thing worth knowing about even if every provider is perfect.
+     * <p>Setting this up faithfully needs two views over one set of bytes rather than one broken store:
+     * neither side misbehaves in isolation, the register has simply diverged, and a claim impossible
+     * against the true state is legal against the local one.
      */
-    public void testTwoWinnersProduceACommitNeitherNodeWrote() throws Exception {
+    public void testTwoWinnersAtOneTermAreRefusedAtPublish() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final var honest = new FsBlobStore(1024, createTempDir(), false);
         final BlobPath headsPath = RegisterMap.shards(BlobPath.cleanPath());
         final java.util.function.Predicate<BlobPath> isHeads = path -> path.buildAsString().equals(headsPath.buildAsString());
 
-        // Two views over one set of bytes. A's is honest throughout.
         final var viewA = new MisbehavingBlobStore(honest, isHeads);
         final var viewB = new MisbehavingBlobStore(honest, isHeads);
         final MetadataPlane planeA = new MetadataPlane(viewA, BlobPath.cleanPath(), clock::get, TTL);
@@ -196,7 +187,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
         planeA.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         // B's view of the shard-head only. Everything else it reads and writes is the real thing --
-        // including the manifest, which is what makes the second half of this test meaningful.
+        // including the manifest, which is what makes the refusal below meaningful.
         viewB.broken(headsPath).partitionRegister(RegisterMap.shardHeadBlob("alpha", 0));
 
         try (
@@ -211,7 +202,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             assertTrue("A must have been told it owns the shard", onA.isPresent());
             assertTrue("B must have been told the same thing; that is the deviation", onB.isPresent());
             assertEquals(
-                "and at the same term, which is what makes them two winners",
+                "and at the same term, which is what makes them two winners rather than a takeover",
                 1L,
                 planeA.heads().read("alpha", 0).orElseThrow().term()
             );
@@ -222,28 +213,15 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             b.reconciler().shard(onB.get()).refresh("deviation");
 
             a.publishShard(onA.get(), 1L);
-            final var afterA = planeA.segmentPublisher("alpha", 0).readManifest().orElseThrow();
 
-            // The manifest's guard is a strictly newer term, so a second writer at the same term walks
-            // straight through it.
-            b.publishShard(onB.get(), 1L);
-            final var afterB = planeA.segmentPublisher("alpha", 0).readManifest().orElseThrow();
-
-            assertEquals("both writers published at one term", 1L, afterB.term());
-            assertEquals(
-                "and the second publish was not refused, because the manifest only fences a strictly newer term",
-                afterA.files().keySet(),
-                afterB.files().keySet()
+            final var refused = expectThrows(ForeignWriterException.class, () -> b.publishShard(onB.get(), 1L));
+            assertTrue(
+                "the refusal must name the other node and say what it implies: " + refused.getMessage(),
+                refused.getMessage().contains(a.localNode().getId()) && refused.getMessage().contains("two winners")
             );
 
-            // Why the file lists match: B produced segments with the same names A had already published --
-            // both shards started empty and flushed once -- and the publisher skips uploading a name that
-            // is already there, on the grounds that segment files are immutable and a published name has
-            // the same bytes. True under one writer per term. Not true here.
-            logger.info("two winners at one term: the surviving commit names {}", afterB.files().keySet());
-
-            // So what survived is A's bytes, and B's acknowledged write is gone -- with no error anywhere,
-            // no term bump, and nothing in the commit to say a second writer ever existed.
+            // The surviving commit is the first writer's, whole. The second's write is gone -- that part is
+            // not recoverable and never was -- but it is gone with an exception rather than in silence.
             try (ServerlessNode reader = new ServerlessNode(readerSettings("dev-two-reader"))) {
                 reader.start();
                 final ShardId served = reader.serveAsReader(planeA, "alpha", 0);
@@ -253,7 +231,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
                     ShardOps.hits(reader.searchService(), served, "msg", "aaa")
                 );
                 assertEquals(
-                    "the second writer's acknowledged document is silently gone",
+                    "and the second writer's must not have been spliced into it",
                     0L,
                     ShardOps.hits(reader.searchService(), served, "msg", "bbb")
                 );
@@ -262,24 +240,21 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
     }
 
     /**
-     * And when the two writers' segments do not happen to share names, the commit is not merely wrong —
-     * it is not a commit.
+     * And the refusal is what stops a manifest naming two writers' segments at once.
      *
-     * <p>The test above is the lucky case: both shards started empty, flushed once, and produced the same
-     * file names, so the second publish inherited every one of them and uploaded nothing. The surviving
-     * commit was at least <em>one node's</em>, whole.
+     * <p>The case above is the lucky one: both shards flushed once and produced the same file names, so
+     * without the guard the survivor was at least <em>one node's</em> commit, whole. Give the second writer
+     * a different number of segments and that stops being true — it inherits the names it shares and
+     * uploads the ones it does not, publishing a manifest whose segments file refers to segments the other
+     * node wrote. Measured before the guard existed, the surviving commit named
+     * {@code [_1.cfs, _1.cfe, _0.cfe, _1.si, _0.si, _0.cfs, segments_5]}, of which {@code segments_5} and
+     * the {@code _1} files were the second node's uploads and the {@code _0} files were the first node's
+     * blobs: a manifest describing an index that has never existed anywhere.
      *
-     * <p>Give the second writer a different number of segments and that stops being true. It inherits the
-     * names it shares and uploads the ones it does not, so the manifest it publishes names its own segments
-     * file — which refers to segments the first writer never wrote — alongside blobs holding the first
-     * writer's bytes. The result is a manifest describing an index that has never existed anywhere.
-     *
-     * <p>This test does not assert that the commit is unreadable, because what Lucene does with an
-     * incoherent segments file is Lucene's business and may change. It asserts the thing that is this
-     * design's business: the surviving manifest names blobs from two different writers, which is a state
-     * nothing downstream is built to survive.
+     * <p>That is the outcome this test exists to keep impossible, and removing the guard is the canary that
+     * proves it still would happen.
      */
-    public void testTwoWinnersWithDifferentSegmentsProduceAMixedCommit() throws Exception {
+    public void testAMixedCommitCannotBePublished() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final var honest = new FsBlobStore(1024, createTempDir(), false);
         final BlobPath headsPath = RegisterMap.shards(BlobPath.cleanPath());
@@ -311,26 +286,48 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             b.reconciler().shard(onB).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
 
             final var fromA = a.publishShard(onA, 1L);
-            final var fromB = b.publishShard(onB, 1L);
-
-            final java.util.Set<String> onlyB = new java.util.HashSet<>(fromB.files().keySet());
-            onlyB.removeAll(fromA.files().keySet());
-            final java.util.Set<String> shared = new java.util.HashSet<>(fromB.files().keySet());
-            shared.retainAll(fromA.files().keySet());
-
-            assertFalse("this test needs the second writer to have segments the first did not: " + fromB.files().keySet(), onlyB.isEmpty());
-            assertFalse("and to share at least one name, which is what makes the mixture: " + shared, shared.isEmpty());
-
-            logger.info(
-                "two winners with different segments: the surviving commit names {}, of which {} are the second "
-                    + "writer's own uploads and {} are blobs the first writer put there",
-                fromB.files().keySet(),
-                onlyB,
-                shared
-            );
+            expectThrows(ForeignWriterException.class, () -> b.publishShard(onB, 1L));
 
             final var surviving = planeA.segmentPublisher("alpha", 0).readManifest().orElseThrow();
-            assertEquals("the second publish is the one that stands", fromB.files(), surviving.files());
+            assertEquals("the first writer's commit must be the one that stands", fromA.files(), surviving.files());
+            assertEquals("and it must be recorded as its writer's", a.localNode().getId(), surviving.writer());
+        }
+    }
+
+    /**
+     * A manifest written before writers were recorded is treated as "cannot tell", not as a mismatch.
+     *
+     * <p>Refusing every publish onto an older manifest would be a worse failure than the one the guard
+     * exists for: an upgrade would stop every shard in the deployment from publishing until somebody
+     * rewrote its manifests by hand. The guard is a defence against something that should be impossible,
+     * and a defence that breaks the ordinary case is not one.
+     */
+    public void testAManifestWithNoRecordedWriterDoesNotBlockPublishing() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final var store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (ServerlessNode a = new ServerlessNode(nodeSettings("dev-legacy"))) {
+            a.start();
+            final var onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
+            ShardOps.indexDoc(a.reconciler().shard(onA), "a1", "{\"msg\":\"aaa\"}");
+            a.reconciler().shard(onA).refresh("deviation");
+            a.publishShard(onA, 1L);
+
+            // Rewrite the manifest as an older build would have left it: a term and files, no writer.
+            final var published = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
+            final var legacy = new org.opensearch.serverless.store.CommitManifest(published.term(), published.files());
+            assertNull("the fixture must really have no writer", legacy.writer());
+            final var container = store.blobContainer(plane.shardData("alpha", 0));
+            final var existing = container.readRegister("manifest").orElseThrow();
+            assertTrue(container.compareAndSwapRegister("manifest", existing.generation(), legacy.toBytes()).applied());
+
+            // And publishing onto it still works.
+            ShardOps.indexDoc(a.reconciler().shard(onA), "a2", "{\"msg\":\"ddd\"}");
+            a.reconciler().shard(onA).refresh("deviation");
+            final var again = a.publishShard(onA, 1L);
+            assertEquals("the publish must have been allowed and recorded its writer", a.localNode().getId(), again.writer());
         }
     }
 }
