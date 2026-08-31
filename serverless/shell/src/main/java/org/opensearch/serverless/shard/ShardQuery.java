@@ -127,8 +127,19 @@ public final class ShardQuery {
     private static List<SearchHit> withScores(
         SearchHit[] hits,
         org.apache.lucene.search.ScoreDoc[] scoreDocs,
-        org.opensearch.search.DocValueFormat[] sortFormats
+        org.opensearch.search.DocValueFormat[] sortFormats,
+        ShardId shardId
     ) {
+        for (SearchHit hit : hits) {
+            // Which shard, and therefore which index, this hit came from.
+            //
+            // A fetched hit does not know: SearchHit's index field is transient and is set from the shard
+            // target, which a full search sets during the fetch phase and this does not. It did not matter
+            // while a search covered one index, because the handler could name it from the request. It does
+            // now, and telling a caller that a hit from logs-b came from "logs-a,logs-b" would be a lie
+            // that reads like a formatting detail.
+            hit.shard(new org.opensearch.search.SearchShardTarget(null, shardId, null, OriginalIndices.NONE));
+        }
         for (int i = 0; i < hits.length && i < scoreDocs.length; i++) {
             hits[i].score(scoreDocs[i].score);
             // And its sort values, when the query was sorted. Lucene hands each hit's sort keys back on the
@@ -197,7 +208,7 @@ public final class ShardQuery {
             ? queryResult.queryResult().consumeAggs().expand()
             : null;
         if (queryResult.fetchResult() != null && queryResult.fetchResult().hits() != null) {
-            return new Result(total, withScores(queryResult.fetchResult().hits().getHits(), scoreDocs, sortFormats), aggregations);
+            return new Result(total, withScores(queryResult.fetchResult().hits().getHits(), scoreDocs, sortFormats, shardId), aggregations);
         }
 
         final List<Integer> docIds = new ArrayList<>();
@@ -213,7 +224,7 @@ public final class ShardQuery {
         try {
             final PlainActionFuture<FetchSearchResult> fetchFuture = PlainActionFuture.newFuture();
             searchService.executeFetchPhase(new ShardFetchRequest(queryResult.getContextId(), docIds, null), task, fetchFuture);
-            return new Result(total, withScores(fetchFuture.actionGet().hits().getHits(), scoreDocs, sortFormats), aggregations);
+            return new Result(total, withScores(fetchFuture.actionGet().hits().getHits(), scoreDocs, sortFormats, shardId), aggregations);
         } finally {
             // The reader is pinned until this runs; leaking one keeps a commit's files alive forever.
             searchService.freeReaderContext(queryResult.getContextId());

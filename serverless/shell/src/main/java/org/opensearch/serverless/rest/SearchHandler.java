@@ -141,13 +141,42 @@ public final class SearchHandler extends BaseRestHandler {
             );
         }
 
-        final Optional<IndexDescriptor> descriptor = metadata.describe(index);
-        if (descriptor.isEmpty()) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index)
-            );
+        // Several indices, named one by one.
+        //
+        // A comma-separated list is resolved by looking each name up, which costs one register read per
+        // name and no listing. A pattern is not, and cannot be: resolving `logs-*` means enumerating the
+        // deployment's indices, which is the operation §6.3 refuses on a request path and the reason
+        // RefusingIndexNameExpressionResolver exists. Refusing it here, by name, is better than a wildcard
+        // that quietly matched only the indices this node happened to know about.
+        final java.util.List<String> names = java.util.List.of(index.split(",", -1));
+        for (String name : names) {
+            if (name.isEmpty() || name.indexOf('*') >= 0 || name.indexOf('?') >= 0) {
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.NOT_IMPLEMENTED,
+                        "unsupported_search",
+                        "index patterns are not supported: matching ["
+                            + name
+                            + "] would mean enumerating every index in the deployment, which this system "
+                            + "does not offer on a request path. Name the indices you want."
+                    )
+                );
+            }
         }
-        final int shards = descriptor.get().numberOfShards();
+        final java.util.LinkedHashMap<String, Integer> indices = new java.util.LinkedHashMap<>();
+        for (String name : names) {
+            final Optional<IndexDescriptor> found = metadata.describe(name);
+            if (found.isEmpty()) {
+                // Refused rather than skipped. A search over three indices where one does not exist and
+                // the answer comes back looking complete is the confident empty answer this surface exists
+                // to avoid.
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name)
+                );
+            }
+            indices.put(name, found.get().numberOfShards());
+        }
 
         // Membership is the address book and the placement input, so refresh once per search rather
         // than per shard.
@@ -162,7 +191,7 @@ public final class SearchHandler extends BaseRestHandler {
         // connection, which surfaces to the client as RST_STREAM rather than as anything diagnosable.
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                respond(channel, serving, metadata, index, source, shards);
+                respond(channel, serving, metadata, indices, source);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -223,7 +252,7 @@ public final class SearchHandler extends BaseRestHandler {
      */
     private static <T> T gated(
         ServerlessNode serving,
-        String index,
+        java.util.Collection<String> indices,
         SearchSourceBuilder source,
         org.opensearch.common.CheckedSupplier<T, Exception> work
     ) throws IOException {
@@ -231,7 +260,9 @@ public final class SearchHandler extends BaseRestHandler {
             return serving.actionGate()
                 .run(
                     org.opensearch.action.search.SearchAction.NAME,
-                    new org.opensearch.action.search.SearchRequest(new String[] { index }, source),
+                    // Every index the search covers, so a filter evaluating privileges sees all of them
+                    // rather than the first one named.
+                    new org.opensearch.action.search.SearchRequest(indices.toArray(new String[0]), source),
                     work
                 );
         } catch (IOException | RuntimeException e) {
@@ -245,13 +276,12 @@ public final class SearchHandler extends BaseRestHandler {
         org.opensearch.rest.RestChannel channel,
         ServerlessNode serving,
         MetadataPlane metadata,
-        String index,
-        SearchSourceBuilder source,
-        int shards
+        java.util.Map<String, Integer> indices,
+        SearchSourceBuilder source
     ) throws IOException {
         // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
         // fan-out rather than going through ShardOperations, so the gate has to meet it where it works.
-        final var outcome = gated(serving, index, source, () -> SearchFanout.run(serving, metadata, index, shards, source));
+        final var outcome = gated(serving, indices.keySet(), source, () -> SearchFanout.run(serving, metadata, indices, source));
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.startObject("_shards");
@@ -269,7 +299,10 @@ public final class SearchHandler extends BaseRestHandler {
             builder.startArray("hits");
             for (SearchHit hit : outcome.hits()) {
                 builder.startObject();
-                builder.field("_index", index);
+                // The hit's own index, not the request's: a search over several indices returns hits from
+                // several, and telling a caller they all came from the first one named would be a lie that
+                // reads like a formatting detail.
+                builder.field("_index", hit.getIndex() == null ? String.join(",", indices.keySet()) : hit.getIndex());
                 builder.field("_id", hit.getId());
                 if (Float.isNaN(hit.getScore()) == false) {
                     builder.field("_score", hit.getScore());

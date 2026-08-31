@@ -52,6 +52,34 @@ public final class SearchFanout {
         int shards,
         SearchSourceBuilder source
     ) throws IOException {
+        return run(serving, metadata, java.util.Map.of(index, shards), source);
+    }
+
+    /**
+     * Runs one search across every shard of several indices and merges the answers.
+     *
+     * <p><b>One fan-out, not one per index.</b> Searching three indices of two shards each is six shards
+     * asked at once, not three searches run in sequence and stitched — which is the difference between a
+     * latency of the slowest shard and a latency of the sum. It also means the window is cut once, over
+     * everything, so page two of a search over three indices is the same page two it would be over one.
+     *
+     * <p>Coverage is reported over the whole set: {@code _shards.total} is every shard of every index
+     * asked for, so a caller can still tell a complete answer from one computed over part of it, which is
+     * the only reason those numbers are in the response.
+     *
+     * @param serving the node coordinating the search
+     * @param metadata the metadata plane
+     * @param indices each index and how many shards it has
+     * @param source the query, with its own from and size
+     * @return what was found and how completely
+     * @throws IOException if the search fails outright
+     */
+    public static ShardOperations.SearchOutcome run(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        java.util.Map<String, Integer> indices,
+        SearchSourceBuilder source
+    ) throws IOException {
         final int from = Math.max(0, source.from());
         final int size = Math.max(0, source.size());
         // What each shard is asked for. A shard cannot know how its hits rank against another's, so it
@@ -64,17 +92,22 @@ public final class SearchFanout {
         // query's latency was the sum of its shards rather than the slowest of them -- and the shape of
         // the loop was the only reason. Each task answers for exactly one shard and swallows nothing: a
         // shard that cannot be reached comes back null and shows up in the coverage this already reports.
-        final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>(shards);
-        for (int shard = 0; shard < shards; shard++) {
-            final int number = shard;
-            tasks.add(() -> askOneShard(serving, metadata, index, number, perShard));
+        int shards = 0;
+        final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>();
+        for (java.util.Map.Entry<String, Integer> index : indices.entrySet()) {
+            for (int shard = 0; shard < index.getValue(); shard++) {
+                final int number = shard;
+                final String name = index.getKey();
+                tasks.add(() -> askOneShard(serving, metadata, name, number, perShard));
+                shards++;
+            }
         }
         final List<ShardAnswer> answers;
         try {
             answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), Fanout.DEFAULT_CONCURRENCY, tasks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IOException("interrupted while searching " + index, e);
+            throw new IOException("interrupted while searching " + indices.keySet(), e);
         }
 
         long total = 0;
