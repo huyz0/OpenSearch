@@ -46,6 +46,11 @@ shards held for them; and sweeps the garbage left by what it has just published.
 blob has been unreferenced across two passes, because a reader may still be reading it — the grace is what
 makes running the collector on a schedule different from running it by hand.
 
+**Identity across a hop.** A thread-context header a plugin sets travels with a forwarded write and
+arrives on the node that owns the shard — core's own mechanism, the one the security plugin uses to move an
+authenticated user between nodes. What does not happen is the receiving node running the action filters
+again: the decision belongs to the node the request reached.
+
 **TLS on the transport, from a plugin.** A plugin supplies a `SecureSettingsFactory`, the shell passes it
 to the network module, and core's own `SecureNetty4Transport` carries the traffic — proved by a write
 forwarded between two nodes over a real handshake. The shell had been passing an empty collection here, so
@@ -97,9 +102,10 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 **Open, and mine to do:**
 
-- Node-to-node forwarding carries no *caller* identity, so filters run on the coordinating node only. With
-  mutual TLS the peer is authenticated as a node, which is what would make propagating a caller's identity
-  safe; nothing does it yet.
+- Filters run once, on the node the request reached, and not again on the node a write is forwarded to.
+  That is a design choice — re-running every filter per hop would make one that counts or rate-limits wrong
+  — but it does mean a plugin cannot enforce at the shard. (A caller *does* travel: a thread-context header
+  set by a plugin arrives on the far side, which is core's own mechanism and is tested.)
 - A plugin's action runs on the node the request reached: nothing forwards one, and no identity crosses a
   transport hop, so an action that must run somewhere particular cannot ask.
 - A point in time is node-local once opened: the record is in the object store and any node can serve it,
@@ -136,7 +142,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-316 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+317 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against a
 live MinIO) — none skipped.
 
