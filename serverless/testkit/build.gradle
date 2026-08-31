@@ -36,6 +36,31 @@ tasks.named('test').configure {
   exclude '**/ServerlessOnObjectStoreTests.class'
   exclude '**/ServerlessBucketContentionTests.class'
   exclude '**/ServerlessCostTests.class'
+  exclude '**/ServerlessRealPluginTests.class'
+}
+
+/*
+ * Installing a real, assembled plugin.
+ *
+ * analysis-icu is chosen for what it drags with it: a 14MB icu4j and a Lucene analysis jar, so the loader
+ * is exercised on a plugin that brings dependencies rather than on a single class a test compiled. It is
+ * also an AnalysisPlugin, so the test can prove the shell honours an extension point rather than merely
+ * loading something.
+ *
+ * Its own task because it reads that zip out of the build tree, which the test framework's security
+ * manager denies -- rightly, since reading build artefacts is not something a node does. One test loses
+ * the filter rather than the whole module.
+ *
+ * The distributions directory rather than the task's output file: reaching across projects for a task
+ * output couples configuration in a way Gradle keeps making harder, and the test globs for the zip anyway.
+ */
+tasks.register('pluginTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/ServerlessRealPluginTests.class'
+  dependsOn ':plugins:analysis-icu:bundlePlugin'
+  systemProperty 'tests.serverless.plugin.dist', project(':plugins:analysis-icu').projectDir.toString() + '/build/distributions'
+  systemProperty 'tests.security.manager', 'false'
 }
 
 // R11 against a real S3 API. Its own task because it needs a running endpoint and because the AWS SDK v2
@@ -74,6 +99,7 @@ tasks.register('processTest', Test) {
 
 tasks.named('check').configure {
   dependsOn 'processTest'
+  dependsOn 'pluginTest'
   // Safe to always depend on: with no endpoint reachable the tests assume-skip rather than fail, so a
   // developer without a container gets a loud skip instead of a red build.
   dependsOn 's3Test'

@@ -399,18 +399,17 @@ public final class ServerlessNode implements Closeable {
 
     private IndicesService buildIndicesService(Environment environment, ClusterSettings clusterSettings) throws Exception {
         final NamedXContentRegistry xContentRegistry = new NamedXContentRegistry(Collections.emptyList());
-        final AnalysisRegistry analysisRegistry = new AnalysisRegistry(
+        // Core's AnalysisModule rather than a hand-built empty registry.
+        //
+        // Loading a plugin and then ignoring what it declares is not hosting it. An AnalysisPlugin's whole
+        // contribution is its tokenizers, filters and analyzers, and they arrive through exactly this
+        // constructor; passing an empty list meant an installed analysis plugin loaded, logged, and did
+        // nothing. The empty registry also had a second cost nobody had noticed: it left out core's own
+        // built-in analyzers, which AnalysisModule registers as a matter of course.
+        final AnalysisRegistry analysisRegistry = new org.opensearch.indices.analysis.AnalysisModule(
             environment,
-            emptyMap(),
-            emptyMap(),
-            emptyMap(),
-            emptyMap(),
-            emptyMap(),
-            emptyMap(),
-            emptyMap(),
-            emptyMap(),
-            emptyMap()
-        );
+            pluginsService.filterPlugins(org.opensearch.plugins.AnalysisPlugin.class)
+        ).getAnalysisRegistry();
         // S0/F2: mandatory — DataFormatRegistry calls filterPlugins() during construction. It is now the
         // real one rather than an empty stub, so an installed plugin gets onIndexModule like it would on a
         // classic node.
@@ -421,13 +420,13 @@ public final class ServerlessNode implements Closeable {
             xContentRegistry,
             analysisRegistry,
             new IndexNameExpressionResolver(new ThreadContext(settings)),
-            new IndicesModule(Collections.emptyList()).getMapperRegistry(),
+            new IndicesModule(pluginsService.filterPlugins(org.opensearch.plugins.MapperPlugin.class)).getMapperRegistry(),
             new NamedWriteableRegistry(Collections.emptyList()),
             threadPool,
             new IndexScopedSettings(settings, IndexScopedSettings.BUILT_IN_INDEX_SETTINGS),
             new NoneCircuitBreakerService(),
             BigArrays.NON_RECYCLING_INSTANCE,
-            new ScriptService(settings, emptyMap(), emptyMap()),
+            scriptService(),
             clusterService,
             null,                                   // Client — no node client in phase 1
             new MetaStateService(nodeEnvironment, xContentRegistry),
@@ -1309,7 +1308,12 @@ public final class ServerlessNode implements Closeable {
      */
     private synchronized org.opensearch.search.SearchModule searchModule() {
         if (searchModule == null) {
-            searchModule = new org.opensearch.search.SearchModule(settings, java.util.List.of());
+            // A SearchPlugin's queries, aggregations and suggesters come in here. Same argument as
+            // analysis: a plugin whose extension point is ignored has not been hosted.
+            searchModule = new org.opensearch.search.SearchModule(
+                settings,
+                pluginsService.filterPlugins(org.opensearch.plugins.SearchPlugin.class)
+            );
         }
         return searchModule;
     }
@@ -1333,6 +1337,69 @@ public final class ServerlessNode implements Closeable {
     private volatile org.opensearch.core.xcontent.NamedXContentRegistry searchRegistry;
 
     private volatile ServerlessClient client;
+
+    private volatile org.opensearch.watcher.ResourceWatcherService resourceWatcherService;
+    private volatile org.opensearch.script.ScriptService scriptService;
+    private volatile org.opensearch.cluster.metadata.IndexNameExpressionResolver indexNameExpressionResolver;
+
+    /**
+     * The file watcher a plugin is given.
+     *
+     * <p>Real, and running. A plugin that keeps configuration on disk — the OpenSearch security plugin is
+     * the obvious one — watches it through this and reloads when it changes. The shell watches nothing
+     * itself, which was the excuse for passing null; a collaborator a plugin needs is not made unnecessary
+     * by the host not needing it.
+     *
+     * @return the watcher service
+     */
+    public synchronized org.opensearch.watcher.ResourceWatcherService resourceWatcherService() {
+        if (resourceWatcherService == null) {
+            resourceWatcherService = new org.opensearch.watcher.ResourceWatcherService(settings, threadPool);
+        }
+        return resourceWatcherService;
+    }
+
+    /**
+     * The script service a plugin is given: real, with no engines registered.
+     *
+     * <p>Scripting is not offered, and this is how to say so usefully. A plugin that compiles a script gets
+     * core's own "cannot compile: no lang registered" — the same error, in the same words, that a classic
+     * node gives when the language's module is not installed — rather than a {@code NullPointerException}
+     * from inside its own code. A plugin that merely holds the reference, as most do, is unaffected.
+     *
+     * @return the script service
+     */
+    public synchronized org.opensearch.script.ScriptService scriptService() {
+        if (scriptService == null) {
+            scriptService = new org.opensearch.script.ScriptService(settings, Map.of(), org.opensearch.script.ScriptModule.CORE_CONTEXTS);
+        }
+        return scriptService;
+    }
+
+    /**
+     * The named-writeable registry a plugin is given.
+     *
+     * <p>The node's own, the one its transport uses, rather than an empty one: a plugin deserialising a
+     * {@code QueryBuilder} it received has to look it up in the same registry that serialised it.
+     *
+     * @return the registry
+     */
+    public NamedWriteableRegistry namedWriteableRegistry() {
+        return new NamedWriteableRegistry(searchModule().getNamedWriteables());
+    }
+
+    /**
+     * The index-name resolver a plugin is given, which refuses rather than answering wrongly.
+     *
+     * @return the resolver
+     * @see RefusingIndexNameExpressionResolver
+     */
+    public synchronized org.opensearch.cluster.metadata.IndexNameExpressionResolver indexNameExpressionResolver() {
+        if (indexNameExpressionResolver == null) {
+            indexNameExpressionResolver = new RefusingIndexNameExpressionResolver(threadPool.getThreadContext());
+        }
+        return indexNameExpressionResolver;
+    }
 
     /**
      * Reports whether an index belongs to a plugin, and is therefore not reachable through REST.
@@ -1709,6 +1776,8 @@ public final class ServerlessNode implements Closeable {
         // that owned a thread pool leaked it out of every node, and the leak detector said so.
         IOUtils.closeWhileHandlingException(httpServerTransport);
         ServerlessPlugins.closeAll(plugins.plugins());
+        // After the plugins, because they were given these and may use them on the way out.
+        IOUtils.closeWhileHandlingException(resourceWatcherService, scriptService);
         IOUtils.closeWhileHandlingException(transportService, searchService, indicesService, clusterService, nodeEnvironment);
         ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
     }

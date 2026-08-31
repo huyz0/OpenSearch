@@ -10,6 +10,7 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.ShardAssignment;
 import org.opensearch.serverless.metadata.Acquisition;
@@ -240,5 +241,56 @@ public class MetadataPlaneTests extends OpenSearchTestCase {
         assertEquals(head.term(), parsed.term());
         assertEquals(head.ownerNodeId(), parsed.ownerNodeId());
         assertEquals(head.leaseExpiresAtMillis(), parsed.leaseExpiresAtMillis());
+    }
+
+    /**
+     * A descriptor carries list-valued settings, which is most of what analysis configuration is.
+     *
+     * <p>It did not until an installed analysis plugin proved it. Settings were written as flat key-to-
+     * string pairs, and {@code Settings.get} on a list returns its bracketed {@code toString}, so a filter
+     * chain of {@code [icu_folding]} came back as one filter literally named {@code "[icu_folding]"} and
+     * the analyzer failed to build. Every custom analyzer has a {@code filter} list, so this ruled out
+     * configuring an analysis plugin at all — the entire reason to install one.
+     */
+    public void testADescriptorCarriesListValuedSettings() throws Exception {
+        final Settings settings = Settings.builder()
+            .put("index.analysis.analyzer.folded.type", "custom")
+            .put("index.analysis.analyzer.folded.tokenizer", "standard")
+            .putList("index.analysis.analyzer.folded.filter", "lowercase", "asciifolding")
+            .build();
+        final IndexDescriptor original = new IndexDescriptor("listy", "uuid-listy-000000000", 1, "{\"properties\":{}}", settings);
+
+        final IndexDescriptor read = IndexDescriptor.fromStream(
+            new java.io.ByteArrayInputStream(org.opensearch.core.common.bytes.BytesReference.toBytes(original.toBytes()))
+        );
+
+        assertEquals(
+            "a filter chain must survive the round trip as a list, not as its own toString",
+            java.util.List.of("lowercase", "asciifolding"),
+            read.extraSettings().getAsList("index.analysis.analyzer.folded.filter")
+        );
+        assertEquals("custom", read.extraSettings().get("index.analysis.analyzer.folded.type"));
+        // And it must reach the metadata the data plane is actually given, not merely the descriptor.
+        assertEquals(
+            java.util.List.of("lowercase", "asciifolding"),
+            read.toIndexMetadata(java.util.Map.of()).getSettings().getAsList("index.analysis.analyzer.folded.filter")
+        );
+    }
+
+    /**
+     * Descriptors written by the older flat form still parse.
+     *
+     * <p>The fix changed how settings are written. A register holding what the previous version wrote is
+     * not a hypothetical — it is every deployment that already exists — so the reader has to take both.
+     */
+    public void testADescriptorWrittenInTheOlderFlatFormStillParses() throws Exception {
+        final String flat = "{\"name\":\"old\",\"uuid\":\"uuid-old-00000000000\",\"number_of_shards\":2,"
+            + "\"mapping\":\"{}\",\"settings\":{\"index.refresh_interval\":\"5s\"}}";
+        final IndexDescriptor read = IndexDescriptor.fromStream(
+            new java.io.ByteArrayInputStream(flat.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        );
+        assertEquals("old", read.name());
+        assertEquals(2, read.numberOfShards());
+        assertEquals("5s", read.extraSettings().get("index.refresh_interval"));
     }
 }

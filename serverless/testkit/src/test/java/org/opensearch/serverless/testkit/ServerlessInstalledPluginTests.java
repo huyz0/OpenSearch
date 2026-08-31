@@ -49,6 +49,14 @@ import java.util.stream.Stream;
  *
  * <p><b>D5:</b> no object store is involved.
  */
+/*
+ * ExtrasFS, the test framework's mock filesystem, plants a stray entry in every directory it creates --
+ * including this test's plugins/ directory. Core then finds a directory there with no descriptor and
+ * refuses to start, which is exactly the behaviour testAnIncompleteInstallationIsRefused asserts and
+ * exactly what we do not want randomly injected. Core's own PluginsServiceTests suppresses it for the
+ * same reason.
+ */
+@org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems("ExtrasFS")
 public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
 
     private static final String PLUGIN_PACKAGE = "org.opensearch.serverless.installed";

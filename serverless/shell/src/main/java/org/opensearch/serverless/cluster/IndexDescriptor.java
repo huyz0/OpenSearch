@@ -22,7 +22,6 @@ import org.opensearch.indices.replication.common.ReplicationType;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -186,10 +185,19 @@ public final class IndexDescriptor {
             if (mapping != null) {
                 builder.field("mapping", mapping);
             }
+            // Core's own settings serialization, rather than a flat key-to-string loop.
+            //
+            // The loop could not carry a list. Settings.get(key) on a list-valued setting returns its
+            // bracketed toString, so `filter: [icu_folding]` came back as one filter literally named
+            // "[icu_folding]" and the analyzer failed to build. Analysis configuration is mostly lists --
+            // filter, char_filter, stopwords -- so that ruled out configuring an analysis plugin at all,
+            // which is exactly what an installed analysis plugin is for. Found by installing one.
+            //
+            // Reading is symmetric and also accepts what the old loop wrote: Settings.fromXContent takes
+            // flat dotted keys as happily as nested objects, so descriptors already in a register parse
+            // unchanged.
             builder.startObject("settings");
-            for (String key : extraSettings.keySet()) {
-                builder.field(key, extraSettings.get(key));
-            }
+            extraSettings.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
             builder.endObject();
             builder.endObject();
             return BytesReference.bytes(builder);
@@ -212,22 +220,14 @@ public final class IndexDescriptor {
             String uuid = null;
             String mapping = null;
             int shards = -1;
-            final Map<String, String> settings = new LinkedHashMap<>();
+            Settings parsedSettings = Settings.EMPTY;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
                 if (token == XContentParser.Token.FIELD_NAME) {
                     field = parser.currentName();
                 } else if (token == XContentParser.Token.START_OBJECT && "settings".equals(field)) {
-                    String settingKey = null;
-                    XContentParser.Token inner;
-                    while ((inner = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
-                        if (inner == XContentParser.Token.FIELD_NAME) {
-                            settingKey = parser.currentName();
-                        } else if (inner.isValue() && settingKey != null) {
-                            settings.put(settingKey, parser.text());
-                        }
-                    }
+                    parsedSettings = Settings.fromXContent(parser);
                 } else if (token.isValue()) {
                     switch (field == null ? "" : field) {
                         case "name" -> name = parser.text();
@@ -243,9 +243,7 @@ public final class IndexDescriptor {
             if (name == null || uuid == null || shards < 1) {
                 throw new IOException("malformed index descriptor: missing a required field");
             }
-            final Settings.Builder extra = Settings.builder();
-            settings.forEach(extra::put);
-            return new IndexDescriptor(name, uuid, shards, mapping, extra.build());
+            return new IndexDescriptor(name, uuid, shards, mapping, parsedSettings);
         }
     }
 

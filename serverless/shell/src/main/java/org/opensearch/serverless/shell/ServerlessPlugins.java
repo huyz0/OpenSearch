@@ -95,6 +95,14 @@ public final class ServerlessPlugins {
      * rather than being skipped: a security plugin that failed to load its configuration and was quietly
      * ignored would leave a node serving without the thing it was installed to enforce.
      *
+     * <p><b>The collaborators are real now.</b> Four of these used to be {@code null}, which meant a plugin
+     * that touched one got a {@code NullPointerException} from inside its own code with nothing to say what
+     * was missing. Three are genuine — a running {@code ResourceWatcherService}, a {@code ScriptService}
+     * with no engines, and the node's {@code NamedWriteableRegistry}. The fourth cannot be genuine and is
+     * therefore explicit: see {@link RefusingIndexNameExpressionResolver}. Only the
+     * {@code RepositoriesService} supplier still yields null, because snapshots are out of scope (R7) and a
+     * supplier that returns nothing is at least a supplier that can be called.
+     *
      * @param node the node the plugins are running in
      * @param environment the node environment
      * @throws Exception if any plugin fails to start
@@ -106,13 +114,13 @@ public final class ServerlessPlugins {
                     node.client(),
                     node.clusterService(),
                     node.threadPool(),
-                    null,                                   // ResourceWatcherService: the shell watches no files
-                    null,                                   // ScriptService: scripting is not offered
+                    node.resourceWatcherService(),
+                    node.scriptService(),
                     node.searchXContentRegistry(),
                     environment,
                     node.nodeEnvironment(),
-                    null,                                   // NamedWriteableRegistry: nothing here registers one
-                    null,                                   // IndexNameExpressionResolver: no wildcards to resolve
+                    node.namedWriteableRegistry(),
+                    node.indexNameExpressionResolver(),
                     () -> null                              // RepositoriesService: snapshots are out of scope (R7)
                 )
             );
