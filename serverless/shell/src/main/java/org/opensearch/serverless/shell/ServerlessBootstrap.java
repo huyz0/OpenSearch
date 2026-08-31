@@ -66,6 +66,9 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static final String IDLE_AFTER = "serverless.activation.idle_after_millis";
 
+    /** How long a shard must be unused before a node at its cap evicts it to take a new one. */
+    public static final String EVICT_AFTER = "serverless.activation.evict_after_millis";
+
     /**
      * How long writes are gathered before one publish covers them all. Exposed because it is the knob
      * that decides how much a crashed node leaves for its successor to replay from the log.
@@ -186,7 +189,8 @@ public final class ServerlessBootstrap implements Closeable {
             complete.getAsBoolean(ON_DEMAND, true)
         )
             .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
-            .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS));
+            .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))
+            .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS));
 
         final ReconcileScheduler scheduler = new ReconcileScheduler(
             loop,

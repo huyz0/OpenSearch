@@ -54,6 +54,14 @@ public final class BackgroundReconciler implements Closeable {
      */
     public static final int DEFAULT_MAX_SHARDS_HELD = 1000;
 
+    /**
+     * How long a shard must have gone unused before a node at its cap will evict it for a new one.
+     *
+     * <p>A minute: long enough that a busy shard is never taken from under a caller, short enough that a
+     * full node reshapes its working set within a request or two rather than waiting on the idle sweep.
+     */
+    public static final long DEFAULT_EVICT_AFTER_MILLIS = 60_000L;
+
     private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(BackgroundReconciler.class);
 
     private final ServerlessNode node;
@@ -65,6 +73,7 @@ public final class BackgroundReconciler implements Closeable {
     private final Set<ShardId> fenced = ConcurrentHashMap.newKeySet();
     private volatile boolean demandDriven;
     private volatile int maxShardsHeld = DEFAULT_MAX_SHARDS_HELD;
+    private volatile long evictAfterMillis = DEFAULT_EVICT_AFTER_MILLIS;
 
     /**
      * How long a shard may go unused before a node lets go of it, when idle release is enabled.
@@ -166,43 +175,20 @@ public final class BackgroundReconciler implements Closeable {
      * @return the shards released for idleness
      */
     public Set<ShardId> releaseIdle(long nowMillis) {
-        final Set<ShardId> letGo = new java.util.LinkedHashSet<>();
+        final Set<ShardId> letGoSet = new java.util.LinkedHashSet<>();
         if (idleAfterMillis <= 0) {
-            return letGo;
+            return letGoSet;
         }
         for (ShardId shardId : node.reconciler().openShards()) {
             final long lastUsed = node.reconciler().lastUsed(shardId).orElse(openedAt.getOrDefault(shardId, nowMillis));
             if (nowMillis - lastUsed < idleAfterMillis) {
                 continue;
             }
-            try {
-                if (node.reconciler().readerShards().contains(shardId)) {
-                    // A reader holds no head and no claim on anything. Closing it loses nothing at all.
-                    node.reconciler().releaseShard(shardId, "idle for " + (nowMillis - lastUsed) + "ms");
-                    letGo.add(shardId);
-                    continue;
-                }
-                final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
-                if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
-                    // Not ours any more; renewLeases will deal with it and this must not race it.
-                    continue;
-                }
-                node.publishShard(shardId, head.get().term());
-                if (plane.heads().release(shardId.getIndexName(), shardId.id(), node.localNode().getId()) == false) {
-                    // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
-                    // closing it while the head still points here is the one outcome to avoid.
-                    logger.warn("could not release the head for {} while idle; keeping it open", shardId);
-                    continue;
-                }
-                node.reconciler().releaseShard(shardId, "idle for " + (nowMillis - lastUsed) + "ms");
-                letGo.add(shardId);
-            } catch (Exception e) {
-                // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
-                // logged and retried on the next pass rather than propagated into the tick.
-                logger.warn("could not release idle shard " + shardId, e);
+            if (letGo(shardId, "idle for " + (nowMillis - lastUsed) + "ms")) {
+                letGoSet.add(shardId);
             }
         }
-        for (ShardId shardId : letGo) {
+        for (ShardId shardId : letGoSet) {
             openedAt.remove(shardId);
             // Stop trying to take it straight back. A demand-driven node re-acquires on the next write or
             // read for it, which is the point; a node that was told to want it keeps wanting it.
@@ -210,7 +196,112 @@ public final class BackgroundReconciler implements Closeable {
                 wanted.remove(Map.entry(shardId.getIndexName(), shardId.id()));
             }
         }
-        return letGo;
+        return letGoSet;
+    }
+
+    /**
+     * Gives up the least recently used shard, if one has been idle long enough to be worth giving up.
+     *
+     * <p><b>Why a node at its cap should evict rather than refuse.</b> The cap exists to bound what a node
+     * holds, not to decide which shards it holds. A node that reached it and then refused everything new
+     * would serve whatever it happened to acquire first for as long as it ran — the working set frozen at
+     * whatever arrived earliest, which is the opposite of what a demand-driven node is for.
+     *
+     * <p><b>Why there is a grace period, and why it is not zero.</b> Evicting the least recently used shard
+     * unconditionally means a node holding N+1 hot shards evicts one to serve another on every request, and
+     * spends its life opening and closing shards instead of answering. A shard is only given up if nobody
+     * has touched it for {@link #setEvictAfterMillis(long)} — so a full node whose shards are all in use
+     * still refuses, and that refusal is a real capacity signal rather than thrash.
+     *
+     * <p>Shorter than the idle threshold on purpose: idle release is housekeeping that can wait for a tick,
+     * and this is a request waiting for room now.
+     *
+     * @return true if a shard was released and there is room
+     */
+    private boolean makeRoom() {
+        if (evictAfterMillis <= 0) {
+            return false;
+        }
+        final long now = plane.clock().getAsLong();
+        ShardId victim = null;
+        long victimLastUsed = Long.MAX_VALUE;
+        for (ShardId shardId : node.reconciler().openShards()) {
+            final long lastUsed = node.reconciler().lastUsed(shardId).orElse(openedAt.getOrDefault(shardId, now));
+            if (now - lastUsed < evictAfterMillis) {
+                continue;
+            }
+            if (lastUsed < victimLastUsed) {
+                victim = shardId;
+                victimLastUsed = lastUsed;
+            }
+        }
+        if (victim == null) {
+            return false;
+        }
+        if (letGo(victim, "evicted to make room, unused for " + (now - victimLastUsed) + "ms") == false) {
+            return false;
+        }
+        openedAt.remove(victim);
+        if (demandDriven) {
+            wanted.remove(Map.entry(victim.getIndexName(), victim.id()));
+        }
+        logger.info("evicted {} to make room at the shard cap", victim);
+        return true;
+    }
+
+    /**
+     * Sets how long a shard must have gone unused before a full node will evict it to make room.
+     *
+     * @param evictAfterMillis the threshold, or 0 to refuse rather than evict
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setEvictAfterMillis(long evictAfterMillis) {
+        this.evictAfterMillis = evictAfterMillis;
+        return this;
+    }
+
+    /**
+     * Gives up one shard, in the only order that is safe.
+     *
+     * <p><b>Publish, then release the head, then close.</b> Publishing first is not what makes the data
+     * durable — the log already did that — it is what keeps a successor from having to replay more than it
+     * must. Releasing the head before closing is the part that matters: a node that closed a shard while
+     * the head still named it would answer 503 for a shard it had told the world it owns.
+     *
+     * <p>Shared by idle release and by eviction, because two copies of this sequence is two chances for one
+     * of them to get the order wrong.
+     *
+     * @param shardId the shard to give up
+     * @param reason why, for the log
+     * @return true if it was released
+     */
+    private boolean letGo(ShardId shardId, String reason) {
+        try {
+            if (node.reconciler().readerShards().contains(shardId)) {
+                // A reader holds no head and no claim on anything. Closing it loses nothing at all.
+                node.reconciler().releaseShard(shardId, reason);
+                return true;
+            }
+            final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+            if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
+                // Not ours any more; renewLeases will deal with it and this must not race it.
+                return false;
+            }
+            node.publishShard(shardId, head.get().term());
+            if (plane.heads().release(shardId.getIndexName(), shardId.id(), node.localNode().getId()) == false) {
+                // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
+                // closing it while the head still points here is the one outcome to avoid.
+                logger.warn("could not release the head for {}; keeping it open", shardId);
+                return false;
+            }
+            node.reconciler().releaseShard(shardId, reason);
+            return true;
+        } catch (Exception e) {
+            // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
+            // logged and retried on the next pass rather than propagated into the tick.
+            logger.warn("could not release shard " + shardId, e);
+            return false;
+        }
     }
 
     /**
@@ -301,11 +392,16 @@ public final class BackgroundReconciler implements Closeable {
         }
         final Set<ShardId> taken = new LinkedHashSet<>();
         for (Map.Entry<String, Integer> candidate : candidates) {
-            if (node.reconciler().openShards().size() >= maxShardsHeld) {
+            if (node.reconciler().openShards().size() >= maxShardsHeld && makeRoom() == false) {
                 // Refusing is a routing outcome, not an error. Saying so is the difference between a
                 // node that is full and a node that is broken, and only one of them should page anyone.
+                //
+                // And it now means something stronger than it used to: the node is full *and* every shard
+                // it holds has been used recently. Before, a node that reached the cap stayed at it until
+                // the idle sweep came round, refusing new shards while holding ones nobody had touched for
+                // minutes -- a cap that behaved like a permanent ceiling rather than a working set.
                 logger.info(
-                    "not taking {}[{}] on demand: already holding {} shards, the cap",
+                    "not taking {}[{}] on demand: holding {} shards, the cap, and all of them are in use",
                     candidate.getKey(),
                     candidate.getValue(),
                     maxShardsHeld
@@ -319,7 +415,15 @@ public final class BackgroundReconciler implements Closeable {
             if (alreadyHeld) {
                 continue;
             }
-            node.activateWriter(plane, candidate.getKey(), candidate.getValue()).ifPresent(taken::add);
+            node.activateWriter(plane, candidate.getKey(), candidate.getValue()).ifPresent(shardId -> {
+                taken.add(shardId);
+                // Its idle clock starts here, exactly as it does for a shard this node was told to want.
+                // It did not, and that was invisible while the only thing reading openedAt was idle
+                // release -- which mostly had a lastUsed to go on, because the request that caused the
+                // activation stamped one. A shard taken on demand and then never touched again had no age
+                // at all, so it could be neither released for idleness nor evicted for room.
+                openedAt.put(shardId, plane.clock().getAsLong());
+            });
         }
         return taken;
     }

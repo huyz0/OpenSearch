@@ -164,18 +164,46 @@ public final class SearchHandler extends BaseRestHandler {
                 );
             }
         }
+        // Whether a name that is not there is a mistake or an expectation.
+        //
+        // Refusing is the default and stays the default: a search over three indices where one does not
+        // exist, answering 200 and looking complete, is the confident empty answer this surface exists to
+        // avoid, and a typo is far more likely than an absence somebody planned for.
+        //
+        // But a caller searching yesterday's and today's index, on a day that has only just started, is
+        // saying something different — they know one of these may not exist yet and they mean it. That is
+        // exactly what ignore_unavailable means everywhere else, and refusing to offer it forces them to
+        // either guess or make two requests. It has to be asked for explicitly, which is what makes the
+        // distinction real rather than a default nobody chose.
+        final boolean ignoreUnavailable = request.paramAsBoolean("ignore_unavailable", false);
         final java.util.LinkedHashMap<String, Integer> indices = new java.util.LinkedHashMap<>();
+        final java.util.List<String> skipped = new java.util.ArrayList<>();
         for (String name : names) {
             final Optional<IndexDescriptor> found = metadata.describe(name);
             if (found.isEmpty()) {
-                // Refused rather than skipped. A search over three indices where one does not exist and
-                // the answer comes back looking complete is the confident empty answer this surface exists
-                // to avoid.
+                if (ignoreUnavailable) {
+                    skipped.add(name);
+                    continue;
+                }
                 return channel -> channel.sendResponse(
                     IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name)
                 );
             }
             indices.put(name, found.get().numberOfShards());
+        }
+        if (indices.isEmpty()) {
+            // Every name was absent. Answering 200 with no hits here would be the very thing the flag is
+            // not for: the caller allowed for *some* of their indices to be missing, not all of them, and
+            // an empty answer over nothing at all is indistinguishable from an empty answer over
+            // everything.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_FOUND,
+                    "index_not_found",
+                    "none of the indices named exist: " + String.join(", ", names)
+                )
+            );
         }
 
         // Membership is the address book and the placement input, so refresh once per search rather
@@ -191,7 +219,7 @@ public final class SearchHandler extends BaseRestHandler {
         // connection, which surfaces to the client as RST_STREAM rather than as anything diagnosable.
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                respond(channel, serving, metadata, indices, source);
+                respond(channel, serving, metadata, indices, skipped, source);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -291,6 +319,7 @@ public final class SearchHandler extends BaseRestHandler {
         ServerlessNode serving,
         MetadataPlane metadata,
         java.util.Map<String, Integer> indices,
+        java.util.List<String> skipped,
         SearchSourceBuilder source
     ) throws IOException {
         // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
@@ -306,6 +335,17 @@ public final class SearchHandler extends BaseRestHandler {
             // Stated, not implied. A caller reading only "total" would otherwise have no way to tell a
             // complete answer from one computed over a fraction of the index.
             builder.field("complete", outcome.complete());
+            if (skipped.isEmpty() == false) {
+                // Named, not merely counted. A caller who asked to ignore what is missing still has to be
+                // able to tell which of their indices this answer does not cover -- otherwise the flag
+                // turns a visible absence into an invisible one, which is worse than the refusal it
+                // replaced.
+                builder.startArray("skipped");
+                for (String name : skipped) {
+                    builder.value(name);
+                }
+                builder.endArray();
+            }
             builder.startObject("hits");
             builder.startObject("total");
             builder.field("value", outcome.total());

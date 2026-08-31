@@ -164,6 +164,60 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * {@code ignore_unavailable} lets a caller say they expect an index to be missing — and names what was.
+     *
+     * <p>Refusing stays the default, because a typo is far more likely than an absence somebody planned for
+     * and a search that answers 200 while covering two of the three indices asked for is the confident
+     * empty answer this surface exists to avoid. Somebody searching yesterday's and today's index on a day
+     * that has only just started is saying something different, and the flag is how they say it.
+     *
+     * <p><b>What is skipped is named in the answer.</b> A flag that turned a visible absence into an
+     * invisible one would be worse than the refusal it replaced: the caller allowed for a gap, they did not
+     * ask to be unable to see it.
+     */
+    public void testIgnoreUnavailableSkipsWhatIsMissingAndSaysWhat() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("today", "uuid-today-00000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-ignore"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "today");
+            assertEquals(201, send(node, "PUT", "/today/_doc/1?refresh=true", body(1)).status());
+
+            // Without the flag, unchanged.
+            assertEquals(404, send(node, "POST", "/today,yesterday/_search", "{\"query\":{\"match_all\":{}}}").status());
+
+            final Response ignored = send(
+                node,
+                "POST",
+                "/today,yesterday/_search?ignore_unavailable=true",
+                "{\"query\":{\"match_all\":{}}}"
+            );
+            assertEquals(ignored.body(), 200, ignored.status());
+            assertTrue("the index that exists is searched: " + ignored.body(), ignored.body().contains("\"value\":1"));
+            assertEquals("and only its shards are counted: " + ignored.body(), 1, shardTotal(ignored.body()));
+            assertTrue("and the one that does not is named: " + ignored.body(), ignored.body().contains("\"skipped\":[\"yesterday\"]"));
+
+            // Nothing skipped, nothing said. A field that appeared on every answer would be noise.
+            assertFalse(send(node, "POST", "/today/_search", "{\"query\":{\"match_all\":{}}}").body().contains("skipped"));
+
+            // And the flag does not extend to "none of them exist": the caller allowed for a gap, not for
+            // the whole thing to be missing, and an empty answer over nothing is indistinguishable from an
+            // empty answer over everything.
+            final Response allMissing = send(
+                node,
+                "POST",
+                "/gone,also-gone/_search?ignore_unavailable=true",
+                "{\"query\":{\"match_all\":{}}}"
+            );
+            assertEquals("every name absent must still be refused: " + allMissing.body(), 404, allMissing.status());
+            assertTrue(allMissing.body().contains("none of the indices named exist"));
+        }
+    }
+
     private MetadataPlane plane(AtomicLong clock) throws java.io.IOException {
         return new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
     }
