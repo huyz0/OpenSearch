@@ -46,6 +46,55 @@ public final class ShardOperations {
         this.plane = plane;
     }
 
+    /**
+     * What this request has already looked up.
+     *
+     * <p><b>Scoped to the request because this object is.</b> One of these is built per REST request and per
+     * client call, so memoising inside it is memoising for exactly as long as it is safe to: a multi-get of
+     * ten documents in one index read that index's descriptor ten times, and each shard's head once per
+     * document that landed on it. Measurement made that visible — ten documents fetched singly cost thirty
+     * object-store requests and the same ten as one multi-get cost twenty, which is batching that does not
+     * batch the part that matters.
+     *
+     * <p><b>What it costs is freshness within one request, and that changes nothing.</b> A shard-head read
+     * at the start of a request can be stale by the end of it whether or not it was read again — routing is
+     * a moment in time, and every caller of this already handles being wrong about the owner. Reading it
+     * twice narrows no window; it only pays twice for the same answer.
+     *
+     * <p>{@code computeIfAbsent} rather than check-then-put, so two items for the same index cannot both
+     * pay: the second blocks on the first rather than racing it, which makes the saving a number rather
+     * than a likelihood.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, Optional<IndexDescriptor>> described =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, Optional<String>> owners = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private Optional<IndexDescriptor> describeOnce(String index) throws IOException {
+        return once(described, index, () -> plane.describe(index));
+    }
+
+    private Optional<String> ownerOnce(String index, int shard) throws IOException {
+        return once(owners, index + "#" + shard, () -> plane.heads().read(index, shard).map(head -> head.ownerNodeId()));
+    }
+
+    private static <T> T once(
+        java.util.concurrent.ConcurrentHashMap<String, T> cache,
+        String key,
+        org.opensearch.common.CheckedSupplier<T, IOException> read
+    ) throws IOException {
+        try {
+            return cache.computeIfAbsent(key, ignored -> {
+                try {
+                    return read.get();
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            });
+        } catch (java.io.UncheckedIOException e) {
+            throw e.getCause();
+        }
+    }
+
     /** The index named does not exist. */
     public static final class NoSuchIndexException extends IOException {
 
@@ -165,7 +214,7 @@ public final class ShardOperations {
      * @throws NoSuchIndexException if the index does not exist
      */
     public Placement place(String index, String id) throws IOException {
-        final Optional<IndexDescriptor> descriptor = plane.describe(index);
+        final Optional<IndexDescriptor> descriptor = describeOnce(index);
         if (descriptor.isEmpty()) {
             throw new NoSuchIndexException(index);
         }
@@ -177,7 +226,7 @@ public final class ShardOperations {
             .filter(s -> node.reconciler().readerShards().contains(s) == false)
             .findFirst()
             .orElse(null);
-        final String owner = plane.heads().read(index, shard).map(h -> h.ownerNodeId()).orElse(null);
+        final String owner = ownerOnce(index, shard).orElse(null);
         return new Placement(local, shard, owner);
     }
 
@@ -463,7 +512,7 @@ public final class ShardOperations {
             org.opensearch.action.search.SearchAction.NAME,
             new org.opensearch.action.search.SearchRequest(new String[] { index }, source),
             () -> {
-                final IndexDescriptor descriptor = plane.describe(index).orElseThrow(() -> new NoSuchIndexException(index));
+                final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
                 return org.opensearch.serverless.rest.SearchFanout.run(node, plane, index, descriptor.numberOfShards(), source);
             }
         );

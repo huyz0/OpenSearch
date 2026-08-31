@@ -678,27 +678,40 @@ public class ServerlessCostTests extends OpenSearchTestCase {
 
             store.reset();
             startedAt = System.nanoTime();
-            final Response batched = post(
-                writer,
-                "/alpha/_mget",
-                "{\"ids\":[\"0\",\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\"]}"
-            );
+            final Response batched = post(writer, "/alpha/_mget", ids(10));
             final long tenTogether = store.impliedS3Requests();
             final long tenTogetherMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
             assertEquals(batched.body(), 200, batched.status());
             assertFalse("every document must have been found: " + batched.body(), batched.body().contains("\"found\":false"));
+
+            // Twice as many documents, from the same three shards.
+            store.reset();
+            final Response twice = post(writer, "/alpha/_mget", ids(20));
+            final long twentyTogether = store.impliedS3Requests();
+            assertEquals(twice.body(), 200, twice.status());
+            assertFalse("and all of those found too: " + twice.body(), twice.body().contains("\"found\":false"));
+
             logger.info(
-                "cost[{}]: ten documents singly -> {} requests {}ms; the same ten as one multi-get -> {} requests {}ms",
+                "cost[{}]: ten documents singly -> {} requests {}ms; ten as one multi-get -> {} requests {}ms; "
+                    + "twenty as one multi-get -> {} requests",
                 label,
                 tenSingly,
                 tenSinglyMillis,
                 tenTogether,
-                tenTogetherMillis
+                tenTogetherMillis,
+                twentyTogether
             );
-            assertTrue(
-                "on " + label + ", a multi-get must not cost more than the same documents fetched one at a time",
-                tenTogether <= tenSingly
+
+            // The property, not the number: a batch's routing cost is the shards it touches, not the
+            // documents it asks for. Ten documents in one index used to read that index's descriptor ten
+            // times over; asserting the constant here would pin a number that may legitimately change,
+            // while asserting that twenty cost what ten cost pins the shape.
+            assertEquals(
+                "on " + label + ", a multi-get's cost must not grow with the number of documents in it",
+                tenTogether,
+                twentyTogether
             );
+            assertTrue("on " + label + ", and must be well below fetching them one at a time", tenTogether * 2 < tenSingly);
 
             // 3. Forwarded: a peer while the writer still owns the shard.
             try (ServerlessNode idle = new ServerlessNode(nodeSettings("cost-get-fwd-" + label))) {
@@ -895,6 +908,15 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 );
             }
         }
+    }
+
+    /** A multi-get body naming the first {@code count} documents. */
+    private static String ids(int count) {
+        final StringBuilder body = new StringBuilder("{\"ids\":[");
+        for (int i = 0; i < count; i++) {
+            body.append(i == 0 ? "" : ",").append('"').append(i).append('"');
+        }
+        return body.append("]}").toString();
     }
 
     private static ShardId shardOf(ServerlessNode node, String index, int i) {
