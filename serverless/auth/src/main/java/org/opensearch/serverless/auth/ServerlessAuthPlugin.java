@@ -179,12 +179,23 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
     }
 
     /**
-     * Creates the plugin with an injectable clock, for tests that age the credential cache.
+     * Creates the plugin with a clock of the caller's choosing, so a test can age the credential cache
+     * without sleeping through its TTL.
+     *
+     * <p><b>A factory rather than a second constructor, and that is not a style preference.</b> Core's
+     * loader refuses a plugin class with more than one public constructor — {@code loadPlugin} throws "no
+     * unique public constructor" — so a second one would make this plugin impossible to install from disk
+     * while working perfectly in every test that constructed it directly.
      *
      * @param settings the node settings
      * @param clock the millisecond clock
+     * @return the plugin
      */
-    public ServerlessAuthPlugin(Settings settings, java.util.function.LongSupplier clock) {
+    public static ServerlessAuthPlugin withClock(Settings settings, java.util.function.LongSupplier clock) {
+        return new ServerlessAuthPlugin(settings, clock);
+    }
+
+    private ServerlessAuthPlugin(Settings settings, java.util.function.LongSupplier clock) {
         this.store = new CredentialStore(settings, client::get, clock);
     }
 

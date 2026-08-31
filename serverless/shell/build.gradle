@@ -14,6 +14,10 @@ dependencies {
   implementation project(':libs:opensearch-common')
   implementation project(':libs:opensearch-core')
   implementation project(':libs:opensearch-telemetry')
+  // Loading a plugin from disk needs it: core's PluginsService builds an ExtendedPluginsClassLoader for
+  // any plugin that extends another, and server depends on this only at compile time -- a distribution
+  // puts it on the runtime classpath, so a shell that loads plugins has to as well.
+  runtimeOnly project(':libs:opensearch-plugin-classloader')
   // The shell picks its transport directly instead of discovering it through the plugin system.
   implementation project(':modules:transport-netty4')
   // Object storage. Used through RepositoryPlugin#getRepositories, the supported API, rather than by

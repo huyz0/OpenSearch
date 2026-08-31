@@ -111,6 +111,7 @@ public final class ServerlessNode implements Closeable {
     private final ClusterService clusterService;
     private final IndicesService indicesService;
     private final SearchService searchService;
+    private final PluginsService pluginsService;
     private org.opensearch.serverless.rest.SystemIndices systemIndices;
     private final RestController restController;
     private final TransportService transportService;
@@ -152,7 +153,6 @@ public final class ServerlessNode implements Closeable {
      * @throws Exception if the node cannot be built
      */
     public ServerlessNode(Settings settings, java.util.List<org.opensearch.plugins.Plugin> plugins) throws Exception {
-        this.plugins = new ServerlessPlugins(plugins);
         this.settings = withShellDefaults(settings);
         settings = this.settings;
         this.nodeName = settings.get("node.name", "serverless-node");
@@ -169,6 +169,18 @@ public final class ServerlessNode implements Closeable {
         );
         final Environment environment = new Environment(settings, null);
         final ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+
+        // Plugins first, from disk, through core's own loader -- see buildPluginsService. Everything after
+        // this can depend on the plugin list: the REST controller takes a plugin's request wrapper in its
+        // constructor, and the system-index guard is built from what plugins declare.
+        this.pluginsService = buildPluginsService(settings, environment);
+        final java.util.List<org.opensearch.plugins.Plugin> installed = new java.util.ArrayList<>(
+            pluginsService.filterPlugins(org.opensearch.plugins.Plugin.class)
+        );
+        // Ones handed to this constructor come after the installed ones, so an operator's installation is
+        // not silently outranked by something a test or an embedder passed in.
+        installed.addAll(plugins);
+        this.plugins = new ServerlessPlugins(installed);
 
         this.threadPool = new ThreadPool(settings);
         boolean success = false;
@@ -301,6 +313,90 @@ public final class ServerlessNode implements Closeable {
         return service;
     }
 
+    /**
+     * Loads the plugins installed on this node, using core's own loader.
+     *
+     * <p><b>Core's {@code PluginsService} rather than a loader of our own</b>, which is the whole point.
+     * Reading a {@code plugin-descriptor.properties}, checking that a plugin's declared OpenSearch version
+     * matches this one, building a classloader over its jars, refusing a jar that collides with the
+     * server's, ordering {@code extended.plugins} before their dependents — all of that is behaviour a
+     * plugin author has already been tested against, and a second implementation of it would differ in
+     * small ways that only show up on somebody's cluster. The shell was constructing this class with an
+     * empty list purely because {@code IndicesService} demands one; giving it the real arguments is the
+     * whole of loading a plugin from disk.
+     *
+     * <p><b>Modules are deliberately not loaded.</b> A classic node loads {@code modules/} the same way it
+     * loads {@code plugins/}, and most of what is in there is machinery this shell replaced — transport is
+     * chosen directly, and the rest assumes a cluster with a manager. An operator installs a plugin; nobody
+     * installs a module.
+     *
+     * @param settings the node settings
+     * @param environment the node environment, which knows where {@code plugins/} is
+     * @return the loader, holding whatever was installed
+     */
+    private static PluginsService buildPluginsService(Settings settings, Environment environment) {
+        final java.nio.file.Path pluginsDir = environment.pluginsDir();
+        return new PluginsService(
+            settings,
+            environment.configDir(),
+            null,                                        // modules: see above
+            java.nio.file.Files.isDirectory(pluginsDir) ? pluginsDir : null,
+            classpathPlugins(settings)
+        );
+    }
+
+    /**
+     * Describes the plugins named by {@code serverless.plugins}, which are already on the classpath.
+     *
+     * <p>The second way in, and a smaller one: no descriptor, no classloader, no jars — the class is simply
+     * there. It exists because a distribution may ship a plugin rather than have it installed, and because
+     * turning one on should not require editing the shell.
+     *
+     * <p><b>A name that does not resolve stops the node here, rather than in core.</b> Core's classpath path
+     * logs the failure and carries on, which is right for its own tests and wrong for this: the thing most
+     * likely to be listed in that setting is the thing enforcing authentication, and a node that started
+     * without it and said so only in a log line is a node serving unguarded.
+     *
+     * @param settings the node settings
+     * @return a descriptor per named class
+     */
+    private static java.util.Collection<org.opensearch.plugins.PluginInfo> classpathPlugins(Settings settings) {
+        final java.util.List<org.opensearch.plugins.PluginInfo> described = new java.util.ArrayList<>();
+        for (String name : settings.getAsList(ServerlessBootstrap.PLUGINS)) {
+            final String className = name.trim();
+            if (className.isEmpty()) {
+                continue;
+            }
+            try {
+                final Class<?> type = ServerlessNode.class.getClassLoader().loadClass(className);
+                if (org.opensearch.plugins.Plugin.class.isAssignableFrom(type) == false) {
+                    throw new IllegalArgumentException(
+                        "[" + ServerlessBootstrap.PLUGINS + "] names [" + className + "], which is not an OpenSearch plugin"
+                    );
+                }
+            } catch (ClassNotFoundException e) {
+                throw new IllegalArgumentException(
+                    "[" + ServerlessBootstrap.PLUGINS + "] names [" + className + "], which is not on this node's classpath",
+                    e
+                );
+            }
+            described.add(
+                new org.opensearch.plugins.PluginInfo(
+                    className,
+                    "named by " + ServerlessBootstrap.PLUGINS,
+                    Version.CURRENT.toString(),
+                    Version.CURRENT,
+                    System.getProperty("java.specification.version"),
+                    className,
+                    null,
+                    java.util.List.of(),
+                    false
+                )
+            );
+        }
+        return described;
+    }
+
     private IndicesService buildIndicesService(Environment environment, ClusterSettings clusterSettings) throws Exception {
         final NamedXContentRegistry xContentRegistry = new NamedXContentRegistry(Collections.emptyList());
         final AnalysisRegistry analysisRegistry = new AnalysisRegistry(
@@ -315,9 +411,9 @@ public final class ServerlessNode implements Closeable {
             emptyMap(),
             emptyMap()
         );
-        // S0/F2: mandatory — DataFormatRegistry calls filterPlugins() during construction.
-        final PluginsService pluginsService = new PluginsService(settings, null, null, Collections.emptyList());
-
+        // S0/F2: mandatory — DataFormatRegistry calls filterPlugins() during construction. It is now the
+        // real one rather than an empty stub, so an installed plugin gets onIndexModule like it would on a
+        // classic node.
         return new IndicesService(
             settings,
             pluginsService,

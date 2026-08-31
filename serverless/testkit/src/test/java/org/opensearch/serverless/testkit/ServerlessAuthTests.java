@@ -149,7 +149,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
     }
 
     private ServerlessAuthPlugin authPlugin(Settings settings) {
-        return new ServerlessAuthPlugin(settings, authClock::get);
+        return ServerlessAuthPlugin.withClock(settings, authClock::get);
     }
 
     /** A request with no credential is refused, and told how to offer one. */

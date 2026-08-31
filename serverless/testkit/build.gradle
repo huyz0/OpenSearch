@@ -12,6 +12,7 @@ dependencies {
   implementation project(':server')
   implementation project(':serverless:shell')
   implementation project(':serverless:auth')
+  runtimeOnly project(':libs:opensearch-plugin-classloader')
   implementation project(':modules:transport-netty4')
   testImplementation project(':test:framework')
   // R11 against a real S3 API: the conformance suite needs the container production would use.
