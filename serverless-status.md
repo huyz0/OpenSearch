@@ -91,7 +91,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-278 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+279 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs) and `s3Test` (against a live MinIO) — none skipped.
 
 Every load-bearing claim has a planted-defect canary: the defect is introduced, the failing test is watched,
