@@ -126,8 +126,42 @@ public final class MetadataPlane {
      * @param shardId the shard number
      * @return the WAL store
      */
-    public org.opensearch.serverless.store.WalStore walStore(String indexName, int shardId) {
-        return new org.opensearch.serverless.store.WalStore(blobStore, RegisterMap.shardData(base, indexName, shardId));
+    public org.opensearch.serverless.store.WalStore walStore(String indexName, int shardId) throws IOException {
+        return walStore(indexName, uuidOf(indexName), shardId);
+    }
+
+    /**
+     * Returns the write-ahead log for one shard, for a caller that already knows the index's uuid.
+     *
+     * @param indexName the index
+     * @param uuid the index's uuid
+     * @param shardId the shard number
+     * @return the WAL store
+     */
+    public org.opensearch.serverless.store.WalStore walStore(String indexName, String uuid, int shardId) {
+        return new org.opensearch.serverless.store.WalStore(blobStore, RegisterMap.shardData(base, indexName, uuid, shardId));
+    }
+
+    /**
+     * Returns where one shard's bytes live.
+     *
+     * <p>Resolving the uuid costs a descriptor read, which is why every caller on a hot path takes the
+     * overload that supplies one. This exists for the maintenance paths, where a read is already happening
+     * and one more is not the cost that matters.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @return the container path
+     * @throws IOException if the descriptor cannot be read
+     */
+    public BlobPath shardData(String indexName, int shardId) throws IOException {
+        return RegisterMap.shardData(base, indexName, uuidOf(indexName), shardId);
+    }
+
+    private String uuidOf(String indexName) throws IOException {
+        return descriptors.get(indexName)
+            .orElseThrow(() -> new IOException("no such index: " + indexName + "; its storage cannot be located without its uuid"))
+            .uuid();
     }
 
     /**
@@ -137,8 +171,20 @@ public final class MetadataPlane {
      * @param shardId the shard number
      * @return the publisher
      */
-    public org.opensearch.serverless.store.SegmentPublisher segmentPublisher(String indexName, int shardId) {
-        return new org.opensearch.serverless.store.SegmentPublisher(blobStore, RegisterMap.shardData(base, indexName, shardId));
+    public org.opensearch.serverless.store.SegmentPublisher segmentPublisher(String indexName, int shardId) throws IOException {
+        return segmentPublisher(indexName, uuidOf(indexName), shardId);
+    }
+
+    /**
+     * Returns the segment publisher for one shard, for a caller that already knows the index's uuid.
+     *
+     * @param indexName the index
+     * @param uuid the index's uuid
+     * @param shardId the shard number
+     * @return the publisher
+     */
+    public org.opensearch.serverless.store.SegmentPublisher segmentPublisher(String indexName, String uuid, int shardId) {
+        return new org.opensearch.serverless.store.SegmentPublisher(blobStore, RegisterMap.shardData(base, indexName, uuid, shardId));
     }
 
     /**
@@ -150,23 +196,10 @@ public final class MetadataPlane {
      * @throws IOException if the write fails
      */
     public long createIndex(IndexDescriptor descriptor) throws IOException {
-        final long generation = descriptors.create(descriptor);
-        // Whatever was at this path is not this index's.
-        //
-        // An index's storage is keyed by its name, so a name that has been used before has a path that may
-        // still hold the previous index's segments and log -- and a freshly created index would open that
-        // commit and serve somebody else's documents. That is not a leak, it is a caller creating an empty
-        // index, searching it, and being shown data. Clearing on create makes the emptiness of a new index
-        // a property of creation rather than a consequence of the previous delete having finished, which
-        // matters because a delete can be interrupted and this cannot.
-        //
-        // Safe against a concurrent writer by construction: writing needs a shard-head, taking a head needs
-        // the descriptor, and this runs after the descriptor's put-if-absent, so any writer that could
-        // reach this path is a writer for this index.
-        //
-        // Costs one container delete per shard, on the rarest operation in the system.
-        purgeShardData(descriptor.name(), descriptor.numberOfShards());
-        return generation;
+        // No clearing of the path here, and that is the point of putting the uuid in it: a uuid is minted
+        // per create, so a new index's storage is somewhere no previous index of that name ever wrote.
+        // Emptiness is a property of the path rather than of a sweep having finished.
+        return descriptors.create(descriptor);
     }
 
     /**
@@ -175,10 +208,10 @@ public final class MetadataPlane {
      * @param indexName the index
      * @param shards how many shards it has
      */
-    private void purgeShardData(String indexName, int shards) {
+    private void purgeShardData(String indexName, String uuid, int shards) {
         for (int shard = 0; shard < shards; shard++) {
             try {
-                blobStore.blobContainer(RegisterMap.shardData(base, indexName, shard)).delete();
+                blobStore.blobContainer(RegisterMap.shardData(base, indexName, uuid, shard)).delete();
             } catch (Exception e) {
                 // Best effort, and it has to be: this is called on paths that may not exist at all, and a
                 // store that cannot delete must not turn creating an index into a failure. What it costs
@@ -223,7 +256,7 @@ public final class MetadataPlane {
         // had already begun, and leave blobs behind this sweep. They are unreachable -- no descriptor, no
         // head -- and the next index of this name clears them on creation, which is why that is where the
         // correctness argument lives rather than here.
-        purgeShardData(indexName, descriptor.get().numberOfShards());
+        purgeShardData(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards());
         return true;
     }
 

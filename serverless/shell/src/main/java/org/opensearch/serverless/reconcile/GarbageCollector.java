@@ -92,7 +92,7 @@ public final class GarbageCollector {
         }
 
         final List<String> deleted = new ArrayList<>();
-        final BlobContainer shardContainer = blobStore.blobContainer(RegisterMap.shardData(base, indexName, shardId));
+        final BlobContainer shardContainer = blobStore.blobContainer(plane.shardData(indexName, shardId));
         for (Map.Entry<String, BlobContainer> child : shardContainer.children().entrySet()) {
             final String termDir = child.getKey();
             final Long term = parseTerm(termDir);

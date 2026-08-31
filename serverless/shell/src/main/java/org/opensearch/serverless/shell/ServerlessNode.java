@@ -515,7 +515,12 @@ public final class ServerlessNode implements Closeable {
                     return org.opensearch.serverless.store.BlockCacheDirectory.create(
                         local,
                         plane.blobStore(),
-                        org.opensearch.serverless.metadata.RegisterMap.shardData(plane.basePath(), shardId.getIndexName(), shardId.id()),
+                        org.opensearch.serverless.metadata.RegisterMap.shardData(
+                            plane.basePath(),
+                            shardId.getIndexName(),
+                            shardId.getIndex().getUUID(),
+                            shardId.id()
+                        ),
                         blockCache,
                         shardId.getIndexName() + "#" + shardId.id()
                     );
@@ -549,7 +554,12 @@ public final class ServerlessNode implements Closeable {
                     return org.opensearch.serverless.store.BlockCacheDirectory.create(
                         local,
                         plane.blobStore(),
-                        org.opensearch.serverless.metadata.RegisterMap.shardData(plane.basePath(), indexName, shardNumber),
+                        org.opensearch.serverless.metadata.RegisterMap.shardData(
+                            plane.basePath(),
+                            indexName,
+                            indexSettings.getIndex().getUUID(),
+                            shardNumber
+                        ),
                         blockCache,
                         indexName + "#" + shardNumber
                     );
@@ -860,8 +870,8 @@ public final class ServerlessNode implements Closeable {
         throws Exception {
         ensureStarted();
         adopt(plane);
-        reconciler.setSegmentPublishers(plane::segmentPublisher);
-        reconciler.setWalStores(plane::walStore);
+        reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
         final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId());
 
         // Phase 4 has only writer shards, and a node that does not accept writer activation must not
@@ -1013,8 +1023,8 @@ public final class ServerlessNode implements Closeable {
     ) throws Exception {
         ensureStarted();
         adopt(plane);
-        reconciler.setSegmentPublishers(plane::segmentPublisher);
-        reconciler.setWalStores(plane::walStore);
+        reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
         final IndexDescriptor descriptor = plane.describe(indexName)
             .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
 

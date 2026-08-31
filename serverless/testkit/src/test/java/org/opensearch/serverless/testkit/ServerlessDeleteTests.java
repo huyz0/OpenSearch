@@ -303,9 +303,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             for (var file : manifest.files().entrySet()) {
                 assertTrue(
                     "the sweep deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
-                    store.blobContainer(
-                        org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), "alpha", 0).add(file.getValue())
-                    ).blobExists(file.getKey())
+                    store.blobContainer(plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
                 );
             }
             b.reconciler().shard(recovered).refresh("test");
@@ -464,7 +462,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             // can distinguish a sweep that stays out of wal/ from one that does not.
             plane.walStore("alpha", 0).append(1, new org.opensearch.serverless.store.WalRecord("zombie", "{\"msg\":\"zombie\"}"));
 
-            final long recordsBefore = walRecords(store);
+            final long recordsBefore = walRecords(store, plane);
             assertEquals("the log should hold one live and one stale record before the sweep", 2, recordsBefore);
 
             final var collected = gc.collectShard(plane, "alpha", 0);
@@ -479,7 +477,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             // term-name check -- and a sweep later made recursive would sail past both. This is what
             // notices that. Counted before and after, because a count that is merely non-zero is also
             // satisfied by a sweep that took some of them.
-            final long recordsLeft = walRecords(store);
+            final long recordsLeft = walRecords(store, plane);
             logger.info("wal + gc: {} of {} log record(s) survive the sweep", recordsLeft, recordsBefore);
             assertEquals("the sweep collected write-ahead log records", recordsBefore, recordsLeft);
 
@@ -490,10 +488,8 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
     }
 
     /** How many write-ahead log records exist for alpha/0, across every term. */
-    private static long walRecords(FsBlobStore store) throws Exception {
-        final var walRoot = store.blobContainer(
-            org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), "alpha", 0).add("wal")
-        );
+    private static long walRecords(FsBlobStore store, MetadataPlane plane) throws Exception {
+        final var walRoot = store.blobContainer(plane.shardData("alpha", 0).add("wal"));
         long records = 0;
         for (var termDir : walRoot.children().values()) {
             records += termDir.listBlobs().keySet().stream().filter(n -> n.matches("\\d{20}")).count();

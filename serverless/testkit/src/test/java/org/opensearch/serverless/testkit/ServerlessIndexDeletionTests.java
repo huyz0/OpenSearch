@@ -96,13 +96,14 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
     /**
      * An index recreated after a delete that never finished is still empty.
      *
-     * <p>This is the case the create-time clear exists for, and the one the test above cannot reach: there,
-     * the delete purged the data, so creation had nothing to clear and would have passed with the clear
-     * removed. Here the bytes are put back after the delete — exactly the state a process killed between
-     * removing the descriptor and removing the data leaves behind — and the new index must still be empty.
+     * <p>The test above cannot reach this case: there the delete purged the data, so a new index would have
+     * been empty whether or not anything guaranteed it. Here the bytes are put back after the delete —
+     * exactly the state a process killed between removing the descriptor and removing the data leaves — and
+     * the new index must still be empty.
      *
-     * <p>That is why the argument lives at creation rather than at deletion. A delete can be interrupted;
-     * a create either happened or did not.
+     * <p>It is, and not because anything cleaned up. The first index's storage is under the first index's
+     * uuid and the second's is under the second's, so there is no path at which one can inherit the other.
+     * A delete can be interrupted; a uuid cannot be shared.
      */
     public void testAnIndexCreatedOverTheRemainsOfAnInterruptedDeleteIsEmpty() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -110,7 +111,8 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, store, false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("halfdeleted", "uuid-half-first-0000", 1, MAPPING, null));
 
-        final java.nio.file.Path shardData = store.resolve("segments").resolve("halfdeleted#0");
+        // Named with the first index's uuid, because that is where the first index's bytes are.
+        final java.nio.file.Path shardData = store.resolve("segments").resolve("halfdeleted#uuid-half-first-0000#0");
         final java.nio.file.Path saved = createTempDir().resolve("saved");
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("delete-interrupted"))) {

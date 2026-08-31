@@ -38,7 +38,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.BiFunction;
 
 /**
  * Opens and closes shards on this node.
@@ -66,8 +65,8 @@ public final class ShardReconciler {
     private final DiscoveryNode localNode;
     private final Map<ShardId, IndexShard> open = new ConcurrentHashMap<>();
     private final Set<ShardId> readers = ConcurrentHashMap.newKeySet();
-    private volatile BiFunction<String, Integer, SegmentPublisher> publishers;
-    private volatile BiFunction<String, Integer, org.opensearch.serverless.store.WalStore> walStores;
+    private volatile java.util.function.Function<ShardId, SegmentPublisher> publishers;
+    private volatile java.util.function.Function<ShardId, org.opensearch.serverless.store.WalStore> walStores;
     private final Map<ShardId, org.opensearch.serverless.store.WalStore> walCache = new ConcurrentHashMap<>();
 
     /**
@@ -87,7 +86,7 @@ public final class ShardReconciler {
      *
      * @param publishers index name and shard number to publisher
      */
-    public void setSegmentPublishers(BiFunction<String, Integer, SegmentPublisher> publishers) {
+    public void setSegmentPublishers(java.util.function.Function<ShardId, SegmentPublisher> publishers) {
         this.publishers = publishers;
     }
 
@@ -95,9 +94,13 @@ public final class ShardReconciler {
      * Supplies the write-ahead log for each shard. Without one, writes are durable only once published,
      * which is the pre-M10 behaviour.
      *
-     * @param walStores index name and shard number to WAL store
+     * <p>Keyed on the {@link ShardId} rather than on a name and a number, because a shard's storage is
+     * located by the index's uuid and a {@code ShardId} carries it. Passing the name alone meant the plane
+     * had to read the descriptor back to find the uuid, on a path that already knew it.
+     *
+     * @param walStores shard to WAL store
      */
-    public void setWalStores(BiFunction<String, Integer, org.opensearch.serverless.store.WalStore> walStores) {
+    public void setWalStores(java.util.function.Function<ShardId, org.opensearch.serverless.store.WalStore> walStores) {
         this.walStores = walStores;
     }
 
@@ -115,7 +118,7 @@ public final class ShardReconciler {
         // term, and the snapshot that makes truncation lag a publish cycle. Building a fresh one per
         // call restarts the ordinal at 1, so every append overwrites the same blob and the log holds
         // exactly the last write -- which is what happened, and what the end-to-end test caught.
-        return walCache.computeIfAbsent(shardId, id -> walStores.apply(id.getIndexName(), id.id()));
+        return walCache.computeIfAbsent(shardId, walStores);
     }
 
     /**
@@ -142,7 +145,7 @@ public final class ShardReconciler {
         // A commit must exist before there is anything to publish; an unflushed shard has its data only
         // in the translog, which this does not upload.
         shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
-        final CommitManifest manifest = publishers.apply(shardId.getIndexName(), shardId.id()).publish(shard.store(), term);
+        final CommitManifest manifest = publishers.apply(shardId).publish(shard.store(), term);
         final var walForPublish = wal(shardId);
         if (walForPublish != null) {
             // Only after the commit is durable in the object store. Truncation drops what the previous
@@ -231,7 +234,7 @@ public final class ShardReconciler {
 
         // Whether anything was published decides the recovery source, and the decision must be made
         // before the shard is created because the source is baked into its routing entry.
-        final SegmentPublisher publisher = publishers == null ? null : publishers.apply(shardId.getIndexName(), shardId.id());
+        final SegmentPublisher publisher = publishers == null ? null : publishers.apply(shardId);
         final Optional<CommitManifest> published = publisher == null ? Optional.empty() : publisher.readManifest();
         final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
 
@@ -367,7 +370,7 @@ public final class ShardReconciler {
         if (open.containsKey(shardId)) {
             return shardId;
         }
-        final CommitManifest manifest = publishers.apply(indexName, shardNumber)
+        final CommitManifest manifest = publishers.apply(shardId)
             .readManifest()
             .orElseThrow(
                 () -> new IOException(

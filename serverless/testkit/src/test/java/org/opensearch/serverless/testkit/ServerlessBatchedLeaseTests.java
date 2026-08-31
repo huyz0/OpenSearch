@@ -167,9 +167,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
             for (Map.Entry<String, String> file : manifest.files().entrySet()) {
                 assertTrue(
                     "the sweep deleted a file the live commit depends on",
-                    store.blobContainer(
-                        org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), "alpha", 0).add(file.getValue())
-                    ).blobExists(file.getKey())
+                    store.blobContainer(plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
                 );
             }
         }

@@ -15,14 +15,23 @@ a freshly created index must be empty, whatever its name was used for before:
 
 That is not a leak. It is a caller creating an empty index, searching it, and being shown data.
 
-**Fixed at creation, not at deletion**, and the choice is the whole point. Deletion now purges the data too,
-but a delete can be interrupted — a process killed between removing the descriptor and removing the bytes
-leaves exactly the state that produced the output above. Clearing the path when an index is *created* makes
-the emptiness of a new index a property of creation, which either happened or did not.
+**Fixed in the path.** A shard's storage is now keyed by the index's **uuid** as well as its name —
+`segments/{name}#{uuid}#{shard}` — and a uuid is minted per create. Two indices that share a name cannot
+share a path, however the earlier one ended, so a new index is empty because there is nowhere for it to
+inherit from rather than because a cleanup finished.
 
-It is safe against a concurrent writer by construction: writing needs a shard-head, taking a head needs the
-descriptor, and the clear runs after the descriptor's put-if-absent — so any writer that could reach that
-path is a writer for *this* index.
+The name stays in front of the uuid because an operator looking at a bucket should be able to tell what
+they are looking at.
+
+### It was first fixed at creation, and that was worse
+
+The first attempt cleared the storage path when an index was created. It worked, and it cost a second
+object-store operation on the cheapest operation in the system — which `testCreationCostIsFlatInThePopulation`
+reported immediately, as it is there to do. Keying by uuid gives the same guarantee for nothing, and the
+cost assertion is back to one write.
+
+That the wrong version shipped for an hour is the argument for having a cost test at all: it is not a
+performance regression suite, it is a design review that runs.
 
 ### The first test could not tell the difference
 
@@ -30,8 +39,8 @@ path is a writer for *this* index.
 purged the data and creation had nothing left to clear. The canary said so.
 
 `testAnIndexCreatedOverTheRemainsOfAnInterruptedDeleteIsEmpty` copies the shard's directory aside, deletes
-the index, copies it back, and then creates the index again — reconstructing the interrupted delete exactly.
-That one fails without the clear, which is what makes the clear justified rather than decorative.
+the index, copies it back, and creates the index again — reconstructing the interrupted delete exactly. It
+fails if storage is keyed by name alone, which is the canary that keeps the uuid in the path.
 
 ## A deleted index went on costing storage
 
@@ -41,26 +50,16 @@ That one fails without the clear, which is what makes the clear justified rather
 Deletion now purges the shard data after removing the heads. Heads first, so a writer cannot renew and the
 node holding it closes the shard on its next tick; data after.
 
-**The residual race is real and bounded.** Publishing is fenced by the manifest register's term rather than
-by the head, so a writer that has lost its head can still finish a publish it had already begun and leave
-blobs behind the sweep. They are unreachable — no descriptor, no head — and the next index of that name
-clears them on creation. Which is, again, why the correctness argument lives at creation.
+## The residual, and where it now lands
 
-## Creating an index now costs two operations, not one
+Publishing is fenced by the manifest register's term rather than by the head, so a writer that has lost its
+head can still finish a publish it had already begun and leave blobs behind the delete's sweep. Under
+name-keyed storage those blobs were a correctness problem, waiting for somebody to reuse the name. Under
+uuid-keyed storage they are unreferenced bytes under a dead uuid: a leak, and only a leak.
 
-`testCreationCostIsFlatInThePopulation` caught this immediately, which is what it is for. A create is the
-descriptor's put-if-absent plus one container clear per shard.
-
-The architectural claim it guards is unchanged: **creation cost does not depend on how many indices already
-exist.** What changed is the constant, and it doubled on the cheapest operation in the system. That is worth
-stating rather than absorbing quietly.
-
-The alternative that keeps a create at one operation is **keying storage by index uuid rather than by
-name** — then a recreated index has a different path and needs no clearing, and the remains of an
-interrupted delete are unreferenced garbage under a dead uuid rather than a correctness problem. That is
-the better design and it is a change to the on-disk layout: every path helper, every caller, and the
-garbage collector's notion of what an orphan is. It belongs to its own milestone, and this one records why
-it is wanted rather than half-doing it.
+A sweep that enumerates live indices and deletes shard containers whose uuid is not among them would
+reclaim them. Enumeration is allowed offline and refused on the request path (§6.3), so that belongs to the
+garbage collector.
 
 ## What was already right
 
@@ -72,17 +71,17 @@ correct" is only knowable once something asserts it.
 
 | Defect | Caught by |
 | --- | --- |
-| Creating an index does not clear its path | `testAnIndexCreatedOverTheRemainsOfAnInterruptedDeleteIsEmpty` |
+| Storage is keyed by name again, not by uuid | `testAnIndexCreatedOverTheRemainsOfAnInterruptedDeleteIsEmpty` |
 | Deleting an index leaves its bytes behind | `testADeletedIndexStopsCostingStorage` |
 
 ## What is still missing
 
-- **Storage keyed by uuid**, as above — the change that would make this structural rather than swept.
-- **No sweep for orphans**, so bytes left by the residual publish race are reclaimed only if the name is
-  reused. A garbage collector that could enumerate live indices and delete unreferenced shard containers
-  would close it; enumeration is allowed offline and forbidden on the request path (§6.3).
+- **No sweep for orphans.** Bytes left by the residual publish race are never reclaimed now, because
+  nothing will ever reuse that uuid. The garbage collector is where that belongs.
 - **Deletion is not fenced against a live writer**, only raced with. Making a publish check the head would
-  close that and would put an extra register read on the publish path.
+  close it and would put an extra register read on the publish path.
+- **No migration.** This changes where shards are stored, so an existing deployment's data is not found by
+  a node running this build. Pre-release, and stated rather than discovered.
 
 263 tests green across `test` (228), `pluginTest` (2), `processTest` (13) and `s3Test` (20), none skipped,
 MinIO live. `server/` untouched.

@@ -100,15 +100,12 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
                 opsPerCreate.get(round)
             );
         }
-        // Two, and the second one is deliberate: the descriptor's put-if-absent, then one container delete
-        // per shard clearing whatever a previous index of this name left behind.
+        // One, and it stayed one. Keying a shard's storage by the index's uuid is what let it: a new index
+        // writes where no previous index of that name ever wrote, so creation has nothing to clear.
         //
-        // It doubled the cost of the cheapest operation in the system, which is worth being explicit about
-        // rather than quietly absorbing. What it buys is that a new index is empty because it was created,
-        // not because the previous delete happened to finish -- and a delete can be interrupted. The
-        // alternative that keeps this at one operation is keying storage by index uuid rather than by name,
-        // which is a change to the on-disk layout and belongs to its own milestone.
-        assertEquals("a create should be the descriptor write plus one clear per shard", 2L, (long) opsPerCreate.get(0));
+        // It briefly cost two, when the same correctness problem was solved by clearing the path on create.
+        // This assertion is what said so.
+        assertEquals("a create should be a single object-store write", 1L, (long) opsPerCreate.get(0));
     }
 
     /**

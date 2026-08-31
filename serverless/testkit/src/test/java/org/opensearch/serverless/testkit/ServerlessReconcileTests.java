@@ -15,7 +15,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.GarbageCollector;
 import org.opensearch.serverless.shell.ServerlessNode;
@@ -178,9 +177,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             // The zombie wakes and writes more. It cannot publish, so these files are orphans.
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
             zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
-            final int term1BlobsBefore = d.store.blobContainer(RegisterMap.shardData(d.base, "alpha", 0).add("t=" + term1))
-                .listBlobs()
-                .size();
+            final int term1BlobsBefore = d.store.blobContainer(d.plane.shardData("alpha", 0).add("t=" + term1)).listBlobs().size();
 
             final List<String> deleted = gc.collectShard(d.plane, "alpha", 0);
 
@@ -188,7 +185,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             for (Map.Entry<String, String> file : liveCommit.files().entrySet()) {
                 assertTrue(
                     "GC deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
-                    d.store.blobContainer(RegisterMap.shardData(d.base, "alpha", 0).add(file.getValue())).blobExists(file.getKey())
+                    d.store.blobContainer(d.plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
                 );
             }
             assertTrue("GC must not have deleted every term-1 blob", term1BlobsBefore > 0);
@@ -220,16 +217,16 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             // publishing uploads files and THEN swaps the manifest, so there is a window in which a live
             // writer's files exist and are not yet referenced. Simulate exactly that.
             final String inFlight = "_inflight_not_yet_in_manifest.cfs";
-            d.store.blobContainer(RegisterMap.shardData(d.base, "alpha", 0).add("t=" + term))
+            d.store.blobContainer(d.plane.shardData("alpha", 0).add("t=" + term))
                 .writeBlob(inFlight, new java.io.ByteArrayInputStream(new byte[] { 1, 2, 3 }), 3L, false);
 
             assertTrue("the live term must never be collected", gc.collectShard(d.plane, "alpha", 0).isEmpty());
             assertTrue(
                 "GC deleted a file a live writer was mid-publish on",
-                d.store.blobContainer(RegisterMap.shardData(d.base, "alpha", 0).add("t=" + term)).blobExists(inFlight)
+                d.store.blobContainer(d.plane.shardData("alpha", 0).add("t=" + term)).blobExists(inFlight)
             );
             for (Map.Entry<String, String> file : manifest.files().entrySet()) {
-                assertTrue(d.store.blobContainer(RegisterMap.shardData(d.base, "alpha", 0).add(file.getValue())).blobExists(file.getKey()));
+                assertTrue(d.store.blobContainer(d.plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey()));
             }
         }
     }

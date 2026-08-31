@@ -14,7 +14,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -58,9 +57,7 @@ public class ServerlessBlockReadTests extends OpenSearchTestCase {
         final var manifest = plane.segmentPublisher(index, shard).readManifest().orElseThrow();
         long total = 0;
         for (Map.Entry<String, String> file : manifest.files().entrySet()) {
-            final var meta = store.blobContainer(RegisterMap.shardData(BlobPath.cleanPath(), index, shard).add(file.getValue()))
-                .listBlobs()
-                .get(file.getKey());
+            final var meta = store.blobContainer(plane.shardData(index, shard).add(file.getValue())).listBlobs().get(file.getKey());
             if (meta != null) {
                 total += meta.length();
             }

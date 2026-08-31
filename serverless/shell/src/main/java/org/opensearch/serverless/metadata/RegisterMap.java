@@ -81,13 +81,23 @@ public final class RegisterMap {
      * and deleted per shard, and giving each its own container keeps both operations a directory scan
      * rather than a filter over everything.
      *
+     * <p><b>The index's uuid is in the path, and it is what makes an index's storage its own.</b> Keyed by
+     * name alone, an index created with a name that had been used before opened the previous index's commit
+     * and served its documents — a caller creating an empty index and being shown data. A uuid is minted
+     * per create, so two indices of the same name cannot share a path however the earlier one ended, and
+     * whatever the earlier one left behind is unreferenced rather than inherited.
+     *
+     * <p>The name stays in the path too, in front of the uuid, because an operator looking at a bucket
+     * should be able to tell what they are looking at.
+     *
      * @param base the deployment's base path
      * @param indexName the index
+     * @param uuid the index's uuid, which distinguishes it from any earlier index of the same name
      * @param shardId the shard number
      * @return the shard data container path
      */
-    public static BlobPath shardData(BlobPath base, String indexName, int shardId) {
-        return base.add("segments").add(indexName + SHARD_SEPARATOR + shardId);
+    public static BlobPath shardData(BlobPath base, String indexName, String uuid, int shardId) {
+        return base.add("segments").add(indexName + SHARD_SEPARATOR + uuid + SHARD_SEPARATOR + shardId);
     }
 
     /**
