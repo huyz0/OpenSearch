@@ -68,7 +68,9 @@ salted PBKDF2, one configured account in the keystore checked before the store s
 store is not a locked door. A separate plugin's `ActionFilter`s can refuse by action name and caller —
 proved by a reader being denied a write an administrator is allowed — and can *rewrite* what a search or a
 get returns, which is what field- and document-level security are made of: a filter that removes a field
-from every hit removes it from `_search`, `_doc/{id}` and `_mget` alike.
+from every hit removes it from `_search`, `_doc/{id}` and `_mget` alike, and one that drops a hit outright
+drops it from the count as well. Coverage is not the filter's to change — a filter that dropped a hit has
+not made a shard unreachable, and a redaction must not be able to masquerade as a partial answer.
 
 **Bounds.** Real circuit breakers, so an aggregation past the limit is refused and the node keeps serving;
 and core's indexing pressure on the write paths, so a batch larger than the node's budget is rejected with
@@ -98,8 +100,6 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - Node-to-node forwarding carries no *caller* identity, so filters run on the coordinating node only. With
   mutual TLS the peer is authenticated as a node, which is what would make propagating a caller's identity
   safe; nothing does it yet.
-- Dropping hits on a per-document rule is possible by the same mechanism as redacting them, and is not
-  demonstrated. Only redaction has a test.
 - A plugin's action runs on the node the request reached: nothing forwards one, and no identity crosses a
   transport hop, so an action that must run somewhere particular cannot ask.
 - A point in time is node-local once opened: the record is in the object store and any node can serve it,

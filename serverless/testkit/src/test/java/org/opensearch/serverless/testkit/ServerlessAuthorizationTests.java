@@ -292,13 +292,25 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                     }
                     chain.proceed(task, action, request, ActionListener.wrap(response -> {
                         final var answered = (org.opensearch.action.search.SearchResponse) response;
-                        final var redacted = new org.opensearch.search.SearchHit[answered.getHits().getHits().length];
-                        for (int i = 0; i < redacted.length; i++) {
-                            redacted[i] = withoutTheSecret(answered.getHits().getHits()[i]);
+                        // Document level: a hit the caller may not see is removed entirely, and the total
+                        // is reduced with it. Field level: what survives has the field taken out. The two
+                        // are the same mechanism and are done together here because a security plugin does
+                        // them together.
+                        final var kept = new java.util.ArrayList<org.opensearch.search.SearchHit>();
+                        for (org.opensearch.search.SearchHit hit : answered.getHits().getHits()) {
+                            if (String.valueOf(hit.getSourceAsMap().get("msg")).contains("classified")) {
+                                continue;
+                            }
+                            kept.add(withoutTheSecret(hit));
                         }
+                        final long dropped = answered.getHits().getHits().length - kept.size();
+                        final var redacted = kept.toArray(new org.opensearch.search.SearchHit[0]);
                         final var hits = new org.opensearch.search.SearchHits(
                             redacted,
-                            answered.getHits().getTotalHits(),
+                            new org.apache.lucene.search.TotalHits(
+                                answered.getHits().getTotalHits().value() - dropped,
+                                answered.getHits().getTotalHits().relation()
+                            ),
                             answered.getHits().getMaxScore()
                         );
                         final var internal = new org.opensearch.search.internal.InternalSearchResponse(
@@ -311,11 +323,16 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                             1
                         );
                         @SuppressWarnings("unchecked")
+                        // Deliberately nonsense coverage. A filter has no idea how many shards answered and
+                        // no reason to care, and one that builds a response without thinking about it --
+                        // which is the normal case -- must not be able to turn a complete answer into a
+                        // partial-looking one. The shell takes coverage from its own fan-out; these numbers
+                        // exist so that a test would notice if it stopped.
                         final Response rewritten = (Response) new org.opensearch.action.search.SearchResponse(
                             internal,
                             null,
-                            answered.getTotalShards(),
-                            answered.getSuccessfulShards(),
+                            99,
+                            0,
                             0,
                             0L,
                             org.opensearch.action.search.ShardSearchFailure.EMPTY_ARRAY,
@@ -354,7 +371,10 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
      * chain produced.
      *
      * <p>The test asserts on the document rather than on the mechanism: the field is in the index, and it
-     * is not in the answer.
+     * is not in the answer. It also covers the document-level case, which is the same mechanism used to
+     * drop a hit rather than to trim one — and which has a question of its own, because a total that did
+     * not come down with the dropped hit would tell the caller there is something they are not being
+     * shown.
      */
     public void testAFilterCanRedactAFieldFromASearchResponse() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -406,6 +426,31 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
             assertEquals(many.body(), 200, many.status());
             assertTrue("the document must still be there: " + many.body(), many.body().contains("visible"));
             assertFalse("_mget must be redacted too: " + many.body(), many.body().contains("do-not-show-this"));
+
+            // Document level: a hit the filter drops is gone from the answer, and the count goes with it.
+            // A total that still said two would be a caller told there is something they cannot see, which
+            // is the thing document-level security exists to avoid.
+            final Response classified = send(
+                node,
+                "PUT",
+                "/alpha/_doc/2?refresh=true",
+                asAdmin,
+                "{\"msg\":\"classified\",\"secret\":\"also-hidden\"}"
+            );
+            assertEquals(classified.body(), 201, classified.status());
+
+            final Response filtered = send(node, "POST", "/alpha/_search", asAdmin, "{\"query\":{\"match_all\":{}}}");
+            assertEquals(filtered.body(), 200, filtered.status());
+            assertFalse("the dropped document must not appear: " + filtered.body(), filtered.body().contains("classified"));
+            assertTrue("and the count must drop with it: " + filtered.body(), filtered.body().contains("\"value\":1"));
+            assertTrue("while the other document survives: " + filtered.body(), filtered.body().contains("visible"));
+
+            // Coverage is not the filter's to change: it dropped a hit, not a shard.
+            assertTrue("the answer must still report itself complete: " + filtered.body(), filtered.body().contains("\"complete\":true"));
+            assertTrue(
+                "and the shard counts must be the shell's, not the filter's: " + filtered.body(),
+                filtered.body().contains("\"total\":1") && filtered.body().contains("\"searched\":1")
+            );
         }
     }
 
