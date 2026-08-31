@@ -289,6 +289,41 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A stray object in the points-in-time container does not switch off the garbage collector.
+     *
+     * <p><b>Found by a test filesystem doing exactly this.</b> Lucene's {@code ExtrasFS} drops a file named
+     * {@code extra0} into random directories, one landed in the points-in-time container, and the plane
+     * reported a live view holding everything — for ever, since nothing would ever delete it. The rule that
+     * an unreadable record pins its files is right and stays; what was wrong is that it applied to anything
+     * at all that appeared in that container. One console upload or backup tool and a deployment's storage
+     * grows without bound with nothing but a log line to say why.
+     *
+     * <p>A half-written record — the case the conservative rule exists for — still has the name this system
+     * gave it, so it is still treated as live. That is the second half of this test, and without it the
+     * first half would be an argument for deleting things we cannot read.
+     */
+    public void testAStrayObjectAmongTheViewsIsNotTreatedAsOne() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final var store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final var container = store.blobContainer(org.opensearch.serverless.metadata.RegisterMap.pointsInTime(BlobPath.cleanPath()));
+
+        final var junk = new org.opensearch.core.common.bytes.BytesArray("not a point in time");
+        container.writeBlob("extra0", junk.streamInput(), junk.length(), true);
+        assertEquals("a name this system would never mint must be ignored", java.util.List.of(), plane.livePointsInTime(clock.get()));
+        assertEquals("and must not be deleted either", 0, plane.reapPointsInTime(clock.get()));
+        assertTrue("it is somebody else's file and stays where it is", container.blobExists("extra0"));
+
+        // A record with a name we did mint, whose bytes are unreadable: that is the half-written case, and
+        // it must pin until a human looks at it.
+        final String plausible = org.opensearch.common.UUIDs.randomBase64UUID();
+        container.writeBlob(plausible, junk.streamInput(), junk.length(), true);
+        final var live = plane.livePointsInTime(clock.get());
+        assertEquals("an unreadable record of ours must still hold: " + live, 1, live.size());
+        assertEquals(plausible, live.get(0).id());
+    }
+
     private BackgroundReconciler hold(ServerlessNode node, MetadataPlane plane, AtomicLong clock, String index, int shards)
         throws Exception {
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);

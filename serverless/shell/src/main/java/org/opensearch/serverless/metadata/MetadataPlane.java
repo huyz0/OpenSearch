@@ -369,6 +369,14 @@ public final class MetadataPlane {
         final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
         final java.util.List<PointInTime> live = new java.util.ArrayList<>();
         for (String name : container.listBlobs().keySet()) {
+            if (PointInTime.looksLikeAnId(name) == false) {
+                // Not a name this system mints, so not a record of ours. Ignored rather than treated as a
+                // pin: one stray object in this container -- a console upload, a backup tool, a test
+                // filesystem's scratch file -- would otherwise turn off the garbage collector for the whole
+                // deployment, and do it silently. Found by a test filesystem doing exactly that.
+                LOGGER.warn("ignoring [" + name + "] in the points-in-time container: it is not a name this system writes");
+                continue;
+            }
             try (java.io.InputStream in = container.readBlob(name)) {
                 final PointInTime pit = PointInTime.fromStream(in);
                 if (pit.expiredAt(nowMillis) == false) {
@@ -376,8 +384,9 @@ public final class MetadataPlane {
                 }
             } catch (Exception e) {
                 // A view the collector cannot read is one it must assume is holding something, because the
-                // alternative is deleting files somebody is paging through. Treated as live and left for a
-                // human, rather than swept because it was unreadable.
+                // alternative is deleting files somebody is paging through. A half-written record still has
+                // the name we gave it, so this is the case that treatment exists for. Treated as live and
+                // left for a human, rather than swept because it was unreadable.
                 LOGGER.warn("could not read the point in time " + name + "; treating it as live", e);
                 live.add(new PointInTime(name, "", Long.MAX_VALUE, java.util.Map.of()));
             }
@@ -396,6 +405,11 @@ public final class MetadataPlane {
         final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
         final java.util.List<String> expired = new java.util.ArrayList<>();
         for (String name : container.listBlobs().keySet()) {
+            if (PointInTime.looksLikeAnId(name) == false) {
+                // Not ours to read and not ours to delete. The sweep says so once, in the log, and leaves
+                // it exactly where it is.
+                continue;
+            }
             try (java.io.InputStream in = container.readBlob(name)) {
                 if (PointInTime.fromStream(in).expiredAt(nowMillis)) {
                     expired.add(name);

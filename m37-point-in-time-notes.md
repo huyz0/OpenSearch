@@ -104,3 +104,33 @@ answer this surface exists to avoid.
 - **63 — a view reads its own uuid's path rather than the index's.** Caught: no segments found.
 
 Six planted, six caught, none by a compile failure.
+
+## A flake that was a defect (added after M38)
+
+`testAViewCanBeReleasedAndExpires` failed about one run in eight, and only in full-suite runs. The
+assertion had been strengthened from `assertTrue(...isEmpty())` to `assertEquals(List.of(), ...)` when it
+first appeared, which is the only reason the cause was legible when it came back:
+
+```
+expected:<[]> but was:<[PointInTime[extra0 of , 0 shards, expires 9223372036854775807]]>
+```
+
+`extra0` is Lucene's `ExtrasFS`, the test filesystem that drops scratch files into random directories. One
+landed in the points-in-time container, `livePointsInTime` could not parse it, and the conservative rule —
+*a record we cannot read must be assumed to be holding something* — reported a view that pinned every
+shard's garbage and would never expire.
+
+The rule is right and stays. What was wrong is that it applied to anything at all that appeared in that
+container: one file left by a console, a backup tool or a migration and the garbage collector is off for
+the whole deployment, silently, for ever.
+
+So the two cases are now separated by the only evidence available before parsing — the name. A record this
+system wrote has the name this system gave it, so a *half-written* record, which is the case the
+conservative rule exists for, is still treated as live. Something named `extra0` is not ours and does not
+get to speak for our data.
+
+`ExtrasFS` is deliberately **not** suppressed on this test. It found the defect; leaving it on keeps the
+rule exercised.
+
+- **86 — anything in the container is treated as a view.** Caught.
+- **87 — an unreadable record of ours stops pinning.** Caught: the half-written case must still hold.
