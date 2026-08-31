@@ -481,4 +481,69 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
             return new Response(response.statusCode(), response.body());
         }
     }
+
+    /**
+     * The shard groups of one batch run at the same time, not one after another.
+     *
+     * <p>The class documentation said they ran sequentially long after they had stopped doing so, and
+     * nothing asserted either version — so the code and its description could disagree indefinitely. A
+     * batch spanning three shards on three nodes is three round trips if the groups are serialised, which
+     * is paying per shard instead of per document: the same mistake batching exists to remove, one level
+     * up.
+     *
+     * <p><b>Asserted as a rendezvous, not as a stopwatch.</b> Each shard's first log append blocks until
+     * every shard has arrived, and fails if they do not. Run one at a time, the first group waits for peers
+     * that cannot arrive until it returns, times out, and its items fail. There is no threshold to tune:
+     * sequential cannot pass this, and concurrent cannot fail it.
+     *
+     * <p>The rendezvous is armed after the fixture is in place, because the fixture goes through the same
+     * store — without that, the setup's writes are the ones that meet and the batch never rendezvouses at
+     * all, which would pass whatever the dispatch did.
+     */
+    public void testTheShardGroupsOfOneBatchRunAtTheSameTime() throws Exception {
+        final int shards = 3;
+        final FsBlobStore disk = new FsBlobStore(1024, createTempDir(), false);
+        // Generous: the point is that a sequential dispatch cannot finish at all, not that it is slow.
+        final RendezvousBlobStore store = new RendezvousBlobStore(disk, shards, 5_000L, RendezvousBlobStore.Meet.WRITES);
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final IndexDescriptor descriptor = new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null);
+        plane.createIndex(descriptor);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("bulk-rendezvous"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            for (int shard = 0; shard < shards; shard++) {
+                loop.want("alpha", shard);
+            }
+            loop.tick(clock.get());
+            assertEquals("the node must hold every shard", shards, node.reconciler().openShards().size());
+
+            // One id per shard, chosen rather than hoped for: a batch that happened to miss a shard could
+            // never complete the rendezvous, and the test would fail for a reason that is not the one it is
+            // about.
+            final String[] idForShard = new String[shards];
+            for (int candidate = 0; idForShard[0] == null || idForShard[1] == null || idForShard[2] == null; candidate++) {
+                final String id = "r" + candidate;
+                idForShard[org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor, id)] = id;
+                assertTrue("no ids route to three shards, which cannot happen with this hash", candidate < 1_000);
+            }
+
+            final StringBuilder batch = new StringBuilder();
+            for (String id : idForShard) {
+                batch.append("{\"index\":{\"_index\":\"alpha\",\"_id\":\"").append(id).append("\"}}\n");
+                batch.append("{\"msg\":\"rendezvous\"}\n");
+            }
+
+            store.arm();
+            final Response got = send(node, "POST", "/_bulk?refresh=true", batch.toString());
+            assertEquals("the batch should have been accepted: " + got.body(), 200, got.status());
+            assertFalse("and every item should have landed: " + got.body(), got.body().contains("\"error\""));
+            assertTrue(
+                "every shard group must have reached the rendezvous, which only concurrent dispatch can do",
+                store.everyoneArrived()
+            );
+        }
+    }
 }

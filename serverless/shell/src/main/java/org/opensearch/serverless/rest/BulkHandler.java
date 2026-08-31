@@ -56,9 +56,16 @@ import java.util.function.Supplier;
  * would be the failure mode D2 exists to prevent — a request that is accepted and means something other
  * than what it says. They are rejected individually, so the rest of the batch still lands.
  *
- * <p><b>Groups are dispatched one after another.</b> A batch spanning three remote shards is three
- * sequential round trips, the same shape the search fan-out has and the same thing wrong with it. It is
- * recorded here rather than fixed, because concurrency in the write path deserves its own measurement.
+ * <p><b>Groups are dispatched together.</b> A batch spanning three shards is one round trip's worth of
+ * latency rather than three, because paying per shard instead of per document is the same mistake batching
+ * exists to remove, one level up.
+ *
+ * <p>This paragraph said the opposite for some time after it stopped being true — the dispatch had been
+ * made concurrent and the class documentation had not — and nothing asserted either version, so the code
+ * and its description could have disagreed indefinitely.
+ * {@code ServerlessBulkTests#testTheShardGroupsOfOneBatchRunAtTheSameTime} settles it as a rendezvous
+ * rather than a stopwatch: each shard's first log append waits for the others and fails if they never come,
+ * so a sequential dispatch cannot pass and a concurrent one cannot fail.
  */
 public final class BulkHandler extends BaseRestHandler {
 

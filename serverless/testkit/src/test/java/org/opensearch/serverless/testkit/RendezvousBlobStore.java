@@ -48,22 +48,63 @@ import java.util.stream.Collectors;
  */
 public final class RendezvousBlobStore implements BlobStore {
 
+    /** Which operation the shards are made to meet on. */
+    public enum Meet {
+        /** Reads — a search opening each shard from the object store. */
+        READS,
+        /** Writes — a batch appending to each shard's log. */
+        WRITES
+    }
+
     private final BlobStore delegate;
-    private final CountDownLatch arrived;
+    private final int parties;
+    private final Meet on;
     private final long timeoutMillis;
+    private volatile CountDownLatch arrived;
     private final Set<String> seen = ConcurrentHashMap.newKeySet();
 
     /**
-     * Wraps a store.
+     * Wraps a store, meeting on reads.
      *
      * @param delegate the real store
      * @param parties how many distinct shards must meet
      * @param timeoutMillis how long a waiter gives the others before giving up
      */
     public RendezvousBlobStore(BlobStore delegate, int parties, long timeoutMillis) {
+        this(delegate, parties, timeoutMillis, Meet.READS);
+    }
+
+    /**
+     * Wraps a store, meeting on the operation named.
+     *
+     * <p>Reads are what a search does; writes are what a batch does. It has to be one or the other rather
+     * than both, because a fixture is loaded through the same store before the thing under test runs — and
+     * a rendezvous that tripped on the fixture's writes would deadlock the setup.
+     *
+     * @param delegate the real store
+     * @param parties how many distinct shards must meet
+     * @param timeoutMillis how long a waiter gives the others before giving up
+     * @param on which operation the shards meet on
+     */
+    public RendezvousBlobStore(BlobStore delegate, int parties, long timeoutMillis, Meet on) {
         this.delegate = delegate;
-        this.arrived = new CountDownLatch(parties);
+        this.parties = parties;
+        this.on = on;
         this.timeoutMillis = timeoutMillis;
+        this.arrived = new CountDownLatch(parties);
+    }
+
+    /**
+     * Forgets who has already arrived and waits for a fresh set.
+     *
+     * <p>For a test whose fixture goes through the same store as the thing under test: load the fixture,
+     * arm, then run the operation whose concurrency is in question. Without this, the setup's own
+     * operations are the ones that meet and the operation under test never rendezvouses at all — which
+     * would make the assertion pass whether or not it ran concurrently.
+     */
+    public void arm() {
+        seen.clear();
+        arrived = new CountDownLatch(parties);
     }
 
     /**
@@ -104,7 +145,11 @@ public final class RendezvousBlobStore implements BlobStore {
             this.inner = inner;
         }
 
-        private void meet() throws IOException {
+        private void meet(Meet kind) throws IOException {
+            if (kind != on) {
+                return;
+            }
+            final CountDownLatch arrived = RendezvousBlobStore.this.arrived;
             final String shard = shardOf(inner.path());
             if (shard == null || seen.add(shard) == false) {
                 return;
@@ -137,18 +182,19 @@ public final class RendezvousBlobStore implements BlobStore {
 
         @Override
         public InputStream readBlob(String blobName) throws IOException {
-            meet();
+            meet(Meet.READS);
             return inner.readBlob(blobName);
         }
 
         @Override
         public InputStream readBlob(String blobName, long position, long length) throws IOException {
-            meet();
+            meet(Meet.READS);
             return inner.readBlob(blobName, position, length);
         }
 
         @Override
         public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
+            meet(Meet.WRITES);
             inner.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
         }
 
