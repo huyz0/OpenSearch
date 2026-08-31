@@ -106,33 +106,110 @@ public final class ActionGate {
      * @throws Exception if a filter refuses, or the operation fails
      */
     public <T> T run(String action, ActionRequest request, CheckedSupplier<T, Exception> work) throws Exception {
+        return run(action, request, work, opaque());
+    }
+
+    /**
+     * How the result of an operation is shown to a filter, and how a filter's answer is read back.
+     *
+     * <p>The shell's operations return their own types — a {@code Read}, a {@code SearchOutcome} — and a
+     * filter speaks {@link ActionResponse}. A view is the translation for one operation, written where
+     * the operation is, rather than a general conversion layer that would have to be right for everything.
+     *
+     * @param <T> what the operation returns
+     */
+    public interface ResponseView<T> {
+
+        /**
+         * Renders the result as the response a filter expects to see.
+         *
+         * @param result what the operation returned
+         * @return the response to show
+         */
+        ActionResponse show(T result);
+
+        /**
+         * Reads back whatever came out of the chain.
+         *
+         * @param response the response the chain produced, which a filter may have replaced
+         * @param original what the operation actually returned
+         * @return the result to give the caller
+         */
+        T read(ActionResponse response, T original);
+    }
+
+    /**
+     * A view that shows nothing.
+     *
+     * <p>What every operation had before responses could be seen at all: the filter is told the work was
+     * admitted and done, and its answer is discarded. Right for an operation whose response a filter has no
+     * business rewriting — a bulk acknowledgement, an index creation — and the only honest option for one
+     * whose result has no {@code ActionResponse} that could carry it without invention.
+     *
+     * @param <T> what the operation returns
+     * @return the view
+     */
+    public static <T> ResponseView<T> opaque() {
+        return new ResponseView<>() {
+            @Override
+            public ActionResponse show(T result) {
+                return Admitted.INSTANCE;
+            }
+
+            @Override
+            public T read(ActionResponse response, T original) {
+                return original;
+            }
+        };
+    }
+
+    /**
+     * Runs one operation through the filters, showing them its result.
+     *
+     * <p><b>What changes when a view is given.</b> The chain's listener is completed with the operation's
+     * actual response rather than with {@link Admitted}, and what the chain produces is what the caller
+     * gets. A filter that wraps the listener can therefore <em>rewrite</em> the answer — drop hits, redact
+     * fields — which is what document- and field-level security are made of, and which was impossible
+     * while every operation reported only that it had happened.
+     *
+     * @param action the action name, from core's own vocabulary
+     * @param request a request describing what is about to happen
+     * @param work the operation itself
+     * @param view how to show the result and read the answer back
+     * @param <T> what the operation returns
+     * @return whatever the operation returned, as the filters left it
+     * @throws Exception if a filter refuses, or the operation fails
+     */
+    public <T> T run(String action, ActionRequest request, CheckedSupplier<T, Exception> work, ResponseView<T> view) throws Exception {
         if (filters.isEmpty()) {
-            // The overwhelmingly common case, and it must cost nothing: no task, no future, no chain.
+            // The overwhelmingly common case, and it must cost nothing: no task, no future, no chain, and
+            // no response built for nobody to look at.
             return work.get();
         }
 
         final AtomicReference<T> result = new AtomicReference<>();
-        ActionFilterChain<ActionRequest, Admitted> chain = (task, name, req, listener) -> {
+        ActionFilterChain<ActionRequest, ActionResponse> chain = (task, name, req, listener) -> {
             try {
-                result.set(work.get());
-                listener.onResponse(Admitted.INSTANCE);
+                final T done = work.get();
+                result.set(done);
+                listener.onResponse(view.show(done));
             } catch (Exception e) {
                 listener.onFailure(e);
             }
         };
         for (int i = filters.size() - 1; i >= 0; i--) {
             final ActionFilter filter = filters.get(i);
-            final ActionFilterChain<ActionRequest, Admitted> next = chain;
+            final ActionFilterChain<ActionRequest, ActionResponse> next = chain;
             chain = (task, name, req, listener) -> filter.apply(task, name, req, ActionRequestMetadata.empty(), listener, next);
         }
 
-        final PlainActionFuture<Admitted> future = PlainActionFuture.newFuture();
+        final PlainActionFuture<ActionResponse> future = PlainActionFuture.newFuture();
         final Task task = new Task(0L, "serverless", action, "", TaskId.EMPTY_TASK_ID, Map.of());
         chain.proceed(task, action, request, future);
         // Throws whatever a filter reported, which for a refusal is the plugin's own exception carrying the
         // plugin's own status. Nothing here reinterprets it: a security plugin's 403 should reach the caller
         // as the security plugin wrote it.
-        future.actionGet();
-        return result.get();
+        final ActionResponse answered = future.actionGet();
+        return view.read(answered, result.get());
     }
 }

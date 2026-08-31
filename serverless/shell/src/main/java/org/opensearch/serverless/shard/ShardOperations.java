@@ -319,7 +319,70 @@ public final class ShardOperations {
      * @throws IOException if the read fails or no copy can answer
      */
     public Read get(String index, String id) throws IOException {
-        return gated(org.opensearch.action.get.GetAction.NAME, new org.opensearch.action.get.GetRequest(index, id), () -> doGet(index, id));
+        return gated(
+            org.opensearch.action.get.GetAction.NAME,
+            new org.opensearch.action.get.GetRequest(index, id),
+            () -> doGet(index, id),
+            getView(index)
+        );
+    }
+
+    /**
+     * How a get is shown to a filter, and how the filter's answer is read back.
+     *
+     * <p><b>A redaction that covered only search would not be one.</b> A filter that removes a field from
+     * every hit and cannot touch a get leaves the field one request away, under a URL any caller can
+     * guess — which is worse than no redaction, because it looks like protection. So a get is shown its
+     * real {@code GetResponse} for the same reason a search is.
+     *
+     * <p>Who served the read and whether it was realtime are kept from the original: they are facts about
+     * this node's routing, not about the document, and a filter has no business restating them.
+     *
+     * @param index the index, which a {@code GetResponse} has to carry
+     * @return the view
+     */
+    private static org.opensearch.serverless.shell.ActionGate.ResponseView<Read> getView(String index) {
+        return new org.opensearch.serverless.shell.ActionGate.ResponseView<>() {
+
+            @Override
+            public org.opensearch.core.action.ActionResponse show(Read read) {
+                final var document = read.document();
+                final org.opensearch.index.get.GetResult result = new org.opensearch.index.get.GetResult(
+                    index,
+                    document.id(),
+                    org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                    0L,
+                    1L,
+                    document.found(),
+                    document.source() == null
+                        ? null
+                        : new org.opensearch.core.common.bytes.BytesArray(
+                            document.source().getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                        ),
+                    java.util.Map.of(),
+                    java.util.Map.of()
+                );
+                return new org.opensearch.action.get.GetResponse(result);
+            }
+
+            @Override
+            public Read read(org.opensearch.core.action.ActionResponse response, Read original) {
+                if (response instanceof org.opensearch.action.get.GetResponse answered) {
+                    return new Read(
+                        new org.opensearch.serverless.shell.ServerlessNode.Document(
+                            answered.getId(),
+                            answered.isExists(),
+                            answered.isSourceEmpty() ? null : answered.getSourceAsString()
+                        ),
+                        original.servedBy(),
+                        original.realtime()
+                    );
+                }
+                throw new IllegalStateException(
+                    "an action filter answered a get with " + response.getClass().getName() + ", which is not a get response"
+                );
+            }
+        };
     }
 
     /**
@@ -338,8 +401,17 @@ public final class ShardOperations {
         org.opensearch.action.ActionRequest request,
         org.opensearch.common.CheckedSupplier<T, Exception> work
     ) throws IOException {
+        return gated(action, request, work, org.opensearch.serverless.shell.ActionGate.opaque());
+    }
+
+    private <T> T gated(
+        String action,
+        org.opensearch.action.ActionRequest request,
+        org.opensearch.common.CheckedSupplier<T, Exception> work,
+        org.opensearch.serverless.shell.ActionGate.ResponseView<T> view
+    ) throws IOException {
         try {
-            return node.actionGate().run(action, request, work);
+            return node.actionGate().run(action, request, work, view);
         } catch (IOException | RuntimeException e) {
             throw e;
         } catch (Exception e) {

@@ -228,6 +228,187 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A plugin whose filter redacts a field from every hit a search returns.
+     *
+     * <p>The smallest thing that is genuinely field-level security: it wraps the listener, waits for the
+     * response, and hands back a different one. Written against core's interface with no knowledge of this
+     * shell — the same filter would run on a classic node.
+     */
+    public static final class RedactingPlugin extends Plugin implements ActionPlugin {
+
+        /** The field it removes from every document it lets through. */
+        public static final String SECRET = "secret";
+
+        @Override
+        public List<ActionFilter> getActionFilters() {
+            return List.of(new ActionFilter() {
+                @Override
+                public int order() {
+                    return 10;
+                }
+
+                @Override
+                public <Request extends ActionRequest, Response extends ActionResponse> void apply(
+                    Task task,
+                    String action,
+                    Request request,
+                    ActionRequestMetadata<Request, Response> metadata,
+                    ActionListener<Response> listener,
+                    ActionFilterChain<Request, Response> chain
+                ) {
+                    if (action.equals(org.opensearch.action.get.GetAction.NAME)) {
+                        chain.proceed(task, action, request, ActionListener.wrap(response -> {
+                            final var answered = (org.opensearch.action.get.GetResponse) response;
+                            if (answered.isExists() == false) {
+                                listener.onResponse(response);
+                                return;
+                            }
+                            final var source = new java.util.LinkedHashMap<>(answered.getSourceAsMap());
+                            source.remove(SECRET);
+                            @SuppressWarnings("unchecked")
+                            final Response rewritten = (Response) new org.opensearch.action.get.GetResponse(
+                                new org.opensearch.index.get.GetResult(
+                                    answered.getIndex(),
+                                    answered.getId(),
+                                    answered.getSeqNo(),
+                                    answered.getPrimaryTerm(),
+                                    answered.getVersion(),
+                                    true,
+                                    org.opensearch.core.common.bytes.BytesReference.bytes(
+                                        org.opensearch.common.xcontent.XContentFactory.jsonBuilder().map(source)
+                                    ),
+                                    java.util.Map.of(),
+                                    java.util.Map.of()
+                                )
+                            );
+                            listener.onResponse(rewritten);
+                        }, listener::onFailure));
+                        return;
+                    }
+                    if (action.equals(org.opensearch.action.search.SearchAction.NAME) == false) {
+                        chain.proceed(task, action, request, listener);
+                        return;
+                    }
+                    chain.proceed(task, action, request, ActionListener.wrap(response -> {
+                        final var answered = (org.opensearch.action.search.SearchResponse) response;
+                        final var redacted = new org.opensearch.search.SearchHit[answered.getHits().getHits().length];
+                        for (int i = 0; i < redacted.length; i++) {
+                            redacted[i] = withoutTheSecret(answered.getHits().getHits()[i]);
+                        }
+                        final var hits = new org.opensearch.search.SearchHits(
+                            redacted,
+                            answered.getHits().getTotalHits(),
+                            answered.getHits().getMaxScore()
+                        );
+                        final var internal = new org.opensearch.search.internal.InternalSearchResponse(
+                            hits,
+                            (org.opensearch.search.aggregations.InternalAggregations) answered.getAggregations(),
+                            null,
+                            null,
+                            false,
+                            null,
+                            1
+                        );
+                        @SuppressWarnings("unchecked")
+                        final Response rewritten = (Response) new org.opensearch.action.search.SearchResponse(
+                            internal,
+                            null,
+                            answered.getTotalShards(),
+                            answered.getSuccessfulShards(),
+                            0,
+                            0L,
+                            org.opensearch.action.search.ShardSearchFailure.EMPTY_ARRAY,
+                            org.opensearch.action.search.SearchResponse.Clusters.EMPTY
+                        );
+                        listener.onResponse(rewritten);
+                    }, listener::onFailure));
+                }
+            });
+        }
+
+        private static org.opensearch.search.SearchHit withoutTheSecret(org.opensearch.search.SearchHit hit) throws java.io.IOException {
+            final var source = new java.util.LinkedHashMap<>(hit.getSourceAsMap());
+            source.remove(SECRET);
+            final var copy = new org.opensearch.search.SearchHit(hit.docId(), hit.getId(), hit.getNestedIdentity(), null, null);
+            copy.sourceRef(
+                org.opensearch.core.common.bytes.BytesReference.bytes(
+                    org.opensearch.common.xcontent.XContentFactory.jsonBuilder().map(source)
+                )
+            );
+            copy.score(hit.getScore());
+            // The shard target is what carries the index name onto a hit, so setting it is how the copy
+            // keeps saying which index it came from.
+            copy.shard(hit.getShard());
+            return copy;
+        }
+    }
+
+    /**
+     * A filter can rewrite a search response, which is what field-level security is made of.
+     *
+     * <p><b>This was impossible until the response reached the filter at all.</b> Every operation completed
+     * its filter chain with a token saying the work had been done, so a plugin could refuse a search and
+     * could not change one — no redaction, no document-level filtering, nothing that depends on seeing what
+     * came back. The gate now shows a search its real {@code SearchResponse} and takes back whatever the
+     * chain produced.
+     *
+     * <p>The test asserts on the document rather than on the mechanism: the field is in the index, and it
+     * is not in the answer.
+     */
+    public void testAFilterCanRedactAFieldFromASearchResponse() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final String mapping = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"secret\":{\"type\":\"keyword\"}}}";
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, mapping, null));
+        plane.createIndex(new IndexDescriptor(".serverless_auth", "uuid-auth-000000000", 1, AUTH_MAPPING, null));
+        final Settings settings = nodeSettings("authz-redact");
+
+        try (
+            ServerlessNode node = new ServerlessNode(
+                settings,
+                List.of(ServerlessAuthPlugin.withClock(settings, System::currentTimeMillis), new RedactingPlugin())
+            )
+        ) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("alpha", 0);
+            loop.want(".serverless_auth", 0);
+            loop.tick(clock.get());
+
+            final String asAdmin = basic(ADMIN, ADMIN_PASSWORD);
+            final Response written = send(
+                node,
+                "PUT",
+                "/alpha/_doc/1?refresh=true",
+                asAdmin,
+                "{\"msg\":\"visible\",\"secret\":\"do-not-show-this\"}"
+            );
+            assertEquals(written.body(), 201, written.status());
+
+            final Response searched = send(node, "POST", "/alpha/_search", asAdmin, "{\"query\":{\"match_all\":{}}}");
+            assertEquals(searched.body(), 200, searched.status());
+            assertTrue("the document must still be found: " + searched.body(), searched.body().contains("visible"));
+            assertFalse("the redacted field must not reach the caller: " + searched.body(), searched.body().contains("do-not-show-this"));
+            assertTrue("and the hit must still be counted: " + searched.body(), searched.body().contains("\"value\":1"));
+
+            // And a get is redacted too, which is the difference between a redaction and a decoration: a
+            // field hidden from search and readable at /alpha/_doc/1 is one URL away from not being hidden.
+            final Response got = send(node, "GET", "/alpha/_doc/1", asAdmin, null);
+            assertEquals(got.body(), 200, got.status());
+            assertTrue("the document must still be returned: " + got.body(), got.body().contains("visible"));
+            assertFalse("a get must be redacted as well: " + got.body(), got.body().contains("do-not-show-this"));
+
+            // And _mget, which routes through the same operation -- asserted rather than assumed, because
+            // "it goes through the same code" is exactly the belief that is worth one line to check.
+            final Response many = send(node, "POST", "/alpha/_mget", asAdmin, "{\"ids\":[\"1\"]}");
+            assertEquals(many.body(), 200, many.status());
+            assertTrue("the document must still be there: " + many.body(), many.body().contains("visible"));
+            assertFalse("_mget must be redacted too: " + many.body(), many.body().contains("do-not-show-this"));
+        }
+    }
+
     /** A bulk arrives at the filter as a bulk, naming the indices it is about to write. */
     public void testABulkReachesTheFilterUnderTheBulkActionWithItsIndices() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

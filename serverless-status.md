@@ -1,6 +1,6 @@
 # The serverless shell: where it actually is
 
-Per-milestone notes (`m10`…`m38`) record what was true when each was written, which is the point of them.
+Per-milestone notes (`m10`…`m40`) record what was true when each was written, which is the point of them.
 Their "what is still missing" sections do not — those age badly, and several had been closed by later work
 while still reading as open. **This document supersedes all of them.** If a milestone note and this
 disagree, this is right.
@@ -62,7 +62,9 @@ search plugins, network plugins and their transport interceptors, system-index d
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,
 salted PBKDF2, one configured account in the keystore checked before the store so an unreadable object
 store is not a locked door. A separate plugin's `ActionFilter`s can refuse by action name and caller —
-proved by a reader being denied a write an administrator is allowed.
+proved by a reader being denied a write an administrator is allowed — and can *rewrite* what a search or a
+get returns, which is what field- and document-level security are made of: a filter that removes a field
+from every hit removes it from `_search`, `_doc/{id}` and `_mget` alike.
 
 **Bounds.** Real circuit breakers, so an aggregation past the limit is refused and the node keeps serving;
 and core's indexing pressure on the write paths, so a batch larger than the node's budget is rejected with
@@ -92,7 +94,8 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - Node-to-node forwarding carries no identity, so filters run on the coordinating node only and the
   transport port must be treated as trusted infrastructure. Making identity travel without node
   authentication would make that assumption load-bearing.
-- Filters see requests, not responses — so document-level security and field redaction cannot work.
+- Dropping hits on a per-document rule is possible by the same mechanism as redacting them, and is not
+  demonstrated. Only redaction has a test.
 - No action registry, so a plugin's own transport actions (Security's config-update API) cannot run.
 - A point in time is node-local once opened: the record is in the object store and any node can serve it,
   but two nodes serving one view open it twice. No slicing.
@@ -128,7 +131,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-308 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+310 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against a
 live MinIO) — none skipped.
 

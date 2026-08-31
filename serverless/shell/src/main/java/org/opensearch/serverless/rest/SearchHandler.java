@@ -367,7 +367,8 @@ public final class SearchHandler extends BaseRestHandler {
                     // Every index the search covers, so a filter evaluating privileges sees all of them
                     // rather than the first one named.
                     new org.opensearch.action.search.SearchRequest(indices.toArray(new String[0]), source),
-                    work
+                    work,
+                    searchView()
                 );
         } catch (IOException | RuntimeException e) {
             throw e;
@@ -375,6 +376,86 @@ public final class SearchHandler extends BaseRestHandler {
             throw new IOException(e);
         }
     }
+
+    /**
+     * How a search result is shown to a filter, and how the filter's answer is read back.
+     *
+     * <p><b>This is what makes field- and document-level security possible here.</b> A filter that wraps
+     * the listener now receives a real {@code SearchResponse} and may hand back a different one — with
+     * hits removed, or with fields redacted from their source — and that is the answer the caller gets.
+     * Before this, every operation reported only that it had happened, so a filter could refuse a search
+     * and could not change one.
+     *
+     * <p><b>Coverage is not the filter's to change, and is taken from the outcome either way.</b> How many
+     * shards answered is a fact about this node's fan-out; a filter that dropped hits has not made an
+     * index unreachable, and letting a rewritten response carry its own shard counts would let a redaction
+     * masquerade as a partial answer.
+     *
+     * <p>The generic type is erased at the seam — the gate is generic over what the work returns, and only
+     * a search passes this view — so the cast is checked by the one call site rather than by the compiler.
+     */
+    @SuppressWarnings("unchecked")
+    private static <T> org.opensearch.serverless.shell.ActionGate.ResponseView<T> searchView() {
+        return (org.opensearch.serverless.shell.ActionGate.ResponseView<T>) SEARCH_VIEW;
+    }
+
+    private static final org.opensearch.serverless.shell.ActionGate.ResponseView<
+        org.opensearch.serverless.shard.ShardOperations.SearchOutcome> SEARCH_VIEW =
+            new org.opensearch.serverless.shell.ActionGate.ResponseView<>() {
+
+                @Override
+                public org.opensearch.core.action.ActionResponse show(
+                    org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome
+                ) {
+                    final SearchHit[] hits = outcome.hits().toArray(new SearchHit[0]);
+                    final org.opensearch.search.SearchHits searchHits = new org.opensearch.search.SearchHits(
+                        hits,
+                        new org.apache.lucene.search.TotalHits(outcome.total(), org.apache.lucene.search.TotalHits.Relation.EQUAL_TO),
+                        Float.NaN
+                    );
+                    final var internal = new org.opensearch.search.internal.InternalSearchResponse(
+                        searchHits,
+                        outcome.aggregations(),
+                        null,
+                        null,
+                        false,
+                        null,
+                        1
+                    );
+                    return new org.opensearch.action.search.SearchResponse(
+                        internal,
+                        null,
+                        outcome.shards(),
+                        outcome.answered(),
+                        0,
+                        0L,
+                        org.opensearch.action.search.ShardSearchFailure.EMPTY_ARRAY,
+                        org.opensearch.action.search.SearchResponse.Clusters.EMPTY
+                    );
+                }
+
+                @Override
+                public org.opensearch.serverless.shard.ShardOperations.SearchOutcome read(
+                    org.opensearch.core.action.ActionResponse response,
+                    org.opensearch.serverless.shard.ShardOperations.SearchOutcome original
+                ) {
+                    if (response instanceof org.opensearch.action.search.SearchResponse answered) {
+                        return new org.opensearch.serverless.shard.ShardOperations.SearchOutcome(
+                            answered.getHits().getTotalHits() == null ? original.total() : answered.getHits().getTotalHits().value(),
+                            java.util.List.of(answered.getHits().getHits()),
+                            original.shards(),
+                            original.answered(),
+                            (org.opensearch.search.aggregations.InternalAggregations) answered.getAggregations()
+                        );
+                    }
+                    // A filter that replaced the response with something that is not a search answer.
+                    // Taking the original would silently undo whatever it meant to do, so this refuses
+                    // instead: a filter doing something the shell cannot honour must be visible.
+                    throw new IllegalStateException(
+                        "an action filter answered a search with " + response.getClass().getName() + ", which is not a search response"
+                    );
+                }
+            };
 
     private void respondFrozen(
         org.opensearch.rest.RestChannel channel,
