@@ -142,7 +142,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-317 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+316 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against a
 live MinIO) — none skipped.
 
