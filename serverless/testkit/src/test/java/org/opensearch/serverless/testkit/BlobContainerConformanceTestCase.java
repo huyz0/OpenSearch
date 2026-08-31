@@ -222,4 +222,86 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
         // And the name is free again, which index deletion depends on.
         assertTrue(container.createRegisterIfAbsent("head", bytes("v2")).applied());
     }
+
+    /**
+     * A concurrent workload must have a sequential order that explains it.
+     *
+     * <p><b>Why this is not one more property.</b> The tests above ask questions somebody thought of: two
+     * contenders, one winner; a stale generation loses. Each is real and each looks at one scenario.
+     * Linearizability is not a scenario — it is a claim about every interleaving — so this runs a workload
+     * shaped like the real one (each worker holds the generation it last saw and swaps against it, exactly
+     * as a node taking a shard does), writes down what every call returned and when, and asks whether any
+     * single sequential order could have produced all of it.
+     *
+     * <p>That is what catches the deviations nobody wrote a scenario for: a read served from a replica that
+     * had not caught up, a refusal reporting a generation nobody stored, an interleaving that is fine
+     * pairwise and impossible together.
+     *
+     * <p><b>Short rounds rather than one long history.</b> The search is exponential in the worst case, and
+     * a violation shows up in a small window far more often than it needs a large one. Several independent
+     * rounds are more chances to catch something and each is cheap to judge.
+     *
+     * @throws Exception if the backend cannot be reached
+     */
+    public void testAConcurrentHistoryIsLinearizable() throws Exception {
+        final BlobContainer container = newContainer();
+        final int workers = Math.min(4, contenders());
+        final int callsEach = 12;
+
+        for (int round = 0; round < 4; round++) {
+            final String name = "history-" + round;
+            container.createRegisterIfAbsent(name, bytes("v0"));
+            final long initial = container.readRegister(name).orElseThrow().generation();
+
+            final RegisterHistory history = new RegisterHistory();
+            final CountDownLatch start = new CountDownLatch(1);
+            final java.util.List<Exception> failures = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+            final Thread[] threads = new Thread[workers];
+            for (int w = 0; w < workers; w++) {
+                final int worker = w;
+                threads[w] = new Thread(() -> {
+                    long known = initial;
+                    try {
+                        start.await();
+                        for (int call = 0; call < callsEach; call++) {
+                            if (call % 3 == 0) {
+                                final long invoked = history.invoke();
+                                final var seen = container.readRegister(name);
+                                history.completed(
+                                    new RegisterHistory.Read(
+                                        seen.map(BlobRegister::generation).orElse(RegisterHistory.ABSENT),
+                                        seen.map(r -> r.value().utf8ToString()).orElse(null)
+                                    ),
+                                    invoked
+                                );
+                                known = seen.map(BlobRegister::generation).orElse(RegisterHistory.ABSENT);
+                            } else {
+                                final String value = "w" + worker + "-" + call;
+                                final long invoked = history.invoke();
+                                final var result = container.compareAndSwapRegister(name, known, bytes(value));
+                                history.completed(
+                                    new RegisterHistory.Cas(known, value, result.applied(), result.currentGeneration()),
+                                    invoked
+                                );
+                                // Whether it won or lost, the register tells the caller where it now is.
+                                // Believing that is exactly what the design does.
+                                known = result.currentGeneration();
+                            }
+                        }
+                    } catch (Exception e) {
+                        failures.add(e);
+                    }
+                });
+                threads[w].start();
+            }
+            start.countDown();
+            for (Thread t : threads) {
+                t.join(120_000);
+            }
+
+            assertEquals("no call should have errored: " + failures, java.util.List.of(), failures);
+            LinearizabilityChecker.check(history.entries(), initial, "v0")
+                .assertLinearizable("round " + round + " of the concurrent register workload");
+        }
+    }
 }

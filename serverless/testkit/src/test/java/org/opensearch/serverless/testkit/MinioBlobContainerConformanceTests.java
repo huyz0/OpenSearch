@@ -160,4 +160,39 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
             return false;
         }
     }
+
+    /**
+     * And the linearizability check must discriminate on this transport too.
+     *
+     * <p>The concurrent history running green against a live endpoint says nothing until somebody has
+     * shown it would have gone red had the endpoint been wrong — and shown it <em>here</em>, over HTTP,
+     * through the S3 client's retries and error handling, rather than only over a filesystem. A stale read
+     * is the deviation chosen because it is the one a real provider is most likely to have and the one no
+     * other property in this suite asks about.
+     *
+     * @throws Exception if the endpoint cannot be reached
+     */
+    public void testTheLinearizabilityCheckWouldCatchAStaleReadOnThisTransport() throws Exception {
+        final BlobContainer honest = newContainer();
+        final var broken = new MisbehavingBlobContainer(honest);
+        broken.createRegisterIfAbsent("stale", new BytesArray("v0".getBytes(StandardCharsets.UTF_8)));
+        final long initial = broken.readRegister("stale").orElseThrow().generation();
+
+        final RegisterHistory history = new RegisterHistory();
+        long invoked = history.invoke();
+        final var applied = broken.compareAndSwapRegister("stale", initial, new BytesArray("v1".getBytes(StandardCharsets.UTF_8)));
+        history.completed(new RegisterHistory.Cas(initial, "v1", applied.applied(), applied.currentGeneration()), invoked);
+        assertTrue("the write must really have happened", applied.applied());
+
+        broken.staleReadEvery(1);
+        invoked = history.invoke();
+        final var seen = broken.readRegister("stale").orElseThrow();
+        history.completed(new RegisterHistory.Read(seen.generation(), seen.value().utf8ToString()), invoked);
+        assertEquals("this test is meaningless unless the read really was stale", "v0", seen.value().utf8ToString());
+
+        assertFalse(
+            "a stale read over this transport must be caught, or the green run above proves nothing",
+            LinearizabilityChecker.check(history.entries(), initial, "v0").linearizable()
+        );
+    }
 }
