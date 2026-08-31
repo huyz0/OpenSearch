@@ -293,12 +293,17 @@ public final class DescriptorStore {
      * fit in a response, cannot be consumed by a caller, and is stale before it finishes. So the API is
      * a cursor walk, and callers that want everything pay for everything, one page at a time, visibly.
      *
-     * <p>Two costs, and they are bounded differently. The descriptor <b>reads</b> are bounded here by
-     * {@code limit}, on any backend. The <b>listing</b> is bounded natively by S3's
-     * {@code ListObjectsV2} {@code start-after} plus {@code max-keys} and GCS's equivalent;
-     * {@code FsBlobContainer} has no such primitive and enumerates the directory, so on a filesystem
-     * this is bounded in reads but not in the listing itself. That half cannot be demonstrated here and
-     * belongs with R11.
+     * <p><b>Two costs, and only one of them is bounded.</b> The descriptor <b>reads</b> are bounded here
+     * by {@code limit}, on any backend. The <b>listing</b> is not bounded on any backend, including S3:
+     * this calls {@code listBlobs()}, which paginates the whole container, and there is no way to do
+     * better through {@code BlobContainer} because its listing API carries a prefix and a limit but no
+     * {@code start-after}, which is what resuming a cursor needs.
+     *
+     * <p>An earlier version of this comment said the listing was bounded natively by S3's
+     * {@code ListObjectsV2} {@code start-after} plus {@code max-keys}. It never was — the code has always
+     * called the unbounded listing, and the claim described what the API would need rather than what it
+     * does. See {@link #namesWithPrefix}, which <em>is</em> bounded, for the shape that works: a prefix
+     * and a maximum, with no resumption to carry.
      *
      * @param after return names strictly greater than this, or null to start at the beginning
      * @param limit maximum descriptors to return
@@ -377,6 +382,94 @@ public final class DescriptorStore {
         public boolean hasMore() {
             return nextAfter != null;
         }
+    }
+
+    /**
+     * More names share a prefix than a caller is willing to be handed.
+     *
+     * <p>A refusal rather than a truncation, and that is the whole point of the class existing: an answer
+     * cut off at a limit looks exactly like a complete one, and a search that quietly covered the first
+     * five hundred indices of a thousand is the confident partial answer this design refuses everywhere
+     * else.
+     */
+    public static final class TooManyMatchesException extends IOException {
+
+        private final String prefix;
+        private final int cap;
+
+        TooManyMatchesException(String prefix, int cap) {
+            super(
+                "more than "
+                    + cap
+                    + " indices begin with ["
+                    + prefix
+                    + "]. Narrowing the pattern or naming the indices is the answer; returning the first "
+                    + cap
+                    + " would be a partial result that looks complete."
+            );
+            this.prefix = prefix;
+            this.cap = cap;
+        }
+
+        /**
+         * Returns the prefix that matched too much.
+         *
+         * @return the prefix
+         */
+        public String prefix() {
+            return prefix;
+        }
+
+        /**
+         * Returns the cap that was exceeded.
+         *
+         * @return the cap
+         */
+        public int cap() {
+            return cap;
+        }
+    }
+
+    /**
+     * Returns the names beginning with a prefix, up to a cap.
+     *
+     * <p><b>This is what makes an index pattern answerable without enumerating the deployment.</b> §6.3
+     * refuses enumeration on a request path, and that refusal was the reason {@code logs-*} was refused
+     * too. It does not have to be: a prefix listing with a maximum key count is one request whose cost is
+     * set by the cap rather than by the population, so a deployment with a hundred million indices pays
+     * exactly what one with ten pays.
+     *
+     * <p><b>The cap is asked for plus one, deliberately.</b> A listing that returns exactly the cap is
+     * indistinguishable from one that was cut off there. Asking for one more is what makes "there are more
+     * than this" a fact rather than a guess, and it costs one key.
+     *
+     * <p><b>Names, not descriptors.</b> Reading each one would turn a bounded listing back into work
+     * proportional to what matched, and the caller reads them anyway to find out what it got — an index,
+     * an alias, or a tombstone left by a deletion. Which of those it is belongs to the caller, not here.
+     *
+     * @param prefix the prefix, which may be empty to mean every name
+     * @param cap the most names to return
+     * @return the matching names, in lexicographic order
+     * @throws TooManyMatchesException if more than {@code cap} names match
+     * @throws IOException if the listing fails
+     */
+    public List<String> namesWithPrefix(String prefix, int cap) throws IOException {
+        if (cap < 1) {
+            throw new IllegalArgumentException("cap must be positive, got " + cap);
+        }
+        final List<org.opensearch.common.blobstore.BlobMetadata> found = container.listBlobsByPrefixInSortedOrder(
+            prefix,
+            cap + 1,
+            BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC
+        );
+        if (found.size() > cap) {
+            throw new TooManyMatchesException(prefix, cap);
+        }
+        final List<String> names = new ArrayList<>(found.size());
+        for (org.opensearch.common.blobstore.BlobMetadata blob : found) {
+            names.add(blob.name());
+        }
+        return names;
     }
 
     /**

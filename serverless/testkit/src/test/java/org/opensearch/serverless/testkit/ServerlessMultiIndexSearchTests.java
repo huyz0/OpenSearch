@@ -33,11 +33,14 @@ import java.util.regex.Pattern;
  * Searching several indices at once, and refusing to guess which ones.
  *
  * <p>A comma-separated list is resolved by looking each name up: one register read per name, no listing.
- * A pattern is refused, and the refusal is the interesting half. Resolving {@code logs-*} means enumerating
- * the deployment's indices, which is the operation &sect;6.3 declines to offer on a request path — the same
- * reason {@code /_serverless/indices} answers 501 and the same reason a plugin's index-name resolver
- * refuses. A wildcard that quietly matched only the indices this node happened to know about would be worse
- * than no wildcard at all.
+ * A <b>prefix</b> pattern costs one bounded listing on top of that — a single {@code ListObjectsV2} with a
+ * maximum key count, whose cost is set by the cap rather than by the population. Anything else stays
+ * refused: {@code *-2026} cannot be answered by a listing at all, only by reading every name in the
+ * deployment, which is the operation &sect;6.3 declines to offer on a request path.
+ *
+ * <p>The rule was never "listings are forbidden". It was that a request must not cost the size of the
+ * deployment and must not answer from a subset while looking complete — so a pattern matching more than the
+ * cap is refused rather than truncated.
  *
  * <p><b>One fan-out, not one search per index.</b> Six shards across three indices are asked at once, and
  * the window is cut once over everything — so page two of a search over three indices is the page two it
@@ -123,8 +126,70 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         }
     }
 
-    /** A pattern is refused, and the refusal says why rather than returning nothing. */
-    public void testAnIndexPatternIsRefused() throws Exception {
+    /**
+     * A prefix pattern is answered, by one bounded listing.
+     *
+     * <p><b>What changed, and why the old refusal was right until it was not.</b> &sect;6.3 refuses
+     * enumeration on a request path, and resolving {@code logs-*} by reading every index name in the
+     * deployment is exactly that. But the rule was never "listings are forbidden" — it was that a request
+     * must not cost the size of the deployment and must not answer from a subset while looking complete.
+     * A prefix listing with a maximum key count satisfies both: one round trip whose cost is set by the
+     * cap, and a refusal rather than a truncation when more match than the cap allows.
+     */
+    public void testAPrefixPatternMatchesTheIndicesThatShareIt() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("logs-a", "uuid-logs-a-0000000", 1, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("logs-b", "uuid-logs-b-0000000", 1, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("metrics-a", "uuid-metrics-a-000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-prefix"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "logs-a", "logs-b", "metrics-a");
+
+            assertEquals(201, send(node, "PUT", "/logs-a/_doc/1?refresh=true", "{\"msg\":\"shared\",\"rank\":1}").status());
+            assertEquals(201, send(node, "PUT", "/logs-b/_doc/2?refresh=true", "{\"msg\":\"shared\",\"rank\":2}").status());
+            assertEquals(201, send(node, "PUT", "/metrics-a/_doc/3?refresh=true", "{\"msg\":\"shared\",\"rank\":3}").status());
+
+            final Response matched = send(node, "POST", "/logs-*/_search", "{\"size\":10,\"query\":{\"match\":{\"msg\":\"shared\"}}}");
+            assertEquals(matched.body(), 200, matched.status());
+            assertTrue("both logs indices must be searched: " + matched.body(), matched.body().contains("\"value\":2"));
+            assertEquals("and only those two: " + matched.body(), 2, shardTotal(matched.body()));
+            final List<String> indices = indicesIn(matched.body());
+            assertTrue("a hit from each: " + matched.body(), indices.contains("logs-a") && indices.contains("logs-b"));
+            assertFalse("and nothing from outside the prefix: " + matched.body(), indices.contains("metrics-a"));
+
+            // A pattern beside a name, which is where the two paths have to agree.
+            final Response mixed = send(
+                node,
+                "POST",
+                "/logs-*,metrics-a/_search",
+                "{\"size\":10,\"query\":{\"match\":{\"msg\":\"shared\"}}}"
+            );
+            assertEquals(mixed.body(), 200, mixed.status());
+            assertEquals("all three: " + mixed.body(), 3, shardTotal(mixed.body()));
+
+            // And a name matched by both the pattern and the list is one index, not two.
+            final Response overlapping = send(
+                node,
+                "POST",
+                "/logs-*,logs-a/_search",
+                "{\"size\":10,\"query\":{\"match\":{\"msg\":\"shared\"}}}"
+            );
+            assertEquals("an index named twice is still one index: " + overlapping.body(), 2, shardTotal(overlapping.body()));
+        }
+    }
+
+    /**
+     * A pattern that is not a prefix is still refused, and the reason is unchanged.
+     *
+     * <p>{@code *-2026} cannot be answered by a listing at all — only by reading every name in the
+     * deployment and matching each one, which is the operation this system does not offer on a request
+     * path. Offering the prefix case and refusing this one is the honest split, rather than supporting a
+     * wildcard syntax whose cost depends on where the caller put the star.
+     */
+    public void testANonPrefixPatternIsRefused() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(clock);
         plane.createIndex(new IndexDescriptor("logs-a", "uuid-logs-a-0000000", 1, MAPPING, null));
@@ -134,13 +199,137 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "logs-a");
 
-            final Response wildcard = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match_all\":{}}}");
-            assertEquals("a pattern must be refused, not matched against what this node knows: " + wildcard.body(), 501, wildcard.status());
-            assertTrue("and say what it would have cost: " + wildcard.body(), wildcard.body().contains("enumerating every index"));
-            assertTrue("and what to do instead: " + wildcard.body(), wildcard.body().contains("Name the indices"));
+            // The single-character wildcard is percent-encoded, because a raw ? in a URL starts the query
+            // string and never reaches the handler as part of the index name.
+            for (String pattern : List.of("*-a", "lo*s-a", "logs-%3F")) {
+                final Response refused = send(node, "POST", "/" + pattern + "/_search", "{\"query\":{\"match_all\":{}}}");
+                assertEquals("[" + pattern + "] must be refused: " + refused.body(), 501, refused.status());
+                assertTrue("and say what it would have cost: " + refused.body(), refused.body().contains("reading every index name"));
+            }
 
-            // The same is true inside a list, where it would be easiest to let one through.
-            assertEquals(501, send(node, "POST", "/logs-a,logs-*/_search", "{\"query\":{\"match_all\":{}}}").status());
+            // Inside a list, where it would be easiest to let one through.
+            assertEquals(501, send(node, "POST", "/logs-a,*-a/_search", "{\"query\":{\"match_all\":{}}}").status());
+        }
+    }
+
+    /**
+     * A pattern matching nothing is an error, not an empty answer.
+     *
+     * <p>The same rule a named index gets: a search that covered no indices at all and reported itself
+     * complete is the confident empty answer this surface exists to avoid. A caller who means "whatever is
+     * there, possibly nothing" says so with {@code ignore_unavailable}.
+     */
+    public void testAPatternMatchingNothingIsRefusedUnlessAsked() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("logs-a", "uuid-logs-a-0000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-empty-pattern"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "logs-a");
+            assertEquals(201, send(node, "PUT", "/logs-a/_doc/1?refresh=true", "{\"msg\":\"shared\",\"rank\":1}").status());
+
+            final Response nothing = send(node, "POST", "/nosuch-*/_search", "{\"query\":{\"match_all\":{}}}");
+            assertEquals("a pattern matching nothing must not answer emptily: " + nothing.body(), 404, nothing.status());
+            assertTrue("and must name the pattern: " + nothing.body(), nothing.body().contains("nosuch-*"));
+
+            // Asked for explicitly, it is allowed -- and the indices that did match are still searched.
+            final Response asked = send(
+                node,
+                "POST",
+                "/logs-*,nosuch-*/_search?ignore_unavailable=true",
+                "{\"query\":{\"match\":{\"msg\":\"shared\"}}}"
+            );
+            assertEquals(asked.body(), 200, asked.status());
+            assertTrue("what did match must still be searched: " + asked.body(), asked.body().contains("\"value\":1"));
+        }
+    }
+
+    /**
+     * A pattern matching more than the cap is refused, not truncated.
+     *
+     * <p><b>This is the assertion the whole permission rests on.</b> A prefix listing is only bounded
+     * because it stops at a maximum, and an answer that stopped at a maximum and said nothing about it
+     * would be a partial result wearing the shape of a complete one — worse than the refusal that used to
+     * be there, because at least the refusal was honest.
+     *
+     * <p>The listing asks for the cap plus one, which is what makes "there are more than this" a fact
+     * rather than a guess: a listing that returns exactly the cap is indistinguishable from one that was
+     * cut off there.
+     */
+    public void testAPatternMatchingMoreThanTheCapIsRefused() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        for (String suffix : List.of("a", "b", "c")) {
+            plane.createIndex(new IndexDescriptor("logs-" + suffix, "uuid-logs-" + suffix + "-0000000", 1, MAPPING, null));
+        }
+
+        final Settings capped = Settings.builder()
+            .put(nodeSettings("multi-capped"))
+            .put("serverless.search.pattern.max_indices", 3)
+            .build();
+        try (ServerlessNode node = new ServerlessNode(capped)) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "logs-a", "logs-b", "logs-c");
+            assertEquals(201, send(node, "PUT", "/logs-a/_doc/1?refresh=true", "{\"msg\":\"shared\",\"rank\":1}").status());
+
+            // Exactly the cap is allowed: the boundary is "more than", not "as many as".
+            final Response atTheCap = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match\":{\"msg\":\"shared\"}}}");
+            assertEquals("three indices with a cap of three must be searched: " + atTheCap.body(), 200, atTheCap.status());
+
+            plane.createIndex(new IndexDescriptor("logs-d", "uuid-logs-d-0000000", 1, MAPPING, null));
+
+            final Response overTheCap = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match\":{\"msg\":\"shared\"}}}");
+            assertEquals("one more than the cap must be refused: " + overTheCap.body(), 400, overTheCap.status());
+            assertTrue("and say what the limit was: " + overTheCap.body(), overTheCap.body().contains("more than 3 indices"));
+            assertTrue(
+                "and why it is a refusal rather than a truncation: " + overTheCap.body(),
+                overTheCap.body().contains("partial result that looks complete")
+            );
+        }
+    }
+
+    /**
+     * A pattern steps over what a deletion left behind.
+     *
+     * <p>Deleting an index swaps its descriptor to a tombstone and then removes it, so a listing can
+     * return a name whose register describes nothing. A pattern is a filter over what exists, so that is
+     * simply not a match — where a <em>named</em> index that is not there is a mistake and stays an error.
+     *
+     * <p>Reporting it as skipped would be wrong for the same reason: skipped means "you asked for this and
+     * it is missing from the answer", and nobody asked for it.
+     */
+    public void testAPatternDoesNotTripOverADeletedIndex() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("logs-a", "uuid-logs-a-0000000", 1, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("logs-b", "uuid-logs-b-0000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-deleted"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "logs-a", "logs-b");
+            assertEquals(201, send(node, "PUT", "/logs-a/_doc/1?refresh=true", "{\"msg\":\"shared\",\"rank\":1}").status());
+
+            assertEquals(200, send(node, "DELETE", "/logs-b", null).status());
+
+            final Response afterDelete = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match\":{\"msg\":\"shared\"}}}");
+            assertEquals("a pattern must survive a deleted index: " + afterDelete.body(), 200, afterDelete.status());
+            assertEquals("and search only what is left: " + afterDelete.body(), 1, shardTotal(afterDelete.body()));
+            assertFalse("with nothing reported as skipped: " + afterDelete.body(), afterDelete.body().contains("\"skipped\""));
+
+            // And with a tombstone still in place -- the window between the swap and the removal, which a
+            // failed removal makes permanent.
+            final var descriptors = plane.blobStore()
+                .blobContainer(org.opensearch.serverless.metadata.RegisterMap.indices(BlobPath.cleanPath()));
+            final var tombstone = new org.opensearch.core.common.bytes.BytesArray("{\"tombstone\":true}");
+            assertTrue(descriptors.createRegisterIfAbsent("logs-c", tombstone).applied());
+
+            final Response withTombstone = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match\":{\"msg\":\"shared\"}}}");
+            assertEquals("a tombstone in the listing must not become an error: " + withTombstone.body(), 200, withTombstone.status());
+            assertEquals("nor a shard to search: " + withTombstone.body(), 1, shardTotal(withTombstone.body()));
         }
     }
 

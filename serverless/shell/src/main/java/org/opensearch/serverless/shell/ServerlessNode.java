@@ -995,6 +995,22 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * The most indices a prefix pattern may match before the request is refused.
+     *
+     * <p>Configurable because it is a policy about how much fan-out a caller may ask for in one request,
+     * not a fact about the store — and because a default of five hundred is unreachable in a test, which
+     * would leave the refusal path unexercised.
+     *
+     * @return the cap
+     */
+    public int patternCap() {
+        return settings.getAsInt(
+            "serverless.search.pattern.max_indices",
+            org.opensearch.serverless.metadata.MetadataPlane.DEFAULT_PATTERN_CAP
+        );
+    }
+
+    /**
      * Opens one shard of a frozen view, so a search can read the commit it froze.
      *
      * <p>The view is opened as an index of its own — see

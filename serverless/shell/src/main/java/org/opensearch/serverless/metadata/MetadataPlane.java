@@ -425,6 +425,29 @@ public final class MetadataPlane {
     }
 
     /**
+     * The most names an index pattern may match before it is refused.
+     *
+     * <p><b>Chosen to keep a pattern to one request.</b> S3's {@code ListObjectsV2} returns at most a
+     * thousand keys per round trip, and this asks for the cap plus one, so anything below a thousand is a
+     * single listing. Five hundred leaves room and is already far past what a caller can do anything
+     * useful with: a search fanning out over five hundred indices is not a search anybody debugs.
+     */
+    public static final int DEFAULT_PATTERN_CAP = 500;
+
+    /**
+     * Returns the index and alias names beginning with a prefix.
+     *
+     * @param prefix the prefix, empty for every name
+     * @param cap the most names to return before refusing
+     * @return the matching names, in lexicographic order
+     * @throws DescriptorStore.TooManyMatchesException if more than {@code cap} match
+     * @throws IOException if the listing fails
+     */
+    public java.util.List<String> namesWithPrefix(String prefix, int cap) throws IOException {
+        return descriptors.namesWithPrefix(prefix, cap);
+    }
+
+    /**
      * Reads an index descriptor.
      *
      * @param indexName the index

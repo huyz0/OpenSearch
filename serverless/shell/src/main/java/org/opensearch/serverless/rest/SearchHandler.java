@@ -173,27 +173,67 @@ public final class SearchHandler extends BaseRestHandler {
             });
         }
 
-        // Several indices, named one by one.
+        // Several indices, named one by one or matched by a prefix.
         //
         // A comma-separated list is resolved by looking each name up, which costs one register read per
-        // name and no listing. A pattern is not, and cannot be: resolving `logs-*` means enumerating the
-        // deployment's indices, which is the operation §6.3 refuses on a request path and the reason
-        // RefusingIndexNameExpressionResolver exists. Refusing it here, by name, is better than a wildcard
-        // that quietly matched only the indices this node happened to know about.
-        final java.util.List<String> names = java.util.List.of(index.split(",", -1));
-        for (String name : names) {
-            if (name.isEmpty() || name.indexOf('*') >= 0 || name.indexOf('?') >= 0) {
+        // name and no listing. A prefix pattern costs one bounded listing on top of that -- a single
+        // ListObjectsV2 with a maximum key count, whose cost is set by the cap rather than by the
+        // population, so a deployment with a hundred million indices pays what one with ten pays.
+        //
+        // That is why §6.3's refusal of enumeration does not refuse this. The rule was never "listings are
+        // forbidden"; it was that a request must not cost the size of the deployment and must not answer
+        // from a subset while looking complete. A capped listing costs a fixed amount, and a pattern that
+        // matches more than the cap is refused rather than truncated.
+        //
+        // A pattern that is not a prefix stays refused, and the reason is the same one: `*-2026` cannot be
+        // answered by a listing at all, only by reading every name in the deployment and matching each.
+        final java.util.List<String> requested = java.util.List.of(index.split(",", -1));
+        for (String name : requested) {
+            if (name.isEmpty()) {
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "unsupported_search", "an empty index name was given")
+                );
+            }
+            if (name.indexOf('?') >= 0 || isPrefixPattern(name) == false && name.indexOf('*') >= 0) {
                 return channel -> channel.sendResponse(
                     IndexAdminHandler.error(
                         channel,
                         RestStatus.NOT_IMPLEMENTED,
                         "unsupported_search",
-                        "index patterns are not supported: matching ["
+                        "only a trailing-wildcard pattern is supported, and ["
                             + name
-                            + "] would mean enumerating every index in the deployment, which this system "
-                            + "does not offer on a request path. Name the indices you want."
+                            + "] is not one: matching it would mean reading every index name in the "
+                            + "deployment, which this system does not offer on a request path. Use a "
+                            + "prefix like [logs-*], or name the indices you want."
                     )
                 );
+            }
+        }
+
+        // What each pattern matched, so a name that came from a pattern can be told from one the caller
+        // typed. The distinction decides what a missing index means: a named index that is not there is a
+        // mistake, and a pattern is a filter over what exists rather than an assertion that anything does.
+        final java.util.List<String> names = new java.util.ArrayList<>();
+        final java.util.Set<String> fromPattern = new java.util.HashSet<>();
+        for (String name : requested) {
+            if (isPrefixPattern(name) == false) {
+                names.add(name);
+                continue;
+            }
+            final String prefix = name.substring(0, name.length() - 1);
+            final java.util.List<String> matched;
+            try {
+                matched = metadata.namesWithPrefix(prefix, serving.patternCap());
+            } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage())
+                );
+            }
+            for (String match : matched) {
+                if (names.contains(match) == false) {
+                    names.add(match);
+                }
+                fromPattern.add(match);
             }
         }
         // Whether a name that is not there is a mistake or an expectation.
@@ -208,6 +248,20 @@ public final class SearchHandler extends BaseRestHandler {
         // either guess or make two requests. It has to be asked for explicitly, which is what makes the
         // distinction real rather than a default nobody chose.
         final boolean ignoreUnavailable = request.paramAsBoolean("ignore_unavailable", false);
+        for (String name : requested) {
+            if (isPrefixPattern(name) && fromPattern.stream().noneMatch(match -> match.startsWith(name.substring(0, name.length() - 1)))) {
+                if (ignoreUnavailable) {
+                    continue;
+                }
+                // A pattern that matches nothing is a search over no indices, and answering it with zero
+                // hits and a complete flag is the confident empty answer this surface exists to avoid. A
+                // caller who means "whatever is there, possibly nothing" says so with ignore_unavailable,
+                // the same way they do for a named index that may not exist yet.
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + name + "]")
+                );
+            }
+        }
         final java.util.LinkedHashMap<String, Integer> indices = new java.util.LinkedHashMap<>();
         final java.util.List<String> skipped = new java.util.ArrayList<>();
         for (String name : names) {
@@ -217,6 +271,14 @@ public final class SearchHandler extends BaseRestHandler {
             // indices it stands for are the same code path, which is the only way they cannot drift.
             final var resolved = metadata.resolve(name);
             if (resolved.absent()) {
+                if (fromPattern.contains(name)) {
+                    // A name the listing returned and the register does not describe: a tombstone left by
+                    // a deletion, or an index deleted between the listing and the read. A pattern filters
+                    // what exists, so this is not a match rather than a missing index -- and reporting it
+                    // as skipped would tell the caller something is absent from an answer they never asked
+                    // to include.
+                    continue;
+                }
                 if (ignoreUnavailable) {
                     skipped.add(name);
                     continue;
@@ -456,6 +518,20 @@ public final class SearchHandler extends BaseRestHandler {
                     );
                 }
             };
+
+    /**
+     * Reports whether a name is a pattern this system can answer.
+     *
+     * <p>One trailing star and nothing else, because that is exactly what a prefix listing can do. A star
+     * anywhere else needs the whole population read and matched, which is the operation §6.3 refuses; a
+     * bare {@code *} is a prefix of nothing at all and is allowed, since the cap bounds it like any other.
+     *
+     * @param name the name as the caller wrote it
+     * @return true if it is a trailing-wildcard pattern
+     */
+    private static boolean isPrefixPattern(String name) {
+        return name.endsWith("*") && name.indexOf('*') == name.length() - 1;
+    }
 
     private void respondFrozen(
         org.opensearch.rest.RestChannel channel,

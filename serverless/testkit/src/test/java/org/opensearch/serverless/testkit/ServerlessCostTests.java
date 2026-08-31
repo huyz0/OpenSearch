@@ -205,6 +205,70 @@ public class ServerlessCostTests extends OpenSearchTestCase {
     }
 
     /** What a document costs, end to end, including the publish it eventually triggers. */
+    private static String uuidFor(String indexName) {
+        final StringBuilder uuid = new StringBuilder("uuid-").append(indexName);
+        while (uuid.length() < 20) {
+            uuid.append('0');
+        }
+        return uuid.substring(0, 20);
+    }
+
+    /**
+     * What a prefix pattern costs, and that it does not grow with the deployment.
+     *
+     * <p><b>This is the measurement the feature stands on.</b> Index patterns were refused because
+     * resolving one meant enumerating the deployment, and the argument for allowing them is that a prefix
+     * listing with a maximum key count costs a fixed amount instead. That is a claim about cost, so it
+     * needs a number rather than a paragraph: the same pattern is resolved against a deployment with a few
+     * indices and against one with ten times as many, and the listing cost must not move.
+     *
+     * <p>What legitimately does move is the read per matching name, because the search needs each
+     * descriptor's shard count. So the pattern is written to match a fixed number of indices while the
+     * population around it grows — which is exactly the shape that would have been O(population) before.
+     *
+     * @throws Exception if the store cannot be reached
+     */
+    public void testWhatAPatternCostsAndThatItIsFlatInThePopulation() throws Exception {
+        for (boolean onBucket : new boolean[] { false, true }) {
+            if (onBucket) {
+                assumeEndpoint();
+            }
+            final CountingBlobStore store = onBucket ? bucket() : filesystem();
+            final String label = onBucket ? "s3" : "fs";
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+
+            // Three indices the pattern matches, and a population around them that grows.
+            for (String name : java.util.List.of("logs-a", "logs-b", "logs-c")) {
+                plane.createIndex(new IndexDescriptor(name, uuidFor(name), 1, MAPPING, null));
+            }
+
+            final long small;
+            store.reset();
+            plane.namesWithPrefix("logs-", MetadataPlane.DEFAULT_PATTERN_CAP);
+            small = store.impliedS3Requests();
+
+            for (int i = 0; i < 60; i++) {
+                final String name = "other-" + String.format(java.util.Locale.ROOT, "%03d", i);
+                plane.createIndex(new IndexDescriptor(name, uuidFor(name), 1, MAPPING, null));
+            }
+
+            store.reset();
+            plane.namesWithPrefix("logs-", MetadataPlane.DEFAULT_PATTERN_CAP);
+            final long large = store.impliedS3Requests();
+
+            logger.info(
+                "cost[{}]: resolving [logs-*] cost {} requests against 3 indices and {} against 63  [{}]",
+                label,
+                small,
+                large,
+                store.breakdown()
+            );
+
+            assertEquals("resolving a prefix must cost the same whatever else is in the deployment", small, large);
+            assertTrue("and it must be a listing rather than a read per index: " + store.breakdown(), large <= 2);
+        }
+    }
+
     public void testWhatADocumentCosts() throws Exception {
         for (boolean onBucket : new boolean[] { false, true }) {
             if (onBucket) {

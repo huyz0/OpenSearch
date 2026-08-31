@@ -14,8 +14,11 @@ acknowledged, and replayed by a successor. A get is routed to the shard's owner 
 cannot yet; an unowned shard is served from its published commit, so a get works against an index that has
 scaled to zero.
 
-**Search.** The full query DSL, sorting, aggregations, `search_after`, `_source` filtering, and several
-indices named in one request. Shards fan out concurrently; the window is cut once over everything; coverage
+**Search.** The full query DSL, sorting, aggregations, `search_after`, `_source` filtering, several
+indices named in one request, and **prefix patterns** (`logs-*`) — resolved by one bounded listing whose
+cost is set by a cap rather than by the population, measured at 1 object-store request against 3 indices
+and 1 against 63, on a filesystem and on S3 alike. A pattern matching more than the cap is refused rather
+than truncated, because an answer that stopped at a limit looks exactly like a complete one. Shards fan out concurrently; the window is cut once over everything; coverage
 (`_shards` and `complete`) is reported on every answer, and a search *no* shard could answer is an error
 rather than an empty result. `ignore_unavailable` turns a named index that cannot be reached into a
 `skipped` entry rather than a failure, and only when the caller asked for that.
@@ -91,8 +94,8 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 | Refused | Because |
 | --- | --- |
-| Index patterns (`logs-*`) | Resolving one means enumerating the deployment, which §6.3 does not offer on a request path. A wildcard matched against what a node happens to know would be silently partial. |
-| Enumerating indices | Same rule, stated directly. |
+| Patterns that are not a prefix (`*-2026`, `lo*s-a`, `logs-?`) | A prefix can be answered by one bounded listing; these cannot be answered by a listing at all, only by reading every index name in the deployment and matching each. Supporting a wildcard syntax whose cost depends on where the caller put the star would be worse than the split. |
+| Enumerating indices (`/_serverless/indices`) | An inventory operation, not a serving one — it is asked to return everything, where a pattern is capped and refuses when the cap is exceeded. Look an index up by name, or run an offline inventory. |
 | `/_cluster/*` | There is no cluster-wide state; a node-local answer would mislead. |
 | `collapse`, `suggest`, `profile` | Each needs cross-shard machinery that does not exist yet. |
 | Two request wrappers, or two plugins contributing one setting | Which one wins would depend on load order. |
@@ -152,7 +155,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-351 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+356 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 
