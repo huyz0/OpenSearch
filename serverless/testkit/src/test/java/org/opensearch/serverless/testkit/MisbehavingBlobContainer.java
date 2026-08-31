@@ -63,6 +63,36 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
     private final BlobContainer honest;
     private final Map<String, BlobRegister> previous = new ConcurrentHashMap<>();
 
+    private volatile String doubleWinBlob;
+    private volatile long doubleWinGeneration;
+    private final Map<String, BlobRegisterCasResult> firstWin = new ConcurrentHashMap<>();
+
+    private volatile String readsAsAbsentBlob;
+
+    private volatile String partitionedBlob;
+    private volatile BlobRegister shadow;
+
+    /**
+     * Cuts one register off from the store, so this caller sees a private copy of it.
+     *
+     * <p><b>This is what two winners actually look like.</b> Neither node's store is misbehaving in
+     * isolation — each is atomic, each honours its own preconditions — and the register has simply
+     * diverged, so a claim that is impossible against the true state is perfectly legal against this one.
+     * Modelling it any other way needs two callers to be told different things by one object, which is not
+     * a thing an object can do.
+     *
+     * <p>Reads see the private copy, which starts absent; creates and swaps apply to it and to nothing
+     * else. The rest of the store is untouched, which is the point: the partition is one key wide, exactly
+     * as a replica that has missed one write is.
+     *
+     * @param blobName the register to cut off, or null to reconnect
+     * @return this
+     */
+    public MisbehavingBlobContainer partitionRegister(String blobName) {
+        this.partitionedBlob = blobName;
+        return this;
+    }
+
     private volatile int staleReadEveryNth;
     private volatile int twoWinnersEveryNth;
     private volatile int ambiguousCasEveryNth;
@@ -79,6 +109,90 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
     public MisbehavingBlobContainer(BlobContainer delegate) {
         super(delegate);
         this.honest = delegate;
+    }
+
+    private volatile String doubleCreateBlob;
+    private final Map<String, BlobRegisterCasResult> firstCreate = new ConcurrentHashMap<>();
+    private volatile int ambiguousCreateEveryNth;
+    private final AtomicInteger creates = new AtomicInteger();
+
+    /**
+     * Lets two put-if-absent calls on one name both be told they created it.
+     *
+     * <p>The same failure as two winners on a swap, at the moment it is most likely to happen for real: a
+     * shard nobody has ever owned, claimed by two nodes at once at cold start, with the precondition
+     * "this must not exist" evaluated on two replicas neither of which has seen the other.
+     *
+     * <p>Index name uniqueness rests on this too, and on the same call.
+     *
+     * @param blobName the register
+     * @return this
+     */
+    public MisbehavingBlobContainer admitASecondCreatorOf(String blobName) {
+        this.doubleCreateBlob = blobName;
+        return this;
+    }
+
+    /**
+     * Applies every nth put-if-absent and then loses the answer.
+     *
+     * @param everyNth how often; zero or less to stop
+     * @return this
+     */
+    public MisbehavingBlobContainer ambiguousCreateEvery(int everyNth) {
+        this.ambiguousCreateEveryNth = everyNth;
+        return this;
+    }
+
+    @Override
+    public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
+        final int attempt = creates.incrementAndGet();
+        if (blobName.equals(partitionedBlob)) {
+            if (shadow != null) {
+                return BlobRegisterCasResult.conflict(shadow.generation());
+            }
+            shadow = new BlobRegister(1L, value);
+            return BlobRegisterCasResult.applied(1L);
+        }
+        if (blobName.equals(doubleCreateBlob)) {
+            final BlobRegisterCasResult already = firstCreate.get(blobName);
+            if (already != null) {
+                // The second caller is told exactly what the first was told, and has no way to know.
+                return already;
+            }
+            final BlobRegisterCasResult first = honest.createRegisterIfAbsent(blobName, value);
+            if (first.applied()) {
+                firstCreate.put(blobName, first);
+            }
+            return first;
+        }
+        final BlobRegisterCasResult result = honest.createRegisterIfAbsent(blobName, value);
+        if (result.applied() && ambiguousCreateEveryNth > 0 && attempt % ambiguousCreateEveryNth == 0) {
+            throw new AmbiguousOutcomeException(
+                "the create of [" + blobName + "] applied and the response was lost; the caller cannot know which"
+            );
+        }
+        return result;
+    }
+
+    /**
+     * Lets two swaps against one generation both be told they won, with the same answer.
+     *
+     * <p><b>The failure the whole design rests on not happening</b>, modelled as it would actually occur:
+     * the precondition passes on two replicas that have not seen each other's write, the writes collapse to
+     * one under last-write-wins, and <em>both</em> callers are told they hold the register at the same
+     * generation. Note the difference from a swap that merely wins against a newer generation — that is an
+     * ordinary takeover, which this design fences correctly. Two callers holding the same generation is the
+     * one it cannot.
+     *
+     * @param blobName the register
+     * @param expectedGeneration the generation both swaps will claim
+     * @return this
+     */
+    public MisbehavingBlobContainer admitASecondWinnerOn(String blobName, long expectedGeneration) {
+        this.doubleWinBlob = blobName;
+        this.doubleWinGeneration = expectedGeneration;
+        return this;
     }
 
     /**
@@ -125,8 +239,29 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
         return this;
     }
 
+    /**
+     * Makes one register read as though it had never been written.
+     *
+     * <p>A replica that has not seen the write at all, rather than one showing an older value. It is the
+     * state a second node has to be in for two of them to claim a shard nobody has ever owned: each looks,
+     * sees nothing, and creates.
+     *
+     * @param blobName the register, or null to stop
+     * @return this
+     */
+    public MisbehavingBlobContainer readsAsAbsent(String blobName) {
+        this.readsAsAbsentBlob = blobName;
+        return this;
+    }
+
     @Override
     public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        if (blobName.equals(partitionedBlob)) {
+            return Optional.ofNullable(shadow);
+        }
+        if (blobName.equals(readsAsAbsentBlob)) {
+            return Optional.empty();
+        }
         final Optional<BlobRegister> current = honest.readRegister(blobName);
         if (staleReadEveryNth > 0 && reads.incrementAndGet() % staleReadEveryNth == 0) {
             final BlobRegister stale = previous.get(blobName);
@@ -142,6 +277,28 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
         final int attempt = swaps.incrementAndGet();
+
+        if (blobName.equals(partitionedBlob)) {
+            final long current = shadow == null ? BlobRegister.ABSENT_GENERATION : shadow.generation();
+            if (current != expectedGeneration) {
+                return BlobRegisterCasResult.conflict(current);
+            }
+            shadow = new BlobRegister(current + 1, newValue);
+            return BlobRegisterCasResult.applied(current + 1);
+        }
+
+        if (blobName.equals(doubleWinBlob) && expectedGeneration == doubleWinGeneration) {
+            final BlobRegisterCasResult already = firstWin.get(blobName);
+            if (already != null) {
+                // The second caller is told exactly what the first was told. Neither has any way to know.
+                return already;
+            }
+            final BlobRegisterCasResult first = honest.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            if (first.applied()) {
+                firstWin.put(blobName, first);
+            }
+            return first;
+        }
 
         if (twoWinnersEveryNth > 0 && attempt % twoWinnersEveryNth == 0) {
             // The precondition is evaluated against a replica that has not caught up, so it passes on a
