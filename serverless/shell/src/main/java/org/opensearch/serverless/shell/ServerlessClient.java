@@ -143,6 +143,13 @@ public final class ServerlessClient extends AbstractClient {
         if (org.opensearch.action.search.SearchAction.INSTANCE.name().equals(action.name())) {
             return search((org.opensearch.action.search.SearchRequest) request, operations);
         }
+        // A plugin's own action, after the shell's allowlist and never before it: a plugin must not be able
+        // to take over "indices:data/write/index" by declaring it. PluginActions refuses a duplicate among
+        // plugins for the same reason, and this ordering settles the one case it cannot see.
+        final var provided = serving.pluginActions().find(action.name());
+        if (provided.isPresent()) {
+            return runPluginAction(provided.get(), request);
+        }
         throw new UnsupportedOperationException(
             "the serverless shell does not implement action ["
                 + action.name()
@@ -156,7 +163,28 @@ public final class ServerlessClient extends AbstractClient {
                 + CreateIndexAction.INSTANCE.name()
                 + " and "
                 + org.opensearch.action.search.SearchAction.INSTANCE.name()
+                + (serving.pluginActions().isEmpty() ? "" : ", plus what the plugins provide: " + serving.pluginActions().names())
         );
+    }
+
+    /**
+     * Runs a plugin's own action and waits for it.
+     *
+     * <p>The client's contract here is synchronous — {@code dispatch} returns a response — while a
+     * {@code TransportAction} is asynchronous. This bridges the two on the pool the request was already
+     * dispatched to, which is never a transport thread. An action that never completes holds that worker,
+     * which is the same exposure a filter that never answers already has.
+     *
+     * <p>{@code TransportAction#execute} runs the node's action filters itself, so this deliberately does
+     * not put the call through {@link ActionGate}: doing both would run every filter twice, and a filter
+     * that counts or rate-limits would be wrong rather than merely slow.
+     */
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    private ActionResponse runPluginAction(org.opensearch.action.support.TransportAction action, ActionRequest request) throws Exception {
+        final org.opensearch.action.support.PlainActionFuture<ActionResponse> future = org.opensearch.action.support.PlainActionFuture
+            .newFuture();
+        action.execute(request, future);
+        return future.get();
     }
 
     private IndexResponse index(IndexRequest request, ShardOperations operations, MetadataPlane metadata) throws Exception {

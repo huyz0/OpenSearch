@@ -1,6 +1,6 @@
 # The serverless shell: where it actually is
 
-Per-milestone notes (`m10`…`m40`) record what was true when each was written, which is the point of them.
+Per-milestone notes (`m10`…`m41`) record what was true when each was written, which is the point of them.
 Their "what is still missing" sections do not — those age badly, and several had been closed by later work
 while still reading as open. **This document supersedes all of them.** If a milestone note and this
 disagree, this is right.
@@ -56,7 +56,9 @@ protects the wire without yet authenticating the peer.
 **Plugins.** Installed from `plugins/` through core's own loader, or named on the classpath by
 configuration. `createComponents`, REST handlers, the request wrapper, `onNodeStarted`, analysis, mappers,
 search plugins, network plugins and their transport interceptors, system-index declarations, and
-`ActionFilter`s all work. The `Client` and the `NodeClient` a handler receives are the same allowlist.
+`ActionFilter`s all work. A plugin's **own transport actions** run too — built by resolving each
+constructor against what the node can supply, since Guice is not on offer here — so an action is reachable
+from the plugin's REST handler, from its own code through the client, and from another node. The `Client` and the `NodeClient` a handler receives are the same allowlist.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,
@@ -96,7 +98,8 @@ These are decisions, not gaps. Each answers 501 with a reason.
   authentication would make that assumption load-bearing.
 - Dropping hits on a per-document rule is possible by the same mechanism as redacting them, and is not
   demonstrated. Only redaction has a test.
-- No action registry, so a plugin's own transport actions (Security's config-update API) cannot run.
+- A plugin's action runs on the node the request reached: nothing forwards one, and no identity crosses a
+  transport hop, so an action that must run somewhere particular cannot ask.
 - A point in time is node-local once opened: the record is in the object store and any node can serve it,
   but two nodes serving one view open it twice. No slicing.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
@@ -131,7 +134,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-310 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+314 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against a
 live MinIO) — none skipped.
 

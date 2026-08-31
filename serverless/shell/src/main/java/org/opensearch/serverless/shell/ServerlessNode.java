@@ -943,9 +943,55 @@ public final class ServerlessNode implements Closeable {
             throw new IllegalStateException("a plugin failed to start; the node will not serve", e);
         }
 
+        // After createComponents, because a plugin's action almost always takes one of its own components,
+        // and before onNodeStarted, because a plugin told the node is up may immediately call its own
+        // action.
+        pluginActions = buildPluginActions();
+
         // And then tell them the node is up. A plugin that has to read its own index cannot do it while
         // components are being built; this is the event it waits for.
         plugins.onNodeStarted(localNode);
+    }
+
+    private PluginActions pluginActions = PluginActions.none();
+
+    /**
+     * Returns the actions the plugins provide.
+     *
+     * @return the registry, empty on a node whose plugins declared none
+     */
+    public PluginActions pluginActions() {
+        return pluginActions;
+    }
+
+    /**
+     * Builds the plugins' own transport actions.
+     *
+     * <p>What a constructor may be given is listed here rather than discovered: the node's own services,
+     * and everything the plugins built. The order is most-specific first, so a plugin component that
+     * happens to implement one of core's interfaces wins the parameter over the node's own — which is what
+     * a plugin means when it declares that parameter.
+     *
+     * @return the registry
+     */
+    private PluginActions buildPluginActions() {
+        final java.util.List<org.opensearch.plugins.ActionPlugin> actionPlugins = plugins.filter(org.opensearch.plugins.ActionPlugin.class);
+        if (actionPlugins.isEmpty()) {
+            return PluginActions.none();
+        }
+        final java.util.List<Object> available = new java.util.ArrayList<>(plugins.components());
+        available.add(new org.opensearch.action.support.ActionFilters(new java.util.HashSet<>(plugins.actionFilters())));
+        available.add(transportService);
+        available.add(transportService.getTaskManager());
+        available.add(threadPool);
+        available.add(client());
+        available.add(clusterService);
+        available.add(settings);
+        available.add(namedWriteableRegistry());
+        available.add(indexNameExpressionResolver());
+        available.add(circuitBreakerService());
+        available.add(indicesService);
+        return PluginActions.build(actionPlugins, available);
     }
 
     /**
