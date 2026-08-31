@@ -50,8 +50,10 @@ makes running the collector on a schedule different from running it by hand.
 to the network module, and core's own `SecureNetty4Transport` carries the traffic — proved by a write
 forwarded between two nodes over a real handshake. The shell had been passing an empty collection here, so
 a plugin naming the secure transport was told the type did not exist: TLS through a plugin was impossible
-rather than undemonstrated. Node *identity* still does not travel with a forwarded request, so this
-protects the wire without yet authenticating the peer.
+rather than undemonstrated. Requiring a client certificate is a deployment's decision expressed
+entirely in that provider, and it works: a node presenting one is served and a node presenting none is
+refused. What still does not travel is the *caller's* identity — the peer is authenticated as a node, and
+a filter on the receiving side would not know who the request came from.
 
 **Plugins.** Installed from `plugins/` through core's own loader, or named on the classpath by
 configuration. `createComponents`, REST handlers, the request wrapper, `onNodeStarted`, analysis, mappers,
@@ -93,9 +95,9 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 **Open, and mine to do:**
 
-- Node-to-node forwarding carries no identity, so filters run on the coordinating node only and the
-  transport port must be treated as trusted infrastructure. Making identity travel without node
-  authentication would make that assumption load-bearing.
+- Node-to-node forwarding carries no *caller* identity, so filters run on the coordinating node only. With
+  mutual TLS the peer is authenticated as a node, which is what would make propagating a caller's identity
+  safe; nothing does it yet.
 - Dropping hits on a per-document rule is possible by the same mechanism as redacting them, and is not
   demonstrated. Only redaction has a test.
 - A plugin's action runs on the node the request reached: nothing forwards one, and no identity crosses a
@@ -134,7 +136,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-314 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+316 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against a
 live MinIO) — none skipped.
 

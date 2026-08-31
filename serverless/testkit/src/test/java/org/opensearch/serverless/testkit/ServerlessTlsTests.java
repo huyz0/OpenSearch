@@ -66,6 +66,25 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
 
         private static final char[] PASSWORD = "testonly".toCharArray();
 
+        private final io.netty.handler.ssl.ClientAuth clientAuth;
+        private final boolean presentsACertificate;
+
+        /** A plugin that encrypts and does not authenticate the peer. */
+        public TlsPlugin() {
+            this(io.netty.handler.ssl.ClientAuth.NONE, false);
+        }
+
+        /**
+         * Creates the plugin.
+         *
+         * @param clientAuth what this node demands of a peer connecting to it
+         * @param presentsACertificate whether this node offers one when it connects out
+         */
+        public TlsPlugin(io.netty.handler.ssl.ClientAuth clientAuth, boolean presentsACertificate) {
+            this.clientAuth = clientAuth;
+            this.presentsACertificate = presentsACertificate;
+        }
+
         @Override
         public Settings additionalSettings() {
             return Settings.builder()
@@ -117,8 +136,14 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
                     org.opensearch.transport.Transport transport
                 ) throws javax.net.ssl.SSLException {
                     try {
+                        // REQUIRE, not NONE: the peer has to present a certificate this node trusts, which
+                        // is what turns "the traffic is encrypted" into "the peer is a node of this
+                        // deployment". Without it the transport port is still open to anyone who can reach
+                        // it, and encryption protects the wire from a bystander rather than the node from a
+                        // caller.
                         final var context = io.netty.handler.ssl.SslContextBuilder.forServer(keys())
-                            .clientAuth(io.netty.handler.ssl.ClientAuth.NONE)
+                            .trustManager(trust())
+                            .clientAuth(clientAuth)
                             .build();
                         final javax.net.ssl.SSLEngine engine = context.newEngine(io.netty.buffer.ByteBufAllocator.DEFAULT);
                         engine.setUseClientMode(false);
@@ -137,7 +162,11 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
                     int port
                 ) throws javax.net.ssl.SSLException {
                     try {
-                        final var context = io.netty.handler.ssl.SslContextBuilder.forClient().trustManager(trust()).build();
+                        final var builder = io.netty.handler.ssl.SslContextBuilder.forClient().trustManager(trust());
+                        if (presentsACertificate) {
+                            builder.keyManager(keys());
+                        }
+                        final var context = builder.build();
                         final javax.net.ssl.SSLEngine engine = context.newEngine(io.netty.buffer.ByteBufAllocator.DEFAULT, hostname, port);
                         engine.setUseClientMode(true);
                         return java.util.Optional.of(engine);
@@ -200,5 +229,82 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"over tls\",\"n\":1}", XContentType.JSON)).actionGet();
             assertTrue("and it must actually carry traffic", other.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
         }
+    }
+
+    /**
+     * With mutual TLS the peer is authenticated, not merely encrypted to.
+     *
+     * <p><b>Why this is a different claim from the test above.</b> Encryption protects the wire from a
+     * bystander. It does nothing about a caller who can reach the transport port — and the shell forwards
+     * writes over that port and applies them without re-deciding, so anyone who can connect can write
+     * anything. That is why the status document called the transport port trusted infrastructure.
+     *
+     * <p>Requiring a client certificate is what changes it, and it is a deployment's decision expressed
+     * entirely in the provider a plugin supplies. The shell's part is only to let the plugin's provider
+     * reach the transport, which is what M39 fixed; this shows the decision is actually available.
+     */
+    public void testMutualTlsAuthenticatesThePeer() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode owner = new ServerlessNode(nodeSettings("mtls-owner"), List.of(mutual()));
+            ServerlessNode other = new ServerlessNode(nodeSettings("mtls-other"), List.of(mutual()))
+        ) {
+            owner.start();
+            other.start();
+            owner.setMetadataPlane(plane);
+            other.setMetadataPlane(plane);
+            owner.activateWriter(plane, "alpha", 0);
+            other.syncFrom(plane);
+
+            other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"mutual\",\"n\":1}", XContentType.JSON)).actionGet();
+            assertTrue(
+                "a node that presents a certificate is served",
+                other.client().get(new GetRequest("alpha", "k")).actionGet().isExists()
+            );
+        }
+    }
+
+    /**
+     * And a peer that presents none is refused, which is the half that makes the other half mean anything.
+     *
+     * <p>A test that only shows mutual TLS working would pass just as well against a server that had never
+     * asked for a certificate.
+     */
+    public void testAPeerWithNoCertificateIsRefused() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode owner = new ServerlessNode(nodeSettings("mtls-strict"), List.of(mutual()));
+            ServerlessNode stranger = new ServerlessNode(nodeSettings("mtls-stranger"), List.of(new TlsPlugin()))
+        ) {
+            owner.start();
+            stranger.start();
+            owner.setMetadataPlane(plane);
+            stranger.setMetadataPlane(plane);
+            owner.activateWriter(plane, "alpha", 0);
+            stranger.syncFrom(plane);
+
+            final Exception refused = expectThrows(
+                Exception.class,
+                () -> stranger.client()
+                    .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"stranger\",\"n\":1}", XContentType.JSON))
+                    .actionGet()
+            );
+            assertNotNull("the write must not have been accepted", refused);
+            // And nothing was written: a refusal that still applied the write would be the worst outcome.
+            assertFalse(
+                "a refused peer must not have written anything",
+                owner.client().get(new GetRequest("alpha", "k")).actionGet().isExists()
+            );
+        }
+    }
+
+    private static TlsPlugin mutual() {
+        return new TlsPlugin(io.netty.handler.ssl.ClientAuth.REQUIRE, true);
     }
 }
