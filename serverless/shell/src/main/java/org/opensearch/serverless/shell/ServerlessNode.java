@@ -552,6 +552,30 @@ public final class ServerlessNode implements Closeable {
         return indexSettings.getSettings().get(STORAGE_UUID_SETTING) == null ? null : indexSettings.getIndex().getUUID();
     }
 
+    /**
+     * The secure-transport providers the plugins supply.
+     *
+     * <p><b>This was an empty list, and that made TLS through a plugin impossible rather than merely
+     * undemonstrated.</b> Core's netty4 module already ships a TLS transport; what it needs is a
+     * {@link org.opensearch.plugins.SecureTransportSettingsProvider} to get an {@code SSLEngine} from, and
+     * the only way a plugin can supply one is through this collection. Passing nothing meant
+     * {@code getSecureTransports} was never called, so naming the secure transport in settings produced
+     * "unsupported transport type" — a plugin doing everything right and being told its transport does not
+     * exist.
+     *
+     * <p>Core refuses more than one provider, which is the right rule and not this class's to soften: two
+     * plugins each believing they configure the node's TLS is a deployment nobody can reason about.
+     *
+     * @return the factories, in plugin order
+     */
+    private java.util.List<org.opensearch.plugins.SecureSettingsFactory> secureSettingsFactories() {
+        final java.util.List<org.opensearch.plugins.SecureSettingsFactory> factories = new java.util.ArrayList<>();
+        for (org.opensearch.plugins.Plugin plugin : plugins.plugins()) {
+            plugin.getSecureSettingFactory(settings).ifPresent(factories::add);
+        }
+        return factories;
+    }
+
     private Map<String, org.opensearch.plugins.IndexStorePlugin.DirectoryFactory> directoryFactories() {
         final org.opensearch.plugins.IndexStorePlugin.DirectoryFactory factory =
             new org.opensearch.plugins.IndexStorePlugin.DirectoryFactory() {
@@ -805,7 +829,7 @@ public final class ServerlessNode implements Closeable {
             clusterSettings,
             NoopTracer.INSTANCE,
             Collections.emptyList(),
-            Collections.emptyList()
+            secureSettingsFactories()
         );
     }
 

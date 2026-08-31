@@ -136,7 +136,11 @@ public final class ShardOperations {
         private final boolean retryable;
 
         NotHereException(String message, String owner, boolean retryable) {
-            super(message);
+            this(message, owner, retryable, null);
+        }
+
+        NotHereException(String message, String owner, boolean retryable, Throwable cause) {
+            super(message, cause);
             this.owner = owner;
             this.retryable = retryable;
         }
@@ -385,10 +389,14 @@ public final class ShardOperations {
             throw e;
         } catch (Exception e) {
             node.signals().ownershipDoubted(index, placement.shard());
+            // Carrying the cause, because the message on its own is often a single word. A TLS handshake
+            // that fails arrives here as "connect_exception" and nothing else, which says a connection did
+            // not happen and not one thing about why.
             throw new NotHereException(
                 "could not forward to " + placement.owner() + ", which the shard-head named as owner: " + e.getMessage(),
                 placement.owner(),
-                true
+                true,
+                e
             );
         }
     }
@@ -606,10 +614,14 @@ public final class ShardOperations {
         } catch (Exception e) {
             // Stale routing is a retry, not a failure of the write itself.
             node.signals().ownershipDoubted(index, placement.shard());
+            // Carrying the cause, because the message on its own is often a single word. A TLS handshake
+            // that fails arrives here as "connect_exception" and nothing else, which says a connection did
+            // not happen and not one thing about why.
             throw new NotHereException(
                 "could not forward to " + placement.owner() + ", which the shard-head named as owner: " + e.getMessage(),
                 placement.owner(),
-                true
+                true,
+                e
             );
         }
     }

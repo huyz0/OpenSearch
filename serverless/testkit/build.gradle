@@ -37,6 +37,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessBucketContentionTests.class'
   exclude '**/ServerlessCostTests.class'
   exclude '**/ServerlessRealPluginTests.class'
+  exclude '**/ServerlessTlsTests.class'
 }
 
 /*
@@ -84,6 +85,21 @@ tasks.register('s3Test', Test) {
   systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
 }
 
+/*
+ * TLS on the transport, which needs the security manager off.
+ *
+ * Netty's SSL handler opens the connection from netty-common's own protection domain, and the test
+ * framework grants that domain nothing -- so the handshake dies with "Denied access to: localhost:<port>"
+ * while a plain netty4 connection in the same build is fine. Nothing about that is the shell's, and one
+ * test class loses the manager rather than the module.
+ */
+tasks.register('tlsTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/ServerlessTlsTests.class'
+  systemProperty 'tests.security.manager', 'false'
+}
+
 tasks.register('processTest', Test) {
   testClassesDirs = sourceSets.test.output.classesDirs
   classpath = sourceSets.test.runtimeClasspath
@@ -105,6 +121,7 @@ tasks.register('processTest', Test) {
 tasks.named('check').configure {
   dependsOn 'processTest'
   dependsOn 'pluginTest'
+  dependsOn 'tlsTest'
   // Safe to always depend on: with no endpoint reachable the tests assume-skip rather than fail, so a
   // developer without a container gets a loud skip instead of a red build.
   dependsOn 's3Test'

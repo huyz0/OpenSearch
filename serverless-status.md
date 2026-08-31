@@ -46,6 +46,13 @@ shards held for them; and sweeps the garbage left by what it has just published.
 blob has been unreferenced across two passes, because a reader may still be reading it — the grace is what
 makes running the collector on a schedule different from running it by hand.
 
+**TLS on the transport, from a plugin.** A plugin supplies a `SecureSettingsFactory`, the shell passes it
+to the network module, and core's own `SecureNetty4Transport` carries the traffic — proved by a write
+forwarded between two nodes over a real handshake. The shell had been passing an empty collection here, so
+a plugin naming the secure transport was told the type did not exist: TLS through a plugin was impossible
+rather than undemonstrated. Node *identity* still does not travel with a forwarded request, so this
+protects the wire without yet authenticating the peer.
+
 **Plugins.** Installed from `plugins/` through core's own loader, or named on the classpath by
 configuration. `createComponents`, REST handlers, the request wrapper, `onNodeStarted`, analysis, mappers,
 search plugins, network plugins and their transport interceptors, system-index declarations, and
@@ -87,9 +94,6 @@ These are decisions, not gaps. Each answers 501 with a reason.
   authentication would make that assumption load-bearing.
 - Filters see requests, not responses — so document-level security and field redaction cannot work.
 - No action registry, so a plugin's own transport actions (Security's config-update API) cannot run.
-- A plugin supplying the node's transport is demonstrated, but with a substitute that delegates to netty4.
-  No TLS stack has been run on it, so TLS through a plugin is *shown to be wireable* rather than shown to
-  work.
 - A point in time is node-local once opened: the record is in the object store and any node can serve it,
   but two nodes serving one view open it twice. No slicing.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
@@ -124,8 +128,9 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-307 tests across four Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
-`processTest` (forked JVMs) and `s3Test` (against a live MinIO) — none skipped.
+308 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+`processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against a
+live MinIO) — none skipped.
 
 Every load-bearing claim has a planted-defect canary: the defect is introduced, the failing test is watched,
 and the defect reverted. A compile failure does not count as caught. Two canaries in this run passed, which

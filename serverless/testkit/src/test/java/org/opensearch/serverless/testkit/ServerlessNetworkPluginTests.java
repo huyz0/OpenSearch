@@ -305,4 +305,5 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
             assertTrue("nothing can have been intercepted", SENT.isEmpty());
         }
     }
+
 }
