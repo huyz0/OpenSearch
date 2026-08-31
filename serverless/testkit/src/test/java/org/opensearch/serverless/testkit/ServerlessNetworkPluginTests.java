@@ -208,6 +208,93 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
         }
     }
 
+    /** Records that the substituted transport was the one actually built. */
+    private static final java.util.concurrent.atomic.AtomicBoolean SUBSTITUTE_USED = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * A plugin that supplies the node's transport under a name of its own.
+     *
+     * <p>It delegates to netty4 rather than implementing a {@code Transport}, because implementing one is a
+     * project and what is in question here is not whether a transport can be written but whether the shell
+     * will use one a plugin supplies. That is the whole mechanism the OpenSearch security plugin needs for
+     * TLS: {@code additionalSettings} names its implementation and {@code getTransports} provides it.
+     */
+    public static final class SubstituteTransportPlugin extends Plugin implements NetworkPlugin {
+
+        private static final String NAME = "substituted";
+        private final org.opensearch.transport.Netty4ModulePlugin netty = new org.opensearch.transport.Netty4ModulePlugin();
+
+        @Override
+        public Settings additionalSettings() {
+            return Settings.builder().put("transport.type", NAME).build();
+        }
+
+        @Override
+        public java.util.Map<String, java.util.function.Supplier<org.opensearch.transport.Transport>> getTransports(
+            Settings settings,
+            org.opensearch.threadpool.ThreadPool threadPool,
+            org.opensearch.common.util.PageCacheRecycler pageCacheRecycler,
+            org.opensearch.core.indices.breaker.CircuitBreakerService circuitBreakerService,
+            NamedWriteableRegistry namedWriteableRegistry,
+            org.opensearch.common.network.NetworkService networkService,
+            org.opensearch.telemetry.tracing.Tracer tracer
+        ) {
+            final var inner = netty.getTransports(
+                settings,
+                threadPool,
+                pageCacheRecycler,
+                circuitBreakerService,
+                namedWriteableRegistry,
+                networkService,
+                tracer
+            ).get(org.opensearch.transport.Netty4ModulePlugin.NETTY_TRANSPORT_NAME);
+            return java.util.Map.of(NAME, () -> {
+                SUBSTITUTE_USED.set(true);
+                return inner.get();
+            });
+        }
+    }
+
+    /**
+     * A plugin can supply the node's transport, and the node uses it.
+     *
+     * <p>M29 wired {@code NetworkPlugin}s into the network module and could not show this: proving it needs
+     * a transport to substitute, and writing one is a project rather than a fixture. Delegating to netty4
+     * under a different name proves the part that was in question — that {@code additionalSettings} selects
+     * an implementation and {@code getTransports} provides it — without pretending to have written a TLS
+     * stack.
+     *
+     * <p>The node then has to actually work on it, so the test forwards a write between two nodes: a
+     * transport that was selected and then did not carry traffic would be a worse outcome than one that was
+     * never selected at all.
+     */
+    public void testAPluginCanSupplyTheNodesTransport() throws Exception {
+        SUBSTITUTE_USED.set(false);
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode owner = new ServerlessNode(nodeSettings("wire-sub-owner"), List.of(new SubstituteTransportPlugin()));
+            ServerlessNode other = new ServerlessNode(nodeSettings("wire-sub-other"), List.of(new SubstituteTransportPlugin()))
+        ) {
+            owner.start();
+            other.start();
+            assertTrue("the plugin's transport must be the one built", SUBSTITUTE_USED.get());
+
+            owner.setMetadataPlane(plane);
+            other.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(owner, plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+
+            // Through the node that does not own the shard, so the write has to cross the transport the
+            // plugin supplied.
+            other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"substituted\",\"n\":1}", XContentType.JSON)).actionGet();
+            assertTrue("and it must actually carry traffic", other.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
+        }
+    }
+
     /** A node with no network plugin is unchanged, which is every node the suite otherwise starts. */
     public void testANodeWithNoNetworkPluginIsUnchanged() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("wire-none"))) {
