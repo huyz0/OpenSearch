@@ -37,6 +37,8 @@ import java.util.function.LongSupplier;
  */
 public final class MetadataPlane {
 
+    private static final org.apache.logging.log4j.Logger LOGGER = org.apache.logging.log4j.LogManager.getLogger(MetadataPlane.class);
+
     private final DescriptorStore descriptors;
     private final ShardHeadStore heads;
     private final BlobLeaseMembership membershipField;
@@ -148,7 +150,42 @@ public final class MetadataPlane {
      * @throws IOException if the write fails
      */
     public long createIndex(IndexDescriptor descriptor) throws IOException {
-        return descriptors.create(descriptor);
+        final long generation = descriptors.create(descriptor);
+        // Whatever was at this path is not this index's.
+        //
+        // An index's storage is keyed by its name, so a name that has been used before has a path that may
+        // still hold the previous index's segments and log -- and a freshly created index would open that
+        // commit and serve somebody else's documents. That is not a leak, it is a caller creating an empty
+        // index, searching it, and being shown data. Clearing on create makes the emptiness of a new index
+        // a property of creation rather than a consequence of the previous delete having finished, which
+        // matters because a delete can be interrupted and this cannot.
+        //
+        // Safe against a concurrent writer by construction: writing needs a shard-head, taking a head needs
+        // the descriptor, and this runs after the descriptor's put-if-absent, so any writer that could
+        // reach this path is a writer for this index.
+        //
+        // Costs one container delete per shard, on the rarest operation in the system.
+        purgeShardData(descriptor.name(), descriptor.numberOfShards());
+        return generation;
+    }
+
+    /**
+     * Removes every byte a shard wrote: its segments, its manifests and its log.
+     *
+     * @param indexName the index
+     * @param shards how many shards it has
+     */
+    private void purgeShardData(String indexName, int shards) {
+        for (int shard = 0; shard < shards; shard++) {
+            try {
+                blobStore.blobContainer(RegisterMap.shardData(base, indexName, shard)).delete();
+            } catch (Exception e) {
+                // Best effort, and it has to be: this is called on paths that may not exist at all, and a
+                // store that cannot delete must not turn creating an index into a failure. What it costs
+                // when it fails is storage, which is recoverable, against a create that is not.
+                LOGGER.warn("could not clear storage for shard " + shard + " of " + indexName, e);
+            }
+        }
     }
 
     /**
@@ -178,6 +215,15 @@ public final class MetadataPlane {
         // lives in the descriptor, and it is bounded by IndexDescriptor.MAX_SHARDS, so this is a
         // bounded loop rather than a listing.
         heads.deleteAllFor(indexName, descriptor.get().numberOfShards());
+        // And the bytes. Heads first, so a writer cannot renew and the node holding it closes the shard on
+        // its next tick; the data after, so a deleted index stops being paid for.
+        //
+        // <b>The residual race is real and bounded.</b> Publishing is fenced by the manifest register's
+        // term rather than by the head, so a writer that has lost its head can still complete a publish it
+        // had already begun, and leave blobs behind this sweep. They are unreachable -- no descriptor, no
+        // head -- and the next index of this name clears them on creation, which is why that is where the
+        // correctness argument lives rather than here.
+        purgeShardData(indexName, descriptor.get().numberOfShards());
         return true;
     }
 

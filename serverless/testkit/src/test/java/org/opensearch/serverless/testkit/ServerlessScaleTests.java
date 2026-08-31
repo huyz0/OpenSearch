@@ -91,8 +91,8 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
             nanosPerCreate.stream().map(n -> n / 1000).toList()
         );
 
-        // The architectural claim, stated as operations rather than as time: one create is one write,
-        // whatever is already there. Classic OpenSearch cannot say this because build() sweeps.
+        // The architectural claim, stated as operations rather than as time: creation cost does not depend
+        // on how many indices already exist. Classic OpenSearch cannot say this because build() sweeps.
         for (int round = 0; round < opsPerCreate.size(); round++) {
             assertEquals(
                 "creation cost must not depend on the population; round " + round + " of " + opsPerCreate,
@@ -100,7 +100,15 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
                 opsPerCreate.get(round)
             );
         }
-        assertEquals("a create should be a single object-store write", 1L, (long) opsPerCreate.get(0));
+        // Two, and the second one is deliberate: the descriptor's put-if-absent, then one container delete
+        // per shard clearing whatever a previous index of this name left behind.
+        //
+        // It doubled the cost of the cheapest operation in the system, which is worth being explicit about
+        // rather than quietly absorbing. What it buys is that a new index is empty because it was created,
+        // not because the previous delete happened to finish -- and a delete can be interrupted. The
+        // alternative that keeps this at one operation is keying storage by index uuid rather than by name,
+        // which is a change to the on-disk layout and belongs to its own milestone.
+        assertEquals("a create should be the descriptor write plus one clear per shard", 2L, (long) opsPerCreate.get(0));
     }
 
     /**
