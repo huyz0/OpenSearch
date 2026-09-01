@@ -566,6 +566,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
             send(node, "GET", "/gamma", asAdmin, null);
             send(node, "DELETE", "/doomed", asAdmin, null);
             send(node, "PUT", "/_cluster/settings", asAdmin, "{\"persistent\":{\"authz-surface-probe\":\"1\"}}");
+            send(node, "POST", "/alpha/_delete_by_query", asAdmin, "{\"query\":{\"match_all\":{}}}");
 
             for (String action : List.of(
                 "indices:data/write/index",
@@ -573,6 +574,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 "indices:data/read/search",
                 "indices:data/write/update",
                 "indices:data/write/delete",
+                "indices:data/write/delete/byquery",
                 "indices:data/write/bulk",
                 "indices:admin/create",
                 "indices:admin/get",

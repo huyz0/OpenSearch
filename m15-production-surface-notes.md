@@ -159,3 +159,100 @@ survives.
 - **115 — a lost CAS race is not retried.** Caught.
 
 M15 is done: delete-by-query is the one item left, tracked separately.
+
+## Part 4 — delete-by-query, and M15 is done
+
+`POST /{index}/_delete_by_query` removes every document a query matches. It's the largest piece of M15
+by a wide margin, and the design question it turned on wasn't "how do you delete documents" — that part
+is trivial, reusing the ordinary write path — it was "how do you find them all without the multi-shard
+merge machinery `_search` already has."
+
+## Why `_search`'s `search_after` merge is the wrong tool here
+
+`_search`'s cross-shard paging exists to produce one *globally ordered* page across shards, and that needs
+a sort whose values are comparable shard to shard. Delete-by-query does not need an order at all — only
+that every match is visited exactly once. Reaching for the same merge machinery anyway would mean solving
+a harder problem (a meaningful cross-shard order) to answer an easier one (exhaustive coverage).
+
+So it walks one shard at a time, sorted by `_doc` — native Lucene document order. Two properties make it
+the right choice for exactly this: it needs no fielddata (unlike sorting by `_id`, which real OpenSearch
+disables by default for cost reasons), and it is natively exhaustive *within* one shard's frozen reader,
+which is all a per-shard walk needs. What it deliberately is not is a meaningful order *across* shards —
+and that was never required.
+
+## Evaluated once, against a frozen view
+
+The set of documents to delete is decided against the last published commit as of when the operation
+starts, using the same point-in-time mechanism `search_after` paging already has. A query re-evaluated
+against a moving index could match a document twice, across two pages, or never, depending on exactly when
+a write landed — the same reason `_pit` exists at all.
+
+**The real cost of this, tested rather than asserted.** A write that is acknowledged and refreshed —
+searchable to a live query *right now* — is not touched by a delete-by-query running at that same moment,
+if the writer has not yet published it. That is not a bug; it is the same boundary a plain `search_after`
+export of matching ids would have. `testAnUnpublishedWriteSurvivesEvenThoughItMatches` proves both halves
+in one test: a live search finds both documents, and the delete-by-query only removes the published one.
+
+Deletes themselves go to *live* state, not the frozen view — matching is frozen, deleting is not. A
+document rewritten between the query freezing and its delete reaching the shard is still deleted, exactly
+as a plain delete would be; there is no version check to make that a conflict here any more than anywhere
+else on this surface (M15 part 1).
+
+## Gated once, not once per document
+
+The first version called the already-public, already-gated `ShardOperations.delete()` once per matched
+document — which would have run the filter chain once per document under `indices:data/write/delete`,
+and never once under a name describing the operation as a whole. `BulkHandler` had already stated the
+reason this is wrong, for the same shape of problem: *"filtering each document under
+`indices:data/write/index` instead would be stricter but would show a filter an action name it never
+registered for, which for a filter that only guards bulk is a hole rather than a difference."*
+
+The fix moved the whole operation onto `ShardOperations` — not the REST handler — as
+`ShardOperations.deleteByQuery`, gated once under core's own `indices:data/write/delete/byquery`
+(`DeleteByQueryAction`, which turned out to already exist in `server`, not a reindex module the shell
+cannot reach). Internally it calls the private, ungated `doDelete` primitive per match. This is the exact
+shape `update()` (M15 part 2) and `search()` already use: a composite operation lives on
+`ShardOperations`, gated once, calling ungated primitives underneath — not assembled from public,
+individually-gated pieces in the REST layer. `ServerlessAuthorizationTests`' filter-surface sweep now
+sends a delete-by-query and asserts its action name arrives.
+
+## Two defects its own tests found before either shipped
+
+**No way to ask for a refresh, at all.** Every other write endpoint on this surface accepts `?refresh=true`
+and delete-by-query simply had nothing — the first version of the tests failed with search-based
+verification showing stale results, because deletes default to `refresh=false` (correctly: refreshing per
+document would be absurd for a bulk operation) and nothing ever made them visible. Fixed by threading a
+`refresh` parameter through and piggybacking it onto the *last* delete issued for each shard — one refresh
+per shard for the whole operation, reusing the exact transport plumbing that already carries a refresh
+flag to a forwarded write's owner, so it works whether the shard is local or remote without any new RPC.
+
+**The tests almost didn't require publishing before matching.** Every write in the fixtures used
+`?refresh=true`, which makes a document searchable on the *live* shard — and does nothing for the
+*published* commit a point in time reads from. The first run of every non-trivial test reported
+`{"matched":0,"deleted":0}` against data that was plainly there, because nothing had ever been published.
+A `publish()` helper was added to make every test explicit about the step it depends on, which is the same
+distinction the class javadoc leads with.
+
+## What is honestly out of scope
+
+Only `query` is read. `script`, `sort`, `size`, `from`, `aggs`, `search_after`, `post_filter` and
+`_source` are all refused explicitly rather than silently ignored — the endpoint decides how it walks a
+shard and does not offer a caller a window into that. There is no implicit `match_all`: a caller who means
+to delete everything says so. Single index only, matching the constraint `PointInTime` itself already has
+(one index per view).
+
+### Canaries
+
+- **116 — the walk stops after the first page instead of continuing.** Caught.
+- **117 — `max_docs` is ignored.** Caught.
+- **118 — a `sort` in the body is silently accepted.** Caught.
+- **119 — a missing `query` is silently treated as `match_all`.** Caught.
+- **120 — the frozen view is never released.** Caught.
+- **121 — refresh never rides any delete, even the last one.** Caught.
+- **122 — gated under the wrong action name.** Caught, once the authorization sweep actually exercised
+  the endpoint — it could not have caught anything before that.
+
+## M15 is done
+
+Conditional-write refusal, an update API, the `cluster/config` register, and delete-by-query. 22 canaries
+across the four parts (102–122, plus the two found and fixed along the way), all caught.

@@ -642,6 +642,169 @@ public final class ShardOperations {
         );
     }
 
+    /** How many a delete-by-query operation visited and how many it actually removed. */
+    public static final class DeleteByQueryOutcome {
+
+        private final long matched;
+        private final long deleted;
+
+        DeleteByQueryOutcome(long matched, long deleted) {
+            this.matched = matched;
+            this.deleted = deleted;
+        }
+
+        /**
+         * Returns how many documents the frozen view matched.
+         *
+         * @return the count
+         */
+        public long matched() {
+            return matched;
+        }
+
+        /**
+         * Returns how many were actually removed.
+         *
+         * <p>Can differ from {@link #matched()}: a document deleted between the query freezing and this
+         * operation reaching it (by an unrelated, ordinary delete) was already gone, and removing something
+         * already gone is not counted twice.
+         *
+         * @return the count
+         */
+        public long deleted() {
+            return deleted;
+        }
+    }
+
+    /** How many matches are fetched per page, per shard, while walking a frozen view. */
+    static final int DELETE_BY_QUERY_BATCH_SIZE = 1000;
+
+    /** How long the frozen view a delete-by-query takes is held. Bounded, not indefinite. */
+    static final long DELETE_BY_QUERY_KEEP_ALIVE_MILLIS = 3_600_000L;
+
+    /**
+     * Deletes every document a query matches.
+     *
+     * <p><b>Evaluated against a frozen view, not live state.</b> The set of documents to delete is decided
+     * once, against the last published commit as of when the operation starts — the same point-in-time
+     * mechanism {@code search_after} paging uses, and for the same reason: a query re-evaluated against a
+     * moving index could match a document twice, or never, depending on when a write happened to land
+     * relative to which page was being read. A write acknowledged after the operation starts, published or
+     * not, is not touched by it — the same boundary a plain search_after export of matching ids would have.
+     *
+     * <p><b>Walked one shard at a time, sorted by {@code _doc}</b> — native Lucene document order, always
+     * available with no fielddata, and exhaustive within one shard's frozen reader — rather than through
+     * the cross-shard {@code search_after} merge a multi-index search uses. That merge exists to produce
+     * one globally ordered page across shards, which needs a sort whose values are comparable across
+     * shards; this needs only that every match is visited exactly once, which a per-shard order already
+     * gives without needing to be meaningful across shards at all.
+     *
+     * <p><b>Deletes go to live state, not the frozen view.</b> Matching is frozen; deleting is not — each
+     * matched id is removed through the ordinary write path. A document rewritten between the query
+     * freezing and its delete reaching the shard is still deleted: there is no version check to make that a
+     * conflict, the same as everywhere else on this surface.
+     *
+     * <p><b>Gated once, under {@code indices:data/write/delete/byquery}</b>, not once per document under
+     * {@code indices:data/write/delete} — the same reasoning {@code BulkHandler} gives for gating a whole
+     * batch once: a privilege evaluator registered for the by-query action would otherwise never see it, and
+     * one registered for plain deletes would see thousands of calls a caller never made individually.
+     *
+     * @param index the index
+     * @param query the query; required, there is no implicit match_all
+     * @param maxDocs the most documents to visit, or {@code Long.MAX_VALUE} for no cap
+     * @param refresh whether to make the deletions visible to search before returning
+     * @return how many matched and how many were removed
+     * @throws NoSuchIndexException if the index does not exist
+     * @throws IOException if the query, a delete, or the point-in-time machinery fails
+     */
+    public DeleteByQueryOutcome deleteByQuery(String index, org.opensearch.index.query.QueryBuilder query, long maxDocs, boolean refresh)
+        throws IOException {
+        return gated(
+            org.opensearch.index.reindex.DeleteByQueryAction.NAME,
+            new org.opensearch.index.reindex.DeleteByQueryRequest(index),
+            () -> doDeleteByQuery(index, query, maxDocs, refresh)
+        );
+    }
+
+    private DeleteByQueryOutcome doDeleteByQuery(String index, org.opensearch.index.query.QueryBuilder query, long maxDocs, boolean refresh)
+        throws Exception {
+        final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
+
+        // A frozen view, exactly as _pit takes one -- see the class javadoc for why the query is decided
+        // once rather than re-evaluated as the walk goes.
+        final java.util.Map<Integer, org.opensearch.serverless.store.CommitManifest> shards = new java.util.LinkedHashMap<>();
+        for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
+            final var manifest = plane.segmentPublisher(index, descriptor.uuid(), shard).readManifest();
+            if (manifest.isEmpty()) {
+                // Nothing published on this shard: nothing to match, and nothing silently skipped either
+                // -- an unpublished shard has no documents a search could have found.
+                continue;
+            }
+            shards.put(shard, manifest.get());
+        }
+        if (shards.isEmpty()) {
+            return new DeleteByQueryOutcome(0, 0);
+        }
+
+        final var pit = new org.opensearch.serverless.metadata.PointInTime(
+            org.opensearch.common.UUIDs.randomBase64UUID(),
+            index,
+            plane.clock().getAsLong() + DELETE_BY_QUERY_KEEP_ALIVE_MILLIS,
+            shards
+        );
+        plane.createPointInTime(pit);
+        try {
+            long visited = 0;
+            long deleted = 0;
+            for (Integer shard : shards.keySet()) {
+                final var frozenShardId = node.openFrozenView(plane, pit, shard);
+                Object[] cursor = null;
+                while (visited < maxDocs) {
+                    final var page = new org.opensearch.search.builder.SearchSourceBuilder().query(query)
+                        .sort(new org.opensearch.search.sort.FieldSortBuilder(org.opensearch.search.sort.FieldSortBuilder.DOC_FIELD_NAME))
+                        .size((int) Math.min(DELETE_BY_QUERY_BATCH_SIZE, maxDocs - visited))
+                        .trackTotalHits(false)
+                        .fetchSource(false);
+                    if (cursor != null) {
+                        page.searchAfter(cursor);
+                    }
+                    final var result = org.opensearch.serverless.shard.ShardQuery.execute(node.searchService(), frozenShardId, page);
+                    final var hits = result.hits();
+                    if (hits.isEmpty()) {
+                        break;
+                    }
+                    final boolean lastPageOfShard = hits.size() < page.size() || visited + hits.size() >= maxDocs;
+                    for (int i = 0; i < hits.size(); i++) {
+                        final var hit = hits.get(i);
+                        visited++;
+                        // The refresh -- when asked for -- rides the last delete of the shard, not every
+                        // one: refreshing per document would refresh the shard once per document instead
+                        // of once for the whole operation.
+                        final boolean isLastOfShard = refresh && lastPageOfShard && i == hits.size() - 1;
+                        if (doDelete(index, hit.getId(), isLastOfShard)) {
+                            deleted++;
+                        }
+                    }
+                    cursor = hits.get(hits.size() - 1).getSortValues();
+                    if (lastPageOfShard) {
+                        // Fewer than a full page, or the cap was reached: this shard has nothing left to
+                        // give (or nothing more is wanted), and asking again would cost a round trip to
+                        // learn what this already knows.
+                        break;
+                    }
+                }
+                // A shard with no match never entered the loop above, so it never issued a delete and
+                // never needed a refresh -- correctly, since nothing changed on it to make visible.
+            }
+            return new DeleteByQueryOutcome(visited, deleted);
+        } finally {
+            // Local shards first, then the record -- the same order _pit's own release does, so this node
+            // is never left holding open frozen shards for a view no longer recorded anywhere.
+            node.reconciler().closeFrozenReader(pit.id());
+            plane.releasePointInTime(pit.id());
+        }
+    }
+
     /** A document does not exist, and there was no {@code upsert} or {@code doc_as_upsert} to fall back to. */
     public static final class DocumentMissingException extends IOException {
 
