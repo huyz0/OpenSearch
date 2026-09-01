@@ -10,7 +10,11 @@ disagree, this is right.
 **Documents.** Write, get, delete, `_bulk`, `_mget`, with `_source` filtering on reads. A conditional write
 (`if_seq_no`, `if_primary_term`, `version`) is refused rather than silently turned unconditional — this
 system has no sequence-number model, and a client believing it holds a compare-and-swap that was quietly
-dropped would be a worse failure than every other refusal on this surface. Routing is resolved
+dropped would be a worse failure than every other refusal on this surface. `_update` does a
+partial-document merge (core's own recursive merge, so a nested object is not silently overwritten), with
+`doc_as_upsert` and `upsert` for a missing document and `detect_noop` skipping a write that changes
+nothing — read then written back, not a transaction: nothing holds the document still between the two,
+which is what the version model above would be for. Routing is resolved
 once per request, so a multi-get's object-store cost is the shards it touches and not the documents it asks
 for: ten documents cost 4 requests and twenty cost 4, against 30 for the same ten fetched one at a time. A write is durable in a write-ahead log before it is
 acknowledged, and replayed by a successor. A get is routed to the shard's owner so it sees writes a search
@@ -158,7 +162,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-359 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+369 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

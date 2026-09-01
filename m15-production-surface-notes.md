@@ -56,6 +56,50 @@ one refusal between them was the bug.
 - **103 — a conditional bulk action line is silently accepted.** Caught.
 - **104 — a fresh-index get 500s instead of 404ing.** Caught.
 
+## Part 2 — an update API
+
+`POST /{index}/_update/{id}` merges a partial document into what's there, using core's own
+`XContentHelper.update` — the same utility core's `_update` uses internally, recursing into nested
+objects rather than overwriting them whole, and reporting whether anything actually changed as a side
+effect of doing the merge rather than needing its own comparison pass.
+
+**Not a transaction, and the javadoc says so before anything else.** The read and the write are two
+separate calls with nothing holding the document still in between: a write landing in that window is
+silently overwritten, exactly as two plain `index` calls racing each other would be. Classic
+OpenSearch's `_update` avoids this by retrying under `if_seq_no`/`if_primary_term` — precisely the
+version model `WalRecord` does not have (M15 part 1). This is the honest version of the feature without
+one, and it says so rather than implying a safety it doesn't provide.
+
+**One gate, not two.** `ShardOperations.get()` and `.index()` each wrap themselves in their own
+`ActionGate` call, under their own action names. Calling them from `update()` would have run a filter
+chain twice per request — once as `indices:data/read/get`, once as `indices:data/write/index` — and
+never once as `indices:data/write/update`, which is the name a security filter meaning to gate updates
+specifically would be looking for. `update()` calls the private, ungated `doGet`/`write` primitives
+directly and wraps the whole operation in one gate instead — the same shape `search()` already uses to
+compose `describeOnce` and the fan-out under one name. `ServerlessAuthorizationTests` now sends an
+update through its filter-surface sweep and asserts the action name arrives exactly once, under its own
+name.
+
+**`script` and `scripted_upsert` are refused**, not approximated — the same reason and the same "no
+engine registered" shape as every other script surface on this node.
+
+**`detect_noop`'s test asserts on the engine, not the label.** A response saying `"result":"noop"` proves
+nothing about whether a write happened; a version of this code that labelled every write "noop" while
+still writing would pass a test that only read the field back. The shard's own max sequence number moves
+on every real write and nowhere else, so the test asserts on that — and its pair, `detect_noop:false`,
+asserts the number *does* move, so the first assertion isn't just an artefact of a shard that never
+writes.
+
+### Canaries
+
+- **105 — a scripted update quietly accepted.** Caught.
+- **106 — a conditional update quietly accepted.** Caught.
+- **107 — a missing document written anyway with no upsert.** Caught.
+- **108 — `detect_noop` never skips the write.** Passed at first: the test asserted the response label,
+  not the effect. Caught once the test asserted the engine's sequence number instead.
+- **109 — the merge does not recurse into nested objects.** Caught.
+- **110 — an update gated under the wrong action name.** Caught.
+
 ## What is still open in M15
 
-Delete-by-query, an update API (partial-document merge), and the `cluster/config` register are next.
+The `cluster/config` register named in §9.3, and delete-by-query.

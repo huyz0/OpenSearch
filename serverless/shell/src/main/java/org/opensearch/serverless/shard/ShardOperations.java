@@ -642,6 +642,153 @@ public final class ShardOperations {
         );
     }
 
+    /** A document does not exist, and there was no {@code upsert} or {@code doc_as_upsert} to fall back to. */
+    public static final class DocumentMissingException extends IOException {
+
+        private final String index;
+        private final String id;
+
+        /**
+         * Creates the exception.
+         *
+         * @param index the index
+         * @param id the document that is not there
+         */
+        public DocumentMissingException(String index, String id) {
+            super("document missing: [" + index + "]/[" + id + "]");
+            this.index = index;
+            this.id = id;
+        }
+
+        /**
+         * Returns the index.
+         *
+         * @return the index name
+         */
+        public String index() {
+            return index;
+        }
+
+        /**
+         * Returns the document id.
+         *
+         * @return the id
+         */
+        public String id() {
+            return id;
+        }
+    }
+
+    /** What an update did. */
+    public static final class UpdateOutcome {
+
+        private final String result;
+        private final String servedBy;
+
+        UpdateOutcome(String result, String servedBy) {
+            this.result = result;
+            this.servedBy = servedBy;
+        }
+
+        /**
+         * Returns what happened: {@code created}, {@code updated} or {@code noop}.
+         *
+         * @return the result
+         */
+        public String result() {
+            return result;
+        }
+
+        /**
+         * Returns the node that performed the write, or answered the read for a noop.
+         *
+         * @return the node id
+         */
+        public String servedBy() {
+            return servedBy;
+        }
+    }
+
+    /**
+     * Reads a document, merges a partial update into it, and writes the result back.
+     *
+     * <p><b>This is a merge, not a transaction.</b> The read and the write are two separate calls to two
+     * separate primitives — {@link #get} and {@link #index}'s underlying machinery — with nothing holding
+     * the document still in between. A write that lands in that window is overwritten by this one, silently,
+     * exactly as two plain {@code index} calls racing each other would be. Classic OpenSearch's
+     * {@code _update} avoids that by retrying under {@code if_seq_no}/{@code if_primary_term}, which is
+     * exactly the version model {@code WalRecord} does not have. This is the honest version of the feature
+     * without one: best-effort, not compare-and-swap, and it does not pretend otherwise.
+     *
+     * <p><b>The merge itself is core's own</b> ({@link org.opensearch.common.xcontent.XContentHelper#update}),
+     * used by core's own {@code _update} internally — recursing into nested objects, overwriting everything
+     * else, and reporting whether anything actually changed. Reusing it means the merge semantics are
+     * exactly what a classic client already expects, and {@code detect_noop} falls out of it for free rather
+     * than needing its own comparison.
+     *
+     * @param index the index
+     * @param id the document id
+     * @param doc the partial document to merge in
+     * @param upsert the document to write if none exists, or null
+     * @param docAsUpsert if true, write {@code doc} itself when none exists
+     * @param detectNoop if true, a merge that changed nothing is not written
+     * @param refresh whether to make the result visible to search before returning
+     * @return what happened
+     * @throws DocumentMissingException if nothing exists and neither {@code upsert} nor {@code docAsUpsert}
+     *     was given
+     * @throws IOException if the read or the write fails
+     */
+    public UpdateOutcome update(
+        String index,
+        String id,
+        java.util.Map<String, Object> doc,
+        java.util.Map<String, Object> upsert,
+        boolean docAsUpsert,
+        boolean detectNoop,
+        boolean refresh
+    ) throws IOException {
+        return gated(org.opensearch.action.update.UpdateAction.NAME, new org.opensearch.action.update.UpdateRequest(index, id), () -> {
+            // doGet, not get: this whole method is one gated operation under UpdateAction's own name, and
+            // calling the public get() here would run the filter chain a second time under GetAction's --
+            // which is not what a filter checking "may this caller write" expects to see for an update.
+            final Read current = doGet(index, id);
+            final ServerlessNode.Document existing = current.document();
+
+            final java.util.Map<String, Object> merged;
+            final String result;
+            if (existing.found() == false) {
+                if (docAsUpsert) {
+                    merged = doc;
+                    result = "created";
+                } else if (upsert != null) {
+                    merged = upsert;
+                    result = "created";
+                } else {
+                    throw new DocumentMissingException(index, id);
+                }
+            } else {
+                merged = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                    new org.opensearch.core.common.bytes.BytesArray(existing.source()),
+                    false,
+                    org.opensearch.common.xcontent.XContentType.JSON
+                ).v2();
+                final boolean changed = org.opensearch.common.xcontent.XContentHelper.update(merged, doc, detectNoop);
+                result = (detectNoop && changed == false) ? "noop" : "updated";
+            }
+
+            if ("noop".equals(result)) {
+                return new UpdateOutcome(result, current.servedBy());
+            }
+            final String mergedJson;
+            try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+                builder.map(merged);
+                mergedJson = org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
+            }
+            final String servedBy = write(index, id, mergedJson, refresh, false);
+            return new UpdateOutcome(result, servedBy);
+        });
+    }
+
     private boolean doDelete(String index, String id, boolean refresh) throws IOException {
         final Placement placement = place(index, id);
         if (placement.local() != null) {

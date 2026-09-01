@@ -559,6 +559,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
             send(node, "PUT", "/alpha/_doc/1?refresh=true", asAdmin, "{\"msg\":\"one\"}");
             send(node, "GET", "/alpha/_doc/1", asAdmin, null);
             send(node, "POST", "/alpha/_search", asAdmin, "{\"query\":{\"match_all\":{}}}");
+            send(node, "POST", "/alpha/_update/1?refresh=true", asAdmin, "{\"doc\":{\"msg\":\"one-updated\"}}");
             send(node, "DELETE", "/alpha/_doc/1?refresh=true", asAdmin, null);
             send(node, "POST", "/_bulk?refresh=true", asAdmin, "{\"index\":{\"_index\":\"alpha\",\"_id\":\"z\"}}\n{\"msg\":\"z\"}\n");
             send(node, "PUT", "/gamma?shards=1", asAdmin, MAPPING);
@@ -569,6 +570,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 "indices:data/write/index",
                 "indices:data/read/get",
                 "indices:data/read/search",
+                "indices:data/write/update",
                 "indices:data/write/delete",
                 "indices:data/write/bulk",
                 "indices:admin/create",
