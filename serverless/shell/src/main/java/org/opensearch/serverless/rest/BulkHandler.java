@@ -470,6 +470,14 @@ public final class BulkHandler extends BaseRestHandler {
         return lines;
     }
 
+    /** Action-line fields that ask for a conditional write, none of which this system honours. */
+    private static final java.util.Set<String> CONDITIONAL_FIELDS = java.util.Set.of(
+        "_seq_no",
+        "_primary_term",
+        "_version",
+        "version_type"
+    );
+
     private static Action parseAction(byte[] bytes, int lineNumber, String defaultIndex) throws BadRequest, IOException {
         try (
             XContentParser parser = XContentType.JSON.xContent()
@@ -495,6 +503,12 @@ public final class BulkHandler extends BaseRestHandler {
                         action.index = parser.text();
                     } else if ("_id".equals(field)) {
                         action.id = parser.text();
+                    } else if (CONDITIONAL_FIELDS.contains(field)) {
+                        // Read and kept, not merely noticed: a client that asked for a compare-and-swap
+                        // and got an unconditional write believing it got one is the confident wrong
+                        // answer this design refuses everywhere else. Every operation on the line stays
+                        // unconditional, so the whole line is unsupported rather than just this field.
+                        action.conditional = field;
                     }
                 }
             }
@@ -512,6 +526,7 @@ public final class BulkHandler extends BaseRestHandler {
         private String index;
         private String id;
         private String source;
+        private String conditional;
 
         Action(String name, String defaultIndex) {
             this.name = name;
@@ -535,6 +550,17 @@ public final class BulkHandler extends BaseRestHandler {
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_action",
                     "'" + name + "' is not supported: it requires version-conditional writes, which this system does not have"
+                );
+            } else if (conditional != null) {
+                item.fail(
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_action",
+                    "'"
+                        + conditional
+                        + "' on '"
+                        + documentId
+                        + "' asks for a conditional write, which this system does not have: "
+                        + "every write is a plain overwrite and every delete a plain removal"
                 );
             } else if ("index".equals(name) && (source == null || source.isBlank())) {
                 item.fail(RestStatus.BAD_REQUEST, "missing_source", "the document body for '" + documentId + "' was empty");

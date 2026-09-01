@@ -30,11 +30,16 @@ import java.util.function.Supplier;
  * <p>Everything M10 built sat behind a Java method until this existed. A write here appends to the
  * write-ahead log before it is applied, so it survives the writer dying before the next publication.
  *
- * <p><b>A node that does not own the shard refuses and names the owner</b> rather than forwarding.
- * That is the same shape as a lost activation race: losing is a routing instruction, not an error, and
- * telling the caller who won is what stops it guessing. Forwarding over transport is the remaining half
- * of this milestone; until it exists, a client must be able to find the right node, so the response
- * carries it.
+ * <p><b>A node that does not own the shard forwards to the one that does</b>, over transport, and answers
+ * as if it had done the write itself. Losing an activation race is still a routing instruction rather
+ * than an error, and the owner's id still rides in the response — a client that wants to skip the extra
+ * hop next time can, but nothing requires it to.
+ *
+ * <p><b>Conditional writes are refused, not silently dropped.</b> {@code if_seq_no}, {@code
+ * if_primary_term} and {@code version} are read and turned into a 501 naming why: {@code WalRecord}
+ * records document state, not history, so there is no sequence number to condition on. A client that
+ * asked for a compare-and-swap and got an unconditional write believing it got one would be the worst
+ * failure on this surface, because it looks like success.
  */
 public final class DocumentHandler extends BaseRestHandler {
 
@@ -77,11 +82,36 @@ public final class DocumentHandler extends BaseRestHandler {
         final String source = request.hasContent() ? request.content().utf8ToString() : null;
         final boolean refresh = request.paramAsBoolean("refresh", false);
         final boolean deletion = request.method() == RestRequest.Method.DELETE;
+        // Read, not merely present-checked, so every parameter is consumed regardless of which branch
+        // below returns -- the class-level idiom this handler already follows.
+        final String ifSeqNo = request.param("if_seq_no");
+        final String ifPrimaryTerm = request.param("if_primary_term");
+        final String version = request.param("version");
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+            );
+        }
+        if (ifSeqNo != null || ifPrimaryTerm != null || version != null) {
+            // Read and refused, not read and dropped. A client asking for a compare-and-swap and getting
+            // an unconditional write believing it got one is the confident wrong answer this design
+            // refuses everywhere else -- and it is a worse failure here than a 501 ever is, because it
+            // looks like success. WalRecord records document state, not history: there is no sequence
+            // number or version to condition on, and inventing one here would be a guarantee this system
+            // does not make.
+            final String named = ifSeqNo != null ? "if_seq_no" : ifPrimaryTerm != null ? "if_primary_term" : "version";
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_write",
+                    "'"
+                        + named
+                        + "' asks for a conditional write, which this system does not have: every write is a plain "
+                        + "overwrite and every delete a plain removal. WalRecord records document state, not history."
+                )
             );
         }
         if (deletion == false && (source == null || source.isBlank())) {

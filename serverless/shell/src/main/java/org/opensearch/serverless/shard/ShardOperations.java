@@ -426,7 +426,16 @@ public final class ShardOperations {
         }
         if (placement.owner() == null) {
             // Nobody owns it, so there is no writer holding unpublished writes and the commit is the
-            // current state.
+            // current state -- except when nothing has ever been published at all. Then there is no
+            // commit to open a reader onto, and with no owner there is no writer about to make one either.
+            // That is not a failure to report, it is a document that has never existed: a fresh index,
+            // read before its first write ever lands. Checked here rather than left to openReader's own
+            // refusal, which exists for a different reader -- the search fan-out, where "unpublished"
+            // must not collapse into "empty" because a live writer really might be mid-first-publish.
+            // Here the owner check already ruled that out.
+            if (plane.segmentPublisher(index, placement.shard()).readManifest().isEmpty()) {
+                return new Read(org.opensearch.serverless.shell.ServerlessNode.Document.absent(id), node.localNode().getId(), false);
+            }
             try {
                 final var shardId = node.serveAsReader(plane, index, placement.shard());
                 return new Read(node.get(shardId, id), node.localNode().getId(), false);

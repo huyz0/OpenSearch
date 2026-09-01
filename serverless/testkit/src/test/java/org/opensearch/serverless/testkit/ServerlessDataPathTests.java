@@ -316,4 +316,95 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             assertEquals("a search with no query must be refused", 400, send(http, "GET", "/library/_search", null).status());
         }
     }
+
+    /**
+     * A get on a fresh index, before its first write has ever landed, is a plain miss.
+     *
+     * <p><b>Found while testing something else.</b> An index that exists and has never had a writer
+     * activate has no owner and no published commit. The get path's "no owner" branch used to assume that
+     * meant it could safely open a reader on the published commit — which is right once something has been
+     * published, and wrong here, where nothing ever has: {@code openReader} refused with an internal
+     * "cannot serve as a reader" message, and nothing caught it, so it surfaced as a 500. A document that
+     * has never existed answering 500 instead of a plain miss is exactly the kind of internal-invariant
+     * leak this project keeps finding at its edges.
+     */
+    public void testAGetOnAFreshIndexIsAMissNotAServerError() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = planeOver(createTempDir(), clock);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("m15-fresh-get"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final TransportAddress http = node.boundHttpAddress().publishAddress();
+
+            send(http, "PUT", "/fresh?shards=1", MAPPING);
+            final Response got = send(http, "GET", "/fresh/_doc/never-written", null);
+            assertEquals("a document in an index nobody has ever written to must be a miss: " + got.body(), 404, got.status());
+            assertTrue("and say so plainly: " + got.body(), got.body().contains("\"found\":false"));
+
+            // And a write afterward still works -- this is a get on empty state, not a broken index.
+            // Activated explicitly: the first write to an index with no owner is itself what triggers
+            // activation, asynchronously, so it is refused rather than served -- a routing signal this
+            // test is not about, and testAWriteToTheWrongNodeIsForwardedToTheOwner is.
+            node.activateWriter(plane, "fresh", 0);
+            assertEquals(201, send(http, "PUT", "/fresh/_doc/1", "{\"msg\":\"x\"}").status());
+        }
+    }
+
+    /**
+     * A conditional write is refused, not silently turned unconditional.
+     *
+     * <p><b>This is the difference between an unimplemented endpoint and a wrong answer.</b> A caller
+     * sending {@code if_seq_no} expects a 409 if the document has changed underneath it, and the failure
+     * mode of ignoring the parameter is not "feature missing" — it is a client believing it holds a
+     * compare-and-swap and silently clobbering a concurrent write. That is worse than every other refusal
+     * on this surface, because it looks like success.
+     *
+     * <p>Both action shapes are asserted: the single-document path, where the parameters ride the query
+     * string, and bulk, where they ride the action line. A refusal that covered one and not the other
+     * would leave exactly the gap a client migrating between the two would fall into.
+     */
+    public void testConditionalWritesAreRefusedNotIgnored() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = planeOver(createTempDir(), clock);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("m15-conditional"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final TransportAddress http = node.boundHttpAddress().publishAddress();
+            send(http, "PUT", "/conditional?shards=1", MAPPING);
+            node.activateWriter(plane, "conditional", 0);
+
+            for (String query : new String[] { "if_seq_no=0&if_primary_term=1", "if_primary_term=1", "version=3" }) {
+                final Response refused = send(http, "PUT", "/conditional/_doc/1?" + query, "{\"msg\":\"x\"}");
+                assertEquals("[" + query + "] must be refused: " + refused.body(), 501, refused.status());
+                assertTrue(
+                    "and say why: " + refused.body(),
+                    refused.body().contains("conditional write") && refused.body().contains("does not have")
+                );
+            }
+
+            // The write must not have happened under any of the refused attempts.
+            assertEquals(404, send(http, "GET", "/conditional/_doc/1", null).status());
+
+            // And a plain write to the same document afterward must still work -- the refusal is per
+            // request, not a state the index gets stuck in.
+            assertEquals(201, send(http, "PUT", "/conditional/_doc/1", "{\"msg\":\"x\"}").status());
+
+            // Bulk carries the same fields on the action line rather than the query string.
+            final String bulk = "{\"index\":{\"_index\":\"conditional\",\"_id\":\"2\",\"_seq_no\":0,\"_primary_term\":1}}\n"
+                + "{\"msg\":\"y\"}\n"
+                + "{\"delete\":{\"_index\":\"conditional\",\"_id\":\"1\",\"_version\":3}}\n";
+            final Response bulkResponse = send(http, "POST", "/_bulk", bulk);
+            assertEquals(bulkResponse.body(), 200, bulkResponse.status());
+            assertTrue(
+                "the bulk response must carry a per-item refusal, not a silent success: " + bulkResponse.body(),
+                bulkResponse.body().contains("\"status\":501") && bulkResponse.body().contains("conditional write")
+            );
+            // Neither item was applied: document 2 was never written, and document 1 -- written plainly
+            // just above -- was not deleted by the refused conditional delete.
+            assertEquals(404, send(http, "GET", "/conditional/_doc/2", null).status());
+            assertEquals(200, send(http, "GET", "/conditional/_doc/1", null).status());
+        }
+    }
 }
