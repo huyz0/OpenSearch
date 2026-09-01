@@ -756,6 +756,13 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> this, () -> metadataPlane)));
+        // The one piece of /_cluster/* not refused below: §9.3's /cluster/config is one register, exactly
+        // like an index descriptor, and this node can answer for it the same honest way it answers for an
+        // index -- unlike health, state or stats, which are genuinely cluster-wide and would mislead
+        // coming from one node.
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.ClusterSettingsHandler(() -> metadataPlane, () -> this))
+        );
         controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,
@@ -783,7 +790,6 @@ public final class ServerlessNode implements Closeable {
             "/_cluster/health",
             "/_cluster/state",
             "/_cluster/stats",
-            "/_cluster/settings",
             "/_cluster/reroute",
             "/_nodes",
             "/_cat/indices",

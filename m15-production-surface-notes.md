@@ -10,7 +10,7 @@ Ground truth, checked rather than assumed: auth (done, M24-M28), bulk index and 
 draining a live writer (done, just not by literal draining — the head clears before the bytes, so a
 writer loses ownership on its next tick, and the residual publish race is bounded and self-heals on the
 next index of the same name). What's genuinely left: delete-by-query, an update API, the `cluster/config`
-register named in §9.3 and never built, and one thing the row never named at all.
+register named in §9.3 and never built (parts 2 and 3, below), and one thing the row never named at all.
 
 ## The thing the row never named
 
@@ -100,6 +100,62 @@ writes.
 - **109 — the merge does not recurse into nested objects.** Caught.
 - **110 — an update gated under the wrong action name.** Caught.
 
-## What is still open in M15
+## Part 3 — the `cluster/config` register
 
-The `cluster/config` register named in §9.3, and delete-by-query.
+`GET/PUT /_cluster/settings` is now the one piece of `/_cluster/*` that is not refused, and the reason it
+can be is exactly what makes the rest of that namespace refused: it genuinely is one register, the same
+shape as an index descriptor, rather than genuinely cluster-wide state a single node cannot honestly
+answer for.
+
+**A store, not a settings service.** Core's `ClusterSettings` validates a key against a registry of
+definitions plugins and modules contribute. Building that here would mean either faking a registry this
+shell does not have or reaching into core's, and either way inventing a guarantee — "this key is known and
+this value is legal" — nobody has actually checked. This register holds whatever an operator puts in it
+and hands back whatever is there, the same as an index's mapping JSON is stored without this shell
+checking it against Lucene's field-type rules.
+
+**Persistent only.** A `transient` block that is not empty is refused — not silently dropped, not silently
+treated as persistent. Not an oversight: transient cluster settings are a footgun even where they exist
+(reset on a full restart, and the source of "why did this change back" confusion), and this design never
+had a restart to reset one on to begin with. An *empty* transient block is allowed, because plenty of
+client libraries send one by default whether or not the caller asked for one, and refusing that would
+break ordinary use for no honesty gained.
+
+**Scalar values only, and this one took real investigation to get right.** The obvious plan — treat a null
+value as "remove this key," merge everything else via `Settings.Builder.put(Settings)` — has two traps,
+both found before they shipped rather than after:
+
+1. Core's own merge does not strip a null-valued key from the map; it stores the null. A register that
+   only ever merged would accumulate one dead tombstone key forever, per removal, with no visible symptom
+   until someone read the raw register and wondered why a "removed" setting was still there as `null`.
+   Fixed by rebuilding the merged result from scratch after every update, keeping only keys whose value is
+   still non-null.
+2. Once that rebuild exists, it needs to tell a genuine list-valued setting apart from a scalar — and
+   `Settings`'s own `getAsList` cannot do that from outside the class: called on a plain scalar key, it
+   still returns a non-null one-element list (by design, for comma-delimited value support), so it cannot
+   be used to detect "this key is really a list" without a false positive on every scalar. Rather than
+   silently drop a list's values during the clean rebuild — the exact same class of loss the rebuild exists
+   to prevent for scalars — a list value is refused at the door, before it ever reaches the register.
+
+**Found by testing gating, not by testing the register itself.** Extending `ServerlessAuthorizationTests`'
+filter-surface sweep to include a `_cluster/settings` write tripped core's own "must not be a transport
+thread" assertion — the PUT branch ran its object-store compare-and-swap inline, on the thread that should
+have been reading the next request. Every other write handler on this surface had already learned not to
+do that; this one had not, because nothing had ever driven a write through it inside a running node until
+the sweep did.
+
+**Retried under contention, not merely once.** §9.3's whole argument for giving settings its own register
+is that the writer population is operators at human-scale, so a retry loop rather than a single
+compare-and-swap attempt costs one extra read on the rare occasion two operators collide, not a storm.
+Tested with eight threads racing genuinely concurrent writes to eight different keys, asserting every one
+survives.
+
+### Canaries
+
+- **111 — a removed key leaves a null tombstone in the register.** Caught.
+- **112 — a second write replaces the register instead of merging.** Caught.
+- **113 — a non-empty transient block is silently accepted.** Caught.
+- **114 — a list-valued setting is silently accepted.** Caught.
+- **115 — a lost CAS race is not retried.** Caught.
+
+M15 is done: delete-by-query is the one item left, tracked separately.

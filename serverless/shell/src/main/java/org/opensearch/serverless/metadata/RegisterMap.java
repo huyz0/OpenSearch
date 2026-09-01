@@ -89,6 +89,23 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns the container path holding the cluster config register.
+     *
+     * <p>§9.3's {@code /cluster/config}: one register, operator write rate, CAS on conflict. Siblings
+     * {@link #members} under {@code cluster/} rather than sharing its container, because a container is
+     * the unit a backend lists and nothing should ever need to list this one alongside node leases.
+     *
+     * @param base the deployment's base path
+     * @return the cluster config container path
+     */
+    public static BlobPath clusterConfig(BlobPath base) {
+        return base.add("cluster").add("config");
+    }
+
+    /** The single blob name the cluster config register is stored under. */
+    public static final String CLUSTER_CONFIG_BLOB = "settings";
+
+    /**
      * Returns the container path holding one shard's published segments.
      *
      * <p>A container per shard rather than a shared one with prefixed names: segment files are listed

@@ -41,6 +41,7 @@ public final class MetadataPlane {
 
     private final DescriptorStore descriptors;
     private final ShardHeadStore heads;
+    private final ClusterConfig clusterConfig;
     private final BlobLeaseMembership membershipField;
     private final BlobStore blobStore;
     private final BlobPath base;
@@ -90,6 +91,7 @@ public final class MetadataPlane {
             }
         };
         this.heads = new ShardHeadStore(blobStore.blobContainer(RegisterMap.shards(base)), clock, leaseTtlMillis, oracle);
+        this.clusterConfig = new ClusterConfig(blobStore.blobContainer(RegisterMap.clusterConfig(base)));
         this.membershipField = leases;
         this.blobStore = blobStore;
         this.base = base;
@@ -580,6 +582,15 @@ public final class MetadataPlane {
      */
     public ShardHeadStore heads() {
         return heads;
+    }
+
+    /**
+     * Returns the cluster config register.
+     *
+     * @return the register
+     */
+    public ClusterConfig clusterConfig() {
+        return clusterConfig;
     }
 
     /**

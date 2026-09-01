@@ -565,6 +565,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
             send(node, "PUT", "/gamma?shards=1", asAdmin, MAPPING);
             send(node, "GET", "/gamma", asAdmin, null);
             send(node, "DELETE", "/doomed", asAdmin, null);
+            send(node, "PUT", "/_cluster/settings", asAdmin, "{\"persistent\":{\"authz-surface-probe\":\"1\"}}");
 
             for (String action : List.of(
                 "indices:data/write/index",
@@ -575,7 +576,8 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 "indices:data/write/bulk",
                 "indices:admin/create",
                 "indices:admin/get",
-                "indices:admin/delete"
+                "indices:admin/delete",
+                "cluster:admin/settings/update"
             )) {
                 assertTrue("no filter ever saw [" + action + "]; the endpoint that performs it is ungated: " + SEEN, SEEN.contains(action));
             }

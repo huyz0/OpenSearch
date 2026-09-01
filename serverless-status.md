@@ -46,6 +46,14 @@ alias.
 cannot inherit the previous index's data. Deletion reclaims the bytes, and a sweep collects shard
 containers no index owns.
 
+**Cluster config.** `GET/PUT /_cluster/settings` — §9.3's `/cluster/config` register, the one piece of
+`/_cluster/*` that is not refused, because it genuinely is one CAS register rather than genuinely
+cluster-wide state. Persistent settings only (`transient` is refused if non-empty — no cluster manager
+means no restart to reset one on), scalar values only (a list cannot be told apart from an explicit
+removal through `Settings`'s public surface without risking silent data loss), and no validation against
+a settings registry: this is a store, not a settings service, the same as an index's mapping JSON is
+stored without checking it against Lucene's field types.
+
 **Scaling to zero and back.** A node takes a shard by compare-and-swap on a register, renews a lease,
 publishes commits to the object store, and releases shards that have gone idle. There is no cluster
 manager, no consensus process, and no cluster-wide state.
@@ -103,7 +111,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 | --- | --- |
 | Patterns that are not a prefix (`*-2026`, `lo*s-a`, `logs-?`) | A prefix can be answered by one bounded listing; these cannot be answered by a listing at all, only by reading every index name in the deployment and matching each. Supporting a wildcard syntax whose cost depends on where the caller put the star would be worse than the split. |
 | Enumerating indices (`/_serverless/indices`) | An inventory operation, not a serving one — it is asked to return everything, where a pattern is capped and refuses when the cap is exceeded. Look an index up by name, or run an offline inventory. |
-| `/_cluster/*` | There is no cluster-wide state; a node-local answer would mislead. |
+| `/_cluster/*` except `settings` | There is no cluster-wide state; a node-local answer would mislead. |
 | `collapse`, `suggest`, `profile` | Each needs cross-shard machinery that does not exist yet. |
 | Two request wrappers, or two plugins contributing one setting | Which one wins would depend on load order. |
 | `IndexNameExpressionResolver` for plugins | A node's `ClusterState` holds only the indices it has open, so resolving would answer a wildcard with a subset — which for privilege evaluation fails open. |
@@ -162,7 +170,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-369 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+378 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 
