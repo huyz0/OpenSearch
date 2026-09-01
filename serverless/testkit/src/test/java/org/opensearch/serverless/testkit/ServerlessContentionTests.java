@@ -233,9 +233,15 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 try {
                     response = send(b, "PUT", "/alpha/_doc/2?refresh=true", "{\"msg\":\"during\",\"n\":2}");
                 } catch (Exception e) {
+                    // Elapsed time even on this path: with the client's own timeout now well above every
+                    // server-side bound, reaching this branch at all is itself informative, and it should
+                    // not be silent about how long it took to get here.
+                    final long elapsedMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
                     final var tail = b.output();
                     fail(
-                        "the write never came back ("
+                        "the write never came back after "
+                            + elapsedMillis
+                            + "ms ("
                             + e
                             + "); b's last output was:\n"
                             + String.join("\n", tail.subList(Math.max(0, tail.size() - 25), tail.size()))
@@ -445,13 +451,22 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
     }
 
     private static Response send(String hostPort, String method, String path, String body) throws Exception {
+        // Deliberately far above every server-side bound this suite measures (the forward timeout is the
+        // lease TTL, 8s here). ServerlessForwardBoundTests measured that bound in isolation at 8033ms --
+        // essentially exact -- so the margin below was never protecting against a slow server; it was
+        // protecting against nothing, and under load it lost that race instead: the client's own timeout
+        // fired before the server's, and a real measurement turned into an HttpTimeoutException with
+        // nothing to diagnose from. Widening it does not weaken this test -- the assertion the test cares
+        // about (elapsedMillis < 20_000L, asserted after send() returns) is unchanged; only the outer
+        // client margin around that assertion is loosened, so a legitimately slow scheduler produces a
+        // number to look at rather than an exception in its place.
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build()) {
             final HttpRequest.BodyPublisher payload = body == null
                 ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(body);
             final HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("http://" + hostPort + path))
-                .timeout(Duration.ofSeconds(25))
+                .timeout(Duration.ofSeconds(90))
                 .header("Content-Type", "application/json")
                 .method(method, payload)
                 .build();
