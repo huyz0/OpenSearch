@@ -449,7 +449,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
             assertTrue("the answer must still report itself complete: " + filtered.body(), filtered.body().contains("\"complete\":true"));
             assertTrue(
                 "and the shard counts must be the shell's, not the filter's: " + filtered.body(),
-                filtered.body().contains("\"total\":1") && filtered.body().contains("\"searched\":1")
+                filtered.body().contains("\"total\":1") && filtered.body().contains("\"successful\":1")
             );
         }
     }

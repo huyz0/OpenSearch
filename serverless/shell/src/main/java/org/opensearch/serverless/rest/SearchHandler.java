@@ -38,9 +38,10 @@ import java.util.function.Supplier;
  * failure {@code HANDOFF.md} records eight times — a confident answer computed over a fraction of the
  * data, indistinguishable from a complete one.
  *
- * <p>So {@code _shards.total} and {@code _shards.searched} are always present, and a partial search
- * additionally sets {@code "complete": false}. A caller that ignores those is choosing to; a caller
- * that reads them cannot be misled.
+ * <p>So {@code _shards.total} and {@code _shards.successful} are always present, and a partial search
+ * additionally sets {@code "complete": false} — a field with no real-OpenSearch equivalent, because a
+ * classic coordinating node always fans out to every shard it can resolve and so never has this question
+ * to answer. A caller that ignores those is choosing to; a caller that reads them cannot be misled.
  */
 public final class SearchHandler extends BaseRestHandler {
 
@@ -540,13 +541,14 @@ public final class SearchHandler extends BaseRestHandler {
         org.opensearch.serverless.metadata.PointInTime pit,
         SearchSourceBuilder source
     ) throws IOException {
+        final long startNanos = System.nanoTime();
         final var outcome = gated(
             serving,
             java.util.List.of(pit.index()),
             source,
             () -> SearchFanout.runFrozen(serving, metadata, pit, source)
         );
-        render(channel, java.util.Map.of(pit.index(), pit.shards().size()), java.util.List.of(), outcome);
+        render(channel, java.util.Map.of(pit.index(), pit.shards().size()), java.util.List.of(), outcome, tookMillis(startNanos));
     }
 
     private void respond(
@@ -557,10 +559,24 @@ public final class SearchHandler extends BaseRestHandler {
         java.util.List<String> skipped,
         SearchSourceBuilder source
     ) throws IOException {
+        final long startNanos = System.nanoTime();
         // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
         // fan-out rather than going through ShardOperations, so the gate has to meet it where it works.
         final var outcome = gated(serving, indices.keySet(), source, () -> SearchFanout.run(serving, metadata, indices, source));
-        render(channel, indices, skipped, outcome);
+        render(channel, indices, skipped, outcome, tookMillis(startNanos));
+    }
+
+    /**
+     * Wall-clock elapsed since a search began, for the {@code took} field real OpenSearch always reports.
+     *
+     * <p>Measured around the fan-out only — parsing and validating the request happens before this is
+     * called, the same boundary a classic node's own {@code took} is measured from.
+     *
+     * @param startNanos {@link System#nanoTime()} at the moment the fan-out began
+     * @return elapsed milliseconds
+     */
+    private static long tookMillis(long startNanos) {
+        return java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
     }
 
     /**
@@ -574,24 +590,39 @@ public final class SearchHandler extends BaseRestHandler {
         org.opensearch.rest.RestChannel channel,
         java.util.Map<String, Integer> indices,
         java.util.List<String> skipped,
-        org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome
+        org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome,
+        long tookMillis
     ) throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
+            builder.field("took", tookMillis);
+            // Always false: nothing on this path enforces a search timeout, so there is nothing that could
+            // make this true yet. Stated rather than omitted, because a caller checking this field before
+            // trusting a result must see an honest answer, not an absent key that happens to read as falsy.
+            builder.field("timed_out", false);
             builder.startObject("_shards");
             builder.field("total", outcome.shards());
-            builder.field("searched", outcome.answered());
-            builder.field("unreachable", outcome.shards() - outcome.answered());
+            // successful/failed, real OpenSearch's own field names -- searched/unreachable were this
+            // shell's own names for the identical count and are gone now, not aliased: a client reading
+            // the real names must get real values, not a second, shell-specific spelling to maintain.
+            builder.field("successful", outcome.answered());
+            builder.field("skipped", 0);
+            builder.field("failed", outcome.shards() - outcome.answered());
             builder.endObject();
             // Stated, not implied. A caller reading only "total" would otherwise have no way to tell a
-            // complete answer from one computed over a fraction of the index.
+            // complete answer from one computed over a fraction of the index. No real-OpenSearch field
+            // says this; a coordinating node there always fans out to every shard it can resolve, so
+            // "how much of the index answered" is not a question a classic search ever has to answer.
             builder.field("complete", outcome.complete());
             if (skipped.isEmpty() == false) {
-                // Named, not merely counted. A caller who asked to ignore what is missing still has to be
-                // able to tell which of their indices this answer does not cover -- otherwise the flag
-                // turns a visible absence into an invisible one, which is worse than the refusal it
+                // Named, not merely counted -- _shards.skipped above is real OpenSearch's count (always 0
+                // here, since nothing on this path skips a shard the way a throttled search can there);
+                // this is a shell-specific list of index *names* dropped by ignore_unavailable, which has
+                // no real-OpenSearch equivalent at all. A caller who asked to ignore what is missing still
+                // has to be able to tell which of their indices this answer does not cover -- otherwise the
+                // flag turns a visible absence into an invisible one, which is worse than the refusal it
                 // replaced.
-                builder.startArray("skipped");
+                builder.startArray("skipped_indices");
                 for (String name : skipped) {
                     builder.value(name);
                 }
@@ -600,7 +631,21 @@ public final class SearchHandler extends BaseRestHandler {
             builder.startObject("hits");
             builder.startObject("total");
             builder.field("value", outcome.total());
+            // Always "eq": trackTotalHits(true) is forced on every search this handler runs (see the
+            // request-parsing side), so "value" is never a lower bound and "relation" never needs to say
+            // otherwise -- unlike real OpenSearch, which reports "gte" once a search stops counting past a
+            // configured ceiling. Nothing here has that ceiling yet, so "eq" is the honest constant.
+            builder.field("relation", "eq");
             builder.endObject();
+            float maxScore = Float.NaN;
+            for (SearchHit hit : outcome.hits()) {
+                if (Float.isNaN(hit.getScore()) == false && (Float.isNaN(maxScore) || hit.getScore() > maxScore)) {
+                    maxScore = hit.getScore();
+                }
+            }
+            if (Float.isNaN(maxScore) == false) {
+                builder.field("max_score", maxScore);
+            }
             builder.startArray("hits");
             for (SearchHit hit : outcome.hits()) {
                 builder.startObject();

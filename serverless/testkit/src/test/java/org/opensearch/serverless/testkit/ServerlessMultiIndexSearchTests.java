@@ -318,7 +318,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
             final Response afterDelete = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match\":{\"msg\":\"shared\"}}}");
             assertEquals("a pattern must survive a deleted index: " + afterDelete.body(), 200, afterDelete.status());
             assertEquals("and search only what is left: " + afterDelete.body(), 1, shardTotal(afterDelete.body()));
-            assertFalse("with nothing reported as skipped: " + afterDelete.body(), afterDelete.body().contains("\"skipped\""));
+            assertFalse("with nothing reported as skipped: " + afterDelete.body(), afterDelete.body().contains("\"skipped_indices\""));
 
             // And with a tombstone still in place -- the window between the swap and the removal, which a
             // failed removal makes permanent.
@@ -388,10 +388,14 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
             assertEquals(ignored.body(), 200, ignored.status());
             assertTrue("the index that exists is searched: " + ignored.body(), ignored.body().contains("\"value\":1"));
             assertEquals("and only its shards are counted: " + ignored.body(), 1, shardTotal(ignored.body()));
-            assertTrue("and the one that does not is named: " + ignored.body(), ignored.body().contains("\"skipped\":[\"yesterday\"]"));
+            assertTrue(
+                "and the one that does not is named: " + ignored.body(),
+                ignored.body().contains("\"skipped_indices\":[\"yesterday\"]")
+            );
 
-            // Nothing skipped, nothing said. A field that appeared on every answer would be noise.
-            assertFalse(send(node, "POST", "/today/_search", "{\"query\":{\"match_all\":{}}}").body().contains("skipped"));
+            // Nothing skipped, nothing said -- "skipped_indices" is the shell-specific list of names, not
+            // real OpenSearch's own "_shards.skipped" count, which is always present (and 0 here).
+            assertFalse(send(node, "POST", "/today/_search", "{\"query\":{\"match_all\":{}}}").body().contains("skipped_indices"));
 
             // And the flag does not extend to "none of them exist": the caller allowed for a gap, not for
             // the whole thing to be missing, and an empty answer over nothing is indistinguishable from an

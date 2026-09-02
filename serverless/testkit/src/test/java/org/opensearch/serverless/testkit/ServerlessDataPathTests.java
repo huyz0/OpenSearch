@@ -150,7 +150,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             final Response partial = send(http, "GET", "/wide/_search?q=msg:anything", null);
             assertEquals(200, partial.status());
             assertTrue("coverage must be reported: " + partial.body(), partial.body().contains("\"total\":3"));
-            assertTrue("coverage must be reported: " + partial.body(), partial.body().contains("\"searched\":1"));
+            assertTrue("coverage must be reported: " + partial.body(), partial.body().contains("\"successful\":1"));
             assertTrue("a partial search must not look complete: " + partial.body(), partial.body().contains("\"complete\":false"));
         }
     }
@@ -252,7 +252,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             for (TransportAddress http : new TransportAddress[] { aHttp, bHttp }) {
                 final Response found = send(http, "GET", "/split/_search?q=msg:fanout&size=20", null);
                 assertEquals(200, found.status());
-                assertTrue("fan-out did not cover both shards: " + found.body(), found.body().contains("\"searched\":2"));
+                assertTrue("fan-out did not cover both shards: " + found.body(), found.body().contains("\"successful\":2"));
                 assertTrue("a fully-covered search must say so: " + found.body(), found.body().contains("\"complete\":true"));
                 assertTrue("documents were lost across the fan-out: " + found.body(), found.body().contains("\"value\":10"));
             }

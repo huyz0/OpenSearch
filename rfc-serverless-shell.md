@@ -374,6 +374,17 @@ empty answer. This is not a drop-in replacement for existing OpenSearch clients,
 a target — if either becomes one later, it arrives as demand-driven additions to the allowlist, not as
 a change of posture.
 
+**What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
+a real audit (reading actual handler source, not assuming from names) found a mix of two very different
+things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for
+(conditional writes, non-prefix wildcards, a cluster-wide surface — each needs a real feature this
+architecture does not have), and shell-specific inventions with no reason to differ at all — `_shards`
+field names, a bare-string error where every uncaught exception on the same surface already rendered the
+real object, a missing `took`. The second kind cost nothing architecturally to fix and is fixed
+([`m47-api-compatibility-notes.md`](m47-api-compatibility-notes.md)); the first kind is untouched, because
+closing it for real (a version model behind `_seq_no`, a settings service behind the classic index-create
+envelope) is a real feature with its own scope, not a response-shape change.
+
 ## 7. Module layout
 
 ```

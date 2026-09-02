@@ -148,6 +148,11 @@ public final class IndexAdminHandler extends BaseRestHandler {
                         try (XContentBuilder builder = channel.newBuilder()) {
                             builder.startObject();
                             builder.field("acknowledged", true);
+                            // Real OpenSearch's own second flag, distinguishing "the descriptor exists" from
+                            // "every shard is allocated and ready." Nothing here is ever the second without
+                            // the first: creation is one put-if-absent, not a routing decision that can lag
+                            // it, so the two are always true together.
+                            builder.field("shards_acknowledged", true);
                             builder.field("index", index);
                             builder.field("shards", shards);
                             builder.endObject();
@@ -219,12 +224,41 @@ public final class IndexAdminHandler extends BaseRestHandler {
         }
     }
 
+    /**
+     * Renders a deliberate refusal in real OpenSearch's own error shape.
+     *
+     * <p><b>{@code error} is an object here, not a bare string, and that is not cosmetic.</b> Every
+     * uncaught exception on this surface already renders correctly — {@code new BytesRestResponse(channel,
+     * e)} is core's own {@code OpenSearchException} renderer, and it has always produced
+     * {@code {"error": {"root_cause": [...], "type": ..., "reason": ...}, "status": N}}. This helper is
+     * what every <em>deliberate</em> refusal on this surface goes through instead — the 501s, the 400s,
+     * the conditional-write and wildcard-pattern refusals — and until now it rendered {@code "error"} as a
+     * plain string. Any client that parses an error structurally rather than only checking the HTTP status
+     * broke on precisely the responses that were trying hardest to explain themselves. This makes the two
+     * paths render the same shape, because a caller should not be able to tell "the shell refused this on
+     * purpose" from "something threw" by the error envelope's own shape.
+     *
+     * @param channel the channel to build a response for
+     * @param status the HTTP status
+     * @param type the error type, e.g. {@code "index_not_found"}
+     * @param reason a human-readable explanation
+     * @return the rendered response
+     * @throws IOException if building the response fails
+     */
     static BytesRestResponse error(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason)
         throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
-            builder.field("error", type);
+            builder.startObject("error");
+            builder.startArray("root_cause");
+            builder.startObject();
+            builder.field("type", type);
             builder.field("reason", reason);
+            builder.endObject();
+            builder.endArray();
+            builder.field("type", type);
+            builder.field("reason", reason);
+            builder.endObject();
             builder.field("status", status.getStatus());
             builder.endObject();
             return new BytesRestResponse(status, builder);

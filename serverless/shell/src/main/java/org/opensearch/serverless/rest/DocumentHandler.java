@@ -330,6 +330,13 @@ public final class DocumentHandler extends BaseRestHandler {
                 builder.field("_id", id);
                 builder.field("_shard", shard);
                 builder.field("result", deletion ? (found ? "deleted" : "not_found") : "created");
+                // One shard, always: this write touched exactly the one it was routed to. Real OpenSearch's
+                // field, added for a client that reads it rather than only checking the HTTP status.
+                builder.startObject("_shards");
+                builder.field("total", 1);
+                builder.field("successful", 1);
+                builder.field("failed", 0);
+                builder.endObject();
                 // Says what was actually guaranteed. "created" alone would leave a reader to assume the
                 // usual meaning; here the write is in the log before this response exists, and the
                 // segment it will live in may not be published yet.

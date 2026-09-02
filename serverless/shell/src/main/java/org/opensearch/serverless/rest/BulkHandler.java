@@ -406,6 +406,11 @@ public final class BulkHandler extends BaseRestHandler {
                 } else {
                     builder.field("status", item.status.getStatus());
                     builder.field("result", item.result);
+                    builder.startObject("_shards");
+                    builder.field("total", 1);
+                    builder.field("successful", 1);
+                    builder.field("failed", 0);
+                    builder.endObject();
                     builder.field("_node", item.nodeId);
                     // The same promise the single-document path makes, and the reason bulk did not have
                     // to weaken it: the whole batch is in the log before any of this response exists.

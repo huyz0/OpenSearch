@@ -77,7 +77,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         if (request.method() == RestRequest.Method.GET) {
             return channel -> {
                 final var current = metadata.clusterConfig().read();
-                respond(channel, current.settings());
+                respond(channel, current.settings(), false);
             };
         }
 
@@ -131,7 +131,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             try {
                 final Settings written = gated(serving, () -> metadata.clusterConfig().update(flat));
-                respond(channel, written);
+                respond(channel, written, true);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -155,9 +155,14 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
             );
     }
 
-    private void respond(org.opensearch.rest.RestChannel channel, Settings settings) throws IOException {
+    private void respond(org.opensearch.rest.RestChannel channel, Settings settings, boolean acknowledged) throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
+            // Only on the write path -- real OpenSearch's own GET has no such field, and a caller reading
+            // it there would find nothing rather than a stale or invented value.
+            if (acknowledged) {
+                builder.field("acknowledged", true);
+            }
             builder.startObject("persistent");
             settings.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
             builder.endObject();

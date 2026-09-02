@@ -208,10 +208,20 @@ These are decisions, not gaps. Each answers 501 with a reason.
   running this build. Pre-release.
 - The authentication plugin authenticates and ships no policy beyond one rule: only the configured account
   may manage accounts. It is one `if`, and is named as one.
+- **Response shapes match real OpenSearch wherever matching costs nothing architecturally** (M47) — field
+  names, envelopes, defaults that were shell-specific inventions with no reason to differ. Every deliberate
+  refusal, not just uncaught exceptions, now renders the real `{"error": {"root_cause": [...], "type": ...,
+  "reason": ...}}` object; search responses carry `took`, `timed_out`, real `_shards` field names,
+  `hits.total.relation`; writes carry `_shards`; index creation carries `shards_acknowledged`. What did
+  **not** change: the endpoints and request shapes D2 and §6.3 refuse on purpose — conditional writes (no
+  version model), non-prefix wildcards (no listing on a request path), a cluster-wide surface (no
+  cluster-wide state) — and `_version`/`_seq_no`/`_primary_term` and "created vs. updated," both deferred
+  because closing them needs a real feature (a version model), not a response-shape change. See
+  [`m47-api-compatibility-notes.md`](m47-api-compatibility-notes.md).
 
 ## How it is tested
 
-411 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+417 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

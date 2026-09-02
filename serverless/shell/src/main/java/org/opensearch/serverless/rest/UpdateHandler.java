@@ -185,6 +185,11 @@ public final class UpdateHandler extends BaseRestHandler {
             builder.field("_index", index);
             builder.field("_id", id);
             builder.field("result", outcome.result());
+            builder.startObject("_shards");
+            builder.field("total", 1);
+            builder.field("successful", 1);
+            builder.field("failed", 0);
+            builder.endObject();
             builder.field("_node", outcome.servedBy());
             builder.endObject();
             // 200 for all three results, matching classic OpenSearch: created, updated and noop are all a

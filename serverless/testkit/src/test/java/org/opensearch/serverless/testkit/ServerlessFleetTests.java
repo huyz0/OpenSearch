@@ -282,7 +282,7 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
             } else {
                 assertTrue(
                     "an incomplete answer must report which shards it could not reach: " + found.body(),
-                    found.body().contains("\"unreachable\"") && found.body().contains("\"searched\"")
+                    found.body().contains("\"failed\"") && found.body().contains("\"successful\"")
                 );
                 assertTrue("and it must be missing something, or 'incomplete' is a lie too", hits < expected);
             }
