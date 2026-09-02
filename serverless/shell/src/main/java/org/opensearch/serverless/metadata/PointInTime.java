@@ -11,6 +11,8 @@ package org.opensearch.serverless.metadata;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -241,6 +243,48 @@ public final class PointInTime {
             referenced.add(file.getValue() + "/" + file.getKey());
         }
         return referenced;
+    }
+
+    /**
+     * Reads a view off the transport wire.
+     *
+     * <p>Carries the whole view, every shard's manifest included, rather than a reduced form with just the
+     * shard being asked for. {@link org.opensearch.serverless.shell.ServerlessNode#openFrozenView} needs
+     * every shard's term to build the view's {@code IndexMetadata} even when opening one shard of it — see
+     * that method for why — and sending the full view lets the node this is forwarded to call the exact
+     * method the coordinating node would have called locally, rather than a second implementation that
+     * could drift from it.
+     *
+     * @param in the stream
+     * @throws IOException if reading fails
+     */
+    public PointInTime(StreamInput in) throws IOException {
+        this.id = in.readString();
+        this.index = in.readString();
+        this.expiresAtMillis = in.readVLong();
+        final int count = in.readVInt();
+        final Map<Integer, CommitManifest> read = new LinkedHashMap<>(count);
+        for (int i = 0; i < count; i++) {
+            read.put(in.readVInt(), new CommitManifest(in));
+        }
+        this.shards = Map.copyOf(read);
+    }
+
+    /**
+     * Writes this view to the transport wire.
+     *
+     * @param out the stream
+     * @throws IOException if writing fails
+     */
+    public void writeTo(StreamOutput out) throws IOException {
+        out.writeString(id);
+        out.writeString(index);
+        out.writeVLong(expiresAtMillis);
+        out.writeVInt(shards.size());
+        for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
+            out.writeVInt(shard.getKey());
+            shard.getValue().writeTo(out);
+        }
     }
 
     @Override

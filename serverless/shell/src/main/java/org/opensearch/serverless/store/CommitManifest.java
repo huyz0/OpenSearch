@@ -11,6 +11,8 @@ package org.opensearch.serverless.store;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -158,6 +160,44 @@ public final class CommitManifest {
                 throw new IOException("malformed commit manifest: no term");
             }
             return new CommitManifest(term, files, writer);
+        }
+    }
+
+    /**
+     * Reads a manifest off the transport wire.
+     *
+     * <p>A second, binary encoding beside {@link #toBytes()}'s JSON. The register format is JSON because a
+     * register is read by hand sometimes and JSON survives an OpenSearch version change better than a
+     * stream version does; the wire format exists only for {@link org.opensearch.serverless.transport}, to
+     * carry a manifest to the node a frozen search is forwarded to, where neither concern applies.
+     *
+     * @param in the stream
+     * @throws IOException if reading fails
+     */
+    public CommitManifest(StreamInput in) throws IOException {
+        this.term = in.readVLong();
+        this.writer = in.readOptionalString();
+        final int count = in.readVInt();
+        final Map<String, String> read = new LinkedHashMap<>(count);
+        for (int i = 0; i < count; i++) {
+            read.put(in.readString(), in.readString());
+        }
+        this.files = Map.copyOf(read);
+    }
+
+    /**
+     * Writes this manifest to the transport wire.
+     *
+     * @param out the stream
+     * @throws IOException if writing fails
+     */
+    public void writeTo(StreamOutput out) throws IOException {
+        out.writeVLong(term);
+        out.writeOptionalString(writer);
+        out.writeVInt(files.size());
+        for (Map.Entry<String, String> file : files.entrySet()) {
+            out.writeString(file.getKey());
+            out.writeString(file.getValue());
         }
     }
 

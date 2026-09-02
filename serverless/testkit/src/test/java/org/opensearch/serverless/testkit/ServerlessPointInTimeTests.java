@@ -11,7 +11,9 @@ package org.opensearch.serverless.testkit;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.cluster.ReaderPlacement;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.GarbageCollector;
@@ -57,6 +59,18 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            .build();
+    }
+
+    private Settings searchNodeSettings(String name) {
+        return Settings.builder()
+            .put("node.name", name)
+            .put("cluster.name", "serverless-pit")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", "search")
             .build();
     }
 
@@ -329,6 +343,180 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         assertEquals(plausible, live.get(0).id());
     }
 
+    /**
+     * A frozen search is forwarded to the placement-preferred node rather than opened by whichever node
+     * happens to coordinate it.
+     *
+     * <p>Every shard of a view used to be opened unconditionally on the coordinating node -- so a caller
+     * whose paged requests land on different nodes (any load balancer with no session affinity) paid the
+     * view's whole cost twice. This is the property that stops that: the node that does not hold the view
+     * yet must ask the placement-preferred peer for it, not open it itself.
+     */
+    public void testAFrozenSearchIsForwardedToThePlacementPreferredNode() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("routed", "uuid-routed-00000000", 1, MAPPING, null));
+
+        final String pit;
+        try (ServerlessNode writer = new ServerlessNode(nodeSettings("pit-route-w"))) {
+            writer.start();
+            writer.setMetadataPlane(plane);
+            final BackgroundReconciler loop = hold(writer, plane, clock, "routed", 1);
+            assertEquals(201, send(writer, "PUT", "/routed/_doc/1?refresh=true", body(1)).status());
+            loop.tick(clock.get());
+            pit = field(send(writer, "POST", "/routed/_pit?keep_alive=10m", null).body(), "pit_id");
+        }
+        // The writer that froze the view is gone. A view has no owner, only a record in the object store,
+        // so what follows must work from that alone.
+
+        try (
+            ServerlessNode a = new ServerlessNode(searchNodeSettings("pit-route-a"));
+            ServerlessNode b = new ServerlessNode(searchNodeSettings("pit-route-b"))
+        ) {
+            a.start();
+            a.setMetadataPlane(plane);
+            b.start();
+            b.setMetadataPlane(plane);
+            a.heartbeat(plane);
+            b.heartbeat(plane);
+
+            final var members = plane.membership().refresh();
+            final var preferred = ReaderPlacement.candidatesFor("routed", 0, members, ServerlessNode.ROLE_SEARCH, 1);
+            assertEquals("both nodes advertise search, so there must be a top candidate", 1, preferred.size());
+            final ServerlessNode winner = preferred.get(0).equals(a.localNode().getId()) ? a : b;
+            final ServerlessNode loser = winner == a ? b : a;
+
+            final Response found = send(
+                loser.boundHttpAddress().publishAddress(),
+                "POST",
+                "/routed/_search?pit=" + pit,
+                "{\"query\":{\"match_all\":{}}}"
+            );
+            assertEquals(found.body(), 200, found.status());
+            assertTrue("the forwarded search must still find the frozen document: " + found.body(), found.body().contains("\"value\":1"));
+
+            assertEquals("the placement-preferred node must have opened the view", 1, winner.reconciler().frozenShards().size());
+            assertEquals("the coordinator must not also have opened it locally", 0, loser.reconciler().frozenShards().size());
+        }
+    }
+
+    /**
+     * A forwarded frozen search still reads the frozen commit over the wire, not whatever is live on the
+     * node it lands on.
+     *
+     * <p>The property the whole feature exists not to break: forwarding is new, "the view sees only what
+     * it froze" is not, and the two must still hold together. A bug that wired the forwarded handler to
+     * open the current commit rather than the one the view named would pass every other test here and
+     * only show up as a write from after the freeze leaking into a page that must not contain it.
+     */
+    public void testAForwardedFrozenSearchStillSeesTheFrozenCommitNotLiveWrites() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("stale", "uuid-stale-000000000", 1, MAPPING, null));
+
+        final String pit;
+        try (ServerlessNode writer = new ServerlessNode(nodeSettings("pit-hop-w"))) {
+            writer.start();
+            writer.setMetadataPlane(plane);
+            final BackgroundReconciler loop = hold(writer, plane, clock, "stale", 1);
+            assertEquals(201, send(writer, "PUT", "/stale/_doc/1?refresh=true", body(1)).status());
+            loop.tick(clock.get());
+            pit = field(send(writer, "POST", "/stale/_pit?keep_alive=10m", null).body(), "pit_id");
+
+            // Written and published after the freeze -- a forwarded search must not see this either.
+            assertEquals(201, send(writer, "PUT", "/stale/_doc/2?refresh=true", body(2)).status());
+            loop.tick(clock.get() + 1);
+        }
+
+        try (
+            ServerlessNode a = new ServerlessNode(searchNodeSettings("pit-hop-a"));
+            ServerlessNode b = new ServerlessNode(searchNodeSettings("pit-hop-b"))
+        ) {
+            a.start();
+            a.setMetadataPlane(plane);
+            b.start();
+            b.setMetadataPlane(plane);
+            a.heartbeat(plane);
+            b.heartbeat(plane);
+
+            final var members = plane.membership().refresh();
+            final var preferred = ReaderPlacement.candidatesFor("stale", 0, members, ServerlessNode.ROLE_SEARCH, 1);
+            final ServerlessNode loser = preferred.get(0).equals(a.localNode().getId()) ? b : a;
+
+            final Response found = send(
+                loser.boundHttpAddress().publishAddress(),
+                "POST",
+                "/stale/_search?pit=" + pit,
+                "{\"size\":20,\"query\":{\"match_all\":{}}}"
+            );
+            assertEquals(found.body(), 200, found.status());
+            assertTrue(
+                "the forwarded search must see only the frozen commit, not the write made after it: " + found.body(),
+                found.body().contains("\"value\":1")
+            );
+        }
+    }
+
+    /**
+     * A dead placement-preferred candidate costs a fallback, not a failed search.
+     *
+     * <p>Placement is a hint read from a lease that can go stale between renewals -- a node can advertise
+     * search and be gone a moment later, with its record not yet expired. Correctness cannot depend on
+     * that record being current, so the coordinator must fall through to opening the view itself rather
+     * than reporting the search as unanswerable.
+     */
+    public void testAFrozenSearchFallsBackToTheCoordinatorWhenThePreferredNodeIsUnreachable() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("orphaned", "uuid-orphaned-0000000", 1, MAPPING, null));
+
+        final String pit;
+        try (ServerlessNode writer = new ServerlessNode(nodeSettings("pit-fallback-w"))) {
+            writer.start();
+            writer.setMetadataPlane(plane);
+            final BackgroundReconciler loop = hold(writer, plane, clock, "orphaned", 1);
+            assertEquals(201, send(writer, "PUT", "/orphaned/_doc/1?refresh=true", body(1)).status());
+            loop.tick(clock.get());
+            pit = field(send(writer, "POST", "/orphaned/_pit?keep_alive=10m", null).body(), "pit_id");
+        }
+
+        try (
+            ServerlessNode a = new ServerlessNode(searchNodeSettings("pit-fallback-a"));
+            ServerlessNode b = new ServerlessNode(searchNodeSettings("pit-fallback-b"))
+        ) {
+            a.start();
+            a.setMetadataPlane(plane);
+            b.start();
+            b.setMetadataPlane(plane);
+            a.heartbeat(plane);
+            b.heartbeat(plane);
+
+            final var members = plane.membership().refresh();
+            final var ranked = ReaderPlacement.candidatesFor("orphaned", 0, members, ServerlessNode.ROLE_SEARCH, 2);
+            final ServerlessNode preferred = ranked.get(0).equals(a.localNode().getId()) ? a : b;
+            final ServerlessNode survivor = preferred == a ? b : a;
+
+            // The preferred candidate dies with its lease still live and not yet expired -- advertised but
+            // unreachable, the exact case placement being a hint has to survive. try-with-resources closes
+            // it a second time on the way out; ServerlessNode#close is written to tolerate that.
+            preferred.close();
+
+            final Response found = send(
+                survivor.boundHttpAddress().publishAddress(),
+                "POST",
+                "/orphaned/_search?pit=" + pit,
+                "{\"query\":{\"match_all\":{}}}"
+            );
+            assertEquals("a dead preferred candidate must not turn into a failed search: " + found.body(), 200, found.status());
+            assertTrue("the frozen document must still be found: " + found.body(), found.body().contains("\"value\":1"));
+            assertEquals(
+                "the survivor must have fallen back to opening the view itself",
+                1,
+                survivor.reconciler().frozenShards().size()
+            );
+        }
+    }
+
     private BackgroundReconciler hold(ServerlessNode node, MetadataPlane plane, AtomicLong clock, String index, int shards)
         throws Exception {
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
@@ -364,7 +552,11 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
     }
 
     private static Response send(ServerlessNode node, String method, String path, String body) throws Exception {
-        final var address = node.boundHttpAddress().publishAddress();
+        return send(node.boundHttpAddress().publishAddress(), method, path, body);
+    }
+
+    /** For a request that must land on a specific node in a multi-node test, not whichever coordinates. */
+    private static Response send(TransportAddress address, String method, String path, String body) throws Exception {
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
             final HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + path))

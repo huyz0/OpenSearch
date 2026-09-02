@@ -77,10 +77,19 @@ public final class SearchFanout {
     /**
      * Runs one search over a frozen view rather than over whatever the shards hold now.
      *
-     * <p>Every shard is opened here, on this node, at the commit the view froze — none of it is forwarded.
-     * Forwarding would mean asking the shard's owner, and the owner answers from its live engine, which is
-     * the one thing a frozen view exists not to read. It costs this node the work of opening the commits;
-     * what it buys is that page two of a paged search sees what page one saw.
+     * <p><b>Fans out by placement now, the same as a live search.</b> Every shard used to be opened
+     * unconditionally on the coordinating node, which meant a wide view's whole cost -- heap, file
+     * descriptors, the shard cap itself -- landed on whichever node happened to answer the HTTP request,
+     * and a second coordinator (the next page, on a load balancer with no session affinity) paid it again
+     * from nothing. This now tries the shard locally, then the {@link org.opensearch.serverless.cluster
+     * .ReaderPlacement}-preferred peer over the wire, and only opens it here itself if neither answers --
+     * the identical hint-with-fallback shape {@link #askOneShard} already uses for a live shard, keyed the
+     * same way (by index and shard number) so a view's placement tends to agree with its live shard's,
+     * where whatever segment files the two share are more likely already cached.
+     *
+     * <p>Nothing here is required to be right. A stale or unlucky placement decision costs a network hop
+     * or a cold open, never a wrong or missing answer -- the same promise {@code ReaderPlacement}'s own
+     * javadoc makes, extended to this path rather than reinvented for it.
      *
      * @param serving the node coordinating the search
      * @param metadata the metadata plane
@@ -109,9 +118,7 @@ public final class SearchFanout {
         for (Integer shard : pit.shards().keySet()) {
             tasks.add(() -> {
                 try {
-                    final var shardId = serving.openFrozenView(metadata, pit, shard);
-                    final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard);
-                    return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+                    return askOneFrozenShard(serving, metadata, pit, shard, perShard);
                 } catch (Exception e) {
                     firstFailure.compareAndSet(null, e);
                     throw e;
@@ -461,6 +468,88 @@ public final class SearchFanout {
             .openShards()
             .stream()
             .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
+            .findFirst()
+            .orElse(null);
+    }
+
+    /**
+     * Answers for exactly one shard of a frozen view, wherever it ends up being opened.
+     *
+     * <p>{@link #askOneShard}'s shape, not a fresh design: serve it here if this node already holds this
+     * view's shard, otherwise pick a reader by {@code ReaderPlacement} and forward, otherwise open it here
+     * as the fallback that guarantees the search still completes. The one real difference is what "here"
+     * means when every placement candidate is unreachable -- a live shard falls back to its owner, the
+     * writer; a view has no owner, only whoever has already opened it, so the fallback is the coordinator
+     * opening it itself -- the same thing every call used to do unconditionally before this existed.
+     *
+     * @param serving the node coordinating the search
+     * @param metadata the metadata plane
+     * @param pit the frozen view
+     * @param shard the shard number
+     * @param perShard the query, sized to cover the whole window on its own
+     * @return what the shard answered
+     * @throws Exception if the shard could not be opened anywhere, local fallback included
+     */
+    private static ShardAnswer askOneFrozenShard(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        org.opensearch.serverless.metadata.PointInTime pit,
+        int shard,
+        SearchSourceBuilder perShard
+    ) throws Exception {
+        final ShardId local = localFrozenView(serving, pit, shard);
+        if (local != null) {
+            final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard);
+            return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+        }
+        // Keyed by the view's underlying index and shard, the same key live placement uses -- not by the
+        // view id -- so a view's placement agrees with its live shard's where a node is likely to already
+        // hold cached blobs for it, rather than scattering every distinct view of one index at random.
+        final List<String> targets = org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+            pit.index(),
+            shard,
+            metadata.membership().current(),
+            ServerlessNode.ROLE_SEARCH,
+            2
+        );
+        for (String target : targets) {
+            try {
+                if (serving.localNode().getId().equals(target)) {
+                    // We are the placement for this shard but had not opened it yet. Open it here rather
+                    // than forwarding to ourselves over the network.
+                    final var shardId = serving.openFrozenView(metadata, pit, shard);
+                    final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard);
+                    return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+                }
+                final var peer = serving.router().peer(target, serving.router().searchForwardTimeout());
+                if (peer.isEmpty()) {
+                    continue;
+                }
+                final var answer = serving.router()
+                    .forwardFrozenSearch(
+                        peer.get(),
+                        new org.opensearch.serverless.transport.ForwardedFrozenSearchRequest(pit, shard, perShard)
+                    );
+                return new ShardAnswer(answer.total(), answer.hits(), answer.aggregations());
+            } catch (Exception e) {
+                // Try the next candidate, same as the live path: a shard that failed to answer is not a
+                // shard with no matches, so it only counts as searched once one candidate has succeeded.
+                LOG.warn("shard " + shard + " of the point in time " + pit.id() + " was not served by " + target, e);
+            }
+        }
+        // No candidate answered -- empty membership, everyone unreachable, or this node holds no search
+        // role at all. Open it here: the unconditional fallback every call used before placement existed,
+        // so a stale or unlucky routing decision costs this node a cold open and never a wrong answer.
+        final var shardId = serving.openFrozenView(metadata, pit, shard);
+        final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard);
+        return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+    }
+
+    private static ShardId localFrozenView(ServerlessNode serving, org.opensearch.serverless.metadata.PointInTime pit, int shard) {
+        return serving.reconciler()
+            .frozenShards()
+            .stream()
+            .filter(s -> s.getIndex().getUUID().equals(pit.id()) && s.id() == shard)
             .findFirst()
             .orElse(null);
     }

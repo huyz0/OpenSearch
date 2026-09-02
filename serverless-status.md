@@ -39,7 +39,10 @@ search quoting it reads that commit however far the writer has moved on, which i
 `search_after` return a consistent result set rather than a moving one. The garbage collector treats a
 live view's blobs as referenced — without that the sweep would collect a caller's commit halfway through
 their paging. The keep-alive is absolute rather than sliding, and a released or expired view answers 404
-rather than emptily.
+rather than emptily. A search over a view fans out by the same **reader placement** a live search uses —
+the coordinating node tries the shard locally, then the placement-preferred peer over the wire, then opens
+it itself as the guaranteed fallback — rather than opening every shard unconditionally on whichever node
+happened to answer the request.
 
 **Aliases.** A name that stands for some indices, created in the same register namespace as an index
 descriptor — so an index and an alias cannot take the same name, and resolving a name is one read rather
@@ -142,8 +145,10 @@ These are decisions, not gaps. Each answers 501 with a reason.
   set by a plugin arrives on the far side, which is core's own mechanism and is tested.)
 - A plugin's action runs on the node the request reached: nothing forwards one, and no identity crosses a
   transport hop, so an action that must run somewhere particular cannot ask.
-- A point in time is node-local once opened: the record is in the object store and any node can serve it,
-  but two nodes serving one view open it twice. No slicing.
+- A point in time is still node-local once opened: the record is in the object store and any node can serve
+  it, but placement is only a hint, so two nodes can still each end up opening one view under an unlucky or
+  stale routing decision — narrowed, not closed, by giving frozen search the same placement a live search
+  already had. No slicing.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
   runs on every pass. A reader whose node cannot reach the object store for longer than the grace can lose
   the commit it is reading — it fails with an error rather than answering wrongly, but it is a real limit.
@@ -184,7 +189,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-395 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+398 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

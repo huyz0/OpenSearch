@@ -102,6 +102,12 @@ public final class ShardRouter {
             ForwardedSearchRequest::new,
             this::handleSearch
         );
+        transportService.registerRequestHandler(
+            ForwardedFrozenSearchRequest.ACTION,
+            ThreadPool.Names.SEARCH,
+            ForwardedFrozenSearchRequest::new,
+            this::handleFrozenSearch
+        );
     }
 
     private void handleIndex(ForwardedIndexRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
@@ -160,6 +166,17 @@ public final class ShardRouter {
             shardId = node.serveAsReader(plane.get(), request.index(), request.shard());
         }
         node.markUsed(shardId);
+        final ShardQuery.Result result = ShardQuery.execute(node.searchService(), shardId, request.source());
+        channel.sendResponse(new ForwardedSearchResponse(result.total(), result.hits(), result.aggregations()));
+    }
+
+    private void handleFrozenSearch(ForwardedFrozenSearchRequest request, TransportChannel channel, org.opensearch.tasks.Task task)
+        throws Exception {
+        // No "not held" refusal here, unlike handleIndex/handleGet: a view has no owner to be stale about,
+        // and openFrozenView is idempotent -- opening it here for the first time is exactly what placement
+        // being a hint means. plane.get() rather than the request: the view travelled the wire, but which
+        // object store to open its files from is this node's own configuration, never the sender's.
+        final ShardId shardId = node.openFrozenView(plane.get(), request.pit(), request.shard());
         final ShardQuery.Result result = ShardQuery.execute(node.searchService(), shardId, request.source());
         channel.sendResponse(new ForwardedSearchResponse(result.total(), result.hits(), result.aggregations()));
     }
@@ -336,6 +353,29 @@ public final class ShardRouter {
         transportService.sendRequest(
             peer,
             ForwardedSearchRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedSearchResponse::new)
+        );
+        return future.actionGet(timeout);
+    }
+
+    /**
+     * Sends a shard query against a frozen view to the node placement prefers and waits for the answer.
+     *
+     * <p>The search bound, same as {@link #forwardSearch} and for the same reason: a peer that is merely
+     * busy opening a wide view should cost latency, not coverage.
+     *
+     * @param peer the preferred node
+     * @param request the query
+     * @return that shard's answer
+     */
+    public ForwardedSearchResponse forwardFrozenSearch(DiscoveryNode peer, ForwardedFrozenSearchRequest request) {
+        final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
+        final TimeValue timeout = searchForwardTimeout();
+        transportService.sendRequest(
+            peer,
+            ForwardedFrozenSearchRequest.ACTION,
             request,
             TransportRequestOptions.builder().withTimeout(timeout).build(),
             new Handler<>(future, ForwardedSearchResponse::new)
