@@ -60,7 +60,11 @@ stored without checking it against Lucene's field types.
 
 **Scaling to zero and back.** A node takes a shard by compare-and-swap on a register, renews a lease,
 publishes commits to the object store, and releases shards that have gone idle. There is no cluster
-manager, no consensus process, and no cluster-wide state.
+manager, no consensus process, and no cluster-wide state. **What an open shard costs is measured**: ~67 KB
+of heap and 3 file descriptors for an open writer shard, ~50 KB for a reader (no translog, no indexing
+buffers) — flat per-shard across two independent 30-shard batches, not growing with how many are already
+open. Lighter than core's own measured 150,888 B for one *gated* (shard-closed) index, because this design
+carries no `ClusterState`/`IndexMetadata` graph behind an open shard at all.
 
 **Maintenance the deployment does for itself.** A reconcile pass lets go of readers whose commit has been
 superseded, so nothing serves a stale commit indefinitely; closes the shards it is holding for a view whose record has gone, every pass and
@@ -174,7 +178,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-387 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+390 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 
