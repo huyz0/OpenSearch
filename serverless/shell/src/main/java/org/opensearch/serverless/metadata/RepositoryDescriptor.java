@@ -18,33 +18,56 @@ import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /**
- * The truth record for one repository: a name, and nothing else.
+ * The truth record for one repository: a name, a {@code type}, and settings — the same three keys
+ * {@code PUT _snapshot/{repo}} accepts on real OpenSearch, kept for API compatibility even though only one
+ * of them changes behaviour here.
  *
  * <p><b>A repository here is a namespace, not a storage backend.</b> Classic OpenSearch's repository
  * abstraction exists to let a snapshot land on storage distinct from the cluster's own data — a different
  * bucket, a different provider, a different account. This shell has exactly one configured object store
  * (D3: one register implementation, not a pluggable set of backends), and a snapshot's data already lives
- * in it — the same store, the same durability, the same R11 conformance question. Registering a repository
- * records a name to snapshot under and nothing to configure, because there is nothing this deployment's
- * own {@code serverless.store.*} settings do not already fix. A caller asking for genuine cross-store
+ * in it — the same store, the same durability, the same R11 conformance question. {@code type} is accepted
+ * and stored for a client that sends it, but only the value meaning "this deployment's own store" is
+ * functional; a genuinely distinct backend is refused at the REST layer rather than silently ignored (see
+ * {@link org.opensearch.serverless.rest.RepositoryHandler}). A caller asking for real cross-store
  * durability wants object-store replication, not a second repository type here.
+ *
+ * <p><b>{@code settings.remote_store_index_shallow_copy}</b> is the one setting that does something: it
+ * chooses, for every snapshot later taken against this repository, whether capture is shallow (references
+ * the live shard's own blobs, free to take, depends on that shard's storage) or standard (copies blobs
+ * into the repository's own storage at capture time, costs the copy, depends on nothing else). The default
+ * is {@code false} — standard — matching real OpenSearch's own default for this setting.
  */
 public final class RepositoryDescriptor {
 
+    /** The only functional {@code type}: this deployment's own configured object store. */
+    public static final String TYPE_NATIVE = "fs";
+
+    /** The repository setting choosing shallow capture. Read once per repository, not per snapshot. */
+    public static final String SHALLOW_SETTING = "remote_store_index_shallow_copy";
+
     private final String name;
+    private final String type;
+    private final Map<String, Object> settings;
     private final long createdAtMillis;
 
     /**
      * Creates a descriptor.
      *
      * @param name the repository name
+     * @param type the repository type, as the client named it
+     * @param settings the repository settings, as the client sent them
      * @param createdAtMillis when it was registered, in the plane's clock
      */
-    public RepositoryDescriptor(String name, long createdAtMillis) {
+    public RepositoryDescriptor(String name, String type, Map<String, Object> settings, long createdAtMillis) {
         this.name = Objects.requireNonNull(name);
+        this.type = type == null ? TYPE_NATIVE : type;
+        this.settings = settings == null ? Map.of() : Map.copyOf(settings);
         this.createdAtMillis = createdAtMillis;
     }
 
@@ -55,6 +78,34 @@ public final class RepositoryDescriptor {
      */
     public String name() {
         return name;
+    }
+
+    /**
+     * Returns the repository type, as registered.
+     *
+     * @return the type
+     */
+    public String type() {
+        return type;
+    }
+
+    /**
+     * Returns the repository's settings, as registered.
+     *
+     * @return the settings
+     */
+    public Map<String, Object> settings() {
+        return settings;
+    }
+
+    /**
+     * Reports whether a snapshot taken against this repository, absent any other instruction, captures
+     * shallow rather than standard.
+     *
+     * @return true if {@link #SHALLOW_SETTING} is set and true
+     */
+    public boolean shallowByDefault() {
+        return Boolean.TRUE.equals(settings.get(SHALLOW_SETTING)) || "true".equals(String.valueOf(settings.get(SHALLOW_SETTING)));
     }
 
     /**
@@ -76,7 +127,13 @@ public final class RepositoryDescriptor {
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject();
             builder.field("name", name);
+            builder.field("type", type);
             builder.field("created_at", createdAtMillis);
+            builder.startObject("settings");
+            for (Map.Entry<String, Object> setting : settings.entrySet()) {
+                builder.field(setting.getKey(), String.valueOf(setting.getValue()));
+            }
+            builder.endObject();
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -100,12 +157,24 @@ public final class RepositoryDescriptor {
             if (name == null || createdAt == null) {
                 throw new IOException("malformed repository record: missing a required field");
             }
-            return new RepositoryDescriptor(name.toString(), Long.parseLong(String.valueOf(createdAt)));
+            final Object type = body.get("type");
+            final Map<String, Object> settings = new LinkedHashMap<>();
+            if (body.get("settings") instanceof Map<?, ?> settingsMap) {
+                for (Map.Entry<?, ?> entry : settingsMap.entrySet()) {
+                    settings.put(String.valueOf(entry.getKey()), entry.getValue());
+                }
+            }
+            return new RepositoryDescriptor(
+                name.toString(),
+                type == null ? null : type.toString(),
+                settings,
+                Long.parseLong(String.valueOf(createdAt))
+            );
         }
     }
 
     @Override
     public String toString() {
-        return "RepositoryDescriptor[" + name + "]";
+        return "RepositoryDescriptor[" + name + ", type=" + type + "]";
     }
 }

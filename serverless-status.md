@@ -63,17 +63,25 @@ stored without checking it against Lucene's field types.
 
 **Snapshot and restore.** `PUT /_snapshot/{repo}` registers a repository — a namespace within this
 deployment's own object store, not a distinct storage backend, because there is only one object store to
-put a snapshot in. `PUT /_snapshot/{repo}/{name}` (given an explicit `indices` list; this surface does not
-enumerate a deployment's population any more than `_search` across several indices does) captures each
-named index's currently published commits at no data-movement cost — a metadata write referencing blobs
-that already exist, the same shallow shape a point in time already has. Restoring is not free: shard
-storage is keyed by an index's own uuid, so `POST /_snapshot/{repo}/{name}/_restore` always creates a new
-index and copies the referenced blobs into its own storage, per index independently, so one name collision
-does not cost the others. The garbage collector protects a live snapshot's blobs the same way it protects a
-point in time's, keyed by uuid rather than name so an unrelated later index reusing a deleted one's name is
-never mistaken for what a snapshot actually captured. Classic OpenSearch's repository-plugin API surface
-(`RepositoriesService`) is untouched and still yields null to a plugin — this is a shell-native surface, not
-a workaround.
+put a snapshot in — upserting on a repeat call, matching real OpenSearch. `remote_store_index_shallow_copy`
+is a repository setting, not a per-snapshot choice, verified against real OpenSearch's own source: standard
+(the default, matching real OpenSearch's own default) copies each shard's blobs into the repository's own
+storage at capture time, real cost, in exchange for a snapshot whose lifecycle owes nothing to the index it
+was taken from; shallow references the live shard's own blobs, free to take, and depends on that shard's
+storage continuing to exist — the garbage collector and index deletion alike now protect a live shallow
+snapshot's blobs, keyed by uuid rather than name so an unrelated later index reusing a deleted one's name is
+never mistaken for what a snapshot actually captured. `PUT /_snapshot/{repo}/{name}` needs an explicit
+`indices` list (comma string or array) — this surface does not enumerate a deployment's population any more
+than `_search` across several indices does. Restoring always creates a new index, since shard storage is
+keyed by an index's own uuid; `rename_pattern`/`rename_replacement` is the real Java-regex mechanism, and a
+restore refuses the whole request rather than half of it if a target name collides. Every request and
+response shape — `GET /_snapshot` with no name, `wait_for_completion`, the `SnapshotInfo`/`RestoreInfo`
+envelopes — matches real OpenSearch's own `_snapshot` API; every operation is synchronous regardless of
+`wait_for_completion`, since there is no background task registry to run one against. Classic OpenSearch's
+repository-plugin API surface (`RepositoriesService`) is untouched and still yields null to a plugin — this
+is a shell-native surface, not a workaround. Not yet built: a repository genuinely on a distinct backend
+(S3 while the deployment runs on GCS, say) — shallow-vs-standard turned out orthogonal to that question and
+didn't require answering it.
 
 **Scaling to zero and back.** A node takes a shard by compare-and-swap on a register, renews a lease,
 publishes commits to the object store, and releases shards that have gone idle. There is no cluster
@@ -203,7 +211,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-406 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+411 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

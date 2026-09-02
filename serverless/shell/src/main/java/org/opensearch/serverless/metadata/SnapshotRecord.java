@@ -47,7 +47,10 @@ public final class SnapshotRecord {
 
     private final String repo;
     private final String name;
-    private final long createdAtMillis;
+    private final String uuid;
+    private final boolean shallow;
+    private final long startTimeMillis;
+    private final long endTimeMillis;
     private final Map<String, SnapshottedIndex> indices;
 
     /**
@@ -55,13 +58,31 @@ public final class SnapshotRecord {
      *
      * @param repo the repository it belongs to
      * @param name the snapshot's name within that repository
-     * @param createdAtMillis when it was taken, in the plane's clock
+     * @param uuid a fresh identifier, the way {@code SnapshotInfo#snapshotId} carries one on real
+     *     OpenSearch — this shell's snapshots are named uniquely per repository already, so nothing here
+     *     resolves by uuid; it exists so a response can carry one for a client that expects to see it
+     * @param shallow whether this snapshot referenced its shards' live blobs rather than copying them —
+     *     decided once, from the repository's {@link RepositoryDescriptor#shallowByDefault()} at the
+     *     moment this snapshot was taken, and fixed from then on regardless of later repository changes
+     * @param startTimeMillis when capture began, in the plane's clock
+     * @param endTimeMillis when capture finished
      * @param indices each captured index, by the name it had when the snapshot was taken
      */
-    public SnapshotRecord(String repo, String name, long createdAtMillis, Map<String, SnapshottedIndex> indices) {
+    public SnapshotRecord(
+        String repo,
+        String name,
+        String uuid,
+        boolean shallow,
+        long startTimeMillis,
+        long endTimeMillis,
+        Map<String, SnapshottedIndex> indices
+    ) {
         this.repo = repo;
         this.name = name;
-        this.createdAtMillis = createdAtMillis;
+        this.uuid = uuid;
+        this.shallow = shallow;
+        this.startTimeMillis = startTimeMillis;
+        this.endTimeMillis = endTimeMillis;
         this.indices = Map.copyOf(indices);
     }
 
@@ -144,12 +165,39 @@ public final class SnapshotRecord {
     }
 
     /**
-     * Returns when this snapshot was taken.
+     * Returns this snapshot's identifier.
      *
-     * @return the creation time, in the plane's clock
+     * @return the uuid
      */
-    public long createdAtMillis() {
-        return createdAtMillis;
+    public String uuid() {
+        return uuid;
+    }
+
+    /**
+     * Reports whether this snapshot referenced its shards' live blobs rather than copying them.
+     *
+     * @return true if shallow
+     */
+    public boolean shallow() {
+        return shallow;
+    }
+
+    /**
+     * Returns when this snapshot's capture began.
+     *
+     * @return the start time, in the plane's clock
+     */
+    public long startTimeMillis() {
+        return startTimeMillis;
+    }
+
+    /**
+     * Returns when this snapshot's capture finished.
+     *
+     * @return the end time, in the plane's clock
+     */
+    public long endTimeMillis() {
+        return endTimeMillis;
     }
 
     /**
@@ -180,11 +228,19 @@ public final class SnapshotRecord {
      * is), and a snapshot durable enough to outlive that reuse must not let a later index's shard be
      * mistaken for the one it actually captured.
      *
+     * <p><b>Always empty for a standard (non-shallow) snapshot.</b> Its bytes were copied into the
+     * repository's own storage at capture time ({@code RegisterMap#snapshotShardData}), not left where the
+     * live shard wrote them, so nothing about a live index's own path is ever referenced by one — there is
+     * nothing here for the garbage collector or index deletion to protect.
+     *
      * @param indexUuid the index's uuid
      * @param shard the shard number
      * @return the referenced blobs
      */
     public List<String> referencedBlobs(String indexUuid, int shard) {
+        if (shallow == false) {
+            return List.of();
+        }
         for (SnapshottedIndex captured : indices.values()) {
             if (captured.uuid().equals(indexUuid) == false) {
                 continue;
@@ -213,7 +269,10 @@ public final class SnapshotRecord {
             builder.startObject();
             builder.field("repo", repo);
             builder.field("name", name);
-            builder.field("created_at", createdAtMillis);
+            builder.field("uuid", uuid);
+            builder.field("shallow", shallow);
+            builder.field("start_time_in_millis", startTimeMillis);
+            builder.field("end_time_in_millis", endTimeMillis);
             builder.startObject("indices");
             for (Map.Entry<String, SnapshottedIndex> index : indices.entrySet()) {
                 builder.startObject(index.getKey());
@@ -259,10 +318,13 @@ public final class SnapshotRecord {
             final var body = parser.map();
             final Object repo = body.get("repo");
             final Object name = body.get("name");
-            final Object createdAt = body.get("created_at");
-            if (repo == null || name == null || createdAt == null) {
+            final Object uuid = body.get("uuid");
+            final Object startTime = body.get("start_time_in_millis");
+            final Object endTime = body.get("end_time_in_millis");
+            if (repo == null || name == null || startTime == null || endTime == null) {
                 throw new IOException("malformed snapshot record: missing a required field");
             }
+            final boolean shallow = Boolean.TRUE.equals(body.get("shallow")) || "true".equals(String.valueOf(body.get("shallow")));
             final Map<String, SnapshottedIndex> indices = new LinkedHashMap<>();
             if (body.get("indices") instanceof Map<?, ?> indexMap) {
                 for (Map.Entry<?, ?> entry : indexMap.entrySet()) {
@@ -270,9 +332,9 @@ public final class SnapshotRecord {
                         throw new IOException("malformed snapshot record: an index entry is not an object");
                     }
                     final Map<?, ?> indexBody = (Map<?, ?>) entry.getValue();
-                    final Object uuid = indexBody.get("uuid");
+                    final Object indexUuid = indexBody.get("uuid");
                     final Object numberOfShards = indexBody.get("number_of_shards");
-                    if (uuid == null || numberOfShards == null) {
+                    if (indexUuid == null || numberOfShards == null) {
                         throw new IOException("malformed snapshot record: an index entry is missing its uuid or shard count");
                     }
                     final Object mapping = indexBody.get("mapping");
@@ -298,7 +360,7 @@ public final class SnapshotRecord {
                     indices.put(
                         String.valueOf(entry.getKey()),
                         new SnapshottedIndex(
-                            uuid.toString(),
+                            indexUuid.toString(),
                             Integer.parseInt(String.valueOf(numberOfShards)),
                             mapping == null ? null : mapping.toString(),
                             shards
@@ -306,7 +368,15 @@ public final class SnapshotRecord {
                     );
                 }
             }
-            return new SnapshotRecord(repo.toString(), name.toString(), Long.parseLong(String.valueOf(createdAt)), indices);
+            return new SnapshotRecord(
+                repo.toString(),
+                name.toString(),
+                uuid == null ? null : uuid.toString(),
+                shallow,
+                Long.parseLong(String.valueOf(startTime)),
+                Long.parseLong(String.valueOf(endTime)),
+                indices
+            );
         }
     }
 

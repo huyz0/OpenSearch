@@ -567,6 +567,19 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
             send(node, "DELETE", "/doomed", asAdmin, null);
             send(node, "PUT", "/_cluster/settings", asAdmin, "{\"persistent\":{\"authz-surface-probe\":\"1\"}}");
             send(node, "POST", "/alpha/_delete_by_query", asAdmin, "{\"query\":{\"match_all\":{}}}");
+            // Every one of these must reach its filter even though every one of them fails on the way --
+            // "alpha" was deleted by the _delete_by_query probe's shard-emptying and nothing here published
+            // a fresh commit, so the repository and the index both refuse business-wise. The filter still
+            // has to see the action first: index resolution, manifest gathering and the collision/rename
+            // checks all run inside the gate now, precisely because they used to run before it and a
+            // refused caller would never reach the filter at all -- the defect this sweep exists to catch.
+            send(node, "PUT", "/_snapshot/authz-repo", asAdmin, null);
+            send(node, "GET", "/_snapshot/authz-repo", asAdmin, null);
+            send(node, "PUT", "/_snapshot/authz-repo/snap1", asAdmin, "{\"indices\":\"alpha\"}");
+            send(node, "GET", "/_snapshot/authz-repo/snap1", asAdmin, null);
+            send(node, "POST", "/_snapshot/authz-repo/snap1/_restore", asAdmin, null);
+            send(node, "DELETE", "/_snapshot/authz-repo/snap1", asAdmin, null);
+            send(node, "DELETE", "/_snapshot/authz-repo", asAdmin, null);
 
             for (String action : List.of(
                 "indices:data/write/index",
@@ -579,7 +592,14 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 "indices:admin/create",
                 "indices:admin/get",
                 "indices:admin/delete",
-                "cluster:admin/settings/update"
+                "cluster:admin/settings/update",
+                "cluster:admin/repository/put",
+                "cluster:admin/repository/get",
+                "cluster:admin/repository/delete",
+                "cluster:admin/snapshot/create",
+                "cluster:admin/snapshot/get",
+                "cluster:admin/snapshot/restore",
+                "cluster:admin/snapshot/delete"
             )) {
                 assertTrue("no filter ever saw [" + action + "]; the endpoint that performs it is ungated: " + SEEN, SEEN.contains(action));
             }

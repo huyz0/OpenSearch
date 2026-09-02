@@ -205,13 +205,43 @@ public final class MetadataPlane {
     }
 
     /**
-     * Removes every byte a shard wrote: its segments, its manifests and its log.
+     * Removes every byte a shard wrote: its segments, its manifests and its log — except a shard a live
+     * shallow snapshot is still pinning.
+     *
+     * <p><b>A shallow snapshot names these bytes directly rather than a copy of them.</b> Its whole
+     * argument for costing nothing at capture time is that a captured commit's blobs are the same ones the
+     * live shard already wrote — see {@code m45-snapshot-notes.md}. Deleting the index unconditionally
+     * would delete exactly those blobs out from under a snapshot nobody had touched, which is not a corner
+     * case: taking a snapshot and then deleting the index it was taken from is the normal shape a backup
+     * is used for. A standard (non-shallow) snapshot already copied its own bytes into the repository's own
+     * storage at capture time, so it needs no such check — this only ever changes behaviour for a shallow
+     * one.
+     *
+     * <p>The check costs one listing of every live snapshot in the deployment, done once per delete rather
+     * than once per shard, and only when at least one snapshot exists anywhere — the same conditional cost
+     * {@link org.opensearch.serverless.reconcile.GarbageCollector} already pays for the identical reason.
+     * A shard this skips is not leaked forever: it becomes ordinary orphaned storage the moment its last
+     * pinning snapshot is deleted, reclaimable the same way any other orphan is (see "the whole-deployment
+     * orphan sweep" in {@code serverless-status.md}'s open items).
      *
      * @param indexName the index
+     * @param uuid the index's uuid, which a live snapshot's pin is keyed on
      * @param shards how many shards it has
      */
-    private void purgeShardData(String indexName, String uuid, int shards) {
+    private void purgeShardData(String indexName, String uuid, int shards) throws IOException {
+        final List<SnapshotRecord> snapshots = liveSnapshots();
         for (int shard = 0; shard < shards; shard++) {
+            if (snapshots.isEmpty() == false && pinnedBy(snapshots, uuid, shard)) {
+                LOGGER.info(
+                    "leaving shard "
+                        + shard
+                        + " of "
+                        + indexName
+                        + " on disk: a live snapshot still names its blobs directly, "
+                        + "and deleting the index must not delete what a snapshot is holding"
+                );
+                continue;
+            }
             try {
                 blobStore.blobContainer(RegisterMap.shardData(base, indexName, uuid, shard)).delete();
             } catch (Exception e) {
@@ -221,6 +251,15 @@ public final class MetadataPlane {
                 LOGGER.warn("could not clear storage for shard " + shard + " of " + indexName, e);
             }
         }
+    }
+
+    private static boolean pinnedBy(List<SnapshotRecord> snapshots, String uuid, int shard) {
+        for (SnapshotRecord snapshot : snapshots) {
+            if (snapshot.referencedBlobs(uuid, shard).isEmpty() == false) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -549,26 +588,24 @@ public final class MetadataPlane {
     }
 
     /**
-     * Registers a repository: a namespace within this deployment's own object store to take snapshots
-     * under. One put-if-absent, the same atomicity {@link #createIndex} and {@link #createPointInTime}
-     * both rely on, arbitrated by the object store rather than by a cluster-manager.
+     * Registers a repository, or updates one already registered: a namespace within this deployment's own
+     * object store to take snapshots under.
      *
-     * <p>Immutable once created and deleted wholesale rather than ever mutated in place, the same shape a
-     * {@link PointInTime} has and an {@link IndexDescriptor} does not — so this is a plain blob write, not
-     * a CAS register: nothing here is ever compare-and-swapped again after creation.
+     * <p><b>An upsert, not a put-if-absent — deliberately, to match real OpenSearch's own
+     * {@code PUT _snapshot/{repo}}.</b> A repository descriptor is unlike an {@link IndexDescriptor} in
+     * exactly this respect: re-registering the same name on real OpenSearch updates its settings rather
+     * than refusing, and a client written against that API sends a repeat {@code PUT} expecting exactly
+     * that. There is no concurrent-writer race this needs to arbitrate the way {@link #createIndex} does —
+     * a repository name colliding with another caller's is a coordination question for whoever is running
+     * two callers with the same repository name, not one this store needs an answer to.
      *
      * @param descriptor the repository to register
-     * @throws RepositoryAlreadyExistsException if the name is taken
      * @throws IOException if the write fails
      */
-    public void createRepository(RepositoryDescriptor descriptor) throws IOException {
+    public void putRepository(RepositoryDescriptor descriptor) throws IOException {
         final var container = blobStore.blobContainer(RegisterMap.repositories(base));
         final var bytes = descriptor.toBytes();
-        try {
-            container.writeBlob(descriptor.name(), bytes.streamInput(), bytes.length(), true);
-        } catch (java.nio.file.FileAlreadyExistsException e) {
-            throw new RepositoryAlreadyExistsException(descriptor.name());
-        }
+        container.writeBlob(descriptor.name(), bytes.streamInput(), bytes.length(), false);
     }
 
     /**
@@ -588,6 +625,30 @@ public final class MetadataPlane {
         } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
             return Optional.empty();
         }
+    }
+
+    /**
+     * Lists every registered repository.
+     *
+     * <p>Allowed where {@code /_serverless/indices} is refused for the same reason {@code _cluster/settings}
+     * is: a repository is operator-registered, human-scale — a handful, curated by hand — not a population
+     * that grows with what a caller writes. Real OpenSearch's own {@code GET _snapshot} with no name is
+     * exactly this listing, unconditionally, which is the strongest evidence the scale assumption holds.
+     *
+     * @return every registered repository, skipping — and logging — any record that cannot be read
+     * @throws IOException if listing fails
+     */
+    public List<RepositoryDescriptor> listRepositories() throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.repositories(base));
+        final List<RepositoryDescriptor> found = new ArrayList<>();
+        for (String name : container.listBlobs().keySet()) {
+            try (java.io.InputStream in = container.readBlob(name)) {
+                found.add(RepositoryDescriptor.fromStream(in));
+            } catch (Exception e) {
+                LOGGER.warn("could not read the repository [" + name + "]; leaving it out of the listing", e);
+            }
+        }
+        return found;
     }
 
     /**
@@ -660,18 +721,37 @@ public final class MetadataPlane {
     }
 
     /**
-     * Removes a snapshot's record, so the collector stops treating its blobs as referenced.
+     * Removes a snapshot's record. For a shallow snapshot this is the whole of it — the collector simply
+     * stops treating a live shard's blobs as referenced on its next sweep. For a standard snapshot it is
+     * not: its bytes are this snapshot's own, copied into the repository's storage at capture time and
+     * named by nothing else, so deleting the record without also deleting them would leak that storage
+     * forever, unreachable and unrecoverable in the same motion.
      *
      * @param repo the repository
      * @param name the snapshot
      * @return true if it existed
-     * @throws IOException if the delete fails
+     * @throws IOException if the read or delete fails
      */
     public boolean deleteSnapshot(String repo, String name) throws IOException {
         final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
         final String key = RegisterMap.snapshotKey(repo, name);
-        if (container.blobExists(key) == false) {
+        final Optional<SnapshotRecord> record = snapshot(repo, name);
+        if (record.isEmpty()) {
             return false;
+        }
+        if (record.get().shallow() == false) {
+            for (Map.Entry<String, SnapshotRecord.SnapshottedIndex> index : record.get().indices().entrySet()) {
+                for (Integer shard : index.getValue().shards().keySet()) {
+                    try {
+                        blobStore.blobContainer(RegisterMap.snapshotShardData(base, repo, name, index.getKey(), shard)).delete();
+                    } catch (Exception e) {
+                        // Best effort, the same reason purgeShardData's own delete is: a store that cannot
+                        // delete must not turn removing the record into a failure. What it costs is storage,
+                        // recoverable, against a delete that reads as having failed when the record is gone.
+                        LOGGER.warn("could not clear snapshot storage for " + index.getKey() + " shard " + shard + " of " + key, e);
+                    }
+                }
+            }
         }
         container.deleteBlobsIgnoringIfNotExists(java.util.List.of(key));
         return true;

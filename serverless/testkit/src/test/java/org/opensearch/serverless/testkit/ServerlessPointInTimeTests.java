@@ -509,11 +509,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
             );
             assertEquals("a dead preferred candidate must not turn into a failed search: " + found.body(), 200, found.status());
             assertTrue("the frozen document must still be found: " + found.body(), found.body().contains("\"value\":1"));
-            assertEquals(
-                "the survivor must have fallen back to opening the view itself",
-                1,
-                survivor.reconciler().frozenShards().size()
-            );
+            assertEquals("the survivor must have fallen back to opening the view itself", 1, survivor.reconciler().frozenShards().size());
         }
     }
 

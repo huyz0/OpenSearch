@@ -147,6 +147,28 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns the container path a standard (non-shallow) snapshot copies one captured shard's segment
+     * files into.
+     *
+     * <p>A shallow snapshot references a live shard's own blobs directly ({@link #shardData}), which is
+     * what makes it free to take and what makes it depend on that shard's own storage continuing to exist.
+     * A standard snapshot exists precisely to not depend on that: its bytes are copied here, under the
+     * repository and snapshot's own names rather than any live index's, so the snapshot's lifecycle is
+     * entirely its own — deleting the index it was taken from, or the garbage collector sweeping that
+     * index's shard, never touches this path at all, because neither one lists it.
+     *
+     * @param base the deployment's base path
+     * @param repo the repository
+     * @param snapshot the snapshot name
+     * @param indexName the captured index's name, at capture time
+     * @param shardId the shard number
+     * @return the container path
+     */
+    public static BlobPath snapshotShardData(BlobPath base, String repo, String snapshot, String indexName, int shardId) {
+        return base.add("snapshot-data").add(repo + SHARD_SEPARATOR + snapshot).add(indexName + SHARD_SEPARATOR + shardId);
+    }
+
+    /**
      * Returns the container path holding one shard's published segments.
      *
      * <p>A container per shard rather than a shared one with prefixed names: segment files are listed
