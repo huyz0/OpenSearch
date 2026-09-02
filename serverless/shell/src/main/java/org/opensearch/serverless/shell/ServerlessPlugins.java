@@ -104,8 +104,11 @@ public final class ServerlessPlugins {
      * was missing. Three are genuine — a running {@code ResourceWatcherService}, a {@code ScriptService}
      * with no engines, and the node's {@code NamedWriteableRegistry}. The fourth cannot be genuine and is
      * therefore explicit: see {@link RefusingIndexNameExpressionResolver}. Only the
-     * {@code RepositoriesService} supplier still yields null, because snapshots are out of scope (R7) and a
-     * supplier that returns nothing is at least a supplier that can be called.
+     * {@code RepositoriesService} supplier still yields null: that class is the classic repository-plugin
+     * API surface — registering a repository <em>type</em>, hooking snapshot lifecycle events — and this
+     * shell's own snapshot/restore surface (M45) does not use it, the same way {@code IndexShard} needs no
+     * {@code ClusterService} to run. A plugin that implements a custom repository type still finds nothing
+     * here; a caller taking or restoring a snapshot does not go through this at all.
      *
      * @param node the node the plugins are running in
      * @param environment the node environment

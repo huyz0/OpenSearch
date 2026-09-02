@@ -61,6 +61,20 @@ removal through `Settings`'s public surface without risking silent data loss), a
 a settings registry: this is a store, not a settings service, the same as an index's mapping JSON is
 stored without checking it against Lucene's field types.
 
+**Snapshot and restore.** `PUT /_snapshot/{repo}` registers a repository — a namespace within this
+deployment's own object store, not a distinct storage backend, because there is only one object store to
+put a snapshot in. `PUT /_snapshot/{repo}/{name}` (given an explicit `indices` list; this surface does not
+enumerate a deployment's population any more than `_search` across several indices does) captures each
+named index's currently published commits at no data-movement cost — a metadata write referencing blobs
+that already exist, the same shallow shape a point in time already has. Restoring is not free: shard
+storage is keyed by an index's own uuid, so `POST /_snapshot/{repo}/{name}/_restore` always creates a new
+index and copies the referenced blobs into its own storage, per index independently, so one name collision
+does not cost the others. The garbage collector protects a live snapshot's blobs the same way it protects a
+point in time's, keyed by uuid rather than name so an unrelated later index reusing a deleted one's name is
+never mistaken for what a snapshot actually captured. Classic OpenSearch's repository-plugin API surface
+(`RepositoriesService`) is untouched and still yields null to a plugin — this is a shell-native surface, not
+a workaround.
+
 **Scaling to zero and back.** A node takes a shard by compare-and-swap on a register, renews a lease,
 publishes commits to the object store, and releases shards that have gone idle. There is no cluster
 manager, no consensus process, and no cluster-wide state. **What an open shard costs is measured**: ~67 KB
@@ -189,7 +203,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-398 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+406 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

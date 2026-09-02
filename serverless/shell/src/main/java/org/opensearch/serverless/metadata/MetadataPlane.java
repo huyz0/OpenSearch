@@ -549,6 +549,189 @@ public final class MetadataPlane {
     }
 
     /**
+     * Registers a repository: a namespace within this deployment's own object store to take snapshots
+     * under. One put-if-absent, the same atomicity {@link #createIndex} and {@link #createPointInTime}
+     * both rely on, arbitrated by the object store rather than by a cluster-manager.
+     *
+     * <p>Immutable once created and deleted wholesale rather than ever mutated in place, the same shape a
+     * {@link PointInTime} has and an {@link IndexDescriptor} does not — so this is a plain blob write, not
+     * a CAS register: nothing here is ever compare-and-swapped again after creation.
+     *
+     * @param descriptor the repository to register
+     * @throws RepositoryAlreadyExistsException if the name is taken
+     * @throws IOException if the write fails
+     */
+    public void createRepository(RepositoryDescriptor descriptor) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.repositories(base));
+        final var bytes = descriptor.toBytes();
+        try {
+            container.writeBlob(descriptor.name(), bytes.streamInput(), bytes.length(), true);
+        } catch (java.nio.file.FileAlreadyExistsException e) {
+            throw new RepositoryAlreadyExistsException(descriptor.name());
+        }
+    }
+
+    /**
+     * Reads a repository's record.
+     *
+     * @param name the repository
+     * @return the record, or empty if not registered
+     * @throws IOException if the read fails
+     */
+    public Optional<RepositoryDescriptor> describeRepository(String name) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.repositories(base));
+        if (container.blobExists(name) == false) {
+            return Optional.empty();
+        }
+        try (java.io.InputStream in = container.readBlob(name)) {
+            return Optional.of(RepositoryDescriptor.fromStream(in));
+        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Removes a repository, refusing while it still holds snapshots.
+     *
+     * <p>The refusal is what a real {@code _snapshot} API's own delete-repository endpoint always enforces
+     * — a repository is a namespace for durable records, and deleting it out from under snapshots that
+     * still name it would leave them with nowhere to describe or restore from.
+     *
+     * @param name the repository
+     * @return true if it existed
+     * @throws RepositoryInUseException if it still holds snapshots
+     * @throws IOException if listing, the read, or the delete fails
+     */
+    public boolean deleteRepository(String name) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.repositories(base));
+        if (container.blobExists(name) == false) {
+            return false;
+        }
+        final var held = listSnapshots(name);
+        if (held.isEmpty() == false) {
+            throw new RepositoryInUseException(name, held.size());
+        }
+        container.deleteBlobsIgnoringIfNotExists(java.util.List.of(name));
+        return true;
+    }
+
+    /**
+     * Records a snapshot. One put-if-absent; the caller has already gathered every captured manifest by
+     * the time this is called, so this is a single write regardless of how many indices or shards it
+     * names — the same "take the cost once, up front" shape {@link #createPointInTime} has.
+     *
+     * @param snapshot the snapshot to record
+     * @throws RepositoryMissingException if its repository is not registered
+     * @throws SnapshotAlreadyExistsException if the name is taken within that repository
+     * @throws IOException if the write fails
+     */
+    public void createSnapshot(SnapshotRecord snapshot) throws IOException {
+        if (describeRepository(snapshot.repo()).isEmpty()) {
+            throw new RepositoryMissingException(snapshot.repo());
+        }
+        final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
+        final var bytes = snapshot.toBytes();
+        try {
+            container.writeBlob(snapshot.key(), bytes.streamInput(), bytes.length(), true);
+        } catch (java.nio.file.FileAlreadyExistsException e) {
+            throw new SnapshotAlreadyExistsException(snapshot.repo(), snapshot.name());
+        }
+    }
+
+    /**
+     * Reads one snapshot's record.
+     *
+     * @param repo the repository
+     * @param name the snapshot
+     * @return the record, or empty if it does not exist
+     * @throws IOException if the read fails
+     */
+    public Optional<SnapshotRecord> snapshot(String repo, String name) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
+        final String key = RegisterMap.snapshotKey(repo, name);
+        if (container.blobExists(key) == false) {
+            return Optional.empty();
+        }
+        try (java.io.InputStream in = container.readBlob(key)) {
+            return Optional.of(SnapshotRecord.fromStream(in));
+        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Removes a snapshot's record, so the collector stops treating its blobs as referenced.
+     *
+     * @param repo the repository
+     * @param name the snapshot
+     * @return true if it existed
+     * @throws IOException if the delete fails
+     */
+    public boolean deleteSnapshot(String repo, String name) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
+        final String key = RegisterMap.snapshotKey(repo, name);
+        if (container.blobExists(key) == false) {
+            return false;
+        }
+        container.deleteBlobsIgnoringIfNotExists(java.util.List.of(key));
+        return true;
+    }
+
+    /**
+     * Lists every snapshot within one repository.
+     *
+     * <p>An operator-triggered listing, the same exception every other listing in this class already is:
+     * registering, deleting or describing a repository happens at human scale, and this is what a real
+     * {@code _snapshot} API's own "list snapshots" endpoint always was — never on a serving path.
+     *
+     * @param repo the repository
+     * @return every snapshot it holds, skipping — and logging — any record that cannot be read
+     * @throws IOException if listing fails
+     */
+    public List<SnapshotRecord> listSnapshots(String repo) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
+        final List<SnapshotRecord> found = new ArrayList<>();
+        for (String key : container.listBlobsByPrefix(repo + RegisterMap.SHARD_SEPARATOR).keySet()) {
+            try (java.io.InputStream in = container.readBlob(key)) {
+                found.add(SnapshotRecord.fromStream(in));
+            } catch (Exception e) {
+                LOGGER.warn("could not read the snapshot [" + key + "]; leaving it out of the listing", e);
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Reads every snapshot in the deployment, across every repository.
+     *
+     * <p>For the collector, which sweeps one shard at a time and has to know what every snapshot,
+     * anywhere, is still pinning before it deletes anything — the same reason {@link #livePointsInTime}
+     * exists. A record that cannot be read is <b>skipped</b>, not treated as pinning everything the way an
+     * unreadable {@link PointInTime} is: a point in time's conservative fallback exists because a paging
+     * caller mid-request loses nothing but latency if the sweep is briefly more cautious than it needs to
+     * be, and it can name only one shard at a time, so "assume it holds this shard" is a bounded,
+     * affordable guess. A snapshot can name an unbounded number of indices and shards, so the equivalent
+     * guess would be "assume it holds everything, deployment-wide" — which turns one corrupted record into
+     * a garbage collector switched off everywhere, silently, forever. That trade is documented rather than
+     * made silently: see {@code m45-snapshot-restore-notes.md}.
+     *
+     * @return every readable snapshot record
+     * @throws IOException if listing fails
+     */
+    public List<SnapshotRecord> liveSnapshots() throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
+        final List<SnapshotRecord> found = new ArrayList<>();
+        for (String key : container.listBlobs().keySet()) {
+            try (java.io.InputStream in = container.readBlob(key)) {
+                found.add(SnapshotRecord.fromStream(in));
+            } catch (Exception e) {
+                LOGGER.warn("could not read the snapshot [" + key + "]; its blobs will not be protected by this sweep", e);
+            }
+        }
+        return found;
+    }
+
+    /**
      * Returns the backing blob store, for components that address shard data directly.
      *
      * @return the blob store

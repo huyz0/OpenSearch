@@ -106,6 +106,47 @@ public final class RegisterMap {
     public static final String CLUSTER_CONFIG_BLOB = "settings";
 
     /**
+     * Returns the container path holding repository descriptors.
+     *
+     * <p>A repository here is a namespace within this deployment's own object store, not a distinct
+     * storage backend or bucket — the same object store already backing every register and every shard's
+     * segments. Registering one records a name and nothing else; there is nothing to configure that this
+     * deployment's own {@code serverless.store.*} settings do not already fix.
+     *
+     * @param base the deployment's base path
+     * @return the repositories container path
+     */
+    public static BlobPath repositories(BlobPath base) {
+        return base.add("repositories");
+    }
+
+    /**
+     * Returns the container path holding snapshot records.
+     *
+     * <p>Its own container, the same reasoning as {@link #pointsInTime}: the collector and the delete
+     * path both have to list every live one, and a listing that also stepped over every repository or
+     * index descriptor would make their cost depend on a population they have nothing to do with.
+     *
+     * @param base the deployment's base path
+     * @return the snapshots container path
+     */
+    public static BlobPath snapshots(BlobPath base) {
+        return base.add("snapshots");
+    }
+
+    /**
+     * Returns the blob name one snapshot is stored under: a repository and a name, joined the same way a
+     * shard-head joins an index name and a shard number.
+     *
+     * @param repo the repository
+     * @param name the snapshot name
+     * @return the blob name
+     */
+    public static String snapshotKey(String repo, String name) {
+        return repo + SHARD_SEPARATOR + name;
+    }
+
+    /**
      * Returns the container path holding one shard's published segments.
      *
      * <p>A container per shard rather than a shared one with prefixed names: segment files are listed

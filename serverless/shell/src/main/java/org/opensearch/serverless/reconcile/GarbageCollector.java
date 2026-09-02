@@ -150,6 +150,24 @@ public final class GarbageCollector {
             }
         }
 
+        // And what any snapshot is still holding -- the same rule, checked once per sweep of a shard
+        // rather than once per blob, and read before the listing for the same reason the point-in-time
+        // read above is: a snapshot taken while this sweep is running must be seen or not seen, never
+        // half-seen. Unlike a point in time, keyed by the index's uuid rather than its name -- see
+        // SnapshotRecord#referencedBlobs for why that is tighter than the point-in-time check just above,
+        // not merely different. The uuid is resolved only when at least one snapshot exists anywhere in
+        // the deployment, so a deployment that has never taken one pays nothing extra for this at all.
+        final List<org.opensearch.serverless.metadata.SnapshotRecord> snapshots = plane.liveSnapshots();
+        if (snapshots.isEmpty() == false) {
+            final Optional<org.opensearch.serverless.cluster.IndexDescriptor> descriptor = plane.describe(indexName);
+            if (descriptor.isPresent()) {
+                final String uuid = descriptor.get().uuid();
+                for (org.opensearch.serverless.metadata.SnapshotRecord snapshot : snapshots) {
+                    referenced.addAll(snapshot.referencedBlobs(uuid, shardId));
+                }
+            }
+        }
+
         final List<String> deleted = new ArrayList<>();
         final Set<String> candidates = new HashSet<>();
         final BlobContainer shardContainer = blobStore.blobContainer(plane.shardData(indexName, shardId));

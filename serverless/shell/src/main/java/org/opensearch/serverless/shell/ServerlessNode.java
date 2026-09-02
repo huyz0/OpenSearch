@@ -757,6 +757,10 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DeleteByQueryHandler(() -> this, () -> metadataPlane)));
+        // Snapshot/restore, backed by this deployment's own object store rather than a distinct
+        // repository backend -- R7's "out of scope" closed, not worked around. See m45-snapshot-notes.md.
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RepositoryHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SnapshotHandler(() -> metadataPlane, () -> this)));
         // The one piece of /_cluster/* not refused below: §9.3's /cluster/config is one register, exactly
         // like an index descriptor, and this node can answer for it the same honest way it answers for an
         // index -- unlike health, state or stats, which are genuinely cluster-wide and would mislead
