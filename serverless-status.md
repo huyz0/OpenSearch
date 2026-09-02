@@ -72,7 +72,13 @@ for nothing when it holds none; reaps expired point-in-time records every tenth 
 a listing across the whole deployment and paying one every thirty seconds per node to be told a feature is
 unused is a bill rather than a safeguard; and sweeps the garbage left by what it has just published. The sweep waits until a
 blob has been unreferenced across two passes, because a reader may still be reading it — the grace is what
-makes running the collector on a schedule different from running it by hand.
+makes running the collector on a schedule different from running it by hand. Eviction under cap pressure
+has **hysteresis** — a full node clears down to a floor below the cap (5% by default) on the first pass a
+burst of arrivals needs, rather than one slot per arrival, so the O(open shards) victim search runs once
+per burst rather than once per arrival — and a **per-index pin**, exempting an index's shards from both
+cap-pressure eviction and idle release on the node that pins it. Pinning is a node-local runtime setting,
+the same shape as the shard cap or the idle timeout, not a durable deployment-wide record; nothing has
+asked for the durable version yet. See [`m13-hysteresis-notes.md`](m13-hysteresis-notes.md).
 
 **Identity across a hop.** A thread-context header a plugin sets travels with a forwarded write and
 arrives on the node that owns the shard — core's own mechanism, the one the security plugin uses to move an
@@ -178,7 +184,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-390 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+395 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

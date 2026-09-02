@@ -62,6 +62,25 @@ public final class BackgroundReconciler implements Closeable {
      */
     public static final long DEFAULT_EVICT_AFTER_MILLIS = 60_000L;
 
+    /**
+     * How far below the cap eviction clears room to, as a fraction of {@link #maxShardsHeld}.
+     *
+     * <p><b>What hysteresis buys here, precisely.</b> It does not reduce how many shards get evicted under
+     * sustained demand above the cap — a node that needs to hold K new shards still has to give up K old
+     * ones, headroom or not. What it reduces is how often {@link #makeRoom()} has to run its victim search
+     * at all: that search is O(open shards), and without headroom a burst of arrivals at a full node pays
+     * that scan once per arrival, each time freeing exactly enough room for the one shard that triggered
+     * it and nothing more. With headroom, one full pass clears room for the whole burst, up to this
+     * fraction of the cap, so the next several arrivals find room already there.
+     *
+     * <p>Five percent, floored at one shard: a fifth of the {@link #DEFAULT_EVICT_AFTER_MILLIS} of grace
+     * a shard already gets before it is eligible at all, chosen the same way that constant was — an order
+     * of magnitude inside what would visibly cost something (evicting a shard nobody asked to be evicted,
+     * unused as it is, costs nothing but the object-store round trip to publish and release it) rather
+     * than measured, because nothing has yet run this shell at a scale where the difference is visible.
+     */
+    public static final double DEFAULT_EVICT_HEADROOM_FRACTION = 0.05;
+
     private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(BackgroundReconciler.class);
 
     private final ServerlessNode node;
@@ -71,9 +90,11 @@ public final class BackgroundReconciler implements Closeable {
     private final Map<ShardId, Long> lastPublishedMaxSeqNo = new ConcurrentHashMap<>();
     private final Set<ShardId> dirty = ConcurrentHashMap.newKeySet();
     private final Set<ShardId> fenced = ConcurrentHashMap.newKeySet();
+    private final Set<String> pinnedIndices = ConcurrentHashMap.newKeySet();
     private volatile boolean demandDriven;
     private volatile int maxShardsHeld = DEFAULT_MAX_SHARDS_HELD;
     private volatile long evictAfterMillis = DEFAULT_EVICT_AFTER_MILLIS;
+    private volatile double evictHeadroomFraction = DEFAULT_EVICT_HEADROOM_FRACTION;
 
     /**
      * How long a shard may go unused before a node lets go of it, when idle release is enabled.
@@ -398,6 +419,10 @@ public final class BackgroundReconciler implements Closeable {
      * infinitely idle — otherwise a demand-driven node would release each shard immediately after taking
      * it and spin.
      *
+     * <p>A pinned index ({@link #pin}) is exempt here too, not only from cap eviction: "this stays
+     * resident" would be a thin promise if it only held during a busy hour and let go the moment traffic
+     * quieted down.
+     *
      * @param nowMillis the observer's clock
      * @return the shards released for idleness
      */
@@ -407,6 +432,9 @@ public final class BackgroundReconciler implements Closeable {
             return letGoSet;
         }
         for (ShardId shardId : node.reconciler().openShards()) {
+            if (pinnedIndices.contains(shardId.getIndexName())) {
+                continue;
+            }
             final long lastUsed = node.reconciler().lastUsed(shardId).orElse(openedAt.getOrDefault(shardId, nowMillis));
             if (nowMillis - lastUsed < idleAfterMillis) {
                 continue;
@@ -449,10 +477,64 @@ public final class BackgroundReconciler implements Closeable {
         if (evictAfterMillis <= 0) {
             return false;
         }
-        final long now = plane.clock().getAsLong();
+        // The floor eviction clears to, not merely the one slot the caller needs -- see
+        // DEFAULT_EVICT_HEADROOM_FRACTION for why clearing further than the immediate request pays for
+        // itself under sustained demand. Never above the cap itself, so a headroom fraction close to or
+        // above 1.0 cannot make this evict shards nobody needed room for.
+        final int floor = Math.min(maxShardsHeld, Math.max(0, maxShardsHeld - headroomShards()));
+        int evicted = 0;
+        while (node.reconciler().heldShards().size() > floor) {
+            final long now = plane.clock().getAsLong();
+            final ShardId victim = pickVictim(now);
+            if (victim == null) {
+                break;
+            }
+            final long victimLastUsed = node.reconciler().lastUsed(victim).orElse(openedAt.getOrDefault(victim, now));
+            if (letGo(victim, "evicted to make room, unused for " + (now - victimLastUsed) + "ms") == false) {
+                // The head could not be released; letGo already logged why. Stopping rather than trying a
+                // different victim next: a head release failing once tends to keep failing, and spinning
+                // through every open shard to find one that happens to release is work for no room gained.
+                break;
+            }
+            openedAt.remove(victim);
+            if (demandDriven) {
+                wanted.remove(Map.entry(victim.getIndexName(), victim.id()));
+            }
+            evicted++;
+        }
+        if (evicted > 0) {
+            logger.info(
+                "evicted {} shard(s) to make room at the shard cap, {} held against a cap of {} (floor {})",
+                evicted,
+                node.reconciler().heldShards().size(),
+                maxShardsHeld,
+                floor
+            );
+        }
+        return node.reconciler().heldShards().size() < maxShardsHeld;
+    }
+
+    /** The number of shards headroom clears beyond the one slot immediately needed, at least one. */
+    private int headroomShards() {
+        return Math.max(1, (int) Math.round(maxShardsHeld * evictHeadroomFraction));
+    }
+
+    /**
+     * Picks the least recently used evictable shard, or null if none qualifies.
+     *
+     * <p>A pinned index's shards are never candidates, at any age -- pinning means "this stays resident,"
+     * not "this stays resident a little longer than the rest."
+     *
+     * @param now the observer's clock
+     * @return the shard to evict next, or null
+     */
+    private ShardId pickVictim(long now) {
         ShardId victim = null;
         long victimLastUsed = Long.MAX_VALUE;
         for (ShardId shardId : node.reconciler().openShards()) {
+            if (pinnedIndices.contains(shardId.getIndexName())) {
+                continue;
+            }
             final long lastUsed = node.reconciler().lastUsed(shardId).orElse(openedAt.getOrDefault(shardId, now));
             if (now - lastUsed < evictAfterMillis) {
                 continue;
@@ -462,18 +544,7 @@ public final class BackgroundReconciler implements Closeable {
                 victimLastUsed = lastUsed;
             }
         }
-        if (victim == null) {
-            return false;
-        }
-        if (letGo(victim, "evicted to make room, unused for " + (now - victimLastUsed) + "ms") == false) {
-            return false;
-        }
-        openedAt.remove(victim);
-        if (demandDriven) {
-            wanted.remove(Map.entry(victim.getIndexName(), victim.id()));
-        }
-        logger.info("evicted {} to make room at the shard cap", victim);
-        return true;
+        return victim;
     }
 
     /**
@@ -485,6 +556,64 @@ public final class BackgroundReconciler implements Closeable {
     public BackgroundReconciler setEvictAfterMillis(long evictAfterMillis) {
         this.evictAfterMillis = evictAfterMillis;
         return this;
+    }
+
+    /**
+     * Sets how far below the cap eviction clears room to, as a fraction of the cap.
+     *
+     * @param evictHeadroomFraction the fraction; 0 clears exactly one slot at a time, matching the
+     *     behaviour before hysteresis existed
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setEvictHeadroomFraction(double evictHeadroomFraction) {
+        this.evictHeadroomFraction = evictHeadroomFraction;
+        return this;
+    }
+
+    /**
+     * Marks an index's shards as never evicted, on this node.
+     *
+     * <p><b>What this is, and what it deliberately is not.</b> It is a node-local runtime setting, exactly
+     * like {@link #setMaxShardsHeld} or {@link #setEvictAfterMillis} — set once per node, not a durable
+     * per-index record every node in a deployment discovers on its own. Building the durable version would
+     * mean a new register namespace, a REST surface to manage it, and a place in the reconcile loop to
+     * read it every tick; nothing has asked for an index to be pinned deployment-wide yet, only for a way
+     * to say "this stays resident" on the node serving it — the same shape every other capacity knob here
+     * already has.
+     *
+     * <p>Pinning exempts an index's shards from eviction under cap pressure ({@link #makeRoom}) and from
+     * idle release ({@link #releaseIdle}) alike: "this stays resident" would be a thin promise if it meant
+     * only "unless a shard limit is reached," and a thinner one still if a busy hour and a quiet one gave
+     * different answers.
+     *
+     * @param indexName the index
+     * @return this, for chaining
+     */
+    public BackgroundReconciler pin(String indexName) {
+        pinnedIndices.add(indexName);
+        return this;
+    }
+
+    /**
+     * Reverses {@link #pin}. A shard already past its idle or eviction threshold at the moment this is
+     * called becomes a candidate on the next pass, not immediately — unpinning is not itself a trigger.
+     *
+     * @param indexName the index
+     * @return this, for chaining
+     */
+    public BackgroundReconciler unpin(String indexName) {
+        pinnedIndices.remove(indexName);
+        return this;
+    }
+
+    /**
+     * Reports whether an index's shards are currently pinned on this node.
+     *
+     * @param indexName the index
+     * @return true if pinned
+     */
+    public boolean isPinned(String indexName) {
+        return pinnedIndices.contains(indexName);
     }
 
     /**
