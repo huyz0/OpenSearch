@@ -28,7 +28,11 @@ acknowledged but not yet published when the operation starts is not touched by i
 plain `search_after` export of matching ids would have. Routing is resolved
 once per request, so a multi-get's object-store cost is the shards it touches and not the documents it asks
 for: ten documents cost 4 requests and twenty cost 4, against 30 for the same ten fetched one at a time. A write is durable in a write-ahead log before it is
-acknowledged, and replayed by a successor. A get is routed to the shard's owner so it sees writes a search
+acknowledged, and replayed by a successor. **A writer that has lost its shard but not yet noticed is fenced
+out of that log**: it refuses to write past the lease deadline it last published for itself, which needs no
+I/O and so is checked on every write; and a successor seals the log at takeover, durably, so nothing
+appended after ownership moved is ever replayed — by that successor or by any node after it
+([`m49-fencing-notes.md`](m49-fencing-notes.md)). A get is routed to the shard's owner so it sees writes a search
 cannot yet; an unowned shard is served from its published commit, so a get works against an index that has
 scaled to zero.
 
@@ -178,6 +182,10 @@ These are decisions, not gaps. Each answers 501 with a reason.
   it, but placement is only a hint, so two nodes can still each end up opening one view under an unlucky or
   stale routing decision — narrowed, not closed, by giving frozen search the same placement a live search
   already had. No slicing.
+- One fencing window is still open: the shard-head is won at the compare-and-swap, but the log is sealed
+  slightly later, when the shard is opened, so a predecessor's appends in between are still replayed.
+  Closing it means sealing at the swap, which the path that opens a shard from projected truth rather than
+  from an acquisition does not have. The unbounded half is closed.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
   runs on every pass. A reader whose node cannot reach the object store for longer than the grace can lose
   the commit it is reading — it fails with an error rather than answering wrongly, but it is a real limit.
@@ -228,7 +236,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-423 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+427 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

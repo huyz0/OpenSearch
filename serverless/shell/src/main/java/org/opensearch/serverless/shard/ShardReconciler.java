@@ -217,15 +217,32 @@ public final class ShardReconciler {
         new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
-     * Returns the log the shard currently being opened should replay, if any.
+     * The cutoff each pending replay is bounded by, snapshotted when the replay was armed.
+     *
+     * <p>See {@link org.opensearch.serverless.store.WalStore#position()} for what the cutoff is and why a
+     * successor needs one. It is held next to the log rather than inside it because a {@code WalStore} is
+     * the shard's live log, shared with the write path, and a cutoff belongs to one act of recovery.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<ShardId, java.util.Map<Long, String>> pendingCutoff =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Returns the records the shard currently being opened should replay, if any.
      *
      * <p>Called by {@link org.opensearch.serverless.engine.ServerlessWriterEngine} from inside recovery.
+     * The result is already bounded by the cutoff taken when this replay was armed, so records a node that
+     * has lost the shard appended after that moment are not returned.
      *
      * @param shardId the shard whose engine is being built
-     * @return the log to replay, or null if this shard should not replay one
+     * @return the records to replay, empty if this shard should not replay any
+     * @throws IOException if the log cannot be read
      */
-    public org.opensearch.serverless.store.WalStore replayLogFor(ShardId shardId) {
-        return pendingReplay.get(shardId);
+    public java.util.List<org.opensearch.serverless.store.WalRecord> replayRecordsFor(ShardId shardId) throws IOException {
+        final org.opensearch.serverless.store.WalStore wal = pendingReplay.get(shardId);
+        if (wal == null) {
+            return java.util.List.of();
+        }
+        return wal.replayable(pendingCutoff.get(shardId));
     }
 
     private IndexShard openAndStart(
@@ -325,7 +342,20 @@ public final class ShardReconciler {
         if (replayWal && walStores != null) {
             // Armed for exactly the window in which the engine is built and recovery runs, which is the
             // only window in which core will accept operations carrying their own sequence numbers.
-            pendingReplay.put(shardId, wal(shardId));
+            final org.opensearch.serverless.store.WalStore log = wal(shardId);
+            pendingReplay.put(shardId, log);
+            // Seal the log before recovery reads anything, so a predecessor that has not yet noticed it lost
+            // this shard cannot have its later appends replayed as acknowledged history. The seal is
+            // durable, so it binds every later successor too and not just this recovery -- see
+            // WalStore#sealAt for why that distinction is the whole point.
+            //
+            // <b>The window this leaves is real and worth naming.</b> The shard-head was won earlier, in
+            // MetadataPlane#activate, and anything the predecessor appends between that moment and this one
+            // still falls inside the seal. Narrowing it further means sealing at the compare-and-swap,
+            // which the path that opens a shard from projected truth rather than from an acquisition does
+            // not have. What is closed here is the unbounded half: after this point the predecessor can
+            // append for as long as it likes and none of it is ever read, by anyone.
+            pendingCutoff.put(shardId, log.sealAt(shardHeadTerm));
         }
         try {
             shard.markAsRecovering("serverless-store", new RecoveryState(initializing, localNode, null));
@@ -336,6 +366,7 @@ public final class ShardReconciler {
             }
         } finally {
             pendingReplay.remove(shardId);
+            pendingCutoff.remove(shardId);
         }
 
         final ShardRouting started = initializing.moveToStarted();

@@ -347,6 +347,91 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A hole in the log does not leave a hole in the sequence space, and the shard stays readable.
+     *
+     * <p><b>What makes a hole possible.</b> The engine assigns a sequence number before it applies, so an
+     * operation that fails inside Lucene — or one whose log append fails after it was already applied —
+     * burns a number that no record accounts for. Replay then reconstructs a history with a gap in it.
+     *
+     * <p><b>Why this shell does not fill the hole itself, and does not need to.</b>
+     * {@code StoreRecovery#internalRecoverFromStore} ends with {@code fillSeqNoGaps} — inside
+     * {@code IndexShard#recoverFromStore}, which is the only way this shell ever opens a writer. Replayed
+     * operations are already in the engine by then, because {@code ServerlessWriterEngine} feeds them in
+     * during recovery, so the gaps core fills are the gaps the log left. M48's notes claimed this shell had
+     * no analogue of {@code fillSeqNoGaps} because the method is unreachable from outside {@code IndexShard};
+     * it does not need to reach it, because the recovery path it already uses calls it.
+     *
+     * <p><b>What this test is.</b> A characterization test, not a test of shell code: the filling happens in
+     * core. Its value is that it fails if activation ever stops being a promotion — if the head term stops
+     * being threaded through {@code updateShardState}, or activation stops going through that path at all.
+     * The property it pins is the one downstream code would care about: the published commit's local
+     * checkpoint keeps up with its max sequence number, so the commit stays coherent for anything that
+     * later demands a complete history.
+     *
+     * <p>The hole is planted rather than provoked. Producing one for real needs a Lucene failure or a
+     * failing object store injected at one exact instant; the property worth pinning is "if a hole exists it
+     * does not survive activation", and planting one states that without building a fault-injection harness.
+     */
+    public void testAHoleInTheLogDoesNotSurviveActivation() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Path objectStore = createTempDir();
+        final MetadataPlane plane = freshIndex(clock, objectStore);
+        final String uuid = plane.describe("alpha").orElseThrow().uuid();
+
+        // Sequence numbers 0 and 2, with nothing at 1: the shape a burned-but-unlogged number leaves.
+        final var wal = plane.walStore("alpha", uuid, 0);
+        wal.append(
+            1L,
+            java.util.List.of(
+                new org.opensearch.serverless.store.WalRecord("a", "{\"msg\":\"first\",\"n\":1}", 0L, 1L, 1L),
+                new org.opensearch.serverless.store.WalRecord("c", "{\"msg\":\"third\",\"n\":3}", 2L, 1L, 1L)
+            )
+        );
+
+        try (ServerlessNode writer = new ServerlessNode(nodeSettings("gap-writer"))) {
+            writer.start();
+            final ShardId shardId = writer.activateWriter(plane, "alpha", 0).orElseThrow();
+
+            // Both logged documents are there, each keeping the number it was logged with: the hole cost
+            // no data and did not renumber what surrounded it.
+            assertTrue("the record before the hole must have replayed", writer.get(shardId, "a").found());
+            assertTrue("and the one after it", writer.get(shardId, "c").found());
+            assertEquals("the surviving records keep their own sequence numbers", 0L, writer.get(shardId, "a").seqNo());
+            assertEquals(2L, writer.get(shardId, "c").seqNo());
+
+            // The assertion that matters. Without gap-filling the checkpoint stalls at 0 -- one below the
+            // hole -- for the rest of this shard's life and every successor's, because a checkpoint cannot
+            // advance past a number it has never seen.
+            final var stats = writer.reconciler().shard(shardId).seqNoStats();
+            assertEquals("the hole must be accounted for, not left open", 2L, stats.getMaxSeqNo());
+            assertEquals("the local checkpoint must have advanced past the hole", 2L, stats.getLocalCheckpoint());
+            assertEquals("and the global checkpoint with it", 2L, stats.getGlobalCheckpoint());
+
+            writer.reconciler().shard(shardId).refresh("test");
+            writer.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
+        }
+
+        // A commit whose max sequence number sits above its global checkpoint is the shape ReadOnlyEngine
+        // refuses when it is asked for a complete history. This shell does not ask for one today, so this
+        // assertion is a guard on the option staying open rather than on a live failure.
+        final Settings searchOnly = Settings.builder()
+            .put("node.name", "gap-reader")
+            .put("cluster.name", "serverless-seqno")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", "search")
+            .build();
+        try (ServerlessNode reader = new ServerlessNode(searchOnly)) {
+            reader.start();
+            final ShardId asReader = reader.serveAsReader(plane, "alpha", 0);
+            assertNotNull("a reader must be able to open a shard whose log had a hole in it", asReader);
+            assertTrue("and serve what was published", reader.get(asReader, "a").found());
+        }
+    }
+
     private static String messageOf(String source) {
         final Matcher matcher = Pattern.compile("\"msg\"\\s*:\\s*\"([^\"]*)\"").matcher(source);
         assertTrue("no msg in " + source, matcher.find());

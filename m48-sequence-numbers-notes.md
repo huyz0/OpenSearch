@@ -124,13 +124,12 @@ Three refusals were kept or added rather than dropped:
 
 ## What this does NOT establish
 
-- **Sequence gaps are possible and are not filled.** If the engine applies an operation and the log append
-  then fails, the sequence number is consumed but never replayed, leaving a hole. Classic OpenSearch plugs
-  holes on promotion with `fillSeqNoGaps`; that method is not reachable from outside `IndexShard`'s own
-  promotion path, so this shell has no analogue. The consequence is bounded and worth stating precisely:
-  a hole stalls the *processed local checkpoint*, which nothing in this shell reads, and does **not**
-  affect `if_seq_no`, because that compares against the live version map and Lucene doc-values rather than
-  against the checkpoint. It would matter if the global checkpoint were ever given meaning here.
+- ~~**Sequence gaps are possible and are not filled.**~~ **This was wrong — corrected in M49.** The
+  reasoning here went from "`fillSeqNoGaps` is not reachable from outside `IndexShard`'s promotion path" to
+  "so this shell has no analogue", which does not follow: `StoreRecovery#internalRecoverFromStore` calls it
+  itself, inside `IndexShard#recoverFromStore`, which is the only way this shell ever opens a writer. Gaps
+  have always been filled. The claim was reasoned from the API surface without checking the call graph. See
+  `m49-fencing-notes.md`, and `testAHoleInTheLogDoesNotSurviveActivation`, which pins it.
 - **WAL-append fencing is still open, and the reference implementation has not closed it either.** A writer
   that has lost its shard-head but not yet noticed can keep appending correctly-tagged records at its own
   term, and a successor reading terms in ascending order will replay them. `plugins/serverless-storage`
@@ -140,6 +139,8 @@ Three refusals were kept or added rather than dropped:
   is the single most important caveat on `if_seq_no`'s safety here: the guarantee is sound against one
   writer and against a cleanly-failed-over writer, and is exactly as strong as the existing head-fencing
   against a partitioned zombie — no stronger.
+  **Addressed in M49**, by a durable takeover seal on the log plus a self-lease check on the write path.
+  One window remains, between winning the shard-head and taking the seal; see `m49-fencing-notes.md`.
 - **No conditional writes in `_bulk`.** Bulk items still refuse `_seq_no`/`_primary_term` on the action
   line, and the `create`/`update` bulk actions remain refused. Their old justification — "which this system
   does not have" — is now false, and the remaining reason is narrower and honest: the batch path takes

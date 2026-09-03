@@ -20,7 +20,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Function;
 
 /**
  * Core's own writer engine, plus the one thing this deployment's durability needs it to know: that some
@@ -43,25 +42,38 @@ import java.util.function.Function;
  * <p><b>The fencing obligation, stated because core's javadoc requires it to be.</b> That javadoc warns
  * that replayed operations must be fenced against a competing writer which has taken the shard over since
  * they were written, or "a naive implementation reintroduces a lost-write bug". Here, that fencing is the
- * term-scoped log: a writer at term T appends only under {@code wal/t=T}, and
- * {@link WalStore#replayable()} reads terms in ascending order up to the successor's own. What that does
- * <em>not</em> yet close is a writer which has lost its head but not yet noticed, and which goes on
- * appending correctly-tagged records at its own still-valid-looking term. That window is real, is the
- * same one {@code plugins/serverless-storage} documents as open in its own WAL, and is recorded in
- * {@code m48-sequence-numbers-notes.md} rather than papered over here.
+ * replay cutoff. A snapshot of how far the log had been written is taken when the replay is armed, and
+ * nothing appended after it is read — so a writer which has lost its head but has not yet noticed, and
+ * which goes on appending correctly-tagged records under its own still-valid-looking term, cannot have
+ * that history replayed as though it had been acknowledged. See {@link WalStore#position()} for why a
+ * snapshot is sufficient, and {@code m49-fencing-notes.md} for the window it does not close.
  */
 public final class ServerlessWriterEngine extends InternalEngine {
 
-    private final Function<ShardId, WalStore> replayLog;
+    /**
+     * Supplies the records a shard should replay on open, already bounded by the cutoff taken when the
+     * replay was armed. Reading the log is I/O, so this throws rather than pretending it cannot fail.
+     */
+    @FunctionalInterface
+    public interface ReplayLog {
+        /**
+         * @param shardId the shard being opened
+         * @return the records to replay, in order; empty if this shard should not replay any
+         * @throws IOException if the log cannot be read
+         */
+        List<WalRecord> recordsFor(ShardId shardId) throws IOException;
+    }
+
+    private final ReplayLog replayLog;
 
     /**
      * Creates the engine.
      *
      * @param config core's engine configuration
-     * @param replayLog supplies the log a shard should replay on open, or null for a shard that should
-     *     not replay — a reader, a frozen view, or a writer opening a shard with no log behind it
+     * @param replayLog supplies the records a shard should replay on open, or null for a shard that
+     *     should not replay — a reader, a frozen view, or a writer opening a shard with no log behind it
      */
-    public ServerlessWriterEngine(EngineConfig config, Function<ShardId, WalStore> replayLog) {
+    public ServerlessWriterEngine(EngineConfig config, ReplayLog replayLog) {
         super(config);
         this.replayLog = replayLog;
     }
@@ -72,14 +84,10 @@ public final class ServerlessWriterEngine extends InternalEngine {
             return List.of();
         }
         final ShardId shardId = config().getShardId();
-        final WalStore wal = replayLog.apply(shardId);
-        if (wal == null) {
-            return List.of();
-        }
         try {
             final List<Translog.Operation> operations = new ArrayList<>();
             long highest = org.opensearch.index.seqno.SequenceNumbers.NO_OPS_PERFORMED;
-            for (WalRecord record : wal.replayable()) {
+            for (WalRecord record : replayLog.recordsFor(shardId)) {
                 if (record.hasSequenceIdentity() == false) {
                     // Written before the log carried sequence numbers. It cannot be replayed as the
                     // operation it was, because the record does not say which operation that is. Left for

@@ -384,9 +384,20 @@ The real gap was narrower: the log recorded only an id and a source, so a succes
 it replayed. It now records each operation's sequence identity and replays through core's own
 `Engine#engineRecoveryOperations()` seam under a recovery origin, which preserves it — and conditional
 writes follow for free, because the comparison is core's own. See
-[`m48-sequence-numbers-notes.md`](m48-sequence-numbers-notes.md), including the two disclosed limits:
-sequence gaps are possible and unfilled, and WAL-append fencing against a not-yet-aware zombie writer
-remains open here exactly as it does in `plugins/serverless-storage`.
+[`m48-sequence-numbers-notes.md`](m48-sequence-numbers-notes.md).
+
+**The two limits M48 disclosed, taken (M49).** One of them was not real. M48 said sequence gaps go
+unfilled because `fillSeqNoGaps` is unreachable from outside `IndexShard`'s promotion path — true of the
+method, false of the conclusion: `StoreRecovery#internalRecoverFromStore` calls it inside
+`recoverFromStore`, which is the only way this shell opens a writer, so gaps have always been filled. That
+claim was reasoned from an API surface without checking the call graph, and is now pinned by a test. The
+other limit was real and is closed in the way the architecture already suggested: a successor **seals** the
+log at takeover, durably, so nothing a not-yet-aware predecessor appends afterwards is replayed by it or by
+any node after it — the seal has to outlive the node that took it, because the case that matters is that
+node dying before it publishes. A per-write check of the node's own lease, costing no I/O, bounds how long
+a partitioned writer can go on appending at all; it bounds, and the seal fences. See
+[`m49-fencing-notes.md`](m49-fencing-notes.md) for the one window that remains, between winning the
+shard-head and taking the seal.
 
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different

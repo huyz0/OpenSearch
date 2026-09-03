@@ -481,7 +481,7 @@ public final class ServerlessNode implements Closeable {
             // sequence numbers survive. See ServerlessWriterEngine for why replay cannot happen later.
             final org.opensearch.index.engine.EngineFactory writer = config -> new org.opensearch.serverless.engine.ServerlessWriterEngine(
                 config,
-                shardId -> reconciler == null ? null : reconciler.replayLogFor(shardId)
+                shardId -> reconciler == null ? java.util.List.of() : reconciler.replayRecordsFor(shardId)
             );
             return java.util.List.of((indexSettings, routing) -> java.util.Optional.of(writer));
         }
@@ -1408,6 +1408,7 @@ public final class ServerlessNode implements Closeable {
         if (wal == null || records.isEmpty()) {
             return;
         }
+        ensureOwnLeaseIsStillValid(shardId);
         try {
             wal.append(shard.getOperationPrimaryTerm(), records);
         } catch (Exception e) {
@@ -1417,6 +1418,47 @@ public final class ServerlessNode implements Closeable {
                 e
             );
         }
+    }
+
+    /**
+     * Refuses the write if this node's own lease has already expired by its own clock.
+     *
+     * <p><b>Why the write path and not just the heartbeat.</b> A node learns it has lost a shard by reading
+     * the shard-head, which it does on its heartbeat. A node that cannot reach the object store cannot read
+     * the head <em>or</em> renew its lease, so today it keeps accepting writes for as long as the partition
+     * lasts — the one case where the existing check is guaranteed not to fire is the one where it is needed.
+     * Checking the lease this node last published costs nothing, needs no I/O, and is therefore affordable
+     * on every write.
+     *
+     * <p><b>It bounds; it does not fence.</b> The check and the append are not atomic, so a pause between
+     * them long enough to outlive the deadline still lands the append. That is the classic lease race and
+     * it cannot be closed from the writer's side. It is closed on the reader's side instead, by the replay
+     * cutoff in {@link org.opensearch.serverless.store.WalStore#position()}: a successor does not read what
+     * was appended after it took over, whether the appender believed itself entitled or not.
+     *
+     * <p>The shard is released rather than merely refused, because a node past its own deadline has lost
+     * every shard it held, not just this one's write — and a released shard is one a successor can take
+     * cleanly instead of racing.
+     *
+     * @param shardId the shard being written to
+     * @throws java.io.IOException if this node may no longer write
+     */
+    private void ensureOwnLeaseIsStillValid(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
+        final var plane = metadataPlane;
+        if (plane == null) {
+            return;
+        }
+        final long now = plane.clock().getAsLong();
+        if (plane.membership().selfLeaseValidAt(now)) {
+            return;
+        }
+        reconciler.releaseShard(shardId, "this node's own lease expired at or before " + now);
+        throw new java.io.IOException(
+            "refusing to write to "
+                + shardId
+                + ": this node's lease has expired, so it can no longer claim to hold the shard; "
+                + "the shard has been released and the write was not acknowledged"
+        );
     }
 
     /**

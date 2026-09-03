@@ -58,6 +58,9 @@ public final class BlobLeaseMembership implements MembershipSource {
     private final List<Consumer<MembershipDelta>> listeners = new CopyOnWriteArrayList<>();
 
     private volatile Set<NodeLease> observed = Set.of();
+    /** The expiry this node last published for itself, so the write path can check it without I/O. */
+    private volatile long ownExpiresAtMillis = 0L;
+
     private volatile long ownGeneration = BlobRegister.ABSENT_GENERATION;
 
     /**
@@ -100,7 +103,35 @@ public final class BlobLeaseMembership implements MembershipSource {
             }
         }
         ownGeneration = result.currentGeneration();
+        ownExpiresAtMillis = renewed.expiresAtMillis();
         return renewed;
+    }
+
+    /**
+     * Whether this node's own lease is still valid, by this node's own clock, with no I/O.
+     *
+     * <p>This exists so the write path can be fenced on every write. A check that costs an object-store
+     * read cannot be made per write, so it would not be made at all, and the write path would stay
+     * unfenced between heartbeats — which is precisely the window a partitioned node keeps writing in.
+     *
+     * <p><b>What it is worth, and what it is not.</b> A node stops writing no later than the expiry it
+     * last published, so the interval in which a zombie can still write is bounded by the TTL rather than
+     * by however long it takes the zombie to notice. It does <em>not</em> make writing safe: the check and
+     * the write are not atomic, so a long enough pause between them lands a write after the deadline
+     * passed. Closing that needs a fence at the log, which is what the replay cutoff in
+     * {@code WalStore#replayable(Map)} is for. This bounds; that fences.
+     *
+     * <p><b>Before the first renewal this answers true</b>, because a node that has never published a
+     * lease has no deadline to have missed, and refusing writes on that basis would break a node that
+     * writes before its first heartbeat rather than protect anything. The fence engages once there is a
+     * lease to lose.
+     *
+     * @param nowMillis this node's current time
+     * @return whether this node may still act as though it holds what it held
+     */
+    public boolean selfLeaseValidAt(long nowMillis) {
+        final long expiry = ownExpiresAtMillis;
+        return expiry == 0L || nowMillis < expiry;
     }
 
     /**

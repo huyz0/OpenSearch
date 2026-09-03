@@ -57,6 +57,10 @@ public final class WalStore {
     private final BlobPath shardBase;
     /** A record's blob name: a zero-padded ordinal, and nothing else in the container is ours. */
     private static final java.util.regex.Pattern RECORD_NAME = java.util.regex.Pattern.compile("\\d{20}");
+    /** Where takeover cutoffs are recorded. Not a term, so term listings and term pruning both skip it. */
+    private static final String SEALS = "seals";
+    /** A seal's blob name. Deliberately not a bare ordinal, so nothing counting records can count a seal. */
+    private static final java.util.regex.Pattern SEAL_NAME = java.util.regex.Pattern.compile("seal-\\d{20}");
 
     private final AtomicLong ordinal = new AtomicLong();
     private volatile List<String> previousSnapshot = List.of();
@@ -139,19 +143,69 @@ public final class WalStore {
      * @throws IOException if listing or reading fails
      */
     public List<WalRecord> replayable() throws IOException {
-        final BlobContainer walRoot = blobStore.blobContainer(shardBase.add("wal"));
-        final Map<Long, BlobContainer> byTerm = new TreeMap<>();
-        for (Map.Entry<String, BlobContainer> child : walRoot.children().entrySet()) {
-            final Long term = parseTerm(child.getKey());
-            if (term != null) {
-                byTerm.put(term, child.getValue());
-            }
-        }
+        return replayable(null);
+    }
 
+    /**
+     * Takes a snapshot of how far the log had been written, for use as a replay cutoff.
+     *
+     * <p><b>Why a successor needs one.</b> A writer that has lost its shard-head but not yet noticed keeps
+     * appending under <em>its own</em> term, and a successor replays every term it finds, so those records
+     * are replayed as though they had been acknowledged before the takeover. They were not. The term-scoped
+     * key path this class's documentation calls a fence separates the two writers' <em>blobs</em>; it does
+     * not stop a successor from reading the older term, which is exactly what recovery does.
+     *
+     * <p>The cutoff closes that. Everything acknowledged before the takeover is already in the log, because
+     * a write is appended before it is acknowledged, so a snapshot taken at the successor's activation
+     * necessarily includes all of it. Anything appearing after that snapshot was written by a node that no
+     * longer owns the shard, and is dropped. A write in flight at the instant of the snapshot is dropped
+     * too, and correctly: its caller never received an acknowledgement.
+     *
+     * <p>This is a per-term high-water mark rather than the set of names, because names are zero-padded
+     * ordinals assigned by a single writer per term, so "everything at or below this name" is exactly
+     * "everything written before this moment" and costs one string per term to carry.
+     *
+     * @return the highest record name seen in each term, empty string for a term with no records yet
+     * @throws IOException if listing fails
+     */
+    public Map<Long, String> position() throws IOException {
+        final Map<Long, String> highest = new java.util.HashMap<>();
+        for (Map.Entry<Long, BlobContainer> term : termsInOrder().entrySet()) {
+            String max = "";
+            for (String name : term.getValue().listBlobs().keySet()) {
+                if (RECORD_NAME.matcher(name).matches() && name.compareTo(max) > 0) {
+                    max = name;
+                }
+            }
+            highest.put(term.getKey(), max);
+        }
+        return highest;
+    }
+
+    /**
+     * Reads the records still in the log that fall at or before a cutoff.
+     *
+     * <p>A term absent from the cutoff did not exist when the snapshot was taken, so every record under it
+     * was written afterwards and none of it replays. That is what drops a zombie that starts a fresh term
+     * directory, as well as one continuing an old one.
+     *
+     * @param cutoff a snapshot from {@link #position()}, or null to read everything
+     * @return the records to replay, ordered by term and then by ordinal
+     * @throws IOException if listing or reading fails
+     */
+    public List<WalRecord> replayable(Map<Long, String> cutoff) throws IOException {
         final List<WalRecord> records = new ArrayList<>();
-        for (BlobContainer container : byTerm.values()) {
+        for (Map.Entry<Long, BlobContainer> entry : termsInOrder().entrySet()) {
+            final BlobContainer container = entry.getValue();
+            if (cutoff != null && cutoff.containsKey(entry.getKey()) == false) {
+                continue;
+            }
+            final String limit = cutoff == null ? null : cutoff.get(entry.getKey());
             final List<String> names = new ArrayList<>(container.listBlobs().keySet());
             names.removeIf(name -> RECORD_NAME.matcher(name).matches() == false);
+            if (limit != null) {
+                names.removeIf(name -> name.compareTo(limit) > 0);
+            }
             names.sort(Comparator.naturalOrder());
             for (String name : names) {
                 try (InputStream in = container.readBlob(name)) {
@@ -168,6 +222,149 @@ public final class WalStore {
             }
         }
         return records;
+    }
+
+    /**
+     * Seals the log against a predecessor that has not yet stopped writing, and returns the cutoff to
+     * replay under.
+     *
+     * <p><b>Why the snapshot has to be durable.</b> A cutoff held only in memory protects the one recovery
+     * that took it. If that node then dies before publishing — which is exactly the case where the log
+     * still matters — the next successor takes its own snapshot, by which time the zombie's records have
+     * been sitting in the log looking like ordinary history for as long as it took. Writing the snapshot
+     * down makes it survive the successor that took it, which is the whole point: the first node to take
+     * over records where legitimate history ended, and every node after it inherits that answer.
+     *
+     * <p>Seals are merged by taking the <em>lowest</em> recorded position for each term, because the
+     * earliest seal was taken closest to the moment ownership actually moved and is therefore the tightest
+     * true bound. Re-sealing writes the merged answer, so one blob carries it and the older ones are then
+     * dropped; a crash between the write and the drop leaves both, and merging them gives the same answer.
+     *
+     * <p>Seals live in their own directory so that {@link #replayable(Map)} — which reads term directories
+     * — cannot mistake one for a term, and {@code dropOlderTerms} cannot delete one while pruning terms.
+     * {@link #deleteAll} does remove them, which is right: that is the log being destroyed, not truncated.
+     *
+     * @param term the term this node is taking the shard over at
+     * @return the cutoff to replay under
+     * @throws IOException if reading or writing the seals fails
+     */
+    public Map<Long, String> sealAt(long term) throws IOException {
+        final Map<Long, String> here = position();
+        final Map<Long, String> sealed = sealedPosition();
+        final long sealedBelow = highestSealedTerm();
+        final Map<Long, String> cutoff = new java.util.HashMap<>();
+        for (Map.Entry<Long, String> entry : here.entrySet()) {
+            if (entry.getKey() >= sealedBelow) {
+                // No seal speaks for this term: it is the last sealer's own term, or later. Its records
+                // are the ones that sealer legitimately wrote after taking over, and they must replay.
+                cutoff.put(entry.getKey(), entry.getValue());
+                continue;
+            }
+            // A seal does speak for this term, and it is authoritative even when it says nothing. A term
+            // that a seal taken above it does not mention had no records when that seal was written, so
+            // anything under it now appeared afterwards -- which is the steady state of this system, not
+            // an edge case: a publish truncates the log, so the usual state at takeover is an empty one,
+            // and falling back to the successor's own listing here would hand a zombie's later appends
+            // straight back. The empty string excludes every name.
+            final String earlier = sealed.getOrDefault(entry.getKey(), "");
+            cutoff.put(entry.getKey(), earlier.compareTo(entry.getValue()) > 0 ? entry.getValue() : earlier);
+        }
+
+        final StringBuilder body = new StringBuilder();
+        for (Map.Entry<Long, String> entry : new TreeMap<>(cutoff).entrySet()) {
+            body.append(entry.getKey()).append(' ').append(entry.getValue()).append('\n');
+        }
+        final byte[] bytes = body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        final String name = String.format(java.util.Locale.ROOT, "seal-%020d", term);
+        final BlobContainer seals = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
+        seals.writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, false);
+
+        final List<String> superseded = new ArrayList<>(seals.listBlobs().keySet());
+        superseded.removeIf(other -> SEAL_NAME.matcher(other).matches() == false || other.compareTo(name) >= 0);
+        if (superseded.isEmpty() == false) {
+            seals.deleteBlobsIgnoringIfNotExists(superseded);
+        }
+        return cutoff;
+    }
+
+    /**
+     * Reads the cutoff recorded by every node that has taken this shard over, merged.
+     *
+     * @return the lowest recorded position for each sealed term, empty if the log has never been sealed
+     * @throws IOException if reading fails
+     */
+    public Map<Long, String> sealedPosition() throws IOException {
+        final BlobContainer seals = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
+        final Map<Long, String> merged = new java.util.HashMap<>();
+        for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : seals.listBlobs().entrySet()) {
+            if (SEAL_NAME.matcher(blob.getKey()).matches() == false) {
+                continue;
+            }
+            final byte[] bytes;
+            try (InputStream in = seals.readBlob(blob.getKey())) {
+                bytes = in.readAllBytes();
+            }
+            for (String line : new String(bytes, java.nio.charset.StandardCharsets.UTF_8).split("\n")) {
+                if (line.isEmpty()) {
+                    continue;
+                }
+                final int space = line.indexOf(' ');
+                if (space < 0) {
+                    throw new IOException("unreadable WAL seal at " + seals.path().buildAsString() + blob.getKey());
+                }
+                final Long term = parseTermNumber(line.substring(0, space));
+                if (term == null) {
+                    throw new IOException("unreadable WAL seal at " + seals.path().buildAsString() + blob.getKey());
+                }
+                final String position = line.substring(space + 1);
+                merged.merge(term, position, (a, b) -> a.compareTo(b) <= 0 ? a : b);
+            }
+        }
+        return merged;
+    }
+
+    /**
+     * The highest term any seal was written at. Every term below it has been sealed, whether or not that
+     * seal mentions it — a seal that does not mention a term is saying the term was empty, which is a
+     * stronger statement than saying nothing.
+     *
+     * @return the highest sealing term, or {@link Long#MIN_VALUE} if the log has never been sealed
+     * @throws IOException if listing fails
+     */
+    private long highestSealedTerm() throws IOException {
+        final BlobContainer seals = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
+        long highest = Long.MIN_VALUE;
+        for (String name : seals.listBlobs().keySet()) {
+            if (SEAL_NAME.matcher(name).matches() == false) {
+                continue;
+            }
+            final Long term = parseTermNumber(name.substring("seal-".length()));
+            if (term != null && term > highest) {
+                highest = term;
+            }
+        }
+        return highest;
+    }
+
+    private static Long parseTermNumber(String text) {
+        try {
+            return Long.parseLong(text);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** The log's term directories, lowest term first, which is replay order. */
+    private Map<Long, BlobContainer> termsInOrder() throws IOException {
+        final BlobContainer walRoot = blobStore.blobContainer(shardBase.add("wal"));
+        final Map<Long, BlobContainer> byTerm = new TreeMap<>();
+        for (Map.Entry<String, BlobContainer> child : walRoot.children().entrySet()) {
+            final Long term = parseTerm(child.getKey());
+            if (term != null) {
+                byTerm.put(term, child.getValue());
+            }
+        }
+        return byTerm;
     }
 
     /**
@@ -270,7 +467,9 @@ public final class WalStore {
         final BlobContainer walRoot = blobStore.blobContainer(shardBase.add("wal"));
         for (BlobContainer child : walRoot.children().values()) {
             final List<String> ours = new ArrayList<>(child.listBlobs().keySet());
-            ours.removeIf(name -> RECORD_NAME.matcher(name).matches() == false);
+            // Seals go too: this is the log being destroyed, not truncated, so the cutoffs recorded
+            // against it have nothing left to bound.
+            ours.removeIf(name -> RECORD_NAME.matcher(name).matches() == false && SEAL_NAME.matcher(name).matches() == false);
             child.deleteBlobsIgnoringIfNotExists(ours);
         }
     }
