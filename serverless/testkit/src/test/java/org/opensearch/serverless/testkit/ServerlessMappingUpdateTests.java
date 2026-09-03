@@ -303,9 +303,10 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
             assertNotNull(node);
             for (String[] expected : new String[][] {
                 { "/_reindex", "search_after" },
-                // These four were served by M59, which is the point of the list shrinking. What is left is
-                // refused for a reason that survived contact.
-                { "/alpha/_explain/1", "per-shard scoring internals" },
+                // The list keeps shrinking, which is the point of it: four went in M59 and _explain went in
+                // M60, whose refusal -- "the fan-out here merges hits rather than exposing per-shard scoring
+                // internals" -- turned out to describe no part of an explain. What is left is refused for a
+                // reason that survived contact.
                 { "/alpha/_rank_eval", "harness doing the evaluating" },
                 // Templates exist since M56; only their table rendering is unrouted.
                 { "/_cat/templates", "GET /_index_template returns them all" } }) {

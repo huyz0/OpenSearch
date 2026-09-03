@@ -508,6 +508,21 @@ a single compare-and-swap and genuinely atomic; only actions spanning several al
 and `_resolve/index` were refused with reasons true of neither — validation is parsing, and resolution over a
 *named* set is not an enumeration. See [`m59-alias-shapes-notes.md`](m59-alias-shapes-notes.md).
 
+**Why a document scored what it did (M60).** Asked as a question — support explain, unless it is impossible
+or costs scalability — and the answer was that its refusal described nothing. That refusal said explaining a
+score "needs the scorer for one document on one shard; the fan-out here merges hits rather than exposing
+per-shard scoring internals". The scorer for one document on one shard is exactly what is available, and an
+explain does no fan-out at all: it names a document, a named document lives on one shard, and the whole
+operation is one term lookup plus Lucene's own `explain` — **strictly cheaper than a search**. Core's own
+`TransportExplainAction` confirms it: everything it takes from the cluster is *which shard answers*, which is
+the job this shell already does from the shard-head. Two things are new rather than copied. A document that
+exists and does not match is a 200 with Lucene's account of why, not a 404 — the half a get cannot answer. And
+the response names which copy scored it, because a score is a function of the whole shard's term and document
+frequencies, so an explanation from a published commit is a true account of that commit and not of what a
+search would return; a cluster never has to say this because every copy of a shard holds the same segments.
+For the same reason an explain is forwarded to the owner rather than served from a commit, following a get and
+not a search. See [`m60-explain-notes.md`](m60-explain-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

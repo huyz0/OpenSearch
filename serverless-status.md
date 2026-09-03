@@ -185,6 +185,14 @@ the same way this shell has always chosen its transport — "no modules are load
 disk, not about the code in `modules/`. Stored scripts stay refused because `ScriptService` reads them out of
 cluster metadata and there is none ([`m57-scripts-notes.md`](m57-scripts-notes.md)).
 
+**Why a document scored what it did.** `GET|POST /{index}/_explain/{id}` accounts for one document's score
+against one query, in Lucene's own words. It is served because it is not a fan-out: an explain names a
+document, a named document lives on one shard, so it is one term lookup and one `explain` call — **cheaper
+than the search whose score it explains**, which has to ask every shard. A document that exists and does not
+match is a 200 saying why, not a 404; that is the half a get cannot answer. The response says which copy
+scored it, because a score is a function of the whole shard's term and document frequencies and a published
+commit's are not a live writer's ([`m60-explain-notes.md`](m60-explain-notes.md)).
+
 **Aliases, in OpenSearch's own spellings.** `PUT|GET|HEAD|DELETE /{index}/_alias/{name}` alongside the
 name-scoped form this shell shipped with. `POST /_aliases` serves the atomic move it exists for — actions on
 one alias are one register, so the whole move is one compare-and-swap — and refuses actions spanning several,

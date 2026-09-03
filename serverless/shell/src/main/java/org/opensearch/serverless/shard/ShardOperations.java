@@ -485,6 +485,100 @@ public final class ShardOperations {
         }
     }
 
+    /** An explanation, and which copy produced it. */
+    public record Explained(boolean exists, org.apache.lucene.search.Explanation explanation, String servedBy, boolean realtime) {
+
+        /**
+         * Reports whether the document matched.
+         *
+         * @return true when it exists and scored a match
+         */
+        public boolean matched() {
+            return exists && explanation != null && explanation.isMatch();
+        }
+    }
+
+    /**
+     * Explains why a document does or does not match a query.
+     *
+     * <p>Routed exactly as a get is, and for the same reason: an explain names one document, and the copy
+     * that has every acknowledged write is the owner. Explaining from a published commit while a writer holds
+     * newer segments would produce a plausible number computed from the wrong statistics — a score is a
+     * function of the whole shard's term and document frequencies, not just of the document being scored.
+     *
+     * <p>Which copy answered is returned rather than inferred, for the reason {@link Read} returns it: when
+     * nobody owns the shard this reads a published commit, and a caller comparing this score against a search
+     * result needs to know the two were computed over the same segments.
+     *
+     * @param index the index
+     * @param id the document id
+     * @param query the query to score against
+     * @return the explanation and who produced it
+     * @throws IOException if the explain fails or no copy can answer
+     */
+    public Explained explain(String index, String id, org.opensearch.index.query.QueryBuilder query) throws IOException {
+        return gated(
+            org.opensearch.action.explain.ExplainAction.NAME,
+            new org.opensearch.action.explain.ExplainRequest(index, id),
+            () -> doExplain(index, id, query)
+        );
+    }
+
+    private Explained doExplain(String index, String id, org.opensearch.index.query.QueryBuilder query) throws IOException {
+        final Placement placement = place(index, id);
+        if (placement.local() != null) {
+            final ShardExplain.Outcome outcome = ShardExplain.execute(node.searchService(), placement.local(), id, query);
+            return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), true);
+        }
+        if (placement.owner() == null) {
+            // Nobody owns it, so the published commit is the current state -- except before the first publish,
+            // where there is no commit to open and no writer about to make one. The same case doGet handles,
+            // and the same answer: a document that has never existed, rather than a failure.
+            if (plane.segmentPublisher(index, placement.shard()).readManifest().isEmpty()) {
+                return new Explained(false, null, node.localNode().getId(), false);
+            }
+            try {
+                final var shardId = node.serveAsReader(plane, index, placement.shard());
+                final ShardExplain.Outcome outcome = ShardExplain.execute(node.searchService(), shardId, id, query);
+                return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), false);
+            } catch (IOException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new IOException("could not open shard " + placement.shard() + " of " + index + " as a reader", e);
+            }
+        }
+        if (placement.owner().equals(node.localNode().getId())) {
+            throw notHere(index, placement);
+        }
+        try {
+            final var peer = node.router().peer(placement.owner());
+            if (peer.isEmpty()) {
+                node.signals().ownershipDoubted(index, placement.shard());
+                throw new NotHereException(
+                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease",
+                    placement.owner(),
+                    true
+                );
+            }
+            final var response = node.router()
+                .forwardExplain(
+                    peer.get(),
+                    new org.opensearch.serverless.transport.ForwardedExplainRequest(index, placement.shard(), id, query)
+                );
+            return new Explained(response.exists(), response.explanation(), response.ownerNodeId(), true);
+        } catch (NotHereException e) {
+            throw e;
+        } catch (Exception e) {
+            node.signals().ownershipDoubted(index, placement.shard());
+            throw new NotHereException(
+                "could not forward to " + placement.owner() + ", which the shard-head named as owner: " + e.getMessage(),
+                placement.owner(),
+                true,
+                e
+            );
+        }
+    }
+
     /** What a whole search found, and how much of the index it managed to look at. */
     public static final class SearchOutcome {
 

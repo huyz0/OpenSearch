@@ -74,6 +74,10 @@ serves, so it belongs in the harness doing the evaluating rather than in the nod
 - **`_explain` is still refused.** Explaining a score needs the scorer for one document on one shard, which is
   a per-shard internal this surface does not expose — the one endpoint from the comparison whose original
   reason survived contact.
+  - **Corrected by M60: it did not survive contact.** The scorer for one document on one shard is precisely
+    what is available, and an explain does no fan-out at all — it is cheaper than a search. This sentence was
+    written from the route list rather than from `TransportExplainAction`, which is how it came to restate a
+    refusal instead of testing it. See `m60-explain-notes.md`.
 - **Nothing here is proven against a real object store** (D5/R11), unchanged.
 
 M59 is done. Every capability the four-way comparison found in AWS or Elastic is now served or refused for a

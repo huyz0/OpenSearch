@@ -15,6 +15,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.ShardExplain;
 import org.opensearch.serverless.shard.ShardQuery;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.threadpool.ThreadPool;
@@ -103,6 +104,12 @@ public final class ShardRouter {
             this::handleSearch
         );
         transportService.registerRequestHandler(
+            ForwardedExplainRequest.ACTION,
+            ThreadPool.Names.SEARCH,
+            ForwardedExplainRequest::new,
+            this::handleExplain
+        );
+        transportService.registerRequestHandler(
             ForwardedFrozenSearchRequest.ACTION,
             ThreadPool.Names.SEARCH,
             ForwardedFrozenSearchRequest::new,
@@ -165,6 +172,19 @@ public final class ShardRouter {
             throw new IllegalStateException("this node does not own " + request.index() + "[" + request.shard() + "]");
         }
         channel.sendResponse(new ForwardedGetResponse(node.localNode().getId(), node.get(shardId, request.id())));
+    }
+
+    private void handleExplain(ForwardedExplainRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
+        final ShardId shardId = localShard(request.index(), request.shard());
+        if (shardId == null) {
+            // Refused rather than opened as a reader, following handleGet and not handleSearch. An explain
+            // was forwarded here because the shard-head named this node the owner; if the shard is not open
+            // as a writer that head is stale, and explaining from a published commit would score against
+            // segment statistics that are missing every unpublished write. The number would look right.
+            throw new IllegalStateException("this node does not own " + request.index() + "[" + request.shard() + "]");
+        }
+        final ShardExplain.Outcome outcome = ShardExplain.execute(node.searchService(), shardId, request.id(), request.query());
+        channel.sendResponse(new ForwardedExplainResponse(node.localNode().getId(), outcome.exists(), outcome.explanation()));
     }
 
     private void handleSearch(ForwardedSearchRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
@@ -346,6 +366,28 @@ public final class ShardRouter {
             request,
             TransportRequestOptions.builder().withTimeout(timeout).build(),
             new Handler<>(future, ForwardedGetResponse::new)
+        );
+        return future.actionGet(timeout);
+    }
+
+    /**
+     * Sends an explain to the node owning the document's shard and waits for the answer.
+     *
+     * @param peer the owning node
+     * @param request the explain
+     * @return what that node found
+     */
+    public ForwardedExplainResponse forwardExplain(DiscoveryNode peer, ForwardedExplainRequest request) {
+        final PlainActionFuture<ForwardedExplainResponse> future = PlainActionFuture.newFuture();
+        // The get bound rather than the search one, for the reason a get uses it: this is a point lookup on
+        // one shard with no fan-out to wait behind.
+        final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
+        transportService.sendRequest(
+            peer,
+            ForwardedExplainRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedExplainResponse::new)
         );
         return future.actionGet(timeout);
     }
