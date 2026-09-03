@@ -306,20 +306,21 @@ public class ServerlessTemplateTests extends OpenSearchTestCase {
     }
 
     /**
-     * Ingest pipelines stay refused, and the reason is now the real one.
+     * Ingest pipelines run, which is what M56's refusal said it would take to change.
      *
-     * <p>The old reason said there was no cluster state for a pipeline to live in. Templates now prove that
-     * wrong — they live in a register. What is missing is what would <em>run</em> one.
+     * <p>That refusal named the obstacle precisely — storing was never the problem, running was, and every
+     * processor lives in a module this shell did not load — and said enabling it was "a decision about
+     * loading modules, not about adding an endpoint". M57 made that decision and M58 applied it. The
+     * assertion here is that the milestone this test belongs to left an accurate account behind it.
      */
-    public void testIngestPipelinesRefuseForTheRealReason() throws Exception {
+    public void testIngestPipelinesRunSinceTheModuleDecisionWasMade() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = running(plane(clock, createTempDir()), "tmpl-pipeline")) {
             assertNotNull(node);
-            final Answer refused = call("GET", "/_ingest/pipeline/x", null);
-            assertEquals(refused.body(), 501, refused.status());
-            assertTrue("storing is not the problem: " + refused.body(), refused.has("storing a pipeline is not the problem"));
-            assertTrue("running it is: " + refused.body(), refused.has("ingest-common module"));
-            assertFalse("the old reason must be gone: " + refused.body(), refused.has("no cluster state for a pipeline"));
+            final Answer stored = call("PUT", "/_ingest/pipeline/x", "{\"processors\":[{\"set\":{\"field\":\"seen\",\"value\":true}}]}");
+            assertEquals("pipelines are served since M58: " + stored.body(), 200, stored.status());
+            assertTrue(call("GET", "/_ingest/pipeline/x", null).has("\"seen\""));
         }
     }
+
 }

@@ -103,6 +103,7 @@ public final class DocumentHandler extends BaseRestHandler {
         final String ifSeqNoParam = request.param("if_seq_no");
         final String ifPrimaryTermParam = request.param("if_primary_term");
         final String version = request.param("version");
+        final String pipeline = request.param("pipeline");
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
@@ -154,7 +155,52 @@ public final class DocumentHandler extends BaseRestHandler {
                 )
             );
         }
-        if (deletion == false && (source == null || source.isBlank())) {
+        // The pipeline runs here, before anything is routed or written: a document is shaped and then
+        // stored, and a caller must never be told a write succeeded against a document the pipeline was
+        // supposed to change and did not. A dropped document is not an error and not a write.
+        String shaped = source;
+        boolean dropped = false;
+        if (deletion == false && pipeline != null && source != null) {
+            final var serving0 = node.get();
+            final var plane0 = plane.get();
+            if (serving0 != null && plane0 != null) {
+                try {
+                    final var stored = plane0.pipelines().get(pipeline);
+                    if (stored.isEmpty()) {
+                        return channel -> channel.sendResponse(
+                            IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "pipeline_missing", "no such pipeline: " + pipeline)
+                        );
+                    }
+                    final var compiled = serving0.ingestPipelines().compile(pipeline, stored.get());
+                    final var outcome = serving0.ingestPipelines().run(compiled, index, id, source);
+                    dropped = outcome.dropped();
+                    shaped = outcome.source();
+                } catch (Exception e) {
+                    final String reason = e.getMessage() == null ? e.toString() : e.getMessage();
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "pipeline_failed", reason)
+                    );
+                }
+            }
+        }
+        if (dropped) {
+            // Reported as what it is. Classic OpenSearch answers "noop" for a dropped document, and a
+            // caller that cannot tell "dropped" from "written" cannot tell whether its pipeline works.
+            return channel -> {
+                try (XContentBuilder builder = channel.newBuilder()) {
+                    builder.startObject();
+                    builder.field("_index", index);
+                    builder.field("_id", id);
+                    builder.field("result", "noop");
+                    builder.field("dropped_by_pipeline", pipeline);
+                    builder.endObject();
+                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                }
+            };
+        }
+        final String shapedSource = shaped;
+
+        if (deletion == false && (shapedSource == null || shapedSource.isBlank())) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a document body is required")
             );
@@ -225,7 +271,7 @@ public final class DocumentHandler extends BaseRestHandler {
                             deletion,
                             index,
                             id,
-                            source,
+                            shapedSource,
                             () -> serving.router()
                                 .forwardIndex(
                                     peer.get(),
@@ -233,7 +279,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                         index,
                                         shard,
                                         id,
-                                        source == null ? "" : source,
+                                        shapedSource == null ? "" : shapedSource,
                                         refresh,
                                         deletion,
                                         ifSeqNo,
@@ -320,7 +366,7 @@ public final class DocumentHandler extends BaseRestHandler {
         // should be reading the next request on remote IO is how a node stops answering under load.
         // A single write is accounted the same way a batch is, for the same reason: a flood of large
         // documents is a flood of large documents whether or not they arrived together.
-        final long inFlightBytes = source == null ? 0L : source.length();
+        final long inFlightBytes = shapedSource == null ? 0L : shapedSource.length();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             try (
                 org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
@@ -334,7 +380,7 @@ public final class DocumentHandler extends BaseRestHandler {
                     source,
                     () -> deletion
                         ? serving.delete(shardId, id, ifSeqNo, ifPrimaryTerm)
-                        : serving.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent)
+                        : serving.index(shardId, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent)
                 );
                 if (refresh) {
                     // Same meaning as classic OpenSearch: make this write visible to search before

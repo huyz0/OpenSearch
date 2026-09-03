@@ -509,6 +509,19 @@ public final class MetadataPlane {
      *
      * @return the component-template store
      */
+    /**
+     * Returns the store holding ingest pipelines.
+     *
+     * <p>A {@link TemplateStore} because the shape is identical: named JSON documents, one register each,
+     * bounded on creation, and a prefix so a foreign object in the container is not read as one. Reusing it
+     * rather than copying it means the ExtrasFS lesson M56 learned applies here without being re-learned.
+     *
+     * @return the pipeline store
+     */
+    public TemplateStore pipelines() {
+        return new TemplateStore(blobStore.blobContainer(RegisterMap.pipelines(base)));
+    }
+
     public TemplateStore componentTemplates() {
         return new TemplateStore(blobStore.blobContainer(RegisterMap.componentTemplates(base)));
     }

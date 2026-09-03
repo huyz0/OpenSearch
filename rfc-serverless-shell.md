@@ -488,6 +488,17 @@ way D2 promises, five of them reporting an unimplemented API as a *missing index
 rather than a path: an underscore-prefixed index name is an API, and the same backstop covers node selectors
 and repository names. See [`m57-scripts-notes.md`](m57-scripts-notes.md).
 
+**Ingest pipelines, and the dynamic mapping under them (M58).** M56 refused pipelines and named the obstacle
+exactly: storing one was never the problem, running one was, and every processor lives in a module this shell
+does not load. M57 decided that question by choosing Painless the way the transport had always been chosen, so
+this applies it a third time — pipelines live in a register, compile through core's own `Pipeline#create`, and
+run before a document is routed. **Probing them found something larger:** an index created without an explicit
+mapping could not accept a single document, because core returns `MAPPING_UPDATE_REQUIRED` with the addition a
+write needs and nothing here did the cluster manager's part. It survived fifty-seven milestones because every
+test in this repository declared its mappings. The fix reuses M52's compare-and-swap, deliberately, so there
+is one way a mapping changes rather than two that could drift. See
+[`m58-ingest-notes.md`](m58-ingest-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

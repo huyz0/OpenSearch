@@ -172,6 +172,13 @@ indices using it. `GET /_list/indices/{prefix}*` lists indices through one bound
 prefix matching more than the cap rather than truncating**, which is why it is `_list` and not `_cat`:
 OpenSearch added `_list` for exactly this reason ([`m53-discovery-notes.md`](m53-discovery-notes.md)).
 
+**Ingest pipelines, and dynamic mapping.** `_ingest/pipeline/{id}` stores a pipeline in a register and
+compiles it at `PUT`, so one naming a processor this deployment does not have is refused where the operator is
+standing rather than at the first write that uses it. `?pipeline=` runs it before the document is routed or
+written, and a dropped document is reported as dropped. Separately: a document carrying a field the mapping
+does not describe now grows the mapping and is indexed — before M58 an index created without an explicit
+mapping could not accept a single document ([`m58-ingest-notes.md`](m58-ingest-notes.md)).
+
 **Scripts.** Painless runs here: script queries, `script_score`, `script_fields`, scripted aggregations and
 scripted updates including `ctx.op` for noop and delete. The engine is chosen by name and registered directly,
 the same way this shell has always chosen its transport — "no modules are loaded" was about discovery from
@@ -248,10 +255,10 @@ These are decisions, not gaps. Each answers 501 with a reason.
   slightly later, when the shard is opened, so a predecessor's appends in between are still replayed.
   Closing it means sealing at the swap, which the path that opens a shard from projected truth rather than
   from an acquisition does not have. The unbounded half is closed.
-- Ingest pipelines are refused, and the reason is now the real one: storing one is not the problem — templates
-  store the same way — but every processor a real pipeline uses lives in the `ingest-common` module, and this
-  shell loads no modules, so a stored pipeline would have almost nothing it could run. Enabling it is a
-  decision about loading modules, not about adding an endpoint.
+- `?pipeline=` is honoured on single-document writes only. `_bulk` does not run pipelines and
+  `index.default_pipeline` is not read, so a client setting a default pipeline gets no pipeline and no
+  warning — the first thing to fix in that area.
+- There is no `_ingest/pipeline/_simulate`: a pipeline cannot be tested without writing a document.
 - `_nodes/stats` is refused, and its reason is now specific rather than shared: each node answers for itself
   at `GET /_serverless/stats` and this node knows where the others are, so what is missing is the fan-out that
   would ask them and the accounting that would report which ones did not answer — a scoping decision, not an
@@ -319,7 +326,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-490 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+497 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

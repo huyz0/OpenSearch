@@ -24,6 +24,10 @@ dependencies {
   // "no module code is used" -- it is that nothing is discovered from disk. A shell that chooses its
   // transport by name can choose its script engine by name.
   implementation project(':modules:lang-painless')
+  // And the ingest processors, by the same rule. M56 recorded that enabling pipelines was "a decision about
+  // loading modules, not about adding an endpoint"; M57 made that decision by choosing painless the way the
+  // transport had always been chosen, so this is that decision applied a third time rather than a new one.
+  implementation project(':modules:ingest-common')
   // Object storage. Used through RepositoryPlugin#getRepositories, the supported API, rather than by
   // reaching into the plugin's package-private constructors -- which is what the R11 test harness had to
   // do and is not something production code should copy.

@@ -790,6 +790,7 @@ public final class ServerlessNode implements Closeable {
         );
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.TemplateHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PipelineHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MultiSearchHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(
             new ServerlessHealthHandler(
@@ -926,17 +927,6 @@ public final class ServerlessNode implements Closeable {
                 "/_search/scroll",
                 "scroll holds a search context open on a node; use a point in time (POST /{index}/_pit) with "
                     + "search_after, which is held in the object store and is not tied to one node" },
-            {
-                "/_ingest/pipeline/{id}",
-                // The old reason -- "there is no cluster state for a pipeline to live in" -- was wrong in
-                // the way four others turned out to be, and templates now prove it: a pipeline stores
-                // perfectly well in a register. What is actually missing is what would run it.
-                "storing a pipeline is not the problem -- index templates store the same way, in a register. "
-                    + "Running one is: every processor a real pipeline uses (set, rename, gsub, grok, date) "
-                    + "lives in the ingest-common module, and this shell deliberately loads no modules, so a "
-                    + "stored pipeline would have almost nothing it could construct. Accepting pipelines that "
-                    + "silently never ran would be worse than refusing them. Enabling this is a decision "
-                    + "about loading modules, not about adding an endpoint" },
             {
                 "/_scripts/{id}",
                 // The old reason stopped being true the moment an engine was registered. Painless runs here
@@ -1593,6 +1583,43 @@ public final class ServerlessNode implements Closeable {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) throws java.io.IOException {
+        return index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
+    }
+
+    /**
+     * Indexes a document, optionally growing the mapping to fit it.
+     *
+     * <p><b>Dynamic mapping, which this shell did not have.</b> When a document carries a field the mapping
+     * does not describe, core's engine does not index it and does not fail either: it returns
+     * {@code MAPPING_UPDATE_REQUIRED} along with the mapping addition that would let the write succeed. A
+     * classic node sends that addition to the cluster manager, waits for it to be applied, and retries.
+     * There is no cluster manager here, and nothing was doing the equivalent — so an index created without a
+     * complete mapping could not accept a single document, and every write of an undeclared field answered
+     * with a 500. Every test in this repository happened to declare its mappings, which is why it went unseen.
+     *
+     * <p>The equivalent here is the one M52 already built: merge the addition into the descriptor under a
+     * compare-and-swap, apply it to the open shard, and retry once. Concurrent writers adding different
+     * fields both win, because that is what the compare-and-swap is for.
+     *
+     * @param shardId the shard to write to
+     * @param id the document id
+     * @param source the document source
+     * @param ifSeqNo the sequence number the document must be at, or unassigned
+     * @param ifPrimaryTerm the primary term the document must be at, or 0
+     * @param requireAbsent whether the write must fail if the document already exists
+     * @param mayGrowMapping whether a required mapping update should be applied and the write retried
+     * @return what the engine assigned this write
+     * @throws java.io.IOException if the shard is not held here, or the write fails
+     */
+    public WriteOutcome index(
+        org.opensearch.core.index.shard.ShardId shardId,
+        String id,
+        String source,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent,
+        boolean mayGrowMapping
+    ) throws java.io.IOException {
         ensureStarted();
         final var shard = reconciler.shard(shardId);
         if (shard == null) {
@@ -1629,6 +1656,13 @@ public final class ServerlessNode implements Closeable {
             if (result.getFailure() instanceof org.opensearch.index.engine.VersionConflictEngineException conflict) {
                 throw conflict;
             }
+        }
+        if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.MAPPING_UPDATE_REQUIRED && mayGrowMapping) {
+            // The document named a field the mapping does not have. Grow the mapping and write it again;
+            // once, because a second MAPPING_UPDATE_REQUIRED after the update has been applied means
+            // something other than a missing field, and retrying forever would hide it.
+            growMapping(shardId, result.getRequiredMappingUpdate());
+            return index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, false);
         }
         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
             // s0-findings.md F5: this is a value, not a throw. A caller that ignores it indexes nothing
@@ -1687,6 +1721,83 @@ public final class ServerlessNode implements Closeable {
                 "could not log " + records.size() + " operation(s); the shard has been released so it is not served",
                 e
             );
+        }
+    }
+
+    /**
+     * Adds what a document needed to the index's mapping, durably, and applies it here.
+     *
+     * <p>The descriptor is the mapping's home, so this is the same compare-and-swap
+     * {@code PUT /{index}/_mapping} performs — deliberately, because two ways of changing a mapping would be
+     * two ways for it to drift. A lost swap re-reads and retries, so two writers introducing different fields
+     * at the same time both keep theirs.
+     *
+     * @param shardId the shard whose write needed the field
+     * @param addition what core says the mapping is missing
+     * @throws java.io.IOException if the mapping cannot be stored
+     */
+    private void growMapping(org.opensearch.core.index.shard.ShardId shardId, org.opensearch.index.mapper.Mapping addition)
+        throws java.io.IOException {
+        final var plane = metadataPlane;
+        if (plane == null || addition == null) {
+            return;
+        }
+        final String indexName = shardId.getIndexName();
+        for (int attempt = 0; attempt < 4; attempt++) {
+            final long generation = plane.descriptorGeneration(indexName);
+            final var current = plane.describe(indexName);
+            if (current.isEmpty()) {
+                return;
+            }
+            final String merged;
+            final var mapperService = indicesService.createIndexMapperService(current.get().toIndexMetadata(java.util.Map.of()));
+            try {
+                if (current.get().mapping() != null) {
+                    mapperService.merge(
+                        org.opensearch.index.mapper.MapperService.SINGLE_MAPPING_NAME,
+                        new org.opensearch.common.compress.CompressedXContent(current.get().mapping()),
+                        org.opensearch.index.mapper.MapperService.MergeReason.MAPPING_RECOVERY
+                    );
+                }
+                final var grown = mapperService.merge(
+                    org.opensearch.index.mapper.MapperService.SINGLE_MAPPING_NAME,
+                    new org.opensearch.common.compress.CompressedXContent(addition.toString()),
+                    org.opensearch.index.mapper.MapperService.MergeReason.MAPPING_UPDATE
+                );
+                merged = unwrapMappingType(grown.mappingSource().string());
+            } catch (Exception e) {
+                throw new java.io.IOException("could not grow the mapping of " + indexName + " to fit the document", e);
+            } finally {
+                mapperService.close();
+            }
+            if (merged.equals(current.get().mapping())) {
+                return;
+            }
+            final var updated = current.get().withMapping(merged);
+            if (plane.updateDescriptor(updated, generation).isPresent()) {
+                reconciler.refreshMapping(indexName, updated);
+                return;
+            }
+        }
+        throw new java.io.IOException("the mapping of " + indexName + " is being changed concurrently; retry the write");
+    }
+
+    /** Strips the single mapping type core wraps a merged mapping in, as MappingUpdateHandler does. */
+    private static String unwrapMappingType(String source) throws java.io.IOException {
+        final java.util.Map<String, Object> parsed = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+            new org.opensearch.core.common.bytes.BytesArray(source),
+            false,
+            org.opensearch.common.xcontent.XContentType.JSON
+        ).v2();
+        final Object inner = parsed.get(org.opensearch.index.mapper.MapperService.SINGLE_MAPPING_NAME);
+        if (parsed.size() != 1 || inner instanceof java.util.Map == false) {
+            return source;
+        }
+        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            @SuppressWarnings("unchecked")
+            final java.util.Map<String, Object> body = (java.util.Map<String, Object>) inner;
+            builder.map(body);
+            return builder.toString();
         }
     }
 
@@ -2369,12 +2480,12 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * The script service a plugin is given: real, with no engines registered.
+     * The script service, with Painless registered.
      *
-     * <p>Scripting is not offered, and this is how to say so usefully. A plugin that compiles a script gets
-     * core's own "cannot compile: no lang registered" — the same error, in the same words, that a classic
-     * node gives when the language's module is not installed — rather than a {@code NullPointerException}
-     * from inside its own code. A plugin that merely holds the reference, as most do, is unaffected.
+     * <p>Chosen by name rather than discovered from disk, which is how this shell has always taken its
+     * transport. A plugin handed this service can compile and run a script; a language nothing registers
+     * still fails with core's own "cannot compile: no lang registered", in the same words a classic node
+     * uses when a language's module is not installed.
      *
      * @return the script service
      */
@@ -2396,6 +2507,44 @@ public final class ServerlessNode implements Closeable {
             );
         }
         return scriptService;
+    }
+
+    private volatile org.opensearch.serverless.ingest.IngestPipelines ingestPipelines;
+
+    /**
+     * Returns the ingest pipeline compiler, built over core's own processor factories.
+     *
+     * <p>{@code Processor.Parameters} is given what this shell has and null for what it does not: there is no
+     * {@code IngestService} here, because pipelines come from a register rather than from cluster state, and
+     * no {@code Client}, because nothing on this surface forwards a processor's own request. A processor that
+     * needs either fails when it is compiled, at {@code PUT} time, naming itself.
+     *
+     * @return the pipeline compiler
+     */
+    public synchronized org.opensearch.serverless.ingest.IngestPipelines ingestPipelines() {
+        if (ingestPipelines == null) {
+            final var parameters = new org.opensearch.ingest.Processor.Parameters(
+                new org.opensearch.env.Environment(settings, null),
+                scriptService(),
+                null,                                   // analysis registry: no processor here needs one
+                threadPool().getThreadContext(),
+                threadPool()::relativeTimeInMillis,
+                (delay, command) -> threadPool().schedule(
+                    command,
+                    org.opensearch.common.unit.TimeValue.timeValueMillis(delay),
+                    ThreadPool.Names.GENERIC
+                ),
+                null,                                   // ingest service: pipelines live in a register
+                null,                                   // client: nothing here re-enters the API
+                task -> threadPool().generic().execute(task),
+                indicesService
+            );
+            ingestPipelines = new org.opensearch.serverless.ingest.IngestPipelines(
+                new org.opensearch.ingest.common.IngestCommonModulePlugin().getProcessors(parameters),
+                scriptService()
+            );
+        }
+        return ingestPipelines;
     }
 
     /**

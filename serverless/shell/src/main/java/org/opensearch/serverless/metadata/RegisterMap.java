@@ -141,6 +141,20 @@ public final class RegisterMap {
         return base.add("templates").add("component");
     }
 
+    /**
+     * Where ingest pipelines live: one register per pipeline id.
+     *
+     * <p>The same shape as templates, and for the same reason — operator-authored configuration, few in
+     * number, read by name. Core keeps pipelines in cluster state; there is none here, so they keep company
+     * with every other piece of this deployment's configuration.
+     *
+     * @param base the deployment root
+     * @return the pipeline container
+     */
+    public static BlobPath pipelines(BlobPath base) {
+        return base.add("pipelines");
+    }
+
     public static BlobPath repositories(BlobPath base) {
         return base.add("repositories");
     }
