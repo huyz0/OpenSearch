@@ -478,6 +478,16 @@ pipelines stay refused with the reason that is actually true: storing one is eas
 pipeline uses lives in a module this shell deliberately does not load, and accepting pipelines that silently
 never ran would be worse than refusing them. See [`m56-templates-notes.md`](m56-templates-notes.md).
 
+**Scripts, and the last of the typos (M57).** "Modules are deliberately not loaded" was always about
+discovery from disk, not about the code in `modules/` — the shell has depended on `modules:transport-netty4`
+directly since the beginning, picking its transport by name. Painless is now chosen the same way, so script
+queries, scores, fields, aggregations and updates all run. Stored scripts stay refused for a structural reason:
+`ScriptService` is a `ClusterStateApplier` and reads them from cluster metadata, of which there is none — the
+same line AWS draws. Separately, the four-way comparison found twenty-seven endpoints that did not answer the
+way D2 promises, five of them reporting an unimplemented API as a *missing index*. That is fixed as a class
+rather than a path: an underscore-prefixed index name is an API, and the same backstop covers node selectors
+and repository names. See [`m57-scripts-notes.md`](m57-scripts-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

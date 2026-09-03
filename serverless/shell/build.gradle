@@ -20,6 +20,10 @@ dependencies {
   runtimeOnly project(':libs:opensearch-plugin-classloader')
   // The shell picks its transport directly instead of discovering it through the plugin system.
   implementation project(':modules:transport-netty4')
+  // And its scripting engine, for the same reason and by the same route. "No modules are loaded" was never
+  // "no module code is used" -- it is that nothing is discovered from disk. A shell that chooses its
+  // transport by name can choose its script engine by name.
+  implementation project(':modules:lang-painless')
   // Object storage. Used through RepositoryPlugin#getRepositories, the supported API, rather than by
   // reaching into the plugin's package-private constructors -- which is what the R11 test harness had to
   // do and is not something production code should copy.

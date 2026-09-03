@@ -139,6 +139,29 @@ public final class IndexAdminHandler extends BaseRestHandler {
             );
         }
 
+        // A name beginning with an underscore is an API this shell does not implement, not an index.
+        //
+        // <b>Why a backstop rather than one refusal per endpoint.</b> The GET /{index} route matches any
+        // single-segment path, so every top-level API that is not separately registered lands here and is
+        // answered "no such index: _stats" -- a confident wrong answer about something that was never an
+        // index, which sends a caller looking for a missing index instead of a missing endpoint. M50 fixed
+        // exactly this for /_search by routing /_search; that fixes one path and leaves the next one. This
+        // catches the whole class, including endpoints nobody has thought of yet.
+        if (index != null && index.startsWith("_")) {
+            return channel -> channel.sendResponse(
+                error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "not_implemented",
+                    "'"
+                        + index
+                        + "' is not an index: names beginning with an underscore are reserved for APIs, and "
+                        + "this shell does not implement this one. An index name that is not there answers 404; this "
+                        + "is a 501 because there is nothing here to find under any name"
+                )
+            );
+        }
+
         // Which projection of the descriptor this path asks for. _mapping and _settings are the same read
         // as GET /{index}, rendered narrower, so neither adds an object-store request.
         final View view;

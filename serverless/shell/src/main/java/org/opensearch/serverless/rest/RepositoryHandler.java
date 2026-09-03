@@ -91,6 +91,22 @@ public final class RepositoryHandler extends BaseRestHandler {
             // above registers PUT/POST/DELETE without {repo}.
             return channel -> dispatch(channel, () -> handleList(channel, metadata, null));
         }
+        if (repoParam.startsWith("_")) {
+            // Not a repository name: an underscore-prefixed segment here is an API this shell does not
+            // implement, and answering "no such repository: _status" would send a caller looking for a
+            // repository that was never a name. The same class as an index API read as an index name.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "not_implemented",
+                    "'"
+                        + repoParam
+                        + "' is not a repository: names beginning with an underscore are reserved for "
+                        + "APIs, and this shell does not implement this one"
+                )
+            );
+        }
         final List<String> names = List.of(repoParam.split(","));
 
         switch (request.method()) {

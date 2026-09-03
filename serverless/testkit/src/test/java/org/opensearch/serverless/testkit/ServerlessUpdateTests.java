@@ -250,7 +250,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
     }
 
     /** A scripted update is refused, the same way scripting is refused everywhere else. */
-    public void testAScriptedUpdateIsRefused() throws Exception {
+    public void testAScriptedUpdateRunsAndAStoredOneIsRefused() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
@@ -260,13 +260,19 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
             node.activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"x\",\"n\":1}");
 
-            final Response refused = send(http, "POST", "/alpha/_update/1", "{\"script\":{\"source\":\"ctx._source.n += 1\"}}");
-            assertEquals(refused.body(), 501, refused.status());
-            assertTrue("must say why: " + refused.body(), refused.body().contains("no scripting engine"));
+            // Since M57 a scripted update runs: an engine is registered, chosen by name the same way the
+            // transport is. What is still refused is a script referenced by id, because a stored script
+            // resolves through cluster state this design does not have.
+            final Response ran = send(http, "POST", "/alpha/_update/1", "{\"script\":{\"source\":\"ctx._source.n += 1\"}}");
+            assertEquals(ran.body(), 200, ran.status());
+            assertTrue(ran.body(), ran.body().contains("\"result\":\"updated\""));
 
-            // And the document must be untouched by the refused attempt.
             final Response got = send(http, "GET", "/alpha/_doc/1", null);
-            assertTrue(got.body(), got.body().contains("\"n\":1"));
+            assertTrue("the script's edit must reach the document: " + got.body(), got.body().contains("\"n\":2"));
+
+            final Response stored = send(http, "POST", "/alpha/_update/1", "{\"script\":{\"id\":\"somewhere\"}}");
+            assertEquals(stored.body(), 400, stored.status());
+            assertTrue("must say why: " + stored.body(), stored.body().contains("stored script cannot be used here"));
         }
     }
 

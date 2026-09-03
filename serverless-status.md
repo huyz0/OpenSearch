@@ -172,6 +172,12 @@ indices using it. `GET /_list/indices/{prefix}*` lists indices through one bound
 prefix matching more than the cap rather than truncating**, which is why it is `_list` and not `_cat`:
 OpenSearch added `_list` for exactly this reason ([`m53-discovery-notes.md`](m53-discovery-notes.md)).
 
+**Scripts.** Painless runs here: script queries, `script_score`, `script_fields`, scripted aggregations and
+scripted updates including `ctx.op` for noop and delete. The engine is chosen by name and registered directly,
+the same way this shell has always chosen its transport — "no modules are loaded" was about discovery from
+disk, not about the code in `modules/`. Stored scripts stay refused because `ScriptService` reads them out of
+cluster metadata and there is none ([`m57-scripts-notes.md`](m57-scripts-notes.md)).
+
 **Templates.** `_index_template` and `_component_template` store in registers like every index descriptor, and
 a new index inherits from the highest-priority template whose patterns match — its components merged in order,
 its own block on top, and whatever the request said on top of that. A missing component fails the create
@@ -203,6 +209,11 @@ resting state, and reporting it as a fault would make `wait_for_status=green` bl
 shards activate on demand. `dormant_shards` carries the real information, `replication: "object-store"` says on
 every answer that green does not mean copies exist, and the unscoped form reports `complete: false` rather than
 counting shards it did not examine ([`m51-cluster-endpoints-notes.md`](m51-cluster-endpoints-notes.md)).
+
+**Nothing looks like a typo.** Every endpoint a client reaches for either answers or refuses with the reason
+it is refused for. An index name beginning with an underscore is an API this shell does not implement and says
+so, rather than being reported as a missing index — and the same backstop covers node selectors and repository
+names. A genuinely missing index is still a 404.
 
 ## What is deliberately refused
 
@@ -308,7 +319,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-482 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+490 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

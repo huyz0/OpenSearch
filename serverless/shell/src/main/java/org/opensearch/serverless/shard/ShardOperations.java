@@ -951,6 +951,49 @@ public final class ShardOperations {
         long ifSeqNo,
         long ifPrimaryTerm
     ) throws IOException {
+        return update(index, id, doc, upsert, docAsUpsert, detectNoop, refresh, ifSeqNo, ifPrimaryTerm, null, false);
+    }
+
+    /**
+     * Updates a document, optionally by running a script over it.
+     *
+     * <p><b>The script decides, and core runs it.</b> A scripted update compiles through the node's own
+     * {@code ScriptService} under core's {@code UpdateScript} context and is handed the same {@code ctx} map
+     * classic OpenSearch hands it — {@code ctx._source}, {@code ctx.op}, {@code ctx._index}, {@code ctx._id}.
+     * Nothing here interprets the script or re-implements the context; a script that works against a classic
+     * node works here because it is the same context object and the same engine.
+     *
+     * <p>{@code ctx.op} is honoured: a script setting it to {@code "noop"} writes nothing and a script
+     * setting it to {@code "delete"} removes the document, which is the whole reason a caller reaches for a
+     * scripted update rather than a partial document.
+     *
+     * @param index the index
+     * @param id the document id
+     * @param doc the partial document, or null for a scripted update
+     * @param upsert what to write when the document is absent, or null
+     * @param docAsUpsert whether the partial document is also the upsert
+     * @param detectNoop whether an update that changes nothing is reported as a noop
+     * @param refresh whether to make the write visible before answering
+     * @param ifSeqNo the sequence number the document must be at, or unassigned
+     * @param ifPrimaryTerm the primary term the document must be at, or 0
+     * @param script the script to run, or null
+     * @param scriptedUpsert whether the script also runs when the document is absent
+     * @return what happened
+     * @throws IOException if the read or the write fails
+     */
+    public UpdateOutcome update(
+        String index,
+        String id,
+        java.util.Map<String, Object> doc,
+        java.util.Map<String, Object> upsert,
+        boolean docAsUpsert,
+        boolean detectNoop,
+        boolean refresh,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        org.opensearch.script.Script script,
+        boolean scriptedUpsert
+    ) throws IOException {
         return gated(org.opensearch.action.update.UpdateAction.NAME, new org.opensearch.action.update.UpdateRequest(index, id), () -> {
             // doGet, not get: this whole method is one gated operation under UpdateAction's own name, and
             // calling the public get() here would run the filter chain a second time under GetAction's --
@@ -976,8 +1019,53 @@ public final class ShardOperations {
                     false,
                     org.opensearch.common.xcontent.XContentType.JSON
                 ).v2();
-                final boolean changed = org.opensearch.common.xcontent.XContentHelper.update(merged, doc, detectNoop);
-                result = (detectNoop && changed == false) ? "noop" : "updated";
+                if (script != null) {
+                    result = "updated";
+                } else {
+                    final boolean changed = org.opensearch.common.xcontent.XContentHelper.update(merged, doc, detectNoop);
+                    result = (detectNoop && changed == false) ? "noop" : "updated";
+                }
+            }
+
+            String operation = result;
+            if (script != null && (existing.found() || scriptedUpsert)) {
+                // ctx as classic OpenSearch builds it, so a script written against a classic node behaves
+                // the same here. The map is mutable and the script edits it in place, which is the contract
+                // UpdateScript defines rather than one chosen here.
+                final java.util.Map<String, Object> ctx = new java.util.HashMap<>();
+                ctx.put("_source", merged);
+                ctx.put("_index", index);
+                ctx.put("_id", id);
+                ctx.put("_version", existing.found() ? existing.version() : 0L);
+                ctx.put("op", "index");
+                final var factory = node.scriptService().compile(script, org.opensearch.script.UpdateScript.CONTEXT);
+                factory.newInstance(script.getParams(), ctx).execute();
+                operation = String.valueOf(ctx.getOrDefault("op", "index"));
+                @SuppressWarnings("unchecked")
+                final java.util.Map<String, Object> edited = (java.util.Map<String, Object>) ctx.get("_source");
+                // A script usually mutates ctx._source in place, in which case it *is* this map and there is
+                // nothing to copy. It may also replace it wholesale. Clearing first and copying second
+                // handles the second case and silently empties the document in the first, because the source
+                // and the destination are the same object -- which is what the assertion on the document's
+                // contents, rather than on the response, caught.
+                if (edited != null && edited != merged) {
+                    final java.util.Map<String, Object> replacement = new java.util.LinkedHashMap<>(edited);
+                    merged.clear();
+                    merged.putAll(replacement);
+                }
+            }
+
+            if ("noop".equals(operation) || "none".equals(operation)) {
+                return new UpdateOutcome("noop", current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
+            }
+            if ("delete".equals(operation)) {
+                // A script may remove the document, and that is the point of one: the alternative is a read,
+                // a decision in the client, and a second request that races with anyone else writing.
+                // doDelete, not delete: this is already inside the update's own gate, and running the
+                // delete filter chain here would show a filter a DeleteAction it did not see the caller ask
+                // for -- the same reason the read above is doGet rather than get.
+                doDelete(index, id, refresh);
+                return new UpdateOutcome("deleted", current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
             }
 
             if ("noop".equals(result)) {

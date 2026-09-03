@@ -744,6 +744,31 @@ public final class SearchHandler extends BaseRestHandler {
                 if (Float.isNaN(hit.getScore()) == false) {
                     builder.field("_score", hit.getScore());
                 }
+                if (hit.getFields().isEmpty() == false) {
+                    // script_fields and docvalue_fields. They were computed and then dropped: a caller asking
+                    // for a derived value got hits carrying nothing, which looks like the script produced
+                    // nothing rather than like the renderer forgot it. Values are always an array, as
+                    // OpenSearch returns them, because a field may be multi-valued and a client that
+                    // sometimes gets a scalar has to branch on it.
+                    builder.startObject("fields");
+                    for (var field : hit.getFields().entrySet()) {
+                        builder.startArray(field.getKey());
+                        for (Object value : field.getValue().getValues()) {
+                            builder.value(value);
+                        }
+                        builder.endArray();
+                    }
+                    builder.endObject();
+                }
+                if (hit.getSortValues() != null && hit.getSortValues().length > 0) {
+                    // The cursor a caller sends back as search_after. It was already being relied on by
+                    // paginating clients, which had to re-derive it from the sorted field values.
+                    builder.startArray("sort");
+                    for (Object value : hit.getSortValues()) {
+                        builder.value(value);
+                    }
+                    builder.endArray();
+                }
                 final String hitSource = hit.getSourceAsString();
                 if (hitSource != null && hitSource.isEmpty() == false) {
                     // Raw, so a document comes back as an object. It used to be written with

@@ -142,22 +142,32 @@ public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
      * <p>Scripting is not offered by this shell. The useful way to say that to a plugin is the way a classic
      * node says it when the language's module is not installed, in the same words, from the same class.
      */
-    public void testScriptingIsRefusedInCoresOwnWords() throws Exception {
+    public void testAPluginIsHandedAWorkingScriptService() throws Exception {
         CapturingPlugin.CAPTURED.set(null);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("collaborators-script"), List.of(new CapturingPlugin()))) {
             node.start();
             final ScriptService scripts = (ScriptService) CapturingPlugin.CAPTURED.get()[4];
-            final var failure = expectThrows(
-                IllegalArgumentException.class,
-                () -> scripts.compile(
+            // Since M57 the service a plugin is handed has a real engine in it: modules:lang-painless is a
+            // dependency and its engine is registered directly, the same way the transport is chosen. A
+            // plugin that compiles a script gets a compiled script rather than an explanation.
+            assertNotNull(
+                "a plugin must be handed a script service that can actually compile",
+                scripts.compile(
                     new org.opensearch.script.Script(ScriptType.INLINE, "painless", "1 + 1", Map.of()),
                     org.opensearch.script.FieldScript.CONTEXT
                 )
             );
-            assertTrue(
-                "the refusal must name the missing language rather than being a null pointer: " + failure.getMessage(),
-                failure.getMessage().contains("painless")
+
+            // A language nothing registers is still refused by name rather than with a null pointer, which
+            // is what this test was originally written to pin.
+            final var failure = expectThrows(
+                IllegalArgumentException.class,
+                () -> scripts.compile(
+                    new org.opensearch.script.Script(ScriptType.INLINE, "expression", "1 + 1", Map.of()),
+                    org.opensearch.script.FieldScript.CONTEXT
+                )
             );
+            assertTrue("the refusal must name the missing language: " + failure.getMessage(), failure.getMessage().contains("expression"));
         }
     }
 

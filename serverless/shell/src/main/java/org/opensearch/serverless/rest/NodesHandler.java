@@ -110,6 +110,37 @@ public final class NodesHandler extends BaseRestHandler {
                     selected.add(lease);
                 }
             }
+            if (wanted != null && NODE_SUB_APIS.contains(wanted)) {
+                // A node sub-API, not a node id. These do not begin with an underscore, so the backstop
+                // above does not catch them, and "no live node matches [hot_threads]" is the same confusing
+                // answer in a different costume. Named explicitly because the list is short and closed.
+                sendQuietly(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "not_implemented",
+                    "'"
+                        + wanted
+                        + "' is a node API rather than a node id, and this shell does not implement it. "
+                        + "GET /_serverless/stats answers for the node it is sent to"
+                );
+                return;
+            }
+            if (wanted != null && wanted.startsWith("_") && "_all".equals(wanted) == false) {
+                // A selector, not a node. "_local", "_master" and "_cluster_manager" pick nodes by role or
+                // by which one received the request; answering "no live node matches [_local]" would send a
+                // caller looking for a node that was never a name. Same class as an index API read as an
+                // index name.
+                sendQuietly(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "not_implemented",
+                    "'"
+                        + wanted
+                        + "' is a node selector, and this shell does not implement selectors. Name a node, "
+                        + "or use _all; there is no cluster manager for _master or _cluster_manager to pick"
+                );
+                return;
+            }
             if (wanted != null && selected.isEmpty()) {
                 channel.sendResponse(
                     IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "node_not_found", "no live node matches [" + wanted + "]")
@@ -165,6 +196,29 @@ public final class NodesHandler extends BaseRestHandler {
                 channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
             }
         });
+    }
+
+    /**
+     * Segments that follow {@code /_nodes/} and are APIs rather than node ids.
+     *
+     * <p>A node could in principle be named any of these; nothing stops an operator. The trade is between
+     * refusing a node whose name collides with an API and telling every caller of a real API that their node
+     * is missing, and the second is the far more likely mistake to make.
+     */
+    private static final java.util.Set<String> NODE_SUB_APIS = java.util.Set.of(
+        "hot_threads",
+        "usage",
+        "reload_secure_settings",
+        "info",
+        "stats"
+    );
+
+    private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
+        try {
+            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+        } catch (IOException e) {
+            logger.error("failed to report a nodes refusal", e);
+        }
     }
 
     private static boolean matches(NodeLease lease, String wanted) {

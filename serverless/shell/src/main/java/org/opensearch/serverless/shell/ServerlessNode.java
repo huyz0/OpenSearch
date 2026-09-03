@@ -828,6 +828,16 @@ public final class ServerlessNode implements Closeable {
         // time, and is refused because reading all of it at once is unbounded. Three of these are refused
         // because there is no allocator, which is a different thing again. This is the same stale-reason
         // shape M50 found in _bulk and M51 found in the node endpoints, in its third place.
+        final String noClosedState = "an index here is being served or it does not exist: there is no closed state "
+            + "for it to be opened from or closed into";
+        final String noClusterManager = "there is no cluster manager, so there is no node to name as one";
+        final String reshaping = "reshaping an index means rewriting every document into a different shard count, "
+            + "and there is no _reindex here to do it with. An index that needs a different shard count is a new "
+            + "index, written by the caller";
+        final String simulate = "simulating template resolution is not routed; create the index and read back "
+            + "GET /{index}, which reports exactly what it inherited";
+        final String indexEnumeration = "aggregating across every index in the deployment is unbounded, and this "
+            + "design refuses an answer it would have to truncate";
         final String noAllocator = "there is no allocator here: a shard is activated by the write that needs it, "
             + "not by a placement decision, so there is nothing to explain, retry or rebalance";
         final String enumeration = "listing every index in the deployment is unbounded, and this design refuses "
@@ -927,8 +937,68 @@ public final class ServerlessNode implements Closeable {
                     + "stored pipeline would have almost nothing it could construct. Accepting pipelines that "
                     + "silently never ran would be worse than refusing them. Enabling this is a decision "
                     + "about loading modules, not about adding an endpoint" },
-            { "/_scripts/{id}", "no scripting engine is registered, so there is nowhere to store a script" },
+            {
+                "/_scripts/{id}",
+                // The old reason stopped being true the moment an engine was registered. Painless runs here
+                // now; what a stored script needs is somewhere for ScriptService to look it up, and that is
+                // cluster state. AWS OpenSearch Serverless refuses stored scripts for the same practical
+                // reason and supports inline ones, which is where this lands too.
+                "stored scripts resolve through cluster state -- ScriptService is a ClusterStateApplier and "
+                    + "reads them from the cluster metadata -- and there is no cluster state here. Inline "
+                    + "scripts work: send the source in the query, the aggregation or the update" },
             { "/_ilm/policy/{name}", "index lifecycle management is not part of this surface" },
+            // Found by driving a running node rather than by reading this list: twenty-two endpoints a real
+            // client reaches for were answering core's default 400 "no handler found for uri", which reads
+            // as a typo. Each has a reason under one of the four the rest of this list already gives -- no
+            // allocator, no cluster-wide state, no modules, no closed index -- and none of them said so.
+            { "/_alias", "aliases are found by name here, not enumerated; GET /_alias/{name} answers for one" },
+            { "/_stats", indexEnumeration },
+            {
+                "/{index}/_stats",
+                "per-shard statistics are not exposed; GET /_serverless/stats answers for the node "
+                    + "it is sent to, and GET /_cluster/health/{index}?level=shards reports one index's shards" },
+            { "/{index}/_segments", "per-shard Lucene detail is not exposed" },
+            { "/{index}/_recovery", noAllocator },
+            { "/{index}/_shard_stores", noAllocator },
+            {
+                "/{index}/_cache/clear",
+                "there is no cluster-wide operation to clear a cache, and clearing one on a "
+                    + "shard this node may not own is not something this node can do" },
+            { "/{index}/_open", noClosedState },
+            { "/{index}/_close", noClosedState },
+            {
+                "/{index}/_rollover",
+                "rollover creates the next index and moves an alias to it atomically; the alias "
+                    + "move is the part this design cannot do, since each alias is its own compare-and-swap" },
+            { "/{index}/_shrink/{target}", reshaping },
+            { "/{index}/_split/{target}", reshaping },
+            { "/{index}/_clone/{target}", reshaping },
+            { "/_cluster/pending_tasks", "there is no cluster manager and no task queue, so there is nothing pending" },
+            { "/_cat/master", noClusterManager },
+            { "/_cat/cluster_manager", noClusterManager },
+            {
+                "/_cat/plugins",
+                "plugins are per node; GET /_nodes lists the fleet and GET /_serverless/stats answers " + "for the node it is sent to" },
+            {
+                "/_cat/nodeattrs",
+                "node attributes are not part of this deployment's node model; GET /_nodes reports " + "the roles a node does have" },
+            {
+                "/_cat/repositories",
+                "a repository here is a namespace in this deployment's own object store; " + "GET /_snapshot lists them" },
+            { "/_cat/snapshots", "GET /_snapshot/{repo} lists a repository's snapshots" },
+            { "/_cat/tasks", "there is no cluster-wide task registry" },
+            { "/_cat/fielddata", "fielddata is per-shard memory this surface does not report" },
+            { "/_remote/info", "there are no remote clusters: cross-cluster search and replication are not part of " + "this design" },
+            {
+                "/_dangling",
+                "a dangling index is one whose data outlived the cluster state naming it. There is no "
+                    + "cluster state here, so an index exists exactly when its descriptor does" },
+            {
+                "/_scripts/painless/_execute",
+                "the script-execution sandbox endpoint is not routed; inline scripts run " + "in a query, an aggregation or an update" },
+            { "/_index_template/_simulate_index/{name}", simulate },
+            { "/_index_template/_simulate/{name}", simulate },
+            { "/_component_template/_simulate/{name}", simulate },
             // Found by comparing this surface against AWS OpenSearch Serverless and Elastic Cloud
             // Serverless: every one of these is an endpoint a real client reaches for, and every one of them
             // fell through to core's default 400 rather than the 501 D2 promises. Being absent is a
@@ -2310,7 +2380,20 @@ public final class ServerlessNode implements Closeable {
      */
     public synchronized org.opensearch.script.ScriptService scriptService() {
         if (scriptService == null) {
-            scriptService = new org.opensearch.script.ScriptService(settings, Map.of(), org.opensearch.script.ScriptModule.CORE_CONTEXTS);
+            // Painless, chosen directly rather than discovered from modules/ -- the same route this shell
+            // already takes for its transport, and for the same reason. Without an engine registered the
+            // service compiles nothing, so every script in a query, an aggregation or an update failed with
+            // "cannot execute [painless] scripts" -- which reads as a configuration problem and is really an
+            // absent capability.
+            final org.opensearch.script.ScriptEngine painless = new org.opensearch.painless.PainlessModulePlugin().getScriptEngine(
+                settings,
+                org.opensearch.script.ScriptModule.CORE_CONTEXTS.values()
+            );
+            scriptService = new org.opensearch.script.ScriptService(
+                settings,
+                Map.of(painless.getType(), painless),
+                org.opensearch.script.ScriptModule.CORE_CONTEXTS
+            );
         }
         return scriptService;
     }

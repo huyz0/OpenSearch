@@ -56,6 +56,43 @@ public final class UpdateHandler extends BaseRestHandler {
         this.plane = plane;
     }
 
+    /**
+     * Reads the {@code script} field, in either shape a client sends it.
+     *
+     * <p>A bare string is shorthand for a painless source; an object may name {@code source}, {@code lang},
+     * {@code params} or an {@code id}. A stored script is refused by name rather than compiled, because
+     * resolving one goes through cluster state this design does not have.
+     *
+     * @param given the script field's value
+     * @return the parsed script
+     */
+    private static org.opensearch.script.Script parseScript(Object given) {
+        if (given instanceof String source) {
+            return new org.opensearch.script.Script(source);
+        }
+        if (given instanceof java.util.Map<?, ?> map) {
+            if (map.get("id") != null) {
+                throw new IllegalArgumentException(
+                    "a stored script cannot be used here: stored scripts resolve through cluster state, which this "
+                        + "design does not have. Send the source inline"
+                );
+            }
+            final Object source = map.get("source");
+            if (source == null) {
+                throw new IllegalArgumentException("a script needs a 'source'");
+            }
+            final String lang = map.get("lang") == null
+                ? org.opensearch.script.Script.DEFAULT_SCRIPT_LANG
+                : String.valueOf(map.get("lang"));
+            @SuppressWarnings("unchecked")
+            final java.util.Map<String, Object> params = map.get("params") instanceof java.util.Map
+                ? (java.util.Map<String, Object>) map.get("params")
+                : java.util.Map.of();
+            return new org.opensearch.script.Script(org.opensearch.script.ScriptType.INLINE, lang, String.valueOf(source), params);
+        }
+        throw new IllegalArgumentException("'script' must be a string or an object");
+    }
+
     @Override
     public String getName() {
         return "serverless_update_action";
@@ -133,23 +170,38 @@ public final class UpdateHandler extends BaseRestHandler {
         try (XContentParser parser = request.contentOrSourceParamParser()) {
             body = parser.map();
         }
-        if (body.get("script") != null || body.get("scripted_upsert") != null) {
+        // A scripted update, compiled by the node's own ScriptService under core's UpdateScript context. The
+        // refusal that stood here said no scripting engine was registered, which stopped being true the
+        // moment one was.
+        final org.opensearch.script.Script script;
+        if (body.get("script") != null) {
+            try {
+                script = parseScript(body.get("script"));
+            } catch (IllegalArgumentException e) {
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage())
+                );
+            }
+        } else {
+            script = null;
+        }
+        final boolean scriptedUpsert = Boolean.TRUE.equals(body.get("scripted_upsert"));
+        if (script == null && scriptedUpsert) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_write",
-                    "scripted updates are not supported: no scripting engine is registered, the same as every other "
-                        + "script surface on this node"
+                    RestStatus.BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "scripted_upsert was given without a script"
                 )
             );
         }
         final boolean docAsUpsert = Boolean.TRUE.equals(body.get("doc_as_upsert"));
         final Object docField = body.get("doc");
         final Object upsertField = body.get("upsert");
-        if ((docField instanceof Map) == false) {
+        if (script == null && (docField instanceof Map) == false) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_doc", "an update body needs a 'doc' object")
+                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_doc", "an update body needs a 'doc' object or a 'script'")
             );
         }
         if (upsertField != null && (upsertField instanceof Map) == false) {
@@ -167,7 +219,19 @@ public final class UpdateHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             final var operations = new ShardOperations(serving, metadata);
             try {
-                final var outcome = operations.update(index, id, doc, upsert, docAsUpsert, detectNoop, refresh, ifSeqNo, ifPrimaryTerm);
+                final var outcome = operations.update(
+                    index,
+                    id,
+                    doc,
+                    upsert,
+                    docAsUpsert,
+                    detectNoop,
+                    refresh,
+                    ifSeqNo,
+                    ifPrimaryTerm,
+                    script,
+                    scriptedUpsert
+                );
                 respond(channel, index, id, outcome);
             } catch (ShardOperations.NoSuchIndexException e) {
                 sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
