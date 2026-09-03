@@ -791,6 +791,9 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.TemplateHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PipelineHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.ValidateAndResolveHandler(() -> metadataPlane, () -> this))
+        );
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MultiSearchHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(
             new ServerlessHealthHandler(
@@ -994,26 +997,16 @@ public final class ServerlessNode implements Closeable {
             // fell through to core's default 400 rather than the 501 D2 promises. Being absent is a
             // decision; looking like a typo is not.
             {
-                "/{index}/_validate/query",
-                "query validation is not implemented here; send the query to _search, which parses it the "
-                    + "same way and reports a parse failure as a 400" },
-            {
-                "/_resolve/index/{name}",
-                "index and alias resolution is not exposed; look an index up by name with GET /{index}, or "
-                    + "use a prefix pattern on _search, which resolves with one bounded listing" },
-            { "/{index}/_rank_eval", "ranking evaluation is not implemented here" },
+                "/{index}/_rank_eval",
+                "ranking evaluation issues a set of searches and scores how well each "
+                    + "ranked a known-good answer. Every part of that is a search this surface already serves and "
+                    + "arithmetic over the results, so it belongs in the harness doing the evaluating rather than "
+                    + "in the node being evaluated" },
             {
                 "/_field_caps",
                 "name an index or a prefix: GET /{index}/_field_caps answers for what it can reach, and "
                     + "asking every index in the deployment what fields it has is the inventory operation "
                     + "this design refuses" },
-            {
-                "/_aliases",
-                "the bulk alias action API is not implemented; this shell has PUT, GET and DELETE on "
-                    + "/_alias/{name}, which covers creating and removing an alias but not atomic swaps" },
-            {
-                "/{index}/_alias/{name}",
-                "aliases are managed by name rather than per index here: use PUT /_alias/{name} with the " + "indices in the body" },
             { "/_search/pipeline/{id}", "search pipelines are not implemented here" },
             {
                 "/_cat/templates",

@@ -499,6 +499,15 @@ test in this repository declared its mappings. The fix reuses M52's compare-and-
 is one way a mapping changes rather than two that could drift. See
 [`m58-ingest-notes.md`](m58-ingest-notes.md).
 
+**The last invented shape, and the atomic move (M59).** The alias API was the one place left where this
+surface differed from classic for no architectural reason — the category M47 cleared out everywhere else,
+surviving because M47's audit predated noticing it. Both spellings now work. `POST /_aliases` turned out to be
+servable for the case it exists to serve: the atomic move touches *one* alias, which is one register, so it is
+a single compare-and-swap and genuinely atomic; only actions spanning several aliases are refused, and the
+"could apply partly" objection now sits where it is true rather than over the whole endpoint. `_validate/query`
+and `_resolve/index` were refused with reasons true of neither — validation is parsing, and resolution over a
+*named* set is not an enumeration. See [`m59-alias-shapes-notes.md`](m59-alias-shapes-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

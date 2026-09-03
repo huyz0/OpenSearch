@@ -311,6 +311,29 @@ public final class MetadataPlane {
      * @return the generation the register now holds
      * @throws IOException if the write fails
      */
+    /**
+     * Replaces an alias under a compare-and-swap.
+     *
+     * @param alias the alias as it should now be
+     * @param expectedGeneration the generation the caller read
+     * @return the new generation, or empty if another writer got there first
+     * @throws IOException if the swap fails
+     */
+    /**
+     * Returns the generation an alias currently sits at, for a compare-and-swap.
+     *
+     * @param name the alias
+     * @return the generation
+     * @throws IOException if the read fails
+     */
+    public long aliasGeneration(String name) throws IOException {
+        return descriptors.generationOf(name);
+    }
+
+    public Optional<Long> updateAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
+        return descriptors.updateAlias(alias, expectedGeneration);
+    }
+
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
         return descriptors.createAlias(alias);
     }

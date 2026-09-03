@@ -120,6 +120,27 @@ public final class DescriptorStore {
      * @throws IndexAlreadyExistsException if the name is already an index or an alias
      * @throws IOException if the write fails
      */
+    /**
+     * Replaces an alias, only if it has not changed underneath the caller.
+     *
+     * <p>The compare-and-swap is what makes {@code POST /_aliases} atomic for the case that matters — moving
+     * one alias from one index to another. Both actions touch a single register, so the whole move is one
+     * swap, and a caller searching the alias sees either the old index or the new one and never neither.
+     *
+     * @param alias the alias as it should now be
+     * @param expectedGeneration the generation the caller read
+     * @return the new generation, or empty if another writer got there first
+     * @throws IOException if the swap fails
+     */
+    public Optional<Long> updateAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
+        final BlobRegisterCasResult result = container.compareAndSwapRegister(
+            RegisterMap.descriptorBlob(alias.name()),
+            expectedGeneration,
+            alias.toBytes()
+        );
+        return result.applied() ? Optional.of(result.currentGeneration()) : Optional.empty();
+    }
+
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
         final BlobRegisterCasResult result = container.createRegisterIfAbsent(RegisterMap.descriptorBlob(alias.name()), alias.toBytes());
         if (result.applied() == false) {

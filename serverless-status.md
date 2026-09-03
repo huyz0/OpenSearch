@@ -185,6 +185,13 @@ the same way this shell has always chosen its transport — "no modules are load
 disk, not about the code in `modules/`. Stored scripts stay refused because `ScriptService` reads them out of
 cluster metadata and there is none ([`m57-scripts-notes.md`](m57-scripts-notes.md)).
 
+**Aliases, in OpenSearch's own spellings.** `PUT|GET|HEAD|DELETE /{index}/_alias/{name}` alongside the
+name-scoped form this shell shipped with. `POST /_aliases` serves the atomic move it exists for — actions on
+one alias are one register, so the whole move is one compare-and-swap — and refuses actions spanning several,
+which would be several registers with no transaction over them. `_validate/query` parses a query and says that
+is all it did; `_resolve/index` reports which names are indices and which are aliases
+([`m59-alias-shapes-notes.md`](m59-alias-shapes-notes.md)).
+
 **Templates.** `_index_template` and `_component_template` store in registers like every index descriptor, and
 a new index inherits from the highest-priority template whose patterns match — its components merged in order,
 its own block on top, and whatever the request said on top of that. A missing component fails the create
@@ -263,6 +270,10 @@ These are decisions, not gaps. Each answers 501 with a reason.
   at `GET /_serverless/stats` and this node knows where the others are, so what is missing is the fan-out that
   would ask them and the accounting that would report which ones did not answer — a scoping decision, not an
   impossibility.
+- An alias filter or routing in an action body is ignored rather than refused — the one place left where
+  something is accepted and not honoured, and the first thing to fix in that area.
+- `GET /{index}/_alias` (every alias an index is under) is a reverse lookup this design does not offer;
+  `GET /{index}/_alias/{name}` answers the bounded form.
 - `_cat/indices` could be served under the wildcard cap that already exists (one bounded listing, refused past
   the cap rather than truncated) and is not. The objection to it is weaker than the current refusal implies.
 - `update` inside `_bulk` is refused: it is a partial merge, which has to read the current document before
@@ -326,7 +337,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-497 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+504 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 
