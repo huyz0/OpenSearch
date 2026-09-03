@@ -7,14 +7,21 @@ disagree, this is right.
 
 ## What works
 
-**Documents.** Write, get, delete, `_bulk`, `_mget`, with `_source` filtering on reads. A conditional write
-(`if_seq_no`, `if_primary_term`, `version`) is refused rather than silently turned unconditional — this
-system has no sequence-number model, and a client believing it holds a compare-and-swap that was quietly
-dropped would be a worse failure than every other refusal on this surface. `_update` does a
+**Documents.** Write, get, delete, `_bulk`, `_mget`, with `_source` filtering on reads. Every write, get
+and bulk item reports `_seq_no`, `_primary_term` and `_version`, and **conditional writes work**:
+`if_seq_no`/`if_primary_term` on a write, a delete or an `_update` are passed to the engine, which performs
+the compare-and-swap against its own live version map; a lost race is a 409. The numbers survive a
+failover — the write-ahead log records each operation's sequence identity and a successor replays it as
+that operation rather than as a new one, so a token minted before a writer died is still honoured by its
+successor ([`m48-sequence-numbers-notes.md`](m48-sequence-numbers-notes.md)). `version` (external
+versioning) stays refused: it asks this system to order writes by a number the caller maintains and this
+system does not keep, which is a different thing from comparing against one the engine assigned. `_update` does a
 partial-document merge (core's own recursive merge, so a nested object is not silently overwritten), with
 `doc_as_upsert` and `upsert` for a missing document and `detect_noop` skipping a write that changes
-nothing — read then written back, not a transaction: nothing holds the document still between the two,
-which is what the version model above would be for. `_delete_by_query` removes every document a query
+nothing — read then written back, not a transaction on its own: nothing holds the document still between
+the two, so an unconditional update can still lose a race. The caller can close that window itself now, by
+passing `if_seq_no`/`if_primary_term` and retrying on a 409 — which is the compare-and-swap classic
+OpenSearch's own `_update` performs internally. `_delete_by_query` removes every document a query
 matches — evaluated once, against a frozen point-in-time view, then walked one shard at a time in native
 Lucene `_doc` order (always available, no fielddata) and deleted through the ordinary write path. A write
 acknowledged but not yet published when the operation starts is not touched by it, the same boundary a
@@ -221,7 +228,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-417 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+423 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

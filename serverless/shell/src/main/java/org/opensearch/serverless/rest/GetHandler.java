@@ -169,6 +169,14 @@ public final class GetHandler extends BaseRestHandler {
             builder.field("_id", document.id());
             builder.field("_shard", shard);
             builder.field("found", document.found());
+            if (document.found()) {
+                // The token a caller sends back as if_seq_no. Only on a found document: there is no
+                // sequence identity for a document that does not exist, and emitting the unassigned
+                // sentinel would look like one.
+                builder.field("_version", document.version());
+                builder.field("_seq_no", document.seqNo());
+                builder.field("_primary_term", document.primaryTerm());
+            }
             // Which copy answered, said plainly rather than left to be inferred. A realtime answer comes
             // from the shard's owner and includes writes that are acknowledged but not yet published; a
             // non-realtime one comes from a published commit, which is the whole truth only while nobody

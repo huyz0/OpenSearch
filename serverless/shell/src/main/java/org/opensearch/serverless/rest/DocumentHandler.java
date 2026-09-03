@@ -27,19 +27,23 @@ import java.util.function.Supplier;
 /**
  * {@code PUT|POST /{index}/_doc/{id}} — the durable write path, reachable by a user.
  *
- * <p>Everything M10 built sat behind a Java method until this existed. A write here appends to the
- * write-ahead log before it is applied, so it survives the writer dying before the next publication.
+ * <p>Everything M10 built sat behind a Java method until this existed. A write here reaches the
+ * write-ahead log before it is acknowledged, so it survives the writer dying before the next publication.
  *
  * <p><b>A node that does not own the shard forwards to the one that does</b>, over transport, and answers
  * as if it had done the write itself. Losing an activation race is still a routing instruction rather
  * than an error, and the owner's id still rides in the response — a client that wants to skip the extra
  * hop next time can, but nothing requires it to.
  *
- * <p><b>Conditional writes are refused, not silently dropped.</b> {@code if_seq_no}, {@code
- * if_primary_term} and {@code version} are read and turned into a 501 naming why: {@code WalRecord}
- * records document state, not history, so there is no sequence number to condition on. A client that
- * asked for a compare-and-swap and got an unconditional write believing it got one would be the worst
- * failure on this surface, because it looks like success.
+ * <p><b>Conditional writes are supported, and every response carries the token they compare against.</b>
+ * {@code if_seq_no} and {@code if_primary_term} are passed to the engine, which performs the
+ * compare-and-swap itself against the live version map; a lost race is a 409. That became possible when
+ * the log started recording each operation's sequence number, so the numbers survive a failover and a
+ * token stays meaningful across one — see {@code m48-sequence-numbers-notes.md}.
+ *
+ * <p><b>{@code version} is still refused</b>, and the difference matters: external versioning asks this
+ * system to order writes by a number the caller maintains and this system does not keep, which is a
+ * different feature from comparing against a number the engine itself assigned.
  */
 public final class DocumentHandler extends BaseRestHandler {
 
@@ -84,8 +88,8 @@ public final class DocumentHandler extends BaseRestHandler {
         final boolean deletion = request.method() == RestRequest.Method.DELETE;
         // Read, not merely present-checked, so every parameter is consumed regardless of which branch
         // below returns -- the class-level idiom this handler already follows.
-        final String ifSeqNo = request.param("if_seq_no");
-        final String ifPrimaryTerm = request.param("if_primary_term");
+        final String ifSeqNoParam = request.param("if_seq_no");
+        final String ifPrimaryTermParam = request.param("if_primary_term");
         final String version = request.param("version");
 
         final MetadataPlane metadata = plane.get();
@@ -94,23 +98,47 @@ public final class DocumentHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        if (ifSeqNo != null || ifPrimaryTerm != null || version != null) {
-            // Read and refused, not read and dropped. A client asking for a compare-and-swap and getting
-            // an unconditional write believing it got one is the confident wrong answer this design
-            // refuses everywhere else -- and it is a worse failure here than a 501 ever is, because it
-            // looks like success. WalRecord records document state, not history: there is no sequence
-            // number or version to condition on, and inventing one here would be a guarantee this system
-            // does not make.
-            final String named = ifSeqNo != null ? "if_seq_no" : ifPrimaryTerm != null ? "if_primary_term" : "version";
+        if (version != null) {
+            // Still refused, and for a reason that did not go away when if_seq_no arrived. External
+            // versioning asks this system to order writes by a number the caller maintains and this
+            // system does not; optimistic concurrency asks it to compare against a number the engine
+            // itself assigned, which it now returns. Those are different features, and only the second
+            // one is here. Classic OpenSearch steers callers the same way.
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_write",
-                    "'"
-                        + named
-                        + "' asks for a conditional write, which this system does not have: every write is a plain "
-                        + "overwrite and every delete a plain removal. WalRecord records document state, not history."
+                    "'version' asks for external versioning, which this system does not have: it keeps no "
+                        + "caller-supplied version model. Use if_seq_no and if_primary_term, which compare "
+                        + "against the sequence number this system does assign and does return."
+                )
+            );
+        }
+        if ((ifSeqNoParam == null) != (ifPrimaryTermParam == null)) {
+            // Core requires both together, and requiring it here too makes the refusal legible: half a
+            // condition is a condition that would silently not be one.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "invalid_condition",
+                    "if_seq_no and if_primary_term must be supplied together"
+                )
+            );
+        }
+        final long ifSeqNo;
+        final long ifPrimaryTerm;
+        try {
+            ifSeqNo = ifSeqNoParam == null ? org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO : Long.parseLong(ifSeqNoParam);
+            ifPrimaryTerm = ifPrimaryTermParam == null ? 0L : Long.parseLong(ifPrimaryTermParam);
+        } catch (NumberFormatException e) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "invalid_condition",
+                    "if_seq_no and if_primary_term must be numbers"
                 )
             );
         }
@@ -195,12 +223,47 @@ public final class DocumentHandler extends BaseRestHandler {
                                         id,
                                         source == null ? "" : source,
                                         refresh,
-                                        deletion
+                                        deletion,
+                                        ifSeqNo,
+                                        ifPrimaryTerm
                                     )
                                 )
                         );
-                        respond(channel, index, id, shard, ack.ownerNodeId(), deletion, true);
+                        respond(
+                            channel,
+                            index,
+                            id,
+                            shard,
+                            ack.ownerNodeId(),
+                            deletion,
+                            new ServerlessNode.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found())
+                        );
                     } catch (Exception e) {
+                        // A lost compare-and-swap is not a routing problem, and must not be dressed as
+                        // one. The owner answered, correctly, that the document had moved on; reporting
+                        // that as a 503 would tell the caller to retry an operation whose whole point is
+                        // that it must not be retried blindly -- and would cast doubt on an ownership
+                        // that was never in question. It arrives wrapped in a transport exception, so it
+                        // has to be unwrapped before it can be recognised.
+                        final Throwable conflict = org.opensearch.ExceptionsHelper.unwrap(
+                            e,
+                            org.opensearch.index.engine.VersionConflictEngineException.class
+                        );
+                        if (conflict != null) {
+                            try {
+                                channel.sendResponse(
+                                    IndexAdminHandler.error(
+                                        channel,
+                                        RestStatus.CONFLICT,
+                                        "version_conflict_engine_exception",
+                                        conflict.getMessage()
+                                    )
+                                );
+                            } catch (IOException nested) {
+                                logger.error("failed to report a forwarded version conflict", nested);
+                            }
+                            return;
+                        }
                         // The owner was reachable and still refused or failed. Either it lost the shard
                         // between our read and its receipt, or it is going away. Same conclusion: the
                         // head we routed on is not to be trusted.
@@ -259,20 +322,23 @@ public final class DocumentHandler extends BaseRestHandler {
                 org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
-                final boolean removed = gated(serving, deletion, index, id, source, () -> {
-                    final boolean found = deletion ? serving.delete(shardId, id) : true;
-                    if (deletion == false) {
-                        serving.index(shardId, id, source);
-                    }
-                    return found;
-                });
+                final ServerlessNode.WriteOutcome outcome = gated(
+                    serving,
+                    deletion,
+                    index,
+                    id,
+                    source,
+                    () -> deletion
+                        ? serving.delete(shardId, id, ifSeqNo, ifPrimaryTerm)
+                        : serving.index(shardId, id, source, ifSeqNo, ifPrimaryTerm)
+                );
                 if (refresh) {
                     // Same meaning as classic OpenSearch: make this write visible to search before
                     // answering. Without it a caller that writes and immediately searches gets zero
                     // hits and no error, which reads as data loss and is not.
                     serving.reconciler().shard(shardId).refresh("serverless-rest-refresh");
                 }
-                respond(channel, index, id, shard, serving.localNode().getId(), deletion, removed);
+                respond(channel, index, id, shard, serving.localNode().getId(), deletion, outcome);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -321,15 +387,20 @@ public final class DocumentHandler extends BaseRestHandler {
         int shard,
         String writtenBy,
         boolean deletion,
-        boolean found
+        ServerlessNode.WriteOutcome outcome
     ) throws IOException {
         {
+            final boolean found = outcome.found();
             try (XContentBuilder builder = channel.newBuilder()) {
                 builder.startObject();
                 builder.field("_index", index);
                 builder.field("_id", id);
                 builder.field("_shard", shard);
-                builder.field("result", deletion ? (found ? "deleted" : "not_found") : "created");
+                builder.field("_version", outcome.version());
+                // "created" versus "updated", told apart honestly rather than always claiming the first.
+                // The engine has always known which it was -- IndexResult#isCreated -- and this path
+                // simply never asked, so an overwrite reported itself as a creation and answered 201.
+                builder.field("result", deletion ? (found ? "deleted" : "not_found") : (outcome.created() ? "created" : "updated"));
                 // One shard, always: this write touched exactly the one it was routed to. Real OpenSearch's
                 // field, added for a client that reads it rather than only checking the HTTP status.
                 builder.startObject("_shards");
@@ -337,6 +408,10 @@ public final class DocumentHandler extends BaseRestHandler {
                 builder.field("successful", 1);
                 builder.field("failed", 0);
                 builder.endObject();
+                // The two numbers a caller sends back as if_seq_no and if_primary_term. They were always
+                // being assigned; this path used to discard them.
+                builder.field("_seq_no", outcome.seqNo());
+                builder.field("_primary_term", outcome.primaryTerm());
                 // Says what was actually guaranteed. "created" alone would leave a reader to assume the
                 // usual meaning; here the write is in the log before this response exists, and the
                 // segment it will live in may not be published yet.
@@ -349,7 +424,12 @@ public final class DocumentHandler extends BaseRestHandler {
                 builder.field("_node", writtenBy);
                 builder.endObject();
                 channel.sendResponse(
-                    new BytesRestResponse(deletion ? (found ? RestStatus.OK : RestStatus.NOT_FOUND) : RestStatus.CREATED, builder)
+                    new BytesRestResponse(
+                        deletion
+                            ? (found ? RestStatus.OK : RestStatus.NOT_FOUND)
+                            : (outcome.created() ? RestStatus.CREATED : RestStatus.OK),
+                        builder
+                    )
                 );
             }
         }

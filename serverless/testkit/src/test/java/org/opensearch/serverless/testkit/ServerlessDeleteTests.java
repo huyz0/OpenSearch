@@ -114,11 +114,11 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             node.reconciler().shard(shardId).refresh("test");
             assertEquals(1, hits(node, shardId, "msg", "here"));
 
-            assertTrue("deleting a document that exists must report that it did", node.delete(shardId, "1"));
+            assertTrue("deleting a document that exists must report that it did", node.delete(shardId, "1").found());
             node.reconciler().shard(shardId).refresh("test");
             assertEquals("the document must be gone", 0, hits(node, shardId, "msg", "here"));
 
-            assertFalse("deleting a document that does not exist must say so, not throw", node.delete(shardId, "nonexistent"));
+            assertFalse("deleting a document that does not exist must say so, not throw", node.delete(shardId, "nonexistent").found());
         }
     }
 
@@ -150,8 +150,8 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
 
         // Now write one more and delete two, none of it published. The log is the only record.
         a.index(shardId, "6", "{\"msg\":\"kept\",\"n\":6}");
-        assertTrue(a.delete(shardId, "2"));
-        assertTrue(a.delete(shardId, "4"));
+        assertTrue(a.delete(shardId, "2").found());
+        assertTrue(a.delete(shardId, "4").found());
 
         // The writer dies without publishing and without releasing anything.
         a.close();
@@ -190,7 +190,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final ShardId shardId = a.reconciler().openShards().iterator().next();
 
         a.index(shardId, "1", "{\"msg\":\"first\",\"n\":1}");
-        assertTrue(a.delete(shardId, "1"));
+        assertTrue(a.delete(shardId, "1").found());
         a.index(shardId, "1", "{\"msg\":\"second\",\"n\":2}");
         a.close();
         clock.set(clock.get() + TTL + 1);
@@ -279,7 +279,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             loopB.tick(clock.get());
             final ShardId recovered = b.reconciler().openShards().iterator().next();
 
-            assertTrue("the successor should delete a document it inherited", b.delete(recovered, "3"));
+            assertTrue("the successor should delete a document it inherited", b.delete(recovered, "3").found());
             b.reconciler().shard(recovered).refresh("test");
             loopB.tick(clock.get() + 1_000);   // publish at the new term, inheriting the old files
 
@@ -340,7 +340,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         loopB.want("alpha", 0);
         loopB.tick(clock.get());
         final ShardId atB = b.reconciler().openShards().iterator().next();
-        assertTrue("b should have recovered x before deleting it", b.delete(atB, "x"));
+        assertTrue("b should have recovered x before deleting it", b.delete(atB, "x").found());
         b.close();
         clock.set(clock.get() + TTL + 1);
 
@@ -385,7 +385,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             a.index(shardId, "filler-" + i, "{\"msg\":\"ordinal\",\"n\":" + i + "}");
         }
         a.index(shardId, "target", "{\"msg\":\"ordinal\",\"n\":100}");   // ordinal 9
-        assertTrue(a.delete(shardId, "target"));                             // ordinal 10
+        assertTrue(a.delete(shardId, "target").found());                             // ordinal 10
         a.close();
         clock.set(clock.get() + TTL + 1);
 
@@ -437,7 +437,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
 
         // Unpublished, and deliberately so: these exist only in the log.
         a.index(shardId, "unpublished", "{\"msg\":\"waltest\",\"n\":2}");
-        assertTrue(a.delete(shardId, "published"));
+        assertTrue(a.delete(shardId, "published").found());
         a.close();
         clock.set(clock.get() + TTL + 1);
 

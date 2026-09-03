@@ -30,6 +30,8 @@ public final class ForwardedIndexRequest extends TransportRequest {
     private final String source;
     private final boolean refresh;
     private final boolean deletion;
+    private final long ifSeqNo;
+    private final long ifPrimaryTerm;
 
     /**
      * Creates a request.
@@ -55,12 +57,61 @@ public final class ForwardedIndexRequest extends TransportRequest {
      * @param deletion whether this removes the document rather than adding it
      */
     public ForwardedIndexRequest(String index, int shard, String id, String source, boolean refresh, boolean deletion) {
+        this(index, shard, id, source, refresh, deletion, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L);
+    }
+
+    /**
+     * Creates a forwarded write that may be conditional.
+     *
+     * <p>The condition travels with the write rather than being evaluated before it leaves. It has to:
+     * only the owner holds the document, so only the owner can compare against it, and a coordinator that
+     * checked first would be comparing against a copy it does not have.
+     *
+     * @param index the index
+     * @param shard the shard
+     * @param id the document id
+     * @param source the document source, empty for a deletion
+     * @param refresh whether to make the change visible before answering
+     * @param deletion whether this removes the document rather than adding it
+     * @param ifSeqNo the sequence number the document must be at, or unassigned for an unconditional write
+     * @param ifPrimaryTerm the primary term the document must be at, or 0 when unconditional
+     */
+    public ForwardedIndexRequest(
+        String index,
+        int shard,
+        String id,
+        String source,
+        boolean refresh,
+        boolean deletion,
+        long ifSeqNo,
+        long ifPrimaryTerm
+    ) {
         this.deletion = deletion;
         this.index = index;
         this.shard = shard;
         this.id = id;
         this.source = source;
         this.refresh = refresh;
+        this.ifSeqNo = ifSeqNo;
+        this.ifPrimaryTerm = ifPrimaryTerm;
+    }
+
+    /**
+     * Returns the sequence number the document must currently be at.
+     *
+     * @return the condition, or unassigned when the write is unconditional
+     */
+    public long ifSeqNo() {
+        return ifSeqNo;
+    }
+
+    /**
+     * Returns the primary term the document must currently be at.
+     *
+     * @return the condition, or 0 when the write is unconditional
+     */
+    public long ifPrimaryTerm() {
+        return ifPrimaryTerm;
     }
 
     /**
@@ -77,6 +128,8 @@ public final class ForwardedIndexRequest extends TransportRequest {
         this.source = in.readString();
         this.refresh = in.readBoolean();
         this.deletion = in.readBoolean();
+        this.ifSeqNo = in.readZLong();
+        this.ifPrimaryTerm = in.readVLong();
     }
 
     @Override
@@ -88,6 +141,8 @@ public final class ForwardedIndexRequest extends TransportRequest {
         out.writeString(source);
         out.writeBoolean(refresh);
         out.writeBoolean(deletion);
+        out.writeZLong(ifSeqNo);
+        out.writeVLong(ifPrimaryTerm);
     }
 
     /**

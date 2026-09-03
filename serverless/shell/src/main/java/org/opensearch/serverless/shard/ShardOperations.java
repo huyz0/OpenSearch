@@ -350,9 +350,12 @@ public final class ShardOperations {
                 final org.opensearch.index.get.GetResult result = new org.opensearch.index.get.GetResult(
                     index,
                     document.id(),
-                    org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                    0L,
-                    1L,
+                    // Real now, not placeholders. A filter deciding what a caller may see should be shown
+                    // the document as it actually is; a redaction policy keyed on a version it was told
+                    // was always 1 would be keyed on nothing.
+                    document.seqNo(),
+                    document.primaryTerm(),
+                    document.version(),
                     document.found(),
                     document.source() == null
                         ? null
@@ -847,10 +850,46 @@ public final class ShardOperations {
 
         private final String result;
         private final String servedBy;
+        private final long seqNo;
+        private final long primaryTerm;
+        private final long version;
 
-        UpdateOutcome(String result, String servedBy) {
+        UpdateOutcome(String result, String servedBy, long seqNo, long primaryTerm, long version) {
             this.result = result;
             this.servedBy = servedBy;
+            this.seqNo = seqNo;
+            this.primaryTerm = primaryTerm;
+            this.version = version;
+        }
+
+        /**
+         * Returns the sequence number the engine assigned the write this update performed.
+         *
+         * <p>For a noop it is the sequence number the document already had: nothing was written, so the
+         * document's identity is unchanged, and a caller conditioning a later write on it is right to.
+         *
+         * @return the sequence number
+         */
+        public long seqNo() {
+            return seqNo;
+        }
+
+        /**
+         * Returns the primary term that operation ran at.
+         *
+         * @return the primary term
+         */
+        public long primaryTerm() {
+            return primaryTerm;
+        }
+
+        /**
+         * Returns the document's version after this update.
+         *
+         * @return the version
+         */
+        public long version() {
+            return version;
         }
 
         /**
@@ -908,7 +947,9 @@ public final class ShardOperations {
         java.util.Map<String, Object> upsert,
         boolean docAsUpsert,
         boolean detectNoop,
-        boolean refresh
+        boolean refresh,
+        long ifSeqNo,
+        long ifPrimaryTerm
     ) throws IOException {
         return gated(org.opensearch.action.update.UpdateAction.NAME, new org.opensearch.action.update.UpdateRequest(index, id), () -> {
             // doGet, not get: this whole method is one gated operation under UpdateAction's own name, and
@@ -940,22 +981,31 @@ public final class ShardOperations {
             }
 
             if ("noop".equals(result)) {
-                return new UpdateOutcome(result, current.servedBy());
+                // Nothing written, so the document keeps the identity the read just observed. Reporting
+                // that identity rather than an unassigned one is what lets a caller chain a conditional
+                // write after a noop without having to re-read.
+                return new UpdateOutcome(result, current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
             }
             final String mergedJson;
             try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
                 builder.map(merged);
                 mergedJson = org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
             }
-            final String servedBy = write(index, id, mergedJson, refresh, false);
-            return new UpdateOutcome(result, servedBy);
+            final Written written = written(index, id, mergedJson, refresh, false, ifSeqNo, ifPrimaryTerm);
+            return new UpdateOutcome(
+                result,
+                written.servedBy(),
+                written.outcome().seqNo(),
+                written.outcome().primaryTerm(),
+                written.outcome().version()
+            );
         });
     }
 
     private boolean doDelete(String index, String id, boolean refresh) throws IOException {
         final Placement placement = place(index, id);
         if (placement.local() != null) {
-            final boolean found = node.delete(placement.local(), id);
+            final boolean found = node.delete(placement.local(), id).found();
             if (refresh) {
                 node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
             }
@@ -968,19 +1018,65 @@ public final class ShardOperations {
     }
 
     private String write(String index, String id, String source, boolean refresh, boolean deletion) throws IOException {
+        return written(index, id, source, refresh, deletion, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L).servedBy();
+    }
+
+    /** Who served a write, and what the engine assigned it. */
+    private static final class Written {
+        private final String servedBy;
+        private final org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome;
+
+        Written(String servedBy, org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome) {
+            this.servedBy = servedBy;
+            this.outcome = outcome;
+        }
+
+        String servedBy() {
+            return servedBy;
+        }
+
+        org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome() {
+            return outcome;
+        }
+    }
+
+    private Written written(String index, String id, String source, boolean refresh, boolean deletion, long ifSeqNo, long ifPrimaryTerm)
+        throws IOException {
         final Placement placement = place(index, id);
         if (placement.local() != null) {
-            node.index(placement.local(), id, source);
+            final var outcome = node.index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm);
             if (refresh) {
                 node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
             }
-            return node.localNode().getId();
+            return new Written(node.localNode().getId(), outcome);
         }
-        return forward(index, id, source, refresh, deletion, placement);
+        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm);
     }
 
     private String forward(String index, String id, String source, boolean refresh, boolean deletion, Placement placement)
         throws IOException {
+        return forwardWritten(
+            index,
+            id,
+            source,
+            refresh,
+            deletion,
+            placement,
+            org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+            0L
+        ).servedBy();
+    }
+
+    private Written forwardWritten(
+        String index,
+        String id,
+        String source,
+        boolean refresh,
+        boolean deletion,
+        Placement placement,
+        long ifSeqNo,
+        long ifPrimaryTerm
+    ) throws IOException {
         if (placement.owner() == null || placement.owner().equals(node.localNode().getId())) {
             throw notHere(index, placement);
         }
@@ -994,15 +1090,43 @@ public final class ShardOperations {
                     true
                 );
             }
-            return node.router()
+            final var ack = node.router()
                 .forwardIndex(
                     peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedIndexRequest(index, placement.shard(), id, source, refresh, deletion)
+                    new org.opensearch.serverless.transport.ForwardedIndexRequest(
+                        index,
+                        placement.shard(),
+                        id,
+                        source,
+                        refresh,
+                        deletion,
+                        ifSeqNo,
+                        ifPrimaryTerm
+                    )
+                );
+            return new Written(
+                ack.ownerNodeId(),
+                new org.opensearch.serverless.shell.ServerlessNode.WriteOutcome(
+                    ack.seqNo(),
+                    ack.primaryTerm(),
+                    ack.version(),
+                    ack.created(),
+                    ack.found()
                 )
-                .ownerNodeId();
+            );
         } catch (NotHereException e) {
             throw e;
         } catch (Exception e) {
+            // A lost compare-and-swap came back from a healthy owner that answered correctly. It is not
+            // stale routing, must not cast doubt on ownership, and must not be retried blindly -- so it
+            // is rethrown as itself rather than dressed as a routing failure.
+            final Throwable conflict = org.opensearch.ExceptionsHelper.unwrap(
+                e,
+                org.opensearch.index.engine.VersionConflictEngineException.class
+            );
+            if (conflict != null) {
+                throw (org.opensearch.index.engine.VersionConflictEngineException) conflict;
+            }
             // Stale routing is a retry, not a failure of the write itself.
             node.signals().ownershipDoubted(index, placement.shard());
             // Carrying the cause, because the message on its own is often a single word. A TLS handshake

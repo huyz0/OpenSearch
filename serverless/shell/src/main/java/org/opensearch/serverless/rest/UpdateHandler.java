@@ -27,12 +27,13 @@ import java.util.function.Supplier;
 /**
  * {@code POST /{index}/_update/{id}} — a partial-document merge, read then written back.
  *
- * <p><b>Not a transaction.</b> The read and the write are two separate calls with nothing holding the
- * document still in between: a write that lands in that window is silently overwritten by this one, the
- * same as two plain writes racing each other would be. Classic OpenSearch's {@code _update} avoids that by
- * retrying under {@code if_seq_no}/{@code if_primary_term} — exactly the version model {@code WalRecord}
- * does not have (see {@link DocumentHandler}, which refuses those parameters outright). This is the honest
- * version of the feature without one: best-effort, not compare-and-swap.
+ * <p><b>Not a transaction on its own, but it can be made one.</b> The read and the write are two separate
+ * calls with nothing holding the document still in between, so an unconditional update silently overwrites
+ * a write that lands in that window — the same as two plain writes racing. What has changed is that the
+ * caller can now close that window itself: {@code if_seq_no} and {@code if_primary_term} are accepted here
+ * and passed to the write, so read-modify-write with a retry loop is the compare-and-swap classic
+ * OpenSearch's own {@code _update} performs internally. Unconditional remains the default, and remains
+ * best-effort; the response carries the {@code _seq_no} a retry would condition on.
  *
  * <p><b>{@code script} and {@code scripted_upsert} are refused</b>, for the same reason scripting is refused
  * everywhere else on this surface — no engine is registered, and a plugin gets core's own "no lang
@@ -73,8 +74,8 @@ public final class UpdateHandler extends BaseRestHandler {
         final String index = request.param("index");
         final String id = request.param("id");
         final boolean refresh = request.paramAsBoolean("refresh", false);
-        final String ifSeqNo = request.param("if_seq_no");
-        final String ifPrimaryTerm = request.param("if_primary_term");
+        final String ifSeqNoParam = request.param("if_seq_no");
+        final String ifPrimaryTermParam = request.param("if_primary_term");
         final String version = request.param("version");
         final boolean detectNoopParam = request.paramAsBoolean("detect_noop", true);
 
@@ -84,18 +85,41 @@ public final class UpdateHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        if (ifSeqNo != null || ifPrimaryTerm != null || version != null) {
-            // Same refusal as a plain write, for the same reason: see DocumentHandler.
-            final String named = ifSeqNo != null ? "if_seq_no" : ifPrimaryTerm != null ? "if_primary_term" : "version";
+        if (version != null) {
+            // Same refusal as a plain write, for the same reason: see DocumentHandler. External
+            // versioning is a model this system does not keep; optimistic concurrency is one it does.
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_write",
-                    "'"
-                        + named
-                        + "' asks for a conditional write, which this system does not have: every write is a plain "
-                        + "overwrite and every delete a plain removal. WalRecord records document state, not history."
+                    "'version' asks for external versioning, which this system does not have. Use if_seq_no "
+                        + "and if_primary_term, which compare against the sequence number this system assigns."
+                )
+            );
+        }
+        if ((ifSeqNoParam == null) != (ifPrimaryTermParam == null)) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "invalid_condition",
+                    "if_seq_no and if_primary_term must be supplied together"
+                )
+            );
+        }
+        final long ifSeqNo;
+        final long ifPrimaryTerm;
+        try {
+            ifSeqNo = ifSeqNoParam == null ? org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO : Long.parseLong(ifSeqNoParam);
+            ifPrimaryTerm = ifPrimaryTermParam == null ? 0L : Long.parseLong(ifPrimaryTermParam);
+        } catch (NumberFormatException e) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "invalid_condition",
+                    "if_seq_no and if_primary_term must be numbers"
                 )
             );
         }
@@ -143,7 +167,7 @@ public final class UpdateHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             final var operations = new ShardOperations(serving, metadata);
             try {
-                final var outcome = operations.update(index, id, doc, upsert, docAsUpsert, detectNoop, refresh);
+                final var outcome = operations.update(index, id, doc, upsert, docAsUpsert, detectNoop, refresh, ifSeqNo, ifPrimaryTerm);
                 respond(channel, index, id, outcome);
             } catch (ShardOperations.NoSuchIndexException e) {
                 sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
@@ -185,6 +209,9 @@ public final class UpdateHandler extends BaseRestHandler {
             builder.field("_index", index);
             builder.field("_id", id);
             builder.field("result", outcome.result());
+            builder.field("_version", outcome.version());
+            builder.field("_seq_no", outcome.seqNo());
+            builder.field("_primary_term", outcome.primaryTerm());
             builder.startObject("_shards");
             builder.field("total", 1);
             builder.field("successful", 1);

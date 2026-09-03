@@ -55,12 +55,19 @@ public final class ForwardedBulkResponse extends TransportResponse {
             final String failure = in.readOptionalString();
             final boolean deletion = in.readBoolean();
             final boolean found = in.readBoolean();
+            // The sequence identity travels too. Without it a forwarded write would answer with no
+            // _seq_no while a local one answered with a real one -- the same operation reporting
+            // differently depending on which node the client happened to reach.
+            final long seqNo = in.readZLong();
+            final long primaryTerm = in.readVLong();
+            final long version = in.readZLong();
+            final boolean created = in.readBoolean();
             if (failure != null) {
                 read.add(ServerlessNode.BulkOutcome.failed(id, failure));
             } else if (deletion) {
-                read.add(ServerlessNode.BulkOutcome.deleted(id, found));
+                read.add(ServerlessNode.BulkOutcome.deleted(id, found, seqNo, primaryTerm, version));
             } else {
-                read.add(ServerlessNode.BulkOutcome.indexed(id));
+                read.add(ServerlessNode.BulkOutcome.indexed(id, seqNo, primaryTerm, version, created));
             }
         }
         this.outcomes = List.copyOf(read);
@@ -75,6 +82,10 @@ public final class ForwardedBulkResponse extends TransportResponse {
             out.writeOptionalString(outcome.failure());
             out.writeBoolean(outcome.isDeletion());
             out.writeBoolean(outcome.found());
+            out.writeZLong(outcome.seqNo());
+            out.writeVLong(outcome.primaryTerm());
+            out.writeZLong(outcome.version());
+            out.writeBoolean(outcome.created());
         }
     }
 

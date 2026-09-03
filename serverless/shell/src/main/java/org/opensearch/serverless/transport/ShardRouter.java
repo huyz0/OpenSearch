@@ -118,15 +118,25 @@ public final class ShardRouter {
             // one outcome that would be unsafe.
             throw new IllegalStateException("this node does not own " + request.index() + "[" + request.shard() + "]");
         }
+        final org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome;
         if (request.deletion()) {
-            node.delete(shardId, request.id());
+            outcome = node.delete(shardId, request.id(), request.ifSeqNo(), request.ifPrimaryTerm());
         } else {
-            node.index(shardId, request.id(), request.source());
+            outcome = node.index(shardId, request.id(), request.source(), request.ifSeqNo(), request.ifPrimaryTerm());
         }
         if (request.refresh()) {
             node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
         }
-        channel.sendResponse(new ForwardedIndexResponse(node.localNode().getId()));
+        channel.sendResponse(
+            new ForwardedIndexResponse(
+                node.localNode().getId(),
+                outcome.seqNo(),
+                outcome.primaryTerm(),
+                outcome.version(),
+                outcome.created(),
+                outcome.found()
+            )
+        );
     }
 
     private void handleBulk(ForwardedBulkRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {

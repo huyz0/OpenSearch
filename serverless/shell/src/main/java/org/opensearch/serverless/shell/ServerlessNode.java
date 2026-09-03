@@ -476,7 +476,14 @@ public final class ServerlessNode implements Closeable {
                 java.util.Optional<org.opensearch.index.engine.EngineFactory>>>
         engineFactoryProviders() {
         if (roles.contains(ROLE_INGEST)) {
-            return Collections.emptyList();   // the default read-write engine
+            // Core's own writer engine, with one thing added: it knows this shard's history may continue
+            // in an object-store log rather than a local translog, and replays it during recovery so the
+            // sequence numbers survive. See ServerlessWriterEngine for why replay cannot happen later.
+            final org.opensearch.index.engine.EngineFactory writer = config -> new org.opensearch.serverless.engine.ServerlessWriterEngine(
+                config,
+                shardId -> reconciler == null ? null : reconciler.replayLogFor(shardId)
+            );
+            return java.util.List.of((indexSettings, routing) -> java.util.Optional.of(writer));
         }
         final org.opensearch.index.engine.EngineFactory readOnly = config -> new org.opensearch.index.engine.ReadOnlyEngine(
             config,
@@ -1278,17 +1285,44 @@ public final class ServerlessNode implements Closeable {
     /**
      * Indexes a document durably: the write reaches the object store's log before it is acknowledged.
      *
-     * <p>This is the ordering that closes M10's window. Appending first means a crash between the append
-     * and the apply replays a write the caller was never told about — harmless, because replay is
-     * idempotent — while the reverse order would acknowledge a write that no successor could recover.
-     * Cheap to get backwards and expensive to notice.
+     * <p>This is the ordering that closes M10's window — the record is in the log before this method
+     * returns, and returning is what acknowledges the write. What changed is <em>where</em> in the method
+     * the append happens: it used to come first, and now it comes after the engine has run, because the
+     * sequence number the record carries does not exist until then. See {@link #appendOrRelease} for what
+     * happens when the append is the thing that fails.
      *
      * @param shardId the shard to write to
      * @param id the document id
      * @param source the document source
+     * @return what the engine assigned this write
      * @throws java.io.IOException if the shard is not held here, or the write fails
      */
-    public void index(org.opensearch.core.index.shard.ShardId shardId, String id, String source) throws java.io.IOException {
+    public WriteOutcome index(org.opensearch.core.index.shard.ShardId shardId, String id, String source) throws java.io.IOException {
+        return index(shardId, id, source, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L);
+    }
+
+    /**
+     * Indexes a document, optionally only if it is still at the sequence number the caller expects.
+     *
+     * <p><b>The compare-and-swap is the engine's own, not a re-implementation.</b> {@code ifSeqNo} and
+     * {@code ifPrimaryTerm} are passed straight through to
+     * {@code IndexShard#applyIndexOperationOnPrimary}, where core compares them against the live version
+     * map (falling back to a Lucene doc-values lookup) under the per-document lock it already takes. A
+     * mismatch is a {@code VersionConflictEngineException}, which this method rethrows so the caller
+     * cannot mistake a lost race for a completed write.
+     *
+     * @param shardId the shard to write to
+     * @param id the document id
+     * @param source the document source
+     * @param ifSeqNo the sequence number the document must currently be at, or
+     *     {@link org.opensearch.index.seqno.SequenceNumbers#UNASSIGNED_SEQ_NO} for an unconditional write
+     * @param ifPrimaryTerm the primary term the document must currently be at, or 0 when unconditional
+     * @return what the engine assigned this write
+     * @throws org.opensearch.index.engine.VersionConflictEngineException if the condition was not met
+     * @throws java.io.IOException if the shard is not held here, or the write fails
+     */
+    public WriteOutcome index(org.opensearch.core.index.shard.ShardId shardId, String id, String source, long ifSeqNo, long ifPrimaryTerm)
+        throws java.io.IOException {
         ensureStarted();
         final var shard = reconciler.shard(shardId);
         if (shard == null) {
@@ -1298,10 +1332,12 @@ public final class ServerlessNode implements Closeable {
             throw new java.io.IOException("cannot index into " + shardId + ": it is open as a reader");
         }
         markUsed(shardId);
-        final var wal = reconciler.wal(shardId);
-        if (wal != null) {
-            wal.append(shard.getOperationPrimaryTerm(), new org.opensearch.serverless.store.WalRecord(id, source));
-        }
+        // Apply first, then log. This is the reverse of what this path used to do, and the reason is the
+        // whole point of carrying sequence numbers: the engine assigns one, so there is nothing worth
+        // recording until it has run. The durability contract the javadoc above states is unchanged --
+        // the record is in the log before the write is acknowledged, and acknowledgement is this method
+        // returning. It is also the order classic OpenSearch uses internally: Lucene, then the translog,
+        // then fsync.
         final var result = shard.applyIndexOperationOnPrimary(
             org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
             org.opensearch.index.VersionType.INTERNAL,
@@ -1311,20 +1347,76 @@ public final class ServerlessNode implements Closeable {
                 new org.opensearch.core.common.bytes.BytesArray(source),
                 org.opensearch.common.xcontent.XContentType.JSON
             ),
-            org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-            0,
+            ifSeqNo,
+            ifPrimaryTerm,
             org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
             false
         );
+        if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.FAILURE) {
+            // A conditional write that lost is a FAILURE carrying a VersionConflictEngineException rather
+            // than a thrown one -- s0-findings.md F5's trap in its sharpest form, since the caller asked
+            // a question and would otherwise be told the answer was yes.
+            if (result.getFailure() instanceof org.opensearch.index.engine.VersionConflictEngineException conflict) {
+                throw conflict;
+            }
+        }
         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
             // s0-findings.md F5: this is a value, not a throw. A caller that ignores it indexes nothing
             // and reports no error.
             throw new java.io.IOException("indexing " + id + " returned " + result.getResultType());
         }
+        appendOrRelease(
+            shardId,
+            shard,
+            java.util.List.of(
+                new org.opensearch.serverless.store.WalRecord(id, source, result.getSeqNo(), result.getTerm(), result.getVersion())
+            )
+        );
         shard.sync();
         // The edge. Fired after the write is durable and applied, so a listener that publishes on it
         // can never publish a commit describing an operation the caller was not told about.
         signals.wrote(shardId);
+        return new WriteOutcome(result.getSeqNo(), result.getTerm(), result.getVersion(), result.isCreated(), true);
+    }
+
+    /**
+     * Appends a record to the log, and gives up the shard if that fails.
+     *
+     * <p><b>Why a failed append cannot simply be reported to the caller.</b> By the time this runs, the
+     * operation is already in the engine. Reporting failure while leaving it there would make the refusal
+     * a lie: this node would go on serving the document and would eventually publish it, so a caller told
+     * the write failed would find it present, permanently. Releasing the shard is what makes the refusal
+     * true — a successor rebuilds from the log, the log does not contain the operation, and the state the
+     * caller was told about is the state that survives. Classic OpenSearch makes the same choice in the
+     * same situation, failing the engine outright when a translog write fails.
+     *
+     * <p>The cost is a shard that has to be reacquired and replayed after a transient object-store
+     * failure, which is the ordinary failover path and is already well covered. The alternative is a
+     * silent divergence between what a caller was told and what the deployment keeps.
+     *
+     * @param shardId the shard being written to
+     * @param shard the open shard
+     * @param records the records to append, in order; empty is a no-op
+     * @throws java.io.IOException if the append failed, after the shard has been released
+     */
+    private void appendOrRelease(
+        org.opensearch.core.index.shard.ShardId shardId,
+        org.opensearch.index.shard.IndexShard shard,
+        java.util.List<org.opensearch.serverless.store.WalRecord> records
+    ) throws java.io.IOException {
+        final var wal = reconciler.wal(shardId);
+        if (wal == null || records.isEmpty()) {
+            return;
+        }
+        try {
+            wal.append(shard.getOperationPrimaryTerm(), records);
+        } catch (Exception e) {
+            reconciler.releaseShard(shardId, "the write-ahead log could not be appended to: " + e.getMessage());
+            throw new java.io.IOException(
+                "could not log " + records.size() + " operation(s); the shard has been released so it is not served",
+                e
+            );
+        }
     }
 
     /**
@@ -1339,10 +1431,30 @@ public final class ServerlessNode implements Closeable {
      *
      * @param shardId the shard to delete from
      * @param id the document id
-     * @return true if a document was actually removed, false if there was nothing to remove
+     * @return what the engine assigned this deletion, including whether anything was actually removed
      * @throws java.io.IOException if the shard is not held here, or the delete fails
      */
-    public boolean delete(org.opensearch.core.index.shard.ShardId shardId, String id) throws java.io.IOException {
+    public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id) throws java.io.IOException {
+        return delete(shardId, id, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L);
+    }
+
+    /**
+     * Deletes a document, optionally only if it is still at the sequence number the caller expects.
+     *
+     * <p>The same engine-owned compare-and-swap {@link #index(ShardId, String, String, long, long)}
+     * describes, on the deletion path.
+     *
+     * @param shardId the shard to delete from
+     * @param id the document id
+     * @param ifSeqNo the sequence number the document must currently be at, or
+     *     {@link org.opensearch.index.seqno.SequenceNumbers#UNASSIGNED_SEQ_NO} for an unconditional delete
+     * @param ifPrimaryTerm the primary term the document must currently be at, or 0 when unconditional
+     * @return what the engine assigned this deletion, including whether anything was actually removed
+     * @throws org.opensearch.index.engine.VersionConflictEngineException if the condition was not met
+     * @throws java.io.IOException if the shard is not held here, or the delete fails
+     */
+    public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm)
+        throws java.io.IOException {
         ensureStarted();
         final var shard = reconciler.shard(shardId);
         if (shard == null) {
@@ -1352,27 +1464,35 @@ public final class ServerlessNode implements Closeable {
             throw new java.io.IOException("cannot delete from " + shardId + ": it is open as a reader");
         }
         markUsed(shardId);
-        final var wal = reconciler.wal(shardId);
-        if (wal != null) {
-            wal.append(shard.getOperationPrimaryTerm(), org.opensearch.serverless.store.WalRecord.deletion(id));
-        }
+        // Apply, then log -- the same reordering, for the same reason, as the index path above.
         final var result = shard.applyDeleteOperationOnPrimary(
             org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
             id,
             org.opensearch.index.VersionType.INTERNAL,
-            org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-            0
+            ifSeqNo,
+            ifPrimaryTerm
         );
+        if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.FAILURE
+            && result.getFailure() instanceof org.opensearch.index.engine.VersionConflictEngineException conflict) {
+            throw conflict;
+        }
         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
             // A value, not a throw -- the same trap s0-findings.md F5 recorded for indexing.
             throw new java.io.IOException("deleting " + id + " returned " + result.getResultType());
         }
+        appendOrRelease(
+            shardId,
+            shard,
+            java.util.List.of(
+                org.opensearch.serverless.store.WalRecord.deletion(id, result.getSeqNo(), result.getTerm(), result.getVersion())
+            )
+        );
         shard.sync();
         // The same edge a write raises: a deletion changes the shard as surely as an addition, and a
         // shard whose only recent change was a delete still needs publishing or the tombstone lives
         // nowhere but this node's disk and its log.
         signals.wrote(shardId);
-        return result.isFound();
+        return new WriteOutcome(result.getSeqNo(), result.getTerm(), result.getVersion(), false, result.isFound());
     }
 
     /**
@@ -1415,14 +1535,12 @@ public final class ServerlessNode implements Closeable {
         }
         markUsed(shardId);
 
-        final var wal = reconciler.wal(shardId);
-        if (wal != null) {
-            // Before anything is applied, and once for the batch. If this throws, nothing was applied
-            // and nothing was acknowledged.
-            wal.append(shard.getOperationPrimaryTerm(), operations);
-        }
-
+        // Applied first, then logged once for the whole batch -- the same reordering the single-document
+        // path took, and the batch economics are unchanged: one PUT for the batch, not one per document.
+        // Only operations that actually applied are logged, so replay never reproduces an item the caller
+        // was told had failed.
         final java.util.List<BulkOutcome> outcomes = new java.util.ArrayList<>(operations.size());
+        final java.util.List<org.opensearch.serverless.store.WalRecord> applied = new java.util.ArrayList<>(operations.size());
         for (org.opensearch.serverless.store.WalRecord operation : operations) {
             try {
                 if (operation.isDeletion()) {
@@ -1439,7 +1557,17 @@ public final class ServerlessNode implements Closeable {
                         outcomes.add(BulkOutcome.failed(operation.id(), "deleting returned " + result.getResultType()));
                         continue;
                     }
-                    outcomes.add(BulkOutcome.deleted(operation.id(), result.isFound()));
+                    applied.add(
+                        org.opensearch.serverless.store.WalRecord.deletion(
+                            operation.id(),
+                            result.getSeqNo(),
+                            result.getTerm(),
+                            result.getVersion()
+                        )
+                    );
+                    outcomes.add(
+                        BulkOutcome.deleted(operation.id(), result.isFound(), result.getSeqNo(), result.getTerm(), result.getVersion())
+                    );
                 } else {
                     final var result = shard.applyIndexOperationOnPrimary(
                         org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
@@ -1459,7 +1587,18 @@ public final class ServerlessNode implements Closeable {
                         outcomes.add(BulkOutcome.failed(operation.id(), "indexing returned " + result.getResultType()));
                         continue;
                     }
-                    outcomes.add(BulkOutcome.indexed(operation.id()));
+                    applied.add(
+                        new org.opensearch.serverless.store.WalRecord(
+                            operation.id(),
+                            operation.source(),
+                            result.getSeqNo(),
+                            result.getTerm(),
+                            result.getVersion()
+                        )
+                    );
+                    outcomes.add(
+                        BulkOutcome.indexed(operation.id(), result.getSeqNo(), result.getTerm(), result.getVersion(), result.isCreated())
+                    );
                 }
             } catch (Exception e) {
                 // One bad document does not fail the batch. A mapping conflict on item 40 is item 40's
@@ -1469,11 +1608,93 @@ public final class ServerlessNode implements Closeable {
             }
         }
 
+        appendOrRelease(shardId, shard, applied);
         // One fsync and one edge for the batch, not one per document. The edge is raised after
         // everything is applied, so a publish it triggers describes the whole batch or none of it.
         shard.sync();
         signals.wrote(shardId);
         return outcomes;
+    }
+
+    /**
+     * What the engine assigned one single-document write or deletion.
+     *
+     * <p>These are the numbers real OpenSearch returns as {@code _seq_no}, {@code _primary_term} and
+     * {@code _version}. They were always being generated here — the engine is core's own and assigns them
+     * on every operation — and were simply discarded at this boundary. Returning them is what lets a
+     * caller hold one and send it back as {@code if_seq_no}.
+     *
+     * <p>A plain class rather than a record because this module's javadoc check rejects records.
+     */
+    public static final class WriteOutcome {
+
+        private final long seqNo;
+        private final long primaryTerm;
+        private final long version;
+        private final boolean created;
+        private final boolean found;
+
+        /**
+         * Creates an outcome.
+         *
+         * @param seqNo the sequence number assigned
+         * @param primaryTerm the primary term the operation ran at
+         * @param version the version assigned
+         * @param created whether a write created the document rather than overwriting one
+         * @param found whether a deletion found anything; always true for a write
+         */
+        public WriteOutcome(long seqNo, long primaryTerm, long version, boolean created, boolean found) {
+            this.seqNo = seqNo;
+            this.primaryTerm = primaryTerm;
+            this.version = version;
+            this.created = created;
+            this.found = found;
+        }
+
+        /**
+         * Returns the sequence number the engine assigned.
+         *
+         * @return the sequence number
+         */
+        public long seqNo() {
+            return seqNo;
+        }
+
+        /**
+         * Returns the primary term the operation ran at — this shard's shard-head term.
+         *
+         * @return the primary term
+         */
+        public long primaryTerm() {
+            return primaryTerm;
+        }
+
+        /**
+         * Returns the version the engine assigned.
+         *
+         * @return the version
+         */
+        public long version() {
+            return version;
+        }
+
+        /**
+         * Reports whether a write created the document rather than overwriting an existing one.
+         *
+         * @return true when the document did not exist before
+         */
+        public boolean created() {
+            return created;
+        }
+
+        /**
+         * Reports whether a deletion found the document. Always true for a write.
+         *
+         * @return true when there was something to remove
+         */
+        public boolean found() {
+            return found;
+        }
     }
 
     /**
@@ -1487,22 +1708,43 @@ public final class ServerlessNode implements Closeable {
         private final boolean deletion;
         private final boolean found;
         private final String failure;
+        private final long seqNo;
+        private final long primaryTerm;
+        private final long version;
+        private final boolean created;
 
-        private BulkOutcome(String id, boolean deletion, boolean found, String failure) {
+        private BulkOutcome(
+            String id,
+            boolean deletion,
+            boolean found,
+            String failure,
+            long seqNo,
+            long primaryTerm,
+            long version,
+            boolean created
+        ) {
             this.id = id;
             this.deletion = deletion;
             this.found = found;
             this.failure = failure;
+            this.seqNo = seqNo;
+            this.primaryTerm = primaryTerm;
+            this.version = version;
+            this.created = created;
         }
 
         /**
-         * Records a document written.
+         * Records a document written, with the sequence identity the engine assigned it.
          *
          * @param id the document id
+         * @param seqNo the sequence number assigned
+         * @param primaryTerm the primary term it ran at
+         * @param version the version assigned
+         * @param created whether the document did not exist before this write
          * @return the outcome
          */
-        public static BulkOutcome indexed(String id) {
-            return new BulkOutcome(id, false, false, null);
+        public static BulkOutcome indexed(String id, long seqNo, long primaryTerm, long version, boolean created) {
+            return new BulkOutcome(id, false, false, null, seqNo, primaryTerm, version, created);
         }
 
         /**
@@ -1510,10 +1752,13 @@ public final class ServerlessNode implements Closeable {
          *
          * @param id the document id
          * @param found whether the document was there
+         * @param seqNo the sequence number assigned
+         * @param primaryTerm the primary term it ran at
+         * @param version the version assigned
          * @return the outcome
          */
-        public static BulkOutcome deleted(String id, boolean found) {
-            return new BulkOutcome(id, true, found, null);
+        public static BulkOutcome deleted(String id, boolean found, long seqNo, long primaryTerm, long version) {
+            return new BulkOutcome(id, true, found, null, seqNo, primaryTerm, version, false);
         }
 
         /**
@@ -1524,7 +1769,52 @@ public final class ServerlessNode implements Closeable {
          * @return the outcome
          */
         public static BulkOutcome failed(String id, String reason) {
-            return new BulkOutcome(id, false, false, reason == null ? "unknown failure" : reason);
+            return new BulkOutcome(
+                id,
+                false,
+                false,
+                reason == null ? "unknown failure" : reason,
+                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
+                org.opensearch.common.lucene.uid.Versions.NOT_FOUND,
+                false
+            );
+        }
+
+        /**
+         * Returns the sequence number the engine assigned.
+         *
+         * @return the sequence number, unassigned for a failed item
+         */
+        public long seqNo() {
+            return seqNo;
+        }
+
+        /**
+         * Returns the primary term the operation ran at.
+         *
+         * @return the primary term, unassigned for a failed item
+         */
+        public long primaryTerm() {
+            return primaryTerm;
+        }
+
+        /**
+         * Returns the version the engine assigned.
+         *
+         * @return the version
+         */
+        public long version() {
+            return version;
+        }
+
+        /**
+         * Reports whether a write created the document rather than overwriting one.
+         *
+         * @return true when the document did not exist before
+         */
+        public boolean created() {
+            return created;
         }
 
         /**
@@ -1856,7 +2146,10 @@ public final class ServerlessNode implements Closeable {
         if (result.isExists() == false) {
             return Document.absent(id);
         }
-        return new Document(id, true, result.sourceAsString());
+        // The sequence identity comes back with the document, and always did -- ShardGetService reads it
+        // out of the same doc-values lookup that finds the source. It was simply dropped here, which is
+        // why a caller could never obtain the token it needed to send back as if_seq_no.
+        return new Document(id, true, result.sourceAsString(), result.getSeqNo(), result.getPrimaryTerm(), result.getVersion());
     }
 
     /** One document, or the fact that there is none. */
@@ -1865,18 +2158,72 @@ public final class ServerlessNode implements Closeable {
         private final String id;
         private final boolean found;
         private final String source;
+        private final long seqNo;
+        private final long primaryTerm;
+        private final long version;
 
         /**
-         * Creates a found document.
+         * Creates a found document with no sequence identity.
          *
          * @param id the document id
          * @param found whether it exists
          * @param source its source, or null when it does not
          */
         public Document(String id, boolean found, String source) {
+            this(
+                id,
+                found,
+                source,
+                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
+                org.opensearch.common.lucene.uid.Versions.NOT_FOUND
+            );
+        }
+
+        /**
+         * Creates a found document, carrying the sequence identity it currently holds.
+         *
+         * @param id the document id
+         * @param found whether it exists
+         * @param source its source, or null when it does not
+         * @param seqNo the sequence number of the operation that last wrote it
+         * @param primaryTerm the primary term that operation ran at
+         * @param version its current version
+         */
+        public Document(String id, boolean found, String source, long seqNo, long primaryTerm, long version) {
             this.id = id;
             this.found = found;
             this.source = source;
+            this.seqNo = seqNo;
+            this.primaryTerm = primaryTerm;
+            this.version = version;
+        }
+
+        /**
+         * Returns the sequence number of the operation that last wrote this document.
+         *
+         * @return the sequence number, unassigned when the document was not found
+         */
+        public long seqNo() {
+            return seqNo;
+        }
+
+        /**
+         * Returns the primary term that operation ran at.
+         *
+         * @return the primary term, unassigned when the document was not found
+         */
+        public long primaryTerm() {
+            return primaryTerm;
+        }
+
+        /**
+         * Returns the document's current version.
+         *
+         * @return the version
+         */
+        public long version() {
+            return version;
         }
 
         /**

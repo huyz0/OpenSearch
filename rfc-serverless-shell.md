@@ -374,6 +374,20 @@ empty answer. This is not a drop-in replacement for existing OpenSearch clients,
 a target — if either becomes one later, it arrives as demand-driven additions to the allowlist, not as
 a change of posture.
 
+**Sequence numbers, and what they cost (M48).** M47 deferred `_seq_no`/`_primary_term`/`_version` as
+"a real feature, not a shape fix", on the grounds that this shell had no version model. That was wrong in
+an instructive way: core's own engine had been assigning all three on every write all along, and
+`BackgroundReconciler` had depended on the sequence number since M10. The one field with a hard
+cluster-manager dependency in classic OpenSearch — the primary term — this design had already replaced with
+the shard-head's compare-and-swap generation, which is exactly the monotonic fencing token core requires.
+The real gap was narrower: the log recorded only an id and a source, so a successor renumbered everything
+it replayed. It now records each operation's sequence identity and replays through core's own
+`Engine#engineRecoveryOperations()` seam under a recovery origin, which preserves it — and conditional
+writes follow for free, because the comparison is core's own. See
+[`m48-sequence-numbers-notes.md`](m48-sequence-numbers-notes.md), including the two disclosed limits:
+sequence gaps are possible and unfilled, and WAL-append fencing against a not-yet-aware zombie writer
+remains open here exactly as it does in `plugins/serverless-storage`.
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

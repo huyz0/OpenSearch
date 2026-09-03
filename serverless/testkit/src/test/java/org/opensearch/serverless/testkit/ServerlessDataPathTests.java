@@ -375,16 +375,24 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             send(http, "PUT", "/conditional?shards=1", MAPPING);
             node.activateWriter(plane, "conditional", 0);
 
-            for (String query : new String[] { "if_seq_no=0&if_primary_term=1", "if_primary_term=1", "version=3" }) {
-                final Response refused = send(http, "PUT", "/conditional/_doc/1?" + query, "{\"msg\":\"x\"}");
-                assertEquals("[" + query + "] must be refused: " + refused.body(), 501, refused.status());
-                assertTrue(
-                    "and say why: " + refused.body(),
-                    refused.body().contains("conditional write") && refused.body().contains("does not have")
-                );
-            }
+            // External versioning is still refused, and still says why -- it asks this system to order
+            // writes by a number it does not maintain, which optimistic concurrency does not.
+            final Response externalVersion = send(http, "PUT", "/conditional/_doc/1?version=3", "{\"msg\":\"x\"}");
+            assertEquals("version= must still be refused: " + externalVersion.body(), 501, externalVersion.status());
+            assertTrue(
+                "and say why, pointing at what does work: " + externalVersion.body(),
+                externalVersion.body().contains("external versioning") && externalVersion.body().contains("if_seq_no")
+            );
 
-            // The write must not have happened under any of the refused attempts.
+            // Half a condition is refused as a bad request rather than silently treated as none.
+            final Response halfCondition = send(http, "PUT", "/conditional/_doc/1?if_primary_term=1", "{\"msg\":\"x\"}");
+            assertEquals("half a condition must be refused: " + halfCondition.body(), 400, halfCondition.status());
+
+            // A condition on a document that does not exist yet is a conflict, not a silent write.
+            final Response staleCondition = send(http, "PUT", "/conditional/_doc/1?if_seq_no=0&if_primary_term=1", "{\"msg\":\"x\"}");
+            assertEquals("a condition against an absent document must conflict: " + staleCondition.body(), 409, staleCondition.status());
+
+            // None of the refused attempts wrote anything.
             assertEquals(404, send(http, "GET", "/conditional/_doc/1", null).status());
 
             // And a plain write to the same document afterward must still work -- the refusal is per

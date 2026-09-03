@@ -202,6 +202,32 @@ public final class ShardReconciler {
     /** One monitor per index, guarding the create-or-update of its {@link IndexService}. */
     private final java.util.concurrent.ConcurrentHashMap<Index, Object> indexLocks = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * The log a shard currently being opened should replay, for the moments its engine is being built.
+     *
+     * <p><b>Why the engine cannot simply ask for the shard's log.</b> Every shard on this node has one --
+     * a reader and a frozen view included -- and replaying into either of those would be wrong: a reader
+     * serves a published commit and owns no history, and a view is a snapshot of one. Only the reconciler
+     * knows which of the three it is opening, and it knows it only for the duration of that open. So the
+     * answer is armed here, immediately before the engine is constructed, and disarmed the moment the
+     * shard is open; an engine that asks at any other time is told there is nothing to replay, which is
+     * the truthful answer.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<ShardId, org.opensearch.serverless.store.WalStore> pendingReplay =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Returns the log the shard currently being opened should replay, if any.
+     *
+     * <p>Called by {@link org.opensearch.serverless.engine.ServerlessWriterEngine} from inside recovery.
+     *
+     * @param shardId the shard whose engine is being built
+     * @return the log to replay, or null if this shard should not replay one
+     */
+    public org.opensearch.serverless.store.WalStore replayLogFor(ShardId shardId) {
+        return pendingReplay.get(shardId);
+    }
+
     private IndexShard openAndStart(
         IndexMetadata indexMetadata,
         ShardId shardId,
@@ -296,11 +322,20 @@ public final class ShardReconciler {
             bootstrapTranslogFor(shard);
         }
 
-        shard.markAsRecovering("serverless-store", new RecoveryState(initializing, localNode, null));
-        final PlainActionFuture<Boolean> recovered = PlainActionFuture.newFuture();
-        shard.recoverFromStore(recovered);
-        if (Boolean.TRUE.equals(recovered.actionGet()) == false) {
-            throw new IOException("recovery from store reported failure for " + shardId);
+        if (replayWal && walStores != null) {
+            // Armed for exactly the window in which the engine is built and recovery runs, which is the
+            // only window in which core will accept operations carrying their own sequence numbers.
+            pendingReplay.put(shardId, wal(shardId));
+        }
+        try {
+            shard.markAsRecovering("serverless-store", new RecoveryState(initializing, localNode, null));
+            final PlainActionFuture<Boolean> recovered = PlainActionFuture.newFuture();
+            shard.recoverFromStore(recovered);
+            if (Boolean.TRUE.equals(recovered.actionGet()) == false) {
+                throw new IOException("recovery from store reported failure for " + shardId);
+            }
+        } finally {
+            pendingReplay.remove(shardId);
         }
 
         final ShardRouting started = initializing.moveToStarted();
@@ -318,12 +353,20 @@ public final class ShardReconciler {
         );
 
         if (replayWal && walStores != null) {
-            // Everything the previous writer acknowledged but never published. Applied after the shard
-            // is STARTED because that is when it accepts writes; replay is idempotent, so applying a
-            // record that was already in the restored commit changes nothing.
+            // Only what the engine could not replay for itself: records written before the log carried
+            // sequence numbers. Everything else was replayed during recovery, as the operation it
+            // originally was, by ServerlessWriterEngine -- which is what makes _seq_no survive a failover.
+            //
+            // These go in the old way, as fresh primary operations, because a record that does not say
+            // which operation it was cannot be replayed as that operation. They therefore get new
+            // sequence numbers, exactly as every replayed record used to. Dropping them instead would
+            // turn a format change into silent data loss.
             final var wal = wal(shardId);
             int replayed = 0;
             for (org.opensearch.serverless.store.WalRecord record : wal.replayable()) {
+                if (record.hasSequenceIdentity()) {
+                    continue;
+                }
                 if (record.isDeletion()) {
                     // Replayed in order with the writes, which is the only thing that makes the result
                     // correct: a document written, deleted, and written again must end up present, and a

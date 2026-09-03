@@ -271,7 +271,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
     }
 
     /** A conditional update is refused, the same way a conditional plain write is. */
-    public void testConditionalUpdateIsRefused() throws Exception {
+    public void testExternalVersioningIsRefusedWhileAConditionIsHonoured() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
@@ -281,9 +281,14 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
             node.activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"x\",\"n\":1}");
 
-            final Response refused = send(http, "POST", "/alpha/_update/1?if_seq_no=0&if_primary_term=1", "{\"doc\":{\"n\":2}}");
+            // External versioning is still refused -- it asks for a model this system does not keep.
+            final Response refused = send(http, "POST", "/alpha/_update/1?version=3", "{\"doc\":{\"n\":2}}");
             assertEquals(refused.body(), 501, refused.status());
-            assertTrue(refused.body(), refused.body().contains("conditional write"));
+            assertTrue(refused.body(), refused.body().contains("external versioning"));
+
+            // A condition, by contrast, is now honoured: a stale one conflicts rather than overwriting.
+            final Response stale = send(http, "POST", "/alpha/_update/1?if_seq_no=500&if_primary_term=1", "{\"doc\":{\"n\":2}}");
+            assertEquals("a stale condition must conflict: " + stale.body(), 409, stale.status());
         }
     }
 

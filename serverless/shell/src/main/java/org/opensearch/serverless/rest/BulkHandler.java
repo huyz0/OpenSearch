@@ -406,6 +406,9 @@ public final class BulkHandler extends BaseRestHandler {
                 } else {
                     builder.field("status", item.status.getStatus());
                     builder.field("result", item.result);
+                    builder.field("_version", item.version);
+                    builder.field("_seq_no", item.seqNo);
+                    builder.field("_primary_term", item.primaryTerm);
                     builder.startObject("_shards");
                     builder.field("total", 1);
                     builder.field("successful", 1);
@@ -584,6 +587,9 @@ public final class BulkHandler extends BaseRestHandler {
         private String nodeId;
         private String errorType;
         private String errorReason;
+        private long seqNo = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
+        private long primaryTerm = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
+        private long version = org.opensearch.common.lucene.uid.Versions.NOT_FOUND;
 
         Item(String index, WalRecord operation) {
             this.index = index;
@@ -609,12 +615,17 @@ public final class BulkHandler extends BaseRestHandler {
                 return;
             }
             this.nodeId = nodeId;
+            this.seqNo = outcome.seqNo();
+            this.primaryTerm = outcome.primaryTerm();
+            this.version = outcome.version();
             if (outcome.isDeletion()) {
                 this.result = outcome.found() ? "deleted" : "not_found";
                 this.status = outcome.found() ? RestStatus.OK : RestStatus.NOT_FOUND;
             } else {
-                this.result = "created";
-                this.status = RestStatus.CREATED;
+                // Told apart honestly now, the same as the single-document path: the engine reports
+                // whether the document existed, and this used to say "created" regardless.
+                this.result = outcome.created() ? "created" : "updated";
+                this.status = outcome.created() ? RestStatus.CREATED : RestStatus.OK;
             }
         }
     }
