@@ -747,6 +747,35 @@ public final class ShardReconciler {
         indexService.updateMapping(indexService.getMetadata(), descriptor.toIndexMetadata(java.util.Map.of()));
     }
 
+    /**
+     * Applies changed settings to whatever this node already has open for an index.
+     *
+     * <p>The counterpart of {@link #refreshMapping}, and needed for the same reason: the reconcile pass opens
+     * and closes shards, and has never had a reason to notice that an index it already holds says something
+     * different than it did. Core does the applying — {@code IndexService#updateMetadata} pushes the new
+     * settings into {@code IndexSettings}, notifies each shard, and re-times the refresh and fsync tasks —
+     * and it gates on the settings version, which is why the descriptor carries one.
+     *
+     * @param indexName the index whose settings changed
+     * @param descriptor the index as it now stands
+     * @throws IOException if the new metadata cannot be built
+     */
+    public void refreshSettings(String indexName, org.opensearch.serverless.cluster.IndexDescriptor descriptor) throws IOException {
+        final Index index = openShards().stream()
+            .map(ShardId::getIndex)
+            .filter(each -> each.getName().equals(indexName))
+            .findFirst()
+            .orElse(null);
+        if (index == null) {
+            return;
+        }
+        final IndexService indexService = indicesService.indexService(index);
+        if (indexService == null) {
+            return;
+        }
+        indexService.updateMetadata(indexService.getMetadata(), descriptor.toIndexMetadata(java.util.Map.of()));
+    }
+
     public Set<ShardId> openShards() {
         final Set<ShardId> serving = new java.util.HashSet<>(open.keySet());
         serving.removeAll(frozenViews);

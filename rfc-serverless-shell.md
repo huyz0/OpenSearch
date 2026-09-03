@@ -451,6 +451,15 @@ prefix cap search wildcards use, refusing rather than truncating. The unscoped f
 reason that was never true of most of them; that is the third time a stale reason has surfaced. See
 [`m53-discovery-notes.md`](m53-discovery-notes.md).
 
+**Settings became mutable too (M54).** The other half of M52. Same shape — compare-and-swap the descriptor,
+apply to shards already open — with one question mappings do not have: core divides settings into dynamic and
+static, and classic OpenSearch changes a static one only on a *closed* index. There is no closed state here, so
+a static setting has no moment at which it could be applied and is refused rather than stored and quietly
+ignored. `IndexScopedSettings` decides which is which; a list kept here would be a second account of a registry
+that grows every release. `number_of_shards` is refused for a reason of its own — routing is a function of it,
+so changing it would re-route every document that already exists. See
+[`m54-mutable-settings-notes.md`](m54-mutable-settings-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

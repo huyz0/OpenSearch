@@ -165,7 +165,11 @@ indices using it. `GET /_list/indices/{prefix}*` lists indices through one bound
 prefix matching more than the cap rather than truncating**, which is why it is `_list` and not `_cat`:
 OpenSearch added `_list` for exactly this reason ([`m53-discovery-notes.md`](m53-discovery-notes.md)).
 
-**Indices are mutable.** `PUT|POST /{index}/_mapping` adds fields to an index that already exists — the merge
+**Indices are mutable.** `PUT|POST /{index}/_settings` changes any *dynamic* setting on a live index and
+refuses a static one, because classic changes those only on a closed index and there is no closed state here —
+storing one would leave a value nothing acts on. `IndexScopedSettings` decides which is which, so there is no
+second list to drift ([`m54-mutable-settings-notes.md`](m54-mutable-settings-notes.md)).
+`PUT|POST /{index}/_mapping` adds fields to an index that already exists — the merge
 is core's own `MapperService`, so adding a field succeeds and changing a field's type is refused in core's own
 words, and a shard already open and serving traffic picks the change up. The write is a compare-and-swap on
 the descriptor, so two clients adding different fields both win
@@ -228,9 +232,9 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - `update` inside `_bulk` is refused: it is a partial merge, which has to read the current document before
   writing one, and the batch path applies without reading. Closing it changes what a batch is, so it is a
   design decision rather than plumbing. `POST /{index}/_update/{id}` does the merge.
-- Settings are write-once. They are honoured at creation and readable afterwards, but `PUT /{index}/_settings`
-  is not routed and there is no settings service behind it. Both AWS OpenSearch Serverless and Elastic Cloud
-  Serverless ship it; mappings became mutable in M52 and settings did not.
+- Static index settings cannot be changed at all, by any route. Classic OpenSearch offers close-change-open
+  and there is no close here, so the only way to change one is to create a new index. Dynamic settings change
+  freely (M54).
 - There is no cursor over indices. `GET /_list/indices/{prefix}*` answers in one bounded page or refuses;
   paginating a deployment whose indices fit under no usable prefix is not possible, because resuming a listing
   needs `start-after` and core's `BlobContainer` does not expose it.
@@ -286,7 +290,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-462 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+467 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 
