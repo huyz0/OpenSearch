@@ -713,6 +713,40 @@ public final class ShardReconciler {
      *
      * @return the open shard ids, excluding frozen views
      */
+    /**
+     * Applies a changed mapping to whatever this node already has open for an index.
+     *
+     * <p><b>Why this is needed at all, rather than letting the next reconcile pass do it.</b> The pass opens
+     * shards that are missing and closes shards that are no longer ours; it has never had a reason to notice
+     * that an index it already holds says something different than it did. A mapping update is the first
+     * change to an index that a node must apply to a shard it is already serving, and the node that accepted
+     * the update is the one node guaranteed to be holding stale metadata the instant it succeeds.
+     *
+     * <p>Core does the applying: {@code IndexService#updateMapping} merges under
+     * {@code MergeReason.MAPPING_RECOVERY} and gates on the mapping version, which is why the descriptor
+     * carries one. A node with nothing open for this index has nothing to do — it will read the new
+     * descriptor when it next opens a shard, which is the only moment the mapping matters to it.
+     *
+     * @param indexName the index whose mapping changed
+     * @param descriptor the index as it now stands
+     * @throws IOException if core rejects the new mapping
+     */
+    public void refreshMapping(String indexName, org.opensearch.serverless.cluster.IndexDescriptor descriptor) throws IOException {
+        final Index index = openShards().stream()
+            .map(ShardId::getIndex)
+            .filter(each -> each.getName().equals(indexName))
+            .findFirst()
+            .orElse(null);
+        if (index == null) {
+            return;
+        }
+        final IndexService indexService = indicesService.indexService(index);
+        if (indexService == null) {
+            return;
+        }
+        indexService.updateMapping(indexService.getMetadata(), descriptor.toIndexMetadata(java.util.Map.of()));
+    }
+
     public Set<ShardId> openShards() {
         final Set<ShardId> serving = new java.util.HashSet<>(open.keySet());
         serving.removeAll(frozenViews);

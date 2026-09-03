@@ -73,7 +73,15 @@ public final class GetHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.GET, "/{index}/_doc/{id}"), new Route(RestRequest.Method.HEAD, "/{index}/_doc/{id}"));
+        return List.of(
+            new Route(RestRequest.Method.GET, "/{index}/_doc/{id}"),
+            new Route(RestRequest.Method.HEAD, "/{index}/_doc/{id}"),
+            // The same read, rendered as the document alone. It is the shape a caller wants when it is going
+            // to hand the body to something that expects the document and not an envelope around it, and it
+            // costs nothing extra: the source was already fetched and already filterable.
+            new Route(RestRequest.Method.GET, "/{index}/_source/{id}"),
+            new Route(RestRequest.Method.HEAD, "/{index}/_source/{id}")
+        );
     }
 
     @Override
@@ -83,6 +91,7 @@ public final class GetHandler extends BaseRestHandler {
         final String index = request.param("index");
         final String id = request.param("id");
         final boolean bodyless = request.method() == RestRequest.Method.HEAD;
+        final boolean sourceOnly = request.path().contains("/_source/");
         // What the caller wants back. Shapes the response only -- the document is fetched whole either
         // way; see SourceFiltering.
         final org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource = org.opensearch.search.fetch.subphase.FetchSourceContext
@@ -105,7 +114,7 @@ public final class GetHandler extends BaseRestHandler {
         final ServerlessNode serving = node.get();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GET).execute(() -> {
             try {
-                answer(channel, serving, metadata, index, id, shard, bodyless, fetchSource);
+                answer(channel, serving, metadata, index, id, shard, bodyless, fetchSource, sourceOnly);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -124,12 +133,13 @@ public final class GetHandler extends BaseRestHandler {
         String id,
         int shard,
         boolean bodyless,
-        org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource
+        org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource,
+        boolean sourceOnly
     ) throws Exception {
         final var operations = new org.opensearch.serverless.shard.ShardOperations(serving, metadata);
         try {
             final var read = operations.get(index, id);
-            respond(channel, index, shard, read.document(), read.servedBy(), read.realtime(), bodyless, fetchSource);
+            respond(channel, index, shard, read.document(), read.servedBy(), read.realtime(), bodyless, fetchSource, sourceOnly);
         } catch (org.opensearch.serverless.shard.ShardOperations.NotHereException e) {
             // Every "not here" is a 503 for a get, and deliberately so: the alternative is answering from
             // a published commit that a live writer is already ahead of, which is a stale document -- or a
@@ -155,12 +165,24 @@ public final class GetHandler extends BaseRestHandler {
         String servedBy,
         boolean realtime,
         boolean bodyless,
-        org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource
+        org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource,
+        boolean sourceOnly
     ) throws IOException {
         final RestStatus status = document.found() ? RestStatus.OK : RestStatus.NOT_FOUND;
         if (bodyless) {
             // HEAD is an existence check, and a body on it would be discarded by any correct client.
             channel.sendResponse(new BytesRestResponse(status, BytesRestResponse.TEXT_CONTENT_TYPE, ""));
+            return;
+        }
+        if (sourceOnly) {
+            // The document, and nothing wrapped around it. A missing document is still a 404 -- returning an
+            // empty body with a 200 would be indistinguishable from a document that happens to be empty.
+            final String only = document.found() ? SourceFiltering.apply(document.source(), fetchSource) : null;
+            channel.sendResponse(
+                only == null
+                    ? new BytesRestResponse(status, BytesRestResponse.TEXT_CONTENT_TYPE, "")
+                    : new BytesRestResponse(status, XContentType.JSON.mediaType(), only)
+            );
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {

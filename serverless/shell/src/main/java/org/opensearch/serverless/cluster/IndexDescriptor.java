@@ -58,6 +58,7 @@ public final class IndexDescriptor {
     private final String uuid;
     private final int numberOfShards;
     private final String mapping;
+    private final long mappingVersion;
     private final Settings extraSettings;
 
     /**
@@ -70,6 +71,27 @@ public final class IndexDescriptor {
      * @param extraSettings settings layered over the defaults, or null
      */
     public IndexDescriptor(String name, String uuid, int numberOfShards, String mapping, Settings extraSettings) {
+        this(name, uuid, numberOfShards, mapping, extraSettings, 1L);
+    }
+
+    /**
+     * Creates a descriptor at a known mapping version.
+     *
+     * <p><b>Why a mapping needs a version here.</b> Core decides whether to re-apply a mapping to an open
+     * shard by comparing {@code IndexMetadata#getMappingVersion} — an unchanged version means "nothing to do"
+     * and the new source is ignored. A shell that edits the mapping and leaves the version alone would write
+     * the change to the object store, hand it to every node, and have every node decline to apply it. The
+     * version is the descriptor's, incremented on each accepted update, because the descriptor is the only
+     * thing here that knows an update happened.
+     *
+     * @param name the index name
+     * @param uuid a stable uuid; the data plane rejects {@code _na_}
+     * @param numberOfShards shard count
+     * @param mapping the mapping source, or null for none
+     * @param extraSettings settings layered over the defaults, or null
+     * @param mappingVersion increments on every accepted mapping change
+     */
+    public IndexDescriptor(String name, String uuid, int numberOfShards, String mapping, Settings extraSettings, long mappingVersion) {
         this.name = Objects.requireNonNull(name);
         this.uuid = Objects.requireNonNull(uuid);
         if (numberOfShards < 1) {
@@ -87,6 +109,7 @@ public final class IndexDescriptor {
         }
         this.numberOfShards = numberOfShards;
         this.mapping = mapping;
+        this.mappingVersion = mappingVersion;
         this.extraSettings = extraSettings == null ? Settings.EMPTY : extraSettings;
     }
 
@@ -140,6 +163,9 @@ public final class IndexDescriptor {
         if (mapping != null) {
             builder.putMapping(mapping);
         }
+        // Without this every node would read the new mapping and decline to apply it, because core gates
+        // re-applying on the version rather than on the source.
+        builder.mappingVersion(mappingVersion);
         for (int shard = 0; shard < numberOfShards; shard++) {
             // S0/F4: the data plane refuses to activate a primary at term 0, so a term must always be
             // supplied. In this design its only legitimate source is the shard-head's CAS generation.
@@ -167,6 +193,25 @@ public final class IndexDescriptor {
     }
 
     /**
+     * Returns the mapping's version, which increments on every accepted change.
+     *
+     * @return the mapping version
+     */
+    public long mappingVersion() {
+        return mappingVersion;
+    }
+
+    /**
+     * Returns a copy carrying a new mapping, one version on.
+     *
+     * @param merged the merged mapping source
+     * @return the updated descriptor
+     */
+    public IndexDescriptor withMapping(String merged) {
+        return new IndexDescriptor(name, uuid, numberOfShards, merged, extraSettings, mappingVersion + 1);
+    }
+
+    /**
      * Serializes this descriptor as the bytes of its register.
      *
      * <p>JSON rather than a binary form on purpose: a descriptor is the record an operator reaches for
@@ -184,6 +229,11 @@ public final class IndexDescriptor {
             builder.field("number_of_shards", numberOfShards);
             if (mapping != null) {
                 builder.field("mapping", mapping);
+            }
+            // Written only when it has moved, so a descriptor that has never had a mapping update is
+            // byte-identical to what this class wrote before mappings could be updated at all.
+            if (mappingVersion != 1L) {
+                builder.field("mapping_version", mappingVersion);
             }
             // Core's own settings serialization, rather than a flat key-to-string loop.
             //
@@ -219,6 +269,7 @@ public final class IndexDescriptor {
             String name = null;
             String uuid = null;
             String mapping = null;
+            long mappingVersion = 1L;
             int shards = -1;
             Settings parsedSettings = Settings.EMPTY;
             String field = null;
@@ -233,6 +284,7 @@ public final class IndexDescriptor {
                         case "name" -> name = parser.text();
                         case "uuid" -> uuid = parser.text();
                         case "mapping" -> mapping = parser.text();
+                        case "mapping_version" -> mappingVersion = parser.longValue();
                         case "number_of_shards" -> shards = parser.intValue();
                         default -> {
                             // forward compatibility: a newer node may write fields we do not know
@@ -243,7 +295,7 @@ public final class IndexDescriptor {
             if (name == null || uuid == null || shards < 1) {
                 throw new IOException("malformed index descriptor: missing a required field");
             }
-            return new IndexDescriptor(name, uuid, shards, mapping, parsedSettings);
+            return new IndexDescriptor(name, uuid, shards, mapping, parsedSettings, mappingVersion);
         }
     }
 
@@ -257,6 +309,7 @@ public final class IndexDescriptor {
                 && name.equals(other.name)
                 && uuid.equals(other.uuid)
                 && Objects.equals(mapping, other.mapping)
+                && mappingVersion == other.mappingVersion
                 && extraSettings.equals(other.extraSettings);
         }
         return false;
@@ -264,7 +317,7 @@ public final class IndexDescriptor {
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings);
+        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings, mappingVersion);
     }
 
     @Override

@@ -425,6 +425,19 @@ shard asked about can be served", yellow is unreachable and says so, and a dorma
 rather than unassigned. Mapping it the classic way would make `wait_for_status=green` block forever in a system
 where shards activate on demand. See [`m51-cluster-endpoints-notes.md`](m51-cluster-endpoints-notes.md).
 
+**Indices became mutable (M52).** A comparison against AWS OpenSearch Serverless and Elastic Cloud Serverless
+found one capability both ship that this did not: changing an index after creating it. An index whose mapping
+is fixed at creation cannot have a field added, and with no `_reindex` to escape through the only remedy was
+to delete the index and its data. Two independent vendors treating something as non-optional is the strongest
+signal a comparison produces, so it was taken first. The merge is core's own `MapperService` — this shell
+decides nothing about what a legal mapping change is, exactly as it decides nothing about a compare-and-swap
+in M48 — validated without a shard through `IndicesService#createIndexMapperService`, written as a
+compare-and-swap on the descriptor, and applied to shards already open. The same comparison found the
+point-in-time API spelled Elasticsearch's way on a fork of OpenSearch, and eight endpoints falling through to
+core's 400 instead of the promised 501; both are fixed. See
+[`m52-mutable-mappings-notes.md`](m52-mutable-mappings-notes.md), including what is still write-once:
+index settings.
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

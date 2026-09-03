@@ -780,6 +780,7 @@ public final class ServerlessNode implements Closeable {
         // being true the moment leases became an address book.
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.ClusterHealthHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.NodesHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MappingUpdateHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,
@@ -856,10 +857,6 @@ public final class ServerlessNode implements Closeable {
             + "write with _bulk, which is the same work under the caller's own control";
         for (String[] refusal : new String[][] {
             {
-                "/{index}/_count",
-                "counting is a search; send GET /{index}/_search with size=0 and read hits.total, which is "
-                    + "exact here because the total is always tracked" },
-            {
                 "/{index}/_refresh",
                 "refresh is per-write here: pass refresh=true on the write that must be visible. A "
                     + "deployment-wide refresh would have to reach every node holding a shard of this index" },
@@ -892,7 +889,35 @@ public final class ServerlessNode implements Closeable {
             { "/_component_template/{name}", "there is no cluster state for a template to live in" },
             { "/_ingest/pipeline/{id}", "there is no cluster state for a pipeline to live in" },
             { "/_scripts/{id}", "no scripting engine is registered, so there is nowhere to store a script" },
-            { "/_ilm/policy/{name}", "index lifecycle management is not part of this surface" } }) {
+            { "/_ilm/policy/{name}", "index lifecycle management is not part of this surface" },
+            // Found by comparing this surface against AWS OpenSearch Serverless and Elastic Cloud
+            // Serverless: every one of these is an endpoint a real client reaches for, and every one of them
+            // fell through to core's default 400 rather than the 501 D2 promises. Being absent is a
+            // decision; looking like a typo is not.
+            {
+                "/_field_caps",
+                "field capabilities are not implemented here yet. It is the largest of these gaps -- both "
+                    + "comparable products ship it and clients use it to discover what they can query -- and "
+                    + "it is absent rather than refused on principle" },
+            { "/{index}/_field_caps", "field capabilities are not implemented here yet" },
+            {
+                "/{index}/_validate/query",
+                "query validation is not implemented here; send the query to _search, which parses it the "
+                    + "same way and reports a parse failure as a 400" },
+            {
+                "/_resolve/index/{name}",
+                "index and alias resolution is not exposed; look an index up by name with GET /{index}, or "
+                    + "use a prefix pattern on _search, which resolves with one bounded listing" },
+            { "/{index}/_rank_eval", "ranking evaluation is not implemented here" },
+            {
+                "/_aliases",
+                "the bulk alias action API is not implemented; this shell has PUT, GET and DELETE on "
+                    + "/_alias/{name}, which covers creating and removing an alias but not atomic swaps" },
+            {
+                "/{index}/_alias/{name}",
+                "aliases are managed by name rather than per index here: use PUT /_alias/{name} with the " + "indices in the body" },
+            { "/_search/pipeline/{id}", "search pipelines are not implemented here" },
+            { "/_cat/templates", "there is no cluster state for a template to live in" } }) {
             controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
         }
         return controller;

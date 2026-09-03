@@ -500,6 +500,33 @@ public final class MetadataPlane {
     }
 
     /**
+     * Returns the generation an index's descriptor currently sits at, for a compare-and-swap.
+     *
+     * @param indexName the index
+     * @return the generation, or the absent generation when there is no descriptor
+     * @throws IOException if the read fails
+     */
+    public long descriptorGeneration(String indexName) throws IOException {
+        return descriptors.generationOf(indexName);
+    }
+
+    /**
+     * Replaces an index's descriptor, only if it has not changed underneath the caller.
+     *
+     * <p>A compare-and-swap rather than a write, because two clients updating a mapping at the same time is
+     * exactly the race this design has an object store to arbitrate. A lost swap is reported as such so the
+     * caller can re-read and retry against what is actually stored, rather than overwriting it.
+     *
+     * @param descriptor the new descriptor
+     * @param expectedGeneration the generation the caller read
+     * @return the new generation, or empty if another writer got there first
+     * @throws IOException if the swap fails
+     */
+    public Optional<Long> updateDescriptor(IndexDescriptor descriptor, long expectedGeneration) throws IOException {
+        return descriptors.update(descriptor, expectedGeneration);
+    }
+
+    /**
      * Attempts to take ownership of a shard.
      *
      * @param indexName the index

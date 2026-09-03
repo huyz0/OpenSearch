@@ -158,7 +158,11 @@ a 429 rather than accepted into memory it does not have. A node at its shard lim
 recently used idle shard to make room rather than refusing, and `GET /_serverless/stats` reports the
 counters those refusals are decided from — breakers, in-flight write bytes, and what the node is holding.
 
-**Indices.** `PUT /{index}` reads OpenSearch's own create envelope — `settings.number_of_shards` is honoured,
+**Indices are mutable.** `PUT|POST /{index}/_mapping` adds fields to an index that already exists — the merge
+is core's own `MapperService`, so adding a field succeeds and changing a field's type is refused in core's own
+words, and a shard already open and serving traffic picks the change up. The write is a compare-and-swap on
+the descriptor, so two clients adding different fields both win
+([`m52-mutable-mappings-notes.md`](m52-mutable-mappings-notes.md)). `PUT /{index}` reads OpenSearch's own create envelope — `settings.number_of_shards` is honoured,
 `mappings` is the mapping, and any other setting is carried into the descriptor and layered into
 `IndexMetadata`, because the data plane under this shell is core's and understands them. The older bare-mapping
 body with `?shards=` still works. `GET /{index}`, `/_mapping` and `/_settings` answer OpenSearch's shape, so
@@ -218,7 +222,11 @@ These are decisions, not gaps. Each answers 501 with a reason.
   writing one, and the batch path applies without reading. Closing it changes what a batch is, so it is a
   design decision rather than plumbing. `POST /{index}/_update/{id}` does the merge.
 - Settings are write-once. They are honoured at creation and readable afterwards, but `PUT /{index}/_settings`
-  is not routed and there is no settings service behind it.
+  is not routed and there is no settings service behind it. Both AWS OpenSearch Serverless and Elastic Cloud
+  Serverless ship it; mappings became mutable in M52 and settings did not.
+- `_field_caps` is the largest endpoint gap left: both comparable products ship it and clients use it to
+  discover what they can query. It refuses honestly rather than falling through, which is not the same as
+  being built.
 - `GET /{index}` omits `aliases` rather than reporting an empty object: resolving an index's aliases needs a
   reverse lookup this design does not offer, and an empty one would be a confident wrong answer.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
@@ -271,7 +279,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-445 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+454 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

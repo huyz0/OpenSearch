@@ -74,7 +74,14 @@ public final class SearchHandler extends BaseRestHandler {
             // request the shell can in fact serve, since a bare "*" is the prefix pattern it already
             // resolves with one bounded listing.
             new Route(RestRequest.Method.GET, "/_search"),
-            new Route(RestRequest.Method.POST, "/_search")
+            new Route(RestRequest.Method.POST, "/_search"),
+            // Counting is a search with size=0 whose total is already exact here, because this shell always
+            // tracks the total. The refusal that used to stand here told callers exactly that and left them
+            // to do it -- which is work this handler was already doing and could simply report.
+            new Route(RestRequest.Method.GET, "/{index}/_count"),
+            new Route(RestRequest.Method.POST, "/{index}/_count"),
+            new Route(RestRequest.Method.GET, "/_count"),
+            new Route(RestRequest.Method.POST, "/_count")
         );
     }
 
@@ -85,6 +92,7 @@ public final class SearchHandler extends BaseRestHandler {
         // A bare /_search names no index, and means every index -- which this shell already expresses as a
         // prefix pattern, resolved by one bounded listing.
         final String index = request.param("index") == null ? "*" : request.param("index");
+        final boolean counting = request.path().endsWith("/_count");
         final String q = request.param("q");
         final int sizeParam = request.paramAsInt("size", 10);
         final int fromParam = request.paramAsInt("from", 0);
@@ -125,20 +133,26 @@ public final class SearchHandler extends BaseRestHandler {
             // fields, the simplest thing a caller can type -- was a 400. The colon form still parses, and
             // now parses as the query-string syntax it always looked like rather than as a lookalike.
             source = new SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.queryStringQuery(q));
+        } else if (counting) {
+            // A count with neither a body nor a q= is "how many documents are there", which is a
+            // well-formed question and the most common way the endpoint is called.
+            source = new SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.matchAllQuery());
         } else {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "bad_query",
-                    "send a search body, or use the q=field:value shorthand"
-                )
+                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "send a search body, or a q= query string")
             );
+        }
+
+        if (counting) {
+            // A count asks how many, not which. Fetching hits to throw them away would make the cheap
+            // question cost the same as the expensive one.
+            source.size(0);
+            source.from(0);
         }
 
         // Defaults that belong to the request rather than to the shard, applied only where the body did
         // not speak. A body's own size wins; the query parameter is the fallback it always was.
-        if (source.size() < 0) {
+        if (counting == false && source.size() < 0) {
             source.size(sizeParam);
         }
         if (source.from() < 0) {
@@ -174,7 +188,7 @@ public final class SearchHandler extends BaseRestHandler {
             final var frozen = pit.get();
             return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
                 try {
-                    respondFrozen(channel, serving, metadata, frozen, source);
+                    respondFrozen(channel, serving, metadata, frozen, source, counting);
                 } catch (Exception e) {
                     try {
                         channel.sendResponse(new BytesRestResponse(channel, e));
@@ -355,7 +369,7 @@ public final class SearchHandler extends BaseRestHandler {
         // connection, which surfaces to the client as RST_STREAM rather than as anything diagnosable.
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                respond(channel, serving, metadata, indices, skipped, source);
+                respond(channel, serving, metadata, indices, skipped, source, counting);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(new BytesRestResponse(channel, e));
@@ -550,7 +564,8 @@ public final class SearchHandler extends BaseRestHandler {
         ServerlessNode serving,
         MetadataPlane metadata,
         org.opensearch.serverless.metadata.PointInTime pit,
-        SearchSourceBuilder source
+        SearchSourceBuilder source,
+        boolean counting
     ) throws IOException {
         final long startNanos = System.nanoTime();
         final var outcome = gated(
@@ -559,7 +574,7 @@ public final class SearchHandler extends BaseRestHandler {
             source,
             () -> SearchFanout.runFrozen(serving, metadata, pit, source)
         );
-        render(channel, java.util.Map.of(pit.index(), pit.shards().size()), java.util.List.of(), outcome, tookMillis(startNanos));
+        render(channel, java.util.Map.of(pit.index(), pit.shards().size()), java.util.List.of(), outcome, tookMillis(startNanos), counting);
     }
 
     private void respond(
@@ -568,13 +583,14 @@ public final class SearchHandler extends BaseRestHandler {
         MetadataPlane metadata,
         java.util.Map<String, Integer> indices,
         java.util.List<String> skipped,
-        SearchSourceBuilder source
+        SearchSourceBuilder source,
+        boolean counting
     ) throws IOException {
         final long startNanos = System.nanoTime();
         // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
         // fan-out rather than going through ShardOperations, so the gate has to meet it where it works.
         final var outcome = gated(serving, indices.keySet(), source, () -> SearchFanout.run(serving, metadata, indices, source));
-        render(channel, indices, skipped, outcome, tookMillis(startNanos));
+        render(channel, indices, skipped, outcome, tookMillis(startNanos), counting);
     }
 
     /**
@@ -591,6 +607,34 @@ public final class SearchHandler extends BaseRestHandler {
     }
 
     /**
+     * Writes a count, which is a search's total without its hits.
+     *
+     * <p>{@code count} is exact rather than a lower bound, because this shell always tracks the total —
+     * there is no {@code track_total_hits} ceiling to hit. The {@code _shards} block is the same one a
+     * search reports, and for the same reason: a count assembled from some of the shards is a different
+     * number from a count assembled from all of them, and a caller must be able to tell.
+     *
+     * @param channel the channel to answer on
+     * @param outcome what the fan-out returned
+     * @throws IOException if writing fails
+     */
+    private void renderCount(org.opensearch.rest.RestChannel channel, org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome)
+        throws IOException {
+        try (XContentBuilder builder = channel.newBuilder()) {
+            builder.startObject();
+            builder.field("count", outcome.total());
+            builder.startObject("_shards");
+            builder.field("total", outcome.shards());
+            builder.field("successful", outcome.answered());
+            builder.field("skipped", 0);
+            builder.field("failed", outcome.shards() - outcome.answered());
+            builder.endObject();
+            builder.endObject();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        }
+    }
+
+    /**
      * Writes the answer, wherever it came from.
      *
      * <p>Shared by the ordinary search and the frozen one, because a caller must not be able to tell which
@@ -602,8 +646,13 @@ public final class SearchHandler extends BaseRestHandler {
         java.util.Map<String, Integer> indices,
         java.util.List<String> skipped,
         org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome,
-        long tookMillis
+        long tookMillis,
+        boolean counting
     ) throws IOException {
+        if (counting) {
+            renderCount(channel, outcome);
+            return;
+        }
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.field("took", tookMillis);

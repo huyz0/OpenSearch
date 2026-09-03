@@ -342,7 +342,9 @@ public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
             call("PUT", "/alpha", "{\"settings\":{\"number_of_shards\":1}}");
 
             for (String[] expected : new String[][] {
-                { "/alpha/_count", "hits.total" },
+                // _count was here until M52 served it. _field_caps replaces it as the example of an
+                // endpoint that is absent and says so rather than looking like a typo.
+                { "/alpha/_field_caps", "field capabilities" },
                 { "/alpha/_refresh", "refresh=true" },
                 { "/_msearch", "one search per request" },
                 { "/_reindex", "search_after" },

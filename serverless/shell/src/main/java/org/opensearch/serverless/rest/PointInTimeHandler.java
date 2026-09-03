@@ -30,7 +30,9 @@ import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
- * {@code POST /{index}/_pit} and {@code DELETE /_pit/{id}} — freezing a view of an index.
+ * {@code POST /{index}/_search/point_in_time} and {@code DELETE /_search/point_in_time/{id}} — freezing a
+ * view of an index. {@code /{index}/_pit} and {@code /_pit/{id}} are accepted too; see {@link #routes()} for
+ * why both spellings exist and which one is OpenSearch's.
  *
  * <p><b>What it is for.</b> {@code search_after} pages through a result set, and between two pages the
  * index moves: documents are written, merged and deleted. A frozen view makes both pages read the same
@@ -76,7 +78,17 @@ public final class PointInTimeHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.POST, "/{index}/_pit"), new Route(RestRequest.Method.DELETE, "/_pit/{id}"));
+        return List.of(
+            // OpenSearch's own spelling, which is what an OpenSearch client library calls and what AWS's
+            // serverless offering lists as supported. This handler shipped with Elasticsearch's spelling
+            // instead -- on a fork of OpenSearch -- so a correctly-written caller got "no handler found".
+            new Route(RestRequest.Method.POST, "/{index}/_search/point_in_time"),
+            new Route(RestRequest.Method.DELETE, "/_search/point_in_time/{id}"),
+            // Kept, because they are what this shell's own callers already use and removing them would break
+            // them to fix a compatibility bug, which is a strange trade.
+            new Route(RestRequest.Method.POST, "/{index}/_pit"),
+            new Route(RestRequest.Method.DELETE, "/_pit/{id}")
+        );
     }
 
     @Override
