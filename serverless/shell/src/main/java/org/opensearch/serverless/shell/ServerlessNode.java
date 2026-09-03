@@ -788,6 +788,8 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(
             guarded.apply(new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> metadataPlane, () -> this))
         );
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MultiSearchHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,
@@ -903,15 +905,10 @@ public final class ServerlessNode implements Closeable {
                 "merging is the shard writer's own decision; there is no cluster-wide operation to trigger "
                     + "it, and forcing one on a shard this node may not own is not something this node can do" },
             {
-                "/{index}/_analyze",
-                "analysis runs inside a shard's mapping, and a node that does not hold a shard of this index " + "cannot answer for it" },
-            {
                 "/{index}/_explain/{id}",
                 "explaining a score needs the scorer for one document on one shard; the fan-out here merges "
                     + "hits rather than exposing per-shard scoring internals" },
             { "/{index}/_termvectors/{id}", "term vectors are a per-shard Lucene detail this surface does not expose" },
-            { "/_msearch", "send one search per request; there is no batched search on this surface" },
-            { "/{index}/_msearch", "send one search per request; there is no batched search on this surface" },
             { "/_reindex", noReindex },
             { "/{index}/_update_by_query", noReindex },
             {

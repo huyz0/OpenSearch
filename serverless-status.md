@@ -158,6 +158,13 @@ a 429 rather than accepted into memory it does not have. A node at its shard lim
 recently used idle shard to make room rather than refusing, and `GET /_serverless/stats` reports the
 counters those refusals are decided from — breakers, in-flight write bytes, and what the node is holding.
 
+**Analysis and batched search.** `GET|POST /{index}/_analyze` shows what the analyzer does to a string — a
+field's own analyzer, a named one, or the index default — read from the mapping, so a dormant index still
+answers. A custom tokenizer chain is refused rather than substituted: a caller debugging analysis must not be
+shown the analysis of something else. `_msearch` runs several searches in one request, each answered in the
+body `_search` would have produced, with one search's failure kept to its own slot. The saving is round trips,
+not shard work ([`m55-analyze-msearch-notes.md`](m55-analyze-msearch-notes.md)).
+
 **Discovery.** `GET /{index}/_field_caps` reports what a client can query — field types, and whether each is
 searchable and aggregatable — read from the mapping rather than from a shard, so it answers for an index whose
 shards are all dormant. Where two indices map a field differently both types come back, each attributed to the
@@ -290,7 +297,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-467 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+473 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

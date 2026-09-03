@@ -654,6 +654,33 @@ public final class SearchHandler extends BaseRestHandler {
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {
+            renderInto(builder, indices, skipped, outcome, tookMillis);
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        }
+    }
+
+    /**
+     * Writes one search's answer into a builder the caller owns.
+     *
+     * <p>Extracted so {@code _msearch} produces the same body inside its array that {@code _search} produces
+     * on its own. A second renderer would agree with this one until somebody changed one of them, and the
+     * difference would surface as two response shapes for the same query.
+     *
+     * @param builder the builder to write into, positioned where an object may start
+     * @param indices the indices searched, and how many shards each contributed
+     * @param skipped indices a pattern named that do not exist
+     * @param outcome what the fan-out returned
+     * @param tookMillis how long it took
+     * @throws IOException if writing fails
+     */
+    static void renderInto(
+        XContentBuilder builder,
+        java.util.Map<String, Integer> indices,
+        java.util.List<String> skipped,
+        org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome,
+        long tookMillis
+    ) throws IOException {
+        {
             builder.startObject();
             builder.field("took", tookMillis);
             // Always false: nothing on this path enforces a search timeout, so there is nothing that could
@@ -739,7 +766,6 @@ public final class SearchHandler extends BaseRestHandler {
                 outcome.aggregations().toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
             }
             builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
     }
 }

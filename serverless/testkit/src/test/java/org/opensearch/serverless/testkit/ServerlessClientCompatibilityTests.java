@@ -342,14 +342,11 @@ public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
             call("PUT", "/alpha", "{\"settings\":{\"number_of_shards\":1}}");
 
             for (String[] expected : new String[][] {
-                // _count was here until M52 served it. _field_caps replaces it as the example of an
-                // endpoint that is absent and says so rather than looking like a typo.
-                // _field_caps was here until M53 served it. _msearch is the stand-in: still absent, and
-                // still saying so rather than looking like a typo.
-                { "/_msearch", "one search per request" },
+                // This list keeps shrinking as endpoints get built: _count went in M52, _field_caps in M53,
+                // _msearch in M55. What is left needs something this design does not have.
                 { "/alpha/_refresh", "refresh=true" },
-                { "/_msearch", "one search per request" },
                 { "/_reindex", "search_after" },
+                { "/alpha/_forcemerge", "merging is the shard writer" },
                 { "/alpha/_update_by_query", "search_after" },
                 { "/_search/scroll", "point in time" },
                 { "/_cluster/state", "no cluster-wide state" },

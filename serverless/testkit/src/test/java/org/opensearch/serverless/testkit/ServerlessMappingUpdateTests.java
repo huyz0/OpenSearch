@@ -302,7 +302,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = running(plane, clock, "fallthrough")) {
             assertNotNull(node);
             for (String[] expected : new String[][] {
-                { "/_msearch", "one search per request" },
+                { "/_reindex", "search_after" },
                 { "/alpha/_validate/query", "send the query to _search" },
                 { "/_resolve/index/alpha", "look an index up by name" },
                 { "/_aliases", "atomic swaps" },

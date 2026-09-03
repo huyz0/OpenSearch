@@ -460,6 +460,14 @@ that grows every release. `number_of_shards` is refused for a reason of its own 
 so changing it would re-route every document that already exists. See
 [`m54-mutable-settings-notes.md`](m54-mutable-settings-notes.md).
 
+**`_analyze` and `_msearch` (M55).** The last two endpoints both compared products ship. `_analyze`'s refusal
+had claimed a node without a shard could not answer for an index — analysis needs the mapping, and any node
+reads one, which is the fourth stale reason found this way. A custom tokenizer chain is refused rather than
+substituted, because this endpoint is called precisely by somebody who does not believe what they are told
+about analysis, and showing them a different analyzer's output would be the worst possible answer. `_msearch`
+saves round trips and not shard work, which is said plainly rather than left to be assumed, and keeps one
+search's failure in that search's slot. See [`m55-analyze-msearch-notes.md`](m55-analyze-msearch-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for
