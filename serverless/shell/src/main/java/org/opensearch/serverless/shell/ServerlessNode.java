@@ -775,6 +775,11 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(
             guarded.apply(new org.opensearch.serverless.rest.ClusterSettingsHandler(() -> metadataPlane, () -> this))
         );
+        // Cluster-shaped endpoints this deployment can answer honestly. See ClusterHealthHandler for what
+        // green is redefined to mean and why, and NodesHandler for why "no node can answer this" stopped
+        // being true the moment leases became an address book.
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.ClusterHealthHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.NodesHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,
@@ -798,21 +803,19 @@ public final class ServerlessNode implements Closeable {
                     + "look an index up by name, or run an offline inventory"
             )
         );
+        // What is left after the answerable ones moved out. Each of these needs a snapshot across every
+        // index, or an allocator, or a cluster-manager task queue -- three things this design does not have
+        // and is not going to grow. The endpoints that only needed the lease registry or one index's shard
+        // heads are served instead, above.
         for (String path : new String[] {
-            "/_cluster/health",
             "/_cluster/state",
             "/_cluster/stats",
             "/_cluster/reroute",
             "/_cluster/allocation/explain",
-            "/_nodes",
-            "/_nodes/stats",
-            "/_tasks",
             "/_cat",
             "/_cat/indices",
             "/_cat/shards",
-            "/_cat/nodes",
             "/_cat/allocation",
-            "/_cat/health",
             "/_cat/count",
             "/_cat/aliases",
             "/_cat/segments",
@@ -821,6 +824,26 @@ public final class ServerlessNode implements Closeable {
             "/_cat/recovery" }) {
             controller.registerHandler(new NotImplementedHandler(path, noGlobalState));
         }
+
+        // Refused for a reason of its own, because the general one is no longer true of it. A node can now
+        // reach every other node -- that is what the lease registry is for -- so "no node can answer this"
+        // would be wrong. What is missing is narrower and worth saying precisely.
+        controller.registerHandler(
+            new NotImplementedHandler(
+                "/_nodes/stats",
+                "each node can answer for itself at GET /_serverless/stats, and this node knows where the "
+                    + "others are; what does not exist yet is the fan-out that would ask them and the "
+                    + "accounting that would report which ones did not answer. Until that is built, asking "
+                    + "one node for the fleet's statistics would return one node's statistics"
+            )
+        );
+        controller.registerHandler(
+            new NotImplementedHandler(
+                "/_tasks",
+                "there is no cluster-wide task registry: work here belongs to the node doing it and does not "
+                    + "outlive it, so there is no task to look up by id from anywhere else"
+            )
+        );
 
         // D2 said unimplemented endpoints return 501 with a reason. Ten paths did; everything else a normal
         // client reaches for fell through to core's default handler and came back as
@@ -959,6 +982,19 @@ public final class ServerlessNode implements Closeable {
         }
     }
 
+    /**
+     * Returns this deployment's cluster name.
+     *
+     * <p>A name, and only a name: there is no cluster object behind it. It is reported because every
+     * OpenSearch response that carries one carries it, and a client reading it should find what it
+     * configured.
+     *
+     * @return the configured cluster name
+     */
+    public String clusterName() {
+        return org.opensearch.cluster.ClusterName.CLUSTER_NAME_SETTING.get(settings).value();
+    }
+
     private void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
         plane.membership()
             .renew(
@@ -967,7 +1003,9 @@ public final class ServerlessNode implements Closeable {
                     localNode.getEphemeralId(),
                     localNode.getAddress().toString(),
                     roles,
-                    0L
+                    0L,
+                    localNode.getName(),
+                    org.opensearch.Version.CURRENT.toString()
                 )
             );
     }

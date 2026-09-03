@@ -188,7 +188,10 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
             assertTrue(health.body().contains("\"status\":\"serving\""));
 
             // D2 still holds: the classic endpoints refuse rather than answering as an index would.
-            for (String path : new String[] { "/_cluster/health", "/_cat/indices", "/_nodes", "/_cluster/state" }) {
+            // Since M51, health and the node list are answered rather than refused -- they need only the
+            // lease registry, which is the address book write forwarding already routes through. What is
+            // still refused needs a snapshot across every index, an allocator, or a task queue.
+            for (String path : new String[] { "/_cluster/state", "/_cat/indices", "/_cluster/stats", "/_cluster/reroute" }) {
                 final Response refused = send(http, "GET", path, null);
                 assertEquals("classic endpoint " + path + " stopped refusing", 501, refused.status());
                 assertTrue(refused.body().contains("no cluster-wide state"));

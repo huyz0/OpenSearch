@@ -165,6 +165,16 @@ body with `?shards=` still works. `GET /{index}`, `/_mapping` and `/_settings` a
 configuration can be read back; `HEAD /{index}` answers whether an index exists. `GET|POST /_search` with no
 index searches everything, and `q=` is core's query-string parser rather than a lookalike.
 
+**Cluster-shaped endpoints, where they can be answered honestly.** `GET /_nodes`, `/_nodes/{id}` and
+`_cat/nodes` are projections of the lease registry — the address book write forwarding already routes through,
+so a node reporting the fleet is reporting what it computes on every heartbeat. `GET /_cluster/health`,
+`/_cluster/health/{index}` and `_cat/health` answer with **green redefined to mean what it can mean here**:
+every shard asked about can be served. A shard nobody owns is *dormant*, not unassigned — it is the healthy
+resting state, and reporting it as a fault would make `wait_for_status=green` block forever in a system where
+shards activate on demand. `dormant_shards` carries the real information, `replication: "object-store"` says on
+every answer that green does not mean copies exist, and the unscoped form reports `complete: false` rather than
+counting shards it did not examine ([`m51-cluster-endpoints-notes.md`](m51-cluster-endpoints-notes.md)).
+
 ## What is deliberately refused
 
 These are decisions, not gaps. Each answers 501 with a reason.
@@ -198,6 +208,12 @@ These are decisions, not gaps. Each answers 501 with a reason.
   slightly later, when the shard is opened, so a predecessor's appends in between are still replayed.
   Closing it means sealing at the swap, which the path that opens a shard from projected truth rather than
   from an acquisition does not have. The unbounded half is closed.
+- `_nodes/stats` is refused, and its reason is now specific rather than shared: each node answers for itself
+  at `GET /_serverless/stats` and this node knows where the others are, so what is missing is the fan-out that
+  would ask them and the accounting that would report which ones did not answer — a scoping decision, not an
+  impossibility.
+- `_cat/indices` could be served under the wildcard cap that already exists (one bounded listing, refused past
+  the cap rather than truncated) and is not. The objection to it is weaker than the current refusal implies.
 - `update` inside `_bulk` is refused: it is a partial merge, which has to read the current document before
   writing one, and the batch path applies without reading. Closing it changes what a batch is, so it is a
   design decision rather than plumbing. `POST /{index}/_update/{id}` does the merge.
@@ -255,7 +271,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-437 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+445 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

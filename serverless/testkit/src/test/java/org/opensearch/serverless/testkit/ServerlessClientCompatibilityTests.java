@@ -348,8 +348,8 @@ public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
                 { "/_reindex", "search_after" },
                 { "/alpha/_update_by_query", "search_after" },
                 { "/_search/scroll", "point in time" },
-                { "/_cluster/health", "no cluster-wide state" },
-                { "/_cat/health", "no cluster-wide state" } }) {
+                { "/_cluster/state", "no cluster-wide state" },
+                { "/_cat/indices", "no cluster-wide state" } }) {
                 final Answer answer = call("GET", expected[0], null);
                 assertEquals(expected[0] + " must be a 501: " + answer.body(), 501, answer.status());
                 assertTrue(expected[0] + " must say why: " + answer.body(), answer.has(expected[1]));

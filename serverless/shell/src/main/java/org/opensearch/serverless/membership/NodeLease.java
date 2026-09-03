@@ -39,6 +39,8 @@ public final class NodeLease {
     private final String address;
     private final Set<String> roles;
     private final long expiresAtMillis;
+    private final String name;
+    private final String version;
 
     /**
      * Creates a lease.
@@ -50,11 +52,64 @@ public final class NodeLease {
      * @param expiresAtMillis wall-clock expiry declared by the writer
      */
     public NodeLease(String nodeId, String ephemeralId, String address, Set<String> roles, long expiresAtMillis) {
+        this(nodeId, ephemeralId, address, roles, expiresAtMillis, null, null);
+    }
+
+    /**
+     * Creates a lease that also describes the node.
+     *
+     * <p><b>Why a lease carries a name and a version at all.</b> This register is the only place one node
+     * learns about another — it is already the address book write forwarding routes through. Answering
+     * {@code GET /_nodes} means reporting a peer's name and version, and the alternatives to putting them
+     * here are worse: asking each peer over the transport turns a listing into a fan-out, and reporting the
+     * local node's version for a peer would be a guess that is wrong during exactly the upgrade it matters
+     * in. A node knows its own name and version, so it publishes them.
+     *
+     * <p>Both are optional, and a lease written before they existed parses with them absent — the name
+     * falls back to the node id, and the version is reported as unknown rather than invented.
+     *
+     * @param nodeId stable node identity
+     * @param ephemeralId changes on every restart, so a restarted node is distinguishable
+     * @param address transport address, as a hint for peers
+     * @param roles what this node currently accepts, per §10.4
+     * @param expiresAtMillis wall-clock expiry declared by the writer
+     * @param name the node's configured name, or null
+     * @param version the node's build version, or null
+     */
+    public NodeLease(
+        String nodeId,
+        String ephemeralId,
+        String address,
+        Set<String> roles,
+        long expiresAtMillis,
+        String name,
+        String version
+    ) {
         this.nodeId = Objects.requireNonNull(nodeId);
         this.ephemeralId = Objects.requireNonNull(ephemeralId);
         this.address = Objects.requireNonNull(address);
         this.roles = Set.copyOf(roles);
         this.expiresAtMillis = expiresAtMillis;
+        this.name = name;
+        this.version = version;
+    }
+
+    /**
+     * Returns the node's name, falling back to its id when the lease predates the field.
+     *
+     * @return a name that is always usable for display
+     */
+    public String name() {
+        return name == null || name.isBlank() ? nodeId : name;
+    }
+
+    /**
+     * Returns the node's build version, if it published one.
+     *
+     * @return the version, or null when unknown
+     */
+    public String version() {
+        return version;
     }
 
     /**
@@ -119,7 +174,7 @@ public final class NodeLease {
      * @return the renewed lease
      */
     public NodeLease renewedUntil(long newExpiryMillis) {
-        return new NodeLease(nodeId, ephemeralId, address, roles, newExpiryMillis);
+        return new NodeLease(nodeId, ephemeralId, address, roles, newExpiryMillis, name, version);
     }
 
     /**
@@ -136,6 +191,14 @@ public final class NodeLease {
             builder.field("address", address);
             builder.field("roles", roles.stream().sorted().toArray(String[]::new));
             builder.field("expires_at_millis", expiresAtMillis);
+            // Written only when known, so a lease from a node that does not publish them is byte-identical
+            // to what this class wrote before they existed.
+            if (name != null) {
+                builder.field("name", name);
+            }
+            if (version != null) {
+                builder.field("version", version);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -156,6 +219,8 @@ public final class NodeLease {
             String nodeId = null;
             String ephemeralId = null;
             String address = null;
+            String name = null;
+            String version = null;
             long expiry = 0L;
             final Set<String> roles = new LinkedHashSet<>();
             String field = null;
@@ -173,6 +238,8 @@ public final class NodeLease {
                         case "ephemeral_id" -> ephemeralId = parser.text();
                         case "address" -> address = parser.text();
                         case "expires_at_millis" -> expiry = parser.longValue();
+                        case "name" -> name = parser.text();
+                        case "version" -> version = parser.text();
                         default -> {
                             // forward compatibility: ignore fields written by a newer node
                         }
@@ -182,7 +249,7 @@ public final class NodeLease {
             if (nodeId == null || ephemeralId == null || address == null) {
                 throw new IOException("malformed node lease: missing a required field");
             }
-            return new NodeLease(nodeId, ephemeralId, address, roles, expiry);
+            return new NodeLease(nodeId, ephemeralId, address, roles, expiry, name, version);
         }
     }
 

@@ -86,7 +86,10 @@ public class ServerlessRestTests extends OpenSearchTestCase {
             // D2: the surface is an allowlist. These exist in classic OpenSearch and must NOT answer
             // here — an empty-but-successful cluster health is the exact failure HANDOFF.md records
             // eight times, and it is worse than a 404.
-            for (String path : new String[] { "/_cluster/health", "/_cat/indices", "/_nodes", "/_cluster/state" }) {
+            // Since M51, health and the node list are answered rather than refused -- they need only the
+            // lease registry, which is the address book write forwarding already routes through. What is
+            // still refused needs a snapshot across every index, an allocator, or a task queue.
+            for (String path : new String[] { "/_cluster/state", "/_cat/indices", "/_cluster/stats", "/_cluster/reroute" }) {
                 final String response = get(http, path);
                 final int code = Integer.parseInt(response.split(" ", 2)[0]);
                 assertNotEquals("unimplemented endpoint " + path + " answered with 200", 200, code);

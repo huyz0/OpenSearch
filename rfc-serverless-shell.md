@@ -412,6 +412,19 @@ closed: the envelope is honoured (and a replica count refused with its real reas
 reason they are refused for. See [`m50-api-compatibility-notes.md`](m50-api-compatibility-notes.md), including
 the gap this leaves: `update` inside `_bulk`, which needs a read per item and so changes what a batch is.
 
+**The cluster surface, where it can be answered honestly (M51).** Fourteen endpoints shared one refusal:
+"there is no cluster-wide state; no node can answer this." The first clause holds; the second had stopped
+being true. Leases are an address book — every node publishes one and reads the others' to forward writes — so
+a node refusing to say who is in the fleet was refusing to report what it computes on every heartbeat. The
+line that actually holds is **cost class, not locality**: node questions are one bounded listing, one index's
+shards are a descriptor plus a head per shard, and only aggregates over every index are enumeration. So
+`_nodes`, `_cat/nodes`, `_cluster/health` and `_cat/health` are served, and the rest stay refused with reasons
+specific to what each lacks. The design decision is the colour: classic green/yellow/red asserts replica
+placement, there are no replicas, and an unowned shard is the *healthy resting state* — so green means "every
+shard asked about can be served", yellow is unreachable and says so, and a dormant shard is reported as dormant
+rather than unassigned. Mapping it the classic way would make `wait_for_status=green` block forever in a system
+where shards activate on demand. See [`m51-cluster-endpoints-notes.md`](m51-cluster-endpoints-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for
