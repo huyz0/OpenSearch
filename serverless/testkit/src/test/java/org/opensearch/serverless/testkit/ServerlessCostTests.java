@@ -100,7 +100,28 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             name,
             createTempDir()
         );
+        created.add(name);
         return new CountingBlobStore(store);
+    }
+
+    /** Buckets this test made, so a long-lived endpoint does not accumulate them. */
+    private final java.util.List<String> created = new java.util.ArrayList<>();
+
+    /**
+     * Removes the buckets this test created.
+     *
+     * <p>The same leak the conformance suite had, in a second place. An abandoned empty bucket costing
+     * nothing on MinIO is exactly the reasoning that let it go unnoticed there until it exhausted a
+     * SeaweedFS volume server, so it is closed here on the same principle rather than on the same symptom.
+     *
+     * @throws Exception if the endpoint is unreachable, which is not a failure
+     */
+    @org.junit.After
+    public void removeBucketsThisTestMade() throws Exception {
+        for (String bucket : created) {
+            org.opensearch.repositories.s3.MinioBlobStores.deleteBucket(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir());
+        }
+        created.clear();
     }
 
     /** What one node holding {@code shards} shards spends on a tick that has nothing to do. */

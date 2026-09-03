@@ -81,12 +81,36 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
         final String endpoint = endpoint();
         assumeTrue("no S3-compatible endpoint at " + endpoint + "; start one with: " + howToStart(), reachable(endpoint));
 
-        // A bucket per run. The suite deletes what it writes, but a shared bucket would let one run's
+        // A bucket per container. The suite deletes what it writes, but a shared bucket would let one run's
         // leftovers decide another run's listing assertions, and a listing assertion that depends on
         // history is not an assertion.
         final String bucket = "r11-" + randomAlphaOfLength(12).toLowerCase(java.util.Locale.ROOT);
         final var store = MinioBlobStores.create(endpoint, accessKey(), secretKey(), bucket, createTempDir());
+        created.add(bucket);
         return store.blobContainer(BlobPath.cleanPath().add("conformance"));
+    }
+
+    /** Buckets this test made, so the next run does not inherit them. */
+    private final java.util.List<String> created = new java.util.ArrayList<>();
+
+    /**
+     * Removes the buckets this test created.
+     *
+     * <p><b>Why this was not here from the start, and what it cost.</b> A bucket was made per container and
+     * none was ever removed. On MinIO an abandoned empty bucket costs nothing, so nothing showed. On
+     * SeaweedFS a bucket is a <em>collection</em>, every collection claims volumes from a finite pool, and
+     * this suite makes one per test — so a few days of runs exhausted the volume server and every test began
+     * failing against a store that was behaving perfectly. That is the worst failure this suite can produce:
+     * it exists to tell a real deviation from a fake one, and it was manufacturing fake ones.
+     *
+     * @throws Exception if the endpoint is unreachable, which is not a failure
+     */
+    @org.junit.After
+    public void removeBucketsThisTestMade() throws Exception {
+        for (String bucket : created) {
+            MinioBlobStores.deleteBucket(endpoint(), accessKey(), secretKey(), bucket, createTempDir());
+        }
+        created.clear();
     }
 
     /**

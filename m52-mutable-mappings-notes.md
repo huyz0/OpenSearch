@@ -108,6 +108,29 @@ An earlier attempt at 175 also failed to fire: swapping `MergeReason.MAPPING_UPD
 changes nothing, because the refusal of a conflicting field type comes from the field mapper's own merge and
 not from the reason. The comment claiming otherwise was corrected rather than left standing.
 
+## A test-harness defect found by running the suite
+
+The conformance suite made a bucket per container and never removed one. On MinIO an abandoned empty bucket
+costs nothing; on SeaweedFS a bucket is a collection, every collection claims volumes from a finite pool, and
+the suite makes one per test. Measured: **77 volumes per run**. A couple of days of runs exhausted the volume
+server, after which every conformance test failed with `no contender should have errored` — against a store
+that was behaving perfectly.
+
+That is the worst failure this suite can produce, because the suite exists to tell a real deviation from a
+fake one and it had started manufacturing fake ones. The buckets are now deleted after each test.
+
+- **179 — the buckets are left behind.** Caught by measurement rather than by an assertion: 77 volumes of
+  growth per run with the cleanup removed, 0 with it. Recorded here because it is the only canary in this
+  project whose observation is a count taken outside the test process.
+
+`ServerlessCostTests` had the same leak and now has the same cleanup. It creates its buckets on MinIO, where
+they cost nothing — which is precisely the reasoning that let the problem hide on the conformance suite until
+it killed a SeaweedFS server, so it is closed on the principle rather than on the symptom.
+
+**What is left is bounded rather than zero.** A SeaweedFS server sits at 7 volumes after a run and stays
+there: deleting a collection returns its volumes asynchronously, so the newest batch is always pending vacuum.
+Seven that do not grow is a different thing from 77 per run, and it is the difference that matters.
+
 ## What this does NOT establish
 
 - **Settings are still write-once.** `PUT /{index}/_settings` remains unrouted, and both compared products

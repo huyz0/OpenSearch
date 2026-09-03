@@ -92,6 +92,24 @@ docker run -d --name serverless-seaweed -p 8333:8333 \
 
 All eleven pass, none skipped.
 
+**The suite used to poison this container, and that is worth knowing about because the symptom lies.** Every
+container the suite builds gets its own bucket, so that one run's leftovers cannot decide another run's
+listing assertions — and until M52 nothing ever removed one. On MinIO an abandoned empty bucket costs nothing,
+which is why it went unnoticed for as long as it did. On SeaweedFS a bucket is a **collection**, every
+collection claims volumes from a finite pool, and this suite makes a bucket per *test*: measured at **77
+volumes per run**. After a couple of days of runs the volume server could no longer allocate, and every
+conformance test began failing with `no contender should have errored` — against a store that was behaving
+perfectly.
+
+That is the worst failure this suite can produce. It exists to tell a real deviation from a fake one, and it
+was manufacturing fake ones. `MinioBlobContainerConformanceTests` now deletes the buckets it made, verified by
+measurement: 77 volumes per run before, 0 after. If you meet the old symptom on a long-lived container, the
+volume server is exhausted rather than wrong — recreate it.
+
+`ServerlessCostTests` had the same leak, on MinIO, and now has the same cleanup. What remains is bounded
+rather than zero: a SeaweedFS server sits at seven volumes after a run and stays there, because deleting a
+collection returns its volumes asynchronously and the newest batch is always awaiting vacuum.
+
 **LocalStack was the obvious second target and is not usable.** Its free S3-only image was discontinued
 in March 2026 and the remaining images require a licence, so it is not something a contributor can run.
 
