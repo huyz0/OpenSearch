@@ -495,6 +495,24 @@ public final class MetadataPlane {
      * @return the descriptor, or empty
      * @throws IOException if the read fails
      */
+    /**
+     * Returns the store holding index templates.
+     *
+     * @return the index-template store
+     */
+    public TemplateStore indexTemplates() {
+        return new TemplateStore(blobStore.blobContainer(RegisterMap.indexTemplates(base)));
+    }
+
+    /**
+     * Returns the store holding component templates.
+     *
+     * @return the component-template store
+     */
+    public TemplateStore componentTemplates() {
+        return new TemplateStore(blobStore.blobContainer(RegisterMap.componentTemplates(base)));
+    }
+
     public Optional<IndexDescriptor> describe(String indexName) throws IOException {
         return descriptors.get(indexName);
     }

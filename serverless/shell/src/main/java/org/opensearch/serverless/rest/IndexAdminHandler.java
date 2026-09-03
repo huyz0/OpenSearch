@@ -177,14 +177,32 @@ public final class IndexAdminHandler extends BaseRestHandler {
                 // already blocking the thread that should be reading the next request -- invisibly, because
                 // blob IO does not assert about it the way a future does. Running the action filters here
                 // made it visible, and the fix is the one every other handler already had.
+                // The count the index was actually made with, which a template may have decided. Reporting
+                // the request's would tell a caller they got one shard when they got three.
+                final java.util.concurrent.atomic.AtomicInteger resolvedShards = new java.util.concurrent.atomic.AtomicInteger(shards);
                 return channel -> dispatch(channel, () -> {
                     try {
                         gated(
                             org.opensearch.action.admin.indices.create.CreateIndexAction.NAME,
                             new org.opensearch.action.admin.indices.create.CreateIndexRequest(index),
                             () -> {
+                                // What matching templates contribute, layered under whatever the request
+                                // said. A caller who spelled out a mapping is not overruled by
+                                // configuration they may not know exists.
+                                final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolve(
+                                    metadata.indexTemplates().all(),
+                                    metadata.componentTemplates().all(),
+                                    index
+                                );
+                                resolvedShards.set(CreateRequest.shardsWith(shards, create.explicitShards, inherited));
                                 metadata.createIndex(
-                                    new IndexDescriptor(index, UUID.randomUUID().toString(), shards, mapping, create.settings)
+                                    new IndexDescriptor(
+                                        index,
+                                        UUID.randomUUID().toString(),
+                                        resolvedShards.get(),
+                                        CreateRequest.mappingWith(mapping, inherited),
+                                        CreateRequest.settingsWith(create.settings, inherited)
+                                    )
                                 );
                                 return null;
                             }
@@ -198,10 +216,13 @@ public final class IndexAdminHandler extends BaseRestHandler {
                             // it, so the two are always true together.
                             builder.field("shards_acknowledged", true);
                             builder.field("index", index);
-                            builder.field("shards", shards);
+                            builder.field("shards", resolvedShards.get());
                             builder.endObject();
                             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                         }
+                    } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
+                        // Configuration the caller can fix, so 400 rather than 500.
+                        channel.sendResponse(error(channel, RestStatus.BAD_REQUEST, "missing_component_template", e.getMessage()));
                     } catch (IndexAlreadyExistsException e) {
                         channel.sendResponse(error(channel, RestStatus.BAD_REQUEST, "index_already_exists", e.getMessage()));
                     } catch (Exception e) {
@@ -379,17 +400,106 @@ public final class IndexAdminHandler extends BaseRestHandler {
         private final int shards;
         private final String mapping;
         private final Settings settings;
+        /** Whether the caller named a shard count, as opposed to falling through to the default of one. */
+        private final boolean explicitShards;
+
+        /**
+         * The shard count to create with: the caller's if they gave one, else a template's, else the default.
+         *
+         * <p>The distinction matters because "one shard" is both a legitimate request and what an absent
+         * request looks like. Without tracking which it was, a template's {@code number_of_shards} could
+         * never take effect — every create would look like an explicit request for one.
+         *
+         * @param requested what the request resolved to
+         * @param explicit whether the request actually said
+         * @param inherited what templates contributed
+         * @return the shard count
+         */
+        static int shardsWith(int requested, boolean explicit, org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited) {
+            if (explicit) {
+                return requested;
+            }
+            final Object fromTemplate = inherited.settings().get("number_of_shards");
+            if (fromTemplate == null) {
+                return requested;
+            }
+            try {
+                return Integer.parseInt(String.valueOf(fromTemplate));
+            } catch (NumberFormatException e) {
+                return requested;
+            }
+        }
+
+        /**
+         * The mapping to create with: the template's fields, with the request's layered over them.
+         *
+         * @param requested the request's mapping, or null
+         * @param inherited what templates contributed
+         * @return the merged mapping source, or null when there is none
+         * @throws IOException if either mapping cannot be read
+         */
+        static String mappingWith(String requested, org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited)
+            throws IOException {
+            if (inherited.mappings().isEmpty()) {
+                return requested;
+            }
+            final Map<String, Object> merged = new java.util.LinkedHashMap<>(inherited.mappings());
+            if (requested != null) {
+                final Map<String, Object> own = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                    new org.opensearch.core.common.bytes.BytesArray(requested.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                    false,
+                    org.opensearch.common.xcontent.XContentType.JSON
+                ).v2();
+                org.opensearch.serverless.metadata.TemplateResolver.deepMerge(merged, own);
+            }
+            try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+                builder.map(merged);
+                return builder.toString();
+            }
+        }
+
+        /**
+         * The settings to create with: the template's, with the request's layered over them.
+         *
+         * @param requested the request's settings, or null
+         * @param inherited what templates contributed
+         * @return the merged settings, or null when there are none
+         */
+        static Settings settingsWith(Settings requested, org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited) {
+            if (inherited.settings().isEmpty()) {
+                return requested;
+            }
+            final Settings.Builder merged = Settings.builder();
+            for (Map.Entry<String, Object> each : inherited.settings().entrySet()) {
+                // Structural settings are the create path's business, not a layered value: shards are
+                // resolved separately above and replicas are refused outright.
+                if ("number_of_shards".equals(each.getKey()) || "number_of_replicas".equals(each.getKey())) {
+                    continue;
+                }
+                merged.put(IndexMetadata.INDEX_SETTING_PREFIX + each.getKey(), String.valueOf(each.getValue()));
+            }
+            if (requested != null) {
+                merged.put(requested);
+            }
+            final Settings result = merged.build();
+            return result.isEmpty() ? null : result;
+        }
 
         private CreateRequest(int shards, String mapping, Settings settings) {
+            this(shards, mapping, settings, false);
+        }
+
+        private CreateRequest(int shards, String mapping, Settings settings, boolean explicitShards) {
             this.shards = shards;
             this.mapping = mapping;
             this.settings = settings;
+            this.explicitShards = explicitShards;
         }
 
         static CreateRequest parse(RestRequest request) throws RefusedException {
             final int fromQuery = request.paramAsInt("shards", 1);
             if (request.hasContent() == false) {
-                return new CreateRequest(fromQuery, null, null);
+                return new CreateRequest(fromQuery, null, null, fromQuery != 1);
             }
             final String body = request.content().utf8ToString();
             final Map<String, Object> parsed;
@@ -406,7 +516,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
             final boolean envelope = parsed.containsKey("settings") || parsed.containsKey("mappings") || parsed.containsKey("aliases");
             if (envelope == false) {
                 // The shape this handler has always taken: the body is the mapping.
-                return new CreateRequest(fromQuery, body, null);
+                return new CreateRequest(fromQuery, body, null, fromQuery != 1);
             }
 
             if (parsed.containsKey("aliases")) {
@@ -483,7 +593,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
             rest.remove(IndexMetadata.SETTING_NUMBER_OF_SHARDS);
             rest.remove(IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
             final Settings carried = rest.build();
-            return new CreateRequest(shards, mapping, carried.isEmpty() ? null : carried);
+            return new CreateRequest(shards, mapping, carried.isEmpty() ? null : carried, requested != null || fromQuery != 1);
         }
     }
 

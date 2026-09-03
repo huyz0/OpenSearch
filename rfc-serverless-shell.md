@@ -468,6 +468,16 @@ about analysis, and showing them a different analyzer's output would be the wors
 saves round trips and not shard work, which is said plainly rather than left to be assumed, and keeps one
 search's failure in that search's slot. See [`m55-analyze-msearch-notes.md`](m55-analyze-msearch-notes.md).
 
+**Templates, and the last refusal made honest (M56).** Index and component templates store in registers,
+exactly as index descriptors do — which is what made the old refusal ("there is no cluster state for a template
+to live in") the *fifth* stale reason this comparison work turned up. Resolution follows OpenSearch's
+composable rule: highest priority wins outright, components merge in order, the request wins over all of it.
+Enumerating templates is allowed where enumerating indices is not, and the difference is where the bound sits —
+templates are bounded on creation, so index creation, which reads them all, can never be what fails. Ingest
+pipelines stay refused with the reason that is actually true: storing one is easy, but every processor a real
+pipeline uses lives in a module this shell deliberately does not load, and accepting pipelines that silently
+never ran would be worse than refusing them. See [`m56-templates-notes.md`](m56-templates-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

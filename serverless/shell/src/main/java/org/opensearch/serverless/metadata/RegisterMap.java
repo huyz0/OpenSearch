@@ -116,6 +116,31 @@ public final class RegisterMap {
      * @param base the deployment's base path
      * @return the repositories container path
      */
+    /**
+     * Where index templates live: one register per template name.
+     *
+     * <p>A template is operator-authored configuration, not data, and there are tens of them rather than
+     * millions — which is why enumerating them at index creation is affordable where enumerating indices
+     * never is. The count is bounded on the way in rather than on the way out, so creating an index can
+     * never fail for having too many templates to read.
+     *
+     * @param base the deployment root
+     * @return the index-template container
+     */
+    public static BlobPath indexTemplates(BlobPath base) {
+        return base.add("templates").add("index");
+    }
+
+    /**
+     * Where component templates live: the reusable fragments an index template composes.
+     *
+     * @param base the deployment root
+     * @return the component-template container
+     */
+    public static BlobPath componentTemplates(BlobPath base) {
+        return base.add("templates").add("component");
+    }
+
     public static BlobPath repositories(BlobPath base) {
         return base.add("repositories");
     }

@@ -172,6 +172,13 @@ indices using it. `GET /_list/indices/{prefix}*` lists indices through one bound
 prefix matching more than the cap rather than truncating**, which is why it is `_list` and not `_cat`:
 OpenSearch added `_list` for exactly this reason ([`m53-discovery-notes.md`](m53-discovery-notes.md)).
 
+**Templates.** `_index_template` and `_component_template` store in registers like every index descriptor, and
+a new index inherits from the highest-priority template whose patterns match — its components merged in order,
+its own block on top, and whatever the request said on top of that. A missing component fails the create
+rather than being skipped, because an index quietly missing the settings a component was meant to contribute
+shows up much later as a query matching nothing
+([`m56-templates-notes.md`](m56-templates-notes.md)).
+
 **Indices are mutable.** `PUT|POST /{index}/_settings` changes any *dynamic* setting on a live index and
 refuses a static one, because classic changes those only on a closed index and there is no closed state here —
 storing one would leave a value nothing acts on. `IndexScopedSettings` decides which is which, so there is no
@@ -230,6 +237,10 @@ These are decisions, not gaps. Each answers 501 with a reason.
   slightly later, when the shard is opened, so a predecessor's appends in between are still replayed.
   Closing it means sealing at the swap, which the path that opens a shard from projected truth rather than
   from an acquisition does not have. The unbounded half is closed.
+- Ingest pipelines are refused, and the reason is now the real one: storing one is not the problem — templates
+  store the same way — but every processor a real pipeline uses lives in the `ingest-common` module, and this
+  shell loads no modules, so a stored pipeline would have almost nothing it could run. Enabling it is a
+  decision about loading modules, not about adding an endpoint.
 - `_nodes/stats` is refused, and its reason is now specific rather than shared: each node answers for itself
   at `GET /_serverless/stats` and this node knows where the others are, so what is missing is the fan-out that
   would ask them and the accounting that would report which ones did not answer — a scoping decision, not an
@@ -297,7 +308,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-473 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+482 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

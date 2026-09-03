@@ -789,6 +789,7 @@ public final class ServerlessNode implements Closeable {
             guarded.apply(new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> metadataPlane, () -> this))
         );
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.TemplateHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MultiSearchHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(
             new ServerlessHealthHandler(
@@ -915,10 +916,17 @@ public final class ServerlessNode implements Closeable {
                 "/_search/scroll",
                 "scroll holds a search context open on a node; use a point in time (POST /{index}/_pit) with "
                     + "search_after, which is held in the object store and is not tied to one node" },
-            { "/_template/{name}", "there is no cluster state for a template to live in" },
-            { "/_index_template/{name}", "there is no cluster state for a template to live in" },
-            { "/_component_template/{name}", "there is no cluster state for a template to live in" },
-            { "/_ingest/pipeline/{id}", "there is no cluster state for a pipeline to live in" },
+            {
+                "/_ingest/pipeline/{id}",
+                // The old reason -- "there is no cluster state for a pipeline to live in" -- was wrong in
+                // the way four others turned out to be, and templates now prove it: a pipeline stores
+                // perfectly well in a register. What is actually missing is what would run it.
+                "storing a pipeline is not the problem -- index templates store the same way, in a register. "
+                    + "Running one is: every processor a real pipeline uses (set, rename, gsub, grok, date) "
+                    + "lives in the ingest-common module, and this shell deliberately loads no modules, so a "
+                    + "stored pipeline would have almost nothing it could construct. Accepting pipelines that "
+                    + "silently never ran would be worse than refusing them. Enabling this is a decision "
+                    + "about loading modules, not about adding an endpoint" },
             { "/_scripts/{id}", "no scripting engine is registered, so there is nowhere to store a script" },
             { "/_ilm/policy/{name}", "index lifecycle management is not part of this surface" },
             // Found by comparing this surface against AWS OpenSearch Serverless and Elastic Cloud
@@ -947,7 +955,10 @@ public final class ServerlessNode implements Closeable {
                 "/{index}/_alias/{name}",
                 "aliases are managed by name rather than per index here: use PUT /_alias/{name} with the " + "indices in the body" },
             { "/_search/pipeline/{id}", "search pipelines are not implemented here" },
-            { "/_cat/templates", "there is no cluster state for a template to live in" } }) {
+            {
+                "/_cat/templates",
+                "listing templates as a table is not routed; GET /_index_template returns them all, and "
+                    + "GET /_index_template/{prefix}* narrows by name" } }) {
             controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
         }
         return controller;

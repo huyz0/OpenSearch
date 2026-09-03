@@ -307,7 +307,8 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
                 { "/_resolve/index/alpha", "look an index up by name" },
                 { "/_aliases", "atomic swaps" },
                 { "/alpha/_alias/x", "PUT /_alias/{name}" },
-                { "/_cat/templates", "no cluster state" } }) {
+                // Templates exist since M56; only their table rendering is unrouted.
+                { "/_cat/templates", "GET /_index_template returns them all" } }) {
                 final Answer refused = call("GET", expected[0], null);
                 assertEquals(expected[0] + " must refuse explicitly: " + refused.body(), 501, refused.status());
                 assertTrue(expected[0] + " must say why: " + refused.body(), refused.has(expected[1]));
