@@ -194,7 +194,9 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
             for (String path : new String[] { "/_cluster/state", "/_cat/indices", "/_cluster/stats", "/_cluster/reroute" }) {
                 final Response refused = send(http, "GET", path, null);
                 assertEquals("classic endpoint " + path + " stopped refusing", 501, refused.status());
-                assertTrue(refused.body().contains("no cluster-wide state"));
+                // As above: each refusal carries its own reason since M53, so this asserts that there is
+                // one rather than which one.
+                assertTrue(refused.body().contains("is not available here:"));
             }
         }
     }

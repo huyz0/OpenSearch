@@ -782,6 +782,10 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.NodesHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MappingUpdateHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.FieldCapabilitiesHandler(() -> metadataPlane, () -> this))
+        );
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.ListIndicesHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(
             new ServerlessHealthHandler(
                 () -> started,
                 () -> membershipSource == null ? 1 : membershipSource.current().size(),
@@ -808,22 +812,49 @@ public final class ServerlessNode implements Closeable {
         // index, or an allocator, or a cluster-manager task queue -- three things this design does not have
         // and is not going to grow. The endpoints that only needed the lease registry or one index's shard
         // heads are served instead, above.
-        for (String path : new String[] {
-            "/_cluster/state",
-            "/_cluster/stats",
-            "/_cluster/reroute",
-            "/_cluster/allocation/explain",
-            "/_cat",
-            "/_cat/indices",
-            "/_cat/shards",
-            "/_cat/allocation",
-            "/_cat/count",
-            "/_cat/aliases",
-            "/_cat/segments",
-            "/_cat/thread_pool",
-            "/_cat/pending_tasks",
-            "/_cat/recovery" }) {
+        for (String path : new String[] { "/_cluster/state", "/_cluster/stats", "/_cat" }) {
             controller.registerHandler(new NotImplementedHandler(path, noGlobalState));
+        }
+
+        // Refusals that used to share the "no cluster-wide state" reason and are not actually refused for
+        // it. A caller reading that a listing is unavailable because there is no cluster state would
+        // reasonably conclude the data does not exist -- when in fact it exists, is readable one index at a
+        // time, and is refused because reading all of it at once is unbounded. Three of these are refused
+        // because there is no allocator, which is a different thing again. This is the same stale-reason
+        // shape M50 found in _bulk and M51 found in the node endpoints, in its third place.
+        final String noAllocator = "there is no allocator here: a shard is activated by the write that needs it, "
+            + "not by a placement decision, so there is nothing to explain, retry or rebalance";
+        final String enumeration = "listing every index in the deployment is unbounded, and this design refuses "
+            + "an answer it would have to truncate. Use GET /_list/indices/{prefix}*, which resolves through "
+            + "one bounded listing and refuses a prefix that matches more than the cap rather than cutting it "
+            + "off -- OpenSearch added _list for this reason and left _cat alone";
+        for (String[] refusal : new String[][] {
+            { "/_cat/indices", enumeration },
+            {
+                "/_cat/shards",
+                "the same unbounded listing as _cat/indices, one row per shard. GET "
+                    + "/_cluster/health/{index}?level=shards reports one index's shards, bounded" },
+            { "/_cat/aliases", "aliases are found by name here, not enumerated; GET /_alias/{name} answers for one" },
+            {
+                "/_cat/count",
+                "counting every document in the deployment means visiting every index; GET "
+                    + "/{index}/_count answers for one, and takes a prefix pattern" },
+            {
+                "/_cat/segments",
+                "per-shard Lucene detail across every index, which is both unbounded and not " + "exposed for a single index either" },
+            { "/_cluster/reroute", noAllocator },
+            { "/_cluster/allocation/explain", noAllocator },
+            { "/_cat/allocation", noAllocator },
+            { "/_cat/recovery", noAllocator },
+            { "/_cat/pending_tasks", "there is no cluster manager and no task queue, so there is nothing pending" },
+            {
+                "/_cat/thread_pool",
+                "this reports per-node thread pools, and answering for the fleet needs the "
+                    + "same fan-out /_nodes/stats is waiting on; GET /_serverless/stats answers for the node it is "
+                    + "sent to" },
+            { "/_list/indices", enumeration },
+            { "/_list/shards", "the same unbounded listing as _cat/shards" } }) {
+            controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
         }
 
         // Refused for a reason of its own, because the general one is no longer true of it. A node can now
@@ -895,12 +926,6 @@ public final class ServerlessNode implements Closeable {
             // fell through to core's default 400 rather than the 501 D2 promises. Being absent is a
             // decision; looking like a typo is not.
             {
-                "/_field_caps",
-                "field capabilities are not implemented here yet. It is the largest of these gaps -- both "
-                    + "comparable products ship it and clients use it to discover what they can query -- and "
-                    + "it is absent rather than refused on principle" },
-            { "/{index}/_field_caps", "field capabilities are not implemented here yet" },
-            {
                 "/{index}/_validate/query",
                 "query validation is not implemented here; send the query to _search, which parses it the "
                     + "same way and reports a parse failure as a 400" },
@@ -909,6 +934,11 @@ public final class ServerlessNode implements Closeable {
                 "index and alias resolution is not exposed; look an index up by name with GET /{index}, or "
                     + "use a prefix pattern on _search, which resolves with one bounded listing" },
             { "/{index}/_rank_eval", "ranking evaluation is not implemented here" },
+            {
+                "/_field_caps",
+                "name an index or a prefix: GET /{index}/_field_caps answers for what it can reach, and "
+                    + "asking every index in the deployment what fields it has is the inventory operation "
+                    + "this design refuses" },
             {
                 "/_aliases",
                 "the bulk alias action API is not implemented; this shell has PUT, GET and DELETE on "

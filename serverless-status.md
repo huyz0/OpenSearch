@@ -158,6 +158,13 @@ a 429 rather than accepted into memory it does not have. A node at its shard lim
 recently used idle shard to make room rather than refusing, and `GET /_serverless/stats` reports the
 counters those refusals are decided from — breakers, in-flight write bytes, and what the node is holding.
 
+**Discovery.** `GET /{index}/_field_caps` reports what a client can query — field types, and whether each is
+searchable and aggregatable — read from the mapping rather than from a shard, so it answers for an index whose
+shards are all dormant. Where two indices map a field differently both types come back, each attributed to the
+indices using it. `GET /_list/indices/{prefix}*` lists indices through one bounded listing and **refuses a
+prefix matching more than the cap rather than truncating**, which is why it is `_list` and not `_cat`:
+OpenSearch added `_list` for exactly this reason ([`m53-discovery-notes.md`](m53-discovery-notes.md)).
+
 **Indices are mutable.** `PUT|POST /{index}/_mapping` adds fields to an index that already exists — the merge
 is core's own `MapperService`, so adding a field succeeds and changing a field's type is refused in core's own
 words, and a shard already open and serving traffic picks the change up. The write is a compare-and-swap on
@@ -224,9 +231,9 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - Settings are write-once. They are honoured at creation and readable afterwards, but `PUT /{index}/_settings`
   is not routed and there is no settings service behind it. Both AWS OpenSearch Serverless and Elastic Cloud
   Serverless ship it; mappings became mutable in M52 and settings did not.
-- `_field_caps` is the largest endpoint gap left: both comparable products ship it and clients use it to
-  discover what they can query. It refuses honestly rather than falling through, which is not the same as
-  being built.
+- There is no cursor over indices. `GET /_list/indices/{prefix}*` answers in one bounded page or refuses;
+  paginating a deployment whose indices fit under no usable prefix is not possible, because resuming a listing
+  needs `start-after` and core's `BlobContainer` does not expose it.
 - `GET /{index}` omits `aliases` rather than reporting an empty object: resolving an index's aliases needs a
   reverse lookup this design does not offer, and an empty one would be a confident wrong answer.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
@@ -279,7 +286,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-454 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+462 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

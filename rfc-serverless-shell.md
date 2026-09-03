@@ -438,6 +438,19 @@ core's 400 instead of the promised 501; both are fixed. See
 [`m52-mutable-mappings-notes.md`](m52-mutable-mappings-notes.md), including what is still write-once:
 index settings.
 
+**Discovery, and a scaling question answered by picking the right endpoint (M53).** `_field_caps` was the
+largest thing the vendor comparison found missing; it is built, and needs no shard, because field capabilities
+are a property of the mapping and `IndicesService#createIndexMapperService` reads one without allocating
+anything. The interesting question was `_cat/indices`. It has no cursor and cannot have one — its contract is
+"return everything" — and returning the first hundred is the confident partial answer this design refuses, in
+`TooManyMatchesException`'s own words. OpenSearch reached the same conclusion about its own `_cat` APIs and
+added `_list/indices`, whose contract *is* a page at a time, so that is what is served: bounded by the same
+prefix cap search wildcards use, refusing rather than truncating. The unscoped form stays refused because
+`DescriptorStore#listPage` is a cursor in shape only — it lists everything and slices — and a real one needs
+`start-after`, which `BlobContainer` does not expose. Fourteen endpoints also stopped sharing one refusal
+reason that was never true of most of them; that is the third time a stale reason has surfaced. See
+[`m53-discovery-notes.md`](m53-discovery-notes.md).
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

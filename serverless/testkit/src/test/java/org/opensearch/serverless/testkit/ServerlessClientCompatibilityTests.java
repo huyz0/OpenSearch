@@ -344,14 +344,17 @@ public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
             for (String[] expected : new String[][] {
                 // _count was here until M52 served it. _field_caps replaces it as the example of an
                 // endpoint that is absent and says so rather than looking like a typo.
-                { "/alpha/_field_caps", "field capabilities" },
+                // _field_caps was here until M53 served it. _msearch is the stand-in: still absent, and
+                // still saying so rather than looking like a typo.
+                { "/_msearch", "one search per request" },
                 { "/alpha/_refresh", "refresh=true" },
                 { "/_msearch", "one search per request" },
                 { "/_reindex", "search_after" },
                 { "/alpha/_update_by_query", "search_after" },
                 { "/_search/scroll", "point in time" },
                 { "/_cluster/state", "no cluster-wide state" },
-                { "/_cat/indices", "no cluster-wide state" } }) {
+                // Its reason is its own since M53: enumeration cost, not missing cluster state.
+                { "/_cat/indices", "unbounded" } }) {
                 final Answer answer = call("GET", expected[0], null);
                 assertEquals(expected[0] + " must be a 501: " + answer.body(), 501, answer.status());
                 assertTrue(expected[0] + " must say why: " + answer.body(), answer.has(expected[1]));

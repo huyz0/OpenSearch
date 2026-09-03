@@ -94,7 +94,10 @@ public class ServerlessRestTests extends OpenSearchTestCase {
                 final int code = Integer.parseInt(response.split(" ", 2)[0]);
                 assertNotEquals("unimplemented endpoint " + path + " answered with 200", 200, code);
                 assertEquals("unimplemented endpoint " + path + " should refuse explicitly: " + response, 501, code);
-                assertTrue("a 501 must say why: " + response, response.contains("no cluster-wide state"));
+                // A reason, not a particular reason. Since M53 each refusal carries the one that is true
+                // of it -- enumeration cost, a missing allocator, a missing task queue -- so asserting the
+                // shared text here would pin the wrong thing. ServerlessDiscoveryTests checks each.
+                assertTrue("a 501 must say why: " + response, response.contains("is not available here:"));
             }
         }
     }
