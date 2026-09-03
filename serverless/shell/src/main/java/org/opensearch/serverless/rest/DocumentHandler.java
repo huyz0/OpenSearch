@@ -71,6 +71,15 @@ public final class DocumentHandler extends BaseRestHandler {
         return List.of(
             new Route(RestRequest.Method.PUT, "/{index}/_doc/{id}"),
             new Route(RestRequest.Method.POST, "/{index}/_doc/{id}"),
+            // An id the caller does not supply. The routing key is the id, so it has to exist before the
+            // request can be placed -- which is why it is generated here rather than by the shard. _bulk
+            // has generated ids all along; this path simply had no route.
+            new Route(RestRequest.Method.POST, "/{index}/_doc"),
+            // Create-if-absent. The engine does the comparison, at MATCH_DELETED, under the per-document
+            // lock it already holds -- so this is a different constant on the same call, not a read
+            // followed by a write, which would be a race rather than a check.
+            new Route(RestRequest.Method.PUT, "/{index}/_create/{id}"),
+            new Route(RestRequest.Method.POST, "/{index}/_create/{id}"),
             // A deletion routes, forwards and logs exactly like a write, so it belongs on the same
             // handler rather than in a parallel one that would have to be kept in step with it.
             new Route(RestRequest.Method.DELETE, "/{index}/_doc/{id}")
@@ -82,7 +91,10 @@ public final class DocumentHandler extends BaseRestHandler {
         // Read every parameter before any early return: BaseRestHandler rejects a request whose
         // parameters were not all consumed, which would turn a deliberate refusal into a 400.
         final String index = request.param("index");
-        final String id = request.param("id");
+        final boolean requireAbsent = request.path().contains("/_create/");
+        // An absent id is generated, exactly as _bulk has always done, because routing is a function of
+        // the id and so it must exist before the request can be placed at all.
+        final String id = request.param("id") == null ? org.opensearch.common.UUIDs.base64UUID() : request.param("id");
         final String source = request.hasContent() ? request.content().utf8ToString() : null;
         final boolean refresh = request.paramAsBoolean("refresh", false);
         final boolean deletion = request.method() == RestRequest.Method.DELETE;
@@ -225,7 +237,8 @@ public final class DocumentHandler extends BaseRestHandler {
                                         refresh,
                                         deletion,
                                         ifSeqNo,
-                                        ifPrimaryTerm
+                                        ifPrimaryTerm,
+                                        requireAbsent
                                     )
                                 )
                         );
@@ -290,26 +303,17 @@ public final class DocumentHandler extends BaseRestHandler {
             // No owner at all. Nothing will fix this except some node activating the shard, and the
             // only reason anyone would is that a write arrived -- which just happened.
             serving.signals().ownershipDoubted(index, shard);
-            return channel -> {
-                try (XContentBuilder builder = channel.newBuilder()) {
-                    builder.startObject();
-                    builder.field("error", "not_the_writer");
-                    builder.field("index", index);
-                    builder.field("shard", shard);
-                    // Name the owner. A bare "wrong node" makes the client guess, and guessing at
-                    // ownership is how two writers end up believing the same thing.
-                    builder.field("owner_node_id", owner);
-                    builder.field(
-                        "reason",
-                        owner == null
-                            ? "no node currently owns this shard; activate it before writing"
-                            : "this node does not own the shard; send the write to the named owner"
-                    );
-                    builder.field("status", RestStatus.MISDIRECTED_REQUEST.getStatus());
-                    builder.endObject();
-                    channel.sendResponse(new BytesRestResponse(RestStatus.MISDIRECTED_REQUEST, builder));
-                }
-            };
+            // Through the shared error helper, so this renders the same nested "error" object every other
+            // deliberate refusal on this surface does. It used to build its own body with "error" as a bare
+            // string -- the exact shape M47 removed everywhere else, missed here because this one path
+            // builds its response by hand. The owner is still named: a bare "wrong node" makes the client
+            // guess, and guessing at ownership is how two writers end up believing the same thing.
+            final String reason = owner == null
+                ? "no node currently owns shard " + shard + " of " + index + "; activate it before writing"
+                : "this node does not own shard " + shard + " of " + index + "; it is owned by " + owner;
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.MISDIRECTED_REQUEST, "not_the_writer", reason)
+            );
         }
 
         // Off the HTTP thread: a WAL append is an object-store write, and blocking the thread that
@@ -330,7 +334,7 @@ public final class DocumentHandler extends BaseRestHandler {
                     source,
                     () -> deletion
                         ? serving.delete(shardId, id, ifSeqNo, ifPrimaryTerm)
-                        : serving.index(shardId, id, source, ifSeqNo, ifPrimaryTerm)
+                        : serving.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent)
                 );
                 if (refresh) {
                     // Same meaning as classic OpenSearch: make this write visible to search before

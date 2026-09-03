@@ -9,9 +9,7 @@
 package org.opensearch.serverless.rest;
 
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
-import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -65,16 +63,20 @@ public final class NotImplementedHandler extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        return channel -> {
-            try (XContentBuilder builder = channel.newBuilder()) {
-                builder.startObject();
-                builder.field("error", "not_implemented");
-                builder.field("path", path);
-                builder.field("reason", reason);
-                builder.field("status", RestStatus.NOT_IMPLEMENTED.getStatus());
-                builder.endObject();
-                channel.sendResponse(new BytesRestResponse(RestStatus.NOT_IMPLEMENTED, builder));
-            }
-        };
+        // Consume every parameter before returning. BaseRestHandler rejects a request whose parameters
+        // were not all read, so a refusal on a path with a placeholder in it -- /{index}/_count, say --
+        // came back as "unrecognized parameter: [index]" instead of as the refusal it is.
+        for (String name : java.util.List.copyOf(request.params().keySet())) {
+            request.param(name);
+        }
+        // The shared error helper, so a refusal renders the same nested "error" object every other
+        // deliberate refusal on this surface does. This handler built its own body with "error" as a bare
+        // string -- the shape M47 removed everywhere else and missed here, which meant the responses
+        // trying hardest to explain themselves were the ones a structurally-parsing client broke on.
+        // The path is carried in the reason rather than as a field of its own, because the error object's
+        // shape is core's and is not this handler's to extend.
+        return channel -> channel.sendResponse(
+            IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "not_implemented", path + " is not available here: " + reason)
+        );
     }
 }

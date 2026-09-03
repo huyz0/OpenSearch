@@ -280,9 +280,9 @@ public final class BulkHandler extends BaseRestHandler {
     private void applyGroup(ServerlessNode serving, List<Item> group, boolean refresh) throws IOException {
         final String index = group.get(0).index;
         final int shard = group.get(0).shard;
-        final List<WalRecord> operations = new ArrayList<>(group.size());
+        final List<ServerlessNode.BulkOperation> operations = new ArrayList<>(group.size());
         for (Item item : group) {
-            operations.add(item.operation);
+            operations.add(new ServerlessNode.BulkOperation(item.operation, item.ifSeqNo, item.ifPrimaryTerm, item.requireAbsent));
         }
 
         final ShardId local = serving.reconciler()
@@ -293,7 +293,7 @@ public final class BulkHandler extends BaseRestHandler {
             .orElse(null);
 
         if (local != null && serving.reconciler().readerShards().contains(local) == false) {
-            record(group, serving.bulk(local, operations), serving.localNode().getId());
+            record(group, serving.bulkOperations(local, operations), serving.localNode().getId());
             if (refresh) {
                 serving.reconciler().shard(local).refresh("serverless-bulk-refresh");
             }
@@ -335,7 +335,7 @@ public final class BulkHandler extends BaseRestHandler {
                 return;
             }
             final var response = serving.router()
-                .forwardBulk(peer.get(), new org.opensearch.serverless.transport.ForwardedBulkRequest(index, shard, operations, refresh));
+                .forwardBulk(peer.get(), org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, shard, operations, refresh));
             record(group, response.outcomes(), response.ownerNodeId());
         } catch (Exception e) {
             // 503 rather than the exception's own status, for the reason the single-write path gives:
@@ -391,7 +391,9 @@ public final class BulkHandler extends BaseRestHandler {
             builder.startArray("items");
             for (Item item : items) {
                 builder.startObject();
-                builder.startObject(item.operation.isDeletion() ? "delete" : "index");
+                // The action the caller wrote, not a normalised one: a client matching items to the
+                // actions it sent looks up this key.
+                builder.startObject(item.operation.isDeletion() ? "delete" : item.requireAbsent ? "create" : "index");
                 builder.field("_index", item.index);
                 builder.field("_id", item.operation.id());
                 if (item.shard >= 0) {
@@ -478,13 +480,28 @@ public final class BulkHandler extends BaseRestHandler {
         return lines;
     }
 
-    /** Action-line fields that ask for a conditional write, none of which this system honours. */
-    private static final java.util.Set<String> CONDITIONAL_FIELDS = java.util.Set.of(
-        "_seq_no",
-        "_primary_term",
-        "_version",
-        "version_type"
-    );
+    /**
+     * Action-line fields asking for a version model this system does not keep.
+     *
+     * <p>{@code _seq_no} and {@code _primary_term} used to be here too, refused with the same message. They
+     * are now honoured: the batch path carries a condition per item and hands it to the same engine
+     * compare-and-swap the single-document path uses. What is left is external versioning, which asks this
+     * system to order writes by a number the caller maintains and it does not keep — the same refusal
+     * {@code PUT /{index}/_doc/{id}} makes, for the same reason.
+     */
+    private static final java.util.Set<String> EXTERNAL_VERSION_FIELDS = java.util.Set.of("_version", "version_type");
+
+    /**
+     * The names a condition is <em>not</em> spelled with on an action line.
+     *
+     * <p>{@code _seq_no} and {@code _primary_term} are what a bulk <em>response</em> reports; the request
+     * spells the condition {@code if_seq_no} and {@code if_primary_term}, in this shell as in OpenSearch. A
+     * client that sends the response's names is asking for a compare-and-swap in a way nothing will honour,
+     * and dropping the field silently would give them an unconditional write while they believed otherwise
+     * — which is the failure this whole surface is built to refuse. So it is a refusal that names the right
+     * spelling rather than a field quietly ignored.
+     */
+    private static final java.util.Set<String> MISSPELLED_CONDITIONS = java.util.Set.of("_seq_no", "_primary_term");
 
     private static Action parseAction(byte[] bytes, int lineNumber, String defaultIndex) throws BadRequest, IOException {
         try (
@@ -511,12 +528,17 @@ public final class BulkHandler extends BaseRestHandler {
                         action.index = parser.text();
                     } else if ("_id".equals(field)) {
                         action.id = parser.text();
-                    } else if (CONDITIONAL_FIELDS.contains(field)) {
-                        // Read and kept, not merely noticed: a client that asked for a compare-and-swap
+                    } else if (EXTERNAL_VERSION_FIELDS.contains(field)) {
+                        // Read and kept, not merely noticed: a client that asked for a version comparison
                         // and got an unconditional write believing it got one is the confident wrong
-                        // answer this design refuses everywhere else. Every operation on the line stays
-                        // unconditional, so the whole line is unsupported rather than just this field.
+                        // answer this design refuses everywhere else.
                         action.conditional = field;
+                    } else if (MISSPELLED_CONDITIONS.contains(field)) {
+                        action.misspelled = field;
+                    } else if ("if_seq_no".equals(field)) {
+                        action.ifSeqNo = parser.longValue();
+                    } else if ("if_primary_term".equals(field)) {
+                        action.ifPrimaryTerm = parser.longValue();
                     }
                 }
             }
@@ -535,13 +557,18 @@ public final class BulkHandler extends BaseRestHandler {
         private String id;
         private String source;
         private String conditional;
+        private String misspelled;
+        private long ifSeqNo = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
+        private long ifPrimaryTerm = 0L;
 
         Action(String name, String defaultIndex) {
             this.name = name;
             this.index = defaultIndex;
-            // "create" is fail-if-exists and "update" is a partial merge. Both need machinery this
-            // system does not have, so both are unsupported rather than approximated.
-            this.supported = "index".equals(name) || "delete".equals(name);
+            // "create" is an ordinary index operation at MATCH_DELETED -- the engine compares against its
+            // own live version map, so it needs no machinery this system lacks. "update" is a partial
+            // merge, which needs the current document read back before anything is written; the batch path
+            // applies without reading, so it stays refused rather than approximated.
+            this.supported = "index".equals(name) || "delete".equals(name) || "create".equals(name);
             this.needsSource = "index".equals(name) || "create".equals(name) || "update".equals(name);
         }
 
@@ -553,11 +580,18 @@ public final class BulkHandler extends BaseRestHandler {
                 index,
                 "delete".equals(name) ? WalRecord.deletion(documentId) : new WalRecord(documentId, source == null ? "" : source)
             );
+            item.requireAbsent = "create".equals(name);
+            item.ifSeqNo = ifSeqNo;
+            item.ifPrimaryTerm = ifPrimaryTerm;
             if (supported == false) {
                 item.fail(
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_action",
-                    "'" + name + "' is not supported: it requires version-conditional writes, which this system does not have"
+                    "'"
+                        + name
+                        + "' is not supported in a batch: it is a partial merge, which has to read the current "
+                        + "document before it can write one, and this path applies a batch without reading it. "
+                        + "Use POST /{index}/_update/{id}, which does."
                 );
             } else if (conditional != null) {
                 item.fail(
@@ -567,10 +601,27 @@ public final class BulkHandler extends BaseRestHandler {
                         + conditional
                         + "' on '"
                         + documentId
-                        + "' asks for a conditional write, which this system does not have: "
-                        + "every write is a plain overwrite and every delete a plain removal"
+                        + "' asks for external versioning, which this system does not have: it keeps no "
+                        + "caller-supplied version model. Use if_seq_no and if_primary_term on the action line."
                 );
-            } else if ("index".equals(name) && (source == null || source.isBlank())) {
+            } else if (misspelled != null) {
+                item.fail(
+                    RestStatus.BAD_REQUEST,
+                    "invalid_condition",
+                    "'"
+                        + misspelled
+                        + "' on '"
+                        + documentId
+                        + "' is what a bulk response reports, not what a request asks with. A condition is "
+                        + "spelled if_seq_no and if_primary_term on the action line."
+                );
+            } else if ((ifSeqNo == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO) != (ifPrimaryTerm == 0L)) {
+                item.fail(
+                    RestStatus.BAD_REQUEST,
+                    "invalid_condition",
+                    "if_seq_no and if_primary_term must be supplied together on '" + documentId + "'"
+                );
+            } else if (("index".equals(name) || "create".equals(name)) && (source == null || source.isBlank())) {
                 item.fail(RestStatus.BAD_REQUEST, "missing_source", "the document body for '" + documentId + "' was empty");
             }
             return item;
@@ -590,6 +641,9 @@ public final class BulkHandler extends BaseRestHandler {
         private long seqNo = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
         private long primaryTerm = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
         private long version = org.opensearch.common.lucene.uid.Versions.NOT_FOUND;
+        private boolean requireAbsent;
+        private long ifSeqNo = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
+        private long ifPrimaryTerm = 0L;
 
         Item(String index, WalRecord operation) {
             this.index = index;
@@ -611,7 +665,14 @@ public final class BulkHandler extends BaseRestHandler {
 
         void succeed(ServerlessNode.BulkOutcome outcome, String nodeId) {
             if (outcome.failure() != null) {
-                fail(RestStatus.BAD_REQUEST, "operation_failed", outcome.failure());
+                // A lost condition is a 409, not a 400, and carries the type classic OpenSearch uses --
+                // a client retrying a compare-and-swap needs to tell "your condition did not hold" from
+                // "your document was malformed", and only one of those is worth retrying.
+                if (outcome.conflict()) {
+                    fail(RestStatus.CONFLICT, "version_conflict_engine_exception", outcome.failure());
+                } else {
+                    fail(RestStatus.BAD_REQUEST, "operation_failed", outcome.failure());
+                }
                 return;
             }
             this.nodeId = nodeId;

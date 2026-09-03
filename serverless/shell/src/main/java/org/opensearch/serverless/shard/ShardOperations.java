@@ -1042,15 +1042,28 @@ public final class ShardOperations {
 
     private Written written(String index, String id, String source, boolean refresh, boolean deletion, long ifSeqNo, long ifPrimaryTerm)
         throws IOException {
+        return written(index, id, source, refresh, deletion, ifSeqNo, ifPrimaryTerm, false);
+    }
+
+    private Written written(
+        String index,
+        String id,
+        String source,
+        boolean refresh,
+        boolean deletion,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent
+    ) throws IOException {
         final Placement placement = place(index, id);
         if (placement.local() != null) {
-            final var outcome = node.index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm);
+            final var outcome = node.index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
             if (refresh) {
                 node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
             }
             return new Written(node.localNode().getId(), outcome);
         }
-        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm);
+        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent);
     }
 
     private String forward(String index, String id, String source, boolean refresh, boolean deletion, Placement placement)
@@ -1077,6 +1090,20 @@ public final class ShardOperations {
         long ifSeqNo,
         long ifPrimaryTerm
     ) throws IOException {
+        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, false);
+    }
+
+    private Written forwardWritten(
+        String index,
+        String id,
+        String source,
+        boolean refresh,
+        boolean deletion,
+        Placement placement,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent
+    ) throws IOException {
         if (placement.owner() == null || placement.owner().equals(node.localNode().getId())) {
             throw notHere(index, placement);
         }
@@ -1101,7 +1128,8 @@ public final class ShardOperations {
                         refresh,
                         deletion,
                         ifSeqNo,
-                        ifPrimaryTerm
+                        ifPrimaryTerm,
+                        requireAbsent
                     )
                 );
             return new Written(

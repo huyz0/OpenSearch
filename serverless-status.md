@@ -7,7 +7,12 @@ disagree, this is right.
 
 ## What works
 
-**Documents.** Write, get, delete, `_bulk`, `_mget`, with `_source` filtering on reads. Every write, get
+**Documents.** Write, get, delete, `_bulk`, `_mget`, with `_source` filtering on reads. The routes an
+OpenSearch client actually calls: `PUT|POST /{index}/_doc/{id}`, `POST /{index}/_doc` for a generated id, and
+`PUT|POST /{index}/_create/{id}` for create-if-absent — which is one constant on the write path's own engine
+call (`MATCH_DELETED`), so the comparison happens under the per-document lock the engine already holds rather
+than as a read followed by a write. `_bulk` does `create` and per-item `if_seq_no`/`if_primary_term` too, and
+reports a lost condition as a 409 ([`m50-api-compatibility-notes.md`](m50-api-compatibility-notes.md)). Every write, get
 and bulk item reports `_seq_no`, `_primary_term` and `_version`, and **conditional writes work**:
 `if_seq_no`/`if_primary_term` on a write, a delete or an `_update` are passed to the engine, which performs
 the compare-and-swap against its own live version map; a lost race is a 409. The numbers survive a
@@ -153,6 +158,13 @@ a 429 rather than accepted into memory it does not have. A node at its shard lim
 recently used idle shard to make room rather than refusing, and `GET /_serverless/stats` reports the
 counters those refusals are decided from — breakers, in-flight write bytes, and what the node is holding.
 
+**Indices.** `PUT /{index}` reads OpenSearch's own create envelope — `settings.number_of_shards` is honoured,
+`mappings` is the mapping, and any other setting is carried into the descriptor and layered into
+`IndexMetadata`, because the data plane under this shell is core's and understands them. The older bare-mapping
+body with `?shards=` still works. `GET /{index}`, `/_mapping` and `/_settings` answer OpenSearch's shape, so
+configuration can be read back; `HEAD /{index}` answers whether an index exists. `GET|POST /_search` with no
+index searches everything, and `q=` is core's query-string parser rather than a lookalike.
+
 ## What is deliberately refused
 
 These are decisions, not gaps. Each answers 501 with a reason.
@@ -186,6 +198,13 @@ These are decisions, not gaps. Each answers 501 with a reason.
   slightly later, when the shard is opened, so a predecessor's appends in between are still replayed.
   Closing it means sealing at the swap, which the path that opens a shard from projected truth rather than
   from an acquisition does not have. The unbounded half is closed.
+- `update` inside `_bulk` is refused: it is a partial merge, which has to read the current document before
+  writing one, and the batch path applies without reading. Closing it changes what a batch is, so it is a
+  design decision rather than plumbing. `POST /{index}/_update/{id}` does the merge.
+- Settings are write-once. They are honoured at creation and readable afterwards, but `PUT /{index}/_settings`
+  is not routed and there is no settings service behind it.
+- `GET /{index}` omits `aliases` rather than reporting an empty object: resolving an index's aliases needs a
+  reverse lookup this design does not offer, and an empty one would be a confident wrong answer.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
   runs on every pass. A reader whose node cannot reach the object store for longer than the grace can lose
   the commit it is reading — it fails with an error rather than answering wrongly, but it is a real limit.
@@ -236,7 +255,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## How it is tested
 
-427 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
+437 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
 

@@ -93,8 +93,10 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
 
             final Response fetched = send(http, "GET", "/alpha", null);
             assertEquals(200, fetched.status());
-            assertTrue(fetched.body().contains("\"shards\":2"));
-            assertTrue("the mapping should have been stored", fetched.body().contains("\"has_mapping\":true"));
+            // OpenSearch's own shape, keyed by index name, since M50: settings under "index", the mapping
+            // itself rather than a flag saying one exists.
+            assertTrue(fetched.body().contains("\"number_of_shards\":\"2\""));
+            assertTrue("the mapping should have been stored and returned", fetched.body().contains("\"mappings\""));
 
             // Name uniqueness, arbitrated by a put-if-absent rather than by an elected node.
             final Response duplicate = send(http, "PUT", "/alpha", null);

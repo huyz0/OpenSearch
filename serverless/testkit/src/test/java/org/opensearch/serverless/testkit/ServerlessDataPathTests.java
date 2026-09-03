@@ -399,15 +399,22 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             // request, not a state the index gets stuck in.
             assertEquals(201, send(http, "PUT", "/conditional/_doc/1", "{\"msg\":\"x\"}").status());
 
-            // Bulk carries the same fields on the action line rather than the query string.
+            // Bulk carries conditions on the action line, and since M50 it honours them. What it refuses
+            // is what it cannot honour: external versioning, and a condition spelled with the names a
+            // response uses rather than the ones a request does. Both are refused per item rather than
+            // dropped, which is the property this test is about and which did not change.
             final String bulk = "{\"index\":{\"_index\":\"conditional\",\"_id\":\"2\",\"_seq_no\":0,\"_primary_term\":1}}\n"
                 + "{\"msg\":\"y\"}\n"
                 + "{\"delete\":{\"_index\":\"conditional\",\"_id\":\"1\",\"_version\":3}}\n";
             final Response bulkResponse = send(http, "POST", "/_bulk", bulk);
             assertEquals(bulkResponse.body(), 200, bulkResponse.status());
             assertTrue(
-                "the bulk response must carry a per-item refusal, not a silent success: " + bulkResponse.body(),
-                bulkResponse.body().contains("\"status\":501") && bulkResponse.body().contains("conditional write")
+                "a condition spelled the response's way must be refused, not dropped: " + bulkResponse.body(),
+                bulkResponse.body().contains("is what a bulk response reports")
+            );
+            assertTrue(
+                "external versioning must still be refused per item: " + bulkResponse.body(),
+                bulkResponse.body().contains("\"status\":501") && bulkResponse.body().contains("external versioning")
             );
             // Neither item was applied: document 2 was never written, and document 1 -- written plainly
             // just above -- was not deleted by the refused conditional delete.

@@ -261,9 +261,12 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
             loop.want("alpha", 0);
             loop.tick(clock.get());
 
+            // "update" is still refused -- it is a partial merge, which has to read the current document
+            // before writing one, and this path applies a batch without reading it. "create" is no longer
+            // here: since M50 it is an ordinary index operation at MATCH_DELETED and works.
             final String body = indexLine("ok-1", 1)
-                + "{\"create\":{\"_id\":\"nope-1\"}}\n{\"msg\":\"bulk\",\"n\":9}\n"
                 + "{\"update\":{\"_id\":\"nope-2\"}}\n{\"doc\":{\"n\":9}}\n"
+                + "{\"index\":{\"_id\":\"nope-3\",\"_version\":7}}\n{\"msg\":\"bulk\",\"n\":9}\n"
                 + indexLine("ok-2", 2);
 
             final Response response = send(node, "POST", "/alpha/_bulk?refresh=true", body);

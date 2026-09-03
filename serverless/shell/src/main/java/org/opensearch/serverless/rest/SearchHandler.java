@@ -66,14 +66,25 @@ public final class SearchHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.GET, "/{index}/_search"), new Route(RestRequest.Method.POST, "/{index}/_search"));
+        return List.of(
+            new Route(RestRequest.Method.GET, "/{index}/_search"),
+            new Route(RestRequest.Method.POST, "/{index}/_search"),
+            // Searching every index. Without these the request fell through to GET /{index}, which read
+            // "_search" as an index name and answered "no such index: _search" -- a confusing refusal of a
+            // request the shell can in fact serve, since a bare "*" is the prefix pattern it already
+            // resolves with one bounded listing.
+            new Route(RestRequest.Method.GET, "/_search"),
+            new Route(RestRequest.Method.POST, "/_search")
+        );
     }
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         // Every parameter read before any early return, or BaseRestHandler turns a refusal into a 400
         // about an unconsumed parameter instead of the one being made here.
-        final String index = request.param("index");
+        // A bare /_search names no index, and means every index -- which this shell already expresses as a
+        // prefix pattern, resolved by one bounded listing.
+        final String index = request.param("index") == null ? "*" : request.param("index");
         final String q = request.param("q");
         final int sizeParam = request.paramAsInt("size", 10);
         final int fromParam = request.paramAsInt("from", 0);
@@ -108,12 +119,12 @@ public final class SearchHandler extends BaseRestHandler {
                     )
                 );
             }
-        } else if (q != null && q.contains(":")) {
-            // The shorthand this handler was born with, kept because it is what every existing caller
-            // uses and because a one-field match is genuinely the common case.
-            final String field = q.substring(0, q.indexOf(':'));
-            final String value = q.substring(q.indexOf(':') + 1);
-            source = new SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.matchQuery(field, value));
+        } else if (q != null && q.isBlank() == false) {
+            // Core's own query-string parser, which is what "q=" means in OpenSearch. It was a hand-rolled
+            // split on the first colon, so "q=field:value" worked and "q=hello" -- a bare term across all
+            // fields, the simplest thing a caller can type -- was a 400. The colon form still parses, and
+            // now parses as the query-string syntax it always looked like rather than as a lookalike.
+            source = new SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.queryStringQuery(q));
         } else {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(

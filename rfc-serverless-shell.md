@@ -399,6 +399,19 @@ a partitioned writer can go on appending at all; it bounds, and the seal fences.
 [`m49-fencing-notes.md`](m49-fencing-notes.md) for the one window that remains, between winning the
 shard-head and taking the seal.
 
+**The allowlist, kept honest (M50).** A re-audit after M49 — reading every handler's routes, then driving a
+running node over HTTP, because half of what it found is invisible from the source — showed the surface had
+drifted off its own posture in three ways. One endpoint gave a *wrong answer* rather than a refusal:
+`PUT /{index}` read the shard count from a query parameter and the whole body as the mapping, so a client
+sending OpenSearch's create envelope got a one-shard index whose mapping was the envelope, and was told
+`acknowledged` and `shards_acknowledged` for it. Several refusals had stopped being true when M48 shipped
+conditional writes — `_bulk` still told callers the system had none. And the promised 501-with-a-reason
+covered ten paths; everything else fell through to core's default 400, which reads like a typo. All three are
+closed: the envelope is honoured (and a replica count refused with its real reason rather than dropped),
+`_bulk` does `create` and per-item conditions, and the endpoints a client actually tries each refuse with the
+reason they are refused for. See [`m50-api-compatibility-notes.md`](m50-api-compatibility-notes.md), including
+the gap this leaves: `update` inside `_bulk`, which needs a read per item and so changes what a batch is.
+
 **What D2 does not license (M47).** "Not a drop-in" was never permission to be gratuitously different —
 a real audit (reading actual handler source, not assuming from names) found a mix of two very different
 things wearing the same "incompatible" label: the deliberate, load-bearing refusals D2 exists for

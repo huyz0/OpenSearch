@@ -32,6 +32,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
     private final boolean deletion;
     private final long ifSeqNo;
     private final long ifPrimaryTerm;
+    private final boolean requireAbsent;
 
     /**
      * Creates a request.
@@ -86,6 +87,34 @@ public final class ForwardedIndexRequest extends TransportRequest {
         long ifSeqNo,
         long ifPrimaryTerm
     ) {
+        this(index, shard, id, source, refresh, deletion, ifSeqNo, ifPrimaryTerm, false);
+    }
+
+    /**
+     * Creates a forwarded write that may also require the document to be absent.
+     *
+     * @param index the index
+     * @param shard the shard
+     * @param id the document id
+     * @param source the document source
+     * @param refresh whether to refresh after the write
+     * @param deletion whether this is a deletion
+     * @param ifSeqNo the sequence number the document must be at, or unassigned for an unconditional write
+     * @param ifPrimaryTerm the primary term the document must be at, or 0 when unconditional
+     * @param requireAbsent whether the write must fail if the document already exists
+     */
+    public ForwardedIndexRequest(
+        String index,
+        int shard,
+        String id,
+        String source,
+        boolean refresh,
+        boolean deletion,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent
+    ) {
+        this.requireAbsent = requireAbsent;
         this.deletion = deletion;
         this.index = index;
         this.shard = shard;
@@ -130,6 +159,16 @@ public final class ForwardedIndexRequest extends TransportRequest {
         this.deletion = in.readBoolean();
         this.ifSeqNo = in.readZLong();
         this.ifPrimaryTerm = in.readVLong();
+        this.requireAbsent = in.readBoolean();
+    }
+
+    /**
+     * Whether the write must fail if the document already exists.
+     *
+     * @return whether this is a create rather than an index
+     */
+    public boolean requireAbsent() {
+        return requireAbsent;
     }
 
     @Override
@@ -143,6 +182,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
         out.writeBoolean(deletion);
         out.writeZLong(ifSeqNo);
         out.writeVLong(ifPrimaryTerm);
+        out.writeBoolean(requireAbsent);
     }
 
     /**

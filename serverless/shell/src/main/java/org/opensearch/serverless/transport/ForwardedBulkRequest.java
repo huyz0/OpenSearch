@@ -38,6 +38,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
     private final String index;
     private final int shard;
     private final List<WalRecord> operations;
+    private final List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch;
     private final boolean refresh;
 
     /**
@@ -49,10 +50,63 @@ public final class ForwardedBulkRequest extends TransportRequest {
      * @param refresh whether to make the batch visible before answering
      */
     public ForwardedBulkRequest(String index, int shard, List<WalRecord> operations, boolean refresh) {
+        this(index, shard, unconditional(operations), refresh, true);
+    }
+
+    /**
+     * Creates a forwarded batch whose items may carry conditions.
+     *
+     * <p>A factory rather than a constructor because a list of operations and a list of records erase to
+     * the same signature.
+     *
+     * @param index the index
+     * @param shard the shard every operation routes to
+     * @param batch the operations, in request order
+     * @param refresh whether to make the batch visible before answering
+     * @return the request
+     */
+    public static ForwardedBulkRequest of(
+        String index,
+        int shard,
+        List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch,
+        boolean refresh
+    ) {
+        return new ForwardedBulkRequest(index, shard, batch, refresh, true);
+    }
+
+    private ForwardedBulkRequest(
+        String index,
+        int shard,
+        List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch,
+        boolean refresh,
+        boolean unused
+    ) {
         this.index = index;
         this.shard = shard;
-        this.operations = List.copyOf(operations);
+        this.batch = List.copyOf(batch);
+        final List<WalRecord> records = new ArrayList<>(batch.size());
+        for (org.opensearch.serverless.shell.ServerlessNode.BulkOperation item : batch) {
+            records.add(item.record());
+        }
+        this.operations = List.copyOf(records);
         this.refresh = refresh;
+    }
+
+    private static List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> unconditional(List<WalRecord> operations) {
+        final List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch = new ArrayList<>(operations.size());
+        for (WalRecord record : operations) {
+            batch.add(org.opensearch.serverless.shell.ServerlessNode.BulkOperation.of(record));
+        }
+        return batch;
+    }
+
+    /**
+     * Returns the operations with their conditions, in the order they must be applied.
+     *
+     * @return the batch
+     */
+    public List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch() {
+        return batch;
     }
 
     /**
@@ -67,12 +121,19 @@ public final class ForwardedBulkRequest extends TransportRequest {
         this.shard = in.readVInt();
         final int count = in.readVInt();
         final List<WalRecord> read = new ArrayList<>(count);
+        final List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> readBatch = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             final String id = in.readString();
             final String source = in.readString();
-            read.add(in.readBoolean() ? WalRecord.deletion(id) : new WalRecord(id, source));
+            final WalRecord record = in.readBoolean() ? WalRecord.deletion(id) : new WalRecord(id, source);
+            final long ifSeqNo = in.readZLong();
+            final long ifPrimaryTerm = in.readVLong();
+            final boolean requireAbsent = in.readBoolean();
+            read.add(record);
+            readBatch.add(new org.opensearch.serverless.shell.ServerlessNode.BulkOperation(record, ifSeqNo, ifPrimaryTerm, requireAbsent));
         }
         this.operations = List.copyOf(read);
+        this.batch = List.copyOf(readBatch);
         this.refresh = in.readBoolean();
     }
 
@@ -81,11 +142,14 @@ public final class ForwardedBulkRequest extends TransportRequest {
         super.writeTo(out);
         out.writeString(index);
         out.writeVInt(shard);
-        out.writeVInt(operations.size());
-        for (WalRecord operation : operations) {
-            out.writeString(operation.id());
-            out.writeString(operation.source());
-            out.writeBoolean(operation.isDeletion());
+        out.writeVInt(batch.size());
+        for (org.opensearch.serverless.shell.ServerlessNode.BulkOperation item : batch) {
+            out.writeString(item.record().id());
+            out.writeString(item.record().source());
+            out.writeBoolean(item.record().isDeletion());
+            out.writeZLong(item.ifSeqNo());
+            out.writeVLong(item.ifPrimaryTerm());
+            out.writeBoolean(item.requireAbsent());
         }
         out.writeBoolean(refresh);
     }

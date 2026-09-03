@@ -147,7 +147,7 @@ public final class ShardRouter {
             // item in it routes to this one shard, so there is no partial answer to give.
             throw new IllegalStateException("this node does not own " + request.index() + "[" + request.shard() + "]");
         }
-        final var outcomes = node.bulk(shardId, request.operations());
+        final var outcomes = node.bulkOperations(shardId, request.batch());
         if (request.refresh()) {
             node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
         }

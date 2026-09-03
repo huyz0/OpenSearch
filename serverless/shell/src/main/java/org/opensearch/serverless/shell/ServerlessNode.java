@@ -803,12 +803,74 @@ public final class ServerlessNode implements Closeable {
             "/_cluster/state",
             "/_cluster/stats",
             "/_cluster/reroute",
+            "/_cluster/allocation/explain",
             "/_nodes",
+            "/_nodes/stats",
+            "/_tasks",
+            "/_cat",
             "/_cat/indices",
             "/_cat/shards",
             "/_cat/nodes",
-            "/_cat/allocation" }) {
+            "/_cat/allocation",
+            "/_cat/health",
+            "/_cat/count",
+            "/_cat/aliases",
+            "/_cat/segments",
+            "/_cat/thread_pool",
+            "/_cat/pending_tasks",
+            "/_cat/recovery" }) {
             controller.registerHandler(new NotImplementedHandler(path, noGlobalState));
+        }
+
+        // D2 said unimplemented endpoints return 501 with a reason. Ten paths did; everything else a normal
+        // client reaches for fell through to core's default handler and came back as
+        // 400 {"error":"no handler found for uri ..."} -- a bare string, the wrong status, and
+        // indistinguishable from a typo. These are the endpoints a client actually tries, each refused with
+        // the reason it is refused for rather than with a generic one, because "not here" and "not here
+        // *because*" are different answers and only the second is useful.
+        final String noReindex = "bulk reindexing runs for hours and needs a task that survives the node "
+            + "that started it; there is no cluster-wide task registry here. Read with search_after and "
+            + "write with _bulk, which is the same work under the caller's own control";
+        for (String[] refusal : new String[][] {
+            {
+                "/{index}/_count",
+                "counting is a search; send GET /{index}/_search with size=0 and read hits.total, which is "
+                    + "exact here because the total is always tracked" },
+            {
+                "/{index}/_refresh",
+                "refresh is per-write here: pass refresh=true on the write that must be visible. A "
+                    + "deployment-wide refresh would have to reach every node holding a shard of this index" },
+            {
+                "/{index}/_flush",
+                "there is no flush to ask for: durability is the write-ahead log, which a write is in "
+                    + "before it is acknowledged, and publication is the background reconciler's job" },
+            {
+                "/{index}/_forcemerge",
+                "merging is the shard writer's own decision; there is no cluster-wide operation to trigger "
+                    + "it, and forcing one on a shard this node may not own is not something this node can do" },
+            {
+                "/{index}/_analyze",
+                "analysis runs inside a shard's mapping, and a node that does not hold a shard of this index " + "cannot answer for it" },
+            {
+                "/{index}/_explain/{id}",
+                "explaining a score needs the scorer for one document on one shard; the fan-out here merges "
+                    + "hits rather than exposing per-shard scoring internals" },
+            { "/{index}/_termvectors/{id}", "term vectors are a per-shard Lucene detail this surface does not expose" },
+            { "/_msearch", "send one search per request; there is no batched search on this surface" },
+            { "/{index}/_msearch", "send one search per request; there is no batched search on this surface" },
+            { "/_reindex", noReindex },
+            { "/{index}/_update_by_query", noReindex },
+            {
+                "/_search/scroll",
+                "scroll holds a search context open on a node; use a point in time (POST /{index}/_pit) with "
+                    + "search_after, which is held in the object store and is not tied to one node" },
+            { "/_template/{name}", "there is no cluster state for a template to live in" },
+            { "/_index_template/{name}", "there is no cluster state for a template to live in" },
+            { "/_component_template/{name}", "there is no cluster state for a template to live in" },
+            { "/_ingest/pipeline/{id}", "there is no cluster state for a pipeline to live in" },
+            { "/_scripts/{id}", "no scripting engine is registered, so there is nowhere to store a script" },
+            { "/_ilm/policy/{name}", "index lifecycle management is not part of this surface" } }) {
+            controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
         }
         return controller;
     }
@@ -1323,6 +1385,40 @@ public final class ServerlessNode implements Closeable {
      */
     public WriteOutcome index(org.opensearch.core.index.shard.ShardId shardId, String id, String source, long ifSeqNo, long ifPrimaryTerm)
         throws java.io.IOException {
+        return index(shardId, id, source, ifSeqNo, ifPrimaryTerm, false);
+    }
+
+    /**
+     * Indexes a document, optionally only if no document with that id exists.
+     *
+     * <p><b>Create is one constant, not a feature.</b> Core's own {@code _create} is an ordinary index
+     * operation at {@code Versions.MATCH_DELETED} — the engine compares against its live version map under
+     * the per-document lock it already takes, and a document that is present fails the comparison. Nothing
+     * here re-implements exists-checking, and in particular nothing does a read first, which would be a
+     * race rather than a check.
+     *
+     * <p>A lost race arrives as a {@code VersionConflictEngineException}, the same type a failed
+     * {@code if_seq_no} produces, and reaches the caller as a 409 by the same path.
+     *
+     * @param shardId the shard to write to
+     * @param id the document id
+     * @param source the document source
+     * @param ifSeqNo the sequence number the document must currently be at, or
+     *     {@link org.opensearch.index.seqno.SequenceNumbers#UNASSIGNED_SEQ_NO} for an unconditional write
+     * @param ifPrimaryTerm the primary term the document must currently be at, or 0 when unconditional
+     * @param requireAbsent whether the write must fail if the document already exists
+     * @return what the engine assigned this write
+     * @throws org.opensearch.index.engine.VersionConflictEngineException if the condition was not met
+     * @throws java.io.IOException if the shard is not held here, or the write fails
+     */
+    public WriteOutcome index(
+        org.opensearch.core.index.shard.ShardId shardId,
+        String id,
+        String source,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent
+    ) throws java.io.IOException {
         ensureStarted();
         final var shard = reconciler.shard(shardId);
         if (shard == null) {
@@ -1339,7 +1435,7 @@ public final class ServerlessNode implements Closeable {
         // returning. It is also the order classic OpenSearch uses internally: Lucene, then the translog,
         // then fsync.
         final var result = shard.applyIndexOperationOnPrimary(
-            org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+            requireAbsent ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
             org.opensearch.index.VersionType.INTERNAL,
             new org.opensearch.index.mapper.SourceToParse(
                 shardId.getIndexName(),
@@ -1564,6 +1660,84 @@ public final class ServerlessNode implements Closeable {
         org.opensearch.core.index.shard.ShardId shardId,
         java.util.List<org.opensearch.serverless.store.WalRecord> operations
     ) throws java.io.IOException {
+        final java.util.List<BulkOperation> plain = new java.util.ArrayList<>(operations.size());
+        for (org.opensearch.serverless.store.WalRecord record : operations) {
+            plain.add(BulkOperation.of(record));
+        }
+        return bulkOperations(shardId, plain);
+    }
+
+    /**
+     * One operation in a batch, with whatever condition the caller attached to it.
+     *
+     * <p><b>Why this type exists.</b> The batch path used to take {@link org.opensearch.serverless.store.WalRecord}
+     * — the write-ahead <em>log</em> record — as its input type. A log record describes what happened, so
+     * there was nowhere in it for a condition, which describes what must be true before anything happens.
+     * That is the whole reason {@code _bulk} refused {@code create} and per-item {@code if_seq_no} after
+     * the single-document path gained both: not a missing capability, a missing input type.
+     */
+    public static final class BulkOperation {
+        private final org.opensearch.serverless.store.WalRecord record;
+        private final long ifSeqNo;
+        private final long ifPrimaryTerm;
+        private final boolean requireAbsent;
+
+        /**
+         * Creates an operation carrying a condition.
+         *
+         * @param record what to write or delete
+         * @param ifSeqNo the sequence number the document must be at, or unassigned when unconditional
+         * @param ifPrimaryTerm the primary term the document must be at, or 0 when unconditional
+         * @param requireAbsent whether the write must fail if the document already exists
+         */
+        public BulkOperation(org.opensearch.serverless.store.WalRecord record, long ifSeqNo, long ifPrimaryTerm, boolean requireAbsent) {
+            this.record = record;
+            this.ifSeqNo = ifSeqNo;
+            this.ifPrimaryTerm = ifPrimaryTerm;
+            this.requireAbsent = requireAbsent;
+        }
+
+        /**
+         * An unconditional operation.
+         *
+         * @param record what to write or delete
+         * @return the operation
+         */
+        public static BulkOperation of(org.opensearch.serverless.store.WalRecord record) {
+            return new BulkOperation(record, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L, false);
+        }
+
+        /** @return the record */
+        public org.opensearch.serverless.store.WalRecord record() {
+            return record;
+        }
+
+        /** @return the sequence number the document must be at, or unassigned */
+        public long ifSeqNo() {
+            return ifSeqNo;
+        }
+
+        /** @return the primary term the document must be at, or 0 */
+        public long ifPrimaryTerm() {
+            return ifPrimaryTerm;
+        }
+
+        /** @return whether the document must not already exist */
+        public boolean requireAbsent() {
+            return requireAbsent;
+        }
+    }
+
+    /**
+     * Applies a batch whose items may carry conditions.
+     *
+     * @param shardId the shard to write to
+     * @param batch the operations, in request order
+     * @return one outcome per operation, in the same order
+     * @throws java.io.IOException if the shard is not open here, is a reader, or the log append fails
+     */
+    public java.util.List<BulkOutcome> bulkOperations(org.opensearch.core.index.shard.ShardId shardId, java.util.List<BulkOperation> batch)
+        throws java.io.IOException {
         ensureStarted();
         final var shard = reconciler.shard(shardId);
         if (shard == null) {
@@ -1572,7 +1746,7 @@ public final class ServerlessNode implements Closeable {
         if (reconciler.readerShards().contains(shardId)) {
             throw new java.io.IOException("cannot write to " + shardId + ": it is open as a reader");
         }
-        if (operations.isEmpty()) {
+        if (batch.isEmpty()) {
             return java.util.List.of();
         }
         markUsed(shardId);
@@ -1581,22 +1755,27 @@ public final class ServerlessNode implements Closeable {
         // path took, and the batch economics are unchanged: one PUT for the batch, not one per document.
         // Only operations that actually applied are logged, so replay never reproduces an item the caller
         // was told had failed.
-        final java.util.List<BulkOutcome> outcomes = new java.util.ArrayList<>(operations.size());
-        final java.util.List<org.opensearch.serverless.store.WalRecord> applied = new java.util.ArrayList<>(operations.size());
-        for (org.opensearch.serverless.store.WalRecord operation : operations) {
+        final java.util.List<BulkOutcome> outcomes = new java.util.ArrayList<>(batch.size());
+        final java.util.List<org.opensearch.serverless.store.WalRecord> applied = new java.util.ArrayList<>(batch.size());
+        for (BulkOperation item : batch) {
+            final org.opensearch.serverless.store.WalRecord operation = item.record();
             try {
                 if (operation.isDeletion()) {
                     final var result = shard.applyDeleteOperationOnPrimary(
                         org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
                         operation.id(),
                         org.opensearch.index.VersionType.INTERNAL,
-                        org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                        0
+                        item.ifSeqNo(),
+                        item.ifPrimaryTerm()
                     );
                     if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
                         // s0-findings.md F5 again: a failure here is a value, and a caller that reads
                         // only the exception channel reports success for an operation that did nothing.
-                        outcomes.add(BulkOutcome.failed(operation.id(), "deleting returned " + result.getResultType()));
+                        outcomes.add(
+                            conflicted(result)
+                                ? BulkOutcome.conflicted(operation.id(), describe("deleting", result))
+                                : BulkOutcome.failed(operation.id(), describe("deleting", result))
+                        );
                         continue;
                     }
                     applied.add(
@@ -1612,7 +1791,9 @@ public final class ServerlessNode implements Closeable {
                     );
                 } else {
                     final var result = shard.applyIndexOperationOnPrimary(
-                        org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                        item.requireAbsent()
+                            ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
+                            : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
                         org.opensearch.index.VersionType.INTERNAL,
                         new org.opensearch.index.mapper.SourceToParse(
                             shardId.getIndexName(),
@@ -1620,13 +1801,21 @@ public final class ServerlessNode implements Closeable {
                             new org.opensearch.core.common.bytes.BytesArray(operation.source()),
                             org.opensearch.common.xcontent.XContentType.JSON
                         ),
-                        org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                        0,
+                        item.ifSeqNo(),
+                        item.ifPrimaryTerm(),
                         org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
                         false
                     );
                     if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-                        outcomes.add(BulkOutcome.failed(operation.id(), "indexing returned " + result.getResultType()));
+                        // A lost condition is a FAILURE carrying a VersionConflictEngineException rather
+                        // than a thrown one, so the item has to be inspected rather than only its type
+                        // reported -- otherwise a caller that asked a compare-and-swap question is told
+                        // only that "indexing returned FAILURE", which is not an answer to it.
+                        outcomes.add(
+                            conflicted(result)
+                                ? BulkOutcome.conflicted(operation.id(), describe("indexing", result))
+                                : BulkOutcome.failed(operation.id(), describe("indexing", result))
+                        );
                         continue;
                     }
                     applied.add(
@@ -1646,7 +1835,12 @@ public final class ServerlessNode implements Closeable {
                 // One bad document does not fail the batch. A mapping conflict on item 40 is item 40's
                 // problem, and failing the other 99 would make a bulk request less useful than the loop
                 // it replaces.
-                outcomes.add(BulkOutcome.failed(operation.id(), e.getMessage() == null ? e.toString() : e.getMessage()));
+                final String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                outcomes.add(
+                    e instanceof org.opensearch.index.engine.VersionConflictEngineException
+                        ? BulkOutcome.conflicted(operation.id(), message)
+                        : BulkOutcome.failed(operation.id(), message)
+                );
             }
         }
 
@@ -1656,6 +1850,31 @@ public final class ServerlessNode implements Closeable {
         shard.sync();
         signals.wrote(shardId);
         return outcomes;
+    }
+
+    /**
+     * Describes a non-success engine result, naming the cause when there is one.
+     *
+     * @param result the engine's answer
+     * @return whether the failure was a lost condition
+     */
+    private static boolean conflicted(org.opensearch.index.engine.Engine.Result result) {
+        return result.getFailure() instanceof org.opensearch.index.engine.VersionConflictEngineException;
+    }
+
+    /**
+     * Describes a non-success engine result, naming the cause when there is one.
+     *
+     * @param what the operation kind, for the message
+     * @param result the engine's answer
+     * @return a message for the failed item
+     */
+    private static String describe(String what, org.opensearch.index.engine.Engine.Result result) {
+        if (result.getFailure() != null) {
+            final String message = result.getFailure().getMessage();
+            return message == null ? result.getFailure().toString() : message;
+        }
+        return what + " returned " + result.getResultType();
     }
 
     /**
@@ -1750,6 +1969,7 @@ public final class ServerlessNode implements Closeable {
         private final boolean deletion;
         private final boolean found;
         private final String failure;
+        private boolean conflict;
         private final long seqNo;
         private final long primaryTerm;
         private final long version;
@@ -1810,6 +2030,25 @@ public final class ServerlessNode implements Closeable {
          * @param reason why it failed
          * @return the outcome
          */
+        public static BulkOutcome conflicted(String id, String reason) {
+            final BulkOutcome outcome = failed(id, reason);
+            outcome.conflict = true;
+            return outcome;
+        }
+
+        /**
+         * Whether this item failed because a condition it carried was not met.
+         *
+         * <p>Separated from any other failure because it is the one a caller asked a question with: a lost
+         * compare-and-swap is a 409 and must not be retried blindly, while an ordinary item failure is a
+         * 400 and usually can be.
+         *
+         * @return whether this was a version conflict
+         */
+        public boolean conflict() {
+            return conflict;
+        }
+
         public static BulkOutcome failed(String id, String reason) {
             return new BulkOutcome(
                 id,
