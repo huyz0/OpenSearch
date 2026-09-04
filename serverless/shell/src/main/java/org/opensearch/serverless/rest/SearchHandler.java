@@ -350,7 +350,14 @@ public final class SearchHandler extends BaseRestHandler {
                     bodyPit.getKeepAlive().millis(),
                     PointInTimeHandler.MAX_KEEP_ALIVE_MILLIS
                 );
-                if (until > frozen.expiresAtMillis()) {
+                // Every client sends keep_alive on every page. Written only when it moves the deadline by
+                // more than a quarter of itself, so a page a second is a write per quarter-lifetime rather
+                // than a write per page; the view is still extended long before it could lapse.
+                final long materially = Math.max(
+                    1L,
+                    Math.min(bodyPit.getKeepAlive().millis(), PointInTimeHandler.MAX_KEEP_ALIVE_MILLIS) / 4
+                );
+                if (until - frozen.expiresAtMillis() > materially) {
                     frozen = new org.opensearch.serverless.metadata.PointInTime(frozen.id(), frozen.index(), until, frozen.shards());
                     metadata.extendPointInTime(frozen);
                 }

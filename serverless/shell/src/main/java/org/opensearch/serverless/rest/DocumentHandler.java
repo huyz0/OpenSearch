@@ -294,8 +294,18 @@ public final class DocumentHandler extends BaseRestHandler {
             .orElse(null);
 
         if (shardId == null || serving.reconciler().readerShards().contains(shardId)) {
-            final var head = metadata.heads().read(writtenIndex, shard);
-            final String owner = head.map(h -> h.ownerNodeId()).orElse(null);
+            // The owner as last seen, if this node has seen it: a head read per write was the largest
+            // fixed cost of a write this node does not serve itself. A hint that is wrong is refused by
+            // the node it names, and the register is read then -- once -- and the write forwarded again.
+            final Optional<String> hinted = serving.ownerHint(writtenIndex, shard);
+            final String owner;
+            if (hinted.isPresent()) {
+                owner = hinted.get();
+            } else {
+                final var head = metadata.heads().read(writtenIndex, shard);
+                serving.noteHead(writtenIndex, shard, head.orElse(null));
+                owner = head.map(h -> h.ownerNodeId()).orElse(null);
+            }
             if (owner != null && owner.equals(serving.localNode().getId())) {
                 // The head names this node and this node has no open shard. That is not a routing
                 // problem, it is the gap inside activation: activateWriter wins the compare-and-swap
@@ -304,6 +314,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 // Forwarding here would send the write to ourselves, and the receiving side would
                 // correctly refuse it -- a 500 for what is a normal, brief, self-resolving state. Say
                 // "not yet" instead, which is a status a client retries.
+                serving.forgetOwner(writtenIndex, shard);
                 return channel -> channel.sendResponse(
                     IndexAdminHandler.error(
                         channel,
@@ -316,6 +327,7 @@ public final class DocumentHandler extends BaseRestHandler {
             if (owner != null) {
                 // Forward rather than refuse. The client should not have to know which node owns which
                 // shard; that is exactly the knowledge the shard-head exists to hold.
+                final boolean fromHint = hinted.isPresent();
                 return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
                     // Accounted on this node for as long as the forward is in flight, exactly as a local
                     // write is: the bytes are held here until the owner answers, whichever node applies them.
@@ -323,47 +335,49 @@ public final class DocumentHandler extends BaseRestHandler {
                         org.opensearch.common.lease.Releasable forwarded = serving.indexingPressure()
                             .markCoordinatingOperationStarted(shapedSource == null ? 0L : shapedSource.length(), false)
                     ) {
-                        final var peer = serving.router().peer(owner);
-                        if (peer.isEmpty()) {
-                            // The head names an owner that holds no live lease. That is precisely a
-                            // dead writer nobody has noticed yet, and this request is the first thing
-                            // in the system to prove it -- so say so rather than waiting for a timer.
-                            serving.signals().ownershipDoubted(writtenIndex, shard);
-                            channel.sendResponse(
-                                IndexAdminHandler.error(
-                                    channel,
-                                    RestStatus.SERVICE_UNAVAILABLE,
-                                    "owner_unreachable",
-                                    "shard " + shard + " is owned by " + owner + ", which has no reachable lease"
-                                )
+                        String forwardTarget = owner;
+                        org.opensearch.serverless.transport.ForwardedIndexResponse ack;
+                        try {
+                            ack = forwardTo(
+                                serving,
+                                forwardTarget,
+                                writtenIndex,
+                                shard,
+                                id,
+                                shapedSource,
+                                refresh,
+                                deletion,
+                                ifSeqNo,
+                                ifPrimaryTerm,
+                                requireAbsent
                             );
-                            return;
+                        } catch (Exception first) {
+                            if (fromHint == false || refusedAsNotOwner(first) == false) {
+                                throw first;
+                            }
+                            // The hint was stale. Read the register once and forward to whoever it names.
+                            serving.forgetOwner(writtenIndex, shard);
+                            final var head = metadata.heads().read(writtenIndex, shard);
+                            serving.noteHead(writtenIndex, shard, head.orElse(null));
+                            final String fresh = head.map(h -> h.ownerNodeId()).orElse(null);
+                            if (fresh == null || fresh.equals(forwardTarget)) {
+                                throw first;
+                            }
+                            forwardTarget = fresh;
+                            ack = forwardTo(
+                                serving,
+                                forwardTarget,
+                                writtenIndex,
+                                shard,
+                                id,
+                                shapedSource,
+                                refresh,
+                                deletion,
+                                ifSeqNo,
+                                ifPrimaryTerm,
+                                requireAbsent
+                            );
                         }
-                        // Filtered here, on the coordinating node, before the write leaves it. The owner
-                        // has no idea who the caller is -- an internal transport request carries no
-                        // identity -- so this is the only node where the question can be asked.
-                        final var ack = gated(
-                            serving,
-                            deletion,
-                            writtenIndex,
-                            id,
-                            shapedSource,
-                            () -> serving.router()
-                                .forwardIndex(
-                                    peer.get(),
-                                    new org.opensearch.serverless.transport.ForwardedIndexRequest(
-                                        writtenIndex,
-                                        shard,
-                                        id,
-                                        shapedSource == null ? "" : shapedSource,
-                                        refresh,
-                                        deletion,
-                                        ifSeqNo,
-                                        ifPrimaryTerm,
-                                        requireAbsent
-                                    )
-                                )
-                        );
                         respond(
                             channel,
                             writtenIndex,
@@ -374,13 +388,21 @@ public final class DocumentHandler extends BaseRestHandler {
                             new ServerlessNode.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
                             refresh
                         );
+                    } catch (OwnerUnreachable unreachable) {
+                        serving.signals().ownershipDoubted(writtenIndex, shard);
+                        try {
+                            channel.sendResponse(
+                                IndexAdminHandler.error(
+                                    channel,
+                                    RestStatus.SERVICE_UNAVAILABLE,
+                                    "owner_unreachable",
+                                    unreachable.getMessage()
+                                )
+                            );
+                        } catch (IOException nested) {
+                            logger.error("failed to report an unreachable owner", nested);
+                        }
                     } catch (Exception e) {
-                        // A lost compare-and-swap is not a routing problem, and must not be dressed as
-                        // one. The owner answered, correctly, that the document had moved on; reporting
-                        // that as a 503 would tell the caller to retry an operation whose whole point is
-                        // that it must not be retried blindly -- and would cast doubt on an ownership
-                        // that was never in question. It arrives wrapped in a transport exception, so it
-                        // has to be unwrapped before it can be recognised.
                         final Throwable conflict = org.opensearch.ExceptionsHelper.unwrap(
                             e,
                             org.opensearch.index.engine.VersionConflictEngineException.class
@@ -400,15 +422,11 @@ public final class DocumentHandler extends BaseRestHandler {
                             }
                             return;
                         }
-                        // The owner was reachable and still refused or failed. Either it lost the shard
-                        // between our read and its receipt, or it is going away. Same conclusion: the
-                        // head we routed on is not to be trusted.
                         serving.signals().ownershipDoubted(writtenIndex, shard);
                         try {
                             // 503, not the exception's own status. A forward that fails means routing was
                             // stale, and stale routing is a retry -- rendering it as a 500 tells a client
                             // the write is hopeless when the correct answer is "ask again in a moment".
-                            // The cause is carried in the message so nothing is hidden by saying so.
                             channel.sendResponse(
                                 IndexAdminHandler.error(
                                     channel,
@@ -568,5 +586,70 @@ public final class DocumentHandler extends BaseRestHandler {
                 );
             }
         }
+    }
+
+    /** The head names an owner that holds no live lease. */
+    private static final class OwnerUnreachable extends Exception {
+        OwnerUnreachable(String message) {
+            super(message);
+        }
+    }
+
+    /** Whether a forward failed because the node it reached does not hold the shard, which is a stale hint. */
+    public static boolean refusedAsNotOwner(Exception e) {
+        Throwable cause = e;
+        while (cause != null) {
+            if (cause.getMessage() != null && cause.getMessage().contains("does not own")) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
+    private org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
+        ServerlessNode serving,
+        String owner,
+        String writtenIndex,
+        int shard,
+        String id,
+        String shapedSource,
+        boolean refresh,
+        boolean deletion,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent
+    ) throws Exception {
+        final var peer = serving.router().peer(owner);
+        if (peer.isEmpty()) {
+            // The head names an owner that holds no live lease. That is precisely a dead writer nobody
+            // has noticed yet, and this request is the first thing in the system to prove it.
+            throw new OwnerUnreachable("shard " + shard + " is owned by " + owner + ", which has no reachable lease");
+        }
+        // Filtered here, on the coordinating node, before the write leaves it. The owner has no idea who
+        // the caller is -- an internal transport request carries no identity -- so this is the only node
+        // where the question can be asked.
+        return gated(
+            serving,
+            deletion,
+            writtenIndex,
+            id,
+            shapedSource,
+            () -> serving.router()
+                .forwardIndex(
+                    peer.get(),
+                    new org.opensearch.serverless.transport.ForwardedIndexRequest(
+                        writtenIndex,
+                        shard,
+                        id,
+                        shapedSource == null ? "" : shapedSource,
+                        refresh,
+                        deletion,
+                        ifSeqNo,
+                        ifPrimaryTerm,
+                        requireAbsent
+                    )
+                )
+        );
     }
 }

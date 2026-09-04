@@ -1237,6 +1237,72 @@ public final class ServerlessNode implements Closeable {
 
     private final java.util.Map<String, long[]> appliedDescriptorVersions = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** A head as last read, with when: the heartbeat's reads, reused by the same pass rather than repeated. */
+    private record SeenHead(org.opensearch.serverless.metadata.ShardHead head, long atMillis) {
+    }
+
+    private final java.util.Map<String, SeenHead> recentHeads = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Records a head this node has just read, for the other readers in the same pass and for routing.
+     *
+     * <p>The heartbeat, the hint rebuild and the publish each read the same register within a second of
+     * each other; a write to a shard this node does not hold read it again to learn the owner. One read
+     * feeds all of them now. A hint is a hint: every user of it survives its being wrong, because the
+     * owner refuses what it does not hold and the caller then reads the register.
+     *
+     * @param index the index
+     * @param shard the shard
+     * @param head what was read, or null if there was no head
+     */
+    public void noteHead(String index, int shard, org.opensearch.serverless.metadata.ShardHead head) {
+        final long now = metadataPlane == null ? System.currentTimeMillis() : metadataPlane.clock().getAsLong();
+        if (head == null) {
+            recentHeads.remove(index + "#" + shard);
+        } else {
+            recentHeads.put(index + "#" + shard, new SeenHead(head, now));
+        }
+    }
+
+    /**
+     * Returns a head read within the given age, if this node has one.
+     *
+     * @param index the index
+     * @param shard the shard
+     * @param maxAgeMillis how old the read may be
+     * @return the head, or empty if none that young was read
+     */
+    public java.util.Optional<org.opensearch.serverless.metadata.ShardHead> recentHead(String index, int shard, long maxAgeMillis) {
+        final SeenHead seen = recentHeads.get(index + "#" + shard);
+        if (seen == null) {
+            return java.util.Optional.empty();
+        }
+        final long now = metadataPlane == null ? System.currentTimeMillis() : metadataPlane.clock().getAsLong();
+        return now - seen.atMillis() <= maxAgeMillis ? java.util.Optional.of(seen.head()) : java.util.Optional.empty();
+    }
+
+    /**
+     * Returns the node last seen owning a shard, whatever the age of that sighting.
+     *
+     * @param index the index
+     * @param shard the shard
+     * @return the owner's node id, or empty if no head has been read here
+     */
+    public java.util.Optional<String> ownerHint(String index, int shard) {
+        final SeenHead seen = recentHeads.get(index + "#" + shard);
+        return seen == null ? java.util.Optional.empty() : java.util.Optional.ofNullable(seen.head().ownerNodeId());
+    }
+
+    /**
+     * Forgets a hint an owner has just refused.
+     *
+     * @param index the index
+     * @param shard the shard
+     */
+    public void forgetOwner(String index, int shard) {
+        recentHeads.remove(index + "#" + shard);
+    }
+
     /**
      * Applies mapping and settings changes made elsewhere to the shards this node holds open.
      *
@@ -1613,6 +1679,7 @@ public final class ServerlessNode implements Closeable {
             // us -- but it is a read, not a write, and that is the whole saving. This used to have an
             // else-branch that renewed each head individually; that mode is gone.
             final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+            noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
             final boolean ours = head.isPresent() && localNode.getId().equals(head.get().ownerNodeId())
             // This incarnation's, not a previous one's under the same node id.
                 && (head.get().ownerEphemeralId() == null || localNode.getEphemeralId().equals(head.get().ownerEphemeralId()))

@@ -268,7 +268,9 @@ indexing pressure, the search coordinator's working set is bounded and inside th
 bodies name a blob rather than a path. A second pass turned the last hot-path listings into reads: membership
 is a `members` register maintained only on join and leave, the WAL is truncated from the writer's own
 ordinals, a sweep runs only when a manifest lost a file, and the manifest records every file's length so a
-reader opens without listing.
+reader opens without listing. Register reads followed: one head read per shard per pass shared by the
+heartbeat, the hints and the publish; writes and gets route by the owner last seen and read the head only
+when that node refuses; a publish swaps over the generation it remembers.
 
 ## What is deliberately refused
 

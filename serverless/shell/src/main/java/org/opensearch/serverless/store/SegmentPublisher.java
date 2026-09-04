@@ -50,6 +50,10 @@ public final class SegmentPublisher {
     private final BlobPath shardBase;
     private final BlobContainer container;
 
+    /** This instance's own last publish: the register need not be read to swap over what this wrote. */
+    private volatile long lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
+    private volatile CommitManifest lastPublished;
+
     /**
      * Creates a publisher for one shard.
      *
@@ -107,8 +111,20 @@ public final class SegmentPublisher {
      *     this one
      */
     public CommitManifest publish(Store store, long term, String writerId) throws IOException {
-        final Optional<BlobRegister> existingRegister = container.readRegister(MANIFEST);
-        final CommitManifest existing = existingRegister.isPresent() ? parse(existingRegister.get()) : null;
+        // What this instance published last, if it has: the swap below is conditioned on that generation,
+        // and a swap that fails re-reads. Reading before every publish was one register read per publish
+        // per shard, paid to learn what this writer already knew.
+        final CommitManifest remembered = lastPublished;
+        final long rememberedGeneration = lastPublishedGeneration;
+        final Optional<BlobRegister> existingRegister;
+        final CommitManifest existing;
+        if (remembered != null && rememberedGeneration != BlobRegister.ABSENT_GENERATION) {
+            existingRegister = Optional.empty();
+            existing = remembered;
+        } else {
+            existingRegister = container.readRegister(MANIFEST);
+            existing = existingRegister.isPresent() ? parse(existingRegister.get()) : null;
+        }
         if (existing != null && existing.term() > term) {
             // A zombie: paused past its lease, someone else took the shard and published. Its bytes are
             // already inert because of the term prefix; this stops it from claiming they are current.
@@ -163,8 +179,22 @@ public final class SegmentPublisher {
         }
 
         final CommitManifest manifest = new CommitManifest(term, published, writerId, lengths);
-        final long expected = existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+        final long expected = remembered != null && rememberedGeneration != BlobRegister.ABSENT_GENERATION
+            ? rememberedGeneration
+            : existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, manifest.toBytes());
+        if (result.applied()) {
+            lastPublishedGeneration = result.currentGeneration();
+            lastPublished = manifest;
+        } else {
+            lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
+            lastPublished = null;
+        }
+        if (result.applied() == false && remembered != null) {
+            // The register moved under what this instance remembered -- a repair, a restore, a manifest
+            // rewritten by hand. Once, the way every publish used to begin: read it and publish over it.
+            return publish(store, term, writerId);
+        }
         if (result.applied() == false) {
             // Who moved it. A newer term is the fence this exception exists for. The same term and the
             // same writer is this node's own concurrent publish -- two of them used to race here, the loser

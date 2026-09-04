@@ -154,6 +154,29 @@ the write that maintains it already exists.
 and publish cost no listing, every published file's length is in the manifest, and a reader opened on
 it lists nothing.
 
+## Register reads, after the listings
+
+The same trace over every `readRegister` and compare-and-swap. No swap ran in an unbounded loop; the
+excess was in reads repeated for what a node already knew.
+
+- **One head read per shard per pass.** The heartbeat, the hint rebuild and the publish each read the
+  same head register within a second. The heartbeat's read is noted on the node and the other two use it
+  while it is younger than one renewal; a head read anywhere on a request path is noted the same way.
+- **Writes route by hint.** A write this node does not serve used to read the head to learn the owner.
+  It now forwards to the owner last seen; a node that no longer holds the shard refuses, the register is
+  read once, and the write is forwarded to whoever it names. The same for a forwarded get. A local
+  writer shard is written without a head read: the lease is what fences it.
+- **A get reads its descriptor once.** The handler's read is handed to the placement rather than
+  repeated.
+- **Keep-alive extends when it matters.** Every client sends `keep_alive` on every page of a point in
+  time; the record is rewritten only when the new deadline is more than a quarter of the keep-alive
+  later than the current one.
+- **A publish swaps over what it remembers.** The publisher keeps the generation of its own last
+  publish and swaps against it without reading first; a swap that fails over a remembered generation
+  reads once and publishes again, which is what every publish used to begin with.
+
+The busy-pass test also bounds register reads: at most four per pass on a node with one shard.
+
 ## What was verified
 
 Every test class the fixes touch was run as it was changed; the whole `:serverless:testkit:test` task was

@@ -68,6 +68,8 @@ public final class ShardReconciler {
     private volatile java.util.function.Function<ShardId, SegmentPublisher> publishers;
     private volatile java.util.function.Function<ShardId, org.opensearch.serverless.store.WalStore> walStores;
     private final Map<ShardId, org.opensearch.serverless.store.WalStore> walCache = new ConcurrentHashMap<>();
+    /** One publisher per open shard, so it can remember the generation of its own last publish. */
+    private final Map<ShardId, SegmentPublisher> publisherCache = new ConcurrentHashMap<>();
 
     /**
      * Creates a reconciler for one node.
@@ -147,7 +149,7 @@ public final class ShardReconciler {
         shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
         // Named, so a manifest says who wrote it. A term is not an identity: the publish fence refuses a
         // newer term and cannot tell two nodes holding the same one apart.
-        final CommitManifest manifest = publishers.apply(shardId).publish(shard.store(), term, localNode.getId());
+        final CommitManifest manifest = publisherCache.computeIfAbsent(shardId, publishers).publish(shard.store(), term, localNode.getId());
         final var walForPublish = wal(shardId);
         if (walForPublish != null) {
             // Only after the commit is durable in the object store. Truncation drops what the previous
@@ -658,6 +660,7 @@ public final class ShardReconciler {
         readers.remove(shardId);
         readerCommits.remove(shardId);
         walCache.remove(shardId);
+        publisherCache.remove(shardId);
         lastUsed.remove(shardId);
         final IndexShard shard = open.remove(shardId);
         if (shard == null) {

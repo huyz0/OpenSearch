@@ -49,10 +49,29 @@ public final class RoutingHints {
      * @throws IOException if the heads cannot be read
      */
     public int refresh(MetadataPlane plane, Map<String, Integer> shardCounts, long nowMillis) throws IOException {
+        return refresh((index, shard) -> plane.heads().read(index, shard), shardCounts, nowMillis);
+    }
+
+    /** Where a head comes from: the register, or a copy read moments ago by the same pass. */
+    @FunctionalInterface
+    public interface HeadLookup {
+        Optional<ShardHead> read(String index, int shard) throws IOException;
+    }
+
+    /**
+     * Rebuilds the hints from the given source of heads.
+     *
+     * @param heads where to read each head
+     * @param shardCounts index name to shard count
+     * @param nowMillis the clock
+     * @return how many hints were rebuilt
+     * @throws IOException if a head cannot be read
+     */
+    public int refresh(HeadLookup heads, Map<String, Integer> shardCounts, long nowMillis) throws IOException {
         final Map<String, String> rebuilt = new LinkedHashMap<>();
         for (Map.Entry<String, Integer> index : shardCounts.entrySet()) {
             for (int shard = 0; shard < index.getValue(); shard++) {
-                final Optional<ShardHead> head = plane.heads().read(index.getKey(), shard);
+                final Optional<ShardHead> head = heads.read(index.getKey(), shard);
                 if (head.isPresent() && head.get().ownerNodeId() != null) {
                     rebuilt.put(key(index.getKey(), shard), head.get().ownerNodeId());
                 }

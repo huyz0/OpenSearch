@@ -168,7 +168,7 @@ public final class GetHandler extends BaseRestHandler {
         final ServerlessNode serving = node.get();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GET).execute(() -> {
             try {
-                answer(channel, serving, metadata, index, id, shard, bodyless, fetchSource, sourceOnly);
+                answer(channel, serving, metadata, descriptor.get(), id, shard, bodyless, fetchSource, sourceOnly);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -183,14 +183,17 @@ public final class GetHandler extends BaseRestHandler {
         org.opensearch.rest.RestChannel channel,
         ServerlessNode serving,
         MetadataPlane metadata,
-        String index,
+        IndexDescriptor descriptor,
         String id,
         int shard,
         boolean bodyless,
         org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource,
         boolean sourceOnly
     ) throws Exception {
+        final String index = descriptor.name();
         final var operations = new org.opensearch.serverless.shard.ShardOperations(serving, metadata);
+        // Read once, above, for the shard number; not again for the placement.
+        operations.assumeDescribed(descriptor);
         try {
             final var read = operations.get(index, id);
             respond(channel, index, shard, read.document(), read.servedBy(), read.realtime(), bodyless, fetchSource, sourceOnly);

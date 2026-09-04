@@ -13,9 +13,11 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
 
 import java.io.Closeable;
+import java.io.IOException;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -964,7 +966,9 @@ public final class BackgroundReconciler implements Closeable {
                 // guard stays on the edge path too: a spurious mark must not become an upload.
                 continue;
             }
-            final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+            // The heartbeat read this head a moment ago; the manifest's own compare-and-swap is the fence
+            // that matters, so a head up to one renewal old is as good here as a fresh read.
+            final var head = recentOrReadHead(shardId);
             if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
                 continue;
             }
@@ -1013,8 +1017,27 @@ public final class BackgroundReconciler implements Closeable {
         for (Map.Entry<String, Integer> target : wanted) {
             shardCounts.merge(target.getKey(), target.getValue() + 1, Math::max);
         }
-        hints.refresh(plane, shardCounts, nowMillis);
+        hints.refresh(
+            (index, shard) -> recentOrReadHead(new ShardId(new org.opensearch.core.index.Index(index, "_na_"), shard)),
+            shardCounts,
+            nowMillis
+        );
         return hints.size();
+    }
+
+    /** A head the heartbeat read within one renewal, or a fresh read that is then noted for the others. */
+    private Optional<org.opensearch.serverless.metadata.ShardHead> recentOrReadHead(ShardId shardId) throws IOException {
+        final Optional<org.opensearch.serverless.metadata.ShardHead> recent = node.recentHead(
+            shardId.getIndexName(),
+            shardId.id(),
+            Math.max(1_000L, plane.leaseTtlMillis() / ReconcileScheduler.RENEWALS_PER_TTL)
+        );
+        if (recent.isPresent()) {
+            return recent;
+        }
+        final Optional<org.opensearch.serverless.metadata.ShardHead> read = plane.heads().read(shardId.getIndexName(), shardId.id());
+        node.noteHead(shardId.getIndexName(), shardId.id(), read.orElse(null));
+        return read;
     }
 
     /**

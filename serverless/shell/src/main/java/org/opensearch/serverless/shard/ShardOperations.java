@@ -74,7 +74,48 @@ public final class ShardOperations {
     }
 
     private Optional<String> ownerOnce(String index, int shard) throws IOException {
-        return once(owners, index + "#" + shard, () -> plane.heads().read(index, shard).map(head -> head.ownerNodeId()));
+        // The owner as this node last saw it, before the register: a wrong hint is refused by the node it
+        // names and corrected by one read then, see freshOwner.
+        return once(owners, index + "#" + shard, () -> {
+            final Optional<String> hinted = node.ownerHint(index, shard);
+            if (hinted.isPresent()) {
+                return hinted;
+            }
+            return freshOwner(index, shard);
+        });
+    }
+
+    /** Reads the head and notes it for the node. Called from inside the cache's compute, so it does not touch the cache. */
+    private Optional<String> freshOwner(String index, int shard) throws IOException {
+        final var head = plane.heads().read(index, shard);
+        node.noteHead(index, shard, head.orElse(null));
+        return head.map(h -> h.ownerNodeId());
+    }
+
+    /**
+     * Seeds this instance with a descriptor the caller has already read, so it is not read again.
+     *
+     * @param descriptor the descriptor
+     */
+    public void assumeDescribed(IndexDescriptor descriptor) {
+        described.put(descriptor.name(), Optional.of(descriptor));
+    }
+
+    /**
+     * After a forward was refused as "not the owner": forgets the hint, reads the register once, and
+     * returns a placement for the node it names -- or empty if it names the same node or nobody.
+     */
+    private Optional<Placement> replaceStaleOwner(String index, String id, Placement stale, Exception refusal) throws IOException {
+        if (org.opensearch.serverless.rest.DocumentHandler.refusedAsNotOwner(refusal) == false) {
+            return Optional.empty();
+        }
+        node.forgetOwner(index, stale.shard());
+        final Optional<String> fresh = freshOwner(index, stale.shard());
+        owners.put(index + "#" + stale.shard(), fresh);
+        if (fresh.isEmpty() || fresh.get().equals(stale.owner()) || fresh.get().equals(node.localNode().getId())) {
+            return Optional.empty();
+        }
+        return Optional.of(new Placement(null, stale.shard(), fresh.get()));
     }
 
     private static <T> T once(
@@ -485,6 +526,15 @@ public final class ShardOperations {
         } catch (NotHereException e) {
             throw e;
         } catch (Exception e) {
+            final Optional<Placement> corrected = replaceStaleOwner(index, id, placement, e);
+            if (corrected.isPresent()) {
+                final var peer = node.router().peer(corrected.get().owner());
+                if (peer.isPresent()) {
+                    final var response = node.router()
+                        .forwardGet(peer.get(), new org.opensearch.serverless.transport.ForwardedGetRequest(index, placement.shard(), id));
+                    return new Read(response.document(), response.ownerNodeId(), true);
+                }
+            }
             node.signals().ownershipDoubted(index, placement.shard());
             // Carrying the cause, because the message on its own is often a single word. A TLS handshake
             // that fails arrives here as "connect_exception" and nothing else, which says a connection did
@@ -1565,6 +1615,11 @@ public final class ShardOperations {
             );
             if (conflict != null) {
                 throw (org.opensearch.index.engine.VersionConflictEngineException) conflict;
+            }
+            // A hint the owner refused: one register read, and one more forward to whoever it names.
+            final Optional<Placement> corrected = replaceStaleOwner(index, id, placement, e);
+            if (corrected.isPresent()) {
+                return forwardWritten(index, id, source, refresh, deletion, corrected.get(), ifSeqNo, ifPrimaryTerm, requireAbsent);
             }
             // Stale routing is a retry, not a failure of the write itself.
             node.signals().ownershipDoubted(index, placement.shard());

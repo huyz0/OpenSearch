@@ -481,6 +481,14 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
                 loop.tick(clock.get());
             }
             assertEquals("busy passes must not list: " + counter.listings() + " of them, " + counter.breakdown(), 0, counter.listings());
+            // And a bounded number of register reads: the head once per shard per pass (the heartbeat's
+            // read, reused by the hint rebuild and the publish), the descriptor once per index, the
+            // scripts marker once. The publish swaps over the generation it remembers rather than
+            // reading first.
+            assertTrue(
+                "a busy pass reads a handful of registers, not a dozen: " + counter.breakdown(),
+                counter.registerReads() <= passes * 4
+            );
 
             final var manifest = d.plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
             assertEquals("every published file's length is in the manifest", manifest.files().keySet(), manifest.lengths().keySet());
