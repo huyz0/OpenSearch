@@ -170,7 +170,11 @@ public final class BackgroundReconciler implements Closeable {
         // told that a feature nobody used is still not being used. A keep-alive is minutes; this is
         // seconds times a small number, which is soon enough and is a fraction of the cost.
         if (passes++ % REAP_EVERY_PASSES == 0) {
-            reapExpiredViews();
+            if (reapExpiredViews() > 0) {
+                // Files a reaped view was holding are deletable now, and nothing else would notice until
+                // the shard next lost a file of its own.
+                forceSweepOfOpenWriters();
+            }
         }
         // One small register read: the stored scripts are re-read only when their marker has moved, which
         // is how a script put on another node reaches this one without a listing per pass.
@@ -248,6 +252,52 @@ public final class BackgroundReconciler implements Closeable {
     /** Per shard, how many consecutive sweeps have found each blob unreferenced. */
     private final Map<ShardId, Map<String, Integer>> unreferencedFor = new ConcurrentHashMap<>();
 
+    /** The manifest each shard last published from this node, for the sweep's gate. */
+    private final Map<ShardId, org.opensearch.serverless.store.CommitManifest> lastManifests = new ConcurrentHashMap<>();
+
+    /** Per shard, the files of the manifest the last sweep ran against. */
+    private final Map<ShardId, Set<String>> sweptAgainst = new ConcurrentHashMap<>();
+
+    /** Shards whose next sweep must run whatever their manifest says. */
+    private final Set<ShardId> forceSweep = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private void forceSweepOfOpenWriters() {
+        for (ShardId shardId : node.reconciler().openShards()) {
+            if (node.reconciler().readerShards().contains(shardId) == false) {
+                forceSweep.add(shardId);
+                pendingSweeps.add(shardId);
+            }
+        }
+    }
+
+    /**
+     * Decides whether a sweep of a shard can find anything a previous sweep did not.
+     *
+     * <p>A file becomes unreferenced when a manifest stops naming it -- a merge or a delete -- and at no
+     * other moment this node can see. So a shard is swept when its newest manifest lacks a file the
+     * last sweep's manifest had, when it has candidates on watch for the grace period, when a reaped
+     * view may have freed something, or when this node has never swept it since opening it. A publish
+     * that only added segments, which is most of them, costs no listing.
+     */
+    private boolean sweepCanFindSomething(ShardId shardId) {
+        if (forceSweep.remove(shardId) || unreferencedFor.containsKey(shardId)) {
+            return true;
+        }
+        final Set<String> previous = sweptAgainst.get(shardId);
+        final org.opensearch.serverless.store.CommitManifest current = lastManifests.get(shardId);
+        if (previous == null || current == null) {
+            return true;
+        }
+        for (String file : previous) {
+            // Every commit replaces its segments_N file, so that one loss says nothing about a merge;
+            // the tiny orphan it leaves is collected with the next real one.
+            if (file.startsWith("segments_") == false && current.files().containsKey(file) == false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Sets how many sweeps a blob must be seen unreferenced by before it is deleted.
      *
@@ -285,10 +335,15 @@ public final class BackgroundReconciler implements Closeable {
             return deleted;
         }
         final GarbageCollector collector = new GarbageCollector(plane.blobStore(), plane.basePath());
-        final Set<ShardId> toSweep = new LinkedHashSet<>(published);
+        final Set<ShardId> toSweep = new LinkedHashSet<>();
+        for (ShardId shardId : published) {
+            if (sweepCanFindSomething(shardId)) {
+                toSweep.add(shardId);
+            }
+        }
         toSweep.addAll(unreferencedFor.keySet());
         if (toSweep.isEmpty()) {
-            // Nothing published and nothing on watch: an idle pass costs no listing at all.
+            // Nothing published that lost a file, and nothing on watch: this pass costs no listing at all.
             return deleted;
         }
         // The views and snapshots every shard's sweep checks against, read once per pass rather than once
@@ -308,6 +363,8 @@ public final class BackgroundReconciler implements Closeable {
                 // Not ours to sweep any more. Forgetting what we had seen is the safe direction: the next
                 // owner starts again from nothing and simply deletes later than it could have.
                 unreferencedFor.remove(shardId);
+                sweptAgainst.remove(shardId);
+                lastManifests.remove(shardId);
                 continue;
             }
             final Map<String, Integer> seen = unreferencedFor.getOrDefault(shardId, Map.of());
@@ -325,6 +382,10 @@ public final class BackgroundReconciler implements Closeable {
             }
             try {
                 final var swept = collector.sweepShard(plane, shardId.getIndexName(), shardId.id(), eligible, views, snapshots);
+                final var manifest = lastManifests.get(shardId);
+                if (manifest != null) {
+                    sweptAgainst.put(shardId, Set.copyOf(manifest.files().keySet()));
+                }
                 deleted.addAll(swept.deleted());
                 final Map<String, Integer> next = new java.util.HashMap<>();
                 for (String candidate : swept.candidates()) {
@@ -909,7 +970,7 @@ public final class BackgroundReconciler implements Closeable {
             }
             try {
                 synchronized (publishLock(shardId)) {
-                    node.publishShard(shardId, head.get().term());
+                    lastManifests.put(shardId, node.publishShard(shardId, head.get().term()));
                 }
             } catch (org.opensearch.serverless.store.StaleWriterException e) {
                 // A newer term has already published. This node is a zombie for this shard: it read a

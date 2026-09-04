@@ -438,6 +438,60 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
     }
 
     /**
+     * A busy pass does not list either.
+     *
+     * <p>A pass that publishes used to list the shard's WAL container to decide what to truncate, list the
+     * WAL root for older terms, list every dead term container to sweep, and list every point in time
+     * and every snapshot to guard the sweep -- per dirty shard, per pass, on a shard whose publish had
+     * only added segments. Now the writer knows its own ordinals, older terms are dropped once per term,
+     * and a sweep runs only when a manifest lost a file. The one listing left is the first sweep after
+     * the shard was opened, which is what a new owner owes its predecessor's leftovers.
+     *
+     * <p>And a reader opened on what was published lists nothing: the manifest carries every length.
+     */
+    public void testABusyPassDoesNotListEither() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Deployment d = deploy(createTempDir(), clock, true);
+        final CountingBlobStore counter = (CountingBlobStore) d.store;
+        d.plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode a = new ServerlessNode(nodeSettings("p8-busy"));
+            ServerlessNode b = new ServerlessNode(nodeSettings("p8-busy-r"))
+        ) {
+            a.start();
+            b.start();
+            final BackgroundReconciler loop = new BackgroundReconciler(a, d.plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            final var shardId = a.reconciler().openShards().iterator().next();
+            // The first publish and the first sweep, paid once: the WAL root for older terms and the
+            // shard's containers for a predecessor's orphans.
+            a.index(shardId, "warm", "{\"msg\":\"warm\",\"n\":0}");
+            clock.set(clock.get() + 1_000L);
+            loop.tick(clock.get());
+
+            counter.reset();
+            // Five, not ten: few enough segments that no merge runs, since a merge is exactly what a
+            // sweep may list for, and few enough passes that the tenth-pass reap does not fall inside.
+            final int passes = 5;
+            for (int i = 0; i < passes; i++) {
+                a.index(shardId, "doc-" + i, "{\"msg\":\"busy\",\"n\":" + i + "}");
+                clock.set(clock.get() + 1_000L);
+                loop.tick(clock.get());
+            }
+            assertEquals("busy passes must not list: " + counter.listings() + " of them, " + counter.breakdown(), 0, counter.listings());
+
+            final var manifest = d.plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
+            assertEquals("every published file's length is in the manifest", manifest.files().keySet(), manifest.lengths().keySet());
+
+            counter.reset();
+            b.serveAsReader(d.plane, "alpha", 0);
+            assertEquals("opening a reader must not list: " + counter.breakdown(), 0, counter.listings());
+        }
+    }
+
+    /**
      * §10.3 builds gossip only if polling turns out to be insufficient, measured rather than assumed.
      * This produces the number that decision needs: object-store operations per reconciliation pass.
      */

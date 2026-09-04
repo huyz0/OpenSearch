@@ -120,6 +120,40 @@ numbered.
 - **A stored script that does not exist costs one register read (M17, cost).** A miss checks the marker
   rather than re-listing the store, and an unsupported language is refused at `PUT` instead of stored.
 
+## Listings, after the review: a read where a listing was
+
+A second pass over every `listBlobs`, `listBlobsByPrefix` and `children()` call in the shell, traced to
+its caller and cadence, found the idle pass clean and four hot paths listing for nothing. Each is now a
+read, or nothing, and the rule for every one of them was the same: an index is worth keeping only where
+the write that maintains it already exists.
+
+- **Membership is a register, not a listing.** A `members` register beside the leases names every node.
+  A node adds itself once, on its first renewal, and removes itself on a clean release; a refresh that
+  finds a listed node with no lease prunes it. No per-pass write touches it, so the steady state gains
+  no writes -- one compare-and-swap per join and per clean leave. A refresh is now one register read
+  and one read per member; a deployment from before the index is listed once and the index written from
+  that listing. Requests refresh only when the snapshot is older than half a lease, off the HTTP thread,
+  and one read of the index's generation between times is what makes a join visible to the very next
+  request rather than after the snapshot ages out. A search used to list on every request.
+- **The WAL is truncated from memory.** Within a term there is one writer, and it seeded its ordinal from
+  the container, so it knows which records exist without listing them; older terms are emptied once per
+  term per instance rather than on every publish. Two to three listings per dirty shard per pass are
+  gone.
+- **A sweep runs when it can find something.** A file becomes unreferenced only when a manifest stops
+  naming it, so a shard is swept when its newest manifest lost a file other than its `segments_N`, when
+  it has candidates on watch, when a reaped view may have freed something, or when this node has never
+  swept it since opening it. The views and snapshots every sweep must respect are read only when some
+  shard qualifies. A publish that only added segments, which is most of them, lists nothing.
+- **The manifest records every file's length.** The publisher knows each length as it uploads, so
+  recording them costs nothing beyond the register write the manifest already is; a reader lists a term
+  container only for a file whose length no manifest recorded, which is a manifest from before this. A
+  frozen view carries the lengths too. Readers reopen on every superseded commit, so this was one
+  listing per term container per publish cycle per shard served.
+
+`ServerlessReconcileTests.testABusyPassDoesNotListEither` pins the result: five passes that each write
+and publish cost no listing, every published file's length is in the manifest, and a reader opened on
+it lists nothing.
+
 ## What was verified
 
 Every test class the fixes touch was run as it was changed; the whole `:serverless:testkit:test` task was

@@ -265,7 +265,10 @@ write is acknowledged only if the lease was valid on both sides of the append, t
 whole surface, no thread pool waits on itself, mapping and settings changes reach every node, `_bulk` grows
 a mapping, `_delete_by_query` is conditional with `version_conflicts` and `conflicts=`, every write is under
 indexing pressure, the search coordinator's working set is bounded and inside the breakers, and error
-bodies name a blob rather than a path.
+bodies name a blob rather than a path. A second pass turned the last hot-path listings into reads: membership
+is a `members` register maintained only on join and leave, the WAL is truncated from the writer's own
+ordinals, a sweep runs only when a manifest lost a file, and the manifest records every file's length so a
+reader opens without listing.
 
 ## What is deliberately refused
 

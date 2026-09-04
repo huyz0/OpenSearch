@@ -37,6 +37,7 @@ public final class CommitManifest {
     private final long term;
     private final Map<String, String> files;
     private final String writer;
+    private final Map<String, Long> lengths;
 
     /**
      * Creates a manifest whose writer is not recorded.
@@ -56,9 +57,47 @@ public final class CommitManifest {
      * @param writer the node that published it, or null if unrecorded
      */
     public CommitManifest(long term, Map<String, String> files, String writer) {
+        this(term, files, writer, Map.of());
+    }
+
+    /**
+     * Creates a manifest that also records how long each file is.
+     *
+     * <p>The lengths are the index that replaces a listing: a reader needs every file's length before
+     * Lucene will read a byte, and without them it listed each term container on every open. The
+     * publisher knows each length as it uploads, so recording them costs nothing beyond the register
+     * write the manifest already is. Optional in the format: a manifest without them reads as before,
+     * and a reader lists only for what it cannot find here.
+     *
+     * @param term the writer's term
+     * @param files file name to the term container holding it
+     * @param writer the writer's node id, or null
+     * @param lengths file name to length, for whichever files are known
+     */
+    public CommitManifest(long term, Map<String, String> files, String writer, Map<String, Long> lengths) {
         this.term = term;
         this.files = Map.copyOf(files);
         this.writer = writer;
+        this.lengths = Map.copyOf(lengths);
+    }
+
+    /**
+     * Returns the recorded lengths, which may cover fewer files than {@link #files()}.
+     *
+     * @return file name to length
+     */
+    public Map<String, Long> lengths() {
+        return lengths;
+    }
+
+    /**
+     * Returns one file's length if recorded.
+     *
+     * @param fileName the file
+     * @return the length, or null if this manifest does not record it
+     */
+    public Long lengthOf(String fileName) {
+        return lengths.get(fileName);
     }
 
     /**
@@ -115,6 +154,13 @@ public final class CommitManifest {
                 builder.field(e.getKey(), e.getValue());
             }
             builder.endObject();
+            if (lengths.isEmpty() == false) {
+                builder.startObject("lengths");
+                for (Map.Entry<String, Long> e : lengths.entrySet()) {
+                    builder.field(e.getKey(), e.getValue());
+                }
+                builder.endObject();
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -135,11 +181,22 @@ public final class CommitManifest {
             long term = -1;
             String writer = null;
             final Map<String, String> files = new LinkedHashMap<>();
+            final Map<String, Long> lengths = new LinkedHashMap<>();
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
                 if (token == XContentParser.Token.FIELD_NAME) {
                     field = parser.currentName();
+                } else if (token == XContentParser.Token.START_OBJECT && "lengths".equals(field)) {
+                    String fileName = null;
+                    XContentParser.Token inner;
+                    while ((inner = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                        if (inner == XContentParser.Token.FIELD_NAME) {
+                            fileName = parser.currentName();
+                        } else if (inner.isValue() && fileName != null) {
+                            lengths.put(fileName, parser.longValue());
+                        }
+                    }
                 } else if (token == XContentParser.Token.START_OBJECT && "files".equals(field)) {
                     String fileName = null;
                     XContentParser.Token inner;
@@ -159,7 +216,7 @@ public final class CommitManifest {
             if (term < 0) {
                 throw new IOException("malformed commit manifest: no term");
             }
-            return new CommitManifest(term, files, writer);
+            return new CommitManifest(term, files, writer, lengths);
         }
     }
 
@@ -183,6 +240,12 @@ public final class CommitManifest {
             read.put(in.readString(), in.readString());
         }
         this.files = Map.copyOf(read);
+        final int known = in.readVInt();
+        final Map<String, Long> readLengths = new LinkedHashMap<>(known);
+        for (int i = 0; i < known; i++) {
+            readLengths.put(in.readString(), in.readVLong());
+        }
+        this.lengths = Map.copyOf(readLengths);
     }
 
     /**
@@ -198,6 +261,11 @@ public final class CommitManifest {
         for (Map.Entry<String, String> file : files.entrySet()) {
             out.writeString(file.getKey());
             out.writeString(file.getValue());
+        }
+        out.writeVInt(lengths.size());
+        for (Map.Entry<String, Long> length : lengths.entrySet()) {
+            out.writeString(length.getKey());
+            out.writeVLong(length.getValue());
         }
     }
 

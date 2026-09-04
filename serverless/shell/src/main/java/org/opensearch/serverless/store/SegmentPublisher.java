@@ -128,6 +128,7 @@ public final class SegmentPublisher {
         }
 
         final Map<String, String> published = new LinkedHashMap<>();
+        final Map<String, Long> lengths = new LinkedHashMap<>();
         final Map<String, String> inherited = existing == null ? Map.of() : existing.files();
         final Directory directory = store.directory();
 
@@ -139,6 +140,10 @@ public final class SegmentPublisher {
                     // Segment files are immutable once written; a name that is already published has the
                     // same bytes. Re-uploading would make failover cost the size of the shard.
                     published.put(fileName, alreadyAt);
+                    final Long knownLength = existing.lengthOf(fileName);
+                    if (knownLength != null) {
+                        lengths.put(fileName, knownLength);
+                    }
                     continue;
                 }
                 final String termDir = termSegment(term);
@@ -147,6 +152,7 @@ public final class SegmentPublisher {
                     try (InputStream stream = new IndexInputStream(input, length)) {
                         blobStore.blobContainer(shardBase.add(termDir)).writeBlob(fileName, stream, length, false);
                     }
+                    lengths.put(fileName, length);
                 }
                 // The manifest records which term's container a file lives in, not a full path, so a
                 // failover can inherit files without moving them.
@@ -156,7 +162,7 @@ public final class SegmentPublisher {
             store.decRef();
         }
 
-        final CommitManifest manifest = new CommitManifest(term, published, writerId);
+        final CommitManifest manifest = new CommitManifest(term, published, writerId, lengths);
         final long expected = existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, manifest.toBytes());
         if (result.applied() == false) {

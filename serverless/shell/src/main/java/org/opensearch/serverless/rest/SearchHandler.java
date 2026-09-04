@@ -383,18 +383,18 @@ public final class SearchHandler extends BaseRestHandler {
             return channel -> channel.sendResponse(IndexAdminHandler.error(channel, resolved.status(), resolved.type(), resolved.reason()));
         }
 
-        // Membership is the address book and the placement input, so refresh once per search rather
-        // than per shard.
-        try {
-            metadata.membership().refresh();
-        } catch (Exception e) {
-            logger.warn("could not refresh membership before searching", e);
-        }
-
         // Off the HTTP thread. executeQueryPhase hands work to the search pool and this waits for it;
         // waiting on the transport thread that is meant to be reading the next request resets the
         // connection, which surfaces to the client as RST_STREAM rather than as anything diagnosable.
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+            // Membership is the address book and the placement input. Refreshed when the snapshot is
+            // older than a fraction of a lease, off the HTTP thread: refreshing on every search was one
+            // listing and a read per node per search, on the thread that should be reading the next one.
+            try {
+                metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
+            } catch (Exception e) {
+                logger.warn("could not refresh membership before searching", e);
+            }
             try {
                 respond(
                     channel,

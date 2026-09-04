@@ -345,7 +345,9 @@ public final class ShardRouter {
             .stream()
             .filter(l -> nodeId.equals(l.nodeId()))
             .findFirst();
-        if (lease.isEmpty()) {
+        if (lease.isEmpty() || lease.get().isExpiredAt(metadata.clock().getAsLong())) {
+            // Not in the snapshot, or in it with an expiry that has passed: the snapshot may simply be
+            // older than the renewal, so the register is what answers, not the copy.
             lease = metadata.membership().read(nodeId);
         }
         if (lease.isEmpty()) {

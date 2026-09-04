@@ -65,6 +65,10 @@ public final class WalStore {
     private final AtomicLong ordinal = new AtomicLong();
     private volatile long seededTerm = -1L;
     private volatile List<String> previousSnapshot = List.of();
+    /** The ordinal the last publish had seen, so the next publish's snapshot is the records after it. */
+    private volatile long publishedUpTo = 0L;
+    /** The term whose older-term containers this instance has already emptied. */
+    private volatile long olderTermsDroppedFor = -1L;
 
     /**
      * Creates a WAL for one shard.
@@ -158,6 +162,11 @@ public final class WalStore {
         }
         ordinal.set(highest);
         seededTerm = term;
+        // What existed at seeding was replayed before this writer started, so it is in the first commit
+        // this instance publishes and is dropped by the publish after that -- the same cycle a listing
+        // gave it.
+        publishedUpTo = 0L;
+        previousSnapshot = List.of();
     }
 
     /**
@@ -430,17 +439,31 @@ public final class WalStore {
      * @throws IOException if listing or deleting fails
      */
     public int onPublished(long term) throws IOException {
+        // No listing. Within a term there is exactly one writer and this instance seeded its ordinal from
+        // the container, so the records that exist are exactly the ordinals up to the counter -- less
+        // whatever an earlier publish already dropped, which is what publishedUpTo remembers. A listing
+        // per publish used to be the largest fixed cost of a busy shard's pass.
+        seed(term);
         final BlobContainer container = containerFor(term);
-        final List<String> current = new ArrayList<>(container.listBlobs().keySet());
-        current.removeIf(name -> RECORD_NAME.matcher(name).matches() == false);
-
-        final List<String> toDelete = new ArrayList<>(previousSnapshot);
-        toDelete.retainAll(current);
+        final List<String> toDelete = previousSnapshot;
         if (toDelete.isEmpty() == false) {
             container.deleteBlobsIgnoringIfNotExists(toDelete);
         }
+        final long upTo = ordinal.get();
+        final List<String> current = new ArrayList<>();
+        for (long each = publishedUpTo + 1; each <= upTo; each++) {
+            current.add(String.format(java.util.Locale.ROOT, "%020d", each));
+        }
         previousSnapshot = current;
-        return toDelete.size() + dropOlderTerms(term);
+        publishedUpTo = upTo;
+        int dropped = toDelete.size();
+        if (olderTermsDroppedFor != term) {
+            // Older terms are emptied once per term per instance: nothing but a zombie can add to one
+            // afterwards, and a zombie's late record loses on replay anyway.
+            dropped += dropOlderTerms(term);
+            olderTermsDroppedFor = term;
+        }
+        return dropped;
     }
 
     /**

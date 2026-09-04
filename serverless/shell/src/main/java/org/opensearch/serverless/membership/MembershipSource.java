@@ -51,4 +51,15 @@ public interface MembershipSource extends Closeable {
      * @throws Exception if the underlying source cannot be read
      */
     Set<NodeLease> refresh() throws Exception;
+
+    /**
+     * Refreshes only if the snapshot is older than the given age, otherwise returns it as it stands.
+     *
+     * @param maxAgeMillis how old a snapshot may be before it is re-read
+     * @return the live members
+     * @throws Exception if the source cannot be read
+     */
+    default Set<NodeLease> refreshIfOlderThan(long maxAgeMillis) throws Exception {
+        return refresh();
+    }
 }

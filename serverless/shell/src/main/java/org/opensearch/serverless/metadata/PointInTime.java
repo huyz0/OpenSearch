@@ -171,6 +171,13 @@ public final class PointInTime {
                     builder.field(file.getKey(), file.getValue());
                 }
                 builder.endObject();
+                if (shard.getValue().lengths().isEmpty() == false) {
+                    builder.startObject("lengths");
+                    for (Map.Entry<String, Long> length : shard.getValue().lengths().entrySet()) {
+                        builder.field(length.getKey(), length.getValue());
+                    }
+                    builder.endObject();
+                }
                 builder.endObject();
             }
             builder.endArray();
@@ -211,9 +218,15 @@ public final class PointInTime {
                             files.put(String.valueOf(file.getKey()), String.valueOf(file.getValue()));
                         }
                     }
+                    final Map<String, Long> lengths = new LinkedHashMap<>();
+                    if (shard.get("lengths") instanceof Map<?, ?> known) {
+                        for (Map.Entry<?, ?> length : known.entrySet()) {
+                            lengths.put(String.valueOf(length.getKey()), Long.parseLong(String.valueOf(length.getValue())));
+                        }
+                    }
                     shards.put(
                         Integer.parseInt(String.valueOf(shard.get("shard"))),
-                        new CommitManifest(Long.parseLong(String.valueOf(shard.get("term"))), files)
+                        new CommitManifest(Long.parseLong(String.valueOf(shard.get("term"))), files, null, lengths)
                     );
                 }
             }

@@ -122,7 +122,7 @@ public final class NodesHandler extends BaseRestHandler {
         }
 
         return channel -> dispatch(channel, () -> {
-            metadata.membership().refresh();
+            metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
             final List<NodeLease> live = new ArrayList<>(metadata.membership().current());
             live.sort(Comparator.comparing(NodeLease::nodeId));
 

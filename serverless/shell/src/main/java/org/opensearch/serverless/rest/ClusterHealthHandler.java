@@ -277,7 +277,8 @@ public final class ClusterHealthHandler extends BaseRestHandler {
     private Health compute(MetadataPlane metadata, Ask ask) throws IOException {
         final Health health = new Health();
         try {
-            metadata.membership().refresh();
+            // A fraction of a lease old is fresh enough for a count, and this is what load balancers poll.
+            metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
             health.nodes = metadata.membership().current().size();
         } catch (IOException e) {
             // The control plane could not be read. That is the red that matters here, and it is reported

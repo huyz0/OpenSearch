@@ -107,22 +107,25 @@ public final class BlockCacheDirectory extends FilterDirectory {
         final Map<String, RemoteFile> files = new LinkedHashMap<>();
 
         if (present.isPresent()) {
-            // One listing per term container rather than a length lookup per file: the manifest records
-            // where each file lives but not how long it is, and Lucene needs the length before it will
-            // read a byte.
+            // The manifest's own lengths first, and a listing only for a file it does not record: a
+            // manifest written before lengths were recorded, or a file inherited from one. Lucene needs
+            // the length before it will read a byte, and an open used to list every term container.
             final Map<String, Map<String, Long>> lengthsByTerm = new LinkedHashMap<>();
             for (Map.Entry<String, String> entry : present.get().files().entrySet()) {
                 final String termDir = entry.getValue();
-                final Map<String, Long> lengths = lengthsByTerm.computeIfAbsent(termDir, dir -> {
-                    final Map<String, Long> found = new LinkedHashMap<>();
-                    try {
-                        blobStore.blobContainer(shardBase.add(dir)).listBlobs().forEach((name, meta) -> found.put(name, meta.length()));
-                    } catch (IOException e) {
-                        throw new UncheckedIOException(e);
-                    }
-                    return found;
-                });
-                final Long length = lengths.get(entry.getKey());
+                Long length = present.get().lengthOf(entry.getKey());
+                if (length == null) {
+                    final Map<String, Long> lengths = lengthsByTerm.computeIfAbsent(termDir, dir -> {
+                        final Map<String, Long> found = new LinkedHashMap<>();
+                        try {
+                            blobStore.blobContainer(shardBase.add(dir)).listBlobs().forEach((name, meta) -> found.put(name, meta.length()));
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                        return found;
+                    });
+                    length = lengths.get(entry.getKey());
+                }
                 if (length != null) {
                     files.put(
                         entry.getKey(),

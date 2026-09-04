@@ -125,7 +125,7 @@ public final class CatalogHandler extends BaseRestHandler {
         }
 
         // /_serverless/nodes
-        metadata.membership().refresh();
+        metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
         final var live = metadata.membership().current();
         return channel -> {
             try (XContentBuilder builder = channel.newBuilder()) {
