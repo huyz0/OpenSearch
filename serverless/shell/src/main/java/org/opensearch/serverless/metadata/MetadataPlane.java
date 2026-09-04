@@ -230,7 +230,18 @@ public final class MetadataPlane {
      */
     private void purgeShardData(String indexName, String uuid, int shards) throws IOException {
         final List<SnapshotRecord> snapshots = liveSnapshots();
+        // And the frozen views, read once per delete: a point in time names a shard's files the same way a
+        // shallow snapshot does, and deleting the index used to remove them before the orphan sweep -- which
+        // does honour views -- ever saw them. A view the collector could not read pins everything, for the
+        // reason livePointsInTime gives.
+        final List<PointInTime> views = livePointsInTime(clock.getAsLong());
         for (int shard = 0; shard < shards; shard++) {
+            if (views.isEmpty() == false && pinnedByView(views, indexName, uuid, shard)) {
+                LOGGER.info(
+                    "leaving shard " + shard + " of " + indexName + " on disk: a live point in time still names its files directly"
+                );
+                continue;
+            }
             if (snapshots.isEmpty() == false && pinnedBy(snapshots, uuid, shard)) {
                 LOGGER.info(
                     "leaving shard "
@@ -253,9 +264,62 @@ public final class MetadataPlane {
         }
     }
 
+    private static boolean pinnedByView(List<PointInTime> views, String indexName, String uuid, int shard) {
+        for (PointInTime view : views) {
+            if (view.isPlaceholder() || (view.pins(indexName, uuid) && view.shards().containsKey(shard))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean pinnedBy(List<SnapshotRecord> snapshots, String uuid, int shard) {
         for (SnapshotRecord snapshot : snapshots) {
             if (snapshot.referencedBlobs(uuid, shard).isEmpty() == false) {
+                return true;
+            }
+            for (SnapshotRecord.SnapshottedIndex index : snapshot.indices().values()) {
+                // A capture still in flight has named the index and not yet its commits: it is reading
+                // those manifests now, or copying the blobs they name. Everything of the index is held
+                // until the record is finished -- see capturing() for why that is the same as a pin.
+                if (index.uuid().equals(uuid) && capturing(index) && shard < index.numberOfShards()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Reports whether a snapshot record describes a capture that has not finished.
+     *
+     * <p>A snapshot's record is written <em>before</em> its manifests are read, naming every index it will
+     * capture and none of their commits, and rewritten with the commits once every one has been read (and,
+     * for a standard repository, copied). The record in between is the provisional one, and it is what
+     * makes a concurrent index deletion leave the shard data alone: without it, a delete landing after the
+     * manifests were read and before the record existed purged the very blobs a {@code SUCCESS} snapshot
+     * then named, and the first restore was the first anyone heard of it.
+     *
+     * <p>Told apart by shape rather than by a flag: a finished capture records every shard of every index
+     * it names or leaves the index out, so an index with a shard count and no shards can only be one still
+     * being taken.
+     *
+     * @param index an index entry of a snapshot record
+     * @return true while the capture of that index has not finished
+     */
+    public static boolean capturing(SnapshotRecord.SnapshottedIndex index) {
+        return index.shards().isEmpty() && index.numberOfShards() > 0;
+    }
+
+    /**
+     * Reports whether a snapshot is still being taken.
+     *
+     * @param snapshot the record
+     * @return true if any index it names is still being captured
+     */
+    public static boolean inProgress(SnapshotRecord snapshot) {
+        for (SnapshotRecord.SnapshottedIndex index : snapshot.indices().values()) {
+            if (capturing(index)) {
                 return true;
             }
         }
@@ -282,13 +346,18 @@ public final class MetadataPlane {
         }
         // Order the delete against any concurrent lifecycle change before removing anything. If the
         // descriptor moved underneath us, someone else is mid-operation and this delete loses.
-        if (descriptors.deleteIfUnchanged(indexName, generation) == false) {
+        if (descriptors.deleteIfUnchanged(indexName, generation, clock.getAsLong()) == false) {
             return false;
         }
         // Heads only after the descriptor is ordered away: the shard count needed to enumerate them
         // lives in the descriptor, and it is bounded by IndexDescriptor.MAX_SHARDS, so this is a
         // bounded loop rather than a listing.
         heads.deleteAllFor(indexName, descriptor.get().numberOfShards());
+        // The aliases that named it stop naming it, as core's delete does. Left in place, the alias
+        // record still listed the name while the new index of that name (created with an empty hint) said
+        // nothing named it -- GET /_alias/x and a search through x included the newcomer, GET /i/_alias
+        // said {} -- which is exactly the under-approximation the hint is documented never to make.
+        detachFromAliases(descriptor.get());
         // And the bytes. Heads first, so a writer cannot renew and the node holding it closes the shard on
         // its next tick; the data after, so a deleted index stops being paid for.
         //
@@ -302,38 +371,120 @@ public final class MetadataPlane {
     }
 
     /**
-     * Creates an alias standing for some indices.
+     * Drops a deleted index from every alias that named it, each under its own compare-and-swap.
      *
-     * <p>Refused if the name is taken by an index or another alias, which the object store decides rather
-     * than a check here — see {@link DescriptorStore#createAlias}.
-     *
-     * @param alias the alias to create
-     * @return the generation the register now holds
-     * @throws IOException if the write fails
+     * <p>An alias whose <em>only</em> index is deleted keeps naming it. Removing the alias would make a
+     * search through it "no such index: {alias}", and the answer this surface gives is the one a named
+     * index gives -- refused, naming the index that is gone -- which is what lets a caller tell a deleted
+     * index from a typo in the alias. The hint-side under-approximation this method closes is the one
+     * with other indices left; for the last one, the alias record is the whole truth and says so. A data
+     * stream keeps its stream fields on the way through; its write index cannot reach here, because
+     * {@code DELETE /{index}} refuses it.
      */
+    private void detachFromAliases(IndexDescriptor deleted) throws IOException {
+        for (String name : deleted.aliasedBy()) {
+            boolean done = false;
+            for (int attempt = 0; attempt < 4 && done == false; attempt++) {
+                final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+                if (resolved.alias() == null || resolved.alias().indices().contains(deleted.name()) == false) {
+                    break;
+                }
+                final java.util.List<String> now = new java.util.ArrayList<>(resolved.alias().indices());
+                now.remove(deleted.name());
+                if (now.isEmpty()) {
+                    break; // the last index: the alias keeps naming it, and a search through it says so
+                }
+                done = descriptors.updateAlias(withIndices(resolved.alias(), now), resolved.generation()).isPresent();
+            }
+            if (done == false) {
+                LOGGER.warn("alias [{}] may still name the deleted index [{}]; it is being changed concurrently", name, deleted.name());
+            }
+        }
+    }
+
     /**
-     * Replaces an alias under a compare-and-swap.
+     * An alias record together with the register generation it was read at.
+     *
+     * <p>The two come from one register read, and that is the whole point of the type: a generation read
+     * separately from the value it is meant to protect guards nothing. Read the value, then read the
+     * generation, and a writer that landed between the two hands the caller a fresh token for a stale
+     * value -- its compare-and-swap succeeds and the other writer's acknowledged change is gone. Worse, a
+     * delete between the two reads hands over a tombstone's generation and the alias is resurrected, and
+     * an index created under the name in that window is overwritten by an alias record.
+     *
+     * @param alias the record as read
+     * @param generation the generation to compare-and-swap against
+     */
+    public record AliasAtGeneration(org.opensearch.serverless.cluster.AliasRecord alias, long generation) {
+    }
+
+    /**
+     * Reads an alias and the generation to change it under, in one register read.
+     *
+     * @param name the alias
+     * @return the record and its generation, or empty when the name is not an alias
+     * @throws IOException if the read fails
+     */
+    public Optional<AliasAtGeneration> aliasWithGeneration(String name) throws IOException {
+        final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+        return resolved.alias() == null ? Optional.empty() : Optional.of(new AliasAtGeneration(resolved.alias(), resolved.generation()));
+    }
+
+    /**
+     * Returns the same record naming different indices, with a data stream's fields carried through.
+     *
+     * <p>Every alias mutation used to rebuild the record with the two-argument constructor, which made a
+     * data stream a plain alias the moment anything touched it.
+     *
+     * @param record the record
+     * @param indices the indices it should name
+     * @return the record as it should now be written
+     */
+    public static org.opensearch.serverless.cluster.AliasRecord withIndices(
+        org.opensearch.serverless.cluster.AliasRecord record,
+        java.util.List<String> indices
+    ) {
+        return new org.opensearch.serverless.cluster.AliasRecord(
+            record.name(),
+            indices,
+            record.dataStream(),
+            record.generation(),
+            record.timestampField()
+        );
+    }
+
+    /**
+     * Replaces an alias under a compare-and-swap, for a caller that has not read it.
+     *
+     * <p>Costs one read more than the three-argument {@code updateAlias}, which is the form
+     * every request path uses: the read here is only for the hints, and the token still has to come from
+     * the caller's own read of the record.
      *
      * @param alias the alias as it should now be
-     * @param expectedGeneration the generation the caller read
+     * @param expectedGeneration the generation the caller read, with the record
      * @return the new generation, or empty if another writer got there first
      * @throws IOException if the swap fails
      */
-    /**
-     * Returns the generation an alias currently sits at, for a compare-and-swap.
-     *
-     * @param name the alias
-     * @return the generation
-     * @throws IOException if the read fails
-     */
-    public long aliasGeneration(String name) throws IOException {
-        return descriptors.generationOf(name);
+    public Optional<Long> updateAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
+        return updateAlias(descriptors.resolve(alias.name()).alias(), alias, expectedGeneration);
     }
 
-    public Optional<Long> updateAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
+    /**
+     * Replaces an alias under a compare-and-swap.
+     *
+     * @param before the record as the caller read it, which decides which hints change; null if none
+     * @param alias the alias as it should now be
+     * @param expectedGeneration the generation the caller read, with {@code before}, in one read
+     * @return the new generation, or empty if another writer got there first
+     * @throws IOException if the swap fails
+     */
+    public Optional<Long> updateAlias(
+        org.opensearch.serverless.cluster.AliasRecord before,
+        org.opensearch.serverless.cluster.AliasRecord alias,
+        long expectedGeneration
+    ) throws IOException {
         // Which indices this alias named before, so the ones it stops naming can be told.
-        final DescriptorStore.Resolution before = descriptors.resolve(alias.name());
-        final java.util.List<String> previously = before.alias() == null ? java.util.List.of() : before.alias().indices();
+        final java.util.List<String> previously = before == null ? java.util.List.of() : before.indices();
         for (String index : alias.indices()) {
             if (previously.contains(index) == false) {
                 noteAlias(index, alias.name(), true);
@@ -371,9 +522,14 @@ public final class MetadataPlane {
             return generation;
         } catch (IndexAlreadyExistsException e) {
             // The hint was written for an alias that was not created; take it back so a name that keeps
-            // losing this race does not accumulate a stale entry per attempt.
+            // losing this race does not accumulate a stale entry per attempt -- unless the alias that won
+            // the race names the index, in which case the hint is the winner's and stripping it would
+            // leave a live alias with no hint, the one thing the hint must never be.
+            final DescriptorStore.Resolution winner = descriptors.resolve(alias.name());
             for (String index : alias.indices()) {
-                noteAlias(index, alias.name(), false);
+                if (winner.alias() == null || winner.alias().indices().contains(index) == false) {
+                    noteAlias(index, alias.name(), false);
+                }
             }
             throw e;
         }
@@ -493,15 +649,29 @@ public final class MetadataPlane {
      * @throws IOException if the delete fails
      */
     public boolean deleteAlias(String name) throws IOException {
-        final long generation = descriptors.generationOf(name);
         final DescriptorStore.Resolution resolved = descriptors.resolve(name);
         if (resolved.alias() == null) {
             return false;
         }
-        final boolean deleted = descriptors.deleteIfUnchanged(name, generation);
+        return deleteAlias(resolved.alias(), resolved.generation());
+    }
+
+    /**
+     * Removes an alias the caller has read, only if it has not changed since.
+     *
+     * <p>The unconditional form re-read its own generation and deleted whatever was there, so "the last
+     * index was removed, delete the alias" deleted an index a concurrent add had just put in.
+     *
+     * @param alias the record as the caller read it
+     * @param expectedGeneration the generation it was read at
+     * @return true if this caller deleted it; false if it changed first
+     * @throws IOException if the delete fails
+     */
+    public boolean deleteAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
+        final boolean deleted = descriptors.deleteIfUnchanged(alias.name(), expectedGeneration, clock.getAsLong());
         if (deleted) {
-            for (String index : resolved.alias().indices()) {
-                noteAlias(index, name, false);
+            for (String index : alias.indices()) {
+                noteAlias(index, alias.name(), false);
             }
         }
         return deleted;
@@ -536,6 +706,44 @@ public final class MetadataPlane {
         final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
         final var bytes = pit.toBytes();
         container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), false);
+    }
+
+    /**
+     * Moves a frozen view's deadline later, only if the view still exists and its deadline is the one the
+     * caller read.
+     *
+     * <p>The unconditional form is a blind overwrite: a page that read the record just before a release
+     * and wrote it back just after resurrected the view for another hour, files pinned and every node's
+     * {@code closeReleasedViews} kept waiting on a record that should have been gone. This re-reads the
+     * record and writes only when it is there and its stored deadline equals the expectation, so a
+     * released view stays released and two extensions do not silently overwrite each other.
+     *
+     * <p>Not a register: the record has to stay a plain blob, because the collector and the reaper find
+     * views by listing this container and read them with {@code readBlob}, which a register is not
+     * guaranteed to serve on every store. The window between the re-read and the overwrite is therefore
+     * the one an object store with no conditional overwrite leaves; it is a fraction of the width of the
+     * blind write, and it is stated rather than hidden.
+     *
+     * @param pit the view, carrying its new deadline
+     * @param expectedExpiresAtMillis the deadline the caller read
+     * @return true if the extension was written; false if the view is gone or its deadline moved
+     * @throws IOException if the read or the write fails
+     */
+    public boolean extendPointInTime(PointInTime pit, long expectedExpiresAtMillis) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
+        final PointInTime stored;
+        try (java.io.InputStream in = container.readBlob(pit.id())) {
+            stored = PointInTime.fromStream(in);
+        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
+            // Released: an extension of a view that is gone must not bring it back.
+            return false;
+        }
+        if (stored.expiresAtMillis() != expectedExpiresAtMillis) {
+            return false;
+        }
+        final var bytes = pit.toBytes();
+        container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), false);
+        return true;
     }
 
     /**
@@ -801,8 +1009,21 @@ public final class MetadataPlane {
             // the compare-and-swap, never before: if the process dies in between, the node simply does
             // not see the shard on its next read and re-acquires, which self-heals. Writing it first
             // would instead advertise a claim that was never won.
-            blobStore.blobContainer(RegisterMap.assignments(base, nodeId))
-                .writeBlob(RegisterMap.assignmentBlob(indexName, shardId), new java.io.ByteArrayInputStream(new byte[0]), 0L, false);
+            try {
+                blobStore.blobContainer(RegisterMap.assignments(base, nodeId))
+                    .writeBlob(RegisterMap.assignmentBlob(indexName, shardId), new java.io.ByteArrayInputStream(new byte[0]), 0L, false);
+            } catch (IOException e) {
+                // A head won and a claim not written is a shard nobody serves: this node never lists it,
+                // and every other node's acquire finds it held by a live owner for as long as the lease
+                // lasts. Give the head back at the term this acquisition won, so it is acquirable again
+                // -- by anyone, this node included -- and let the caller see the failure.
+                try {
+                    heads.release(indexName, shardId, nodeId, acquisition.head().term());
+                } catch (IOException release) {
+                    e.addSuppressed(release);
+                }
+                throw e;
+            }
         }
         return acquisition;
     }
@@ -880,9 +1101,22 @@ public final class MetadataPlane {
                 // A previous incarnation's head. Not ours to serve at its term; see the javadoc.
                 continue;
             }
-            final Optional<IndexDescriptor> descriptor = hosted.containsKey(indexName)
-                ? Optional.of(hosted.get(indexName))
-                : descriptors.get(indexName);
+            if (Names.isValidIndexOrAlias(indexName) == false) {
+                // A stray object in this node's assignments container -- a console upload, a scratch file --
+                // used to abort the whole read with the validator's exception, and with it every shard this
+                // node serves. Skipped, and named once in the log.
+                LOGGER.warn("ignoring [{}] in the assignments of {}: not an index name this system writes", claim, nodeId);
+                continue;
+            }
+            final Optional<IndexDescriptor> descriptor;
+            try {
+                descriptor = hosted.containsKey(indexName) ? Optional.of(hosted.get(indexName)) : descriptors.get(indexName);
+            } catch (IllegalArgumentException e) {
+                // Belt and braces behind the name check above: whatever the descriptor store refuses about
+                // this one claim is that claim's problem, not the resync's.
+                LOGGER.warn("ignoring the claim [{}] of {}: {}", claim, nodeId, e.getMessage());
+                continue;
+            }
             if (descriptor.isEmpty()) {
                 // The index was deleted underneath us. Not an error: the shard is going away too.
                 continue;
@@ -1009,6 +1243,27 @@ public final class MetadataPlane {
         } catch (java.nio.file.FileAlreadyExistsException e) {
             throw new SnapshotAlreadyExistsException(snapshot.repo(), snapshot.name());
         }
+    }
+
+    /**
+     * Replaces a snapshot's provisional record with the finished one.
+     *
+     * <p>The counterpart of {@link #createSnapshot}: the record that reserved the name and pinned the
+     * indices before their manifests were read is rewritten with the commits it captured. Refused if the
+     * record is gone, because a snapshot deleted while it was being taken must stay deleted rather than be
+     * written back by the capture that outlived it. The window between that check and the write is the
+     * one an object store with no conditional overwrite leaves; it is stated rather than hidden.
+     *
+     * @param snapshot the finished record
+     * @throws IOException if the record was deleted meanwhile, or the write fails
+     */
+    public void finishSnapshot(SnapshotRecord snapshot) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
+        if (container.blobExists(snapshot.key()) == false) {
+            throw new IOException("snapshot [" + snapshot.repo() + "/" + snapshot.name() + "] was deleted while it was being taken");
+        }
+        final var bytes = snapshot.toBytes();
+        container.writeBlob(snapshot.key(), bytes.streamInput(), bytes.length(), false);
     }
 
     /**
@@ -1178,24 +1433,161 @@ public final class MetadataPlane {
      * @throws IOException if the register cannot be read or created
      */
     public String transportSecret() throws IOException {
+        return transportSecrets().current();
+    }
+
+    /**
+     * The deployment's transport secrets: the current one, the one before it, and the register
+     * generation they were read at.
+     *
+     * <p>Two secrets rather than one is what makes rotation possible without partitioning the fleet: a
+     * receiver accepts a request authenticated under either until every node has re-read the register,
+     * and the generation is what a node caches against so a refusal can trigger one re-read rather than
+     * a read per request. Stored as JSON; a register written before generations existed holds a bare hex
+     * string, which parses as generation 1 with no previous secret, so a running deployment upgrades in
+     * place.
+     *
+     * @param generation the register generation, which rotation moves
+     * @param current the secret new requests are authenticated with
+     * @param previous the secret still accepted for one rotation window, or null
+     * @param rotatedAtMillis when the current secret became current, in the plane's clock
+     */
+    public record TransportSecrets(long generation, String current, String previous, long rotatedAtMillis) {
+
+        /**
+         * Parses a register value: the JSON form, or a bare hex secret from before rotation existed.
+         *
+         * @param stored the register's value
+         * @return the secrets
+         * @throws IOException if the JSON is malformed
+         */
+        public static TransportSecrets parse(String stored) throws IOException {
+            final String trimmed = stored.trim();
+            if (trimmed.startsWith("{") == false) {
+                return new TransportSecrets(1L, trimmed, null, 0L);
+            }
+            final java.util.Map<String, Object> body = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                new org.opensearch.core.common.bytes.BytesArray(trimmed.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                false,
+                org.opensearch.common.xcontent.XContentType.JSON
+            ).v2();
+            final Object current = body.get("current");
+            if (current == null) {
+                throw new IOException("malformed transport-secret register: no current secret");
+            }
+            return new TransportSecrets(
+                body.get("generation") instanceof Number n ? n.longValue() : 1L,
+                String.valueOf(current),
+                body.get("previous") == null ? null : String.valueOf(body.get("previous")),
+                body.get("rotated_at") instanceof Number n ? n.longValue() : 0L
+            );
+        }
+
+        /**
+         * Renders the register value.
+         *
+         * @return the JSON
+         * @throws IOException if it cannot be written
+         */
+        public String toJson() throws IOException {
+            try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+                builder.startObject();
+                builder.field("generation", generation);
+                builder.field("current", current);
+                builder.field("previous", previous);
+                builder.field("rotated_at", rotatedAtMillis);
+                builder.endObject();
+                return org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
+            }
+        }
+
+        /**
+         * Reports whether a secret is one this record accepts: the current, or the previous.
+         *
+         * @param secret the secret presented
+         * @return true if it is either
+         */
+        public boolean accepts(String secret) {
+            return secret != null
+                && (java.security.MessageDigest.isEqual(
+                    secret.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                    current.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                )
+                    || (previous != null
+                        && java.security.MessageDigest.isEqual(
+                            secret.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                            previous.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                        )));
+        }
+    }
+
+    /**
+     * Reads the transport secrets, minting the first under put-if-absent when there are none.
+     *
+     * @return the secrets and the register generation they sit at
+     * @throws IOException if the register cannot be read or created
+     */
+    public TransportSecrets transportSecrets() throws IOException {
         final var container = blobStore.blobContainer(RegisterMap.clusterConfig(base));
         final Optional<org.opensearch.common.blobstore.BlobRegister> existing = container.readRegister(TRANSPORT_SECRET_BLOB);
         if (existing.isPresent()) {
-            return existing.get().value().utf8ToString();
+            return atGeneration(TransportSecrets.parse(existing.get().value().utf8ToString()), existing.get().generation());
         }
-        final byte[] fresh = new byte[32];
-        new java.security.SecureRandom().nextBytes(fresh);
-        final String minted = org.opensearch.common.hash.MessageDigests.toHexString(fresh);
+        final TransportSecrets minted = new TransportSecrets(1L, freshHex(), null, clock.getAsLong());
         final var created = container.createRegisterIfAbsent(
             TRANSPORT_SECRET_BLOB,
-            new org.opensearch.core.common.bytes.BytesArray(minted.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            new org.opensearch.core.common.bytes.BytesArray(minted.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8))
         );
         if (created.applied()) {
-            return minted;
+            return atGeneration(minted, created.currentGeneration());
         }
-        return container.readRegister(TRANSPORT_SECRET_BLOB)
-            .map(r -> r.value().utf8ToString())
-            .orElseThrow(() -> new IOException("transport secret vanished"));
+        final Optional<org.opensearch.common.blobstore.BlobRegister> raced = container.readRegister(TRANSPORT_SECRET_BLOB);
+        if (raced.isEmpty()) {
+            throw new IOException("transport secret vanished");
+        }
+        return atGeneration(TransportSecrets.parse(raced.get().value().utf8ToString()), raced.get().generation());
+    }
+
+    /**
+     * Rotates the transport secret: the current one becomes the previous, a fresh one becomes current.
+     *
+     * <p>A compare-and-swap on the register, so two operators rotating at once produce one new
+     * generation rather than two secrets neither knows about. The previous secret stays accepted until
+     * the next rotation, which is the window every node has to re-read the register.
+     *
+     * @return the secrets as rotated
+     * @throws IOException if the register cannot be read or the swap keeps losing
+     */
+    public TransportSecrets rotateTransportSecret() throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.clusterConfig(base));
+        for (int attempt = 0; attempt < 8; attempt++) {
+            final TransportSecrets old = transportSecrets();
+            final TransportSecrets next = new TransportSecrets(old.generation() + 1, freshHex(), old.current(), clock.getAsLong());
+            final var swapped = container.compareAndSwapRegister(
+                TRANSPORT_SECRET_BLOB,
+                old.generation(),
+                new org.opensearch.core.common.bytes.BytesArray(next.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            );
+            if (swapped.applied()) {
+                return atGeneration(next, swapped.currentGeneration());
+            }
+        }
+        throw new IOException("transport secret rotation lost the compare-and-swap eight times; something else is rotating it");
+    }
+
+    /**
+     * The register's own generation is the one a node caches against, so the record carries it rather
+     * than the counter it was written with -- the two agree except for a register written before
+     * generations existed, whose stored counter is a placeholder.
+     */
+    private static TransportSecrets atGeneration(TransportSecrets secrets, long registerGeneration) {
+        return new TransportSecrets(registerGeneration, secrets.current(), secrets.previous(), secrets.rotatedAtMillis());
+    }
+
+    private static String freshHex() {
+        final byte[] fresh = new byte[32];
+        new java.security.SecureRandom().nextBytes(fresh);
+        return org.opensearch.common.hash.MessageDigests.toHexString(fresh);
     }
 
     private static final String TRANSPORT_SECRET_BLOB = "transport-secret";

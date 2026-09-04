@@ -134,21 +134,30 @@ public final class SearchTemplateHandler extends BaseRestHandler {
             template.setScriptType(ScriptType.STORED);
             template.setScript(id);
         }
-        final String rendered;
-        try {
-            rendered = render(serving, template);
-        } catch (Exception e) {
-            return channel -> channel.sendResponse(IndexAdminHandler.failure(channel, e));
-        }
-        return channel -> {
-            // The module's own render shape: the rendered template, raw.
-            try (XContentBuilder builder = channel.newBuilder()) {
-                builder.startObject();
-                builder.rawField("template_output", new BytesArray(rendered).streamInput(), XContentType.JSON);
-                builder.endObject();
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        // Off the HTTP thread before rendering: a stored template is a script-register read on a cache
+        // miss, which is object-store IO on the thread that should be reading the next request.
+        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                final String rendered = render(serving, template);
+                // The module's own render shape: the rendered template, raw.
+                try (XContentBuilder builder = channel.newBuilder()) {
+                    builder.startObject();
+                    builder.rawField("template_output", new BytesArray(rendered).streamInput(), XContentType.JSON);
+                    builder.endObject();
+                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                }
+            } catch (Exception e) {
+                report(channel, e, "render");
             }
-        };
+        });
+    }
+
+    private void report(org.opensearch.rest.RestChannel channel, Exception e, String what) {
+        try {
+            channel.sendResponse(IndexAdminHandler.failure(channel, e));
+        } catch (IOException nested) {
+            logger.error("failed to report a search template " + what + " failure", nested);
+        }
     }
 
     private RestChannelConsumer single(RestRequest request, ServerlessNode serving) throws IOException {
@@ -173,27 +182,32 @@ public final class SearchTemplateHandler extends BaseRestHandler {
                 )
             );
         }
-        final SearchSourceBuilder rendered;
-        try {
-            rendered = parse(serving, render(serving, template), template);
-        } catch (Exception e) {
-            return channel -> channel.sendResponse(IndexAdminHandler.failure(channel, e));
-        }
-        // The rendered source takes the body's place; what the URL said about size and from stays as the
-        // request's own, since the URL wins over the body on a plain search too.
-        if (source.size() >= 0) {
-            rendered.size(source.size());
-        }
-        if (source.from() >= 0) {
-            rendered.from(source.from());
-        }
-        if (template.getSearchPipeline() != null) {
-            searchRequest.pipeline(template.getSearchPipeline());
-        }
-        searchRequest.source(rendered);
-        final org.opensearch.search.builder.PointInTimeBuilder pit = rendered.pointInTimeBuilder();
-        rendered.pointInTimeBuilder(null);
-        return search.plan(request, searchRequest, rendered, pit, false);
+        // Everything after parsing runs off the HTTP thread, as SearchHandler.prepareRequest and multi()
+        // in this file already do: rendering a stored template reads the script register on a miss, and
+        // plan() reads pipelines, points in time and index descriptors before it returns its consumer.
+        // All of that used to run on the Netty worker that should have been reading the next request.
+        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                final SearchSourceBuilder rendered = parse(serving, render(serving, template), template);
+                // The rendered source takes the body's place; what the URL said about size and from stays
+                // as the request's own, since the URL wins over the body on a plain search too.
+                if (source.size() >= 0) {
+                    rendered.size(source.size());
+                }
+                if (source.from() >= 0) {
+                    rendered.from(source.from());
+                }
+                if (template.getSearchPipeline() != null) {
+                    searchRequest.pipeline(template.getSearchPipeline());
+                }
+                searchRequest.source(rendered);
+                final org.opensearch.search.builder.PointInTimeBuilder pit = rendered.pointInTimeBuilder();
+                rendered.pointInTimeBuilder(null);
+                search.plan(request, searchRequest, rendered, pit, false).accept(channel);
+            } catch (Exception e) {
+                report(channel, e, "search");
+            }
+        });
     }
 
     private RestChannelConsumer multi(RestRequest request, ServerlessNode serving, MetadataPlane metadata) throws IOException {

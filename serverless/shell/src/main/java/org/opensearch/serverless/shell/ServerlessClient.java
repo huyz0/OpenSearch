@@ -141,7 +141,7 @@ public final class ServerlessClient extends AbstractClient {
             return createIndex((CreateIndexRequest) request, metadata);
         }
         if (org.opensearch.action.search.SearchAction.INSTANCE.name().equals(action.name())) {
-            return search((org.opensearch.action.search.SearchRequest) request, operations);
+            return search((org.opensearch.action.search.SearchRequest) request, serving, metadata);
         }
         // A plugin's own action, after the shell's allowlist and never before it: a plugin must not be able
         // to take over "indices:data/write/index" by declaring it. PluginActions refuses a duplicate among
@@ -236,28 +236,49 @@ public final class ServerlessClient extends AbstractClient {
     }
 
     /**
-     * Runs a search through the same fan-out a user's search uses.
+     * Runs a search through the same resolution and the same fan-out a user's search uses.
      *
      * <p>This is how a plugin loads all of its state — Security reads its whole config that way — so it
-     * matters that it is the same code path and not a second one. What cannot be merged across shards is
-     * refused by {@code SearchHandler} for REST callers and by the fan-out for everyone; a plugin asking
-     * for an aggregation gets the same answer a user does.
+     * matters that it is the same code path and not a second one. Every index the request names is
+     * searched, and an alias or a prefix pattern resolves the way it does on {@code _search}: this used to
+     * take {@code indices()[0]} and search that alone, so a plugin asking for two indices got one with
+     * {@code _shards.total} agreeing, and a plugin asking through an alias got "no such index". A
+     * privilege evaluator loading its policy from several indices would have loaded a subset and
+     * believed it complete, which is the failure that must never succeed.
+     *
+     * <p>What cannot be merged across shards is refused here by name, as it is for a REST caller, rather
+     * than merged wrongly; and a plugin's own index is reachable, because this client is what a plugin's
+     * index exists to be reached by. The action filters still see every index the search covers.
      */
     private org.opensearch.action.search.SearchResponse search(
         org.opensearch.action.search.SearchRequest request,
-        ShardOperations operations
+        ServerlessNode serving,
+        MetadataPlane metadata
     ) throws Exception {
         final var source = request.source() == null
             ? new org.opensearch.search.builder.SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.matchAllQuery())
             : request.source();
-        if (source.size() < 0) {
-            source.size(10);
+        org.opensearch.serverless.rest.SearchHandler.applyDefaults(source, false);
+        final String unsupported = org.opensearch.serverless.rest.SearchHandler.whatCannotBeMerged(source);
+        if (unsupported != null) {
+            throw new UnsupportedOperationException(unsupported);
         }
-        if (source.from() < 0) {
-            source.from(0);
+        final String names = request.indices().length == 0 ? "*" : String.join(",", request.indices());
+        final org.opensearch.serverless.rest.SearchHandler.Resolution resolved = org.opensearch.serverless.rest.SearchHandler
+            .resolveIndices(metadata, serving, names, request.indicesOptions().ignoreUnavailable(), false);
+        if (resolved.refused()) {
+            if (resolved.status() == org.opensearch.core.rest.RestStatus.NOT_FOUND) {
+                throw new org.opensearch.index.IndexNotFoundException(names);
+            }
+            throw new org.opensearch.OpenSearchStatusException(resolved.reason(), resolved.status());
         }
         final long startNanos = System.nanoTime();
-        final var outcome = operations.search(request.indices()[0], source);
+        final var outcome = org.opensearch.serverless.rest.SearchHandler.gated(
+            serving,
+            resolved.indices().keySet(),
+            source,
+            admitted -> org.opensearch.serverless.rest.SearchFanout.run(serving, metadata, resolved.indices(), admitted)
+        );
         // The same response a REST caller gets, built by the same code, so a plugin reading
         // shard failures or a timed-out flag sees what a user would see.
         return org.opensearch.serverless.rest.SearchHandler.toResponse(

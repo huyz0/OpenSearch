@@ -8,10 +8,16 @@
 
 package org.opensearch.serverless.reconcile;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.PointInTime;
 import org.opensearch.serverless.metadata.RegisterMap;
+import org.opensearch.serverless.metadata.SnapshotRecord;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
 
@@ -22,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Reclaims segment blobs no longer referenced by a shard's published commit.
@@ -35,8 +42,8 @@ import java.util.Set;
  *
  * <ol>
  *   <li>it lives in a term container <em>strictly older</em> than the published manifest's term, and</li>
- *   <li>nothing names it: not the published manifest, and not any frozen view somebody may still be
- *       paging through.</li>
+ *   <li>nothing names it: not the published manifest, not any frozen view somebody may still be
+ *       paging through, and not any snapshot.</li>
  * </ol>
  *
  * <p>Condition 1 exists because publishing is not atomic: a writer uploads files and <em>then</em>
@@ -49,11 +56,33 @@ import java.util.Set;
  * (phase 4), so files a live commit depends on routinely live in older term containers. Collecting by
  * term alone would delete exactly the data the current writer is serving. That is the mistake this
  * class is shaped to make impossible, and the one its tests are pointed at.
+ *
+ * <p><b>A pin that cannot be read pins everything.</b> The plane stands in for a view record it could
+ * not read with a placeholder that names no shards. Adding its (empty) references to the set and
+ * sweeping on would be treating "unreadable" as "holds nothing", which is the opposite of what the
+ * placeholder means; a sweep that sees one deletes nothing and says so.
  */
 public final class GarbageCollector {
 
+    private static final Logger logger = LogManager.getLogger(GarbageCollector.class);
+
+    /**
+     * The floor a production sweep should set: a blob first seen unreferenced less than this long ago is
+     * kept whatever the pass count says.
+     *
+     * <p>The two-sweep grace is counted in passes, and a pass is however long the loop takes to come
+     * round -- under a burst of publishes, two passes can be a second apart. Freezing a view reads one
+     * manifest per shard and then writes the record; a two-hundred-shard freeze on a slow store takes
+     * longer than that, and the files its first shards froze were swept before the record existed. A
+     * floor in wall-clock time is what makes "two sweeps" mean "long enough".
+     */
+    public static final long DEFAULT_MINIMUM_UNREFERENCED_MILLIS = 60_000L;
+
     private final BlobStore blobStore;
     private final org.opensearch.common.blobstore.BlobPath base;
+    /** Per {@code index#shard}, when each candidate was first seen unreferenced, in the plane's clock. */
+    private final Map<String, Map<String, Long>> firstSeenUnreferenced = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile long minimumUnreferencedMillis = 0L;
 
     /**
      * Creates a collector.
@@ -64,6 +93,22 @@ public final class GarbageCollector {
     public GarbageCollector(BlobStore blobStore, org.opensearch.common.blobstore.BlobPath base) {
         this.blobStore = blobStore;
         this.base = base;
+    }
+
+    /**
+     * Sets how long a blob must have been unreferenced, by the plane's clock, before a graced sweep may
+     * delete it -- on top of the pass count the caller keeps.
+     *
+     * <p>Zero, the default, keeps the grace a pure pass count. The floor is remembered on this instance,
+     * so a caller that wants it must keep one collector across passes rather than build one per pass; a
+     * fresh collector has never seen anything and would start every clock again.
+     *
+     * @param millis the floor; see {@link #DEFAULT_MINIMUM_UNREFERENCED_MILLIS}
+     * @return this, for chaining
+     */
+    public GarbageCollector setMinimumUnreferencedMillis(long millis) {
+        this.minimumUnreferencedMillis = Math.max(0L, millis);
+        return this;
     }
 
     /**
@@ -79,6 +124,38 @@ public final class GarbageCollector {
         // No grace: everything unreferenced goes now. Right for a sweep an operator asked for, and for
         // one that follows a deletion, where there is nothing left to be reading.
         return sweepShard(plane, indexName, shardId, null).deleted();
+    }
+
+    /**
+     * Collects one shard with the two-sweep grace, remembering between calls what it saw unreferenced.
+     *
+     * <p>{@link #collectShard(MetadataPlane, String, int)} deletes on first sight, which is right after a
+     * deletion and wrong for a sweep over live indices: a reader on another node serves the previous
+     * commit until its next backstop, and its files are exactly what the first sight finds unreferenced.
+     * A caller that keeps the memory across sweeps — a scheduled whole-deployment sweep — gets the same
+     * grace the per-node sweep has: a blob goes only when two consecutive sweeps found it unreferenced.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param memory what earlier sweeps saw unreferenced, keyed by {@code index#shard}; updated in place.
+     *     Null for no grace.
+     * @return the blob names deleted, qualified by their term container
+     * @throws IOException if listing or deleting fails
+     */
+    public List<String> collectShard(MetadataPlane plane, String indexName, int shardId, Map<String, Set<String>> memory)
+        throws IOException {
+        if (memory == null) {
+            return collectShard(plane, indexName, shardId);
+        }
+        final String key = indexName + RegisterMap.SHARD_SEPARATOR + shardId;
+        final ShardSweep sweep = sweepShard(plane, indexName, shardId, memory.getOrDefault(key, Set.of()));
+        if (sweep.candidates().isEmpty()) {
+            memory.remove(key);
+        } else {
+            memory.put(key, sweep.candidates());
+        }
+        return sweep.deleted();
     }
 
     /**
@@ -148,9 +225,24 @@ public final class GarbageCollector {
         String indexName,
         int shardId,
         Set<String> previousCandidates,
-        List<org.opensearch.serverless.metadata.PointInTime> views,
-        List<org.opensearch.serverless.metadata.SnapshotRecord> snapshots
+        List<PointInTime> views,
+        List<SnapshotRecord> snapshots
     ) throws IOException {
+        for (PointInTime pit : views) {
+            if (pit.isPlaceholder()) {
+                // A record the plane could not read. What it holds is unknowable, so nothing is deleted
+                // while it stands; what was on watch stays on watch, so the grace is not restarted when
+                // the record is repaired or removed.
+                logger.warn(
+                    "not sweeping shard {} of {}: the point in time [{}] could not be read and may hold any of its files",
+                    shardId,
+                    indexName,
+                    pit.id()
+                );
+                return new ShardSweep(List.of(), previousCandidates == null ? Set.of() : Set.copyOf(previousCandidates));
+            }
+        }
+
         final SegmentPublisher publisher = plane.segmentPublisher(indexName, shardId);
         final Optional<CommitManifest> manifest = publisher.readManifest();
         if (manifest.isEmpty()) {
@@ -167,6 +259,18 @@ public final class GarbageCollector {
             referenced.add(file.getValue() + "/" + file.getKey());
         }
 
+        // The index's uuid, read only when something to check against it exists: a snapshot pins by uuid,
+        // and a view that recorded one is matched by it rather than by a name that may since have been
+        // reused. A deployment with neither pays nothing extra for this.
+        String uuid = null;
+        boolean uuidNeeded = snapshots.isEmpty() == false;
+        for (PointInTime pit : views) {
+            uuidNeeded |= pit.index().equals(indexName) && pit.indexUuid() != null;
+        }
+        if (uuidNeeded) {
+            uuid = plane.describe(indexName).map(IndexDescriptor::uuid).orElse(null);
+        }
+
         // And what any frozen view is still holding.
         //
         // <b>This is the second half of the safety rule and it is not optional.</b> The sweep deletes a
@@ -178,8 +282,8 @@ public final class GarbageCollector {
         // Read once per sweep of a shard rather than once per blob, and read *before* the listing below:
         // a view taken while this sweep is running is one whose files this sweep may already have listed
         // as orphans, so it must be seen first or not at all.
-        for (org.opensearch.serverless.metadata.PointInTime pit : views) {
-            if (pit.index().equals(indexName) || pit.index().isEmpty()) {
+        for (PointInTime pit : views) {
+            if (pit.pins(indexName, uuid)) {
                 referenced.addAll(pit.referencedBlobs(shardId));
             }
         }
@@ -187,22 +291,30 @@ public final class GarbageCollector {
         // And what any snapshot is still holding -- the same rule, checked once per sweep of a shard
         // rather than once per blob, and read before the listing for the same reason the point-in-time
         // read above is: a snapshot taken while this sweep is running must be seen or not seen, never
-        // half-seen. Unlike a point in time, keyed by the index's uuid rather than its name -- see
-        // SnapshotRecord#referencedBlobs for why that is tighter than the point-in-time check just above,
-        // not merely different. The uuid is resolved only when at least one snapshot exists anywhere in
-        // the deployment, so a deployment that has never taken one pays nothing extra for this at all.
-        if (snapshots.isEmpty() == false) {
-            final Optional<org.opensearch.serverless.cluster.IndexDescriptor> descriptor = plane.describe(indexName);
-            if (descriptor.isPresent()) {
-                final String uuid = descriptor.get().uuid();
-                for (org.opensearch.serverless.metadata.SnapshotRecord snapshot : snapshots) {
-                    referenced.addAll(snapshot.referencedBlobs(uuid, shardId));
+        // half-seen. Keyed by the index's uuid rather than its name -- see SnapshotRecord#referencedBlobs.
+        if (uuid != null) {
+            for (SnapshotRecord snapshot : snapshots) {
+                referenced.addAll(snapshot.referencedBlobs(uuid, shardId));
+                for (SnapshotRecord.SnapshottedIndex captured : snapshot.indices().values()) {
+                    if (captured.uuid().equals(uuid) && capturing(captured) && captured.numberOfShards() > shardId) {
+                        // A capture that has named this index and not yet read its manifests. Which commit
+                        // it will record is not known until it has, so every file of this shard may be one
+                        // it is about to name; nothing goes until the record is finalised.
+                        return new ShardSweep(List.of(), previousCandidates == null ? Set.of() : Set.copyOf(previousCandidates));
+                    }
                 }
             }
         }
 
         final List<String> deleted = new ArrayList<>();
         final Set<String> candidates = new HashSet<>();
+        // The wall-clock half of the grace, applied only to a graced sweep: an ungraced one is an operator
+        // or a deletion, where there is nothing left to be reading.
+        final String shardKey = indexName + RegisterMap.SHARD_SEPARATOR + shardId;
+        final Map<String, Long> firstSeen = previousCandidates == null
+            ? null
+            : firstSeenUnreferenced.computeIfAbsent(shardKey, ignored -> new java.util.concurrent.ConcurrentHashMap<>());
+        final long now = plane.clock().getAsLong();
         final BlobContainer shardContainer = blobStore.blobContainer(plane.shardData(indexName, shardId));
         for (Map.Entry<String, BlobContainer> child : shardContainer.children().entrySet()) {
             final String termDir = child.getKey();
@@ -216,10 +328,20 @@ public final class GarbageCollector {
             for (String blobName : child.getValue().listBlobs().keySet()) {
                 final String qualified = termDir + "/" + blobName;
                 if (referenced.contains(qualified)) {
+                    if (firstSeen != null) {
+                        // Referenced again -- a view or snapshot now names it -- so its clock restarts if
+                        // it ever becomes unreferenced once more.
+                        firstSeen.remove(qualified);
+                    }
                     continue;
                 }
                 candidates.add(qualified);
-                if (previousCandidates == null || previousCandidates.contains(qualified)) {
+                if (previousCandidates == null) {
+                    orphans.add(blobName);
+                    continue;
+                }
+                final long since = firstSeen.computeIfAbsent(qualified, ignored -> now);
+                if (previousCandidates.contains(qualified) && now - since >= minimumUnreferencedMillis) {
                     orphans.add(blobName);
                 }
             }
@@ -232,32 +354,59 @@ public final class GarbageCollector {
         }
         // What was deleted is not watched any more; what survived is what the next sweep compares against.
         candidates.removeAll(deleted);
+        if (firstSeen != null) {
+            firstSeen.keySet().retainAll(candidates);
+            if (firstSeen.isEmpty()) {
+                firstSeenUnreferenced.remove(shardKey);
+            }
+        }
         return new ShardSweep(deleted, candidates);
     }
 
     /**
-     * Sweeps every shard of every index.
+     * Sweeps every shard of every index, deleting on first sight.
      *
      * <p>Walks the whole deployment one page at a time via {@link #collectPage}. A sweep genuinely does
      * intend to visit everything, so being proportional to the population is correct here in a way it
      * never is on a request path — but it must still be resumable and sliceable, which is why the paged
      * form is the real one and this is a convenience over it.
      *
+     * <p><b>No grace</b>, which is right for a sweep an operator runs once after a deletion and wrong for
+     * one run on a schedule over live indices: see {@link #collectAll(MetadataPlane, Map)}.
+     *
      * @param plane the metadata plane
      * @return blob names deleted, keyed by {@code index#shard}
      * @throws IOException if listing or deleting fails
      */
     public Map<String, List<String>> collectAll(MetadataPlane plane) throws IOException {
+        return collectAll(plane, null);
+    }
+
+    /**
+     * Sweeps every shard of every index, with the two-sweep grace carried in the caller's memory.
+     *
+     * <p>A reader on another node serves the commit it opened until its next backstop, so the files a
+     * sweep first finds unreferenced may still be being read somewhere. A caller that keeps the memory
+     * from one sweep to the next deletes a blob only once two consecutive sweeps found it unreferenced,
+     * which is the same grace {@code BackgroundReconciler} gives the shards it publishes.
+     *
+     * @param plane the metadata plane
+     * @param memory what earlier sweeps saw unreferenced, keyed by {@code index#shard}, updated in place;
+     *     null for no grace
+     * @return blob names deleted, keyed by {@code index#shard}
+     * @throws IOException if listing or deleting fails
+     */
+    public Map<String, List<String>> collectAll(MetadataPlane plane, Map<String, Set<String>> memory) throws IOException {
         final Map<String, List<String>> deleted = new java.util.LinkedHashMap<>();
         String after = null;
         do {
-            after = collectPage(plane, after, 500, deleted);
+            after = collectPage(plane, after, 500, deleted, memory);
         } while (after != null);
         return deleted;
     }
 
     /**
-     * Collects one bounded slice of the deployment.
+     * Collects one bounded slice of the deployment, deleting on first sight.
      *
      * <p>This is the shape a sweep at target scale has to have, and {@link #collectAll} is a loop over
      * it kept for small deployments and tests. A real fleet runs many workers each taking a slice, which
@@ -273,12 +422,28 @@ public final class GarbageCollector {
      * @throws IOException if listing or deleting fails
      */
     public String collectPage(MetadataPlane plane, String after, int limit, Map<String, List<String>> into) throws IOException {
+        return collectPage(plane, after, limit, into, null);
+    }
+
+    /**
+     * Collects one bounded slice of the deployment, with the two-sweep grace carried in the caller's memory.
+     *
+     * @param plane the metadata plane
+     * @param after resume point, or null to start
+     * @param limit how many indices this slice covers
+     * @param into accumulates deletions, keyed by {@code index#shard}
+     * @param memory what earlier sweeps saw unreferenced, keyed by {@code index#shard}; null for no grace
+     * @return the cursor to resume from, or null when the sweep is complete
+     * @throws IOException if listing or deleting fails
+     */
+    public String collectPage(MetadataPlane plane, String after, int limit, Map<String, List<String>> into, Map<String, Set<String>> memory)
+        throws IOException {
         final var page = plane.descriptors().listPage(after, limit);
-        for (Map.Entry<String, org.opensearch.serverless.cluster.IndexDescriptor> index : page.descriptors().entrySet()) {
+        for (Map.Entry<String, IndexDescriptor> index : page.descriptors().entrySet()) {
             for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
-                final List<String> orphans = collectShard(plane, index.getKey(), shard);
+                final List<String> orphans = collectShard(plane, index.getKey(), shard, memory);
                 if (orphans.isEmpty() == false) {
-                    into.put(index.getKey() + "#" + shard, orphans);
+                    into.put(index.getKey() + RegisterMap.SHARD_SEPARATOR + shard, orphans);
                 }
             }
         }
@@ -286,7 +451,53 @@ public final class GarbageCollector {
     }
 
     /**
-     * Deletes the storage of shards no index owns any more.
+     * Removes descriptor tombstones older than the quarantine.
+     *
+     * <p>A deleted index leaves its descriptor register as a tombstone so a later index of the same name
+     * does not restart at the generation numbers the old one had — see
+     * {@code DescriptorStore#deleteIfUnchanged}. Kept forever, they are read on every listing and count
+     * against every prefix pattern's cap; a name created and deleted daily poisoned {@code logs-*} after a
+     * year. A compare-and-swap carrying a generation read hours ago is not an in-flight operation, so a
+     * tombstone that old has done its job.
+     *
+     * @param plane the metadata plane
+     * @param nowMillis the plane's clock
+     * @return the names whose tombstones were removed
+     * @throws IOException if listing, reading or deleting fails
+     */
+    public List<String> collectTombstones(MetadataPlane plane, long nowMillis) throws IOException {
+        return plane.descriptors().sweepTombstones(nowMillis, DescriptorStore.DEFAULT_TOMBSTONE_QUARANTINE_MILLIS);
+    }
+
+    /**
+     * Names every pin in the deployment, cheaply enough to compare between passes.
+     *
+     * <p>The per-node sweep gate runs a shard's sweep when that node can see something became
+     * collectable: a manifest it published lost a file, or a view it reaped freed one. What it cannot see
+     * is a view reaped on another node or a snapshot deleted anywhere, and a quiet index held the files
+     * such a pin had covered until its next merge. This is the fingerprint the gate compares: two
+     * listings and no reads, one name per live view record and one per snapshot record. A pin that came
+     * or went between two readings changes the set, and a changed set is the signal to sweep every open
+     * writer once.
+     *
+     * @return the pin names, sorted, prefixed by kind
+     * @throws IOException if a listing fails
+     */
+    public Set<String> pins() throws IOException {
+        final Set<String> pins = new TreeSet<>();
+        for (String name : blobStore.blobContainer(RegisterMap.pointsInTime(base)).listBlobs().keySet()) {
+            if (PointInTime.looksLikeAnId(name)) {
+                pins.add("view:" + name);
+            }
+        }
+        for (String name : blobStore.blobContainer(RegisterMap.snapshots(base)).listBlobs().keySet()) {
+            pins.add("snapshot:" + name);
+        }
+        return pins;
+    }
+
+    /**
+     * Deletes the storage of shards no index owns any more, unless a snapshot or a view still holds it.
      *
      * <p><b>What leaves an orphan.</b> Publishing is fenced by the manifest register's term, not by the
      * shard-head, so a writer that has lost its head can still finish a publish it had already begun — and
@@ -298,6 +509,12 @@ public final class GarbageCollector {
      * index is not there, or is there under a different uuid. A register read that fails throws rather than
      * answering "absent", so a store having a bad minute cannot be mistaken for an index having been
      * deleted — which is the mistake that would turn a garbage collector into data loss.
+     *
+     * <p><b>Pinned is not orphaned.</b> Deleting an index deliberately leaves the shards a live shallow
+     * snapshot references (see {@code MetadataPlane#purgeShardData}), and a view taken before the delete
+     * still names its files; both look exactly like orphans to a sweep that consults only descriptors. The
+     * same pins index deletion honours are honoured here, read once per sweep, and a view record that
+     * cannot be read stops the sweep outright, since what it holds is unknowable.
      *
      * <p><b>A container this does not recognise is left alone.</b> Anything whose name is not
      * {@code index#uuid#shard} was not written by this system, and a sweep that deletes what it cannot
@@ -315,6 +532,15 @@ public final class GarbageCollector {
      * @throws IOException if listing fails
      */
     public List<String> collectOrphanedShards(MetadataPlane plane) throws IOException {
+        final List<SnapshotRecord> snapshots = plane.liveSnapshots();
+        final List<PointInTime> views = plane.livePointsInTime(plane.clock().getAsLong());
+        for (PointInTime pit : views) {
+            if (pit.isPlaceholder()) {
+                logger.warn("not sweeping orphaned shards: the point in time [{}] could not be read and may hold any of them", pit.id());
+                return List.of();
+            }
+        }
+
         final BlobContainer segments = blobStore.blobContainer(base.add("segments"));
         final List<String> deleted = new ArrayList<>();
         for (Map.Entry<String, BlobContainer> child : segments.children().entrySet()) {
@@ -328,20 +554,59 @@ public final class GarbageCollector {
             }
             final String indexName = container.substring(0, uuidSeparator);
             final String uuid = container.substring(uuidSeparator + 1, lastSeparator);
+            final int shard;
             try {
-                Integer.parseInt(container.substring(lastSeparator + 1));
+                shard = Integer.parseInt(container.substring(lastSeparator + 1));
             } catch (NumberFormatException e) {
                 continue;
             }
 
-            final Optional<org.opensearch.serverless.cluster.IndexDescriptor> descriptor = plane.describe(indexName);
+            final Optional<IndexDescriptor> descriptor = plane.describe(indexName);
             if (descriptor.isPresent() && descriptor.get().uuid().equals(uuid)) {
+                continue;
+            }
+            if (pinnedBySnapshot(snapshots, uuid, shard) || pinnedByView(views, indexName, uuid, shard)) {
+                logger.info("leaving {} in place: a live snapshot or point in time still names its blobs", container);
                 continue;
             }
             child.getValue().delete();
             deleted.add(container);
         }
         return deleted;
+    }
+
+    private static boolean pinnedBySnapshot(List<SnapshotRecord> snapshots, String uuid, int shard) {
+        for (SnapshotRecord snapshot : snapshots) {
+            if (snapshot.referencedBlobs(uuid, shard).isEmpty() == false) {
+                return true;
+            }
+            for (SnapshotRecord.SnapshottedIndex captured : snapshot.indices().values()) {
+                // A capture in progress names the index and none of its shards yet: it is about to read
+                // -- or copy from -- exactly this container, and must find it there.
+                if (captured.uuid().equals(uuid) && capturing(captured) && captured.numberOfShards() > shard) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether a snapshot's index entry is a capture still being taken: a shard count and no shards. The
+     * same reading {@code MetadataPlane.capturing} gives the record; kept here so the collector's safety
+     * argument does not depend on the plane's.
+     */
+    private static boolean capturing(SnapshotRecord.SnapshottedIndex captured) {
+        return captured.shards().isEmpty() && captured.numberOfShards() > 0;
+    }
+
+    private static boolean pinnedByView(List<PointInTime> views, String indexName, String uuid, int shard) {
+        for (PointInTime pit : views) {
+            if (pit.pins(indexName, uuid) && pit.shards().containsKey(shard)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

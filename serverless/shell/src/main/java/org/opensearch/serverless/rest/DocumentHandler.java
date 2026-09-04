@@ -249,8 +249,10 @@ public final class DocumentHandler extends BaseRestHandler {
             );
         }
 
-        // An index by name, or a data stream's newest backing index. The name the caller wrote is the one
-        // the response reports, as core reports it; the routing is the backing index's.
+        // An index by name, or a data stream's newest backing index. The response reports the backing
+        // index, as core does -- {@code .ds-logs-000001} for a write through {@code logs} -- on the local
+        // path and the forwarded path alike. The comment here used to claim the caller's name, the local
+        // path agreed with it and the forwarded path did not.
         final Optional<MetadataPlane.WriteTarget> target = metadata.writeTarget(index);
         if (target.isEmpty()) {
             return channel -> channel.sendResponse(
@@ -273,7 +275,14 @@ public final class DocumentHandler extends BaseRestHandler {
         }
         final Optional<IndexDescriptor> descriptor = Optional.of(target.get().index());
         final String writtenIndex = descriptor.get().name();
-        if (node.get() != null && node.get().isSystemIndex(writtenIndex)) {
+        final ServerlessNode serving = node.get();
+        if (serving == null) {
+            // Checked once, here, rather than checked at one use and dereferenced at the next.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
+            );
+        }
+        if (serving.isSystemIndex(writtenIndex)) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
@@ -285,7 +294,6 @@ public final class DocumentHandler extends BaseRestHandler {
         }
 
         final int shard = DocumentRouting.shardFor(descriptor.get(), id);
-        final ServerlessNode serving = node.get();
         final ShardId shardId = serving.reconciler()
             .openShards()
             .stream()
@@ -313,21 +321,16 @@ public final class DocumentHandler extends BaseRestHandler {
                 //
                 // Forwarding here would send the write to ourselves, and the receiving side would
                 // correctly refuse it -- a 500 for what is a normal, brief, self-resolving state. Say
-                // "not yet" instead, which is a status a client retries.
+                // "not yet" instead, which is a status a client retries. The doubt makes the activation
+                // pass run now rather than on the next write, which is what turns "retry" into a short wait.
                 serving.forgetOwner(writtenIndex, shard);
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.SERVICE_UNAVAILABLE,
-                        "activation_in_progress",
-                        "this node is acquiring shard " + shard + " of " + writtenIndex + "; retry"
-                    )
-                );
+                serving.signals().ownershipDoubted(writtenIndex, shard);
+                return channel -> channel.sendResponse(activationInProgress(channel, writtenIndex, shard));
             }
             if (owner != null) {
                 // Forward rather than refuse. The client should not have to know which node owns which
                 // shard; that is exactly the knowledge the shard-head exists to hold.
-                final boolean fromHint = hinted.isPresent();
+                final String indexUuid = descriptor.get().uuid();
                 return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
                     // Accounted on this node for as long as the forward is in flight, exactly as a local
                     // write is: the bytes are held here until the owner answers, whichever node applies them.
@@ -342,6 +345,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                 serving,
                                 forwardTarget,
                                 writtenIndex,
+                                indexUuid,
                                 shard,
                                 id,
                                 shapedSource,
@@ -351,16 +355,35 @@ public final class DocumentHandler extends BaseRestHandler {
                                 ifPrimaryTerm,
                                 requireAbsent
                             );
-                        } catch (Exception first) {
-                            if (fromHint == false || refusedAsNotOwner(first) == false) {
+                        } catch (ForwardFailed first) {
+                            // Whatever went wrong, the hint that sent the write there is not consulted
+                            // again. It used to survive everything but a refusal worded "does not own", so
+                            // a hint naming a node that had died, or that held the shard only as a reader,
+                            // was tried on every request and every request through this node failed the
+                            // same way until it restarted -- while the same write through _bulk, which
+                            // reads the register each time, succeeded.
+                            serving.forgetOwner(writtenIndex, shard);
+                            if (org.opensearch.serverless.transport.ForwardFailure.classify(first.getCause())
+                                .mayRetryElsewhere() == false) {
+                                // Applied, possibly applied, or answered: not sent anywhere else.
                                 throw first;
                             }
-                            // The hint was stale. Read the register once and forward to whoever it names.
-                            serving.forgetOwner(writtenIndex, shard);
+                            // The owner never applied it. Read the register once and forward to whoever it names.
                             final var head = metadata.heads().read(writtenIndex, shard);
                             serving.noteHead(writtenIndex, shard, head.orElse(null));
                             final String fresh = head.map(h -> h.ownerNodeId()).orElse(null);
-                            if (fresh == null || fresh.equals(forwardTarget)) {
+                            if (fresh == null) {
+                                // Whoever the hint named is gone and nobody has taken over: the same state,
+                                // and the same answer, as a register that never named anyone.
+                                serving.signals().ownershipDoubted(writtenIndex, shard);
+                                channel.sendResponse(notTheWriter(channel, writtenIndex, shard, null));
+                                return;
+                            }
+                            if (fresh.equals(serving.localNode().getId())) {
+                                channel.sendResponse(activationInProgress(channel, writtenIndex, shard));
+                                return;
+                            }
+                            if (fresh.equals(forwardTarget)) {
                                 throw first;
                             }
                             forwardTarget = fresh;
@@ -368,6 +391,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                 serving,
                                 forwardTarget,
                                 writtenIndex,
+                                indexUuid,
                                 shard,
                                 id,
                                 shapedSource,
@@ -388,55 +412,18 @@ public final class DocumentHandler extends BaseRestHandler {
                             new ServerlessNode.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
                             refresh
                         );
-                    } catch (OwnerUnreachable unreachable) {
-                        serving.signals().ownershipDoubted(writtenIndex, shard);
-                        try {
-                            channel.sendResponse(
-                                IndexAdminHandler.error(
-                                    channel,
-                                    RestStatus.SERVICE_UNAVAILABLE,
-                                    "owner_unreachable",
-                                    unreachable.getMessage()
-                                )
-                            );
-                        } catch (IOException nested) {
-                            logger.error("failed to report an unreachable owner", nested);
-                        }
+                    } catch (ForwardFailed failed) {
+                        reportForwardFailure(channel, serving, writtenIndex, shard, failed.target(), failed.getCause());
                     } catch (Exception e) {
-                        final Throwable conflict = org.opensearch.ExceptionsHelper.unwrap(
-                            e,
-                            org.opensearch.index.engine.VersionConflictEngineException.class
-                        );
-                        if (conflict != null) {
-                            try {
-                                channel.sendResponse(
-                                    IndexAdminHandler.error(
-                                        channel,
-                                        RestStatus.CONFLICT,
-                                        "version_conflict_engine_exception",
-                                        conflict.getMessage()
-                                    )
-                                );
-                            } catch (IOException nested) {
-                                logger.error("failed to report a forwarded version conflict", nested);
-                            }
-                            return;
-                        }
-                        serving.signals().ownershipDoubted(writtenIndex, shard);
+                        // Not the forward's failure: a filter refused the write before it left this node,
+                        // or the answer could not be written. Rendered with the plugin's own status, as the
+                        // local path renders it. This used to be a 503 forward_failed that also cast doubt
+                        // on ownership, so whether a caller was told 403 or 503 depended on which node it
+                        // happened to reach.
                         try {
-                            // 503, not the exception's own status. A forward that fails means routing was
-                            // stale, and stale routing is a retry -- rendering it as a 500 tells a client
-                            // the write is hopeless when the correct answer is "ask again in a moment".
-                            channel.sendResponse(
-                                IndexAdminHandler.error(
-                                    channel,
-                                    RestStatus.SERVICE_UNAVAILABLE,
-                                    "forward_failed",
-                                    IndexAdminHandler.forwardFailureMessage(owner, e)
-                                )
-                            );
+                            channel.sendResponse(IndexAdminHandler.failure(channel, e));
                         } catch (IOException nested) {
-                            logger.error("failed to report a forwarding failure", nested);
+                            logger.error("failed to report a refused forward", nested);
                         }
                     }
                 });
@@ -444,17 +431,7 @@ public final class DocumentHandler extends BaseRestHandler {
             // No owner at all. Nothing will fix this except some node activating the shard, and the
             // only reason anyone would is that a write arrived -- which just happened.
             serving.signals().ownershipDoubted(writtenIndex, shard);
-            // Through the shared error helper, so this renders the same nested "error" object every other
-            // deliberate refusal on this surface does. It used to build its own body with "error" as a bare
-            // string -- the exact shape M47 removed everywhere else, missed here because this one path
-            // builds its response by hand. The owner is still named: a bare "wrong node" makes the client
-            // guess, and guessing at ownership is how two writers end up believing the same thing.
-            final String reason = owner == null
-                ? "no node currently owns shard " + shard + " of " + writtenIndex + "; activate it before writing"
-                : "this node does not own shard " + shard + " of " + writtenIndex + "; it is owned by " + owner;
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.MISDIRECTED_REQUEST, "not_the_writer", reason)
-            );
+            return channel -> channel.sendResponse(notTheWriter(channel, writtenIndex, shard, owner));
         }
 
         // Off the HTTP thread: a WAL append is an object-store write, and blocking the thread that
@@ -480,13 +457,21 @@ public final class DocumentHandler extends BaseRestHandler {
                         ? serving.delete(shardId, id, ifSeqNo, ifPrimaryTerm)
                         : serving.index(shardId, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent)
                 );
+                boolean refreshed = false;
                 if (refresh) {
                     // Same meaning as classic OpenSearch: make this write visible to search before
                     // answering. Without it a caller that writes and immediately searches gets zero
-                    // hits and no error, which reads as data loss and is not.
-                    serving.reconciler().shard(shardId).refresh("serverless-rest-refresh");
+                    // hits and no error, which reads as data loss and is not. Null-checked: a heartbeat
+                    // can release the shard between the durable append and this refresh, and a 500 for a
+                    // write that is in the log told the client the opposite of the truth.
+                    final var open = serving.reconciler().shard(shardId);
+                    if (open != null) {
+                        open.refresh("serverless-rest-refresh");
+                        refreshed = true;
+                    }
                 }
-                respond(channel, index, id, shard, serving.localNode().getId(), deletion, outcome, refresh);
+                // The backing index, as core reports it and as the forwarded path has always reported it.
+                respond(channel, writtenIndex, id, shard, serving.localNode().getId(), deletion, outcome, refreshed);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -588,29 +573,158 @@ public final class DocumentHandler extends BaseRestHandler {
         }
     }
 
-    /** The head names an owner that holds no live lease. */
-    private static final class OwnerUnreachable extends Exception {
-        OwnerUnreachable(String message) {
-            super(message);
+    /**
+     * A forward that failed, and which node it was sent to.
+     *
+     * <p>A {@code RuntimeException} so the action gate hands it back unwrapped -- a checked exception
+     * thrown inside the gate comes out as an {@code UncategorizedExecutionException} when a filter is
+     * installed and as itself when none is, and a classification that depended on that would depend on
+     * which plugins happen to be loaded.
+     */
+    private static final class ForwardFailed extends RuntimeException {
+
+        private final String target;
+
+        ForwardFailed(String target, Throwable cause) {
+            super(cause.getMessage(), cause);
+            this.target = target;
+        }
+
+        String target() {
+            return target;
         }
     }
 
-    /** Whether a forward failed because the node it reached does not hold the shard, which is a stale hint. */
+    /**
+     * Whether a forward failed because the node it reached does not hold the shard as its writer.
+     *
+     * <p>Typed, not phrased: the check is {@link org.opensearch.serverless.transport.NotShardOwnerException},
+     * which the owner throws and which carries a token no other message does. This used to search every
+     * cause's message for "does not own", so a security plugin refusing with "user does not own index
+     * alpha" re-routed the write instead of reaching the caller as a 403.
+     *
+     * @param e what the forward threw
+     * @return true for the owner's own refusal
+     */
     public static boolean refusedAsNotOwner(Exception e) {
-        Throwable cause = e;
-        while (cause != null) {
-            if (cause.getMessage() != null && cause.getMessage().contains("does not own")) {
-                return true;
-            }
-            cause = cause.getCause();
+        return org.opensearch.serverless.transport.NotShardOwnerException.describes(e);
+    }
+
+    /** The 421 for a shard this node does not own, naming the owner when there is one. */
+    private static BytesRestResponse notTheWriter(org.opensearch.rest.RestChannel channel, String index, int shard, String owner)
+        throws IOException {
+        // Through the shared error helper, so this renders the same nested "error" object every other
+        // deliberate refusal on this surface does. The owner is still named: a bare "wrong node" makes the
+        // client guess, and guessing at ownership is how two writers end up believing the same thing.
+        final String reason = owner == null
+            ? "no node currently owns shard " + shard + " of " + index + "; activate it before writing"
+            : "this node does not own shard " + shard + " of " + index + "; it is owned by " + owner;
+        return IndexAdminHandler.error(channel, RestStatus.MISDIRECTED_REQUEST, "not_the_writer", reason);
+    }
+
+    /** The 503 for the gap inside activation, which is brief and self-resolving. */
+    private static BytesRestResponse activationInProgress(org.opensearch.rest.RestChannel channel, String index, int shard)
+        throws IOException {
+        return IndexAdminHandler.error(
+            channel,
+            RestStatus.SERVICE_UNAVAILABLE,
+            "activation_in_progress",
+            "this node is acquiring shard " + shard + " of " + index + "; retry"
+        );
+    }
+
+    /**
+     * Answers for a forward that failed, with the status the failure actually deserves.
+     *
+     * <p>Every failure used to be a 503 {@code forward_failed} that also cast doubt on ownership. An
+     * owner at its indexing-pressure limit answered 429 to a local write and 503 to a forwarded one, and
+     * cost the coordinator an activation pass for saying so; a mapper's 400 became a "retry". Now the
+     * owner's own answer keeps its status, and only a refusal, a silence or an absence is doubt.
+     */
+    private void reportForwardFailure(
+        org.opensearch.rest.RestChannel channel,
+        ServerlessNode serving,
+        String writtenIndex,
+        int shard,
+        String owner,
+        Throwable cause
+    ) {
+        final org.opensearch.serverless.transport.ForwardFailure kind = org.opensearch.serverless.transport.ForwardFailure.classify(cause);
+        if (kind.castsDoubtOnOwnership()) {
+            serving.signals().ownershipDoubted(writtenIndex, shard);
         }
-        return false;
+        try {
+            switch (kind) {
+                case CONFLICT: {
+                    final Throwable conflict = org.opensearch.ExceptionsHelper.unwrap(
+                        cause,
+                        org.opensearch.index.engine.VersionConflictEngineException.class
+                    );
+                    channel.sendResponse(
+                        IndexAdminHandler.error(channel, RestStatus.CONFLICT, "version_conflict_engine_exception", conflict.getMessage())
+                    );
+                    return;
+                }
+                case REJECTED: {
+                    // Owner-side back-pressure, in core's own shape and with core's own 429.
+                    final Throwable rejected = org.opensearch.ExceptionsHelper.unwrap(
+                        cause,
+                        org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class
+                    );
+                    channel.sendResponse(IndexAdminHandler.failure(channel, asException(rejected)));
+                    return;
+                }
+                case REMOTE: {
+                    if (org.opensearch.serverless.transport.ForwardFailure.isClientStatus(cause)) {
+                        // The owner's own answer, with the owner's own status.
+                        channel.sendResponse(
+                            IndexAdminHandler.failure(
+                                channel,
+                                asException(org.opensearch.serverless.transport.ForwardFailure.answer(cause))
+                            )
+                        );
+                        return;
+                    }
+                    channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.SERVICE_UNAVAILABLE,
+                            "forward_failed",
+                            org.opensearch.serverless.transport.ForwardFailure.describe(owner, cause)
+                        )
+                    );
+                    return;
+                }
+                default: {
+                    // 503, not the exception's own status. A forward that fails means routing was stale,
+                    // and stale routing is a retry -- rendering it as a 500 tells a client the write is
+                    // hopeless when the correct answer is "ask again in a moment". A deadline is worded
+                    // as one, so the client reads before it retries.
+                    final boolean noLease = cause instanceof org.opensearch.serverless.transport.OwnerUnreachableException;
+                    channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.SERVICE_UNAVAILABLE,
+                            noLease ? "owner_unreachable" : "forward_failed",
+                            noLease ? cause.getMessage() : org.opensearch.serverless.transport.ForwardFailure.describe(owner, cause)
+                        )
+                    );
+                }
+            }
+        } catch (IOException nested) {
+            logger.error("failed to report a forwarding failure", nested);
+        }
+    }
+
+    private static Exception asException(Throwable failure) {
+        return failure instanceof Exception e ? e : new RuntimeException(failure);
     }
 
     private org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
         ServerlessNode serving,
         String owner,
         String writtenIndex,
+        String indexUuid,
         int shard,
         String id,
         String shapedSource,
@@ -620,36 +734,49 @@ public final class DocumentHandler extends BaseRestHandler {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) throws Exception {
-        final var peer = serving.router().peer(owner);
+        final Optional<org.opensearch.cluster.node.DiscoveryNode> peer;
+        try {
+            peer = serving.router().peer(owner);
+        } catch (Exception e) {
+            // Resolving the peer connects to it, so this fails as readily as the forward itself does, and
+            // means the same thing.
+            throw new ForwardFailed(owner, e);
+        }
         if (peer.isEmpty()) {
             // The head names an owner that holds no live lease. That is precisely a dead writer nobody
             // has noticed yet, and this request is the first thing in the system to prove it.
-            throw new OwnerUnreachable("shard " + shard + " is owned by " + owner + ", which has no reachable lease");
+            throw new ForwardFailed(
+                owner,
+                new org.opensearch.serverless.transport.OwnerUnreachableException(
+                    "shard " + shard + " is owned by " + owner + ", which has no reachable lease"
+                )
+            );
         }
         // Filtered here, on the coordinating node, before the write leaves it. The owner has no idea who
         // the caller is -- an internal transport request carries no identity -- so this is the only node
-        // where the question can be asked.
-        return gated(
-            serving,
-            deletion,
-            writtenIndex,
-            id,
-            shapedSource,
-            () -> serving.router()
-                .forwardIndex(
-                    peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedIndexRequest(
-                        writtenIndex,
-                        shard,
-                        id,
-                        shapedSource == null ? "" : shapedSource,
-                        refresh,
-                        deletion,
-                        ifSeqNo,
-                        ifPrimaryTerm,
-                        requireAbsent
-                    )
-                )
-        );
+        // where the question can be asked. The forward's own failure is wrapped inside the gate, so that
+        // what comes out of the gate unwrapped is the gate's own refusal and nothing else.
+        return gated(serving, deletion, writtenIndex, id, shapedSource, () -> {
+            try {
+                return serving.router()
+                    .forwardIndex(
+                        peer.get(),
+                        new org.opensearch.serverless.transport.ForwardedIndexRequest(
+                            writtenIndex,
+                            indexUuid,
+                            shard,
+                            id,
+                            shapedSource == null ? "" : shapedSource,
+                            refresh,
+                            deletion,
+                            ifSeqNo,
+                            ifPrimaryTerm,
+                            requireAbsent
+                        )
+                    );
+            } catch (Exception e) {
+                throw new ForwardFailed(owner, e);
+            }
+        });
     }
 }

@@ -42,6 +42,11 @@ import java.util.Map;
  * for why reusing one is the bug this design specifically closed) has to copy the referenced blobs into the
  * new index's own storage. The snapshot stays shallow; the restore does the one copy the uuid-keying
  * invariant makes unavoidable.
+ *
+ * <p><b>An index entry with a shard count and no {@code shards} is a capture in progress</b> (see
+ * {@code MetadataPlane.capturing}): the record is written naming every index before any manifest is
+ * read, and rewritten with the commits once every one has been. Records written before settings were
+ * captured have no {@code settings} and parse unchanged.
  */
 public final class SnapshotRecord {
 
@@ -92,10 +97,11 @@ public final class SnapshotRecord {
         private final String uuid;
         private final int numberOfShards;
         private final String mapping;
+        private final Map<String, Object> settings;
         private final Map<Integer, CommitManifest> shards;
 
         /**
-         * Creates a captured index.
+         * Creates a captured index with no settings.
          *
          * @param uuid the index's uuid at the moment of capture
          * @param numberOfShards its shard count
@@ -103,10 +109,41 @@ public final class SnapshotRecord {
          * @param shards each shard's commit at the moment of capture
          */
         public SnapshottedIndex(String uuid, int numberOfShards, String mapping, Map<Integer, CommitManifest> shards) {
+            this(uuid, numberOfShards, mapping, Map.of(), shards);
+        }
+
+        /**
+         * Creates a captured index.
+         *
+         * @param uuid the index's uuid at the moment of capture
+         * @param numberOfShards its shard count
+         * @param mapping its mapping source, or null for none
+         * @param settings the index's settings in the structured form {@code Settings#toXContent} writes
+         *     (nested objects, lists as lists), so a restore can {@code Settings.Builder#loadFromMap} them;
+         *     empty for none
+         * @param shards each shard's commit at the moment of capture
+         */
+        public SnapshottedIndex(
+            String uuid,
+            int numberOfShards,
+            String mapping,
+            Map<String, Object> settings,
+            Map<Integer, CommitManifest> shards
+        ) {
             this.uuid = uuid;
             this.numberOfShards = numberOfShards;
             this.mapping = mapping;
+            this.settings = settings == null ? Map.of() : Map.copyOf(settings);
             this.shards = Map.copyOf(shards);
+        }
+
+        /**
+         * Returns the captured settings, structured; empty for none.
+         *
+         * @return the settings
+         */
+        public Map<String, Object> settings() {
+            return settings;
         }
 
         /**
@@ -282,6 +319,9 @@ public final class SnapshotRecord {
                 if (captured.mapping() != null) {
                     builder.field("mapping", captured.mapping());
                 }
+                if (captured.settings().isEmpty() == false) {
+                    builder.field("settings", captured.settings());
+                }
                 builder.startArray("shards");
                 for (Map.Entry<Integer, CommitManifest> shard : captured.shards().entrySet()) {
                     builder.startObject();
@@ -338,6 +378,10 @@ public final class SnapshotRecord {
                         throw new IOException("malformed snapshot record: an index entry is missing its uuid or shard count");
                     }
                     final Object mapping = indexBody.get("mapping");
+                    @SuppressWarnings("unchecked")
+                    final Map<String, Object> settings = indexBody.get("settings") instanceof Map<?, ?> given
+                        ? (Map<String, Object>) given
+                        : Map.of();
                     final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
                     if (indexBody.get("shards") instanceof List<?> listed) {
                         for (Object shardEntry : listed) {
@@ -363,6 +407,7 @@ public final class SnapshotRecord {
                             indexUuid.toString(),
                             Integer.parseInt(String.valueOf(numberOfShards)),
                             mapping == null ? null : mapping.toString(),
+                            settings,
                             shards
                         )
                     );

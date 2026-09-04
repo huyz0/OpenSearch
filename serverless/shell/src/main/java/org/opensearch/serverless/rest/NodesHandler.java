@@ -123,7 +123,16 @@ public final class NodesHandler extends BaseRestHandler {
 
         return channel -> dispatch(channel, () -> {
             metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
-            final List<NodeLease> live = new ArrayList<>(metadata.membership().current());
+            // The snapshot keeps an expired lease until a full refresh finds its blob gone, which a young
+            // snapshot does not do; a node that died is listed "until its lease expires", as the class
+            // says, only if the expiry is checked here.
+            final long now = metadata.clock().getAsLong();
+            final List<NodeLease> live = new ArrayList<>();
+            for (NodeLease lease : metadata.membership().current()) {
+                if (lease.isExpiredAt(now) == false) {
+                    live.add(lease);
+                }
+            }
             live.sort(Comparator.comparing(NodeLease::nodeId));
 
             final List<NodeLease> selected = new ArrayList<>();

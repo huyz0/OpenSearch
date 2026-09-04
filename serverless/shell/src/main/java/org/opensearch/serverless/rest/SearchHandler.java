@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.rest;
 
-import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -47,6 +46,17 @@ public final class SearchHandler extends BaseRestHandler {
 
     private final Supplier<ServerlessNode> node;
     private final Supplier<MetadataPlane> plane;
+
+    /**
+     * When this handler last asked the object store whether membership moved, in {@link System#nanoTime}
+     * terms; see {@link #refreshMembership}.
+     */
+    private final java.util.concurrent.atomic.AtomicLong membershipProbedAtNanos = new java.util.concurrent.atomic.AtomicLong(
+        Long.MIN_VALUE
+    );
+
+    /** How long a membership snapshot is served without asking the object store whether it moved. */
+    static final long MEMBERSHIP_PROBE_INTERVAL_MILLIS = 1_000L;
 
     /**
      * Creates the handler.
@@ -111,13 +121,18 @@ public final class SearchHandler extends BaseRestHandler {
      * @param type the refusal's error type, or null
      * @param reason the refusal's reason, or null
      */
-    record Resolution(java.util.LinkedHashMap<String, IndexDescriptor> indices, java.util.List<String> skipped, RestStatus status,
+    public record Resolution(java.util.LinkedHashMap<String, IndexDescriptor> indices, java.util.List<String> skipped, RestStatus status,
         String type, String reason) {
         static Resolution refuse(RestStatus status, String type, String reason) {
             return new Resolution(null, null, status, type, reason);
         }
 
-        boolean refused() {
+        /**
+         * Reports whether the names could not be resolved.
+         *
+         * @return true when this carries a refusal rather than indices
+         */
+        public boolean refused() {
             return status != null;
         }
     }
@@ -153,13 +168,20 @@ public final class SearchHandler extends BaseRestHandler {
         searchRequest.source(source);
         final org.opensearch.search.builder.PointInTimeBuilder bodyPit;
         try {
-            if (request.hasContent()) {
+            // The body, or the source= parameter core's own search action accepts in its place -- a GET
+            // with the search in the URL, which some proxies and clients insist on. Parsed with the search
+            // registry either way, since the request's own parser does not know the query names.
+            if (request.hasContentOrSourceParam()) {
+                final org.opensearch.common.collect.Tuple<
+                    org.opensearch.core.xcontent.MediaType,
+                    org.opensearch.core.common.bytes.BytesReference> body = request.contentOrSourceParam();
                 try (
-                    XContentParser parser = XContentType.JSON.xContent()
+                    XContentParser parser = body.v1()
+                        .xContent()
                         .createParser(
                             serving.searchXContentRegistry(),
                             DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
-                            request.content().streamInput()
+                            body.v2().streamInput()
                         )
                 ) {
                     source.parseXContent(parser, true);
@@ -261,6 +283,11 @@ public final class SearchHandler extends BaseRestHandler {
             );
         }
         final boolean failOnPartial = Boolean.FALSE.equals(searchRequest.allowPartialSearchResults());
+        // Two more core parses into the request and nothing here reads: cancel_after_time_interval cancels
+        // a task, and a search here is not a task -- each shard's query is bounded by the request's own
+        // timeout and the fan-out's own deadline, which are the bounds that exist; phase_took asks for
+        // per-phase timings that a fan-out over shard results does not measure. Both are accepted for the
+        // same reason preference is: a hint that cannot be followed is not a reason to refuse the search.
 
         // A search pipeline, named by the search_pipeline parameter or the body, or defined inline in the
         // body. Its request processors run here, over the request core parsed, before anything is
@@ -341,25 +368,80 @@ public final class SearchHandler extends BaseRestHandler {
                 );
             }
             org.opensearch.serverless.metadata.PointInTime frozen = pit.get();
+            final String viewIndex = frozen.index();
+            if (frozen.indexUuid() != null
+                && metadata.describe(viewIndex).map(IndexDescriptor::uuid).filter(frozen.indexUuid()::equals).isEmpty()) {
+                // The name is gone, or names a different index now. A record written before the uuid was
+                // recorded (indexUuid null) cannot be checked and is left to the manifest's own lengths.
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.NOT_FOUND,
+                        "pit_not_found",
+                        "the point in time " + pitId + " was taken over an earlier index of that name, which no longer exists"
+                    )
+                );
+            }
+            if (searchRequest.indices().length > 0
+                && java.util.List.of(searchRequest.indices()).equals(java.util.List.of(viewIndex)) == false) {
+                // A view already names its index, and the path named something else. Core refuses the
+                // combination outright; this shell's own callers write /{index}/_search?pit= with the
+                // view's own index and are left alone, but /orders/_search over a view of logs used to
+                // answer hits from logs under the orders path -- a lie in the URL.
+                final String named = java.util.Arrays.toString(searchRequest.indices());
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.BAD_REQUEST,
+                        "bad_query",
+                        "[indices] cannot be used with point in time: the view "
+                            + pitId
+                            + " is over ["
+                            + viewIndex
+                            + "], and the path named "
+                            + named
+                    )
+                );
+            }
             if (bodyPit != null && bodyPit.getKeepAlive() != null) {
+                if (bodyPit.getKeepAlive().millis() > PointInTimeHandler.MAX_KEEP_ALIVE_MILLIS) {
+                    // The same refusal creating the view gives, for the same reason: a caller asking for a
+                    // day and being quietly handed an hour finds out at minute sixty-one.
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.BAD_REQUEST,
+                            "keep_alive_too_long",
+                            PointInTimeHandler.keepAliveTooLong()
+                        )
+                    );
+                }
                 // OpenSearch's keep_alive on a search extends the view from now. This shell's expiry is
                 // absolute, so extending it is a new record with a later deadline -- one write, and only
                 // when it actually moves the deadline later, since a keep_alive shorter than what remains
                 // asks for nothing.
-                final long until = metadata.clock().getAsLong() + Math.min(
-                    bodyPit.getKeepAlive().millis(),
-                    PointInTimeHandler.MAX_KEEP_ALIVE_MILLIS
-                );
+                final long until = metadata.clock().getAsLong() + bodyPit.getKeepAlive().millis();
                 // Every client sends keep_alive on every page. Written only when it moves the deadline by
                 // more than a quarter of itself, so a page a second is a write per quarter-lifetime rather
                 // than a write per page; the view is still extended long before it could lapse.
-                final long materially = Math.max(
-                    1L,
-                    Math.min(bodyPit.getKeepAlive().millis(), PointInTimeHandler.MAX_KEEP_ALIVE_MILLIS) / 4
-                );
+                final long materially = Math.max(1L, bodyPit.getKeepAlive().millis() / 4);
                 if (until - frozen.expiresAtMillis() > materially) {
-                    frozen = new org.opensearch.serverless.metadata.PointInTime(frozen.id(), frozen.index(), until, frozen.shards());
-                    metadata.extendPointInTime(frozen);
+                    // Conditional on the deadline this request read: a release that landed in between, or
+                    // another node's extension, makes this a no-write, and a released view is answered as
+                    // gone rather than written back into existence -- which an unconditional write used
+                    // to do, resurrecting a view every node had already let go of.
+                    final long expected = frozen.expiresAtMillis();
+                    frozen = frozen.withExpiry(until);
+                    if (metadata.extendPointInTime(frozen, expected) == false) {
+                        return channel -> channel.sendResponse(
+                            IndexAdminHandler.error(
+                                channel,
+                                RestStatus.NOT_FOUND,
+                                "pit_not_found",
+                                "no such point in time, or it has expired: " + pitId
+                            )
+                        );
+                    }
                 }
             }
             final var view = frozen;
@@ -394,14 +476,7 @@ public final class SearchHandler extends BaseRestHandler {
         // waiting on the transport thread that is meant to be reading the next request resets the
         // connection, which surfaces to the client as RST_STREAM rather than as anything diagnosable.
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
-            // Membership is the address book and the placement input. Refreshed when the snapshot is
-            // older than a fraction of a lease, off the HTTP thread: refreshing on every search was one
-            // listing and a read per node per search, on the thread that should be reading the next one.
-            try {
-                metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
-            } catch (Exception e) {
-                logger.warn("could not refresh membership before searching", e);
-            }
+            refreshMembership(metadata);
             try {
                 respond(
                     channel,
@@ -426,6 +501,35 @@ public final class SearchHandler extends BaseRestHandler {
     }
 
     /**
+     * Brings the membership snapshot up to date before a search fans out, at a bounded cost.
+     *
+     * <p>Membership is the address book and the placement input. The snapshot is good for as long as a
+     * lease is, and a join moves the members index's generation, which one register read detects -- but
+     * one read per search is one object-store round trip on the critical path of every search, which at a
+     * thousand searches a second is millions of reads an hour for a fact that changes at join and leave.
+     * So the read is made at most once per {@link #MEMBERSHIP_PROBE_INTERVAL_MILLIS}, wall-clock, and the
+     * searches in between are served from the snapshot. A node that joined inside that second is reached
+     * a second late; a node already known is reached at once, and a peer missing from the snapshot is
+     * still looked up by its lease when a forward needs its address.
+     */
+    private void refreshMembership(MetadataPlane metadata) {
+        final long now = System.nanoTime();
+        final long last = membershipProbedAtNanos.get();
+        if (last != Long.MIN_VALUE && now - last < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(MEMBERSHIP_PROBE_INTERVAL_MILLIS)) {
+            return;
+        }
+        if (membershipProbedAtNanos.compareAndSet(last, now) == false) {
+            // Somebody else is probing this instant; their answer is as good as ours.
+            return;
+        }
+        try {
+            metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
+        } catch (Exception e) {
+            logger.warn("could not refresh membership before searching", e);
+        }
+    }
+
+    /**
      * The defaults a request gets where its body did not speak.
      *
      * <p>Shared with {@code _msearch}, so a search inside a batch is the same search it would be on its
@@ -435,7 +539,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @param source the parsed search
      * @param counting whether this is a {@code _count}, which fetches nothing and counts everything
      */
-    static void applyDefaults(SearchSourceBuilder source, boolean counting) {
+    public static void applyDefaults(SearchSourceBuilder source, boolean counting) {
         if (counting) {
             // A count asks how many, not which. Fetching hits to throw them away would make the cheap
             // question cost the same as the expensive one, and a count is exact by definition.
@@ -481,8 +585,33 @@ public final class SearchHandler extends BaseRestHandler {
      * @return the indices and their shard counts, or the refusal
      * @throws IOException if a register cannot be read
      */
-    static Resolution resolveIndices(MetadataPlane metadata, ServerlessNode serving, String index, boolean ignoreUnavailable)
+    public static Resolution resolveIndices(MetadataPlane metadata, ServerlessNode serving, String index, boolean ignoreUnavailable)
         throws IOException {
+        return resolveIndices(metadata, serving, index, ignoreUnavailable, true);
+    }
+
+    /**
+     * Resolves names for a caller that may or may not be on the request path.
+     *
+     * <p>A plugin's index is unreachable through REST and is exactly what the plugin's own client exists
+     * to reach, so the guard is the one thing that differs between the two callers of this method; the
+     * resolution of lists, aliases and patterns is deliberately the same code for both.
+     *
+     * @param metadata the metadata plane
+     * @param serving the node, for its pattern cap
+     * @param index the names as the caller wrote them, comma-separated
+     * @param ignoreUnavailable whether a name that is not there is an expectation rather than a mistake
+     * @param throughRequestPath whether a plugin's index is out of reach for this caller
+     * @return the indices and their shard counts, or the refusal
+     * @throws IOException if a register cannot be read
+     */
+    public static Resolution resolveIndices(
+        MetadataPlane metadata,
+        ServerlessNode serving,
+        String index,
+        boolean ignoreUnavailable,
+        boolean throughRequestPath
+    ) throws IOException {
         final java.util.List<String> requested = java.util.List.of(index.split(",", -1));
         for (String name : requested) {
             if (name.isEmpty()) {
@@ -550,6 +679,8 @@ public final class SearchHandler extends BaseRestHandler {
         }
         final java.util.LinkedHashMap<String, IndexDescriptor> indices = new java.util.LinkedHashMap<>();
         final java.util.List<String> skipped = new java.util.ArrayList<>();
+        // Pattern matches that belong to a plugin, left out of the answer and out of every message.
+        final java.util.List<String> hidden = new java.util.ArrayList<>();
         for (String name : names) {
             // One read tells us whether the name is an index or an alias, because both live in the same
             // register. An alias is expanded here rather than deeper down, so everything below this line
@@ -572,9 +703,18 @@ public final class SearchHandler extends BaseRestHandler {
                 return Resolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name);
             }
             if (resolved.index() != null) {
-                if (serving.isSystemIndex(name)) {
-                    // Checked here, on the resolved name, and not only on the path parameter: a comma list,
-                    // a prefix pattern or a body index used to walk straight past the guard.
+                if (throughRequestPath && serving.isSystemIndex(name)) {
+                    if (fromPattern.contains(name)) {
+                        // A pattern is a filter over what the caller may see, and a plugin's index is not
+                        // in that set -- the listing endpoints already leave it out. Refusing the whole
+                        // search here made GET /*/_search fail for everyone the moment a plugin created
+                        // its index, and spelled the name in the refusal.
+                        hidden.add(name);
+                        continue;
+                    }
+                    // Checked here, on the resolved name, and not only on the path parameter: a comma list
+                    // or a body index used to walk straight past the guard. A name the caller typed is
+                    // refused as before; the name was theirs to begin with.
                     return Resolution.refuse(
                         RestStatus.FORBIDDEN,
                         "system_index",
@@ -602,7 +742,7 @@ public final class SearchHandler extends BaseRestHandler {
                         "alias [" + name + "] names [" + target + "], which does not exist"
                     );
                 }
-                if (serving.isSystemIndex(target)) {
+                if (throughRequestPath && serving.isSystemIndex(target)) {
                     return Resolution.refuse(
                         RestStatus.FORBIDDEN,
                         "system_index",
@@ -613,6 +753,14 @@ public final class SearchHandler extends BaseRestHandler {
             }
         }
         if (indices.isEmpty()) {
+            final java.util.List<String> visible = new java.util.ArrayList<>(names);
+            visible.removeAll(hidden);
+            if (visible.isEmpty()) {
+                // Everything the patterns matched was a plugin's. To this caller that is a pattern that
+                // matched nothing, and it is answered as one -- without the names, which are not theirs
+                // to learn from an error message.
+                return Resolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + index + "]");
+            }
             // Every name was absent. Answering 200 with no hits here would be the very thing the flag is
             // not for: the caller allowed for *some* of their indices to be missing, not all of them, and
             // an empty answer over nothing at all is indistinguishable from an empty answer over
@@ -620,7 +768,7 @@ public final class SearchHandler extends BaseRestHandler {
             return Resolution.refuse(
                 RestStatus.NOT_FOUND,
                 "index_not_found",
-                "none of the indices named exist: " + String.join(", ", names)
+                "none of the indices named exist: " + String.join(", ", visible)
             );
         }
         return new Resolution(indices, skipped, null, null, null);
@@ -643,7 +791,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @param source the parsed search
      * @return why it cannot be served, or null
      */
-    static String whatCannotBeMerged(SearchSourceBuilder source) {
+    public static String whatCannotBeMerged(SearchSourceBuilder source) {
         if (source.searchAfter() != null) {
             // The two things that make a cursor a cursor. Without a sort there is no order for "after" to
             // be after, and OpenSearch's own answer to search_after with from is the same refusal: the
@@ -697,10 +845,16 @@ public final class SearchHandler extends BaseRestHandler {
     /**
      * Runs a search through the plugins' action filters.
      *
+     * @param <T> what the work produces
+     * @param serving the node whose filters run
+     * @param indices every index the search covers
+     * @param source the search as parsed
+     * @param work the search, given the source as the filters left it
+     * @return what the work produced, as the filters left it
      * @throws IOException if the search fails; a filter's own refusal is a runtime exception and passes
      *     through carrying the plugin's status
      */
-    static <T> T gated(
+    public static <T> T gated(
         ServerlessNode serving,
         java.util.Collection<String> indices,
         SearchSourceBuilder source,
@@ -805,6 +959,19 @@ public final class SearchHandler extends BaseRestHandler {
         return name.endsWith("*") && name.indexOf('*') == name.length() - 1;
     }
 
+    /** Whether a frozen shard failed to open because its record had gone, anywhere in the cause chain. */
+    private static boolean noLongerHeld(Throwable e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause.getMessage() != null && cause.getMessage().contains("no longer held")) {
+                return true;
+            }
+            if (cause == cause.getCause()) {
+                break;
+            }
+        }
+        return false;
+    }
+
     private void respondFrozen(
         org.opensearch.rest.RestChannel channel,
         ServerlessNode serving,
@@ -817,12 +984,30 @@ public final class SearchHandler extends BaseRestHandler {
         java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess
     ) throws IOException {
         final long startNanos = System.nanoTime();
-        final var outcome = gated(
-            serving,
-            java.util.List.of(pit.index()),
-            source,
-            admitted -> SearchFanout.runFrozen(serving, metadata, pit, admitted)
-        );
+        final org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome;
+        try {
+            outcome = gated(
+                serving,
+                java.util.List.of(pit.index()),
+                source,
+                admitted -> SearchFanout.runFrozen(serving, metadata, pit, admitted)
+            );
+        } catch (Exception e) {
+            if (noLongerHeld(e)) {
+                // Released or expired between this request resolving the record and a shard opening it.
+                // To the caller that is the view being gone, not the node failing.
+                channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.NOT_FOUND,
+                        "pit_not_found",
+                        "no such point in time, or it has expired: " + pit.id()
+                    )
+                );
+                return;
+            }
+            throw e;
+        }
         render(
             channel,
             java.util.List.of(),

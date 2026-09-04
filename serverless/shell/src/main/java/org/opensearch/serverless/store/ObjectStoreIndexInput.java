@@ -73,28 +73,27 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
 
     private byte[] blockAt(long blockIndex) throws IOException {
         final String key = cacheKeyPrefix + "#" + blockIndex;
-        final byte[] cached = cache.get(key);
-        if (cached != null) {
-            return cached;
-        }
-        final int blockSize = cache.blockSize();
-        final long start = blockIndex * blockSize;
-        final int size = (int) Math.min(blockSize, length - start);
-        final byte[] block = new byte[size];
-        // The one range request. Everything else in this class exists so that this asks for as little
-        // as the query actually needs.
-        try (InputStream in = container.readBlob(blobName, start, size)) {
-            int read = 0;
-            while (read < size) {
-                final int n = in.read(block, read, size - read);
-                if (n < 0) {
-                    throw new IOException("short read of " + blobName + " at " + start + ": wanted " + size + ", got " + read);
+        // Single-flighted: a cold block every concurrent query of this segment needs at once is fetched
+        // by the first of them and handed to the rest, rather than fetched once per query.
+        return cache.fetch(key, () -> {
+            final int blockSize = cache.blockSize();
+            final long start = blockIndex * blockSize;
+            final int size = (int) Math.min(blockSize, length - start);
+            final byte[] block = new byte[size];
+            // The one range request. Everything else in this class exists so that this asks for as little
+            // as the query actually needs.
+            try (InputStream in = container.readBlob(blobName, start, size)) {
+                int read = 0;
+                while (read < size) {
+                    final int n = in.read(block, read, size - read);
+                    if (n < 0) {
+                        throw new IOException("short read of " + blobName + " at " + start + ": wanted " + size + ", got " + read);
+                    }
+                    read += n;
                 }
-                read += n;
             }
-        }
-        cache.put(key, block);
-        return block;
+            return block;
+        });
     }
 
     @Override

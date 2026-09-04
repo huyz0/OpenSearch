@@ -57,6 +57,22 @@ public final class PointInTimeHandler extends BaseRestHandler {
     /** The longest a view may be held, so one request cannot pin a commit for a week. */
     static final long MAX_KEEP_ALIVE_MILLIS = 3_600_000L;
 
+    /**
+     * The one refusal for a keep-alive past the maximum, whether it arrives on create or on a page.
+     *
+     * <p>Refused rather than clamped. A caller asking for a day and being handed an hour, with a 200,
+     * finds out when their paging fails at minute sixty-one -- which is exactly the kind of quiet
+     * substitution a keep-alive exists to make unnecessary. The search path used to clamp where this
+     * path refused, so the same request got two answers depending on which endpoint carried it.
+     *
+     * @return the reason
+     */
+    static String keepAliveTooLong() {
+        return "keep_alive may be at most "
+            + org.opensearch.common.unit.TimeValue.timeValueMillis(MAX_KEEP_ALIVE_MILLIS)
+            + "; a view pins a commit's files for as long as it lives";
+    }
+
     private final Supplier<ServerlessNode> node;
     private final Supplier<MetadataPlane> plane;
 
@@ -186,18 +202,8 @@ public final class PointInTimeHandler extends BaseRestHandler {
             });
         }
         if (keepAlive > MAX_KEEP_ALIVE_MILLIS) {
-            // Refused rather than clamped. A caller asking for a day and being handed an hour, with a 200,
-            // finds out when their paging fails at minute sixty-one -- which is exactly the kind of quiet
-            // substitution a keep-alive exists to make unnecessary.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "keep_alive_too_long",
-                    "keep_alive may be at most "
-                        + org.opensearch.common.unit.TimeValue.timeValueMillis(MAX_KEEP_ALIVE_MILLIS)
-                        + "; a view pins a commit's files for as long as it lives"
-                )
+                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "keep_alive_too_long", keepAliveTooLong())
             );
         }
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
@@ -228,11 +234,42 @@ public final class PointInTimeHandler extends BaseRestHandler {
         long keepAlive,
         org.opensearch.core.xcontent.ToXContent.Params params
     ) throws IOException {
-        final Optional<IndexDescriptor> descriptor = metadata.describe(index);
-        if (descriptor.isEmpty()) {
+        if (index.indexOf(',') >= 0 || index.indexOf('*') >= 0 || index.indexOf('?') >= 0) {
+            // A record freezes one index's commits, shard by shard; a list or a pattern would need a
+            // record that names an index per shard entry, which this one does not. Said as what it is,
+            // rather than as "no such index" for a name that was never meant to be one.
+            channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_point_in_time",
+                    "a point in time here is taken over one index, and [" + index + "] names several; take one per index"
+                )
+            );
+            return;
+        }
+        final var resolved = metadata.resolve(index);
+        if (resolved.absent()) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
             return;
         }
+        if (resolved.index() == null) {
+            // An alias. Core freezes every index behind it; this record holds one index, so the honest
+            // answer names the indices the caller can freeze rather than claiming the alias does not exist.
+            channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_point_in_time",
+                    "["
+                        + index
+                        + "] is an alias, and a point in time here is taken over one index; take one over each of "
+                        + resolved.alias().indices()
+                )
+            );
+            return;
+        }
+        final Optional<IndexDescriptor> descriptor = Optional.of(resolved.index());
 
         final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
         for (int shard = 0; shard < descriptor.get().numberOfShards(); shard++) {
@@ -255,7 +292,9 @@ public final class PointInTimeHandler extends BaseRestHandler {
         }
 
         final long now = metadata.clock().getAsLong();
-        final PointInTime pit = new PointInTime(UUIDs.randomBase64UUID(), index, now + keepAlive, shards);
+        // With the index's uuid: a view of "logs" must not outlive a delete-and-recreate of the name, or its
+        // manifest would be looked up under the new index's bytes and served as frozen.
+        final PointInTime pit = new PointInTime(UUIDs.randomBase64UUID(), index, descriptor.get().uuid(), now + keepAlive, shards);
         // Written before it is answered with, because the collector reads these and a view nobody had
         // recorded would be a promise the sweep never heard.
         metadata.createPointInTime(pit);

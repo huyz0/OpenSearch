@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.shard;
 
+import org.apache.lucene.index.IndexCommit;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -17,6 +18,8 @@ import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.UnassignedInfo;
+import org.opensearch.common.concurrent.GatedCloseable;
+import org.opensearch.common.lease.Releasable;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexService;
@@ -27,6 +30,7 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason;
 import org.opensearch.indices.recovery.RecoveryState;
 import org.opensearch.serverless.cluster.ShardAssignment;
+import org.opensearch.serverless.metadata.PointInTime;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
 
@@ -38,6 +42,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Opens and closes shards on this node.
@@ -58,12 +63,26 @@ import java.util.concurrent.ConcurrentHashMap;
  * closes anything, and {@link #releaseShard} takes a shard id the caller must have obtained from truth.
  * There is deliberately no method that accepts a view and closes what is missing from it, which is the
  * shape {@code IndicesClusterStateService} uses and the reason it is replaced rather than reused.
+ *
+ * <p><b>The second invariant: local disk never outranks the published commit.</b> Every shard here —
+ * writer, reader, frozen view — opens on a directory that reads published segments from the object store
+ * and keeps only what this node itself writes on local disk. Local disk is a cache of one node's own
+ * output, and it outlives the node's tenure of a shard: a writer fenced after a local flush leaves a
+ * segment on disk that its successor, restoring the same commit, will name identically and fill with
+ * other bytes. A directory that preferred the local copy served the fenced writer's documents under the
+ * successor's manifest — a confidently wrong answer, not an error. So before any open, every local file
+ * the manifest names is deleted, and every local commit with it; what remains local is either what the
+ * engine is about to write or an unreferenced leftover Lucene removes on open.
  */
 public final class ShardReconciler {
+
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(ShardReconciler.class);
 
     private final IndicesService indicesService;
     private final DiscoveryNode localNode;
     private final Map<ShardId, IndexShard> open = new ConcurrentHashMap<>();
+    /** Queries running against each shard right now, so a release does not close a reader mid-query. */
+    private final Map<ShardId, java.util.concurrent.atomic.AtomicInteger> inFlight = new ConcurrentHashMap<>();
     private final Set<ShardId> readers = ConcurrentHashMap.newKeySet();
     private volatile java.util.function.Function<ShardId, SegmentPublisher> publishers;
     private volatile java.util.function.Function<ShardId, org.opensearch.serverless.store.WalStore> walStores;
@@ -123,6 +142,34 @@ public final class ShardReconciler {
         return walCache.computeIfAbsent(shardId, walStores);
     }
 
+    /** Per writer shard, the lock that keeps a commit from landing between an apply and its append. */
+    private final Map<ShardId, ReentrantReadWriteLock> writeGuards = new ConcurrentHashMap<>();
+
+    private ReentrantReadWriteLock guardFor(ShardId shardId) {
+        return writeGuards.computeIfAbsent(shardId, ignored -> new ReentrantReadWriteLock());
+    }
+
+    /**
+     * Holds a write's place against the publish path's commit, from before the engine applies it until its
+     * log record is durable.
+     *
+     * <p><b>What this closes.</b> A write is applied to the engine and then appended to the log; a publish
+     * flushes the engine and then swaps the manifest. With nothing between them, a flush can land between
+     * an apply and its append: the commit contains the operation, the append then fails, the shard is
+     * released and the caller is told the write was not acknowledged — and the successor restores the
+     * commit and serves it. The refusal was a lie. A write holds this in read mode across apply and
+     * append; {@link #publish} takes it in write mode around the flush only, so publishes still overlap
+     * with uploads and writes still overlap with each other.
+     *
+     * @param shardId the shard being written
+     * @return the hold, to be released once the append has landed or failed
+     */
+    public Releasable writeGuard(ShardId shardId) {
+        final ReentrantReadWriteLock.ReadLock lock = guardFor(shardId).readLock();
+        lock.lock();
+        return lock::unlock;
+    }
+
     /**
      * Publishes a shard's current commit to the object store.
      *
@@ -145,11 +192,24 @@ public final class ShardReconciler {
             throw new IOException("cannot publish " + shardId + ": it is open as a reader and owns no head");
         }
         // A commit must exist before there is anything to publish; an unflushed shard has its data only
-        // in the translog, which this does not upload.
-        shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
-        // Named, so a manifest says who wrote it. A term is not an identity: the publish fence refuses a
-        // newer term and cannot tell two nodes holding the same one apart.
-        final CommitManifest manifest = publisherCache.computeIfAbsent(shardId, publishers).publish(shard.store(), term, localNode.getId());
+        // in the translog, which this does not upload. Under the write guard, so the commit cannot split
+        // an apply from its append -- see writeGuard for the lie that would tell.
+        final ReentrantReadWriteLock.WriteLock exclusive = guardFor(shardId).writeLock();
+        exclusive.lock();
+        try {
+            shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
+        } finally {
+            exclusive.unlock();
+        }
+        final CommitManifest manifest;
+        // The commit is pinned for the length of the upload. Without the pin, a periodic flush landing
+        // mid-upload let the deletion policy remove a file only the older commit referenced, and the
+        // upload failed on a file that had been there a moment ago.
+        try (GatedCloseable<IndexCommit> commit = shard.acquireLastIndexCommit(false)) {
+            // Named, so a manifest says who wrote it. A term is not an identity: the publish fence refuses
+            // a newer term and cannot tell two nodes holding the same one apart.
+            manifest = publisherCache.computeIfAbsent(shardId, publishers).publish(shard.store(), commit.get(), term, localNode.getId());
+        }
         final var walForPublish = wal(shardId);
         if (walForPublish != null) {
             // Only after the commit is durable in the object store. Truncation drops what the previous
@@ -187,7 +247,11 @@ public final class ShardReconciler {
             if (open.containsKey(shardId)) {
                 continue;
             }
-            open.put(shardId, openAndStart(indexMetadata, shardId, assignment.term(), view.nodes(), true, false));
+            // A writer opens lazily too. It used to download every published file first, which made a
+            // cold start proportional to the shard rather than to what the first write touches; a merge
+            // reads its inputs through the block cache and writes its output locally, and the publisher
+            // inherits unchanged files by name, so nothing about publishing needed the download.
+            openAndStart(onBlockCache(indexMetadata), shardId, assignment.term(), view.nodes(), true, null);
             opened.add(shardId);
         }
         return opened;
@@ -201,8 +265,32 @@ public final class ShardReconciler {
     /** When each open shard was last touched by a request. */
     private final java.util.concurrent.ConcurrentHashMap<ShardId, Long> lastUsed = new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** One monitor per index, guarding the create-or-update of its {@link IndexService}. */
+    /**
+     * One monitor per index, guarding the create-or-update of its {@link IndexService}.
+     *
+     * <p>Evicted when the index's last shard closes, under the monitor itself, so a node that churns
+     * through many indices — every frozen view is one — does not keep a lock object per index it ever
+     * held. A thread that took the monitor from the map just before it was evicted re-reads the map after
+     * acquiring it and goes round again, which is the only way a removed monitor can be told apart from a
+     * live one.
+     */
     private final java.util.concurrent.ConcurrentHashMap<Index, Object> indexLocks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Shards between {@code createShard} and being recorded as open, so an index's service is not closed
+     * underneath a shard of it that is still being built.
+     */
+    private final Set<ShardId> opening = ConcurrentHashMap.newKeySet();
+
+    /**
+     * The commit each shard currently being opened is opening at, for the directory factory.
+     *
+     * <p>The reconciler reads a shard's manifest once to decide how to open it; the directory the store
+     * then builds needs the same manifest, and used to read it again. Armed here from before the shard is
+     * created until it is open, so the factory can take the one already in hand — see
+     * {@link #pendingManifest}.
+     */
+    private final Map<ShardId, CommitManifest> pendingManifests = new ConcurrentHashMap<>();
 
     /**
      * The log a shard currently being opened should replay, for the moments its engine is being built.
@@ -247,15 +335,35 @@ public final class ShardReconciler {
         return wal.replayable(pendingCutoff.get(shardId));
     }
 
-    private IndexShard openAndStart(
-        IndexMetadata indexMetadata,
-        ShardId shardId,
-        long shardHeadTerm,
-        DiscoveryNodes nodes,
-        boolean replayWal,
-        boolean lazy
-    ) throws IOException {
-        return openAndStart(indexMetadata, shardId, shardHeadTerm, nodes, replayWal, lazy, null);
+    /**
+     * Returns the commit a shard being opened right now is opening at, for the store's directory factory.
+     *
+     * <p>Armed for exactly the window in which the shard's {@code Store} is built; empty at any other
+     * time, when the factory should read the register itself. A frozen view's slot holds the frozen commit
+     * under the view's own index identity, so the factory need not read the view's record either.
+     *
+     * @param index the index the store is being built for, a view's synthetic identity included
+     * @param shardNumber the shard
+     * @return the commit, if one is armed
+     */
+    public Optional<CommitManifest> pendingManifest(Index index, int shardNumber) {
+        return Optional.ofNullable(pendingManifests.get(new ShardId(index, shardNumber)));
+    }
+
+    /** The given index, served from the block-cache directory: published segments remote, own output local. */
+    private static IndexMetadata onBlockCache(IndexMetadata indexMetadata) {
+        final String storeType = org.opensearch.serverless.shell.ServerlessNode.BLOCK_CACHE_STORE_TYPE;
+        if (storeType.equals(indexMetadata.getSettings().get("index.store.type"))) {
+            return indexMetadata;
+        }
+        return IndexMetadata.builder(indexMetadata)
+            .settings(
+                org.opensearch.common.settings.Settings.builder()
+                    .put(indexMetadata.getSettings())
+                    .put("index.store.type", storeType)
+                    .build()
+            )
+            .build();
     }
 
     /**
@@ -263,7 +371,8 @@ public final class ShardReconciler {
      *     publisher for the current one. A frozen view has to pass it, for two reasons: the commit it
      *     wants is by definition not the current one, and its synthetic index uuid has no manifest
      *     register of its own, so asking would answer "nothing published" and start an empty shard --
-     *     which is a wrong answer that looks exactly like a right one.
+     *     which is a wrong answer that looks exactly like a right one. A reader passes the one it read to
+     *     decide whether it could open at all, so an open reads the register once.
      */
     private IndexShard openAndStart(
         IndexMetadata indexMetadata,
@@ -271,179 +380,237 @@ public final class ShardReconciler {
         long shardHeadTerm,
         DiscoveryNodes nodes,
         boolean replayWal,
-        boolean lazy,
         CommitManifest knownCommit
     ) throws IOException {
+        opening.add(shardId);
+        try {
+            final IndexService indexService = indexServiceFor(indexMetadata);
+
+            // Whether anything was published decides the recovery source, and the decision must be made
+            // before the shard is created because the source is baked into its routing entry.
+            final SegmentPublisher publisher = publishers == null ? null : publishers.apply(shardId);
+            final Optional<CommitManifest> published = knownCommit != null
+                ? Optional.of(knownCommit)
+                : (publisher == null ? Optional.empty() : publisher.readManifest());
+            final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
+
+            final ShardRouting initializing = ShardRouting.newUnassigned(
+                shardId,
+                true,
+                restoring ? RecoverySource.ExistingStoreRecoverySource.INSTANCE : RecoverySource.EmptyStoreRecoverySource.INSTANCE,
+                new UnassignedInfo(UnassignedInfo.Reason.INDEX_CREATED, "serverless activation")
+            ).initialize(localNode.getId(), null, ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE);
+
+            final IndexShard shard;
+            published.ifPresent(manifest -> pendingManifests.put(shardId, manifest));
+            try {
+                shard = indexService.createShard(
+                    initializing,
+                    ignored -> {},
+                    RetentionLeaseSyncer.EMPTY,
+                    null,
+                    null,
+                    null,
+                    localNode,
+                    null,
+                    nodes,
+                    new MergedSegmentWarmerFactory(null, null, null),
+                    null,
+                    null
+                );
+            } finally {
+                pendingManifests.remove(shardId);
+            }
+
+            // From here the IndexService holds a shard that is not yet ours. Anything that fails before
+            // it is must take the shard back out, or the next attempt is refused with "already exists"
+            // for as long as the process lives -- while the head still names this node, so nobody else
+            // can take it either. That was a permanent single-shard outage from one object-store hiccup.
+            try {
+                if (restoring) {
+                    // Whatever the manifest names is the truth and is read from the object store; a
+                    // same-named local file is this node's own earlier output and may not be the same
+                    // bytes. Local commits go too, so the history bootstrap below starts from the
+                    // published segments_N rather than from a stale local one that happens to be newer.
+                    dropLocalFilesNamedBy(shard.store().directory(), published.get());
+                    // A translog is still needed, because recovery reads one and a node taking a shard
+                    // over has none.
+                    bootstrapTranslogFor(shard);
+                }
+
+                if (replayWal && walStores != null) {
+                    // Armed for exactly the window in which the engine is built and recovery runs, which is
+                    // the only window in which core will accept operations carrying their own sequence
+                    // numbers.
+                    final org.opensearch.serverless.store.WalStore log = wal(shardId);
+                    pendingReplay.put(shardId, log);
+                    // Seal the log before recovery reads anything, so a predecessor that has not yet noticed
+                    // it lost this shard cannot have its later appends replayed as acknowledged history. The
+                    // seal is durable, so it binds every later successor too and not just this recovery --
+                    // see WalStore#sealAt for why that distinction is the whole point.
+                    //
+                    // <b>The window this leaves is real and worth naming.</b> The shard-head was won earlier,
+                    // in MetadataPlane#activate, and anything the predecessor appends between that moment and
+                    // this one still falls inside the seal. Narrowing it further means sealing at the
+                    // compare-and-swap, which the path that opens a shard from projected truth rather than
+                    // from an acquisition does not have. What is closed here is the unbounded half: after
+                    // this point the predecessor can append for as long as it likes and none of it is ever
+                    // read, by anyone.
+                    pendingCutoff.put(shardId, log.sealAt(shardHeadTerm));
+                }
+                try {
+                    shard.markAsRecovering("serverless-store", new RecoveryState(initializing, localNode, null));
+                    final PlainActionFuture<Boolean> recovered = PlainActionFuture.newFuture();
+                    shard.recoverFromStore(recovered);
+                    if (Boolean.TRUE.equals(recovered.actionGet()) == false) {
+                        throw new IOException("recovery from store reported failure for " + shardId);
+                    }
+                } finally {
+                    pendingReplay.remove(shardId);
+                    pendingCutoff.remove(shardId);
+                }
+
+                final ShardRouting started = initializing.moveToStarted();
+                // The applying version is the SHARD-HEAD TERM, not the projected view's version. S1
+                // reproduced what happens when a per-node counter is used here: the update is silently
+                // ignored, because ReplicationTracker gates on > against a value that may have crossed a
+                // node boundary.
+                shard.updateShardState(
+                    started,
+                    shardHeadTerm,
+                    null,
+                    shardHeadTerm,
+                    Set.of(started.allocationId().getId()),
+                    new IndexShardRoutingTable.Builder(shardId).addShard(started).build(),
+                    nodes
+                );
+
+                if (replayWal && walStores != null) {
+                    replayRecordsWithoutSequenceIdentity(shard, shardId);
+                }
+                open.put(shardId, shard);
+                return shard;
+            } catch (Exception e) {
+                abandon(indexService, shardId, e);
+                throw e;
+            }
+        } finally {
+            opening.remove(shardId);
+        }
+    }
+
+    /** Creates the index's service or refreshes its metadata, under the index's monitor. */
+    private IndexService indexServiceFor(IndexMetadata indexMetadata) throws IOException {
         final Index index = indexMetadata.getIndex();
-        final IndexService indexService;
         // Locked per index, because this is a check-then-act and shards of one index now open at the same
         // time. Sequentially it was safe by luck; the moment the search fan-out became concurrent, three
         // shards of one index raced here and two lost with ResourceAlreadyExistsException -- reported as
         // two unreachable shards, which reads like a routing problem and is not one. IndexService.createShard
         // is itself synchronized, so only this acquisition needs guarding and shard opening stays parallel.
-        synchronized (indexLocks.computeIfAbsent(index, ignored -> new Object())) {
-            IndexService existing = indicesService.indexService(index);
-            if (existing == null) {
-                existing = indicesService.createIndex(indexMetadata, Collections.emptyList(), false);
-                existing.updateMapping(null, indexMetadata);
-            } else {
-                // The IndexService is created once per index but shards arrive one at a time, so by the
-                // time the second shard opens its metadata is stale -- in particular its per-shard primary
-                // terms. A shard created from stale metadata starts at the old term and then gets
-                // updateShardState at the new one, which the data plane rejects: "term is only increased
-                // as part of primary promotion". Found by the first multi-shard test; every earlier one
-                // had a single shard.
-                existing.updateMetadata(existing.getMetadata(), indexMetadata);
+        while (true) {
+            final Object lock = indexLocks.computeIfAbsent(index, ignored -> new Object());
+            synchronized (lock) {
+                if (indexLocks.get(index) != lock) {
+                    // Evicted between the lookup and the acquisition; the current one is the monitor.
+                    continue;
+                }
+                IndexService existing = indicesService.indexService(index);
+                if (existing == null) {
+                    existing = indicesService.createIndex(indexMetadata, Collections.emptyList(), false);
+                    existing.updateMapping(null, indexMetadata);
+                } else {
+                    // The IndexService is created once per index but shards arrive one at a time, so by the
+                    // time the second shard opens its metadata is stale -- in particular its per-shard
+                    // primary terms. A shard created from stale metadata starts at the old term and then
+                    // gets updateShardState at the new one, which the data plane rejects: "term is only
+                    // increased as part of primary promotion". Found by the first multi-shard test; every
+                    // earlier one had a single shard.
+                    final IndexMetadata current = existing.getMetadata();
+                    // At the same settings version the settings are, by definition, the same ones -- what
+                    // this call carries is the terms. Handing core different settings at an unchanged
+                    // version is an assertion failure in IndexService#updateMetadata, and the store type
+                    // set on open is exactly such a difference once a settings refresh has been applied.
+                    final IndexMetadata refreshed = current.getSettingsVersion() == indexMetadata.getSettingsVersion()
+                        ? IndexMetadata.builder(indexMetadata).settings(current.getSettings()).build()
+                        : indexMetadata;
+                    existing.updateMetadata(current, refreshed);
+                }
+                return existing;
             }
-            indexService = existing;
         }
+    }
 
-        // Whether anything was published decides the recovery source, and the decision must be made
-        // before the shard is created because the source is baked into its routing entry.
-        final SegmentPublisher publisher = publishers == null ? null : publishers.apply(shardId);
-        final Optional<CommitManifest> published = knownCommit != null
-            ? Optional.of(knownCommit)
-            : (publisher == null ? Optional.empty() : publisher.readManifest());
-        final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
-
-        final ShardRouting initializing = ShardRouting.newUnassigned(
-            shardId,
-            true,
-            restoring ? RecoverySource.ExistingStoreRecoverySource.INSTANCE : RecoverySource.EmptyStoreRecoverySource.INSTANCE,
-            new UnassignedInfo(UnassignedInfo.Reason.INDEX_CREATED, "serverless activation")
-        ).initialize(localNode.getId(), null, ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE);
-
-        final IndexShard shard = indexService.createShard(
-            initializing,
-            ignored -> {},
-            RetentionLeaseSyncer.EMPTY,
-            null,
-            null,
-            null,
-            localNode,
-            null,
-            nodes,
-            new MergedSegmentWarmerFactory(null, null, null),
-            null,
-            null
-        );
-
-        if (restoring) {
-            if (lazy == false) {
-                // A writer needs a local, writable copy it can merge into, so it downloads. Between
-                // createShard and recovery: the store exists but nothing has opened it yet. Using
-                // EMPTY_STORE here instead would call Store#createEmpty and delete exactly this.
-                publisher.restoreInto(shard.store().directory(), shardId);
-            } else {
-                // A reader keeps its local directory across releases, and the history bootstrap below
-                // writes a local segments_{N+1} over the remote segments_N. The writer's next publish is
-                // also segments_{N+1}, and the directory prefers the local file -- so a reopened reader
-                // loaded its own stale commit and recorded the new manifest as current, one commit behind
-                // forever. Local commit files are dropped first; the remote ones are the truth.
-                dropLocalCommits(shard.store().directory());
+    /** Takes a shard that never became ours back out of its IndexService, keeping the cause's own report. */
+    private void abandon(IndexService indexService, ShardId shardId, Exception cause) {
+        try {
+            if (indexService.hasShard(shardId.id())) {
+                indexService.removeShard(shardId.id(), "activation failed: " + cause.getMessage());
             }
-            // A reader skips the download entirely: its directory already sees the published files and
-            // fetches the blocks a query touches. Both still need a translog, because recovery reads
-            // one and a node taking a shard over has none.
-            bootstrapTranslogFor(shard);
-        }
-
-        if (replayWal && walStores != null) {
-            // Armed for exactly the window in which the engine is built and recovery runs, which is the
-            // only window in which core will accept operations carrying their own sequence numbers.
-            final org.opensearch.serverless.store.WalStore log = wal(shardId);
-            pendingReplay.put(shardId, log);
-            // Seal the log before recovery reads anything, so a predecessor that has not yet noticed it lost
-            // this shard cannot have its later appends replayed as acknowledged history. The seal is
-            // durable, so it binds every later successor too and not just this recovery -- see
-            // WalStore#sealAt for why that distinction is the whole point.
-            //
-            // <b>The window this leaves is real and worth naming.</b> The shard-head was won earlier, in
-            // MetadataPlane#activate, and anything the predecessor appends between that moment and this one
-            // still falls inside the seal. Narrowing it further means sealing at the compare-and-swap,
-            // which the path that opens a shard from projected truth rather than from an acquisition does
-            // not have. What is closed here is the unbounded half: after this point the predecessor can
-            // append for as long as it likes and none of it is ever read, by anyone.
-            pendingCutoff.put(shardId, log.sealAt(shardHeadTerm));
+        } catch (Exception e) {
+            cause.addSuppressed(e);
         }
         try {
-            shard.markAsRecovering("serverless-store", new RecoveryState(initializing, localNode, null));
-            final PlainActionFuture<Boolean> recovered = PlainActionFuture.newFuture();
-            shard.recoverFromStore(recovered);
-            if (Boolean.TRUE.equals(recovered.actionGet()) == false) {
-                throw new IOException("recovery from store reported failure for " + shardId);
-            }
-        } finally {
-            pendingReplay.remove(shardId);
-            pendingCutoff.remove(shardId);
+            opening.remove(shardId);
+            closeIndexIfUnused(shardId.getIndex(), "activation failed: " + cause.getMessage(), false);
+        } catch (Exception e) {
+            cause.addSuppressed(e);
         }
+    }
 
-        final ShardRouting started = initializing.moveToStarted();
-        // The applying version is the SHARD-HEAD TERM, not the projected view's version. S1 reproduced
-        // what happens when a per-node counter is used here: the update is silently ignored, because
-        // ReplicationTracker gates on > against a value that may have crossed a node boundary.
-        shard.updateShardState(
-            started,
-            shardHeadTerm,
-            null,
-            shardHeadTerm,
-            Set.of(started.allocationId().getId()),
-            new IndexShardRoutingTable.Builder(shardId).addShard(started).build(),
-            nodes
-        );
-
-        if (replayWal && walStores != null) {
-            // Only what the engine could not replay for itself: records written before the log carried
-            // sequence numbers. Everything else was replayed during recovery, as the operation it
-            // originally was, by ServerlessWriterEngine -- which is what makes _seq_no survive a failover.
-            //
-            // These go in the old way, as fresh primary operations, because a record that does not say
-            // which operation it was cannot be replayed as that operation. They therefore get new
-            // sequence numbers, exactly as every replayed record used to. Dropping them instead would
-            // turn a format change into silent data loss.
-            final var wal = wal(shardId);
-            int replayed = 0;
-            for (org.opensearch.serverless.store.WalRecord record : wal.replayable()) {
-                if (record.hasSequenceIdentity()) {
-                    continue;
-                }
-                if (record.isDeletion()) {
-                    // Replayed in order with the writes, which is the only thing that makes the result
-                    // correct: a document written, deleted, and written again must end up present, and a
-                    // document written and deleted must end up gone. Applying all the writes and then all
-                    // the deletes would get the first case wrong.
-                    shard.applyDeleteOperationOnPrimary(
-                        org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                        record.id(),
-                        org.opensearch.index.VersionType.INTERNAL,
-                        org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                        0
-                    );
-                    replayed++;
-                    continue;
-                }
-                shard.applyIndexOperationOnPrimary(
+    /**
+     * Applies the records recovery could not replay for itself: those written before the log carried
+     * sequence numbers. Everything else was replayed during recovery, as the operation it originally was,
+     * by ServerlessWriterEngine -- which is what makes _seq_no survive a failover.
+     *
+     * <p>These go in the old way, as fresh primary operations, because a record that does not say which
+     * operation it was cannot be replayed as that operation. They therefore get new sequence numbers,
+     * exactly as every replayed record used to. Dropping them instead would turn a format change into
+     * silent data loss.
+     */
+    private void replayRecordsWithoutSequenceIdentity(IndexShard shard, ShardId shardId) throws IOException {
+        final var wal = wal(shardId);
+        int replayed = 0;
+        for (org.opensearch.serverless.store.WalRecord record : wal.replayable()) {
+            if (record.hasSequenceIdentity()) {
+                continue;
+            }
+            if (record.isDeletion()) {
+                // Replayed in order with the writes, which is the only thing that makes the result
+                // correct: a document written, deleted, and written again must end up present, and a
+                // document written and deleted must end up gone. Applying all the writes and then all
+                // the deletes would get the first case wrong.
+                shard.applyDeleteOperationOnPrimary(
                     org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                    record.id(),
                     org.opensearch.index.VersionType.INTERNAL,
-                    new org.opensearch.index.mapper.SourceToParse(
-                        shardId.getIndexName(),
-                        record.id(),
-                        new org.opensearch.core.common.bytes.BytesArray(record.source()),
-                        org.opensearch.common.xcontent.XContentType.JSON
-                    ),
                     org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                    0,
-                    org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
-                    false
+                    0
                 );
                 replayed++;
+                continue;
             }
-            if (replayed > 0) {
-                shard.sync();
-                shard.refresh("serverless-wal-replay");
-            }
+            shard.applyIndexOperationOnPrimary(
+                org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                org.opensearch.index.VersionType.INTERNAL,
+                new org.opensearch.index.mapper.SourceToParse(
+                    shardId.getIndexName(),
+                    record.id(),
+                    new org.opensearch.core.common.bytes.BytesArray(record.source()),
+                    org.opensearch.common.xcontent.XContentType.JSON
+                ),
+                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                0,
+                org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+                false
+            );
+            replayed++;
         }
-        return shard;
+        if (replayed > 0) {
+            // The replayed operations sit in the translog's write buffer, a page charged to the request breaker,
+            // until synced; the object-store log is the durability, this gives the page back.
+            shard.sync();
+            shard.refresh("serverless-wal-replay");
+        }
     }
 
     /**
@@ -465,6 +632,24 @@ public final class ShardReconciler {
      * @throws IOException if nothing has been published for the shard, or opening fails
      */
     public ShardId openReader(ClusterState view, String indexName, int shardNumber) throws IOException {
+        return openReader(view, indexName, shardNumber, null);
+    }
+
+    /**
+     * Opens a shard as a reader at a commit the caller has already read.
+     *
+     * <p>The caller that projects the view needs the manifest's term before it can project, so it has
+     * read the register already; passing what it read is what makes a reader open cost one register read
+     * rather than one per layer that needs it.
+     *
+     * @param view the node-local view, which must describe the index
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @param known the currently published commit, if the caller has read it; null to read it here
+     * @return the shard id now open as a reader
+     * @throws IOException if nothing has been published for the shard, or opening fails
+     */
+    public ShardId openReader(ClusterState view, String indexName, int shardNumber, CommitManifest known) throws IOException {
         final IndexMetadata indexMetadata = view.metadata().index(indexName);
         if (indexMetadata == null) {
             throw new IllegalStateException("cannot open a reader for " + indexName + ": the view does not describe it");
@@ -476,28 +661,21 @@ public final class ShardReconciler {
         if (open.containsKey(shardId)) {
             return shardId;
         }
-        final CommitManifest manifest = publishers.apply(shardId)
-            .readManifest()
-            .orElseThrow(
-                () -> new IOException(
-                    "cannot serve "
-                        + shardId
-                        + " as a reader: nothing has been published for it. "
-                        + "An empty result here would be indistinguishable from an empty index."
-                )
-            );
+        final CommitManifest manifest = known != null
+            ? known
+            : publishers.apply(shardId)
+                .readManifest()
+                .orElseThrow(
+                    () -> new IOException(
+                        "cannot serve "
+                            + shardId
+                            + " as a reader: nothing has been published for it. "
+                            + "An empty result here would be indistinguishable from an empty index."
+                    )
+                );
         // Readers read blocks; they do not download segments. The store type is set here rather than in
-        // the descriptor because it is a property of how this node is serving the shard, not of the
-        // index -- the same index has writers that need a local, writable copy.
-        final IndexMetadata lazyMetadata = IndexMetadata.builder(indexMetadata)
-            .settings(
-                org.opensearch.common.settings.Settings.builder()
-                    .put(indexMetadata.getSettings())
-                    .put("index.store.type", org.opensearch.serverless.shell.ServerlessNode.BLOCK_CACHE_STORE_TYPE)
-                    .build()
-            )
-            .build();
-        open.put(shardId, openAndStart(lazyMetadata, shardId, manifest.term(), view.nodes(), false, true));
+        // the descriptor because it is a property of how this node is serving the shard, not of the index.
+        openAndStart(onBlockCache(indexMetadata), shardId, manifest.term(), view.nodes(), false, manifest);
         readers.add(shardId);
         // What it is a cache of. A reader never changes commit while it is open -- a ReadOnlyEngine is
         // opened on one and core offers no way to move it -- so the only way to notice the commit has
@@ -517,6 +695,42 @@ public final class ShardReconciler {
      */
     public Optional<CommitManifest> readerCommit(ShardId shardId) {
         return Optional.ofNullable(readerCommits.get(shardId));
+    }
+
+    /**
+     * Opens one shard of a frozen view, refusing a view taken over an earlier index of the same name.
+     *
+     * <p>A view records the uuid of the index it froze. The name it was taken under may since have been
+     * deleted and created again, and the new index's first segments have the same names as the old one's
+     * did — so a view opened by name against the new index would serve the new index's bytes under the old
+     * view's id, or fail on a length mismatch if it was lucky. The uuid is what the view is a view of; a
+     * view whose uuid is not the index's is no longer held, and is refused as such.
+     *
+     * @param indexMetadata the index the view was taken over, as it stands now
+     * @param pit the view
+     * @param shardNumber the shard
+     * @param nodes the node view the shard is started against
+     * @return the shard id the view was opened under
+     * @throws IOException if the shard cannot be opened
+     * @throws IllegalArgumentException if the view is of a different incarnation of the name, or did not
+     *     freeze this shard
+     */
+    public ShardId openFrozenReader(IndexMetadata indexMetadata, PointInTime pit, int shardNumber, DiscoveryNodes nodes)
+        throws IOException {
+        if (pit.indexUuid() != null && pit.indexUuid().equals(indexMetadata.getIndexUUID()) == false) {
+            throw new IllegalArgumentException(
+                "the point in time ["
+                    + pit.id()
+                    + "] was taken over an earlier index named ["
+                    + pit.index()
+                    + "] that has since been deleted; it is no longer held"
+            );
+        }
+        final CommitManifest manifest = pit.shards().get(shardNumber);
+        if (manifest == null) {
+            throw new IllegalArgumentException("the point in time [" + pit.id() + "] did not freeze shard " + shardNumber);
+        }
+        return openFrozenReader(indexMetadata, pit.id(), shardNumber, manifest, nodes);
     }
 
     /**
@@ -566,7 +780,7 @@ public final class ShardReconciler {
                     .build()
             )
             .build();
-        open.put(shardId, openAndStart(frozen, shardId, manifest.term(), nodes, false, true, manifest));
+        openAndStart(frozen, shardId, manifest.term(), nodes, false, manifest);
         readers.add(shardId);
         // A view serves a commit like any other reader, so it records which one. It is exempt from the
         // staleness pass because it is a view, not because it forgot -- and the difference matters: the
@@ -578,7 +792,11 @@ public final class ShardReconciler {
     }
 
     /**
-     * Closes a frozen view, releasing the shards it opened.
+     * Closes a frozen view, releasing the shards it opened and deleting what they left on disk.
+     *
+     * <p>A view's shards live under the view's own uuid, so nothing shares their directory and nothing
+     * will ever open it again: the record it served is gone or expired. Left behind, every point in time
+     * ever taken cost a directory — index and translog — for the life of the node's disk.
      *
      * @param viewId the view's identifier
      * @return how many shards were closed
@@ -589,9 +807,12 @@ public final class ShardReconciler {
             if (shardId.getIndex().getUUID().equals(viewId) == false) {
                 continue;
             }
-            releaseShard(shardId, "the frozen view it served was released");
-            frozenViews.remove(shardId);
-            closed++;
+            // A shard a query is still paging through stays a view, so the next pass finds it and closes
+            // it then; forgetting it here would leave it open and uncounted for the life of the process.
+            if (releaseShard(shardId, "the frozen view it served was released", true)) {
+                frozenViews.remove(shardId);
+                closed++;
+            }
         }
         return closed;
     }
@@ -608,6 +829,33 @@ public final class ShardReconciler {
     }
 
     /**
+     * Removes every local file the published commit names, and every local commit.
+     *
+     * <p>Local disk is this node's own output and it may be stale: the counter that mints segment names
+     * travels in the commit, so a successor restoring this node's last published commit mints the same
+     * next name this node minted for a segment it flushed and never published. A directory that preferred
+     * the local copy would serve those bytes under the successor's manifest. Everything the manifest names
+     * is therefore read from the object store, and every local {@code segments_N} goes so the history
+     * bootstrap starts from the published commit rather than from a local one that happens to be newer.
+     * Whatever else is local and unreferenced, Lucene removes on open.
+     */
+    private static void dropLocalFilesNamedBy(org.apache.lucene.store.Directory directory, CommitManifest manifest) throws IOException {
+        for (String name : directory.listAll()) {
+            final boolean commit = name.startsWith("segments_") || name.startsWith("pending_segments_");
+            if (commit == false && manifest.files().containsKey(name) == false) {
+                continue;
+            }
+            try {
+                // The block-cache directory ignores a delete of a name that is remote only, so this
+                // removes exactly the local copies and leaves the published files where they are.
+                directory.deleteFile(name);
+            } catch (java.nio.file.NoSuchFileException | java.io.FileNotFoundException ignored) {
+                // remote-only, which is the state we want
+            }
+        }
+    }
+
+    /**
      * Gives a restored commit a fresh, empty translog.
      *
      * <p>Restoring segments is not enough on its own: recovery reads a translog whose UUID matches the
@@ -616,22 +864,10 @@ public final class ShardReconciler {
      *
      * <p>The sequence is the one {@code StoreRecovery} uses for snapshot restore, for the same reason —
      * segments arrived from somewhere other than a peer, so the history has to be re-established rather
-     * than continued. Operations the previous writer had accepted but not committed are lost here; that
-     * is what a write-ahead log is for, and this phase does not have one (see phase 4's notes).
+     * than continued. Operations the previous writer had accepted but not committed are replayed from the
+     * write-ahead log, never from a local translog: this deletes the local one, on every open, which is
+     * why fsyncing it per operation buys nothing.
      */
-    /** Removes local {@code segments_*} and {@code pending_segments_*} files so a remote commit is what opens. */
-    private static void dropLocalCommits(org.apache.lucene.store.Directory directory) throws IOException {
-        for (String name : directory.listAll()) {
-            if (name.startsWith("segments_") || name.startsWith("pending_segments_")) {
-                try {
-                    directory.deleteFile(name);
-                } catch (java.nio.file.NoSuchFileException | java.io.FileNotFoundException ignored) {
-                    // remote-only, which is the state we want
-                }
-            }
-        }
-    }
-
     private void bootstrapTranslogFor(IndexShard shard) throws IOException {
         shard.store().bootstrapNewHistory();
         final org.apache.lucene.index.SegmentInfos segmentInfos = shard.store().readLastCommittedSegmentsInfo();
@@ -650,29 +886,119 @@ public final class ShardReconciler {
     }
 
     /**
+     * Marks a query as running against a shard, so a release waits for it.
+     *
+     * <p>Bracketed with {@link #exit} around every local {@code ShardQuery.execute}. A pass that found a
+     * reader's commit superseded used to close it under a running aggregation; the query failed with a
+     * closed reader, which looks like corruption and is a scheduling choice.
+     *
+     * @param shardId the shard
+     */
+    public void enter(ShardId shardId) {
+        inFlight.computeIfAbsent(shardId, ignored -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();
+    }
+
+    /**
+     * Marks a query against a shard as finished.
+     *
+     * @param shardId the shard
+     */
+    public void exit(ShardId shardId) {
+        final java.util.concurrent.atomic.AtomicInteger count = inFlight.get(shardId);
+        if (count != null && count.decrementAndGet() <= 0) {
+            inFlight.remove(shardId, count);
+        }
+    }
+
+    /**
+     * Returns how many queries are running against a shard.
+     *
+     * @param shardId the shard
+     * @return the count
+     */
+    public int inFlight(ShardId shardId) {
+        final java.util.concurrent.atomic.AtomicInteger count = inFlight.get(shardId);
+        return count == null ? 0 : Math.max(0, count.get());
+    }
+
+    /**
      * Closes one shard. This is the <em>only</em> way a shard closes, and the caller must have learned
      * from a shard-head that this node no longer owns it.
+     *
+     * <p>Takes the shard out of the {@code IndexService} whether or not this reconciler had recorded it as
+     * open: a shard whose activation failed part-way is in the service and not in the record, and leaving
+     * it there refuses every later attempt with "already exists".
+     *
+     * <p>A shard with a query running against it is left for the next pass: the caller learned the shard
+     * is not ours from truth that will still say so then, and a query mid-flight losing its reader is the
+     * failure this refuses to cause.
      *
      * @param shardId the shard to release
      * @param reason why, for the log
      */
     public void releaseShard(ShardId shardId, String reason) {
+        releaseShard(shardId, reason, false);
+    }
+
+    /** @return true if the shard was released; false if a query is running against it and it was left */
+    private boolean releaseShard(ShardId shardId, String reason, boolean deleteStore) {
+        final int busy = inFlight(shardId);
+        // Readers only. A writer being released has lost its head, or is about to give it up, and a
+        // writer that stays open past that point would go on acknowledging writes nobody will replay; a
+        // query against it failing on a closed reader is the lesser harm, and the one this always risked.
+        if (busy > 0 && readers.contains(shardId)) {
+            logger.debug(
+                "not releasing {} ({}): {} quer{} still running against it",
+                shardId,
+                reason,
+                busy,
+                busy == 1 ? "y is" : "ies are"
+            );
+            return false;
+        }
         readers.remove(shardId);
         readerCommits.remove(shardId);
         walCache.remove(shardId);
         publisherCache.remove(shardId);
         lastUsed.remove(shardId);
+        writeGuards.remove(shardId);
         final IndexShard shard = open.remove(shardId);
-        if (shard == null) {
-            return;
-        }
         final Index index = shardId.getIndex();
         final IndexService indexService = indicesService.indexService(index);
+        boolean removed = false;
         if (indexService != null && indexService.hasShard(shardId.id())) {
             indexService.removeShard(shardId.id(), reason);
+            removed = true;
         }
-        if (open.keySet().stream().noneMatch(id -> id.getIndex().equals(index))) {
-            indicesService.removeIndex(index, IndexRemovalReason.NO_LONGER_ASSIGNED, reason);
+        if (shard == null && removed == false) {
+            return true;
+        }
+        closeIndexIfUnused(index, reason, deleteStore);
+        return true;
+    }
+
+    /** Closes the index's service once nothing of ours is open or opening under it, and evicts its monitor. */
+    private void closeIndexIfUnused(Index index, String reason, boolean deleteStore) {
+        while (true) {
+            final Object lock = indexLocks.computeIfAbsent(index, ignored -> new Object());
+            synchronized (lock) {
+                if (indexLocks.get(index) != lock) {
+                    continue;
+                }
+                final boolean inUse = open.keySet().stream().anyMatch(id -> id.getIndex().equals(index))
+                    || opening.stream().anyMatch(id -> id.getIndex().equals(index));
+                if (inUse == false) {
+                    // DELETED wipes the directory; NO_LONGER_ASSIGNED closes and keeps it. A view's
+                    // directory is never opened again, a live shard's is a cache the next open uses.
+                    indicesService.removeIndex(
+                        index,
+                        deleteStore ? IndexRemovalReason.DELETED : IndexRemovalReason.NO_LONGER_ASSIGNED,
+                        reason
+                    );
+                    indexLocks.remove(index, lock);
+                }
+                return;
+            }
         }
     }
 
@@ -719,23 +1045,6 @@ public final class ShardReconciler {
         return at == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(at);
     }
 
-    /**
-     * Returns the shards this node is serving as itself.
-     *
-     * <p><b>Frozen views are not among them, and leaving them in was a bug with a long reach.</b> Every
-     * caller of this finds a shard by index name and shard number, because until a view existed a node
-     * could not hold two shards of one index name. A view has the name of the index it is a view of, so
-     * a document write looking for "shard 0 of paged" could match the view instead -- a reader -- and
-     * conclude the node was not serving the shard it had been writing to a moment earlier. It answered
-     * "activation in progress, retry" for a shard that was open, owned, and healthy, and only sometimes,
-     * because it depended on which of the two a set iterated first.
-     *
-     * <p>Fixing the seven lookups would have left the eighth to write. This is the one definition they
-     * all read, so it is the one that changes: a view is not something this node serves, it is something
-     * a caller is holding, and {@link #frozenShards()} is where it is counted.
-     *
-     * @return the open shard ids, excluding frozen views
-     */
     /**
      * Applies a changed mapping to whatever this node already has open for an index.
      *
@@ -804,9 +1113,28 @@ public final class ShardReconciler {
         if (indexService.getMetadata().getSettingsVersion() >= descriptor.settingsVersion()) {
             return;
         }
-        indexService.updateMetadata(indexService.getMetadata(), descriptor.toIndexMetadata(java.util.Map.of()));
+        // The store type is how this node serves the index, not a property of the index; it travels with
+        // the refreshed settings so the service's settings keep saying what its directory is.
+        indexService.updateMetadata(indexService.getMetadata(), onBlockCache(descriptor.toIndexMetadata(java.util.Map.of())));
     }
 
+    /**
+     * Returns the shards this node is serving as itself.
+     *
+     * <p><b>Frozen views are not among them, and leaving them in was a bug with a long reach.</b> Every
+     * caller of this finds a shard by index name and shard number, because until a view existed a node
+     * could not hold two shards of one index name. A view has the name of the index it is a view of, so
+     * a document write looking for "shard 0 of paged" could match the view instead -- a reader -- and
+     * conclude the node was not serving the shard it had been writing to a moment earlier. It answered
+     * "activation in progress, retry" for a shard that was open, owned, and healthy, and only sometimes,
+     * because it depended on which of the two a set iterated first.
+     *
+     * <p>Fixing the seven lookups would have left the eighth to write. This is the one definition they
+     * all read, so it is the one that changes: a view is not something this node serves, it is something
+     * a caller is holding, and {@link #frozenShards()} is where it is counted.
+     *
+     * @return the open shard ids, excluding frozen views
+     */
     public Set<ShardId> openShards() {
         final Set<ShardId> serving = new java.util.HashSet<>(open.keySet());
         serving.removeAll(frozenViews);

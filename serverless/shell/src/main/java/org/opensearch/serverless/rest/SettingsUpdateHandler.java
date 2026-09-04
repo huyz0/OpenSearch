@@ -150,6 +150,16 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_setting", refusal)
             );
         }
+        try {
+            // Every value parsed by core's own setting before anything is written. The first parse used to
+            // be IndexService.updateMetadata on a shard, after the compare-and-swap: a value like
+            // "banana" for refresh_interval was committed to the descriptor, rendered by GET _settings,
+            // and failed every node that next opened a shard of the index -- with a 400 to the caller that
+            // read as if it had been refused.
+            IndexAdminHandler.validateIndexSettings(requested, false);
+        } catch (IndexAdminHandler.RefusedException e) {
+            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, e.status, e.type, e.getMessage()));
+        }
 
         final MetadataPlane metadata = plane.get();
         final var serving = node.get();
@@ -208,6 +218,13 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
             return "number_of_replicas is not supported: a shard has one writer and its durability comes from "
                 + "the object store, not from replica copies. Readers are added by scaling search nodes, not "
                 + "by setting a replica count";
+        }
+        // The index-level pipeline settings: dynamic in core's registry, so they passed the static check
+        // below, and read by nothing on this shell's write or search path, so they were stored and never
+        // ran. Refused with the reason rather than acknowledged with "changed": true.
+        final String unsupported = IndexAdminHandler.unsupportedIndexSetting(requested);
+        if (unsupported != null) {
+            return unsupported;
         }
 
         // Core's own registry decides what is dynamic. Keeping a list here would be a second account of it,

@@ -202,8 +202,9 @@ mapping could not accept a single document ([`m58-ingest-notes.md`](m58-ingest-n
 **Scripts.** Painless runs here: script queries, `script_score`, `script_fields`, scripted aggregations and
 scripted updates including `ctx.op` for noop and delete. The engine is chosen by name and registered directly,
 the same way this shell has always chosen its transport — "no modules are loaded" was about discovery from
-disk, not about the code in `modules/`. Stored scripts stay refused because `ScriptService` reads them out of
-cluster metadata and there is none ([`m57-scripts-notes.md`](m57-scripts-notes.md)).
+disk, not about the code in `modules/`. Stored scripts were refused at M57 because `ScriptService` reads them
+out of cluster metadata; M62 overrode the one method that does so, and they live in a register now (see
+above and [`m62-remaining-compatibility-notes.md`](m62-remaining-compatibility-notes.md)).
 
 **Why a document scored what it did.** `GET|POST /{index}/_explain/{id}` accounts for one document's score
 against one query, in Lucene's own words. It is served because it is not a fan-out: an explain names a
@@ -270,7 +271,17 @@ is a `members` register maintained only on join and leave, the WAL is truncated 
 ordinals, a sweep runs only when a manifest lost a file, and the manifest records every file's length so a
 reader opens without listing. Register reads followed: one head read per shard per pass shared by the
 heartbeat, the hints and the publish; writes and gets route by the owner last seen and read the head only
-when that node refuses; a publish swaps over the generation it remembers.
+when that node refuses; a publish swaps over the generation it remembers. M64
+([`m64-deep-review-fixes-notes.md`](m64-deep-review-fixes-notes.md)) took every finding of the deep review
+([`serverless-deep-review-2026-09.md`](serverless-deep-review-2026-09.md)): the acknowledgement fence is
+explicit — a lapsed lease suspends every shard until the heads are re-verified, a per-shard fence spans
+apply→append→acknowledge and publish→release→close, the holder treats its lease as lapsed a margin early,
+a forwarded write is accepted only for a shard whose recent head names the owner, and a failed append fences
+rather than closes; readers never serve a fenced writer's bytes and writers open lazily; hints are forgotten
+on every forward failure; forwarded answers carry sequence identity and conflicts; alias and stream
+mutations swap against the generation they read; snapshots capture settings and honour their swap on
+restore; tombstones are quarantined and swept; forwarded requests carry a per-request MAC; the throttle can
+lock neither a shared address nor the recovery account.
 
 ## What is deliberately refused
 
@@ -284,7 +295,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 | `collapse`, `suggest`, `profile` | Each needs cross-shard machinery that does not exist yet. |
 | Two request wrappers, or two plugins contributing one setting | Which one wins would depend on load order. |
 | `IndexNameExpressionResolver` for plugins | A node's `ClusterState` holds only the indices it has open, so resolving would answer a wildcard with a subset — which for privilege evaluation fails open. |
-| Scripting | No engines registered; a plugin gets core's own "no lang registered". |
+| Scripting from a plugin's own engine | The shell registers painless and mustache by name; a plugin cannot contribute a third engine, and gets core's own "no lang registered" for one. |
 | On-behalf-of and service-account tokens | They delegate authority, and this deployment authenticates without a general authorization model to delegate. |
 
 ## What is genuinely missing
@@ -305,18 +316,15 @@ These are decisions, not gaps. Each answers 501 with a reason.
   slightly later, when the shard is opened, so a predecessor's appends in between are still replayed.
   Closing it means sealing at the swap, which the path that opens a shard from projected truth rather than
   from an acquisition does not have. The unbounded half is closed.
-- `?pipeline=` is honoured on single-document writes only. `_bulk` does not run pipelines and
-  `index.default_pipeline` is not read, so a client setting a default pipeline gets no pipeline and no
-  warning — the first thing to fix in that area.
-- There is no `_ingest/pipeline/_simulate`: a pipeline cannot be tested without writing a document.
+- `index.default_pipeline` and `index.final_pipeline` are not read on any write path; a client setting a
+  default pipeline gets no pipeline. (`?pipeline=` is honoured on single-document and bulk writes, per line
+  or per request, and `_ingest/pipeline/_simulate` exists — M58 and M61.)
 - `_nodes/stats` is refused, and its reason is now specific rather than shared: each node answers for itself
   at `GET /_serverless/stats` and this node knows where the others are, so what is missing is the fan-out that
   would ask them and the accounting that would report which ones did not answer — a scoping decision, not an
   impossibility.
 - An alias filter or routing in an action body is ignored rather than refused — the one place left where
   something is accepted and not honoured, and the first thing to fix in that area.
-- `GET /{index}/_alias` (every alias an index is under) is a reverse lookup this design does not offer;
-  `GET /{index}/_alias/{name}` answers the bounded form.
 - `_cat/indices` could be served under the wildcard cap that already exists (one bounded listing, refused past
   the cap rather than truncated) and is not. The objection to it is weaker than the current refusal implies.
 - `update` inside `_bulk` is refused: it is a partial merge, which has to read the current document before
@@ -328,13 +336,11 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - There is no cursor over indices. `GET /_list/indices/{prefix}*` answers in one bounded page or refuses;
   paginating a deployment whose indices fit under no usable prefix is not possible, because resuming a listing
   needs `start-after` and core's `BlobContainer` does not expose it.
-- `GET /{index}` omits `aliases` rather than reporting an empty object: resolving an index's aliases needs a
-  reverse lookup this design does not offer, and an empty one would be a confident wrong answer.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
   runs on every pass. A reader whose node cannot reach the object store for longer than the grace can lose
   the commit it is reading — it fails with an error rather than answering wrongly, but it is a real limit.
 
-**Out of scope while `server/` may not change:**
+**Open under D4 (each needs a narrow shared interface in `server/`, which D4 permits and nobody has built):**
 
 - `onIndexModule` fires only for plugins loaded from disk. Firing it for a plugin passed in as an instance
   needs `PluginsService` to accept instances.
@@ -360,7 +366,9 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## Decisions a reader should know about
 
-- `server/` is untouched, and a build task fails if any file under it references `org.opensearch.serverless`.
+- `server/` is untouched so far, and a build task fails if any file under it references
+  `org.opensearch.serverless`. D4 permits narrow shared interfaces in `server/`; none has been added, which is
+  why the three items above are open rather than impossible.
 - The REST surface is an allowlist. Anything not registered answers 404 or an explicit 501, never an empty
   success.
 - Storage layout changed in M32 (uuid in the path); an existing deployment's data is not found by a node

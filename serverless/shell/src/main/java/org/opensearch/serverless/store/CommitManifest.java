@@ -258,12 +258,15 @@ public final class CommitManifest {
         out.writeVLong(term);
         out.writeOptionalString(writer);
         out.writeVInt(files.size());
-        for (Map.Entry<String, String> file : files.entrySet()) {
+        // Sorted, so the same manifest serialises to the same bytes on every node: Map.copyOf iterates in
+        // a salted order, and the per-request MAC over a forwarded frozen search digests these bytes on
+        // both sides. An order that differed between sender and receiver read as a forged request.
+        for (Map.Entry<String, String> file : new java.util.TreeMap<>(files).entrySet()) {
             out.writeString(file.getKey());
             out.writeString(file.getValue());
         }
         out.writeVInt(lengths.size());
-        for (Map.Entry<String, Long> length : lengths.entrySet()) {
+        for (Map.Entry<String, Long> length : new java.util.TreeMap<>(lengths).entrySet()) {
             out.writeString(length.getKey());
             out.writeVLong(length.getValue());
         }

@@ -16,6 +16,7 @@ import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.WriteRequest;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.transport.client.Client;
 
@@ -23,6 +24,7 @@ import java.security.SecureRandom;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -64,6 +66,18 @@ import java.util.function.Supplier;
  * <p><b>Every failure is a denial.</b> An unreadable store, an unparseable record, a missing index: none
  * of them authenticate anybody. The distinction the caller does get is <em>why</em>, because "no such
  * account" and "cannot reach the accounts" are a 401 and a 503, and an operator needs to tell them apart.
+ * A record that asks for more iterations than this node will pay for is unreadable too:
+ * whoever can write the index can write a record that pins a checker thread for hours, and refusing it
+ * costs a parse.
+ *
+ * <p><b>Its own client calls are marked as the plugin's, and the caller stays who they were.</b> Every
+ * read and write of the account index goes out with {@link ServerlessAuthPlugin#PLUGIN_SUBJECT} on the
+ * thread, alongside -- not instead of -- the request's principal. A filter therefore sees the
+ * administrator writing the account index <em>through the plugin</em> during account management, which is
+ * the question an authorizer wants to answer ("may this caller manage accounts?"), and sees
+ * {@code plugin:...} with no user during a login, where there is no caller yet. Replacing the principal
+ * would have made every account write look like nobody's, which is exactly the call a fail-closed
+ * authorizer refuses.
  */
 public final class CredentialStore {
 
@@ -122,6 +136,7 @@ public final class CredentialStore {
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final Supplier<Client> client;
+    private final Supplier<ThreadContext> context;
     private final LongSupplier clock;
     private final String index;
     private final String bootstrapUser;
@@ -130,6 +145,16 @@ public final class CredentialStore {
     private final int iterations;
     private final long cacheTtlMillis;
     private final TimeValue timeout;
+
+    /**
+     * The most iterations a stored record may ask for: four times what this node writes, and never less
+     * than four times the default, so a record written by a node configured higher still verifies while
+     * a planted one does not.
+     */
+    private final int verifyCap;
+
+    /** Keys the cache's fingerprints; generated here, never persisted, gone with the process. */
+    private final byte[] cacheKey = new byte[32];
 
     private final Map<String, Long> cache;
 
@@ -143,20 +168,37 @@ public final class CredentialStore {
     private volatile long markerSeen;
 
     /**
-     * Builds the store.
+     * Builds a store whose client calls carry no plugin identity, for a caller that has no thread context
+     * to offer -- a test driving the index directly.
      *
      * @param settings the node settings
      * @param client supplies the client, which does not exist until the node has started
      * @param clock the millisecond clock, injectable so a test can age the cache without sleeping
      */
     public CredentialStore(Settings settings, Supplier<Client> client, LongSupplier clock) {
+        this(settings, client, () -> null, clock);
+    }
+
+    /**
+     * Builds the store.
+     *
+     * @param settings the node settings
+     * @param client supplies the client, which does not exist until the node has started
+     * @param context supplies the node's thread context, under which the store's own calls are marked as
+     *     the plugin's; may supply null before the node has one
+     * @param clock the millisecond clock, injectable so a test can age the cache without sleeping
+     */
+    public CredentialStore(Settings settings, Supplier<Client> client, Supplier<ThreadContext> context, LongSupplier clock) {
         this.client = client;
+        this.context = context;
         this.clock = clock;
         this.index = ServerlessAuthPlugin.INDEX.get(settings);
         this.bootstrapUser = ServerlessAuthPlugin.BOOTSTRAP_USER.get(settings);
         this.iterations = ServerlessAuthPlugin.ITERATIONS.get(settings);
         this.cacheTtlMillis = ServerlessAuthPlugin.CACHE_TTL.get(settings).millis();
         this.timeout = ServerlessAuthPlugin.LOOKUP_TIMEOUT.get(settings);
+        this.verifyCap = (int) Math.min(PasswordHash.MAX_ITERATIONS, Math.max(4L * iterations, 4L * PasswordHash.DEFAULT_ITERATIONS));
+        RANDOM.nextBytes(cacheKey);
 
         try (org.opensearch.core.common.settings.SecureString password = ServerlessAuthPlugin.BOOTSTRAP_PASSWORD.get(settings)) {
             if (password == null || password.length() == 0) {
@@ -258,7 +300,26 @@ public final class CredentialStore {
             markerPending.set(true);
             return false;
         }
-        return cachedAndFresh(user + " " + PasswordHash.fingerprint(user, password));
+        return cachedAndFresh(user + " " + PasswordHash.fingerprint(cacheKey, user, password));
+    }
+
+    /**
+     * Reports whether this exact credential has a live cache entry, without claiming the marker check.
+     *
+     * <p>For the request path to tell a caller it knows from a guess. {@link #isCached} declines once a
+     * second so that the marker gets read on the slow path, and that decline must not turn into a
+     * throttle refusal or a delay for a caller this node verified a moment ago: the throttle prices
+     * guesses, and this is not one.
+     *
+     * @param user the username offered
+     * @param password the password offered
+     * @return true if the credential is cached and unexpired
+     */
+    public boolean isKnown(String user, char[] password) {
+        if (user == null || user.isEmpty() || password == null || password.length == 0) {
+            return false;
+        }
+        return cachedAndFresh(user + " " + PasswordHash.fingerprint(cacheKey, user, password));
     }
 
     /**
@@ -279,14 +340,14 @@ public final class CredentialStore {
         if (markerPending.compareAndSet(true, false) || claimMarkerCheck()) {
             refreshMarker();
         }
-        final String key = user + " " + PasswordHash.fingerprint(user, password);
+        final String key = user + " " + PasswordHash.fingerprint(cacheKey, user, password);
         if (cachedAndFresh(key)) {
             return new Verdict(user, null);
         }
         boolean derived = false;
         if (bootstrapUser.equals(user)) {
             derived = true;
-            if (PasswordHash.verify(password, bootstrapRecord)) {
+            if (PasswordHash.verify(password, bootstrapRecord, verifyCap)) {
                 remember(key);
                 return new Verdict(user, null);
             }
@@ -305,7 +366,7 @@ public final class CredentialStore {
             return new Verdict(null, "the account store could not be read: " + rootMessage(e));
         }
         if (record != null) {
-            if (PasswordHash.verify(password, record)) {
+            if (PasswordHash.verify(password, record, verifyCap)) {
                 remember(key);
                 return new Verdict(user, null);
             }
@@ -315,7 +376,7 @@ public final class CredentialStore {
             // No account, so nothing to check against -- and answering now would answer faster than a
             // wrong password does, which tells the caller the name is not real. The decoy costs the same
             // derivation a real record would; the configured name skips it because it already paid one.
-            PasswordHash.verify(password, decoy);
+            PasswordHash.verify(password, decoy, verifyCap);
         }
         return REJECTED;
     }
@@ -337,10 +398,10 @@ public final class CredentialStore {
             .endObject();
         final IndexRequest request = new IndexRequest(index).id(user).source(source).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
         try {
-            require().index(request).actionGet(timeout);
+            asPlugin(() -> require().index(request).actionGet(timeout));
         } catch (IndexNotFoundException e) {
             createIndex();
-            require().index(request).actionGet(timeout);
+            asPlugin(() -> require().index(request).actionGet(timeout));
         }
         forget(user);
         // After the record, so a node that sees the new marker sees the new record. A bump that fails
@@ -359,9 +420,10 @@ public final class CredentialStore {
     public boolean remove(String user) throws Exception {
         final boolean deleted;
         try {
-            deleted = require().delete(new DeleteRequest(index, user).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE))
-                .actionGet(timeout)
-                .getResult() == org.opensearch.action.DocWriteResponse.Result.DELETED;
+            deleted = asPlugin(
+                () -> require().delete(new DeleteRequest(index, user).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE))
+                    .actionGet(timeout)
+            ).getResult() == org.opensearch.action.DocWriteResponse.Result.DELETED;
         } catch (IndexNotFoundException e) {
             return false;
         } finally {
@@ -388,7 +450,7 @@ public final class CredentialStore {
     public long version() throws Exception {
         final GetResponse response;
         try {
-            response = require().get(new GetRequest(index, MARKER)).actionGet(timeout);
+            response = asPlugin(() -> require().get(new GetRequest(index, MARKER)).actionGet(timeout));
         } catch (IndexNotFoundException e) {
             return 0L;
         }
@@ -419,7 +481,7 @@ public final class CredentialStore {
             // The marker is a document in the account index and is not an account.
             return null;
         }
-        final GetResponse response = require().get(new GetRequest(index, user)).actionGet(timeout);
+        final GetResponse response = asPlugin(() -> require().get(new GetRequest(index, user)).actionGet(timeout));
         if (response.isExists() == false) {
             return null;
         }
@@ -429,18 +491,20 @@ public final class CredentialStore {
 
     private void createIndex() throws Exception {
         try {
-            require().admin()
-                .indices()
-                .create(
-                    new CreateIndexRequest(index).settings(Settings.builder().put("index.number_of_shards", 1))
-                        // The hash is not indexed: nothing searches for one, and a field that is not
-                        // indexed cannot be matched against by anyone who reaches the search API.
-                        .mapping(
-                            "{\"properties\":{\"user\":{\"type\":\"keyword\"},\"hash\":{\"type\":\"keyword\",\"index\":false},"
-                                + "\"marker\":{\"type\":\"long\",\"index\":false}}}"
-                        )
-                )
-                .actionGet(timeout);
+            asPlugin(
+                () -> require().admin()
+                    .indices()
+                    .create(
+                        new CreateIndexRequest(index).settings(Settings.builder().put("index.number_of_shards", 1))
+                            // The hash is not indexed: nothing searches for one, and a field that is not
+                            // indexed cannot be matched against by anyone who reaches the search API.
+                            .mapping(
+                                "{\"properties\":{\"user\":{\"type\":\"keyword\"},\"hash\":{\"type\":\"keyword\",\"index\":false},"
+                                    + "\"marker\":{\"type\":\"long\",\"index\":false}}}"
+                            )
+                    )
+                    .actionGet(timeout)
+            );
         } catch (org.opensearch.ResourceAlreadyExistsException e) {
             // Two nodes creating the first account at once. One wins and the other proceeds.
         }
@@ -457,13 +521,40 @@ public final class CredentialStore {
         return available;
     }
 
+    /**
+     * Runs one client call marked as this plugin's own, on behalf of whoever is making the request.
+     *
+     * <p>The request's context is kept -- its principal above all, since an authorizing filter decides
+     * account management by who the caller is -- and {@link ServerlessAuthPlugin#PLUGIN_SUBJECT} is added
+     * for the duration, so the same filter can tell the plugin writing its own index from a user reaching
+     * for it. The context is restored when the call returns. The shell's client preserves the context
+     * onto the pool it dispatches from, so a filter running there sees both. A store built without a
+     * context, as a test does, runs the call as it is; a call nested inside another (creating the index
+     * from inside a put) finds the marker already there and leaves it.
+     */
+    private <T> T asPlugin(Callable<T> call) throws Exception {
+        final ThreadContext threadContext = context.get();
+        if (threadContext == null || threadContext.getTransient(ServerlessAuthPlugin.PLUGIN_SUBJECT) != null) {
+            return call.call();
+        }
+        try (ThreadContext.StoredContext ignored = threadContext.newStoredContext(false)) {
+            threadContext.putTransient(
+                ServerlessAuthPlugin.PLUGIN_SUBJECT,
+                ServerlessAuthPlugin.pluginPrincipal(ServerlessAuthPlugin.class)
+            );
+            return call.call();
+        }
+    }
+
     private void bump() throws Exception {
         final org.opensearch.core.xcontent.XContentBuilder source = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()
             .startObject()
             .field("marker", RANDOM.nextLong())
             .endObject();
-        require().index(new IndexRequest(index).id(MARKER).source(source).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE))
-            .actionGet(timeout);
+        asPlugin(
+            () -> require().index(new IndexRequest(index).id(MARKER).source(source).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE))
+                .actionGet(timeout)
+        );
         // Deliberately not recorded as seen: this node's own next check will find it moved and drop a
         // cache it just cleaned itself, which is one spurious drop per change. Recording it would hide
         // a change another node made in the same second, and a hidden change is the one this exists

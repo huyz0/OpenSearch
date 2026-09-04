@@ -248,7 +248,33 @@ public final class ShardQuery {
      * @throws IOException if the query fails
      */
     public static Result execute(SearchService searchService, ShardId shardId, SearchSourceBuilder source) throws IOException {
-        final SearchRequest searchRequest = new SearchRequest(shardId.getIndexName()).allowPartialSearchResults(false).source(source);
+        return execute(searchService, shardId, source, System.currentTimeMillis());
+    }
+
+    /**
+     * Runs a client's query against one shard at a moment the caller fixes.
+     *
+     * <p><b>One {@code now} per request, not per shard.</b> Core evaluates {@code now} once on the
+     * coordinator for every shard of a request; a shard that evaluated it on its own clock at its own
+     * moment answered {@code now-1s} with a different boundary than its sibling did, and a
+     * {@code date_histogram} with {@code extended_bounds: now} reduced buckets computed against different
+     * nows. The coordinator takes the instant and passes it here and to every forwarded shard.
+     *
+     * <p><b>A shard that runs out of time reports it rather than failing.</b> With partial results refused
+     * at the shard, core's query phase throws on a timeout instead of setting {@code timed_out}, so the
+     * flag could never travel. The caller's own {@code allow_partial_search_results} is applied where the
+     * caller is -- by the coordinator, on the merged answer -- which is the only place it means anything.
+     *
+     * @param searchService the node's search service
+     * @param shardId the shard to query
+     * @param source the query, size and everything else the client asked for
+     * @param nowInMillis the request's {@code now}, fixed by the coordinator
+     * @return the shard's total and hits
+     * @throws IOException if the query fails
+     */
+    public static Result execute(SearchService searchService, ShardId shardId, SearchSourceBuilder source, long nowInMillis)
+        throws IOException {
+        final SearchRequest searchRequest = new SearchRequest(shardId.getIndexName()).allowPartialSearchResults(true).source(source);
         final ShardSearchRequest shardRequest = new ShardSearchRequest(
             // The index this request came for, rather than OriginalIndices.NONE.
             //
@@ -262,7 +288,7 @@ public final class ShardQuery {
             1,
             AliasFilter.EMPTY,
             1.0f,
-            System.currentTimeMillis(),
+            nowInMillis,
             null,
             Strings.EMPTY_ARRAY
         );

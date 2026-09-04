@@ -43,7 +43,14 @@ public final class ForwardedGetResponse extends TransportResponse {
         final String id = in.readString();
         final boolean found = in.readBoolean();
         final String source = in.readOptionalString();
-        this.document = new ServerlessNode.Document(id, found, source);
+        // The sequence identity travels with the document. This used to rebuild it with the three-argument
+        // constructor, whose defaults are the unassigned sentinels -- so every forwarded get reported
+        // _seq_no -2 and _version -1, and the conditional write a caller built on those tokens lost every
+        // time, while the same get served by the owner itself answered with real numbers.
+        final long seqNo = in.readZLong();
+        final long primaryTerm = in.readVLong();
+        final long version = in.readZLong();
+        this.document = new ServerlessNode.Document(id, found, source, seqNo, primaryTerm, version);
     }
 
     @Override
@@ -52,6 +59,9 @@ public final class ForwardedGetResponse extends TransportResponse {
         out.writeString(document.id());
         out.writeBoolean(document.found());
         out.writeOptionalString(document.source());
+        out.writeZLong(document.seqNo());
+        out.writeVLong(document.primaryTerm());
+        out.writeZLong(document.version());
     }
 
     /**

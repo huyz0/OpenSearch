@@ -38,6 +38,7 @@ public final class ForwardedFrozenSearchRequest extends TransportRequest {
     private final PointInTime pit;
     private final int shard;
     private final SearchSourceBuilder source;
+    private final long nowInMillis;
 
     /**
      * Creates a request.
@@ -47,9 +48,23 @@ public final class ForwardedFrozenSearchRequest extends TransportRequest {
      * @param source the query as the client sent it
      */
     public ForwardedFrozenSearchRequest(PointInTime pit, int shard, SearchSourceBuilder source) {
+        this(pit, shard, source, System.currentTimeMillis());
+    }
+
+    /**
+     * Creates a request that evaluates {@code now} at the instant the coordinator chose, for the reason
+     * {@link ForwardedSearchRequest} gives: every shard of one search must score against one clock.
+     *
+     * @param pit the frozen view
+     * @param shard the shard to query
+     * @param source the query as the client sent it
+     * @param nowInMillis the instant {@code now} means for this whole search
+     */
+    public ForwardedFrozenSearchRequest(PointInTime pit, int shard, SearchSourceBuilder source, long nowInMillis) {
         this.pit = pit;
         this.shard = shard;
         this.source = source;
+        this.nowInMillis = nowInMillis;
     }
 
     /**
@@ -63,6 +78,7 @@ public final class ForwardedFrozenSearchRequest extends TransportRequest {
         this.pit = new PointInTime(in);
         this.shard = in.readVInt();
         this.source = new SearchSourceBuilder(in);
+        this.nowInMillis = in.readLong();
     }
 
     @Override
@@ -71,6 +87,16 @@ public final class ForwardedFrozenSearchRequest extends TransportRequest {
         pit.writeTo(out);
         out.writeVInt(shard);
         source.writeTo(out);
+        out.writeLong(nowInMillis);
+    }
+
+    /**
+     * Returns the instant {@code now} means for this search, chosen once by the coordinator.
+     *
+     * @return epoch milliseconds
+     */
+    public long nowInMillis() {
+        return nowInMillis;
     }
 
     /**

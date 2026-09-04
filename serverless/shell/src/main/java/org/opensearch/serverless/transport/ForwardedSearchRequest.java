@@ -32,6 +32,7 @@ public final class ForwardedSearchRequest extends TransportRequest {
     private final int shard;
     private final SearchSourceBuilder source;
     private final String indexUuid;
+    private final long nowInMillis;
 
     /**
      * Creates a request.
@@ -53,10 +54,29 @@ public final class ForwardedSearchRequest extends TransportRequest {
      * @param indexUuid the uuid the coordinator resolved, so the peer does not answer from a recreated index
      */
     public ForwardedSearchRequest(String index, int shard, SearchSourceBuilder source, String indexUuid) {
+        this(index, shard, source, indexUuid, System.currentTimeMillis());
+    }
+
+    /**
+     * Creates a request that evaluates {@code now} at the instant the coordinator chose.
+     *
+     * <p><b>One clock reading per search, not one per shard.</b> A range on {@code now-1h} evaluated on
+     * each shard at its own arrival time is a different query per shard, and a document on the boundary
+     * is counted by one shard and not another. The coordinator reads the clock once and every shard,
+     * local or forwarded, scores against that instant.
+     *
+     * @param index the index
+     * @param shard the shard to query
+     * @param source the query as the client sent it
+     * @param indexUuid the uuid the coordinator resolved, so the peer does not answer from a recreated index
+     * @param nowInMillis the instant {@code now} means for this whole search
+     */
+    public ForwardedSearchRequest(String index, int shard, SearchSourceBuilder source, String indexUuid, long nowInMillis) {
         this.index = index;
         this.shard = shard;
         this.source = source;
         this.indexUuid = indexUuid;
+        this.nowInMillis = nowInMillis;
     }
 
     /**
@@ -71,6 +91,7 @@ public final class ForwardedSearchRequest extends TransportRequest {
         this.shard = in.readVInt();
         this.source = new SearchSourceBuilder(in);
         this.indexUuid = in.readOptionalString();
+        this.nowInMillis = in.readLong();
     }
 
     @Override
@@ -80,6 +101,16 @@ public final class ForwardedSearchRequest extends TransportRequest {
         out.writeVInt(shard);
         source.writeTo(out);
         out.writeOptionalString(indexUuid);
+        out.writeLong(nowInMillis);
+    }
+
+    /**
+     * Returns the instant {@code now} means for this search, chosen once by the coordinator.
+     *
+     * @return epoch milliseconds
+     */
+    public long nowInMillis() {
+        return nowInMillis;
     }
 
     /**

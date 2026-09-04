@@ -82,9 +82,33 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         }
 
         if (request.method() == RestRequest.Method.GET) {
+            // Off the transport thread and through the gate, as the PUT below already is: a read of the
+            // config register is an object-store round trip, and a filter that guards cluster state must
+            // see the read as well as the write.
+            final ServerlessNode reader = node.get();
             return channel -> {
-                final var current = metadata.clusterConfig().read();
-                respond(channel, current.settings(), false);
+                final Runnable read = () -> {
+                    try {
+                        final Settings current = IndexAdminHandler.gate(
+                            reader,
+                            org.opensearch.action.admin.cluster.state.ClusterStateAction.NAME,
+                            new org.opensearch.action.admin.cluster.state.ClusterStateRequest(),
+                            () -> metadata.clusterConfig().read().settings()
+                        );
+                        respond(channel, current, false);
+                    } catch (Exception e) {
+                        try {
+                            channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                        } catch (IOException nested) {
+                            logger.error("failed to report a cluster settings read failure", nested);
+                        }
+                    }
+                };
+                if (reader == null) {
+                    read.run();
+                    return;
+                }
+                reader.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(read);
             };
         }
 

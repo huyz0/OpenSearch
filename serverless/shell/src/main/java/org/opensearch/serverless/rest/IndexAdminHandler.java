@@ -182,6 +182,22 @@ public final class IndexAdminHandler extends BaseRestHandler {
                 )
             );
         }
+        if (request.method() == RestRequest.Method.PUT && index != null && index.startsWith(DataStreamHandler.BACKING_INDEX_PREFIX)) {
+            // The names a data stream's rollover computes. A user-created one sat exactly where the next
+            // rollover would land, and every rollover of that stream failed with "already exists" for ever.
+            return channel -> channel.sendResponse(
+                error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "index name ["
+                        + index
+                        + "] must not start with '"
+                        + DataStreamHandler.BACKING_INDEX_PREFIX
+                        + "': that prefix names a data stream's backing indices, which its rollover creates"
+                )
+            );
+        }
 
         // Which projection of the descriptor this path asks for. _mapping and _settings are the same read
         // as GET /{index}, rendered narrower, so neither adds an object-store request.
@@ -250,9 +266,23 @@ public final class IndexAdminHandler extends BaseRestHandler {
                     } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
                         // Configuration the caller can fix, so 400 rather than 500.
                         channel.sendResponse(error(channel, RestStatus.BAD_REQUEST, "missing_component_template", e.getMessage()));
+                    } catch (RefusedException e) {
+                        // A setting the merged request and templates carry that core would not accept, or
+                        // one this design cannot honour -- refused before anything is written.
+                        channel.sendResponse(error(channel, e.status, e.type, e.getMessage()));
                     } catch (IndexAlreadyExistsException e) {
                         channel.sendResponse(error(channel, RestStatus.BAD_REQUEST, "index_already_exists", e.getMessage()));
                     } catch (Exception e) {
+                        // A filter chain hands the work's own exception back wrapped; a refusal inside it
+                        // is still a refusal.
+                        final RefusedException refused = org.opensearch.ExceptionsHelper.unwrap(
+                            e,
+                            RefusedException.class
+                        ) instanceof RefusedException r ? r : null;
+                        if (refused != null) {
+                            channel.sendResponse(error(channel, refused.status, refused.type, refused.getMessage()));
+                            return;
+                        }
                         channel.sendResponse(new BytesRestResponse(channel, e));
                     }
                 });
@@ -300,6 +330,21 @@ public final class IndexAdminHandler extends BaseRestHandler {
                 // Inside the consumer, not before it: the delete has to happen after the filters have had
                 // their say, and doing it while preparing the request would delete the index and then ask.
                 return channel -> dispatch(channel, () -> {
+                    final Optional<IndexDescriptor> deleting = metadata.describe(index);
+                    final String stream = deleting.isEmpty() ? null : writeIndexOf(metadata, deleting.get());
+                    if (stream != null) {
+                        // Core's rule and core's words: the newest backing index is where the stream's
+                        // writes land, and removing it would leave the stream with nowhere to put them.
+                        channel.sendResponse(
+                            error(
+                                channel,
+                                RestStatus.BAD_REQUEST,
+                                "illegal_argument_exception",
+                                "index [" + index + "] is the write index for data stream [" + stream + "] and cannot be deleted"
+                            )
+                        );
+                        return;
+                    }
                     final boolean existed;
                     try {
                         existed = gated(
@@ -314,6 +359,14 @@ public final class IndexAdminHandler extends BaseRestHandler {
                     if (existed == false) {
                         channel.sendResponse(error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
                         return;
+                    }
+                    final var serving = node.get();
+                    if (serving != null && deleting.isPresent()) {
+                        // This node's owner hints for the old incarnation. Left in place, a write to a new
+                        // index of the same name would be routed to whoever owned the deleted one's shards.
+                        for (int shard = 0; shard < deleting.get().numberOfShards(); shard++) {
+                            serving.forgetOwner(index, shard);
+                        }
                     }
                     try (XContentBuilder builder = channel.newBuilder()) {
                         builder.startObject();
@@ -478,21 +531,118 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * @return the descriptor as created
      * @throws IOException if a register cannot be read or written
      */
-    static IndexDescriptor createIndex(MetadataPlane metadata, String index, CreateRequest create) throws IOException {
-        final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolve(
-            metadata.indexTemplates().all(),
-            metadata.componentTemplates().all(),
-            index
+    static IndexDescriptor createIndex(MetadataPlane metadata, String index, CreateRequest create) throws IOException, RefusedException {
+        return createIndex(
+            metadata,
+            index,
+            create,
+            org.opensearch.serverless.metadata.TemplateResolver.resolve(
+                metadata.indexTemplates().all(),
+                metadata.componentTemplates().all(),
+                index
+            )
         );
+    }
+
+    /**
+     * Creates an index from a request and what it inherits, for a caller that resolved the templates
+     * against a different name than the index's own.
+     *
+     * <p>A data stream's backing index is named {@code .ds-<stream>-<n>}, which no template pattern written
+     * for the stream matches; what it inherits is what the <em>stream's</em> name matches, so the caller
+     * resolves against that and hands the result here.
+     *
+     * @param metadata the metadata plane
+     * @param index the name
+     * @param create the request
+     * @param inherited what the templates contributed
+     * @return the descriptor as created
+     * @throws IOException if a register cannot be read or written
+     * @throws RefusedException if the merged settings are ones core would refuse, or this design cannot honour
+     */
+    static IndexDescriptor createIndex(
+        MetadataPlane metadata,
+        String index,
+        CreateRequest create,
+        org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited
+    ) throws IOException, RefusedException {
+        final Settings settings = CreateRequest.settingsWith(create.settings, inherited);
+        // Parsed and validated before the descriptor exists, not by the first shard to open it. A value
+        // core cannot parse used to land in the register and fail every node that later built
+        // IndexSettings from it, with a 400 to the caller that read like a refusal.
+        validateIndexSettings(settings == null ? Settings.EMPTY : settings, true);
         final IndexDescriptor descriptor = new IndexDescriptor(
             index,
             UUID.randomUUID().toString(),
             CreateRequest.shardsWith(create.shards, create.explicitShards, inherited),
             CreateRequest.mappingWith(create.mapping, inherited),
-            CreateRequest.settingsWith(create.settings, inherited)
+            settings
         ).createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id);
         metadata.createIndex(descriptor);
         return descriptor;
+    }
+
+    /**
+     * Names the data stream an index is the write index of, or null.
+     *
+     * <p>Bounded by the aliases that name the index, verified against each record, like every reverse
+     * question here.
+     */
+    private static String writeIndexOf(MetadataPlane metadata, IndexDescriptor descriptor) throws IOException {
+        for (String name : descriptor.aliasedBy()) {
+            final var resolved = metadata.resolve(name).alias();
+            if (resolved != null && resolved.dataStream() && descriptor.name().equals(resolved.writeIndex())) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Names an index setting this design accepts nowhere, with the reason, or null.
+     *
+     * <p>The three pipeline settings are registered dynamic settings core honours on every write and
+     * search; nothing on this shell's write or search path reads them. Stored, they would report a
+     * pipeline that never ran -- a document written un-piped under {@code "changed": true}.
+     *
+     * @param settings normalised settings
+     * @return the reason to refuse, or null when there is none
+     */
+    static String unsupportedIndexSetting(Settings settings) {
+        for (String key : new String[] {
+            org.opensearch.index.IndexSettings.DEFAULT_PIPELINE.getKey(),
+            org.opensearch.index.IndexSettings.FINAL_PIPELINE.getKey(),
+            org.opensearch.index.IndexSettings.DEFAULT_SEARCH_PIPELINE.getKey() }) {
+            if (settings.hasValue(key)) {
+                return key
+                    + " is not supported: an index-level pipeline is applied by the write and search paths, and "
+                    + "this shell's do not read it, so the value would be stored and never run. Name the pipeline on "
+                    + "the request instead (?pipeline= on a write, ?search_pipeline= on a search)";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Refuses settings core would not accept, or this design cannot honour, before anything is written.
+     *
+     * @param settings normalised ({@code index.}-prefixed) settings
+     * @param atCreation whether this is a create, where dependencies between settings are checked as
+     *     core checks them; an update validates each value on its own, as core's update does
+     * @throws RefusedException with the status and words the caller should see
+     */
+    static void validateIndexSettings(Settings settings, boolean atCreation) throws RefusedException {
+        final String unsupported = unsupportedIndexSetting(settings);
+        if (unsupported != null) {
+            throw new RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);
+        }
+        try {
+            // Core's own registry and parsers, private and archived keys left alone: they are core's to
+            // write, and none reach here from a request or a template.
+            org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS.validate(settings, atCreation, true, true);
+        } catch (IllegalArgumentException e) {
+            throw new RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+        }
     }
 
     static final class CreateRequest {
@@ -518,15 +668,34 @@ public final class IndexAdminHandler extends BaseRestHandler {
             if (explicit) {
                 return requested;
             }
-            final Object fromTemplate = inherited.settings().get("number_of_shards");
+            // Through the same normalisation the request path uses, so "number_of_shards",
+            // {"index": {"number_of_shards": n}} and "index.number_of_shards" are one key.
+            final String fromTemplate = normalised(inherited).get(IndexMetadata.SETTING_NUMBER_OF_SHARDS);
             if (fromTemplate == null) {
                 return requested;
             }
             try {
-                return Integer.parseInt(String.valueOf(fromTemplate));
+                return Integer.parseInt(fromTemplate);
             } catch (NumberFormatException e) {
                 return requested;
             }
+        }
+
+        /**
+         * A template's settings in core's canonical spelling.
+         *
+         * <p>A template may write {@code "number_of_shards"}, {@code {"index": {"number_of_shards": ...}}} or
+         * {@code "index.number_of_shards"}, and core treats them as one. The create path used to prefix every
+         * key with {@code index.} unconditionally, which turned the nested form into a key called
+         * {@code index.index} holding a map's {@code toString()} and the dotted form into
+         * {@code index.index.refresh_interval} -- a template written the way core's documentation shows it
+         * was silently mangled and its shard count ignored.
+         */
+        static Settings normalised(org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited) {
+            if (inherited.settings().isEmpty()) {
+                return Settings.EMPTY;
+            }
+            return Settings.builder().loadFromMap(inherited.settings()).normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX).build();
         }
 
         /**
@@ -549,7 +718,9 @@ public final class IndexAdminHandler extends BaseRestHandler {
                     false,
                     org.opensearch.common.xcontent.XContentType.JSON
                 ).v2();
-                org.opensearch.serverless.metadata.TemplateResolver.deepMerge(merged, own);
+                // Core layers the request over a template with MergeReason.INDEX_TEMPLATE, where a field definition
+                // replaces rather than merges parameter by parameter; mergeMappings is that rule.
+                org.opensearch.serverless.metadata.TemplateResolver.mergeMappings(merged, own);
             }
             try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
                 builder.map(merged);
@@ -568,15 +739,11 @@ public final class IndexAdminHandler extends BaseRestHandler {
             if (inherited.settings().isEmpty()) {
                 return requested;
             }
-            final Settings.Builder merged = Settings.builder();
-            for (Map.Entry<String, Object> each : inherited.settings().entrySet()) {
-                // Structural settings are the create path's business, not a layered value: shards are
-                // resolved separately above and replicas are refused outright.
-                if ("number_of_shards".equals(each.getKey()) || "number_of_replicas".equals(each.getKey())) {
-                    continue;
-                }
-                merged.put(IndexMetadata.INDEX_SETTING_PREFIX + each.getKey(), String.valueOf(each.getValue()));
-            }
+            final Settings.Builder merged = Settings.builder().put(normalised(inherited));
+            // Structural settings are the create path's business, not a layered value: shards are resolved
+            // separately above and replicas are refused outright.
+            merged.remove(IndexMetadata.SETTING_NUMBER_OF_SHARDS);
+            merged.remove(IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
             if (requested != null) {
                 merged.put(requested);
             }
@@ -752,6 +919,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
      */
     public static String forwardFailureMessage(String owner, Exception e) {
         if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.transport.ReceiveTimeoutTransportException.class) != null
+            || org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.OpenSearchTimeoutException.class) != null
             || org.opensearch.ExceptionsHelper.unwrap(
                 e,
                 org.opensearch.common.util.concurrent.UncategorizedExecutionException.class

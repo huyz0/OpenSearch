@@ -10,9 +10,16 @@ package org.opensearch.serverless.store;
 
 import org.opensearch.cluster.metadata.RepositoryMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobMetadata;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.indices.recovery.RecoverySettings;
@@ -78,7 +85,7 @@ public final class ObjectStores {
             if (path == null || path.isBlank()) {
                 throw new IllegalArgumentException("serverless.store.path is required for a filesystem store");
             }
-            return new Handle(new FsBlobStore(8192, Path.of(path), false), null);
+            return new Handle(new Metered(new FsBlobStore(8192, Path.of(path), false)), null);
         }
         if ("s3".equals(type) == false) {
             throw new IllegalArgumentException("unknown " + TYPE + ": " + type + "; expected fs or s3");
@@ -142,7 +149,304 @@ public final class ObjectStores {
         // Started here rather than left to the caller: blobStore() is lazy and throws on a repository
         // that is not started, and the failure reads as a store problem rather than a lifecycle one.
         blobStoreRepository.start();
-        return new Handle(blobStoreRepository.blobStore(), threadPool);
+        return new Handle(new Metered(blobStoreRepository.blobStore()), threadPool);
+    }
+
+    /**
+     * The store every node runs on: the real one, with every request counted on the way through.
+     *
+     * <p>The object store is priced per request and the RFC treats request counts as service levels
+     * from day one, yet the only counter lived in the test kit and production returned the raw store.
+     * A deployment could measure its cost in a test and not in the field. This is that counter, in the
+     * one place every store is built, so {@code /_serverless/stats} can report what the node has spent.
+     *
+     * <p>Reads and writes are counted by kind because they price differently on every real provider.
+     * {@code impliedS3Requests} applies what each kind actually costs -- a compare-and-swap is one call
+     * here and two requests on S3, a GET for the ETag then a conditional PUT -- and is an estimate derived
+     * from reading the S3 container, not from watching the wire. A listing by prefix and a
+     * {@code children()} call are both listings, which price above a GET.
+     *
+     * <p>Bytes are counted at the stream: a ranged read of a segment counts what was actually pulled,
+     * which is the number that says whether reads are lazy.
+     */
+    public static final class Metered implements BlobStore {
+
+        private final BlobStore delegate;
+        private final java.util.concurrent.atomic.AtomicLong registerReads = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong registerWrites = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong blobReads = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong blobWrites = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong listings = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong deletes = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong bytesRead = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong bytesWritten = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong errors = new java.util.concurrent.atomic.AtomicLong();
+
+        /**
+         * Wraps a store.
+         *
+         * @param delegate the real store
+         */
+        public Metered(BlobStore delegate) {
+            this.delegate = delegate;
+        }
+
+        /**
+         * Returns the store this counts for.
+         *
+         * @return the real store
+         */
+        public BlobStore delegate() {
+            return delegate;
+        }
+
+        /**
+         * Returns register reads.
+         *
+         * @return the count
+         */
+        public long registerReads() {
+            return registerReads.get();
+        }
+
+        /**
+         * Returns register compare-and-swaps, including put-if-absent.
+         *
+         * @return the count
+         */
+        public long registerWrites() {
+            return registerWrites.get();
+        }
+
+        /**
+         * Returns ordinary blob reads, ranged or whole, and existence checks.
+         *
+         * @return the count
+         */
+        public long blobReads() {
+            return blobReads.get();
+        }
+
+        /**
+         * Returns ordinary blob writes.
+         *
+         * @return the count
+         */
+        public long blobWrites() {
+            return blobWrites.get();
+        }
+
+        /**
+         * Returns listings, by prefix or of children.
+         *
+         * @return the count
+         */
+        public long listings() {
+            return listings.get();
+        }
+
+        /**
+         * Returns delete calls. One call may remove many blobs.
+         *
+         * @return the count
+         */
+        public long deletes() {
+            return deletes.get();
+        }
+
+        /**
+         * Returns the bytes actually read from blobs, as the streams were consumed.
+         *
+         * @return the byte count
+         */
+        public long bytesRead() {
+            return bytesRead.get();
+        }
+
+        /**
+         * Returns the bytes handed to blob writes.
+         *
+         * @return the byte count
+         */
+        public long bytesWritten() {
+            return bytesWritten.get();
+        }
+
+        /**
+         * Returns how many calls ended in an exception, of any kind.
+         *
+         * @return the count
+         */
+        public long errors() {
+            return errors.get();
+        }
+
+        /**
+         * Returns what these operations would cost in S3 requests: every kind is one, a compare-and-swap
+         * is two.
+         *
+         * @return the implied request count
+         */
+        public long impliedS3Requests() {
+            return registerReads.get() + 2 * registerWrites.get() + blobReads.get() + blobWrites.get() + listings.get() + deletes.get();
+        }
+
+        @Override
+        public BlobContainer blobContainer(BlobPath path) {
+            return new Counting(delegate.blobContainer(path));
+        }
+
+        @Override
+        public void close() throws java.io.IOException {
+            delegate.close();
+        }
+
+        private final class Counting implements BlobContainer {
+
+            private final BlobContainer inner;
+
+            Counting(BlobContainer inner) {
+                this.inner = inner;
+            }
+
+            private <T> T count(
+                java.util.concurrent.atomic.AtomicLong counter,
+                org.opensearch.common.CheckedSupplier<T, java.io.IOException> call
+            ) throws java.io.IOException {
+                counter.incrementAndGet();
+                try {
+                    return call.get();
+                } catch (java.io.IOException | RuntimeException e) {
+                    errors.incrementAndGet();
+                    throw e;
+                }
+            }
+
+            @Override
+            public BlobPath path() {
+                return inner.path();
+            }
+
+            @Override
+            public boolean blobExists(String blobName) throws java.io.IOException {
+                return count(blobReads, () -> inner.blobExists(blobName));
+            }
+
+            @Override
+            public java.io.InputStream readBlob(String blobName) throws java.io.IOException {
+                return new CountedStream(count(blobReads, () -> inner.readBlob(blobName)));
+            }
+
+            @Override
+            public java.io.InputStream readBlob(String blobName, long position, long length) throws java.io.IOException {
+                return new CountedStream(count(blobReads, () -> inner.readBlob(blobName, position, length)));
+            }
+
+            @Override
+            public void writeBlob(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+                throws java.io.IOException {
+                bytesWritten.addAndGet(Math.max(0L, blobSize));
+                count(blobWrites, () -> {
+                    inner.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+                    return null;
+                });
+            }
+
+            @Override
+            public void writeBlobAtomic(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+                throws java.io.IOException {
+                bytesWritten.addAndGet(Math.max(0L, blobSize));
+                count(blobWrites, () -> {
+                    inner.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
+                    return null;
+                });
+            }
+
+            @Override
+            public DeleteResult delete() throws java.io.IOException {
+                return count(deletes, inner::delete);
+            }
+
+            @Override
+            public void deleteBlobsIgnoringIfNotExists(java.util.List<String> blobNames) throws java.io.IOException {
+                count(deletes, () -> {
+                    inner.deleteBlobsIgnoringIfNotExists(blobNames);
+                    return null;
+                });
+            }
+
+            @Override
+            public java.util.Map<String, BlobMetadata> listBlobs() throws java.io.IOException {
+                return count(listings, inner::listBlobs);
+            }
+
+            @Override
+            public java.util.Map<String, BlobContainer> children() throws java.io.IOException {
+                // A listing with a delimiter on every provider worth naming, and priced as one.
+                final java.util.Map<String, BlobContainer> children = count(listings, inner::children);
+                final java.util.Map<String, BlobContainer> counted = new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<String, BlobContainer> child : children.entrySet()) {
+                    counted.put(child.getKey(), new Counting(child.getValue()));
+                }
+                return counted;
+            }
+
+            @Override
+            public java.util.Map<String, BlobMetadata> listBlobsByPrefix(String blobNamePrefix) throws java.io.IOException {
+                return count(listings, () -> inner.listBlobsByPrefix(blobNamePrefix));
+            }
+
+            @Override
+            public java.util.Optional<BlobRegister> readRegister(String blobName) throws java.io.IOException {
+                return count(registerReads, () -> inner.readRegister(blobName));
+            }
+
+            @Override
+            public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+                throws java.io.IOException {
+                return count(registerWrites, () -> inner.compareAndSwapRegister(blobName, expectedGeneration, newValue));
+            }
+
+            @Override
+            public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws java.io.IOException {
+                return count(registerWrites, () -> inner.createRegisterIfAbsent(blobName, value));
+            }
+        }
+
+        /** Counts the bytes a caller actually pulls through a read, which for a ranged read is the range. */
+        private final class CountedStream extends java.io.FilterInputStream {
+
+            CountedStream(java.io.InputStream in) {
+                super(in);
+            }
+
+            @Override
+            public int read() throws java.io.IOException {
+                final int b = super.read();
+                if (b >= 0) {
+                    bytesRead.incrementAndGet();
+                }
+                return b;
+            }
+
+            @Override
+            public int read(byte[] buffer, int offset, int length) throws java.io.IOException {
+                final int n = super.read(buffer, offset, length);
+                if (n > 0) {
+                    bytesRead.addAndGet(n);
+                }
+                return n;
+            }
+
+            @Override
+            public long skip(long n) throws java.io.IOException {
+                final long skipped = super.skip(n);
+                if (skipped > 0) {
+                    bytesRead.addAndGet(skipped);
+                }
+                return skipped;
+            }
+        }
     }
 
     /** A blob store and whatever had to be built to reach it. */

@@ -223,24 +223,45 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
                 }
             }
             builder.endArray();
-            builder.startArray("aliases");
+            // One read per name for both arrays: an alias and a data stream are the same register, and
+            // which of the two it is decides where it is rendered. A stream used to be listed under
+            // aliases, with its backing indices as if a caller had aliased them, and data_streams was
+            // hard-coded empty with a comment saying they did not exist.
+            final List<org.opensearch.serverless.cluster.AliasRecord> aliases = new java.util.ArrayList<>();
+            final List<org.opensearch.serverless.cluster.AliasRecord> streams = new java.util.ArrayList<>();
             for (String name : wanted) {
                 final var resolved = metadata.resolve(name);
                 if (resolved.alias() != null) {
-                    builder.startObject();
-                    builder.field("name", name);
-                    builder.startArray("indices");
-                    for (String index : resolved.alias().indices()) {
-                        builder.value(index);
-                    }
-                    builder.endArray();
-                    builder.endObject();
+                    (resolved.alias().dataStream() ? streams : aliases).add(resolved.alias());
                 }
             }
+            builder.startArray("aliases");
+            for (org.opensearch.serverless.cluster.AliasRecord alias : aliases) {
+                builder.startObject();
+                builder.field("name", alias.name());
+                builder.startArray("indices");
+                for (String index : alias.indices()) {
+                    builder.value(index);
+                }
+                builder.endArray();
+                builder.endObject();
+            }
             builder.endArray();
-            // Data streams do not exist here. The key is present and empty rather than absent, because a
-            // client walking all three arrays should not have to branch on which of them this deployment has.
-            builder.startArray("data_streams").endArray();
+            // Core's ResolveIndexAction shape for a data stream. The key is present and empty when there are
+            // none, because a client walking all three arrays should not have to branch on which it got.
+            builder.startArray("data_streams");
+            for (org.opensearch.serverless.cluster.AliasRecord stream : streams) {
+                builder.startObject();
+                builder.field("name", stream.name());
+                builder.startArray("backing_indices");
+                for (String index : stream.indices()) {
+                    builder.value(index);
+                }
+                builder.endArray();
+                builder.field("timestamp_field", stream.timestampField());
+                builder.endObject();
+            }
+            builder.endArray();
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }

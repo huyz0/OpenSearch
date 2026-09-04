@@ -36,10 +36,14 @@ import java.util.concurrent.CountDownLatch;
  * anything would be useless. Both defaults are visible, and
  * {@code serverless.activation.on_demand} turns this one off.
  *
- * <p><b>Per D5, filesystem-backed only.</b> {@code serverless.store.path} is a local directory standing
- * in for an object store. That is not a deployment story — it is the same restriction every test in this
- * project runs under, and R11 is what would lift it. A process that pretended otherwise by accepting an
- * S3 bucket it has never been run against would be worse than one that says what it is.
+ * <p><b>D5, and what it says about the store.</b> A node runs on a local directory ({@code fs}) or on an
+ * S3-compatible store ({@code s3}), and the two are not equally proven. The conformance suite R11 wrote
+ * has been run against the filesystem container, MinIO and SeaweedFS; the linearizability of a
+ * provider's conditional writes -- the property every register here leans on -- has not been closed for
+ * Amazon S3 itself, and D5 says a node may ship on such a provider only behind a flag that says so. So an
+ * {@code s3} store boots, and boots with a warning naming R11 and the providers actually tested, unless
+ * {@link #PROVIDER_ACK} records that the operator has read it. A process that accepted a bucket it has
+ * never been run against and said nothing would be worse than one that says what it is.
  */
 public final class ServerlessBootstrap implements Closeable {
 
@@ -99,6 +103,16 @@ public final class ServerlessBootstrap implements Closeable {
 
     /** The default lease TTL: long enough to survive a slow object store, short enough to fail over. */
     public static final long DEFAULT_LEASE_TTL_MILLIS = 30_000L;
+
+    /**
+     * Set to {@code true} to record that the operator knows an {@code s3} store's conditional writes have
+     * not been proven linearizable by R11's suite against their provider. Silences the boot warning and
+     * nothing else: the node behaves the same either way.
+     */
+    public static final String PROVIDER_ACK = "serverless.store.provider_ack";
+
+    /** The providers R11's conformance suite has actually been run against. */
+    static final String TESTED_PROVIDERS = "the filesystem container, MinIO and SeaweedFS";
 
     /**
      * System property prefixes {@link #main} forwards into settings. An allowlist rather than everything,
@@ -162,6 +176,17 @@ public final class ServerlessBootstrap implements Closeable {
         }
         if ("fs".equals(storeType) && (settings.get(STORE_PATH) == null || settings.get(STORE_PATH).isBlank())) {
             throw new IllegalArgumentException(STORE_PATH + " is required: it is where the metadata plane and segments live");
+        }
+        if ("s3".equals(storeType) && settings.getAsBoolean(PROVIDER_ACK, false) == false) {
+            // D5's flag, as a warning rather than a refusal: a deployment already on such a store must
+            // not stop booting on upgrade, and an operator who has read this sets the setting once.
+            logger.warn(
+                "running on an s3 store: R11's conformance suite has been run against {}, and the linearizability of this "
+                    + "provider's conditional writes -- which every register here depends on -- has not been closed for it. "
+                    + "Set {}=true to record that this is understood.",
+                TESTED_PROVIDERS,
+                PROVIDER_ACK
+            );
         }
         final long ttl = settings.getAsLong(LEASE_TTL, DEFAULT_LEASE_TTL_MILLIS);
 

@@ -501,53 +501,61 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
      * A run of failures earns a wait, the wait is answered at the door, and it ends when the clock says.
      *
      * <p>Five is the default threshold, one second the first wait, and the plugin's clock is the test's,
-     * so the recovery is a number added to it rather than a sleep. The by-address key is checked with a
-     * second name from the same address, which is what a guesser rotating names looks like from here.
+     * so the recovery is a number added to it rather than a sleep. The wait belongs to the pair of address
+     * and account that earned it -- a second name from the same address is checked as usual -- and it is
+     * an ordinary account that earns one here, because the configured account is never refused at the
+     * door, only delayed; {@link ServerlessThrottleTests} holds that property and the shared-address one.
      */
     public void testRepeatedFailuresAreThrottledAndRecoverAfterTheDelay() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
         final Settings settings = nodeSettings("auth-throttle");
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
             node.start();
-            node.setMetadataPlane(plane(clock));
+            node.setMetadataPlane(plane);
+            ready(node, plane, clock);
+            assertEquals(
+                200,
+                send(node, "PUT", "/_serverless/security/users/poe", basic(ADMIN, ADMIN_PASSWORD), "{\"password\":\"black-one\"}").status()
+            );
 
             for (int i = 0; i < 5; i++) {
-                final Response wrong = send(node, "GET", "/", basic(ADMIN, "guess-" + i), null);
+                final Response wrong = send(node, "GET", "/", basic("poe", "guess-" + i), null);
                 assertEquals("failure " + (i + 1) + " is checked and refused: " + wrong.body(), 401, wrong.status());
             }
 
-            final Response throttled = send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null);
+            final Response throttled = send(node, "GET", "/", basic("poe", "black-one"), null);
             assertEquals("the right password is refused too while the wait lasts: " + throttled.body(), 429, throttled.status());
             assertEquals("and told how long: " + throttled.headers(), "1", throttled.header("Retry-After"));
             assertTrue("and why: " + throttled.body(), throttled.body().contains("too_many_attempts"));
             assertEquals(
-                "a different name from the same address is waiting too",
-                429,
+                "a different name from the same address is checked, not refused: the wait belongs to the pair",
+                401,
                 send(node, "GET", "/", basic("somebody-else", "whatever"), null).status()
             );
 
             // The wait ends; the next failure is checked, and doubles the wait.
             authClock.addAndGet(1_001L);
-            assertEquals(401, send(node, "GET", "/", basic(ADMIN, "guess-6"), null).status());
-            final Response doubled = send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null);
+            assertEquals(401, send(node, "GET", "/", basic("poe", "guess-6"), null).status());
+            final Response doubled = send(node, "GET", "/", basic("poe", "black-one"), null);
             assertEquals(429, doubled.status());
             assertEquals("the sixth failure earns two seconds", "2", doubled.header("Retry-After"));
             authClock.addAndGet(1_000L);
             assertEquals(
                 "halfway through it is still a second",
                 "1",
-                send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null).header("Retry-After")
+                send(node, "GET", "/", basic("poe", "black-one"), null).header("Retry-After")
             );
 
             authClock.addAndGet(1_000L);
-            final Response recovered = send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null);
+            final Response recovered = send(node, "GET", "/", basic("poe", "black-one"), null);
             assertEquals("after the wait the right password is served: " + recovered.body(), 200, recovered.status());
 
             // A success cleared the count, so the next run starts from nothing.
             for (int i = 0; i < 4; i++) {
-                assertEquals(401, send(node, "GET", "/", basic(ADMIN, "guess-again-" + i), null).status());
+                assertEquals(401, send(node, "GET", "/", basic("poe", "guess-again-" + i), null).status());
             }
-            assertEquals("four failures earn no wait", 200, send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null).status());
+            assertEquals("four failures earn no wait", 200, send(node, "GET", "/", basic("poe", "black-one"), null).status());
         }
     }
 
@@ -821,6 +829,18 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
     }
 
     /** The password is a keystore setting, and putting it in opensearch.yml is an error rather than a downgrade. */
+    /**
+     * The plugin-subject marker is one string in two places: the auth plugin sets it, the shell's router
+     * turns it into the plugin-origin header a forwarded system-index write needs. Pinned here so the two
+     * cannot drift apart silently, which would make every forwarded account write a 403.
+     */
+    public void testThePluginSubjectMarkerIsOneStringInBothPlaces() {
+        assertEquals(
+            org.opensearch.serverless.auth.ServerlessAuthPlugin.PLUGIN_SUBJECT,
+            org.opensearch.serverless.transport.ShardRouter.PLUGIN_SUBJECT_TRANSIENT
+        );
+    }
+
     public void testThePasswordCannotBeConfiguredInTheClear() {
         final Settings settings = Settings.builder()
             .put("path.home", createTempDir())

@@ -40,7 +40,9 @@ import java.util.function.Supplier;
  * alias is its own compare-and-swap. That is exactly why it can: moving one alias from one index to
  * another is one swap, and M59 already served {@code POST /_aliases} for that case. What is not atomic is
  * the pair -- create the index, then move the name -- and that is reported rather than hidden: a swap lost
- * to a concurrent rollover answers 409 and names the index that was created and not adopted.
+ * to a concurrent rollover removes the index it created, answers 409, and says so; if the removal itself
+ * fails, the 409 names the index that was created and not adopted, so nothing is left behind unmentioned.
+ * The record and the generation the swap is made under come from one read (see {@link AliasHandler}).
  *
  * <p>Conditions are evaluated against what this deployment records: {@code max_age} against the index's
  * creation time, {@code max_docs} against a count fanned out over its shards. Sizes are not reported here,
@@ -183,7 +185,22 @@ public final class RolloverHandler extends BaseRestHandler {
             return;
         }
         final AliasRecord record = resolved.alias();
-        final long generation = metadata.aliasGeneration(ask.target());
+        final long generation = resolved.generation();
+        final boolean bodyShapesIndex = ask.create().mapping != null
+            || (ask.create().settings != null && ask.create().settings.isEmpty() == false);
+        if (record.dataStream() && (ask.newIndex() != null || bodyShapesIndex)) {
+            // Core's rules, in core's words: a stream's backing index is named by its generation and shaped
+            // by its template, and a rollover may not override either.
+            sendQuietly(
+                channel,
+                RestStatus.BAD_REQUEST,
+                "illegal_argument_exception",
+                ask.newIndex() != null
+                    ? "new index name may not be specified when rolling over a data stream"
+                    : "aliases, mappings, and index settings may not be specified when rolling over a data stream"
+            );
+            return;
+        }
         if (record.dataStream() == false && record.indices().size() != 1) {
             sendQuietly(
                 channel,
@@ -199,7 +216,7 @@ public final class RolloverHandler extends BaseRestHandler {
             sendQuietly(channel, RestStatus.NOT_FOUND, "index_not_found", "the current index [" + oldName + "] does not exist");
             return;
         }
-        final String newName;
+        String newName;
         if (ask.newIndex() != null) {
             newName = ask.newIndex();
         } else if (record.dataStream()) {
@@ -264,37 +281,74 @@ public final class RolloverHandler extends BaseRestHandler {
             return;
         }
 
-        // The index first, then the name. A rollover the swap loses is reported with the index it made.
+        if (serving.isSystemIndex(newName)) {
+            // Reserved on every path that mints a name, not only on PUT /{index}.
+            sendQuietly(channel, RestStatus.FORBIDDEN, "system_index", "[" + newName + "] belongs to a plugin and cannot be created here");
+            return;
+        }
+
+        // The index first, then the name. A rollover the swap loses is reported with what became of the
+        // index it made. A stream's backing index inherits what the stream's own name matches, which is the
+        // template that declared the stream -- see DataStreamHandler.create for why it cannot be resolved
+        // against the backing name.
         final IndexAdminHandler.CreateRequest create = record.dataStream()
             ? DataStreamHandler.withTimestamp(ask.create(), record.timestampField())
             : ask.create();
+        long newGeneration = record.generation() + 1;
         try {
-            IndexAdminHandler.createIndex(metadata, newName, create);
+            if (record.dataStream()) {
+                final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolve(
+                    metadata.indexTemplates().all(),
+                    metadata.componentTemplates().all(),
+                    ask.target()
+                );
+                // A taken name is skipped by bumping the generation, as core does, rather than wedging the
+                // stream on a name something else holds.
+                for (int attempt = 0;; attempt++) {
+                    try {
+                        IndexAdminHandler.createIndex(metadata, newName, create, inherited);
+                        break;
+                    } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
+                        if (attempt >= 8) {
+                            throw e;
+                        }
+                        newGeneration++;
+                        newName = DataStreamHandler.backingIndexName(ask.target(), newGeneration);
+                    }
+                }
+            } else {
+                IndexAdminHandler.createIndex(metadata, newName, create);
+            }
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "index [" + newName + "] already exists");
+            return;
+        } catch (IndexAdminHandler.RefusedException e) {
+            sendQuietly(channel, e.status, e.type, e.getMessage());
             return;
         }
         final AliasRecord moved;
         if (record.dataStream()) {
             final List<String> backing = new ArrayList<>(record.indices());
             backing.add(newName);
-            moved = new AliasRecord(ask.target(), backing, true, record.generation() + 1, record.timestampField());
+            moved = new AliasRecord(ask.target(), backing, true, newGeneration, record.timestampField());
         } else {
             moved = new AliasRecord(ask.target(), List.of(newName));
         }
-        if (metadata.updateAlias(moved, generation).isEmpty()) {
+        if (metadata.updateAlias(record, moved, generation).isEmpty()) {
             // Undo the half that landed. Left in place, the next rollover would compute the same name and
-            // find it taken, and the stream could never roll again.
+            // find it taken -- and the answer has to say which of the two outcomes this is.
+            String left = "the index [" + newName + "] created for it was removed";
             try {
                 metadata.deleteIndex(newName);
             } catch (Exception e) {
                 logger.warn("could not remove the index [" + newName + "] created by a rollover that lost its swap", e);
+                left = "the index [" + newName + "] was created and not adopted, and could not be removed: " + e.getMessage();
             }
             sendQuietly(
                 channel,
                 RestStatus.CONFLICT,
                 "version_conflict_engine_exception",
-                "[" + ask.target() + "] was changed concurrently; nothing was rolled over, retry"
+                "[" + ask.target() + "] was changed concurrently; nothing was rolled over and " + left + "; retry"
             );
             return;
         }

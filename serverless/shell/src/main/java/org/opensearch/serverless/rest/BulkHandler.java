@@ -286,8 +286,10 @@ public final class BulkHandler extends BaseRestHandler {
                 );
                 continue;
             }
-            // The backing index is where the write lands; the name the caller wrote is what the item reports.
+            // The backing index is where the write lands, and it is what the item reports, as core reports
+            // it. Its uuid rides along so the local lookup and the forward both name the incarnation.
             item.writtenIndex = target.get().index().name();
+            item.writtenUuid = target.get().index().uuid();
             item.shard = DocumentRouting.shardFor(target.get().index(), item.operation.id());
         }
     }
@@ -370,23 +372,52 @@ public final class BulkHandler extends BaseRestHandler {
 
     private void applyGroup(ServerlessNode serving, List<Item> group, boolean refresh) throws IOException {
         final String index = group.get(0).writtenIndex;
+        final String uuid = group.get(0).writtenUuid;
         final int shard = group.get(0).shard;
         final List<ServerlessNode.BulkOperation> operations = new ArrayList<>(group.size());
         for (Item item : group) {
             operations.add(new ServerlessNode.BulkOperation(item.operation, item.ifSeqNo, item.ifPrimaryTerm, item.requireAbsent));
         }
 
+        // By uuid as well as name, as the single-document path has matched since the recreate bug: a
+        // deleted and recreated index keeps its name, and a writer that has not yet heartbeat still holds
+        // the old incarnation open under it. Matched by name alone, a batch through that node was applied
+        // to the old shard, logged into a log nothing replays, and answered 201.
         final ShardId local = serving.reconciler()
             .openShards()
             .stream()
-            .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
+            .filter(s -> s.getIndexName().equals(index) && s.id() == shard && s.getIndex().getUUID().equals(uuid))
+            .filter(s -> serving.reconciler().readerShards().contains(s) == false)
             .findFirst()
             .orElse(null);
 
-        if (local != null && serving.reconciler().readerShards().contains(local) == false) {
-            record(group, serving.bulkOperations(local, operations), serving.localNode().getId());
-            if (refresh) {
-                serving.reconciler().shard(local).refresh("serverless-bulk-refresh");
+        if (local != null) {
+            try {
+                record(group, serving.bulkOperations(local, operations), serving.localNode().getId());
+                if (refresh) {
+                    final var open = serving.reconciler().shard(local);
+                    if (open != null) {
+                        open.refresh("serverless-bulk-refresh");
+                    }
+                }
+            } catch (Exception e) {
+                // A batch that could not be applied here -- the log append failed and the shard was
+                // released, the shard turned out to be a reader, this node's own lease had lapsed -- used
+                // to escape into the fan-out, which swallowed it, and every item answered 500 "the writer
+                // returned no outcome". The reason and the right status: the shard is moving, retry.
+                serving.signals().ownershipDoubted(index, shard);
+                failGroup(
+                    group,
+                    RestStatus.SERVICE_UNAVAILABLE,
+                    "write_failed",
+                    "the batch could not be applied on this node, which held shard "
+                        + shard
+                        + " of "
+                        + index
+                        + ": "
+                        + (e.getMessage() == null ? e.toString() : e.getMessage())
+                        + "; the shard may have moved, retry"
+                );
             }
             return;
         }
@@ -426,13 +457,77 @@ public final class BulkHandler extends BaseRestHandler {
                 return;
             }
             final var response = serving.router()
-                .forwardBulk(peer.get(), org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, shard, operations, refresh));
+                .forwardBulk(
+                    peer.get(),
+                    org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh)
+                );
             record(group, response.outcomes(), response.ownerNodeId());
         } catch (Exception e) {
-            // 503 rather than the exception's own status, for the reason the single-write path gives:
-            // a forward that fails means the routing was stale, and stale routing is a retry.
+            failForwarded(serving, group, index, shard, owner, e);
+        }
+    }
+
+    /**
+     * Fails a forwarded group with the status its failure deserves, the same sorting the single-document
+     * path applies.
+     *
+     * <p>Every failure used to be a 503 {@code forward_failed} that cast doubt on ownership. An owner at its
+     * indexing-pressure limit told a local batch 429 and a forwarded one 503; a deadline was worded as
+     * "stale routing, retry", which for a batch of auto-id documents is an invitation to write them twice.
+     */
+    private void failForwarded(ServerlessNode serving, List<Item> group, String index, int shard, String owner, Exception e) {
+        final org.opensearch.serverless.transport.ForwardFailure kind = org.opensearch.serverless.transport.ForwardFailure.classify(e);
+        if (kind.castsDoubtOnOwnership()) {
             serving.signals().ownershipDoubted(index, shard);
-            failGroup(group, RestStatus.SERVICE_UNAVAILABLE, "forward_failed", IndexAdminHandler.forwardFailureMessage(owner, e));
+        }
+        switch (kind) {
+            case REJECTED: {
+                final Throwable rejected = org.opensearch.ExceptionsHelper.unwrap(
+                    e,
+                    org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class
+                );
+                failGroup(group, RestStatus.TOO_MANY_REQUESTS, "rejected_execution_exception", rejected.getMessage());
+                return;
+            }
+            case CONFLICT: {
+                final Throwable conflict = org.opensearch.ExceptionsHelper.unwrap(
+                    e,
+                    org.opensearch.index.engine.VersionConflictEngineException.class
+                );
+                failGroup(group, RestStatus.CONFLICT, "version_conflict_engine_exception", conflict.getMessage());
+                return;
+            }
+            case REMOTE: {
+                if (org.opensearch.serverless.transport.ForwardFailure.isClientStatus(e)) {
+                    // The owner's own answer, with the owner's own status and core's own type name.
+                    final Throwable answer = org.opensearch.serverless.transport.ForwardFailure.answer(e);
+                    failGroup(
+                        group,
+                        org.opensearch.ExceptionsHelper.status(answer),
+                        org.opensearch.OpenSearchException.getExceptionName(answer),
+                        answer.getMessage() == null ? answer.toString() : answer.getMessage()
+                    );
+                    return;
+                }
+                failGroup(
+                    group,
+                    RestStatus.SERVICE_UNAVAILABLE,
+                    "forward_failed",
+                    org.opensearch.serverless.transport.ForwardFailure.describe(owner, e)
+                );
+                return;
+            }
+            default: {
+                // 503 rather than the exception's own status, for the reason the single-write path gives:
+                // a forward that fails means the routing was stale, and stale routing is a retry. A deadline
+                // is worded as one, so the client reads before it retries.
+                failGroup(
+                    group,
+                    RestStatus.SERVICE_UNAVAILABLE,
+                    "forward_failed",
+                    org.opensearch.serverless.transport.ForwardFailure.describe(owner, e)
+                );
+            }
         }
     }
 
@@ -480,7 +575,9 @@ public final class BulkHandler extends BaseRestHandler {
                 // The action the caller wrote, not a normalised one: a client matching items to the
                 // actions it sent looks up this key.
                 builder.startObject(item.operation.isDeletion() ? "delete" : item.requireAbsent ? "create" : "index");
-                builder.field("_index", item.index);
+                // The backing index once the item was routed, as core reports it and as the single-document
+                // path reports it; the name the caller wrote until then, since nothing else is known.
+                builder.field("_index", item.writtenIndex != null ? item.writtenIndex : item.index);
                 builder.field("_id", item.operation.id());
                 if (item.shard >= 0) {
                     builder.field("_shard", item.shard);
@@ -617,6 +714,11 @@ public final class BulkHandler extends BaseRestHandler {
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
                 if (token == XContentParser.Token.FIELD_NAME) {
                     field = parser.currentName();
+                } else if (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY) {
+                    // A nested value has no meaning on an action line. Skipped whole: this walker is flat,
+                    // and {"index":{"_id":"1","x":{"_id":"2"}}} used to overwrite _id with the inner one
+                    // and stop at the inner object's end.
+                    parser.skipChildren();
                 } else if (token.isValue()) {
                     if ("_index".equals(field)) {
                         action.index = parser.text();
@@ -756,6 +858,7 @@ public final class BulkHandler extends BaseRestHandler {
     private static final class Item {
         private final String index;
         private String writtenIndex;
+        private String writtenUuid;
         private WalRecord operation;
         private String pipeline;
         private int shard = -1;
@@ -803,6 +906,10 @@ public final class BulkHandler extends BaseRestHandler {
                 // "your document was malformed", and only one of those is worth retrying.
                 if (outcome.conflict()) {
                     fail(RestStatus.CONFLICT, "version_conflict_engine_exception", outcome.failure());
+                } else if (outcome.retryable()) {
+                    // The mapping was being grown by another node at the same moment. The document is
+                    // fine and a retry lands it; a 400 told the client the opposite.
+                    fail(RestStatus.SERVICE_UNAVAILABLE, "mapping_contention", outcome.failure());
                 } else {
                     fail(RestStatus.BAD_REQUEST, "operation_failed", outcome.failure());
                 }

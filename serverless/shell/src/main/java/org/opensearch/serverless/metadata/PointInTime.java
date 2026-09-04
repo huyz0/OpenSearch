@@ -41,6 +41,14 @@ import java.util.Map;
  * time is holding on to. Without the collector reading these, a paging caller would find their commit
  * dissolving underneath them halfway through, which is worse than not offering this at all.
  *
+ * <p><b>It names the index by uuid as well as by name.</b> A name can be deleted and created again, and
+ * the new index of that name has the same first segment names as the old one had. A view that knew only
+ * the name would open the new index's bytes under the old view's id — a "frozen" view serving whatever
+ * is there now — and the collector would pin the new index's files on the old view's behalf. The uuid is
+ * what a view is <em>of</em>; the name is how a caller spelled it. A record written before the uuid was
+ * recorded carries none, and is matched by name alone, which is the older, looser behaviour and not a
+ * failure.
+ *
  * <p><b>It expires, and expiry is enforced by time rather than by the caller.</b> A caller that goes away
  * mid-page would otherwise pin those files for the life of the deployment. The keep-alive is absolute
  * rather than sliding — a search does not renew it — because a sliding one would mean a caller paging
@@ -50,11 +58,15 @@ public final class PointInTime {
 
     private final String id;
     private final String index;
+    private final String indexUuid;
     private final long expiresAtMillis;
     private final Map<Integer, CommitManifest> shards;
 
     /**
-     * Creates a record.
+     * Creates a record that names its index by name only.
+     *
+     * <p>Kept for records and callers that predate the uuid; {@link #PointInTime(String, String, String,
+     * long, Map)} is the form a new view should be written in.
      *
      * @param id the identifier a caller quotes back
      * @param index the index it froze
@@ -62,8 +74,22 @@ public final class PointInTime {
      * @param shards each shard's commit at the moment it was taken
      */
     public PointInTime(String id, String index, long expiresAtMillis, Map<Integer, CommitManifest> shards) {
+        this(id, index, null, expiresAtMillis, shards);
+    }
+
+    /**
+     * Creates a record.
+     *
+     * @param id the identifier a caller quotes back
+     * @param index the index it froze
+     * @param indexUuid the uuid of that index at the moment it was frozen, or null if not recorded
+     * @param expiresAtMillis when it stops being honoured, in the plane's clock
+     * @param shards each shard's commit at the moment it was taken
+     */
+    public PointInTime(String id, String index, String indexUuid, long expiresAtMillis, Map<Integer, CommitManifest> shards) {
         this.id = id;
         this.index = index;
+        this.indexUuid = indexUuid;
         this.expiresAtMillis = expiresAtMillis;
         this.shards = Map.copyOf(shards);
     }
@@ -84,6 +110,15 @@ public final class PointInTime {
      */
     public String index() {
         return index;
+    }
+
+    /**
+     * Returns the uuid of the index this view is of, as it was when the view was taken.
+     *
+     * @return the uuid, or null for a record written before it was recorded
+     */
+    public String indexUuid() {
+        return indexUuid;
     }
 
     /**
@@ -112,6 +147,51 @@ public final class PointInTime {
      */
     public boolean expiredAt(long nowMillis) {
         return nowMillis >= expiresAtMillis;
+    }
+
+    /**
+     * The same view with a later deadline.
+     *
+     * <p>Extending a view is a new record with a later expiry and everything else unchanged — the uuid
+     * included, which a caller rebuilding the record by hand from its name and shards would drop.
+     *
+     * @param expiresAtMillis the new deadline
+     * @return the extended view
+     */
+    public PointInTime withExpiry(long expiresAtMillis) {
+        return new PointInTime(id, index, indexUuid, expiresAtMillis, shards);
+    }
+
+    /**
+     * Reports whether this is the stand-in the plane substitutes for a record it could not read.
+     *
+     * <p>Such a record pins nothing by name — it has no shards — and the collector has to treat its
+     * presence as "do not delete anything", since what it holds is unknowable. See
+     * {@code GarbageCollector#sweepShard}.
+     *
+     * @return true if this record stands for one that could not be read
+     */
+    public boolean isPlaceholder() {
+        return index.isEmpty();
+    }
+
+    /**
+     * Reports whether this view holds files of the given index.
+     *
+     * <p>By uuid when both sides know one, by name otherwise. A view taken over an index that has since
+     * been deleted and created again under the same name does not pin the new index's files, and the new
+     * index's sweep does not have to honour it — but a record written before uuids were recorded still
+     * matches by name, which errs towards pinning.
+     *
+     * @param indexName the index's name
+     * @param uuid the index's uuid, or null if the caller does not know it
+     * @return true if this view is of that index
+     */
+    public boolean pins(String indexName, String uuid) {
+        if (index.equals(indexName) == false) {
+            return false;
+        }
+        return indexUuid == null || uuid == null || indexUuid.equals(uuid);
     }
 
     /**
@@ -160,6 +240,9 @@ public final class PointInTime {
             builder.startObject();
             builder.field("id", id);
             builder.field("index", index);
+            if (indexUuid != null) {
+                builder.field("index_uuid", indexUuid);
+            }
             builder.field("expires_at", expiresAtMillis);
             builder.startArray("shards");
             for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
@@ -205,6 +288,8 @@ public final class PointInTime {
             if (id == null || index == null || expiresAt == null) {
                 throw new IOException("malformed point in time: missing a required field");
             }
+            // Optional: a record written before the uuid was recorded has none, and reads as before.
+            final Object indexUuid = body.get("index_uuid");
             final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
             if (body.get("shards") instanceof List<?> listed) {
                 for (Object entry : listed) {
@@ -233,7 +318,13 @@ public final class PointInTime {
             if (shards.isEmpty()) {
                 throw new IOException("malformed point in time: it froze no shards");
             }
-            return new PointInTime(id.toString(), index.toString(), Long.parseLong(String.valueOf(expiresAt)), shards);
+            return new PointInTime(
+                id.toString(),
+                index.toString(),
+                indexUuid == null ? null : indexUuid.toString(),
+                Long.parseLong(String.valueOf(expiresAt)),
+                shards
+            );
         }
     }
 
@@ -281,6 +372,7 @@ public final class PointInTime {
             read.put(in.readVInt(), new CommitManifest(in));
         }
         this.shards = Map.copyOf(read);
+        this.indexUuid = in.readOptionalString();
     }
 
     /**
@@ -294,14 +386,24 @@ public final class PointInTime {
         out.writeString(index);
         out.writeVLong(expiresAtMillis);
         out.writeVInt(shards.size());
-        for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
+        for (Map.Entry<Integer, CommitManifest> shard : new java.util.TreeMap<>(shards).entrySet()) {
             out.writeVInt(shard.getKey());
             shard.getValue().writeTo(out);
         }
+        out.writeOptionalString(indexUuid);
     }
 
     @Override
     public String toString() {
-        return "PointInTime[" + id + " of " + index + ", " + shards.size() + " shards, expires " + expiresAtMillis + "]";
+        return "PointInTime["
+            + id
+            + " of "
+            + index
+            + (indexUuid == null ? "" : " (" + indexUuid + ")")
+            + ", "
+            + shards.size()
+            + " shards, expires "
+            + expiresAtMillis
+            + "]";
     }
 }

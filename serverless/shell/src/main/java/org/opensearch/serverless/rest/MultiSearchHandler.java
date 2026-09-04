@@ -112,6 +112,18 @@ public final class MultiSearchHandler extends BaseRestHandler {
                     "a point in time is searched through _search, not inside _msearch"
                 );
             }
+            if (source.searchPipelineSource() != null) {
+                // Parsed and then dropped, before this: the line ran without its pipeline and looked like
+                // it had run with it. A pipeline's processors run around one search's request and
+                // response, and the batch runs its lines through the fan-out directly; until it runs them
+                // through the same plan a lone search gets, the honest answer is the refusal.
+                return refuse(
+                    index,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_search",
+                    "a search pipeline inside an _msearch line is not applied here; send that search through _search, which runs it"
+                );
+            }
             return new Sub(index, source, ignoreUnavailable, null, null, null);
         }
     }
@@ -145,6 +157,19 @@ public final class MultiSearchHandler extends BaseRestHandler {
         final boolean requestIgnoreUnavailable = request.paramAsBoolean("ignore_unavailable", false);
         request.param("allow_no_indices");
         request.param("expand_wildcards");
+        final String searchPipeline = request.param("search_pipeline");
+        if (searchPipeline != null) {
+            // Consumed and refused, rather than left for BaseRestHandler to call unrecognized: it is a
+            // real parameter of core's _msearch, and the refusal says what to do instead.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_search",
+                    "search_pipeline is not applied to a batch here; send each search through _search, which runs it"
+                )
+            );
+        }
         if (request.hasContent() == false) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
@@ -252,15 +277,18 @@ public final class MultiSearchHandler extends BaseRestHandler {
                 items.add(new Item(null, false, List.of(), RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage()));
             } catch (Exception e) {
                 // This search's problem, not the batch's. The slot carries the failure so a caller
-                // pairing responses to requests by position still can.
+                // pairing responses to requests by position still can -- with the failure's own status
+                // and core's own type name, so a breaker's 429 and a filter's 403 do not both arrive as a
+                // 500 that reads like the node broke.
+                final Throwable cause = org.opensearch.ExceptionsHelper.unwrapCause(e);
                 items.add(
                     new Item(
                         null,
                         false,
                         List.of(),
-                        RestStatus.INTERNAL_SERVER_ERROR,
-                        "search_failed",
-                        e.getMessage() == null ? e.toString() : e.getMessage()
+                        org.opensearch.ExceptionsHelper.status(cause),
+                        org.opensearch.OpenSearchException.getExceptionName(cause),
+                        cause.getMessage() == null ? cause.toString() : cause.getMessage()
                     )
                 );
             }

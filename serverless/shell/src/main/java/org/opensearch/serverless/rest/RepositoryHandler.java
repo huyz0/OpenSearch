@@ -156,6 +156,15 @@ public final class RepositoryHandler extends BaseRestHandler {
                     );
                 }
                 final String repo = names.get(0);
+                try {
+                    // A repository name is half of every snapshot's register key (repo#name), so a '#' or a
+                    // ',' in it makes one repository's listing include another's snapshots.
+                    org.opensearch.serverless.metadata.Names.validateId(repo, "repository");
+                } catch (IllegalArgumentException e) {
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "repository_exception", e.getMessage())
+                    );
+                }
                 final Object typeField = body.get("type");
                 final String type = typeField == null ? RepositoryDescriptor.TYPE_NATIVE : String.valueOf(typeField);
                 if (type.equals(RepositoryDescriptor.TYPE_NATIVE) == false) {

@@ -33,6 +33,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
     private final long ifSeqNo;
     private final long ifPrimaryTerm;
     private final boolean requireAbsent;
+    private final String indexUuid;
 
     /**
      * Creates a request.
@@ -114,9 +115,45 @@ public final class ForwardedIndexRequest extends TransportRequest {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) {
+        this(index, null, shard, id, source, refresh, deletion, ifSeqNo, ifPrimaryTerm, requireAbsent);
+    }
+
+    /**
+     * Creates a forwarded write that names the incarnation of the index it is for.
+     *
+     * <p><b>The uuid travels because the name is not enough.</b> A deleted and recreated index keeps its
+     * name and changes its uuid, and a writer that has not yet noticed the delete still holds the old
+     * incarnation open under the same name. A forward matched by name alone was applied to that shard and
+     * acknowledged -- into a log nothing will ever replay. The search path has always carried the uuid
+     * for this reason; the write path now does too.
+     *
+     * @param index the index
+     * @param indexUuid the uuid of the index the sender resolved, or null to match by name only
+     * @param shard the shard
+     * @param id the document id
+     * @param source the document source
+     * @param refresh whether to refresh after the write
+     * @param deletion whether this is a deletion
+     * @param ifSeqNo the sequence number the document must be at, or unassigned for an unconditional write
+     * @param ifPrimaryTerm the primary term the document must be at, or 0 when unconditional
+     * @param requireAbsent whether the write must fail if the document already exists
+     */
+    public ForwardedIndexRequest(
+        String index,
+        String indexUuid,
+        int shard,
+        String id,
+        String source,
+        boolean refresh,
+        boolean deletion,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent
+    ) {
         this.requireAbsent = requireAbsent;
         this.deletion = deletion;
         this.index = index;
+        this.indexUuid = indexUuid;
         this.shard = shard;
         this.id = id;
         this.source = source;
@@ -160,6 +197,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
         this.ifSeqNo = in.readZLong();
         this.ifPrimaryTerm = in.readVLong();
         this.requireAbsent = in.readBoolean();
+        this.indexUuid = in.readOptionalString();
     }
 
     /**
@@ -183,6 +221,16 @@ public final class ForwardedIndexRequest extends TransportRequest {
         out.writeZLong(ifSeqNo);
         out.writeVLong(ifPrimaryTerm);
         out.writeBoolean(requireAbsent);
+        out.writeOptionalString(indexUuid);
+    }
+
+    /**
+     * Returns the uuid of the index incarnation the sender resolved.
+     *
+     * @return the uuid, or null when the sender did not name one
+     */
+    public String indexUuid() {
+        return indexUuid;
     }
 
     /**

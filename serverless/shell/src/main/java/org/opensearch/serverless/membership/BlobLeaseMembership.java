@@ -35,13 +35,24 @@ import java.util.function.LongSupplier;
  * {@link #refresh()} is called. That is the cost §9.5 records, and the reason §10.2 treats a Kubernetes
  * informer as interesting rather than redundant — it is a real push channel for exactly this.
  *
- * <p><b>What the expiry check assumes.</b> A lease carries an expiry stamped by its writer, compared
- * against the reader's clock. That trusts the two clocks to be roughly aligned; skew beyond the TTL
- * makes a live node look dead, or a dead one live. The refinement that removes the assumption is
- * observer-local liveness — track when *this* node last saw a lease's generation change, and expire on
- * the observer's own clock only. It is deliberately not implemented here: it cannot classify a node
- * until it has been observed twice, which a freshly started node has not done, and phase 1 has no need
- * of it. Recorded so the assumption is visible rather than inherited.
+ * <p><b>What the expiry check assumes, and the margin that makes the assumption a budget.</b> A lease
+ * carries an expiry stamped by its writer, compared against the reader's clock. Two clocks are involved
+ * in every takeover: the holder decides when to stop acknowledging writes by its own clock, and the
+ * taker decides when it may steal by its own. If the taker's clock runs ahead by δ, it steals at
+ * holder-time {@code expiry − δ}, and every write the holder acknowledged in those δ milliseconds sits
+ * behind the successor's seal and is never replayed. That is acknowledged-write loss, and it needs no
+ * skew "beyond the TTL" — any positive δ does it. So the two sides are deliberately asymmetric: the taker
+ * treats a lease as live until its stamped expiry, exactly as written; the holder treats its own lease as
+ * gone {@link #skewMarginMillis()} <em>before</em> that ({@link #selfLeaseValidAt}), and considers every
+ * shard it held lost from that moment ({@link #selfLeaseLapsedAt}). The margin is therefore the skew
+ * budget: clocks that disagree by less than it cannot lose an acknowledged write. It sits entirely on
+ * the holder because the taker's reading is the one every failover latency and every timing contract
+ * in the system is measured against; moving it there would make failover slower by the margin for no
+ * additional safety.
+ *
+ * <p>Observer-local liveness — expiring a lease on the observer's own clock, counted from when it last
+ * saw the generation move — would remove the assumption rather than budget for it. It is still not
+ * implemented, for the reason it never was: it cannot classify a node it has observed only once.
  *
  * <p>Safety does not rest on any of this. A node wrongly believed alive still cannot take a shard it
  * does not hold the head for.
@@ -56,11 +67,38 @@ public final class BlobLeaseMembership implements MembershipSource {
      *
      * <p>The index that turns a refresh from a listing into a read. A node adds itself once, when it
      * first renews, and removes itself when it releases; a refresh that finds a listed node with no lease
-     * at all prunes it. Nothing on the per-pass path writes it, so it adds no writes to a steady state --
-     * only one compare-and-swap per join and per clean leave. A deployment from before the index exists
-     * is listed once and the index written from that listing.
+     * at all prunes it, and one that finds a lease dead for {@link #DEAD_LEASE_PRUNE_TTLS} lease lifetimes
+     * prunes that too, blob and all. Nothing on the per-pass path writes it, so it adds no writes to a
+     * steady state -- only one compare-and-swap per join, per clean leave and per pruning. A deployment
+     * from before the index exists is listed once and the index written from that listing.
      */
     public static final String MEMBERS = "members";
+
+    /**
+     * The holder's skew margin as a fraction of the TTL: one thirty-second, about a second at the default
+     * thirty-second TTL.
+     *
+     * <p>Why that and not more. A second is an order of magnitude above the skew a fleet keeping time by
+     * NTP actually shows, so it is a real budget rather than a token one. It is also inside the slack the
+     * system's own timing contracts already assume: a node that renews later than {@code TTL − margin}
+     * after its last renewal was one lost renewal from lapsing anyway, and the scheduler renews at a
+     * third of the TTL. A wider margin would buy nothing against well-kept clocks and would shorten the
+     * window a node has to renew in; an operator with worse clocks raises it with
+     * {@link #setSkewMarginMillis}.
+     */
+    public static final int SKEW_MARGIN_DIVISOR = 32;
+
+    /**
+     * How many lease lifetimes a lease may be expired for before a refresh removes it from the index and
+     * deletes its blob.
+     *
+     * <p>An expired lease that is still present used to be kept forever: "the node may be slow rather than
+     * gone". Ten lifetimes is not slow. A fleet that mints a node id per pod incarnation accumulates one
+     * dead lease per restart, and every refresh on every node reads every one of them, which is the
+     * O(fleet history) term nothing else in the steady state has. A node that does come back after that
+     * long renews from an absent register and re-enrols, so pruning costs it one extra index swap.
+     */
+    public static final int DEAD_LEASE_PRUNE_TTLS = 10;
 
     private final BlobContainer container;
     private final LongSupplier clock;
@@ -73,6 +111,7 @@ public final class BlobLeaseMembership implements MembershipSource {
     private final Set<String> enrolled = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** The expiry this node last published for itself, so the write path can check it without I/O. */
     private volatile long ownExpiresAtMillis = 0L;
+    private volatile long skewMarginMillis;
 
     private volatile long ownGeneration = BlobRegister.ABSENT_GENERATION;
 
@@ -87,6 +126,40 @@ public final class BlobLeaseMembership implements MembershipSource {
         this.container = container;
         this.clock = clock;
         this.ttlMillis = ttlMillis;
+        this.skewMarginMillis = Math.max(0L, ttlMillis / SKEW_MARGIN_DIVISOR);
+    }
+
+    /**
+     * Sets how far ahead of its stamped expiry this node treats its own lease as gone.
+     *
+     * @param skewMarginMillis the clock-skew budget; see the class documentation
+     * @return this, for chaining
+     */
+    public BlobLeaseMembership setSkewMarginMillis(long skewMarginMillis) {
+        if (skewMarginMillis < 0L || skewMarginMillis >= ttlMillis) {
+            throw new IllegalArgumentException("the skew margin must be within [0, ttl): " + skewMarginMillis + " against " + ttlMillis);
+        }
+        this.skewMarginMillis = skewMarginMillis;
+        return this;
+    }
+
+    /**
+     * Returns the clock-skew budget: how much earlier than its stamped expiry this node stops trusting
+     * its own lease.
+     *
+     * @return the margin in millis
+     */
+    public long skewMarginMillis() {
+        return skewMarginMillis;
+    }
+
+    /**
+     * Returns the lease TTL this source stamps.
+     *
+     * @return the TTL in millis
+     */
+    public long ttlMillis() {
+        return ttlMillis;
     }
 
     /**
@@ -96,11 +169,20 @@ public final class BlobLeaseMembership implements MembershipSource {
      * ownership of its own lease register, so a conflict means something unexpected — a duplicate node
      * id, or a restart that lost track — and is resolved by re-reading rather than by forcing.
      *
+     * <p><b>This does not check whether the lease had already lapsed.</b> That is the caller's rule to
+     * enforce, and it is a rule about shards, not about the register: a node whose lease lapsed has lost
+     * every shard it held and must let go of them <em>before</em> it renews, or the renewal reopens the
+     * write path on shards a successor has already sealed. {@link #selfLeaseLapsedAt} is the question to
+     * ask first; {@code ServerlessNode#renewLease} asks it.
+     *
+     * <p>Synchronized because two renewals at once -- the renewal timer and a backstop, or an activation
+     * -- would each expect the other's generation and both take the re-read path for nothing.
+     *
      * @param self the lease to write, whose expiry is replaced
      * @return the lease as written
      * @throws IOException if the register cannot be written
      */
-    public NodeLease renew(NodeLease self) throws IOException {
+    public synchronized NodeLease renew(NodeLease self) throws IOException {
         final NodeLease renewed = self.renewedUntil(clock.getAsLong() + ttlMillis);
         final String name = LEASE_PREFIX + self.nodeId();
         BlobRegisterCasResult result = container.compareAndSwapRegister(name, ownGeneration, renewed.toBytes());
@@ -113,14 +195,25 @@ public final class BlobLeaseMembership implements MembershipSource {
             if (actual.isPresent()) {
                 try (java.io.InputStream in = actual.get().value().streamInput()) {
                     final NodeLease other = NodeLease.fromStream(in);
+                    // One exception, and it is an argument rather than a convenience: a lease at the same
+                    // transport address cannot belong to a live process. Two processes cannot both hold
+                    // one listening socket on one host, and a node's id is minted by its data directory,
+                    // which the node lock keeps to one process at a time. So an unexpired lease under
+                    // this id at this address is the previous incarnation of this very node -- a fast
+                    // restart -- and waiting a TTL for it to expire would delay this node's first
+                    // activation for nothing. A live lease at a *different* address is the genuine
+                    // duplicate: a cloned data directory, or a lock bypassed, and refusing is right.
                     if (other.ephemeralId() != null
                         && other.ephemeralId().equals(self.ephemeralId()) == false
-                        && other.expiresAtMillis() > clock.getAsLong()) {
+                        && other.expiresAtMillis() > clock.getAsLong()
+                        && other.address().equals(self.address()) == false) {
                         throw new IOException(
                             "duplicate node id ["
                                 + self.nodeId()
                                 + "]: another live process ("
                                 + other.ephemeralId()
+                                + " at "
+                                + other.address()
                                 + ") holds this node's lease; this node will not renew"
                         );
                     }
@@ -137,6 +230,12 @@ public final class BlobLeaseMembership implements MembershipSource {
                     "could not renew lease for " + self.nodeId() + "; register contended at generation " + result.currentGeneration()
                 );
             }
+            // The register moved underneath this node -- most often because it was collected while the
+            // node was away, and a refresh somewhere pruned the id from the index when it found the lease
+            // gone. Whatever this node remembered about being enrolled is no longer evidence of anything,
+            // so it enrols again below. Without this a node whose lease blob was swept stayed off the
+            // index for the life of the process: live, renewing, and invisible to reader placement.
+            enrolled.clear();
         }
         ownGeneration = result.currentGeneration();
         ownExpiresAtMillis = renewed.expiresAtMillis();
@@ -146,9 +245,30 @@ public final class BlobLeaseMembership implements MembershipSource {
         return renewed;
     }
 
-    /** Adds a node to the members index; true once it is there. Bounded, and retried on the next renewal. */
+    /**
+     * Reports whether this node is currently on the members index, as far as it knows.
+     *
+     * @param nodeId this node's id
+     * @return true once an enrolment has succeeded since the register was last moved underneath it
+     */
+    public boolean isEnrolled(String nodeId) {
+        return enrolled.contains(nodeId);
+    }
+
+    /**
+     * Adds a node to the members index; true once it is there.
+     *
+     * <p>Bounded per call and retried on every renewal until it succeeds, so enrolment is retried in the
+     * background at the renewal cadence rather than given up on. The whole fleet is this register's
+     * writer population, and a co-started fleet contends on it: each round admits one writer, so the
+     * attempts here are spread by a short random pause rather than fired back to back, and a node that
+     * loses its three still comes back a renewal later.
+     */
     private boolean enrol(String nodeId) throws IOException {
         for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                pauseBriefly(attempt);
+            }
             final Optional<BlobRegister> index = container.readRegister(MEMBERS);
             if (index.isEmpty()) {
                 // No index yet: this deployment predates it. Built from a listing, once, so a member that
@@ -170,6 +290,16 @@ public final class BlobLeaseMembership implements MembershipSource {
             }
         }
         return false;
+    }
+
+    /** A few to a few tens of milliseconds, growing with the attempt, so contending nodes do not retry in step. */
+    private static void pauseBriefly(int attempt) {
+        final long upper = Math.min(200L, 10L * (1L << Math.min(attempt, 4)));
+        try {
+            Thread.sleep(java.util.concurrent.ThreadLocalRandom.current().nextLong(1L, upper + 1L));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private Set<String> listedIds() throws IOException {
@@ -220,11 +350,16 @@ public final class BlobLeaseMembership implements MembershipSource {
      * read cannot be made per write, so it would not be made at all, and the write path would stay
      * unfenced between heartbeats — which is precisely the window a partitioned node keeps writing in.
      *
+     * <p><b>Valid means inside the expiry less the skew margin.</b> The successor's clock may run ahead
+     * of this one by up to the margin and still find this lease expired exactly when this node finds it
+     * live; stopping the margin early is what keeps that from being an acknowledged write behind a seal.
+     * See the class documentation.
+     *
      * <p><b>What it is worth, and what it is not.</b> A node stops writing no later than the expiry it
-     * last published, so the interval in which a zombie can still write is bounded by the TTL rather than
-     * by however long it takes the zombie to notice. It does <em>not</em> make writing safe: the check and
-     * the write are not atomic, so a long enough pause between them lands a write after the deadline
-     * passed. Closing that needs a fence at the log, which is what the replay cutoff in
+     * last published, less the margin, so the interval in which a zombie can still write is bounded by
+     * the TTL rather than by however long it takes the zombie to notice. It does <em>not</em> make writing
+     * safe: the check and the write are not atomic, so a long enough pause between them lands a write
+     * after the deadline passed. Closing that needs a fence at the log, which is what the replay cutoff in
      * {@code WalStore#replayable(Map)} is for. This bounds; that fences.
      *
      * <p><b>Before the first renewal this answers true</b>, because a node that has never published a
@@ -237,7 +372,33 @@ public final class BlobLeaseMembership implements MembershipSource {
      */
     public boolean selfLeaseValidAt(long nowMillis) {
         final long expiry = ownExpiresAtMillis;
-        return expiry == 0L || nowMillis < expiry;
+        return expiry == 0L || nowMillis < expiry - skewMarginMillis;
+    }
+
+    /**
+     * Whether this node once held a lease and no longer does, by its own clock and its own margin.
+     *
+     * <p>The other half of {@link #selfLeaseValidAt}, and the question that has to be asked <em>before</em>
+     * renewing: a lease that lapsed and is then renewed looks, to the write path, exactly like one that
+     * never lapsed -- but in between, a successor may have taken every shard this node held and sealed
+     * every log. The rule this makes explicit is that a node whose own lease lapsed has lost every shard
+     * it held, whether or not anyone has actually taken them yet.
+     *
+     * @param nowMillis this node's current time
+     * @return true if a lease was published and has passed its expiry less the margin
+     */
+    public boolean selfLeaseLapsedAt(long nowMillis) {
+        final long expiry = ownExpiresAtMillis;
+        return expiry != 0L && nowMillis >= expiry - skewMarginMillis;
+    }
+
+    /**
+     * Returns the expiry this node last stamped on its own lease, or zero before the first renewal.
+     *
+     * @return the expiry in wall-clock millis
+     */
+    public long ownExpiresAtMillis() {
+        return ownExpiresAtMillis;
     }
 
     /**
@@ -318,6 +479,7 @@ public final class BlobLeaseMembership implements MembershipSource {
         final long now = clock.getAsLong();
         final Set<NodeLease> live = new LinkedHashSet<>();
         final Set<String> missing = new LinkedHashSet<>();
+        final Set<String> longDead = new LinkedHashSet<>();
 
         // The members index, and a listing only when there is none yet -- in which case the index is
         // written from that listing so the next refresh is a read.
@@ -343,9 +505,7 @@ public final class BlobLeaseMembership implements MembershipSource {
             try {
                 final Optional<BlobRegister> register = container.readRegister(LEASE_PREFIX + nodeId);
                 if (register.isEmpty()) {
-                    // Listed and gone: a clean leave whose index swap was lost. Pruned below. An expired
-                    // lease that is still there is not pruned -- the node may be slow rather than gone,
-                    // and it renews the same register when it returns.
+                    // Listed and gone: a clean leave whose index swap was lost. Pruned below.
                     missing.add(nodeId);
                     continue;
                 }
@@ -353,12 +513,37 @@ public final class BlobLeaseMembership implements MembershipSource {
                     final NodeLease lease = NodeLease.fromStream(in);
                     if (lease.isExpiredAt(now) == false) {
                         live.add(lease);
+                    } else if (now - lease.expiresAtMillis() >= DEAD_LEASE_PRUNE_TTLS * ttlMillis) {
+                        // Expired for many lifetimes. A slow node is expired for seconds; this is a node
+                        // that is gone, and every refresh everywhere has been paying a read to confirm it.
+                        // Pruned below, blob and index entry both. Recently expired leases are kept: the
+                        // node may be slow rather than gone, and it renews the same register when it
+                        // returns.
+                        longDead.add(nodeId);
                     }
                 }
             } catch (IOException e) {
                 // A lease being deleted underneath a read is normal, not exceptional. Skipping an
                 // unreadable one is safe: it can only make us believe fewer nodes exist, and nothing
                 // about safety depends on the member list (§10.1).
+            }
+        }
+        if (longDead.isEmpty() == false) {
+            // The index entry first, then the blob. In the other order a refresh between the two finds a
+            // listed id with no lease, which is also pruned -- the same end state -- but this order means
+            // a node that comes back in the gap renews a register that still exists and is simply
+            // re-enrolled by the swap below losing to its own. Best effort on both: a failure leaves the
+            // lease for the next refresh to prune again.
+            unenrol(longDead);
+            final List<String> blobs = new java.util.ArrayList<>();
+            for (String nodeId : longDead) {
+                blobs.add(LEASE_PREFIX + nodeId);
+            }
+            try {
+                container.deleteBlobsIgnoringIfNotExists(blobs);
+            } catch (Exception ignored) {
+                // The index no longer names them, so nothing reads them again; the blobs are a storage
+                // cost only, and the next refresh that lists (none, once the index exists) would collect.
             }
         }
         if (missing.isEmpty() == false && index.isPresent()) {

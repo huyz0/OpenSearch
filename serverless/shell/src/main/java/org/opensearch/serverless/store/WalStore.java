@@ -306,8 +306,19 @@ public final class WalStore {
             cutoff.put(entry.getKey(), earlier.compareTo(entry.getValue()) > 0 ? entry.getValue() : earlier);
         }
 
+        // A seal speaks only for terms strictly below the sealing term. The sealer's own term can appear
+        // in `here` -- a shard released locally and reopened at the same term through ensureOpen seals
+        // again at that term, and its container already holds records -- and writing that entry down was
+        // a latent loss: the records the reopened writer went on to append after this seal, all of them
+        // acknowledged, would be bounded by *this* listing if a later sealer's seal-write succeeded but
+        // its delete of this one did not, because seals are merged by taking the minimum per term. The
+        // sealer's own term is bounded only by a later sealer's listing, which is the one true bound; it
+        // still replays in full here, through the cutoff returned below.
         final StringBuilder body = new StringBuilder();
         for (Map.Entry<Long, String> entry : new TreeMap<>(cutoff).entrySet()) {
+            if (entry.getKey() >= term) {
+                continue;
+            }
             body.append(entry.getKey()).append(' ').append(entry.getValue()).append('\n');
         }
         final byte[] bytes = body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -504,6 +515,11 @@ public final class WalStore {
                 child.getValue().deleteBlobsIgnoringIfNotExists(ours);
                 dropped += ours.size();
             }
+            // The emptied container stays. Deleting it would stop every later takeover listing one
+            // container per historical term, but a term's directory is also how the log reports that a
+            // term existed and holds nothing -- position() and the tests that read the log off disk key
+            // on it -- and a store that has no real directories (S3) lists nothing for an empty prefix
+            // anyway. The per-term listing cost is bounded by the number of takeovers, not by writes.
         }
         return dropped;
     }

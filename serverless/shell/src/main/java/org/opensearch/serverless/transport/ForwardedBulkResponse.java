@@ -53,6 +53,13 @@ public final class ForwardedBulkResponse extends TransportResponse {
         for (int i = 0; i < count; i++) {
             final String id = in.readString();
             final String failure = in.readOptionalString();
+            // A lost condition is a 409 on the coordinator only if the flag survives the wire. It did not:
+            // every forwarded failure was rebuilt as an ordinary one, so a create of an existing id
+            // answered 400 through one node and 409 through the other.
+            final boolean conflict = in.readBoolean();
+            // Mapping contention is a retry, not a malformed document; the flag has to travel for the
+            // coordinator to say so.
+            final boolean retryable = in.readBoolean();
             final boolean deletion = in.readBoolean();
             final boolean found = in.readBoolean();
             // The sequence identity travels too. Without it a forwarded write would answer with no
@@ -63,7 +70,11 @@ public final class ForwardedBulkResponse extends TransportResponse {
             final long version = in.readZLong();
             final boolean created = in.readBoolean();
             if (failure != null) {
-                read.add(ServerlessNode.BulkOutcome.failed(id, failure));
+                read.add(
+                    retryable ? ServerlessNode.BulkOutcome.retryable(id, failure)
+                        : conflict ? ServerlessNode.BulkOutcome.conflicted(id, failure)
+                        : ServerlessNode.BulkOutcome.failed(id, failure)
+                );
             } else if (deletion) {
                 read.add(ServerlessNode.BulkOutcome.deleted(id, found, seqNo, primaryTerm, version));
             } else {
@@ -80,6 +91,8 @@ public final class ForwardedBulkResponse extends TransportResponse {
         for (ServerlessNode.BulkOutcome outcome : outcomes) {
             out.writeString(outcome.id());
             out.writeOptionalString(outcome.failure());
+            out.writeBoolean(outcome.conflict());
+            out.writeBoolean(outcome.retryable());
             out.writeBoolean(outcome.isDeletion());
             out.writeBoolean(outcome.found());
             out.writeZLong(outcome.seqNo());

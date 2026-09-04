@@ -36,10 +36,12 @@ public final class ForwardedBulkRequest extends TransportRequest {
     public static final String ACTION = "internal:serverless/document/bulk";
 
     private final String index;
+    private final String indexUuid;
     private final int shard;
     private final List<WalRecord> operations;
     private final List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch;
     private final boolean refresh;
+    private final long bytes;
 
     /**
      * Creates a forwarded batch.
@@ -50,7 +52,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
      * @param refresh whether to make the batch visible before answering
      */
     public ForwardedBulkRequest(String index, int shard, List<WalRecord> operations, boolean refresh) {
-        this(index, shard, unconditional(operations), refresh, true);
+        this(index, null, shard, unconditional(operations), refresh);
     }
 
     /**
@@ -71,25 +73,53 @@ public final class ForwardedBulkRequest extends TransportRequest {
         List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch,
         boolean refresh
     ) {
-        return new ForwardedBulkRequest(index, shard, batch, refresh, true);
+        return new ForwardedBulkRequest(index, null, shard, batch, refresh);
+    }
+
+    /**
+     * Creates a forwarded batch that names the incarnation of the index it is for.
+     *
+     * <p>The uuid travels for the reason {@link ForwardedIndexRequest} gives: a recreated index keeps its
+     * name, and a batch matched by name alone was applied to the previous incarnation's shard and
+     * acknowledged into a log nothing will replay.
+     *
+     * @param index the index
+     * @param indexUuid the uuid of the index the sender resolved, or null to match by name only
+     * @param shard the shard every operation routes to
+     * @param batch the operations, in request order
+     * @param refresh whether to make the batch visible before answering
+     * @return the request
+     */
+    public static ForwardedBulkRequest of(
+        String index,
+        String indexUuid,
+        int shard,
+        List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch,
+        boolean refresh
+    ) {
+        return new ForwardedBulkRequest(index, indexUuid, shard, batch, refresh);
     }
 
     private ForwardedBulkRequest(
         String index,
+        String indexUuid,
         int shard,
         List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> batch,
-        boolean refresh,
-        boolean unused
+        boolean refresh
     ) {
         this.index = index;
+        this.indexUuid = indexUuid;
         this.shard = shard;
         this.batch = List.copyOf(batch);
         final List<WalRecord> records = new ArrayList<>(batch.size());
+        long counted = 0L;
         for (org.opensearch.serverless.shell.ServerlessNode.BulkOperation item : batch) {
             records.add(item.record());
+            counted += item.record().source() == null ? 0L : item.record().source().length();
         }
         this.operations = List.copyOf(records);
         this.refresh = refresh;
+        this.bytes = counted;
     }
 
     private static List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> unconditional(List<WalRecord> operations) {
@@ -122,6 +152,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
         final int count = in.readVInt();
         final List<WalRecord> read = new ArrayList<>(count);
         final List<org.opensearch.serverless.shell.ServerlessNode.BulkOperation> readBatch = new ArrayList<>(count);
+        long counted = 0L;
         for (int i = 0; i < count; i++) {
             final String id = in.readString();
             final String source = in.readString();
@@ -131,10 +162,13 @@ public final class ForwardedBulkRequest extends TransportRequest {
             final boolean requireAbsent = in.readBoolean();
             read.add(record);
             readBatch.add(new org.opensearch.serverless.shell.ServerlessNode.BulkOperation(record, ifSeqNo, ifPrimaryTerm, requireAbsent));
+            counted += source == null ? 0L : source.length();
         }
         this.operations = List.copyOf(read);
         this.batch = List.copyOf(readBatch);
         this.refresh = in.readBoolean();
+        this.indexUuid = in.readOptionalString();
+        this.bytes = counted;
     }
 
     @Override
@@ -152,6 +186,28 @@ public final class ForwardedBulkRequest extends TransportRequest {
             out.writeBoolean(item.requireAbsent());
         }
         out.writeBoolean(refresh);
+        out.writeOptionalString(indexUuid);
+    }
+
+    /**
+     * Returns the uuid of the index incarnation the sender resolved.
+     *
+     * @return the uuid, or null when the sender did not name one
+     */
+    public String indexUuid() {
+        return indexUuid;
+    }
+
+    /**
+     * Returns the size of the batch's sources, for pressure accounting and the forward's deadline.
+     *
+     * <p>Counted once as the request is built rather than by re-encoding every record on the receiving
+     * side, which was a second full JSON encode per forwarded batch spent purely on counting.
+     *
+     * @return the summed source lengths
+     */
+    public long bytes() {
+        return bytes;
     }
 
     /**

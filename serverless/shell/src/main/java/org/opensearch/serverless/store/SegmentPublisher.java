@@ -111,6 +111,28 @@ public final class SegmentPublisher {
      *     this one
      */
     public CommitManifest publish(Store store, long term, String writerId) throws IOException {
+        return publish(store, null, term, writerId);
+    }
+
+    /**
+     * Publishes one specific commit of the shard, which the caller has pinned.
+     *
+     * <p><b>Why the commit is passed in.</b> Reading "the latest commit" and then opening its files is a
+     * check-then-act against Lucene's deletion policy: a periodic flush landing in between commits a newer
+     * generation, and the files only the older one referenced are deleted out from under the upload, which
+     * then fails on a file that was there a moment ago. A caller that holds the commit through
+     * {@code IndexShard#acquireLastIndexCommit} keeps the policy's hands off it until the upload is done.
+     *
+     * @param store the shard's store, already flushed to a commit
+     * @param commit the commit to publish, pinned by the caller; null to publish whatever is latest
+     * @param term the publishing writer's term
+     * @param writerId the publishing node, or null to skip the writer check
+     * @return the manifest as published
+     * @throws IOException if upload fails
+     * @throws StaleWriterException if a newer term has already published, or another node has published at
+     *     this one
+     */
+    public CommitManifest publish(Store store, org.apache.lucene.index.IndexCommit commit, long term, String writerId) throws IOException {
         // What this instance published last, if it has: the swap below is conditioned on that generation,
         // and a swap that fails re-reads. Reading before every publish was one register read per publish
         // per shard, paid to learn what this writer already knew.
@@ -150,7 +172,8 @@ public final class SegmentPublisher {
 
         store.incRef();
         try {
-            for (String fileName : store.getMetadata().asMap().keySet()) {
+            final Store.MetadataSnapshot snapshot = commit == null ? store.getMetadata() : store.getMetadata(commit);
+            for (String fileName : snapshot.asMap().keySet()) {
                 final String alreadyAt = inherited.get(fileName);
                 if (alreadyAt != null) {
                     // Segment files are immutable once written; a name that is already published has the
@@ -193,7 +216,7 @@ public final class SegmentPublisher {
         if (result.applied() == false && remembered != null) {
             // The register moved under what this instance remembered -- a repair, a restore, a manifest
             // rewritten by hand. Once, the way every publish used to begin: read it and publish over it.
-            return publish(store, term, writerId);
+            return publish(store, commit, term, writerId);
         }
         if (result.applied() == false) {
             // Who moved it. A newer term is the fence this exception exists for. The same term and the
@@ -227,7 +250,11 @@ public final class SegmentPublisher {
     }
 
     /**
-     * Restores the published commit into a directory, so a shard can open from it.
+     * Restores the published commit into a directory, whole, so a shard can open from local disk alone.
+     *
+     * <p>Not on the activation path any more: a writer opens the way a reader does, on a directory that
+     * reads published segments block by block, so its cold start is proportional to what it touches rather
+     * than to the shard. This survives for a caller that genuinely wants a complete local copy.
      *
      * <p>Called before the shard is recovered, and the reason recovery must then use
      * {@code ExistingStoreRecoverySource}: {@code EMPTY_STORE} calls {@code Store#createEmpty}, which
@@ -244,9 +271,11 @@ public final class SegmentPublisher {
             return Optional.empty();
         }
         for (Map.Entry<String, String> file : manifest.get().files().entrySet()) {
-            // Local disk is a cache, and a reader re-opening onto a newer commit finds files from the
-            // previous one still there. Lucene segment names restart at _0 after a history bootstrap, so
-            // a same-named file is not necessarily the same bytes; overwrite rather than trust the name.
+            // Local disk is a cache, and a node re-opening onto a newer commit finds files from an earlier
+            // one still there. The segment counter is carried in the commit, so a successor that restored
+            // this node's last published commit mints the same next segment name this node did for a
+            // segment it never published: a same-named file is not necessarily the same bytes. Overwrite
+            // rather than trust the name.
             try {
                 target.deleteFile(file.getKey());
             } catch (java.io.IOException ignored) {

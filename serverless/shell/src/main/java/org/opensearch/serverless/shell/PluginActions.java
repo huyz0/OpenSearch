@@ -36,7 +36,10 @@ import java.util.Optional;
  *
  * <p><b>Constructor resolution, not injection.</b> Core binds these with Guice; R4 says plugins run here
  * without it. So each action is built by picking the constructor whose parameters can all be supplied from
- * what this node has — its services, and whatever the plugin itself returned from {@code createComponents}.
+ * what this node has — its services, and whatever <em>that</em> plugin itself returned from
+ * {@code createComponents}. Never another plugin's components: the aggregate list was once offered to every
+ * action, and a constructor parameter typed to some other plugin's private class would have been handed
+ * that plugin's object by reflection.
  * That is a small, legible rule with two properties worth stating:
  *
  * <ul>
@@ -70,13 +73,27 @@ public final class PluginActions {
      * Builds every action the plugins declared.
      *
      * @param plugins the action plugins
-     * @param available what a constructor may be given, most specific first
+     * @param available what a constructor may be given, most specific first, offered to every plugin alike
      * @return the registry
      * @throws IllegalStateException if an action cannot be built, naming what was missing
      */
     public static PluginActions build(List<ActionPlugin> plugins, List<Object> available) {
+        return build(plugins, plugin -> available);
+    }
+
+    /**
+     * Builds every action the plugins declared, resolving each against what its own plugin may be given.
+     *
+     * @param plugins the action plugins
+     * @param availableFor what a constructor of the given plugin's actions may be given, most specific
+     *        first: the node's services and that plugin's own components
+     * @return the registry
+     * @throws IllegalStateException if an action cannot be built, naming what was missing
+     */
+    public static PluginActions build(List<ActionPlugin> plugins, java.util.function.Function<ActionPlugin, List<Object>> availableFor) {
         final Map<String, TransportAction<? extends ActionRequest, ? extends ActionResponse>> built = new LinkedHashMap<>();
         for (ActionPlugin plugin : plugins) {
+            final List<Object> available = availableFor.apply(plugin);
             for (ActionPlugin.ActionHandler<? extends ActionRequest, ? extends ActionResponse> handler : plugin.getActions()) {
                 final String name = handler.getAction().name();
                 if (built.containsKey(name)) {

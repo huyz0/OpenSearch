@@ -83,9 +83,25 @@ public final class AnalyzeHandler extends BaseRestHandler {
         );
     }
 
-    /** What an analyze request asked for. */
-    private record Ask(List<String> text, String analyzer, String field, String refusal) {
+    /** What an analyze request asked for, or the refusal it earned and the status that refusal carries. */
+    private record Ask(List<String> text, String analyzer, String field, String refusal, RestStatus refusalStatus, String refusalType) {
+        Ask(List<String> text, String analyzer, String field, String refusal) {
+            this(text, analyzer, field, refusal, RestStatus.NOT_IMPLEMENTED, "unsupported_parameter");
+        }
     }
+
+    /** The body keys core's request reads. Anything else is a typo, answered as core answers one. */
+    private static final java.util.Set<String> KNOWN_BODY_KEYS = java.util.Set.of(
+        "text",
+        "analyzer",
+        "field",
+        "tokenizer",
+        "filter",
+        "char_filter",
+        "explain",
+        "attributes",
+        "normalizer"
+    );
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
@@ -93,9 +109,7 @@ public final class AnalyzeHandler extends BaseRestHandler {
         final Ask ask = read(request);
 
         if (ask.refusal() != null) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_parameter", ask.refusal())
-            );
+            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, ask.refusalStatus(), ask.refusalType(), ask.refusal()));
         }
         if (ask.text().isEmpty()) {
             return channel -> channel.sendResponse(
@@ -149,9 +163,13 @@ public final class AnalyzeHandler extends BaseRestHandler {
         final List<String> text = new ArrayList<>();
         String analyzer = request.param("analyzer");
         String field = request.param("field");
-        // Read so the request is fully consumed whichever branch answers.
+        // Read so the request is fully consumed whichever branch answers. char_filter and normalizer are
+        // core's own URL parameters too, and were a 400 "unrecognized parameter" rather than the refusal
+        // their body spellings get.
         final String tokenizer = request.param("tokenizer");
         final String filters = request.param("filter");
+        final String charFilters = request.param("char_filter");
+        final String normalizer = request.param("normalizer");
         final String explain = request.param("explain");
         if (request.param("text") != null) {
             text.add(request.param("text"));
@@ -163,6 +181,24 @@ public final class AnalyzeHandler extends BaseRestHandler {
                 false,
                 org.opensearch.common.xcontent.XContentType.JSON
             ).v2();
+            for (String key : body.keySet()) {
+                if (KNOWN_BODY_KEYS.contains(key) == false) {
+                    // Core's parser is strict, and a key it does not read is a request it does not
+                    // understand. Accepted and ignored, {"analyser": "x"} was analyzed with the default and
+                    // answered 200 -- the analysis of something else, which this endpoint exists to prevent.
+                    return new Ask(
+                        text,
+                        analyzer,
+                        field,
+                        "Unknown parameter [" + key + "]",
+                        RestStatus.BAD_REQUEST,
+                        "illegal_argument_exception"
+                    );
+                }
+            }
+            if (body.get("normalizer") != null) {
+                return new Ask(text, analyzer, field, normalizerRefusal());
+            }
             final Object given = body.get("text");
             if (given instanceof List<?> many) {
                 for (Object each : many) {
@@ -180,18 +216,29 @@ public final class AnalyzeHandler extends BaseRestHandler {
             if (body.get("tokenizer") != null || body.get("filter") != null || body.get("char_filter") != null) {
                 return new Ask(text, analyzer, field, custom());
             }
-            if (body.get("explain") != null && Boolean.parseBoolean(String.valueOf(body.get("explain")))) {
+            if ((body.get("explain") != null && Boolean.parseBoolean(String.valueOf(body.get("explain"))))
+                || body.get("attributes") != null) {
                 return new Ask(text, analyzer, field, explanation());
             }
         }
 
-        if (tokenizer != null || filters != null) {
+        if (tokenizer != null || filters != null || charFilters != null) {
             return new Ask(text, analyzer, field, custom());
+        }
+        if (normalizer != null) {
+            return new Ask(text, analyzer, field, normalizerRefusal());
         }
         if (explain != null && Boolean.parseBoolean(explain)) {
             return new Ask(text, analyzer, field, explanation());
         }
         return new Ask(text, analyzer, field, null);
+    }
+
+    private static String normalizerRefusal() {
+        return "normalizer is not supported: a normalizer is a keyword field's analysis chain, and running one "
+            + "here needs the same per-request analysis registry a custom analyzer does. Accepted and ignored, "
+            + "the text was analyzed with the default analyzer, which is the analysis of something else. Name "
+            + "the keyword field with 'field' instead";
     }
 
     private static String custom() {

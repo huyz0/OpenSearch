@@ -170,12 +170,15 @@ public final class ExplainHandler extends BaseRestHandler {
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                final ShardOperations operations = new ShardOperations(serving, metadata);
+                final ShardOperations operations = new ShardOperations(serving, metadata, true);
                 respond(channel, index, id, operations.explain(index, id, query));
             } catch (ShardOperations.NoSuchIndexException e) {
                 sendQuietly(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
+            } catch (ShardOperations.SystemIndexException e) {
+                sendQuietly(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage());
             } catch (ShardOperations.NotHereException e) {
-                sendQuietly(channel, RestStatus.SERVICE_UNAVAILABLE, "not_here", e.getMessage());
+                // The same status and type the get and update endpoints give the same state.
+                sendQuietly(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage());
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));

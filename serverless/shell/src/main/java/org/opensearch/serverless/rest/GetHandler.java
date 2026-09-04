@@ -191,26 +191,20 @@ public final class GetHandler extends BaseRestHandler {
         boolean sourceOnly
     ) throws Exception {
         final String index = descriptor.name();
-        final var operations = new org.opensearch.serverless.shard.ShardOperations(serving, metadata);
+        final var operations = new org.opensearch.serverless.shard.ShardOperations(serving, metadata, true);
         // Read once, above, for the shard number; not again for the placement.
         operations.assumeDescribed(descriptor);
         try {
             final var read = operations.get(index, id);
             respond(channel, index, shard, read.document(), read.servedBy(), read.realtime(), bodyless, fetchSource, sourceOnly);
+        } catch (org.opensearch.serverless.shard.ShardOperations.SystemIndexException e) {
+            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
         } catch (org.opensearch.serverless.shard.ShardOperations.NotHereException e) {
-            // Every "not here" is a 503 for a get, and deliberately so: the alternative is answering from
-            // a published commit that a live writer is already ahead of, which is a stale document -- or a
-            // 404 for a document that exists -- reported as success.
-            channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.SERVICE_UNAVAILABLE,
-                    e.owner() != null && e.owner().equals(serving.localNode().getId())
-                        ? "activation_in_progress"
-                        : (e.getMessage().contains("could not forward") ? "forward_failed" : "owner_unreachable"),
-                    e.getMessage()
-                )
-            );
+            // A "not here" is never answered from a published commit that a live writer is already ahead
+            // of, which would be a stale document -- or a 404 for a document that exists -- reported as
+            // success. The status and type are the exception's own, so this endpoint says the same thing
+            // about the same state as every other.
+            channel.sendResponse(IndexAdminHandler.error(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage()));
         }
     }
 

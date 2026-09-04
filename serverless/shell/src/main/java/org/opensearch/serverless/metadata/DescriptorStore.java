@@ -40,14 +40,52 @@ import java.util.Optional;
  */
 public final class DescriptorStore {
 
-    /** Marks a descriptor as deleted between the swap that orders the delete and the blob's removal. */
-    private static final byte[] TOMBSTONE = "{\"tombstone\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    /**
+     * How a tombstone begins. Every tombstone this store ever wrote starts this way, with or without the
+     * {@code deleted_at} that later ones carry, and no descriptor or alias record does.
+     */
+    private static final String TOMBSTONE_PREFIX = "{\"tombstone\":true";
+
+    /**
+     * How long a tombstone is kept before {@link #sweepTombstones} may remove it.
+     *
+     * <p>The tombstone exists so a compare-and-swap carrying a generation read before the delete cannot
+     * land on the recreated name. Such a swap is an operation in flight — a mapping update, a settings
+     * change — and none of them is in flight for hours. Kept longer than that, tombstones only cost:
+     * every listing reads them, and every prefix pattern counts them.
+     */
+    public static final long DEFAULT_TOMBSTONE_QUARANTINE_MILLIS = 6L * 60L * 60L * 1000L;
 
     private final BlobContainer container;
 
     private static boolean isTombstone(org.opensearch.core.common.bytes.BytesReference value) {
-        return value.length() == TOMBSTONE.length
-            && java.util.Arrays.equals(org.opensearch.core.common.bytes.BytesReference.toBytes(value), TOMBSTONE);
+        if (value.length() < TOMBSTONE_PREFIX.length()) {
+            return false;
+        }
+        final byte[] head = org.opensearch.core.common.bytes.BytesReference.toBytes(value.slice(0, TOMBSTONE_PREFIX.length()));
+        return new String(head, java.nio.charset.StandardCharsets.UTF_8).equals(TOMBSTONE_PREFIX);
+    }
+
+    /** Renders a tombstone recording when the delete happened. */
+    private static org.opensearch.core.common.bytes.BytesArray tombstone(long deletedAtMillis) {
+        return new org.opensearch.core.common.bytes.BytesArray(
+            (TOMBSTONE_PREFIX + ",\"deleted_at\":" + deletedAtMillis + "}").getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        );
+    }
+
+    /** When a tombstone's delete happened, or 0 for one written before that was recorded. */
+    private static long tombstoneDeletedAt(org.opensearch.core.common.bytes.BytesReference value) throws IOException {
+        try (
+            org.opensearch.core.xcontent.XContentParser parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
+                .createParser(
+                    org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
+                    org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                    value.streamInput()
+                )
+        ) {
+            final Object deletedAt = parser.map().get("deleted_at");
+            return deletedAt instanceof Number number ? number.longValue() : 0L;
+        }
     }
 
     /**
@@ -188,16 +226,17 @@ public final class DescriptorStore {
     public Resolution resolve(String name) throws IOException {
         Names.validateIndexOrAlias(name);
         final Optional<BlobRegister> register = container.readRegister(RegisterMap.descriptorBlob(name));
+        final long generation = register.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
         if (register.isEmpty() || isTombstone(register.get().value())) {
-            return new Resolution(null, null);
+            return new Resolution(null, null, generation);
         }
         if (isAlias(register.get().value())) {
             try (InputStream in = register.get().value().streamInput()) {
-                return new Resolution(null, org.opensearch.serverless.cluster.AliasRecord.fromStream(in));
+                return new Resolution(null, org.opensearch.serverless.cluster.AliasRecord.fromStream(in), generation);
             }
         }
         try (InputStream in = register.get().value().streamInput()) {
-            return new Resolution(IndexDescriptor.fromStream(in), null);
+            return new Resolution(IndexDescriptor.fromStream(in), null, generation);
         }
     }
 
@@ -222,15 +261,32 @@ public final class DescriptorStore {
         }
     }
 
-    /** What a name turned out to be. */
+    /** What a name turned out to be, and the register generation it was read at -- one read for both. */
     public static final class Resolution {
 
         private final IndexDescriptor index;
         private final org.opensearch.serverless.cluster.AliasRecord alias;
+        private final long generation;
 
         Resolution(IndexDescriptor index, org.opensearch.serverless.cluster.AliasRecord alias) {
+            this(index, alias, BlobRegister.ABSENT_GENERATION);
+        }
+
+        Resolution(IndexDescriptor index, org.opensearch.serverless.cluster.AliasRecord alias, long generation) {
             this.index = index;
             this.alias = alias;
+            this.generation = generation;
+        }
+
+        /**
+         * Returns the generation the register held when this was read, for a compare-and-swap on what
+         * was read -- never a generation read separately, which guards nothing (see
+         * {@code MetadataPlane.AliasAtGeneration}).
+         *
+         * @return the generation, or {@link BlobRegister#ABSENT_GENERATION} when the name is absent
+         */
+        public long generation() {
+            return generation;
         }
 
         /**
@@ -316,23 +372,77 @@ public final class DescriptorStore {
      * conditional delete. The swap is the linearization point: after it, {@link #get} reports the index
      * as absent whether or not the blob has actually gone yet.
      *
+     * <p>The tombstone records when the delete happened, in the caller's clock, so
+     * {@link #sweepTombstones} can tell one that has outlived every operation it could have been guarding
+     * from one written a moment ago.
+     *
+     * @param indexName the index to delete
+     * @param expectedGeneration the generation the caller read
+     * @param nowMillis when, in the clock the sweep will be run with
+     * @return true if this caller deleted it; false if the descriptor changed first
+     * @throws IOException if the write fails
+     */
+    public boolean deleteIfUnchanged(String indexName, long expectedGeneration, long nowMillis) throws IOException {
+        final String blobName = RegisterMap.descriptorBlob(indexName);
+        final BlobRegisterCasResult swapped = container.compareAndSwapRegister(blobName, expectedGeneration, tombstone(nowMillis));
+        if (swapped.applied() == false) {
+            return false;
+        }
+        // The tombstone stays, for the quarantine: see createRegister for why a deleted name must keep
+        // its generation, and sweepTombstones for why not forever.
+        return true;
+    }
+
+    /**
+     * Deletes an index only if its descriptor still holds the generation the caller read, stamping the
+     * tombstone with the wall clock.
+     *
+     * <p>Prefer the form that takes the plane's clock, so the stamp and the sweep agree on what "now"
+     * means; this one exists for a caller that has no clock to hand.
+     *
      * @param indexName the index to delete
      * @param expectedGeneration the generation the caller read
      * @return true if this caller deleted it; false if the descriptor changed first
      * @throws IOException if the write fails
      */
     public boolean deleteIfUnchanged(String indexName, long expectedGeneration) throws IOException {
-        final String blobName = RegisterMap.descriptorBlob(indexName);
-        final BlobRegisterCasResult swapped = container.compareAndSwapRegister(
-            blobName,
-            expectedGeneration,
-            new org.opensearch.core.common.bytes.BytesArray(TOMBSTONE)
-        );
-        if (swapped.applied() == false) {
-            return false;
+        return deleteIfUnchanged(indexName, expectedGeneration, System.currentTimeMillis());
+    }
+
+    /**
+     * Removes tombstones that have outlived their quarantine.
+     *
+     * <p><b>Why they cannot stay forever.</b> A tombstone guards against one thing: a compare-and-swap
+     * carrying a generation read before the delete landing on the recreated name, whose generations would
+     * otherwise restart at the numbers the old one had. That swap is an operation in flight, and no
+     * operation is in flight for hours. Past that, a tombstone is a register every listing reads and every
+     * prefix pattern counts — a tenant creating and deleting a daily index poisoned {@code logs-*} after
+     * five hundred days with one live index under it.
+     *
+     * <p>A tombstone written before the delete time was recorded reads as infinitely old and goes on the
+     * first sweep; it predates every operation that could still be in flight.
+     *
+     * <p>O(population) reads, like every whole-deployment walk here: for a sweep, not a request path.
+     *
+     * @param nowMillis the current time, in the clock the tombstones were stamped with
+     * @param quarantineMillis how long a tombstone must have stood
+     * @return the names whose tombstones were removed
+     * @throws IOException if listing, reading or deleting fails
+     */
+    public List<String> sweepTombstones(long nowMillis, long quarantineMillis) throws IOException {
+        final List<String> removed = new ArrayList<>();
+        for (String blobName : new ArrayList<>(container.listBlobs().keySet())) {
+            final Optional<BlobRegister> register = container.readRegister(blobName);
+            if (register.isEmpty() || isTombstone(register.get().value()) == false) {
+                continue;
+            }
+            if (nowMillis - tombstoneDeletedAt(register.get().value()) < quarantineMillis) {
+                continue;
+            }
+            container.deleteBlobsIgnoringIfNotExists(List.of(blobName));
+            removed.add(blobName);
         }
-        // The tombstone stays: see createRegister for why a deleted name must keep its generation.
-        return true;
+        return removed;
     }
 
     /**
@@ -497,10 +607,18 @@ public final class DescriptorStore {
      * proportional to what matched, and the caller reads them anyway to find out what it got — an index,
      * an alias, or a tombstone left by a deletion. Which of those it is belongs to the caller, not here.
      *
+     * <p><b>Only live names count against the cap.</b> A deleted name leaves a tombstone for its
+     * quarantine, and a tenant that creates and deletes a name a day accumulates hundreds under one
+     * prefix; a cap that counted them refused {@code logs-*} with one live index beneath it. So when the
+     * bounded listing overflows, the names sharing the prefix are read to tell live from deleted, and the
+     * cap is applied to the live ones. That read is proportional to the tombstones under the prefix — the
+     * cost the tombstone sweep exists to bound — and happens only when the bounded listing alone could not
+     * answer. In that case the tombstones are also filtered out of the answer, since they were read anyway.
+     *
      * @param prefix the prefix, which may be empty to mean every name
      * @param cap the most names to return
      * @return the matching names, in lexicographic order
-     * @throws TooManyMatchesException if more than {@code cap} names match
+     * @throws TooManyMatchesException if more than {@code cap} live names match
      * @throws IOException if the listing fails
      */
     public List<String> namesWithPrefix(String prefix, int cap) throws IOException {
@@ -513,14 +631,30 @@ public final class DescriptorStore {
             cap + 1,
             BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC
         );
-        if (found.size() > cap) {
-            throw new TooManyMatchesException(prefix, cap);
+        if (found.size() <= cap) {
+            final List<String> names = new ArrayList<>(found.size());
+            for (org.opensearch.common.blobstore.BlobMetadata blob : found) {
+                names.add(blob.name());
+            }
+            return names;
         }
-        final List<String> names = new ArrayList<>(found.size());
-        for (org.opensearch.common.blobstore.BlobMetadata blob : found) {
-            names.add(blob.name());
+        // More names than the cap, deleted ones included. The bounded listing cannot be resumed past its
+        // cap, so this is the one place a prefix is listed whole: the population under it is bounded by
+        // the live indices plus the tombstones still in quarantine, never by the deployment.
+        final List<String> under = new ArrayList<>(container.listBlobsByPrefix(prefix).keySet());
+        under.sort(String::compareTo);
+        final List<String> live = new ArrayList<>();
+        for (String name : under) {
+            final Optional<BlobRegister> register = container.readRegister(name);
+            if (register.isEmpty() || isTombstone(register.get().value())) {
+                continue;
+            }
+            live.add(name);
+            if (live.size() > cap) {
+                throw new TooManyMatchesException(prefix, cap);
+            }
         }
-        return names;
+        return live;
     }
 
     /**

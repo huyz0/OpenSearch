@@ -39,8 +39,8 @@ import java.util.function.Supplier;
  * <p><b>What a real cursor needs, stated so it is not mistaken for a design choice.</b> S3 supports
  * {@code start-after} natively. Core's {@code BlobContainer} exposes {@code listBlobs},
  * {@code listBlobsByPrefix} and {@code listBlobsByPrefixInSortedOrder} — none of them resumable. Until that
- * interface grows a cursor, {@code next_token} here can only ever be null, and it is reported as null rather
- * than omitted so a client can see that this page is the whole answer.
+ * interface grows a cursor, {@code next_token} here is refused when given, and never rendered: the answer is
+ * a table, and a table with no cursor row is one page that is the whole answer.
  *
  * <p><b>What is reported, and what is not.</b> {@code _list/indices} carries {@code docs.count} and
  * {@code store.size} in OpenSearch. Those are shard-level facts and this reads only descriptors, so they are

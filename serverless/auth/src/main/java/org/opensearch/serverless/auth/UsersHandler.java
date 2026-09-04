@@ -85,6 +85,24 @@ public final class UsersHandler extends BaseRestHandler {
         final ThreadContext threadContext = context.get();
         final String caller = threadContext == null ? null : threadContext.<String>getTransient(ServerlessAuthPlugin.PRINCIPAL);
 
+        if (store.bootstrapUser().equals(caller) == false) {
+            // Before the body is parsed, so that every authenticated account cannot make this node parse
+            // an http.max_content_length document it was never going to act on. Touched but not read:
+            // BaseRestHandler treats an unconsumed body as a request that does not support one.
+            request.content();
+            // 403, not 404: the caller is authenticated and this endpoint plainly exists, so hiding it
+            // would only make a legitimate operator think the plugin was misconfigured.
+            return channel -> error(
+                channel,
+                RestStatus.FORBIDDEN,
+                "not_permitted",
+                "only the configured account ["
+                    + store.bootstrapUser()
+                    + "] may manage accounts; this deployment authenticates without authorizing, so there "
+                    + "is no role that could grant it"
+            );
+        }
+
         final char[] password;
         if (method == RestRequest.Method.PUT) {
             if (request.hasContentOrSourceParam() == false) {
@@ -101,23 +119,6 @@ public final class UsersHandler extends BaseRestHandler {
             password = offered.toString().toCharArray();
         } else {
             password = null;
-        }
-
-        if (store.bootstrapUser().equals(caller) == false) {
-            if (password != null) {
-                Arrays.fill(password, '\0');
-            }
-            // 403, not 404: the caller is authenticated and this endpoint plainly exists, so hiding it
-            // would only make a legitimate operator think the plugin was misconfigured.
-            return channel -> error(
-                channel,
-                RestStatus.FORBIDDEN,
-                "not_permitted",
-                "only the configured account ["
-                    + store.bootstrapUser()
-                    + "] may manage accounts; this deployment authenticates without authorizing, so there "
-                    + "is no role that could grant it"
-            );
         }
 
         // Off the transport thread: everything below is a get, an index or a delete against the object

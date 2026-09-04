@@ -15,6 +15,7 @@ import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
@@ -91,11 +92,13 @@ public final class SnapshotHandler extends BaseRestHandler {
         java.util.Map.entry("rename_alias_replacement", "aliases are not captured in a snapshot here"),
         java.util.Map.entry(
             "index_settings",
-            "settings come from the snapshot; change them on the restored index with PUT /{index}/_settings"
+            "the settings an index had when it was captured are restored with it, unchanged; change them on the "
+                + "restored index with PUT /{index}/_settings"
         ),
         java.util.Map.entry(
             "ignore_index_settings",
-            "settings come from the snapshot; change them on the restored index with PUT /{index}/_settings"
+            "the settings an index had when it was captured are restored with it, unchanged; change them on the "
+                + "restored index with PUT /{index}/_settings"
         ),
         java.util.Map.entry("settings", "repository settings are fixed when the repository is registered"),
         java.util.Map.entry(
@@ -111,13 +114,7 @@ public final class SnapshotHandler extends BaseRestHandler {
     );
 
     /** What a create here reads. */
-    private static final Set<String> CREATE_KNOWN_KEYS = Set.of(
-        "indices",
-        "ignore_unavailable",
-        "partial",
-        "include_global_state",
-        "metadata"
-    );
+    private static final Set<String> CREATE_KNOWN_KEYS = Set.of("indices", "ignore_unavailable", "partial", "include_global_state");
 
     private final Supplier<MetadataPlane> plane;
     private final Supplier<ServerlessNode> node;
@@ -164,6 +161,25 @@ public final class SnapshotHandler extends BaseRestHandler {
         // Hints: there is no cluster manager to time out against.
         request.param("master_timeout");
         request.param("cluster_manager_timeout");
+        // Both names are halves of the register key a snapshot is stored under (repo#name) and of the
+        // prefix a repository's listing uses, so a '#' or a ',' in either made one repository's listing
+        // include another's snapshots, and a name like "x,y" was created and then never found by the GET
+        // and DELETE that split on the comma. _all and * are the two spellings that are not names.
+        final boolean listing = request.method() == RestRequest.Method.GET && ("_all".equals(snapshotParam) || "*".equals(snapshotParam));
+        final String badName = invalidName(repo, "repository", false);
+        final String badSnapshot = listing
+            ? null
+            : invalidName(
+                snapshotParam,
+                "snapshot",
+                request.method() != RestRequest.Method.PUT && request.method() != RestRequest.Method.POST
+            );
+        if (badName != null || badSnapshot != null) {
+            final String reason = badName != null ? badName : badSnapshot;
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "invalid_snapshot_name_exception", reason)
+            );
+        }
         if (request.path().endsWith("/_restore")) {
             final Map<String, Object> body = request.hasContent() ? parseBody(request) : Map.of();
             for (Map.Entry<String, String> refused : RESTORE_REFUSED_KEYS.entrySet()) {
@@ -194,6 +210,19 @@ public final class SnapshotHandler extends BaseRestHandler {
             case PUT:
             case POST: {
                 final Map<String, Object> body = request.hasContent() ? parseBody(request) : Map.of();
+                if (body.containsKey("metadata")) {
+                    // Refused rather than admitted and dropped: the record has no field for it, and a
+                    // caller who sent it and then read the snapshot back found nothing, with no reason why.
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_IMPLEMENTED,
+                            "unsupported_snapshot_option",
+                            "metadata is not supported: a snapshot record here carries no user metadata, so it would be accepted "
+                                + "and never returned"
+                        )
+                    );
+                }
                 final String unknownCreateKey = firstUnknownKey(body, CREATE_KNOWN_KEYS);
                 if (unknownCreateKey != null) {
                     // The same check the restore path has always made, which the create path did not: an
@@ -287,17 +316,18 @@ public final class SnapshotHandler extends BaseRestHandler {
             record = gated(
                 org.opensearch.action.admin.cluster.snapshots.create.CreateSnapshotAction.NAME,
                 new org.opensearch.action.admin.cluster.snapshots.create.CreateSnapshotRequest(repo, snapshot),
-                () -> {
-                    final SnapshotRecord captured = capture(metadata, repo, snapshot, indexNames, ignoreUnavailable, partial);
-                    metadata.createSnapshot(captured);
-                    return captured;
-                }
+                // capture() writes the record itself: the provisional one before a manifest is read, and the
+                // finished one over it. A second createSnapshot here found its own record and refused.
+                () -> capture(metadata, repo, snapshot, indexNames, ignoreUnavailable, partial)
             );
         } catch (RepositoryMissingException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "repository_missing", e.getMessage()));
+            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "repository_missing_exception", e.getMessage()));
             return;
         } catch (IndexNotFoundForOperationException e) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", e.getMessage()));
+            return;
+        } catch (SystemIndexException e) {
+            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
             return;
         } catch (NothingPublishedException e) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.CONFLICT, "nothing_published", e.getMessage()));
@@ -325,6 +355,19 @@ public final class SnapshotHandler extends BaseRestHandler {
      * Resolves every named index's current commit and, for a standard repository, copies it into the
      * repository's own storage. Runs entirely inside {@link #handleCreate}'s gate; everything it throws is
      * caught there, once, after the gate returns.
+     *
+     * <p><b>The record is written before a manifest is read.</b> First every index is described, then a
+     * provisional record naming each one -- uuid, shard count, shape, and no commits -- is written under
+     * put-if-absent, and only then are the manifests read and, for a standard repository, the blobs
+     * copied. The provisional record is what {@code MetadataPlane#purgeShardData} and the collector consult,
+     * so an index deleted during the capture keeps its shard data until the capture has finished with it.
+     * Without it a delete landing after the manifests were read and before the record existed purged
+     * exactly the blobs a {@code SUCCESS} snapshot then named, and the first restore was the first anyone
+     * heard of it. Writing the record first also settles the name before any blob is copied: a duplicate
+     * name is refused before it pays for the copy, and never writes into the live snapshot's storage.
+     *
+     * <p>A capture that fails after the provisional record deletes it, and with it whatever a standard
+     * repository had copied so far, so a failed attempt leaves no storage that nothing names.
      */
     private SnapshotRecord capture(
         MetadataPlane metadata,
@@ -341,10 +384,19 @@ public final class SnapshotHandler extends BaseRestHandler {
         final boolean shallow = repoDescriptor.get().shallowByDefault();
         final long startTime = metadata.clock().getAsLong();
         final BlobStore blobStore = metadata.blobStore();
+        final ServerlessNode serving = node.get();
 
-        final Map<String, SnapshotRecord.SnapshottedIndex> captured = new LinkedHashMap<>();
+        // Every index described first: what the provisional record needs, and where a name is refused
+        // before anything has been written.
+        final Map<String, IndexDescriptor> described = new LinkedHashMap<>();
         for (String raw : indexNames) {
             final String trimmed = raw.trim();
+            if (serving != null && serving.isSystemIndex(trimmed)) {
+                // A plugin's own index. Captured and restored under another name, its records -- a
+                // credential store's password hashes -- would be readable through the ordinary API, which is
+                // exactly what declaring it a system index exists to prevent.
+                throw new SystemIndexException(trimmed);
+            }
             final Optional<IndexDescriptor> descriptor = metadata.describe(trimmed);
             if (descriptor.isEmpty()) {
                 if (ignoreUnavailable) {
@@ -352,61 +404,154 @@ public final class SnapshotHandler extends BaseRestHandler {
                 }
                 throw new IndexNotFoundForOperationException(trimmed);
             }
-            final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
-            boolean complete = true;
-            for (int shard = 0; shard < descriptor.get().numberOfShards(); shard++) {
-                final Optional<CommitManifest> manifest = metadata.segmentPublisher(trimmed, descriptor.get().uuid(), shard).readManifest();
-                if (manifest.isEmpty()) {
-                    if (partial) {
-                        complete = false;
-                        break;
-                    }
-                    throw new NothingPublishedException(trimmed, shard);
-                }
-                shards.put(shard, manifest.get());
-            }
-            if (complete == false) {
-                // partial=true and this index could not be captured in full -- skipped rather than
-                // failing the whole snapshot, the one meaning "partial" has here: less than requested,
-                // never a lie about what was captured.
-                continue;
-            }
+            described.put(trimmed, descriptor.get());
+        }
 
-            final Map<Integer, CommitManifest> stored;
-            if (shallow) {
-                stored = shards;
-            } else {
-                stored = new LinkedHashMap<>();
-                for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
-                    final BlobPath sourceBase = RegisterMap.shardData(
-                        metadata.basePath(),
-                        trimmed,
-                        descriptor.get().uuid(),
-                        shard.getKey()
-                    );
-                    final BlobPath destBase = RegisterMap.snapshotShardData(metadata.basePath(), repo, snapshot, trimmed, shard.getKey());
-                    stored.put(shard.getKey(), copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue()));
-                }
-            }
-            captured.put(
-                trimmed,
+        final String snapshotUuid = UUIDs.randomBase64UUID();
+        final Map<String, SnapshotRecord.SnapshottedIndex> provisional = new LinkedHashMap<>();
+        for (Map.Entry<String, IndexDescriptor> index : described.entrySet()) {
+            provisional.put(
+                index.getKey(),
                 new SnapshotRecord.SnapshottedIndex(
-                    descriptor.get().uuid(),
-                    descriptor.get().numberOfShards(),
-                    descriptor.get().mapping(),
-                    stored
+                    index.getValue().uuid(),
+                    index.getValue().numberOfShards(),
+                    index.getValue().mapping(),
+                    settingsOf(index.getValue()),
+                    Map.of()
                 )
             );
         }
+        metadata.createSnapshot(new SnapshotRecord(repo, snapshot, snapshotUuid, shallow, startTime, startTime, provisional));
 
-        final long endTime = metadata.clock().getAsLong();
-        return new SnapshotRecord(repo, snapshot, UUIDs.randomBase64UUID(), shallow, startTime, endTime, captured);
+        try {
+            final Map<String, SnapshotRecord.SnapshottedIndex> captured = new LinkedHashMap<>();
+            for (Map.Entry<String, IndexDescriptor> index : described.entrySet()) {
+                final String trimmed = index.getKey();
+                final IndexDescriptor descriptor = index.getValue();
+                final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
+                boolean complete = true;
+                for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
+                    final Optional<CommitManifest> manifest = metadata.segmentPublisher(trimmed, descriptor.uuid(), shard).readManifest();
+                    if (manifest.isEmpty()) {
+                        if (partial) {
+                            complete = false;
+                            break;
+                        }
+                        throw new NothingPublishedException(trimmed, shard);
+                    }
+                    shards.put(shard, manifest.get());
+                }
+                if (complete == false) {
+                    // partial=true and this index could not be captured in full -- skipped rather than
+                    // failing the whole snapshot, the one meaning "partial" has here: less than requested,
+                    // never a lie about what was captured.
+                    continue;
+                }
+
+                final Map<Integer, CommitManifest> stored;
+                if (shallow) {
+                    stored = shards;
+                } else {
+                    stored = new LinkedHashMap<>();
+                    for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
+                        final BlobPath sourceBase = RegisterMap.shardData(metadata.basePath(), trimmed, descriptor.uuid(), shard.getKey());
+                        final BlobPath destBase = RegisterMap.snapshotShardData(
+                            metadata.basePath(),
+                            repo,
+                            snapshot,
+                            trimmed,
+                            shard.getKey()
+                        );
+                        stored.put(shard.getKey(), copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue()));
+                    }
+                }
+                captured.put(
+                    trimmed,
+                    new SnapshotRecord.SnapshottedIndex(
+                        descriptor.uuid(),
+                        descriptor.numberOfShards(),
+                        descriptor.mapping(),
+                        settingsOf(descriptor),
+                        stored
+                    )
+                );
+            }
+
+            final long endTime = metadata.clock().getAsLong();
+            final SnapshotRecord finished = new SnapshotRecord(repo, snapshot, snapshotUuid, shallow, startTime, endTime, captured);
+            metadata.finishSnapshot(finished);
+            return finished;
+        } catch (Exception e) {
+            // The provisional record, and whatever a standard repository had copied so far. The record
+            // names no shards yet, so deleting it alone would leave the copies unnamed and unreachable.
+            try {
+                metadata.deleteSnapshot(repo, snapshot);
+            } catch (Exception cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            if (shallow == false) {
+                for (Map.Entry<String, IndexDescriptor> index : described.entrySet()) {
+                    for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
+                        try {
+                            blobStore.blobContainer(
+                                RegisterMap.snapshotShardData(metadata.basePath(), repo, snapshot, index.getKey(), shard)
+                            ).delete();
+                        } catch (Exception cleanup) {
+                            e.addSuppressed(cleanup);
+                        }
+                    }
+                }
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * An index's settings as a snapshot records them: the structured form the descriptor itself writes,
+     * so a list-valued setting (an analyzer's filters) comes back as a list rather than as the bracketed
+     * string {@code Settings#get} would render it.
+     */
+    private static Map<String, Object> settingsOf(IndexDescriptor descriptor) throws IOException {
+        try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            builder.startObject();
+            descriptor.extraSettings().toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+            builder.endObject();
+            return org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                BytesReference.bytes(builder),
+                false,
+                org.opensearch.common.xcontent.XContentType.JSON
+            ).v2();
+        }
     }
 
     /** Thrown from inside {@link #handleCreate}'s gate when a named index does not exist. */
     private static final class IndexNotFoundForOperationException extends Exception {
         IndexNotFoundForOperationException(String indexName) {
             super("no such index: " + indexName);
+        }
+    }
+
+    /** Thrown from inside a gate when a capture or a restore names a plugin's own index. */
+    private static final class SystemIndexException extends Exception {
+        SystemIndexException(String indexName) {
+            super("[" + indexName + "] belongs to a plugin and cannot be captured in, or restored from, a snapshot");
+        }
+    }
+
+    /**
+     * Thrown from inside {@link #handleRestore}'s gate when a restored shard's manifest was written by
+     * something else first -- a writer that activated on the freshly created index and published.
+     */
+    private static final class RestoreConflictException extends Exception {
+        RestoreConflictException(String indexName, int shard) {
+            super(
+                "shard "
+                    + shard
+                    + " of ["
+                    + indexName
+                    + "] was written by something else while it was being restored; the restore was rolled back and "
+                    + "nothing of it remains -- retry once nothing is writing to that name"
+            );
         }
     }
 
@@ -426,7 +571,12 @@ public final class SnapshotHandler extends BaseRestHandler {
         );
         if (record.isEmpty()) {
             channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "snapshot_missing", "no such snapshot: " + repo + "/" + snapshot)
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_FOUND,
+                    "snapshot_missing_exception",
+                    "no such snapshot: " + repo + "/" + snapshot
+                )
             );
             return;
         }
@@ -450,8 +600,16 @@ public final class SnapshotHandler extends BaseRestHandler {
         final List<SnapshotRecord> records = gated(
             org.opensearch.action.admin.cluster.snapshots.get.GetSnapshotsAction.NAME,
             new org.opensearch.action.admin.cluster.snapshots.get.GetSnapshotsRequest(repo),
-            () -> metadata.listSnapshots(repo)
+            () -> metadata.describeRepository(repo).isEmpty() ? null : metadata.listSnapshots(repo)
         );
+        if (records == null) {
+            // Core's answer for a repository that is not registered, rather than an empty list that reads
+            // as "registered and holding nothing".
+            channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "repository_missing_exception", "[" + repo + "] missing")
+            );
+            return;
+        }
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.startArray("snapshots");
@@ -479,7 +637,12 @@ public final class SnapshotHandler extends BaseRestHandler {
             );
             if (existed == false) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "snapshot_missing", "no such snapshot: " + repo + "/" + name)
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.NOT_FOUND,
+                        "snapshot_missing_exception",
+                        "no such snapshot: " + repo + "/" + name
+                    )
                 );
                 return;
             }
@@ -515,13 +678,25 @@ public final class SnapshotHandler extends BaseRestHandler {
                 () -> restore(metadata, repo, snapshot, body)
             );
         } catch (SnapshotMissingException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "snapshot_missing", e.getMessage()));
+            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "snapshot_missing_exception", e.getMessage()));
             return;
         } catch (IndexNotCapturedException e) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", e.getMessage()));
             return;
         } catch (IndexNameCollisionException | IndexAlreadyExistsException e) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "index_already_exists", e.getMessage()));
+            return;
+        } catch (SystemIndexException e) {
+            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
+            return;
+        } catch (SnapshotInProgressException e) {
+            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.CONFLICT, "snapshot_in_progress", e.getMessage()));
+            return;
+        } catch (RestoreConflictException e) {
+            // Reported, not counted as a success. The manifest compare-and-swap result used to be
+            // discarded, so a shard that a writer had already published on the fresh index stayed empty
+            // behind {"failed": 0}, with the copied blobs unreferenced in the live term.
+            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.CONFLICT, "restore_conflict", e.getMessage()));
             return;
         }
 
@@ -560,6 +735,10 @@ public final class SnapshotHandler extends BaseRestHandler {
             throw new SnapshotMissingException(repo, snapshot);
         }
         final SnapshotRecord record = found.get();
+        if (MetadataPlane.inProgress(record)) {
+            throw new SnapshotInProgressException(repo, snapshot);
+        }
+        final ServerlessNode serving = node.get();
 
         final List<String> requested = body.containsKey("indices")
             ? readIndices(body.get("indices"))
@@ -586,6 +765,12 @@ public final class SnapshotHandler extends BaseRestHandler {
             if (collidingSource != null) {
                 throw new IndexNameCollisionException(collidingSource, original, target);
             }
+            if (serving != null && (serving.isSystemIndex(original) || serving.isSystemIndex(target))) {
+                // Neither a captured system index nor a target under a system-index pattern: the first is
+                // a plugin's records restored somewhere readable, the second a name minted under a pattern
+                // the plugin owns, on a path PUT /{index}'s guard never sees.
+                throw new SystemIndexException(serving.isSystemIndex(original) ? original : target);
+            }
             if (metadata.describe(target).isPresent()) {
                 throw new IndexAlreadyExistsException(target);
             }
@@ -593,28 +778,87 @@ public final class SnapshotHandler extends BaseRestHandler {
         }
 
         final BlobStore blobStore = metadata.blobStore();
+        // Every target created so far, so a restore that fails part-way removes what it made rather than
+        // leaving earlier targets restored and the current one with nothing published behind its name.
+        final List<String> created = new ArrayList<>();
         int shardsRestored = 0;
-        for (Map.Entry<String, String> restoring : targets.entrySet()) {
-            final SnapshotRecord.SnapshottedIndex capturedIndex = record.indices().get(restoring.getKey());
-            final String newUuid = UUIDs.randomBase64UUID();
-            metadata.createIndex(
-                new IndexDescriptor(restoring.getValue(), newUuid, capturedIndex.numberOfShards(), capturedIndex.mapping(), null).createdAt(
-                    metadata.clock().getAsLong(),
-                    org.opensearch.Version.CURRENT.id
-                )
-            );
-            for (Map.Entry<Integer, CommitManifest> shard : capturedIndex.shards().entrySet()) {
-                final BlobPath sourceBase = record.shallow()
-                    ? RegisterMap.shardData(metadata.basePath(), restoring.getKey(), capturedIndex.uuid(), shard.getKey())
-                    : RegisterMap.snapshotShardData(metadata.basePath(), repo, snapshot, restoring.getKey(), shard.getKey());
-                final BlobPath destBase = RegisterMap.shardData(metadata.basePath(), restoring.getValue(), newUuid, shard.getKey());
-                final CommitManifest restored = copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue());
-                blobStore.blobContainer(destBase)
-                    .compareAndSwapRegister(SegmentPublisher.MANIFEST, BlobRegister.ABSENT_GENERATION, restored.toBytes());
-                shardsRestored++;
+        try {
+            for (Map.Entry<String, String> restoring : targets.entrySet()) {
+                final SnapshotRecord.SnapshottedIndex capturedIndex = record.indices().get(restoring.getKey());
+                final String newUuid = UUIDs.randomBase64UUID();
+                // The settings the index had when it was captured, restored with it: the analyzers a mapping
+                // names live there, and a restored index without them could neither index nor search.
+                final org.opensearch.common.settings.Settings settings = restorableSettings(capturedIndex.settings());
+                metadata.createIndex(
+                    new IndexDescriptor(restoring.getValue(), newUuid, capturedIndex.numberOfShards(), capturedIndex.mapping(), settings)
+                        .createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id)
+                );
+                created.add(restoring.getValue());
+                for (Map.Entry<Integer, CommitManifest> shard : capturedIndex.shards().entrySet()) {
+                    final BlobPath sourceBase = record.shallow()
+                        ? RegisterMap.shardData(metadata.basePath(), restoring.getKey(), capturedIndex.uuid(), shard.getKey())
+                        : RegisterMap.snapshotShardData(metadata.basePath(), repo, snapshot, restoring.getKey(), shard.getKey());
+                    final BlobPath destBase = RegisterMap.shardData(metadata.basePath(), restoring.getValue(), newUuid, shard.getKey());
+                    final CommitManifest restored = copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue());
+                    // The manifest lands only if nothing has published on the new index yet. A writer that
+                    // activated the shard between the descriptor's creation and this swap has already
+                    // published a commit of its own, and the restored commit must not be reported as in
+                    // place when it is not.
+                    final var landed = blobStore.blobContainer(destBase)
+                        .compareAndSwapRegister(SegmentPublisher.MANIFEST, BlobRegister.ABSENT_GENERATION, restored.toBytes());
+                    if (landed.applied() == false) {
+                        throw new RestoreConflictException(restoring.getValue(), shard.getKey());
+                    }
+                    shardsRestored++;
+                }
             }
+        } catch (Exception e) {
+            for (String target : created) {
+                try {
+                    metadata.deleteIndex(target);
+                } catch (Exception cleanup) {
+                    e.addSuppressed(cleanup);
+                }
+            }
+            throw e;
         }
         return new RestoreOutcome(targets, shardsRestored);
+    }
+
+    /**
+     * The captured settings a restored index is created with: everything core's restore carries over,
+     * and none of what it does not. The uuid, creation date, version and provided name are the new
+     * index's own; the shard count is structural and travels as {@code numberOfShards}; replicas are
+     * refused here. A descriptor never stores these in its extra settings, but a snapshot record is data
+     * this handler did not necessarily write, and a restored descriptor carrying another index's uuid is
+     * a shard that opens under the wrong storage path.
+     */
+    private static org.opensearch.common.settings.Settings restorableSettings(Map<String, Object> captured) {
+        if (captured.isEmpty()) {
+            return org.opensearch.common.settings.Settings.EMPTY;
+        }
+        final org.opensearch.common.settings.Settings.Builder settings = org.opensearch.common.settings.Settings.builder()
+            .loadFromMap(captured)
+            .normalizePrefix(org.opensearch.cluster.metadata.IndexMetadata.INDEX_SETTING_PREFIX);
+        for (String key : new String[] {
+            org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_UUID,
+            org.opensearch.cluster.metadata.IndexMetadata.SETTING_HISTORY_UUID,
+            org.opensearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED,
+            org.opensearch.cluster.metadata.IndexMetadata.SETTING_VERSION_UPGRADED,
+            org.opensearch.cluster.metadata.IndexMetadata.SETTING_CREATION_DATE,
+            org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_PROVIDED_NAME,
+            org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS,
+            org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS }) {
+            settings.remove(key);
+        }
+        return settings.build();
+    }
+
+    /** Thrown from inside {@link #handleRestore}'s gate when the snapshot is still being taken. */
+    private static final class SnapshotInProgressException extends Exception {
+        SnapshotInProgressException(String repo, String snapshot) {
+            super("snapshot " + repo + "/" + snapshot + " is still being taken; there is nothing to restore yet");
+        }
     }
 
     /** Thrown from inside {@link #handleRestore}'s gate when a requested index was not in the snapshot. */
@@ -647,7 +891,9 @@ public final class SnapshotHandler extends BaseRestHandler {
         builder.field("indices", record.indices().keySet());
         builder.startArray("data_streams").endArray();
         builder.field("include_global_state", includeGlobalState);
-        builder.field("state", "SUCCESS");
+        // A record whose indices have no commits yet is a capture still running -- see
+        // MetadataPlane.capturing -- and says so rather than reporting a success with no shards.
+        builder.field("state", MetadataPlane.inProgress(record) ? "IN_PROGRESS" : "SUCCESS");
         builder.field("start_time", Instant.ofEpochMilli(record.startTimeMillis()).toString());
         builder.field("start_time_in_millis", record.startTimeMillis());
         builder.field("end_time", Instant.ofEpochMilli(record.endTimeMillis()).toString());
@@ -744,6 +990,27 @@ public final class SnapshotHandler extends BaseRestHandler {
             return bool;
         }
         return Boolean.parseBoolean(String.valueOf(field));
+    }
+
+    /**
+     * Why a repository or snapshot name is not one, or null when it is.
+     *
+     * @param name the name, or a comma-separated list of them when {@code list} is true
+     * @param what "repository" or "snapshot", for the message
+     * @param list whether several names may be given
+     */
+    private static String invalidName(String name, String what, boolean list) {
+        if (name == null) {
+            return null;
+        }
+        for (String each : list ? name.split(",") : new String[] { name }) {
+            try {
+                org.opensearch.serverless.metadata.Names.validateId(each, what);
+            } catch (IllegalArgumentException e) {
+                return e.getMessage();
+            }
+        }
+        return null;
     }
 
     private static String firstUnknownKey(Map<String, Object> body, Set<String> known) {

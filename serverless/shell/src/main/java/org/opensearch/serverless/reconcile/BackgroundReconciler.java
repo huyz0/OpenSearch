@@ -94,6 +94,14 @@ public final class BackgroundReconciler implements Closeable {
     private final Set<ShardId> fenced = ConcurrentHashMap.newKeySet();
     private final Set<String> pinnedIndices = ConcurrentHashMap.newKeySet();
     private volatile boolean demandDriven;
+    /** Set by a running {@link ReconcileScheduler}: the lease is renewed by its timer, so the backstop must not renew it again. */
+    private volatile boolean renewalDrivenByTimer;
+    /**
+     * One monitor for both activation passes. The renewal timer, the backstop and a failure-triggered
+     * pass can all reach {@link #activateWanted} or {@link #activateOnDemand} at once, and two of them
+     * activating the same shard is two acquisitions, two seals and two opens racing on one shard.
+     */
+    private final Object activationLock = new Object();
     private volatile int maxShardsHeld = DEFAULT_MAX_SHARDS_HELD;
     private volatile long evictAfterMillis = DEFAULT_EVICT_AFTER_MILLIS;
     private volatile double evictHeadroomFraction = DEFAULT_EVICT_HEADROOM_FRACTION;
@@ -124,6 +132,19 @@ public final class BackgroundReconciler implements Closeable {
     public BackgroundReconciler(ServerlessNode node, MetadataPlane plane) {
         this.node = node;
         this.plane = plane;
+        this.collector = new GarbageCollector(plane.blobStore(), plane.basePath());
+        // Readers and frozen views are admitted under this loop's cap and eviction, not a constant.
+        node.setShardAdmission(new ServerlessNode.ShardAdmission() {
+            @Override
+            public int maxShardsHeld() {
+                return BackgroundReconciler.this.maxShardsHeld;
+            }
+
+            @Override
+            public boolean makeRoom() {
+                return BackgroundReconciler.this.makeRoom();
+            }
+        });
     }
 
     /**
@@ -159,7 +180,7 @@ public final class BackgroundReconciler implements Closeable {
      */
     public TickResult tick(long nowMillis) throws Exception {
         final Set<ShardId> released = new java.util.LinkedHashSet<>(renewLeases());
-        final Set<ShardId> activated = activateWanted();
+        final Set<ShardId> activated = new java.util.LinkedHashSet<>(activateWanted());
         final Set<ShardId> published = publishAll();
         // After publishing, so a shard released for idleness has just had its chance to flush.
         released.addAll(releaseIdle(nowMillis));
@@ -177,10 +198,47 @@ public final class BackgroundReconciler implements Closeable {
                 // the shard next lost a file of its own.
                 forceSweepOfOpenWriters();
             }
+            reaps++;
+            // And the pins this node did not touch: two listings, no reads, every few reaps. A view reaped
+            // elsewhere or a snapshot deleted anywhere changes the set, and a changed set is the one signal
+            // that files a quiet index held under that pin are collectable now rather than at its next
+            // merge.
+            if (reaps % PINS_EVERY_REAPS == 0) {
+                try {
+                    final Set<String> pins = collector.pins();
+                    if (lastPins != null && pins.equals(lastPins) == false) {
+                        forceSweepOfOpenWriters();
+                    }
+                    lastPins = pins;
+                } catch (Exception e) {
+                    logger.warn("could not read the deployment's pins; the sweep gate keeps its last reading", e);
+                }
+            }
+            // Descriptor tombstones past their quarantine, rarely: a name created and deleted daily used
+            // to poison its prefix pattern after a year, because nothing ever removed them.
+            if (reaps % TOMBSTONE_SWEEP_EVERY_REAPS == 0) {
+                try {
+                    collector.collectTombstones(plane, plane.clock().getAsLong());
+                } catch (Exception e) {
+                    logger.warn("could not sweep descriptor tombstones; the next sweep will retry", e);
+                }
+            }
         }
         // One small register read: the stored scripts are re-read only when their marker has moved, which
         // is how a script put on another node reaches this one without a listing per pass.
         node.storedScripts().refresh(false);
+        // The full re-read of this node's truth, rarely. Activation no longer goes through it -- taking
+        // one shard used to re-read every held head -- so this is what reopens a shard whose head still
+        // names this node but which is not open here: one closed after a failed log append, or one whose
+        // open failed after the head was won. One listing and a head read per claim, every
+        // RESYNC_EVERY_PASSES backstops, which at the default interval is once in ten minutes.
+        if (passes % RESYNC_EVERY_PASSES == RESYNC_EVERY_PASSES - 1) {
+            try {
+                activated.addAll(node.syncFrom(plane));
+            } catch (Exception e) {
+                logger.warn("periodic resync against the metadata plane failed; the next one will retry", e);
+            }
+        }
         // Only what was published, so the sweep costs nothing at all on a shard nobody is writing to.
         // Edge-triggered publishes are swept here too: only the backstop's result used to enter the
         // watch set, so a burst-then-idle shard kept its merged-away segments forever.
@@ -223,18 +281,34 @@ public final class BackgroundReconciler implements Closeable {
             if (opened.isEmpty()) {
                 continue;
             }
+            if (node.reconciler().inFlight(shardId) > 0) {
+                // A query is running against it. Closing the reader under a running aggregation failed
+                // the query with a closed reader, which looks like corruption and is a scheduling choice;
+                // the next pass finds the commit still superseded and tries again.
+                continue;
+            }
             try {
                 final var current = plane.segmentPublisher(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id())
                     .readManifest();
                 if (current.isEmpty()) {
-                    // The commit this reader is serving is no longer published at all -- a deleted index,
-                    // most likely. Nothing good comes of guessing; the next search will say what is true.
+                    // The commit this reader is serving is no longer published at all. A deleted index,
+                    // most likely -- but a manifest read that came back empty is not proof of that on its
+                    // own, so the descriptor decides: gone too, and the reader is let go with the records
+                    // this node kept of it; still there, and the next search will say what is true.
+                    if (plane.describe(shardId.getIndexName()).isEmpty()) {
+                        node.reconciler().releaseShard(shardId, "its index has been deleted");
+                        node.forgetReader(shardId);
+                        stale.add(shardId);
+                    }
                     continue;
                 }
                 if (sameCommit(opened.get(), current.get())) {
                     continue;
                 }
                 node.reconciler().releaseShard(shardId, "the commit it was serving has been superseded");
+                // And the node's own record of serving it, or a search node that cycles through readers
+                // carries every one it ever opened into every reader open for the rest of its life.
+                node.forgetReader(shardId);
                 stale.add(shardId);
             } catch (Exception e) {
                 // Refreshing is an optimisation over being wrong, not a correctness step of its own: a
@@ -312,6 +386,25 @@ public final class BackgroundReconciler implements Closeable {
     }
 
     /**
+     * Sets how long a blob must have been unreferenced, by the plane's clock, before a graced sweep may
+     * delete it -- on top of the pass count.
+     *
+     * <p>Zero in the library and {@link GarbageCollector#DEFAULT_MINIMUM_UNREFERENCED_MILLIS} in the
+     * daemon, the same split idle release and demand-driven activation use, and for the same reason: a
+     * test that drives passes by hand at one clock value is asserting the pass count, and a node running
+     * unattended is the one whose passes can come round a second apart under a burst of publishes --
+     * which is when two passes are not "long enough" for a freeze on a slow store to have written its
+     * record. {@code ServerlessBootstrap} turns it on.
+     *
+     * @param millis the floor, or zero for a pure pass count
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setMinimumUnreferencedMillis(long millis) {
+        collector.setMinimumUnreferencedMillis(millis);
+        return this;
+    }
+
+    /**
      * Collects unreferenced segment blobs for the shards this node has just published.
      *
      * <p><b>Until this existed, nothing in a running deployment ever ran the collector.</b> It was reachable
@@ -336,7 +429,6 @@ public final class BackgroundReconciler implements Closeable {
         if (plane.blobStore() == null) {
             return deleted;
         }
-        final GarbageCollector collector = new GarbageCollector(plane.blobStore(), plane.basePath());
         final Set<ShardId> toSweep = new LinkedHashSet<>();
         for (ShardId shardId : published) {
             if (sweepCanFindSomething(shardId)) {
@@ -439,6 +531,36 @@ public final class BackgroundReconciler implements Closeable {
     /** How many passes between deployment-wide reaps of expired views. */
     public static final int REAP_EVERY_PASSES = 10;
 
+    /** How many reaps between sweeps of descriptor tombstones past their quarantine: about hourly at the defaults. */
+    public static final int TOMBSTONE_SWEEP_EVERY_REAPS = 12;
+
+    /**
+     * How many reaps between readings of the deployment's pins: two listings each, so every third reap
+     * -- a quarter of an hour at the defaults -- keeps an idle node's listings at one per ten passes
+     * plus a fraction, rather than three.
+     */
+    public static final int PINS_EVERY_REAPS = 3;
+
+    /**
+     * The one collector this loop sweeps with. One instance rather than one per pass because it remembers
+     * when each candidate was first seen unreferenced, which is what a wall-clock floor is measured from;
+     * a fresh collector per pass has never seen anything and would start every clock again.
+     */
+    private final GarbageCollector collector;
+
+    /**
+     * The pins -- live view records and snapshot records -- as of the last reap, so a pin that came or
+     * went anywhere in the deployment is noticed here. The per-node sweep gate can see only what this node
+     * did: a manifest it published losing a file, a view it reaped. A view reaped on another node or a
+     * snapshot deleted anywhere freed files a quiet index would otherwise hold until its next merge.
+     */
+    private Set<String> lastPins;
+
+    private long reaps;
+
+    /** How many passes between full re-reads of this node's truth from the metadata plane. */
+    public static final int RESYNC_EVERY_PASSES = 20;
+
     private long passes;
 
     /**
@@ -451,8 +573,13 @@ public final class BackgroundReconciler implements Closeable {
      */
     public int closeReleasedViews() {
         int closed = 0;
+        // One record read per view, not per frozen shard: a hundred-shard view was a hundred identical
+        // reads every pass on every node holding it.
+        final Set<String> viewIds = new LinkedHashSet<>();
         for (ShardId view : node.reconciler().frozenShards()) {
-            final String viewId = view.getIndex().getUUID();
+            viewIds.add(view.getIndex().getUUID());
+        }
+        for (String viewId : viewIds) {
             try {
                 final var record = plane.pointInTime(viewId);
                 if (record.isEmpty() || record.get().expiredAt(plane.clock().getAsLong())) {
@@ -721,33 +848,62 @@ public final class BackgroundReconciler implements Closeable {
             if (node.reconciler().readerShards().contains(shardId)) {
                 // A reader holds no head and no claim on anything. Closing it loses nothing at all.
                 node.reconciler().releaseShard(shardId, reason);
+                node.forgetReader(shardId);
                 return true;
             }
-            final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
-            if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
-                // Not ours any more; renewLeases will deal with it and this must not race it.
-                return false;
-            }
-            synchronized (publishLock(shardId)) {
-                node.publishShard(shardId, head.get().term());
-            }
-            if (plane.heads().release(shardId.getIndexName(), shardId.id(), node.localNode().getId()) == false) {
-                // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
-                // closing it while the head still points here is the one outcome to avoid.
-                logger.warn("could not release the head for {}; keeping it open", shardId);
-                return false;
-            }
-            node.reconciler().releaseShard(shardId, reason);
-            // And forget the claim, so a node that churns through shards does not read a head per stale
-            // claim on every heartbeat for the rest of its life.
-            plane.forgetAssignment(node.localNode().getId(), shardId.getIndexName(), shardId.id());
-            return true;
+            // Under the shard's fence, from before the publish until after the close. A write that has
+            // applied to the engine and is about to append to the log holds the other side of that fence;
+            // without it the sequence below interleaved with one: the publish completed, a request thread
+            // applied a document, this thread released the head, a successor acquired and sealed the log,
+            // and the request thread then appended behind the seal and acknowledged. Nobody replays a
+            // record behind a seal. The fence makes the release wait for writes in flight and makes writes
+            // that arrive during it wait for the close -- after which they find no shard and are refused,
+            // which is the truthful answer.
+            return node.underShardFence(shardId, () -> letGoFenced(shardId, reason));
         } catch (Exception e) {
             // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
             // logged and retried on the next pass rather than propagated into the tick.
             logger.warn("could not release shard " + shardId, e);
             return false;
         }
+    }
+
+    /** The body of {@link #letGo} for a writer, run while the shard's fence is held. */
+    private boolean letGoFenced(ShardId shardId, String reason) throws Exception {
+        final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+        if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
+            // Not ours any more; renewLeases will deal with it and this must not race it.
+            return false;
+        }
+        final var shard = node.reconciler().shard(shardId);
+        final long maxSeqNo = shard == null ? -1L : shard.seqNoStats().getMaxSeqNo();
+        // Publish only when there is something the last publish did not cover. An unconditional publish
+        // here forced a fresh commit, uploaded a new segments_N and swapped the manifest on a shard
+        // nobody had written to since it was last published -- seven requests and an orphan blob per
+        // idle release, times every shard a node under cap pressure cycles through. The head release is
+        // still required either way.
+        //
+        // And never for a shard whose log could not be appended to: its engine holds an operation the
+        // log does not, and publishing would make the refusal the caller was given a lie. A successor
+        // rebuilds it from the log, which is the state the caller was told about.
+        final boolean unchanged = maxSeqNo < 0 || maxSeqNo == lastPublishedMaxSeqNo.getOrDefault(shardId, -1L);
+        if (unchanged == false && node.isWriteFenced(shardId) == false) {
+            synchronized (publishLock(shardId)) {
+                node.publishShard(shardId, head.get().term());
+            }
+        }
+        if (plane.heads().release(shardId.getIndexName(), shardId.id(), node.localNode().getId()) == false) {
+            // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
+            // closing it while the head still points here is the one outcome to avoid.
+            logger.warn("could not release the head for {}; keeping it open", shardId);
+            return false;
+        }
+        node.reconciler().releaseShard(shardId, reason);
+        lastPublishedMaxSeqNo.remove(shardId);
+        // And forget the claim, so a node that churns through shards does not read a head per stale
+        // claim on every heartbeat for the rest of its life.
+        plane.forgetAssignment(node.localNode().getId(), shardId.getIndexName(), shardId.id());
+        return true;
     }
 
     /**
@@ -776,7 +932,48 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> renewLeases() throws Exception {
+        if (renewalDrivenByTimer) {
+            // The timer renews the lease; the backstop's job is the half that verifies. Renewing here too
+            // was a fourth lease write per TTL that guaranteed nothing the timer's three did not.
+            return node.verifyHeads(plane);
+        }
         return node.heartbeat(plane);
+    }
+
+    /**
+     * Renews this node's lease, and only that: the renewal timer's body.
+     *
+     * <p>Separated from {@link #verifyHeads()} so the lease can be renewed on its own clock, ahead of and
+     * independent from the pass that reads one head per held shard. If the lease had already lapsed by
+     * this node's own clock, every writer shard is released <em>before</em> the renewal -- see
+     * {@link ServerlessNode#renewLease}.
+     *
+     * @return the shards released because the lease had lapsed
+     * @throws Exception if the metadata plane cannot be reached
+     */
+    public Set<ShardId> renewLease() throws Exception {
+        return node.renewLease(plane);
+    }
+
+    /**
+     * Reads the head of every held writer shard and releases what this node has lost.
+     *
+     * @return the shards released
+     * @throws Exception if the metadata plane cannot be reached
+     */
+    public Set<ShardId> verifyHeads() throws Exception {
+        return node.verifyHeads(plane);
+    }
+
+    /**
+     * Tells the loop whether a renewal timer is running, so the backstop does not renew as well.
+     *
+     * @param renewalDrivenByTimer true while a {@link ReconcileScheduler} is renewing the lease
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setRenewalDrivenByTimer(boolean renewalDrivenByTimer) {
+        this.renewalDrivenByTimer = renewalDrivenByTimer;
+        return this;
     }
 
     /**
@@ -790,6 +987,12 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> activateWanted() throws Exception {
+        synchronized (activationLock) {
+            return activateWantedLocked();
+        }
+    }
+
+    private Set<ShardId> activateWantedLocked() throws Exception {
         final Set<ShardId> activated = new LinkedHashSet<>();
         for (Map.Entry<String, Integer> target : wanted) {
             final boolean alreadyHeld = node.reconciler()
@@ -836,6 +1039,12 @@ public final class BackgroundReconciler implements Closeable {
         if (demandDriven == false) {
             return Set.of();
         }
+        synchronized (activationLock) {
+            return activateOnDemandLocked(candidates);
+        }
+    }
+
+    private Set<ShardId> activateOnDemandLocked(Collection<Map.Entry<String, Integer>> candidates) throws Exception {
         final Set<ShardId> taken = new LinkedHashSet<>();
         for (Map.Entry<String, Integer> candidate : candidates) {
             // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
@@ -966,13 +1175,19 @@ public final class BackgroundReconciler implements Closeable {
                 // guard stays on the edge path too: a spurious mark must not become an upload.
                 continue;
             }
-            // The heartbeat read this head a moment ago; the manifest's own compare-and-swap is the fence
-            // that matters, so a head up to one renewal old is as good here as a fresh read.
-            final var head = recentOrReadHead(shardId);
-            if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
+            if (node.isWriteFenced(shardId)) {
+                // Its engine holds an operation its log does not. Publishing that commit would make the
+                // failure the caller was told a lie; the shard is reopened from its log by the next
+                // heartbeat that reaches the store, and published after.
                 continue;
             }
             try {
+                // The heartbeat read this head a moment ago; the manifest's own compare-and-swap is the
+                // fence that matters, so a head up to one renewal old is as good here as a fresh read.
+                final var head = recentOrReadHead(shardId);
+                if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
+                    continue;
+                }
                 synchronized (publishLock(shardId)) {
                     lastManifests.put(shardId, node.publishShard(shardId, head.get().term()));
                 }
@@ -980,16 +1195,45 @@ public final class BackgroundReconciler implements Closeable {
                 // A newer term has already published. This node is a zombie for this shard: it read a
                 // head that named it, and by the time it wrote, it did not. Stop serving it now rather
                 // than at the next renewal, and go look at ownership -- this is exactly the evidence
-                // ownershipDoubted exists for.
-                node.reconciler().releaseShard(shardId, "fenced while publishing: " + e.getMessage());
+                // ownershipDoubted exists for. Under the fence, so a write in flight is not acknowledged
+                // against a shard that is being closed as fenced.
+                try {
+                    node.underShardFence(shardId, () -> {
+                        node.reconciler().releaseShard(shardId, "fenced while publishing: " + e.getMessage());
+                        return null;
+                    });
+                } catch (Exception releaseFailure) {
+                    logger.warn("could not release " + shardId + " after a fenced publish", releaseFailure);
+                }
                 lastPublishedMaxSeqNo.remove(shardId);
                 fenced.add(shardId);
+                continue;
+            } catch (Exception e) {
+                // One shard's upload failing must not defer every other dirty shard to the backstop:
+                // the marks were drained before this loop began, so an exception out of it silently left
+                // the rest unpublished for up to a backstop interval. This shard is re-marked and the
+                // loop goes on.
+                logger.warn("could not publish " + shardId + "; it is re-marked and will be retried", e);
+                dirty.add(shardId);
                 continue;
             }
             lastPublishedMaxSeqNo.put(shardId, maxSeqNo);
             published.add(shardId);
         }
         return published;
+    }
+
+    /**
+     * Returns the highest sequence number this node has published for a shard, for the stats endpoint's
+     * publish-lag figure.
+     *
+     * @param shardId the shard
+     * @return the sequence number the last publish from this node covered, or empty if it has never
+     *         published the shard
+     */
+    public java.util.OptionalLong lastPublishedMaxSeqNo(ShardId shardId) {
+        final Long published = lastPublishedMaxSeqNo.get(shardId);
+        return published == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(published);
     }
 
     /**

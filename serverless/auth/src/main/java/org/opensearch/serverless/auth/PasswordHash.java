@@ -61,6 +61,17 @@ public final class PasswordHash {
      */
     public static final int DEFAULT_ITERATIONS = 210_000;
 
+    /**
+     * The most iterations a record may ask for before it is refused unread.
+     *
+     * <p>The count is read from the record, and a record is a document in an index: whoever can write one
+     * -- another plugin through the client, anyone with write access to the bucket -- can write one that
+     * asks for two billion iterations, and a checker thread would spend hours on it. Four such records
+     * and every uncached login is a 503. A record above this is treated as unreadable, which denies.
+     * {@link CredentialStore} passes a tighter bound derived from what it is configured to write.
+     */
+    public static final int MAX_ITERATIONS = 10_000_000;
+
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private PasswordHash() {}
@@ -91,6 +102,18 @@ public final class PasswordHash {
      * @return true if they match
      */
     public static boolean verify(char[] password, String stored) {
+        return verify(password, stored, MAX_ITERATIONS);
+    }
+
+    /**
+     * Checks a password against a stored record, refusing a record whose work factor is above a bound.
+     *
+     * @param password the password offered
+     * @param stored the record to check against
+     * @param maxIterations the most iterations a record may ask for; above it the record is unreadable
+     * @return true if they match
+     */
+    public static boolean verify(char[] password, String stored, int maxIterations) {
         if (stored == null) {
             return false;
         }
@@ -108,7 +131,7 @@ public final class PasswordHash {
         } catch (IllegalArgumentException e) {
             return false;
         }
-        if (iterations <= 0 || salt.length == 0) {
+        if (iterations <= 0 || iterations > Math.min(maxIterations, MAX_ITERATIONS) || salt.length == 0) {
             return false;
         }
         return MessageDigest.isEqual(expected, derive(password, salt, iterations));
@@ -154,27 +177,31 @@ public final class PasswordHash {
     /**
      * A short, non-reversible fingerprint of a credential, for use as a cache key.
      *
-     * <p>Not for storage: this is a plain digest with no work factor, and a stored one would be
-     * brute-forceable. It exists so that {@link CredentialStore}'s cache can recognise the same password
-     * again without keeping the password itself in a long-lived map.
+     * <p><b>Keyed, so that it means nothing outside the process that made it.</b> A plain digest has no
+     * work factor, and the cache holds it for a TTL: a heap dump would hand an attacker every recently
+     * used password as a hash crackable at GPU speed -- exactly what the salted derivation was chosen to
+     * deny. An HMAC under a key generated at construction and never persisted is the same size, costs the
+     * same, and is worthless without a key that exists only in this node's memory.
      *
+     * @param key the process-local key, which is never stored
      * @param user the username
      * @param password the password
      * @return the fingerprint
      */
-    static String fingerprint(String user, char[] password) {
+    static String fingerprint(byte[] key, String user, char[] password) {
         try {
-            final MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            digest.update(user.getBytes(StandardCharsets.UTF_8));
-            digest.update((byte) 0);
+            final javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"));
+            mac.update(user.getBytes(StandardCharsets.UTF_8));
+            mac.update((byte) 0);
             final java.nio.ByteBuffer buffer = StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(password));
             final byte[] bytes = new byte[buffer.remaining()];
             buffer.get(bytes);
-            digest.update(bytes);
+            mac.update(bytes);
             java.util.Arrays.fill(bytes, (byte) 0);
-            return Base64.getEncoder().withoutPadding().encodeToString(digest.digest());
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("this JVM has no SHA-256", e);
+            return Base64.getEncoder().withoutPadding().encodeToString(mac.doFinal());
+        } catch (NoSuchAlgorithmException | java.security.InvalidKeyException e) {
+            throw new IllegalStateException("this JVM has no HmacSHA256", e);
         }
     }
 }

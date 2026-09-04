@@ -38,9 +38,22 @@ public final class StoredScripts {
 
     private static final Logger logger = LogManager.getLogger(StoredScripts.class);
 
+    /**
+     * How old a marker check may be before a lookup makes another one.
+     *
+     * <p>Core reads a stored script from cluster state on every use, so an overwrite or a delete on one
+     * node is what the next compile on every node sees. A cache that consulted the marker only on a miss
+     * kept serving an overwritten script — and kept executing a deleted one — until the next backstop
+     * pass, which is a stale positive for up to thirty seconds. One register read per second per node
+     * bounds that at a second, and costs nothing a request path notices.
+     */
+    static final long CHECK_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+
     private final Supplier<MetadataPlane> plane;
     private volatile Map<String, StoredScriptSource> scripts = Map.of();
     private volatile long appliedVersion = -1L;
+    /** Far enough in the past that the first lookup checks; not so far that the subtraction wraps. */
+    private volatile long lastCheckedNanos = System.nanoTime() - 2 * CHECK_INTERVAL_NANOS;
 
     /**
      * Creates the cache.
@@ -52,19 +65,19 @@ public final class StoredScripts {
     }
 
     /**
-     * Looks a script up, refreshing from the store once if it is not here.
+     * Looks a script up, consulting the store's marker when the last check is older than a second.
      *
      * @param id the script id
      * @return the script, or empty
      */
     public Optional<StoredScriptSource> lookup(String id) {
         final StoredScriptSource known = scripts.get(id);
-        if (known != null) {
+        if (known != null && System.nanoTime() - lastCheckedNanos < CHECK_INTERVAL_NANOS) {
             return Optional.of(known);
         }
-        // The marker, not the listing: a miss re-reads the store only when something changed since this
-        // node last read it, so a request naming a script that does not exist costs one register read
-        // rather than a listing and a read per script.
+        // The marker, not the listing: this re-reads the store only when something changed since this
+        // node last read it, so a request naming a script that does not exist -- or one that has not
+        // changed -- costs one register read rather than a listing and a read per script.
         refresh(false);
         return Optional.ofNullable(scripts.get(id));
     }
@@ -83,6 +96,7 @@ public final class StoredScripts {
         try {
             final StoredScriptStore store = metadata.scripts();
             final long version = store.version();
+            lastCheckedNanos = System.nanoTime();
             if (force == false && version == appliedVersion) {
                 return false;
             }

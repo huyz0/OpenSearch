@@ -268,7 +268,7 @@ public final class UpdateHandler extends BaseRestHandler {
 
         final ServerlessNode serving = node.get();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
-            final var operations = new ShardOperations(serving, metadata);
+            final var operations = new ShardOperations(serving, metadata, true);
             try {
                 ShardOperations.UpdateOutcome outcome = null;
                 // retry_on_conflict, honoured the way core honours it: an unconditional update is a read
@@ -303,17 +303,14 @@ public final class UpdateHandler extends BaseRestHandler {
                 sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
             } catch (ShardOperations.DocumentMissingException e) {
                 sendError(channel, RestStatus.NOT_FOUND, "document_missing_exception", e.getMessage());
+            } catch (ShardOperations.SystemIndexException e) {
+                sendError(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage());
             } catch (ShardOperations.NotHereException e) {
                 // The get endpoint's vocabulary, not an update-shaped approximation of it: an update is a
-                // get and a write, and either half can be the one that could not find a home.
-                sendError(
-                    channel,
-                    RestStatus.SERVICE_UNAVAILABLE,
-                    e.owner() != null && e.owner().equals(serving.localNode().getId())
-                        ? "activation_in_progress"
-                        : (e.getMessage().contains("could not forward") ? "forward_failed" : "owner_unreachable"),
-                    e.getMessage()
-                );
+                // get and a write, and either half can be the one that could not find a home. The status
+                // is the exception's own: "nobody owns the shard" is the 421 PUT answers, not a 503 that
+                // a client treats as "retry" for a state the code itself calls not retryable.
+                sendError(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage());
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));

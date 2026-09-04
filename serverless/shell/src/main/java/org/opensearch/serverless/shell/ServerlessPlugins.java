@@ -60,6 +60,8 @@ public final class ServerlessPlugins {
 
     private final List<Plugin> plugins;
     private final List<Object> components = new ArrayList<>();
+    /** What each plugin built, by plugin: an action's constructor is resolved against its own plugin's only. */
+    private final java.util.Map<Plugin, List<Object>> componentsByPlugin = new java.util.LinkedHashMap<>();
 
     /**
      * Holds the plugins a node was given.
@@ -84,7 +86,8 @@ public final class ServerlessPlugins {
      *
      * <p>A list rather than a type-keyed registry, because nothing in the shell looks components up —
      * a plugin keeps its own references. This exists so that they are reachable at all, and so that a
-     * plugin's component with a lifecycle can be closed.
+     * plugin's component with a lifecycle can be closed. It is not a cross-plugin registry: an action is
+     * resolved against {@link #componentsOf(Plugin)}, never against this.
      *
      * @return the components
      */
@@ -116,23 +119,37 @@ public final class ServerlessPlugins {
      */
     public void createComponents(ServerlessNode node, org.opensearch.env.Environment environment) throws Exception {
         for (Plugin plugin : plugins) {
-            components.addAll(
-                plugin.createComponents(
-                    node.client(),
-                    node.clusterService(),
-                    node.threadPool(),
-                    node.resourceWatcherService(),
-                    node.scriptService(),
-                    node.searchXContentRegistry(),
-                    environment,
-                    node.nodeEnvironment(),
-                    node.namedWriteableRegistry(),
-                    node.indexNameExpressionResolver(),
-                    () -> null                              // RepositoriesService: snapshots are out of scope (R7)
-                )
+            final java.util.Collection<Object> built = plugin.createComponents(
+                node.client(),
+                node.clusterService(),
+                node.threadPool(),
+                node.resourceWatcherService(),
+                node.scriptService(),
+                node.searchXContentRegistry(),
+                environment,
+                node.nodeEnvironment(),
+                node.namedWriteableRegistry(),
+                node.indexNameExpressionResolver(),
+                () -> null                              // RepositoriesService: snapshots are out of scope (R7)
             );
+            components.addAll(built);
+            componentsByPlugin.put(plugin, List.copyOf(built));
             logger.info("started plugin {}", plugin.getClass().getName());
         }
+    }
+
+    /**
+     * Returns what one plugin built from {@code createComponents}, and nothing another plugin built.
+     *
+     * <p>This is the list a plugin's own transport actions are constructed against. The aggregate
+     * {@link #components()} is not a cross-plugin registry, and offering it to every action let one plugin
+     * take another's private component as a constructor argument.
+     *
+     * @param plugin the plugin
+     * @return its components, in the order it returned them; empty for a plugin that built none
+     */
+    public List<Object> componentsOf(Plugin plugin) {
+        return componentsByPlugin.getOrDefault(plugin, List.of());
     }
 
     /**

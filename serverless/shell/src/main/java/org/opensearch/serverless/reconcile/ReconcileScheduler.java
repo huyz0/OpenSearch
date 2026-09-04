@@ -65,10 +65,33 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     private static final Logger logger = LogManager.getLogger(ReconcileScheduler.class);
 
     /**
-     * How many renewals fit inside one lease TTL. Three means two may be lost — to a GC pause, a slow
-     * object store, a dropped connection — before the lease lapses.
+     * How many renewals fit inside one lease TTL.
+     *
+     * <p>Three means <em>one</em> may be lost — to a GC pause, a slow object store, a dropped connection
+     * — before the lease lapses, and usually two. Not "two may be lost": the renewal is jittered by up to
+     * {@link #JITTER_FRACTION} either side, and the holder treats its lease as gone a skew margin before
+     * the stamped expiry ({@code BlobLeaseMembership#selfLeaseValidAt}), so after a renewal at {@code t}
+     * the next two land no later than {@code t + 2 × 1.2 × TTL/3 = t + 0.8 TTL}, inside the margin, and a
+     * third only usually does. The claim this used to make was one lost renewal stronger than the
+     * arithmetic.
+     *
+     * <p>What keeps a healthy node from lapsing is not this number but the shape of the renewal: the
+     * lease is renewed on its own timer, and the next renewal is scheduled <em>before</em> the pass goes
+     * on to read one shard-head per held shard. A node holding a thousand shards on a slow object store
+     * used to lapse because that scan ran ahead of the next renewal's scheduling; it no longer can.
      */
     public static final int RENEWALS_PER_TTL = 3;
+
+    /**
+     * How many renewal passes go by between checks that a reader's commit has moved on.
+     *
+     * <p>Readers used to be refreshed only by the backstop, so a reader on a hot index answered from a
+     * commit up to a backstop interval old. Every other renewal cuts that lag to two renewal intervals
+     * -- two thirds of a TTL, against a backstop of one -- for a third more manifest reads per reader.
+     * Every renewal would cut it further for three times the reads; a manifest read per reader per pass
+     * is already the largest per-reader cost, so the middle is taken.
+     */
+    public static final int READER_REFRESH_EVERY_RENEWALS = 2;
 
     /**
      * How far either side of the renewal interval each renewal is spread, to keep a co-started fleet
@@ -183,6 +206,9 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return this, for chaining onto a constructor
      */
     public ReconcileScheduler start() {
+        // The backstop must not renew the lease as well: with the timer running, a fourth renewal per
+        // TTL bought nothing but a third more lease writes. The backstop still verifies heads.
+        loop.setRenewalDrivenByTimer(true);
         scheduleNextRenewal();
         if (backstopInterval != null) {
             backstopTask = threadPool.scheduleWithFixedDelay(this::backstopNow, backstopInterval, ThreadPool.Names.GENERIC);
@@ -226,14 +252,68 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             return;
         }
         renewalTask = threadPool.schedule(() -> {
+            java.util.Set<ShardId> released;
             try {
-                renewNow();
+                released = renewLeaseNow();
             } finally {
-                // In a finally, and renewNow never throws: a renewal loop that stops rescheduling
+                // In a finally, and renewLeaseNow never throws: a renewal loop that stops rescheduling
                 // because one pass failed is a node that looks alive until its lease lapses.
+                //
+                // And scheduled here, before the head scan below, on purpose. The next renewal is timed
+                // from this one's start, never from the end of a pass that reads one head per held shard
+                // -- that scan is O(shards held) object-store round trips, and a node that scheduled its
+                // next renewal only after it finished lapsed under nothing but latency once it held
+                // enough shards. The lease is the one job that genuinely needs the clock; nothing else in
+                // the pass is allowed to hold it up.
                 scheduleNextRenewal();
             }
+            verifyNow(released);
         }, nextRenewalDelay(), ThreadPool.Names.GENERIC);
+    }
+
+    /**
+     * Renews the node lease, and nothing else. Never throws.
+     *
+     * @return the shards released because the lease had lapsed before it could be renewed
+     */
+    private java.util.Set<ShardId> renewLeaseNow() {
+        renewals.incrementAndGet();
+        try {
+            return loop.renewLease();
+        } catch (Exception e) {
+            // Never propagate out of a scheduled task: an exception cancels a fixed-delay schedule, so
+            // one unreachable-object-store blip would silently stop this node renewing anything, for
+            // good, and the node would look healthy right up until its leases lapsed.
+            logger.warn("lease renewal failed; will retry on the next interval", e);
+            return java.util.Set.of();
+        }
+    }
+
+    /**
+     * The rest of a renewal pass: verify the heads of every held writer shard, and every other pass
+     * check the readers' commits. Runs after the next renewal is already on the clock.
+     *
+     * @param alreadyReleased shards the renewal itself released, so a doubt is raised once for the pass
+     */
+    private void verifyNow(java.util.Set<ShardId> alreadyReleased) {
+        final java.util.Set<ShardId> released = new java.util.LinkedHashSet<>(alreadyReleased);
+        try {
+            released.addAll(loop.verifyHeads());
+        } catch (Exception e) {
+            logger.warn("shard-head verification failed; the backstop will retry", e);
+        }
+        if (renewals.get() % READER_REFRESH_EVERY_RENEWALS == 0) {
+            try {
+                loop.refreshReaders();
+            } catch (Exception e) {
+                logger.warn("reader refresh failed; the backstop will retry", e);
+            }
+        }
+        if (released.isEmpty() == false) {
+            // Losing a shard is itself evidence worth acting on: something else took it, so the
+            // picture this node has of ownership is out of date beyond just these shards.
+            ownershipDoubted(released.iterator().next().getIndexName(), released.iterator().next().id());
+        }
     }
 
     @Override
@@ -260,27 +340,22 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     }
 
     /**
-     * Renews leases once, now. The renewal timer's body, exposed so a test can drive it without a clock.
+     * Renews the lease and verifies the heads once, now: the renewal timer's whole pass, exposed so a
+     * test can drive it without a clock.
      *
      * @return the shards released because this node lost them
      */
     public java.util.Set<ShardId> renewNow() {
-        renewals.incrementAndGet();
+        final java.util.Set<ShardId> released = new java.util.LinkedHashSet<>(renewLeaseNow());
         try {
-            final var released = loop.renewLeases();
-            if (released.isEmpty() == false) {
-                // Losing a shard is itself evidence worth acting on: something else took it, so the
-                // picture this node has of ownership is out of date beyond just these shards.
-                ownershipDoubted(released.iterator().next().getIndexName(), released.iterator().next().id());
-            }
-            return released;
+            released.addAll(loop.verifyHeads());
         } catch (Exception e) {
-            // Never propagate out of a scheduled task: an exception cancels a fixed-delay schedule, so
-            // one unreachable-object-store blip would silently stop this node renewing anything, for
-            // good, and the node would look healthy right up until its leases lapsed.
-            logger.warn("lease renewal failed; will retry on the next interval", e);
-            return java.util.Set.of();
+            logger.warn("shard-head verification failed; the backstop will retry", e);
         }
+        if (released.isEmpty() == false) {
+            ownershipDoubted(released.iterator().next().getIndexName(), released.iterator().next().id());
+        }
+        return released;
     }
 
     /**
@@ -355,6 +430,8 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     @Override
     public void close() {
         closed = true;
+        // Whoever ticks the loop after this is the only thing renewing, so the tick renews again.
+        loop.setRenewalDrivenByTimer(false);
         if (renewalTask != null) {
             renewalTask.cancel();
         }

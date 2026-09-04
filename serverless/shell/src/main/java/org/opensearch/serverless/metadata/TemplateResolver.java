@@ -157,17 +157,78 @@ public final class TemplateResolver {
                 deepMerge(settings, cast(given));
             }
             if (inner.get("mappings") instanceof Map<?, ?> given) {
-                deepMerge(mappings, cast(given));
+                mergeMappings(mappings, cast(given));
             }
         }
     }
 
     /**
+     * Layers one mapping over another the way core composes templates: objects merge, fields replace.
+     *
+     * <p>Core merges template mappings under {@code MergeReason.INDEX_TEMPLATE}, where an object mapper
+     * merges its {@code properties} field by field and a field mapper's definition <em>replaces</em> the one
+     * beneath it. A merge that recursed into a field's parameter map instead composed
+     * {@code {"type":"keyword","ignore_above":64}} and {@code {"type":"text"}} into a {@code text} field
+     * carrying {@code ignore_above}, which core refuses — and nothing validated the merged mapping at
+     * create, so the descriptor was stored and the shard failed to open. The quiet variant kept
+     * {@code "index":false} from a component under a template that said only {@code "type":"long"}.
+     *
+     * <p>A field is an object when it says so ({@code type: object} or {@code nested}) or when it names
+     * {@code properties} without naming a type, which is core's own reading of a mapping. Everything that is
+     * not a field definition — {@code _source}, {@code dynamic}, {@code _meta} and the rest — merges by key.
+     *
+     * @param into the accumulator
+     * @param from what to layer over it
+     */
+    public static void mergeMappings(Map<String, Object> into, Map<String, Object> from) {
+        for (Map.Entry<String, Object> each : from.entrySet()) {
+            final Object existing = into.get(each.getKey());
+            if (existing instanceof Map<?, ?> left && each.getValue() instanceof Map<?, ?> right) {
+                final Map<String, Object> merged = new LinkedHashMap<>(cast(left));
+                if ("properties".equals(each.getKey())) {
+                    mergeProperties(merged, cast(right));
+                } else {
+                    mergeMappings(merged, cast(right));
+                }
+                into.put(each.getKey(), merged);
+            } else {
+                into.put(each.getKey(), each.getValue());
+            }
+        }
+    }
+
+    /** Field by field: two object definitions merge, anything else the later one replaces outright. */
+    private static void mergeProperties(Map<String, Object> into, Map<String, Object> from) {
+        for (Map.Entry<String, Object> field : from.entrySet()) {
+            final Object existing = into.get(field.getKey());
+            if (existing instanceof Map<?, ?> left
+                && field.getValue() instanceof Map<?, ?> right
+                && isObjectField(cast(left))
+                && isObjectField(cast(right))) {
+                final Map<String, Object> merged = new LinkedHashMap<>(cast(left));
+                mergeMappings(merged, cast(right));
+                into.put(field.getKey(), merged);
+            } else {
+                into.put(field.getKey(), field.getValue());
+            }
+        }
+    }
+
+    private static boolean isObjectField(Map<String, Object> definition) {
+        final Object type = definition.get("type");
+        if (type == null) {
+            return definition.containsKey("properties");
+        }
+        return "object".equals(type) || "nested".equals(type);
+    }
+
+    /**
      * Merges one map over another, recursing into nested objects.
      *
-     * <p>Recursive rather than shallow so two component templates each contributing different fields under
-     * {@code properties} both survive. A shallow merge would silently drop every field from the earlier one,
-     * which is exactly what composing templates is meant to avoid.
+     * <p>Recursive rather than shallow so two component templates each contributing different keys under
+     * one settings group both survive. A shallow merge would silently drop every key from the earlier one,
+     * which is exactly what composing templates is meant to avoid. For mappings use {@link #mergeMappings},
+     * which knows that a field definition is not a group to recurse into.
      *
      * @param into the accumulator
      * @param from what to layer over it

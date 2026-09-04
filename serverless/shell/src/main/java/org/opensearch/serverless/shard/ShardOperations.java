@@ -34,16 +34,36 @@ public final class ShardOperations {
 
     private final ServerlessNode node;
     private final MetadataPlane plane;
+    private final boolean refuseSystemIndices;
 
     /**
-     * Creates the operations view.
+     * Creates the operations view for a caller inside the node -- a plugin's {@code Client}, which may
+     * read and write its own system index.
      *
      * @param node the node serving requests
      * @param plane the metadata plane
      */
     public ShardOperations(ServerlessNode node, MetadataPlane plane) {
+        this(node, plane, false);
+    }
+
+    /**
+     * Creates the operations view.
+     *
+     * <p><b>The system-index rule lives here, once, for every request that arrives over REST.</b> The
+     * registration-time guard reads only the index in the request path, and a body-addressed request --
+     * {@code _mget} naming {@code .serverless_auth} in {@code docs} -- walked straight past it to the
+     * credential records. Placing the refusal in {@link #place} means the next handler that resolves an
+     * index from a body cannot miss it, because every operation here places before it does anything.
+     *
+     * @param node the node serving requests
+     * @param plane the metadata plane
+     * @param refuseSystemIndices true for a REST caller, which may not touch a plugin's index by any spelling
+     */
+    public ShardOperations(ServerlessNode node, MetadataPlane plane, boolean refuseSystemIndices) {
         this.node = node;
         this.plane = plane;
+        this.refuseSystemIndices = refuseSystemIndices;
     }
 
     /**
@@ -102,20 +122,107 @@ public final class ShardOperations {
     }
 
     /**
-     * After a forward was refused as "not the owner": forgets the hint, reads the register once, and
-     * returns a placement for the node it names -- or empty if it names the same node or nobody.
+     * What to do after a forward failed, whatever the failure was.
+     *
+     * <p><b>The hint is forgotten first, unconditionally.</b> It used to survive everything except the one
+     * refusal whose message said "does not own", so a hint naming a node that had died, or that held the
+     * shard only as a reader, or that was shedding load, was consulted again on every request and every
+     * request failed the same way -- indefinitely, on that coordinator, while the same write through
+     * {@code _bulk} succeeded because the batch path reads the register every time.
+     *
+     * <p>Then the failure is sorted by {@link org.opensearch.serverless.transport.ForwardFailure}. A refusal or an unreachable owner means the
+     * request was never applied: the register is read once and, if it names somebody new, the caller
+     * forwards there. A deadline or a dropped connection means it may have been applied, so it is not sent
+     * again; the caller is told to read before retrying. An answer from the owner -- a lost condition, a
+     * 429, a mapper's 400 -- is the owner's answer and is thrown as itself.
+     *
+     * @return the placement to forward to next
+     * @throws IOException when there is nothing to retry, worded for the caller
      */
-    private Optional<Placement> replaceStaleOwner(String index, String id, Placement stale, Exception refusal) throws IOException {
-        if (org.opensearch.serverless.rest.DocumentHandler.refusedAsNotOwner(refusal) == false) {
-            return Optional.empty();
-        }
+    private Placement afterForwardFailure(String index, Placement stale, Exception failure, boolean mayRetry) throws IOException {
         node.forgetOwner(index, stale.shard());
-        final Optional<String> fresh = freshOwner(index, stale.shard());
-        owners.put(index + "#" + stale.shard(), fresh);
-        if (fresh.isEmpty() || fresh.get().equals(stale.owner()) || fresh.get().equals(node.localNode().getId())) {
-            return Optional.empty();
+        owners.remove(index + "#" + stale.shard());
+        final org.opensearch.serverless.transport.ForwardFailure kind = org.opensearch.serverless.transport.ForwardFailure.classify(
+            failure
+        );
+        switch (kind) {
+            case CONFLICT:
+                // A lost compare-and-swap came back from a healthy owner that answered correctly. It is
+                // not stale routing, must not cast doubt on ownership, and must not be retried blindly --
+                // so it is rethrown as itself rather than dressed as a routing failure.
+                throw (org.opensearch.index.engine.VersionConflictEngineException) org.opensearch.ExceptionsHelper.unwrap(
+                    failure,
+                    org.opensearch.index.engine.VersionConflictEngineException.class
+                );
+            case REJECTED:
+            case REMOTE:
+                // The owner answered. A client-side status -- its 429, a mapper's 400 -- is the owner's
+                // answer and reaches the caller as it is, with the status the owner gave it. A server-side
+                // one means the operation did not land there, and the caller retries against a re-read head.
+                if (org.opensearch.serverless.transport.ForwardFailure.isClientStatus(failure)) {
+                    if (failure instanceof RuntimeException runtime) {
+                        throw runtime;
+                    }
+                    throw new IOException(failure);
+                }
+                throw new NotHereException(
+                    org.opensearch.serverless.transport.ForwardFailure.describe(stale.owner(), failure),
+                    stale.owner(),
+                    true,
+                    failure
+                );
+            case DEADLINE:
+            case INTERRUPTED:
+                // May have been applied: not sent again, and worded so the caller reads before it retries.
+                node.signals().ownershipDoubted(index, stale.shard());
+                throw new NotHereException(
+                    org.opensearch.serverless.transport.ForwardFailure.describe(stale.owner(), failure),
+                    stale.owner(),
+                    true,
+                    failure
+                );
+            case NOT_OWNER:
+            case UNREACHABLE:
+            default:
+                break;
         }
-        return Optional.of(new Placement(null, stale.shard(), fresh.get()));
+        // The owner never applied it. One register read, and one more forward to whoever it names now.
+        final Optional<String> fresh = mayRetry ? freshOwner(index, stale.shard()) : Optional.empty();
+        if (mayRetry) {
+            owners.put(index + "#" + stale.shard(), fresh);
+            if (fresh.isPresent() && fresh.get().equals(stale.owner()) == false && fresh.get().equals(node.localNode().getId()) == false) {
+                return new Placement(null, stale.shard(), fresh.get(), stale.uuid());
+            }
+        }
+        node.signals().ownershipDoubted(index, stale.shard());
+        if (mayRetry && fresh.isEmpty()) {
+            // Whoever the hint named is gone and nobody has taken over: the same state, and the same
+            // answer, as a register that never named anyone.
+            throw new NotHereException(
+                "no node currently owns shard " + stale.shard() + " of " + index + "; activate it before writing",
+                null,
+                false,
+                failure
+            );
+        }
+        if (mayRetry && fresh.get().equals(node.localNode().getId())) {
+            throw new NotHereException(
+                "this node is acquiring shard " + stale.shard() + " of " + index + "; retry",
+                fresh.get(),
+                true,
+                failure
+            );
+        }
+        // An owner with no live lease keeps its own words, which name the missing lease; anything else is
+        // worded as the forward that failed.
+        throw new NotHereException(
+            failure instanceof org.opensearch.serverless.transport.OwnerUnreachableException
+                ? failure.getMessage()
+                : org.opensearch.serverless.transport.ForwardFailure.describe(stale.owner(), failure),
+            stale.owner(),
+            true,
+            failure
+        );
     }
 
     private static <T> T once(
@@ -206,6 +313,66 @@ public final class ShardOperations {
         public boolean retryable() {
             return retryable;
         }
+
+        /**
+         * The HTTP status this refusal renders as, the same on every endpoint.
+         *
+         * <p>"Nobody owns the shard" used to be a 421 from {@code PUT} and {@code _bulk} and a 503
+         * {@code owner_unreachable} from {@code _update}, {@code _get} and {@code _mget} -- a state the code
+         * itself classifies as not retryable, reported to the client as "retry". The one place that knows
+         * what was thrown decides what it is.
+         *
+         * @return 421 when no node owns the shard, 503 for every self-resolving state
+         */
+        public org.opensearch.core.rest.RestStatus restStatus() {
+            return owner == null
+                ? org.opensearch.core.rest.RestStatus.MISDIRECTED_REQUEST
+                : org.opensearch.core.rest.RestStatus.SERVICE_UNAVAILABLE;
+        }
+
+        /**
+         * The error type this refusal renders as, in the vocabulary the single-document endpoints use.
+         *
+         * @param localNodeId this node's id, to recognise the activation window
+         * @return the type
+         */
+        public String restType(String localNodeId) {
+            if (owner == null) {
+                return "not_the_writer";
+            }
+            if (owner.equals(localNodeId)) {
+                return "activation_in_progress";
+            }
+            final String message = getMessage() == null ? "" : getMessage();
+            return message.contains("could not forward") || message.contains("may or may not have been applied")
+                ? "forward_failed"
+                : "owner_unreachable";
+        }
+    }
+
+    /** The index named belongs to a plugin and is not reachable through the request path. */
+    public static final class SystemIndexException extends IOException {
+
+        private final String index;
+
+        /**
+         * Creates the refusal.
+         *
+         * @param index the system index that was named
+         */
+        public SystemIndexException(String index) {
+            super("[" + index + "] belongs to a plugin and is not reachable through the request path");
+            this.index = index;
+        }
+
+        /**
+         * Returns the index that was refused.
+         *
+         * @return the index name
+         */
+        public String index() {
+            return index;
+        }
     }
 
     /** Which shard a document belongs to, and what this node can do about it. */
@@ -214,11 +381,25 @@ public final class ShardOperations {
         private final ShardId local;
         private final int shard;
         private final String owner;
+        private final String uuid;
 
-        Placement(ShardId local, int shard, String owner) {
+        Placement(ShardId local, int shard, String owner, String uuid) {
             this.local = local;
             this.shard = shard;
             this.owner = owner;
+            this.uuid = uuid;
+        }
+
+        /**
+         * Returns the uuid of the index incarnation this placement was resolved against.
+         *
+         * <p>Travels with every forward, so the owner can refuse a request for an index that has since
+         * been deleted and recreated under the same name.
+         *
+         * @return the uuid
+         */
+        public String uuid() {
+            return uuid;
         }
 
         /**
@@ -259,6 +440,10 @@ public final class ShardOperations {
      * @throws NoSuchIndexException if the index does not exist
      */
     public Placement place(String index, String id) throws IOException {
+        if (refuseSystemIndices && node.isSystemIndex(index)) {
+            // Before the descriptor is read: a refusal that first confirmed the index exists would say so.
+            throw new SystemIndexException(index);
+        }
         final Optional<IndexDescriptor> descriptor = describeOnce(index);
         if (descriptor.isEmpty()) {
             throw new NoSuchIndexException(index);
@@ -275,7 +460,7 @@ public final class ShardOperations {
             .findFirst()
             .orElse(null);
         final String owner = ownerOnce(index, shard).orElse(null);
-        return new Placement(local, shard, owner);
+        return new Placement(local, shard, owner, descriptor.get().uuid());
     }
 
     /**
@@ -507,17 +692,22 @@ public final class ShardOperations {
         if (placement.owner().equals(node.localNode().getId())) {
             throw notHere(index, placement);
         }
+        return forwardGet(index, id, placement, true);
+    }
+
+    /**
+     * Asks the owner for a document, and once -- after a refusal or an unreachable owner -- whoever the
+     * register names instead.
+     */
+    private Read forwardGet(String index, String id, Placement placement, boolean mayRetry) throws IOException {
         // Resolving the peer connects to it, so this can throw as readily as the forward itself can --
         // and both mean the same thing. Leaving the connect outside the catch let a transport failure
         // escape as a 500 for what is a routing problem and a retry.
         try {
             final var peer = node.router().peer(placement.owner());
             if (peer.isEmpty()) {
-                node.signals().ownershipDoubted(index, placement.shard());
-                throw new NotHereException(
-                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease",
-                    placement.owner(),
-                    true
+                throw new org.opensearch.serverless.transport.OwnerUnreachableException(
+                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease"
                 );
             }
             final var response = node.router()
@@ -526,25 +716,7 @@ public final class ShardOperations {
         } catch (NotHereException e) {
             throw e;
         } catch (Exception e) {
-            final Optional<Placement> corrected = replaceStaleOwner(index, id, placement, e);
-            if (corrected.isPresent()) {
-                final var peer = node.router().peer(corrected.get().owner());
-                if (peer.isPresent()) {
-                    final var response = node.router()
-                        .forwardGet(peer.get(), new org.opensearch.serverless.transport.ForwardedGetRequest(index, placement.shard(), id));
-                    return new Read(response.document(), response.ownerNodeId(), true);
-                }
-            }
-            node.signals().ownershipDoubted(index, placement.shard());
-            // Carrying the cause, because the message on its own is often a single word. A TLS handshake
-            // that fails arrives here as "connect_exception" and nothing else, which says a connection did
-            // not happen and not one thing about why.
-            throw new NotHereException(
-                org.opensearch.serverless.rest.IndexAdminHandler.forwardFailureMessage(placement.owner(), e),
-                placement.owner(),
-                true,
-                e
-            );
+            return forwardGet(index, id, afterForwardFailure(index, placement, e, mayRetry), false);
         }
     }
 
@@ -613,14 +785,21 @@ public final class ShardOperations {
         if (placement.owner().equals(node.localNode().getId())) {
             throw notHere(index, placement);
         }
+        return forwardExplain(index, id, query, placement, true);
+    }
+
+    private Explained forwardExplain(
+        String index,
+        String id,
+        org.opensearch.index.query.QueryBuilder query,
+        Placement placement,
+        boolean mayRetry
+    ) throws IOException {
         try {
             final var peer = node.router().peer(placement.owner());
             if (peer.isEmpty()) {
-                node.signals().ownershipDoubted(index, placement.shard());
-                throw new NotHereException(
-                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease",
-                    placement.owner(),
-                    true
+                throw new org.opensearch.serverless.transport.OwnerUnreachableException(
+                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease"
                 );
             }
             final var response = node.router()
@@ -632,13 +811,7 @@ public final class ShardOperations {
         } catch (NotHereException e) {
             throw e;
         } catch (Exception e) {
-            node.signals().ownershipDoubted(index, placement.shard());
-            throw new NotHereException(
-                org.opensearch.serverless.rest.IndexAdminHandler.forwardFailureMessage(placement.owner(), e),
-                placement.owner(),
-                true,
-                e
-            );
+            return forwardExplain(index, id, query, afterForwardFailure(index, placement, e, mayRetry), false);
         }
     }
 
@@ -1565,17 +1738,29 @@ public final class ShardOperations {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) throws IOException {
+        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
+    }
+
+    private Written forwardWritten(
+        String index,
+        String id,
+        String source,
+        boolean refresh,
+        boolean deletion,
+        Placement placement,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent,
+        boolean mayRetry
+    ) throws IOException {
         if (placement.owner() == null || placement.owner().equals(node.localNode().getId())) {
             throw notHere(index, placement);
         }
         try {
             final var peer = node.router().peer(placement.owner());
             if (peer.isEmpty()) {
-                node.signals().ownershipDoubted(index, placement.shard());
-                throw new NotHereException(
-                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease",
-                    placement.owner(),
-                    true
+                throw new org.opensearch.serverless.transport.OwnerUnreachableException(
+                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease"
                 );
             }
             final var ack = node.router()
@@ -1583,6 +1768,7 @@ public final class ShardOperations {
                     peer.get(),
                     new org.opensearch.serverless.transport.ForwardedIndexRequest(
                         index,
+                        placement.uuid(),
                         placement.shard(),
                         id,
                         source,
@@ -1606,31 +1792,20 @@ public final class ShardOperations {
         } catch (NotHereException e) {
             throw e;
         } catch (Exception e) {
-            // A lost compare-and-swap came back from a healthy owner that answered correctly. It is not
-            // stale routing, must not cast doubt on ownership, and must not be retried blindly -- so it
-            // is rethrown as itself rather than dressed as a routing failure.
-            final Throwable conflict = org.opensearch.ExceptionsHelper.unwrap(
-                e,
-                org.opensearch.index.engine.VersionConflictEngineException.class
-            );
-            if (conflict != null) {
-                throw (org.opensearch.index.engine.VersionConflictEngineException) conflict;
-            }
-            // A hint the owner refused: one register read, and one more forward to whoever it names.
-            final Optional<Placement> corrected = replaceStaleOwner(index, id, placement, e);
-            if (corrected.isPresent()) {
-                return forwardWritten(index, id, source, refresh, deletion, corrected.get(), ifSeqNo, ifPrimaryTerm, requireAbsent);
-            }
-            // Stale routing is a retry, not a failure of the write itself.
-            node.signals().ownershipDoubted(index, placement.shard());
-            // Carrying the cause, because the message on its own is often a single word. A TLS handshake
-            // that fails arrives here as "connect_exception" and nothing else, which says a connection did
-            // not happen and not one thing about why.
-            throw new NotHereException(
-                org.opensearch.serverless.rest.IndexAdminHandler.forwardFailureMessage(placement.owner(), e),
-                placement.owner(),
-                true,
-                e
+            // Sorted by afterForwardFailure: a lost condition is rethrown as itself, an owner's own answer
+            // keeps its status, a deadline is not retried, and a refusal or an unreachable owner costs one
+            // register read and one more forward.
+            return forwardWritten(
+                index,
+                id,
+                source,
+                refresh,
+                deletion,
+                afterForwardFailure(index, placement, e, mayRetry),
+                ifSeqNo,
+                ifPrimaryTerm,
+                requireAbsent,
+                false
             );
         }
     }

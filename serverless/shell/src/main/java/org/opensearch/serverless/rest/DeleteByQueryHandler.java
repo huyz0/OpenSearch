@@ -223,7 +223,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         final long startNanos = System.nanoTime();
         serving.threadPool().executor(ThreadPool.Names.WRITE).execute(() -> {
             try {
-                final var operations = new ShardOperations(serving, metadata);
+                final var operations = new ShardOperations(serving, metadata, true);
                 final var outcome = operations.deleteByQuery(index, query, maxDocs, refresh, abortOnConflict);
                 respond(channel, index, outcome, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
             } catch (ShardOperations.NoSuchIndexException e) {

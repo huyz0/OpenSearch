@@ -385,7 +385,7 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
             );
             assertTrue(
                 "a write after rollover lands in the new backing index: " + afterRoll.body(),
-                afterRoll.body().contains("\"_index\":\"events\"")
+                afterRoll.body().contains("\"_index\":\".ds-events-000002\"")
             );
             assertTrue(send(f.node(), "GET", "/.ds-events-000002/_doc/9", null).body().contains("\"found\":true"));
             assertTrue(

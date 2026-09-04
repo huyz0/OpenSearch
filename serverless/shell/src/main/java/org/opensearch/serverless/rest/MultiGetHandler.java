@@ -274,11 +274,19 @@ public final class MultiGetHandler extends BaseRestHandler {
 
     /** Fetches every item at once, up to the fan-out's bound. */
     private void fetch(ServerlessNode serving, MetadataPlane metadata, List<Item> items) throws IOException {
-        final ShardOperations operations = new ShardOperations(serving, metadata);
+        final ShardOperations operations = new ShardOperations(serving, metadata, true);
         final List<Callable<Boolean>> tasks = new ArrayList<>(items.size());
         for (Item item : items) {
             if (item.failureType != null) {
                 // Refused while parsing; there is nothing to read for it.
+                continue;
+            }
+            if (serving.isSystemIndex(item.index)) {
+                // The registration-time guard reads only the index in the request path, and a multi-get
+                // names its indices in the body: POST /_mget {"docs":[{"_index":".serverless_auth",...}]}
+                // walked straight past it to the credential records. Refused here, per item, and again in
+                // ShardOperations.place for whatever body-addressed handler comes next.
+                item.fail("system_index", "[" + item.index + "] belongs to a plugin and is not reachable through the request path");
                 continue;
             }
             tasks.add(() -> {
@@ -287,14 +295,11 @@ public final class MultiGetHandler extends BaseRestHandler {
                     return true;
                 } catch (ShardOperations.NoSuchIndexException e) {
                     item.fail("index_not_found", e.getMessage());
+                } catch (ShardOperations.SystemIndexException e) {
+                    item.fail("system_index", e.getMessage());
                 } catch (ShardOperations.NotHereException e) {
                     // The get endpoint's vocabulary, not a batch-shaped approximation of it.
-                    item.fail(
-                        e.owner() != null && e.owner().equals(serving.localNode().getId())
-                            ? "activation_in_progress"
-                            : (e.getMessage().contains("could not forward") ? "forward_failed" : "owner_unreachable"),
-                        e.getMessage()
-                    );
+                    item.fail(e.restType(serving.localNode().getId()), e.getMessage());
                 } catch (Exception e) {
                     item.fail("read_failed", String.valueOf(e.getMessage()));
                 }

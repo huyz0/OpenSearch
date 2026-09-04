@@ -70,9 +70,12 @@ public final class DataStreamHandler extends BaseRestHandler {
         );
     }
 
+    /** The prefix every backing index name carries, which {@code PUT /{index}} refuses so a rollover never finds its name taken. */
+    static final String BACKING_INDEX_PREFIX = ".ds-";
+
     /** Core's backing-index naming: {@code .ds-<stream>-<generation, six digits>}. */
     static String backingIndexName(String stream, long generation) {
-        return String.format(Locale.ROOT, ".ds-%s-%06d", stream, generation);
+        return String.format(Locale.ROOT, BACKING_INDEX_PREFIX + "%s-%06d", stream, generation);
     }
 
     /** A create request with the timestamp field mapped as a date, over whatever else it carried. */
@@ -89,7 +92,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                     org.opensearch.common.xcontent.XContentType.JSON
                 ).v2()
             );
-            TemplateResolver.deepMerge(
+            TemplateResolver.mergeMappings(
                 merged,
                 org.opensearch.common.xcontent.XContentHelper.convertToMap(
                     new org.opensearch.core.common.bytes.BytesArray(create.mapping.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
@@ -142,7 +145,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                         org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.NAME,
                         new org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.Request(name),
                         () -> {
-                            create(channel, metadata, name);
+                            create(channel, serving, metadata, name);
                             return null;
                         }
                     );
@@ -178,7 +181,23 @@ public final class DataStreamHandler extends BaseRestHandler {
         });
     }
 
-    private void create(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name) throws IOException {
+    private void create(org.opensearch.rest.RestChannel channel, ServerlessNode serving, MetadataPlane metadata, String name)
+        throws IOException {
+        final String backing = backingIndexName(name, 1);
+        for (String minted : new String[] { name, backing }) {
+            if (serving.isSystemIndex(minted)) {
+                // A name a plugin declared as its own is reserved on every path that creates a name, not
+                // only on PUT /{index}: a stream created under it would resolve the plugin's own writes to a
+                // backing index nothing guards.
+                sendQuietly(
+                    channel,
+                    RestStatus.FORBIDDEN,
+                    "system_index",
+                    "[" + minted + "] belongs to a plugin and cannot be created here"
+                );
+                return;
+            }
+        }
         if (metadata.resolve(name).absent() == false) {
             sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "[" + name + "] already exists");
             return;
@@ -198,22 +217,37 @@ public final class DataStreamHandler extends BaseRestHandler {
             );
             return;
         }
-        final String backing = backingIndexName(name, 1);
         // The hint before the truth, as every alias creation does: the backing index lists the stream
         // before the stream's record exists, and a reader verifies the hint against the record.
+        //
+        // What the backing index inherits is what the *stream's* name matches -- the template that
+        // declared the stream -- handed in rather than resolved against ".ds-events-000001", which no
+        // pattern written for "events*" matches. Resolved against its own name, the backing index got
+        // one shard and only the timestamp mapped, whatever the template said.
         try {
             IndexAdminHandler.createIndex(
                 metadata,
                 backing,
-                withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), inherited.timestampField())
+                withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), inherited.timestampField()),
+                inherited
             );
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "index [" + backing + "] already exists");
+            return;
+        } catch (IndexAdminHandler.RefusedException e) {
+            sendQuietly(channel, e.status, e.type, e.getMessage());
             return;
         }
         try {
             metadata.createAlias(new AliasRecord(name, List.of(backing), true, 1L, inherited.timestampField()));
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
+            // The stream lost its name; the backing index made for it must not stay, or every later
+            // attempt to create the stream would find ".ds-<name>-000001" taken and the name unusable.
+            try {
+                metadata.deleteIndex(backing);
+            } catch (Exception cleanup) {
+                logger.warn("could not remove the backing index [" + backing + "] of a data stream that was not created", cleanup);
+            }
             sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "[" + name + "] already exists");
             return;
         }
@@ -269,14 +303,25 @@ public final class DataStreamHandler extends BaseRestHandler {
     }
 
     private void delete(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name) throws IOException {
-        final DescriptorStore.Resolution resolved = metadata.resolve(name);
-        if (resolved.alias() == null || resolved.alias().dataStream() == false) {
+        final Optional<MetadataPlane.AliasAtGeneration> found = metadata.aliasWithGeneration(name);
+        if (found.isEmpty() || found.get().alias().dataStream() == false) {
             sendQuietly(channel, RestStatus.NOT_FOUND, "resource_not_found_exception", "data stream [" + name + "] does not exist");
             return;
         }
-        // The name first, so a write arriving during the deletion has nowhere to land, then the indices.
-        metadata.deleteAlias(name);
-        for (String backing : resolved.alias().indices()) {
+        // The name first, so a write arriving during the deletion has nowhere to land, then the indices --
+        // and only the indices the record this deleted actually named. A rollover landing between the read
+        // and the delete used to leave a live record over deleted backing indices, with a 200 to the caller.
+        final AliasRecord record = found.get().alias();
+        if (metadata.deleteAlias(record, found.get().generation()) == false) {
+            sendQuietly(
+                channel,
+                RestStatus.CONFLICT,
+                "version_conflict_engine_exception",
+                "data stream [" + name + "] was changed concurrently; nothing was deleted, retry"
+            );
+            return;
+        }
+        for (String backing : record.indices()) {
             metadata.deleteIndex(backing);
         }
         acknowledge(channel);

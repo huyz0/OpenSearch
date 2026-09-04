@@ -34,10 +34,16 @@ import java.util.function.Supplier;
  * reason there is no way to list indices: enumerating a deployment is not an operation this system offers
  * on a request path (&sect;6.3). An alias is looked up by name, like everything else here.
  *
- * <p><b>Replacing an alias is a delete and a create.</b> Offering an in-place update would mean a
- * read-modify-write on a register that something may be resolving at the same moment, and the compare-and
- * -swap to make that safe is real machinery for an operation nobody performs in a loop. Saying so is better
- * than offering an update that quietly loses a concurrent one.
+ * <p><b>Replacing an alias wholesale is a delete and a create; changing its membership is a
+ * compare-and-swap.</b> Every add or remove reads the record and the register generation it sits at in one
+ * read, and writes back under that generation, so two callers changing one alias at the same time both land
+ * or one is told to retry -- never one silently overwriting the other. The generation and the value it
+ * protects come from the same read on purpose: read separately, a writer landing between the two hands
+ * this handler a fresh token for a stale value, and its swap succeeds over the other caller's change.
+ *
+ * <p><b>A data stream is not an alias here, even though it is stored as one.</b> Every mutation on this
+ * surface refuses a name that resolves to a data stream, in core's words, because rebuilding the record
+ * as a plain alias would silently take the stream's generation and timestamp field with it.
  */
 public final class AliasHandler extends BaseRestHandler {
 
@@ -295,7 +301,9 @@ public final class AliasHandler extends BaseRestHandler {
                     case GET -> read(channel, metadata, aliasName);
                     case HEAD -> {
                         // An existence check on a name: the same one register read a GET does, and no body.
-                        final boolean exists = metadata.resolve(aliasName).alias() != null;
+                        // A data stream is not an alias, so HEAD /_alias/{stream} is a 404 as it is in core.
+                        final var record = metadata.resolve(aliasName).alias();
+                        final boolean exists = record != null && record.dataStream() == false;
                         channel.sendResponse(new BytesRestResponse(exists ? RestStatus.OK : RestStatus.NOT_FOUND, "application/json", ""));
                     }
                     case DELETE -> delete(channel, metadata, aliasName);
@@ -412,9 +420,9 @@ public final class AliasHandler extends BaseRestHandler {
                 }
             }
         }
-        final String failure = swap(metadata, name, indices, adding);
+        final Refusal failure = swap(metadata, name, indices, adding);
         if (failure != null) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "alias_not_updated", failure));
+            channel.sendResponse(IndexAdminHandler.error(channel, failure.status(), failure.type(), failure.reason()));
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {
@@ -426,23 +434,43 @@ public final class AliasHandler extends BaseRestHandler {
         }
     }
 
+    /** A refusal, with the status and type the caller should see rather than one status for everything. */
+    private record Refusal(RestStatus status, String type, String reason) {
+    }
+
+    /** Core's refusal when an alias operation names a data stream. */
+    private static String dataStreamNotAlias(String name) {
+        return "The provided expression [" + name + "] matches a data stream, specify the corresponding concrete indices instead";
+    }
+
     /**
      * Applies one add-or-remove to an alias under a compare-and-swap, retrying a lost race.
+     *
+     * <p>The record and the generation it is swapped under come from one read; see the class comment for
+     * why two reads are not a token at all.
      *
      * @param metadata the metadata plane
      * @param name the alias
      * @param indices the indices to add or remove
      * @param adding whether to add or remove
-     * @return a failure to report, or null on success
+     * @return a refusal to report, or null on success
      * @throws IOException if the store cannot be read or written
      */
-    private String swap(MetadataPlane metadata, String name, List<String> indices, boolean adding) throws IOException {
+    private Refusal swap(MetadataPlane metadata, String name, List<String> indices, boolean adding) throws IOException {
         for (int attempt = 0; attempt < 4; attempt++) {
             final var resolved = metadata.resolve(name);
             if (resolved.index() != null) {
-                return "[" + name + "] is an index, not an alias; a name cannot be both";
+                return new Refusal(
+                    RestStatus.BAD_REQUEST,
+                    "invalid_alias_name_exception",
+                    "[" + name + "] is an index, not an alias; a name cannot be both"
+                );
             }
-            final List<String> now = new ArrayList<>(resolved.alias() == null ? List.of() : resolved.alias().indices());
+            final AliasRecord before = resolved.alias();
+            if (before != null && before.dataStream()) {
+                return new Refusal(RestStatus.BAD_REQUEST, "illegal_argument_exception", dataStreamNotAlias(name));
+            }
+            final List<String> now = new ArrayList<>(before == null ? List.of() : before.indices());
             for (String index : indices) {
                 if (adding) {
                     if (now.contains(index) == false) {
@@ -452,28 +480,37 @@ public final class AliasHandler extends BaseRestHandler {
                     now.remove(index);
                 }
             }
-            if (resolved.alias() == null) {
+            if (before == null) {
                 if (adding == false) {
-                    return "no such alias: " + name;
+                    return new Refusal(RestStatus.NOT_FOUND, "aliases_not_found_exception", "aliases [" + name + "] missing");
                 }
                 try {
-                    metadata.createAlias(new org.opensearch.serverless.cluster.AliasRecord(name, now));
+                    metadata.createAlias(new AliasRecord(name, now));
                     return null;
                 } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
                     continue; // somebody created it between the read and the write; re-read and merge
                 }
             }
-            if (now.isEmpty()) {
-                // The last index left. An alias over nothing is worse than no alias, so it goes.
-                metadata.deleteAlias(name);
-                return null;
+            if (now.equals(before.indices())) {
+                if (adding) {
+                    return null; // already named; nothing to swap
+                }
+                // Core's answer when a remove matched nothing: 404, not a silent 200 that reads as done.
+                return new Refusal(RestStatus.NOT_FOUND, "aliases_not_found_exception", "aliases [" + name + "] missing on " + indices);
             }
-            final long generation = metadata.aliasGeneration(name);
-            if (metadata.updateAlias(new org.opensearch.serverless.cluster.AliasRecord(name, now), generation).isPresent()) {
+            if (now.isEmpty()) {
+                // The last index left. An alias over nothing is worse than no alias, so it goes -- under the
+                // generation this read saw, so a concurrent add is a lost swap here rather than a lost add.
+                if (metadata.deleteAlias(before, resolved.generation())) {
+                    return null;
+                }
+                continue;
+            }
+            if (metadata.updateAlias(before, MetadataPlane.withIndices(before, now), resolved.generation()).isPresent()) {
                 return null;
             }
         }
-        return "[" + name + "] is being changed concurrently; retry";
+        return new Refusal(RestStatus.CONFLICT, "version_conflict_engine_exception", "[" + name + "] is being changed concurrently; retry");
     }
 
     /**
@@ -494,7 +531,10 @@ public final class AliasHandler extends BaseRestHandler {
         boolean bodyless
     ) throws IOException {
         final var resolved = metadata.resolve(name);
-        final boolean all = resolved.alias() != null && resolved.alias().indices().containsAll(indices);
+        // A data stream's backing indices are not "under an alias", so the answer for one is core's 404.
+        final boolean all = resolved.alias() != null
+            && resolved.alias().dataStream() == false
+            && resolved.alias().indices().containsAll(indices);
         if (bodyless) {
             channel.sendResponse(
                 new BytesRestResponse(all ? RestStatus.OK : RestStatus.NOT_FOUND, BytesRestResponse.TEXT_CONTENT_TYPE, "")
@@ -588,6 +628,20 @@ public final class AliasHandler extends BaseRestHandler {
                     channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", option));
                     return;
                 }
+                if ("remove_index".equals(entry.getKey())) {
+                    // Names no alias, so it is answered here rather than by the shape check below.
+                    channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_IMPLEMENTED,
+                            "unsupported_action",
+                            "remove_index is not supported here: it deletes an index inside an alias request, and index "
+                                + "deletion is its own compare-and-swap on the descriptor rather than part of the alias "
+                                + "swap, so the two could not be one atomic step. DELETE /{index} does the same thing"
+                        )
+                    );
+                    return;
+                }
                 // Both spellings core takes: one index or alias, or a list. A list used to be unread, so
                 // the action resolved to the literal string "null" and failed as a missing index.
                 final List<String> names = namesOf(detail.get("index"), detail.get("indices"));
@@ -609,7 +663,12 @@ public final class AliasHandler extends BaseRestHandler {
                         step.put("op", String.valueOf(entry.getKey()));
                         step.put("alias", aliasName);
                         step.put("index", name);
-                        step.put("must_exist", Boolean.TRUE.equals(detail.get("must_exist")));
+                        // Tri-state, as core reads it: unspecified means "404 if the whole request removed
+                        // nothing", true means "404 if this step removes nothing", false means silence.
+                        step.put(
+                            "must_exist",
+                            detail.get("must_exist") == null ? null : Boolean.valueOf(String.valueOf(detail.get("must_exist")))
+                        );
                         steps.add(step);
                     }
                     aliases.add(aliasName);
@@ -645,7 +704,19 @@ public final class AliasHandler extends BaseRestHandler {
                 );
                 return;
             }
-            final List<String> now = new ArrayList<>(resolved.alias() == null ? List.of() : resolved.alias().indices());
+            final AliasRecord before = resolved.alias();
+            if (before != null && before.dataStream()) {
+                // Core's refusal, in core's words. Rebuilding the record here would have turned the stream
+                // into a plain alias: no generation, no timestamp field, no write index, and a 200.
+                channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", dataStreamNotAlias(alias))
+                );
+                return;
+            }
+            final List<String> now = new ArrayList<>(before == null ? List.of() : before.indices());
+            // Whether any remove found what it named, for core's rule that a request removing nothing is a 404.
+            boolean removedSomething = false;
+            boolean removing = false;
             for (java.util.Map<String, Object> step : steps) {
                 final String index = String.valueOf(step.get("index"));
                 if ("add".equals(step.get("op"))) {
@@ -675,7 +746,10 @@ public final class AliasHandler extends BaseRestHandler {
                         now.add(index);
                     }
                 } else if ("remove".equals(step.get("op"))) {
-                    if (now.contains(index) == false && Boolean.TRUE.equals(step.get("must_exist"))) {
+                    removing = true;
+                    if (now.remove(index)) {
+                        removedSomething = true;
+                    } else if (Boolean.TRUE.equals(step.get("must_exist"))) {
                         // must_exist is the caller saying a silent no-op would be a mistake, which is the
                         // default position of everything else on this surface.
                         channel.sendResponse(
@@ -688,7 +762,18 @@ public final class AliasHandler extends BaseRestHandler {
                         );
                         return;
                     }
-                    now.remove(index);
+                } else if ("remove_index".equals(step.get("op"))) {
+                    channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_IMPLEMENTED,
+                            "unsupported_action",
+                            "remove_index is not supported here: it deletes an index inside an alias request, and index "
+                                + "deletion is its own compare-and-swap on the descriptor rather than part of the alias "
+                                + "swap, so the two could not be one atomic step. DELETE /{index} does the same thing"
+                        )
+                    );
+                    return;
                 } else {
                     channel.sendResponse(
                         IndexAdminHandler.error(
@@ -701,37 +786,49 @@ public final class AliasHandler extends BaseRestHandler {
                     return;
                 }
             }
-
-            final boolean applied;
-            if (resolved.alias() == null) {
-                if (now.isEmpty()) {
+            if (removing && removedSomething == false && now.equals(before == null ? List.of() : before.indices())) {
+                // Core's default when must_exist is unspecified and the request removed nothing at all:
+                // aliases_not_found_exception, because a 200 would report a removal that did not happen. A
+                // step that said must_exist=false asked for silence and gets it -- only the wholly silent
+                // request is refused.
+                boolean silenced = false;
+                for (java.util.Map<String, Object> step : steps) {
+                    silenced |= Boolean.FALSE.equals(step.get("must_exist"));
+                }
+                if (silenced == false) {
                     channel.sendResponse(
-                        IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "alias_not_found", "no such alias: " + alias)
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_FOUND,
+                            "aliases_not_found_exception",
+                            "aliases [" + alias + "] missing"
+                        )
                     );
                     return;
                 }
+            }
+
+            final boolean applied;
+            if (before == null) {
+                if (now.isEmpty()) {
+                    acknowledge(channel);
+                    return;
+                }
                 try {
-                    metadata.createAlias(new org.opensearch.serverless.cluster.AliasRecord(alias, now));
+                    metadata.createAlias(new AliasRecord(alias, now));
                     applied = true;
                 } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
                     continue;
                 }
+            } else if (now.equals(before.indices())) {
+                applied = true; // nothing to swap: the record already says this
             } else if (now.isEmpty()) {
-                metadata.deleteAlias(alias);
-                applied = true;
+                applied = metadata.deleteAlias(before, resolved.generation());
             } else {
-                applied = metadata.updateAlias(
-                    new org.opensearch.serverless.cluster.AliasRecord(alias, now),
-                    metadata.aliasGeneration(alias)
-                ).isPresent();
+                applied = metadata.updateAlias(before, MetadataPlane.withIndices(before, now), resolved.generation()).isPresent();
             }
             if (applied) {
-                try (XContentBuilder builder = channel.newBuilder()) {
-                    builder.startObject();
-                    builder.field("acknowledged", true);
-                    builder.endObject();
-                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-                }
+                acknowledge(channel);
                 return;
             }
         }
@@ -791,15 +888,28 @@ public final class AliasHandler extends BaseRestHandler {
         }
     }
 
+    private static void acknowledge(org.opensearch.rest.RestChannel channel) throws IOException {
+        try (XContentBuilder builder = channel.newBuilder()) {
+            builder.startObject();
+            builder.field("acknowledged", true);
+            builder.endObject();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        }
+    }
+
     private void read(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name) throws IOException {
         final var resolved = metadata.resolve(name);
-        if (resolved.alias() == null) {
+        if (resolved.alias() == null || resolved.alias().dataStream()) {
+            // A data stream is not an alias, and rendering it as one -- backing indices keyed as if a
+            // caller had aliased them -- would tell a client it can be managed through this API.
             channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
                     RestStatus.NOT_FOUND,
                     "alias_not_found",
-                    resolved.index() != null ? "[" + name + "] is an index, not an alias" : "no such alias: " + name
+                    resolved.index() != null ? "[" + name + "] is an index, not an alias"
+                        : resolved.alias() != null ? "[" + name + "] is a data stream, not an alias; GET /_data_stream/" + name
+                        : "no such alias: " + name
                 )
             );
             return;
@@ -843,8 +953,33 @@ public final class AliasHandler extends BaseRestHandler {
     }
 
     private void delete(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name) throws IOException {
-        if (metadata.deleteAlias(name) == false) {
+        final var found = metadata.aliasWithGeneration(name);
+        if (found.isEmpty()) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "alias_not_found", "no such alias: " + name));
+            return;
+        }
+        if (found.get().alias().dataStream()) {
+            // Deleting the record and leaving the backing indices would strand them under names nothing
+            // resolves; the data-stream API deletes both, and is the one that knows to.
+            channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "[" + name + "] is a data stream, not an alias; DELETE /_data_stream/" + name + " removes it and its backing indices"
+                )
+            );
+            return;
+        }
+        if (metadata.deleteAlias(found.get().alias(), found.get().generation()) == false) {
+            channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.CONFLICT,
+                    "version_conflict_engine_exception",
+                    "[" + name + "] is being changed concurrently; retry"
+                )
+            );
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {

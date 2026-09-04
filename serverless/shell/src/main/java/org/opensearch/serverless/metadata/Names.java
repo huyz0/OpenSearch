@@ -61,6 +61,25 @@ public final class Names {
     }
 
     /**
+     * Reports whether a name could be an index or alias here, without throwing.
+     *
+     * <p>For a caller walking names it did not mint — a node's assignments container, a listing — where a
+     * stray object must be stepped over rather than abort the walk. A request naming an index still goes
+     * through {@link #validateIndexOrAlias}, which says what is wrong with it.
+     *
+     * @param name the name
+     * @return true if {@link #validateIndexOrAlias} would accept it
+     */
+    public static boolean isValidIndexOrAlias(String name) {
+        try {
+            validateIndexOrAlias(name);
+            return true;
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    /**
      * Refuses a name that cannot be a template, pipeline, script, repository or snapshot here.
      *
      * <p>Looser than an index name -- core allows uppercase and most punctuation in these -- but never a

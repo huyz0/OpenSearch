@@ -204,13 +204,17 @@ public final class ShardHeadStore {
         if (nodeId.equals(current.ownerNodeId()) == false) {
             return Optional.empty();
         }
+        // The uuid travels with the head through a renewal. Dropping it would disable the incarnation
+        // check for every later acquirer: a same-name index created after this one was deleted could
+        // not tell this owner from a live one of its own.
         final ShardHead renewed = new ShardHead(
             indexName,
             shardId,
             current.term(),
             nodeId,
             current.ownerEphemeralId(),
-            clock.getAsLong() + leaseTtlMillis
+            clock.getAsLong() + leaseTtlMillis,
+            current.indexUuid()
         );
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), renewed.toBytes());
         return result.applied() ? Optional.of(renewed) : Optional.empty();
@@ -226,6 +230,26 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or written
      */
     public boolean release(String indexName, int shardId, String nodeId) throws IOException {
+        return release(indexName, shardId, nodeId, -1L);
+    }
+
+    /**
+     * Gives up ownership, but only of the term the caller thinks it holds.
+     *
+     * <p>For a release that is deferred -- a node that lost the shard to its own lapsed lease and could
+     * not reach the store to say so -- and retried later. By then this same node may have re-acquired
+     * the shard at a higher term, and a release keyed on node id alone would give away a head it now
+     * legitimately holds. The term is what tells the two apart.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param nodeId the node giving up ownership
+     * @param expectedTerm the term the caller lost the shard at, or a negative number to release whatever
+     *        term this node holds
+     * @return true if this node owned it at that term and released it
+     * @throws IOException if the register cannot be read or written
+     */
+    public boolean release(String indexName, int shardId, String nodeId, long expectedTerm) throws IOException {
         final String name = RegisterMap.shardHeadBlob(indexName, shardId);
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
@@ -238,7 +262,12 @@ public final class ShardHeadStore {
         if (nodeId.equals(current.ownerNodeId()) == false) {
             return false;
         }
-        final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L);
+        if (expectedTerm >= 0L && current.term() != expectedTerm) {
+            return false;
+        }
+        // Unowned, but still this incarnation's: the uuid is kept so the next acquirer of a recreated
+        // index sees a head from the previous one and overwrites it, exactly as it would an owned one.
+        final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L, current.indexUuid());
         return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied();
     }
 

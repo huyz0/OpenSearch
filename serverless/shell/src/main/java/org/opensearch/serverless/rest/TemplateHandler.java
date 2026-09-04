@@ -226,6 +226,45 @@ public final class TemplateHandler extends BaseRestHandler {
             sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", "data_stream must be an object");
             return;
         }
+        if (parsed.get("template") instanceof Map<?, ?> template && template.get("settings") != null) {
+            // The settings a template contributes are validated the way a create request's are, in every
+            // spelling core accepts, so a value core cannot parse is refused here rather than stored and
+            // failing the first index that inherits it. Replicas above zero and the pipeline settings are
+            // refused for the reasons a create refuses them.
+            if ((template.get("settings") instanceof Map<?, ?>) == false) {
+                sendQuietly(channel, RestStatus.BAD_REQUEST, "malformed_body", "template.settings must be an object");
+                return;
+            }
+            final org.opensearch.common.settings.Settings settings;
+            try {
+                @SuppressWarnings("unchecked")
+                final Map<String, Object> raw = (Map<String, Object>) template.get("settings");
+                settings = org.opensearch.common.settings.Settings.builder()
+                    .loadFromMap(raw)
+                    .normalizePrefix(org.opensearch.cluster.metadata.IndexMetadata.INDEX_SETTING_PREFIX)
+                    .build();
+            } catch (Exception e) {
+                sendQuietly(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not read template.settings: " + e.getMessage());
+                return;
+            }
+            final String replicas = settings.get(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
+            if (replicas != null && "0".equals(replicas) == false) {
+                sendQuietly(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_setting",
+                    "number_of_replicas is not supported: a shard has one writer and its durability comes from the "
+                        + "object store, not from replica copies"
+                );
+                return;
+            }
+            try {
+                IndexAdminHandler.validateIndexSettings(settings, false);
+            } catch (IndexAdminHandler.RefusedException e) {
+                sendQuietly(channel, e.status, e.type, e.getMessage());
+                return;
+            }
+        }
         if (create && store.get(name).isPresent()) {
             // create=true is "add, do not replace", and replacing would be exactly what it asked not to do.
             sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", "template [" + name + "] already exists");

@@ -36,7 +36,16 @@ public final class ControlPlaneAbsence {
         "org.opensearch.cluster.coordination.Coordinator",
         "org.opensearch.cluster.routing.allocation.AllocationService",
         "org.opensearch.gateway.GatewayMetaState",
-        "org.opensearch.node.Node"
+        "org.opensearch.node.Node",
+        // The rest of §6.2's "never constructed" list. MetaStateService was constructed for real for a
+        // long time because IndicesService wants one; a no-op subclass satisfies it and is what the
+        // section asks for, and this scan would not have noticed the real one.
+        "org.opensearch.gateway.MetaStateService",
+        "org.opensearch.gateway.PersistedClusterStateService",
+        "org.opensearch.node.NodeService",
+        "org.opensearch.cluster.coordination.JoinHelper",
+        "org.opensearch.discovery.DiscoveryModule",
+        "org.opensearch.common.inject.Injector"
     );
 
     private ControlPlaneAbsence() {}

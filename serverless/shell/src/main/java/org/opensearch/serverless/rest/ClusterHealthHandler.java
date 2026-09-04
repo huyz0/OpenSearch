@@ -94,7 +94,71 @@ public final class ClusterHealthHandler extends BaseRestHandler {
     }
 
     /** What a health request asked for, after reading it. */
-    private record Ask(List<String> indices, String waitForStatus, Integer waitForNodes, TimeValue timeout, boolean perShard) {
+    private record Ask(List<String> indices, String waitForStatus, NodeCondition waitForNodes, TimeValue timeout, boolean perShard) {
+    }
+
+    /**
+     * A {@code wait_for_nodes} condition, in core's grammar: {@code N}, {@code >=N}, {@code >N}, {@code <=N},
+     * {@code <N}, {@code ge(N)}, {@code gt(N)}, {@code le(N)}, {@code lt(N)}.
+     *
+     * <p>This used to strip everything but the digits, so {@code <3} and {@code lt(3)} meant {@code >=3}: a
+     * caller waiting for a fleet to shrink blocked until the timeout and was then told, with a 200, that it
+     * had. A bare number means exactly that many, as it does in core.
+     */
+    record NodeCondition(String operator, int count) {
+        static NodeCondition parse(String text) {
+            final String trimmed = text.trim();
+            final String operator;
+            final String number;
+            if (trimmed.startsWith(">=")) {
+                operator = ">=";
+                number = trimmed.substring(2);
+            } else if (trimmed.startsWith("<=")) {
+                operator = "<=";
+                number = trimmed.substring(2);
+            } else if (trimmed.startsWith(">")) {
+                operator = ">";
+                number = trimmed.substring(1);
+            } else if (trimmed.startsWith("<")) {
+                operator = "<";
+                number = trimmed.substring(1);
+            } else if (trimmed.startsWith("ge(") && trimmed.endsWith(")")) {
+                operator = ">=";
+                number = trimmed.substring(3, trimmed.length() - 1);
+            } else if (trimmed.startsWith("gt(") && trimmed.endsWith(")")) {
+                operator = ">";
+                number = trimmed.substring(3, trimmed.length() - 1);
+            } else if (trimmed.startsWith("le(") && trimmed.endsWith(")")) {
+                operator = "<=";
+                number = trimmed.substring(3, trimmed.length() - 1);
+            } else if (trimmed.startsWith("lt(") && trimmed.endsWith(")")) {
+                operator = "<";
+                number = trimmed.substring(3, trimmed.length() - 1);
+            } else {
+                operator = "=";
+                number = trimmed;
+            }
+            try {
+                return new NodeCondition(operator, Integer.parseInt(number.trim()));
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+
+        boolean satisfiedBy(int nodes) {
+            switch (operator) {
+                case ">=":
+                    return nodes >= count;
+                case ">":
+                    return nodes > count;
+                case "<=":
+                    return nodes <= count;
+                case "<":
+                    return nodes < count;
+                default:
+                    return nodes == count;
+            }
+        }
     }
 
     @Override
@@ -139,16 +203,21 @@ public final class ClusterHealthHandler extends BaseRestHandler {
             );
         }
 
-        Integer nodesWanted = null;
+        NodeCondition nodesWanted = null;
         if (waitForNodes != null) {
-            // ">=3", "3" and "ge(3)" all mean the same thing to a client waiting for a fleet to come up.
-            final String digits = waitForNodes.replaceAll("[^0-9]", "");
-            if (digits.isEmpty()) {
+            nodesWanted = NodeCondition.parse(waitForNodes);
+            if (nodesWanted == null) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "invalid_parameter", "wait_for_nodes must contain a number")
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.BAD_REQUEST,
+                        "invalid_parameter",
+                        "wait_for_nodes must be a number, or one of >=N, >N, <=N, <N, ge(N), gt(N), le(N), lt(N); got ["
+                            + waitForNodes
+                            + "]"
+                    )
                 );
             }
-            nodesWanted = Integer.parseInt(digits);
         }
 
         final MetadataPlane metadata = plane.get();
@@ -165,6 +234,22 @@ public final class ClusterHealthHandler extends BaseRestHandler {
                     indices.add(name.trim());
                 }
             }
+        }
+        if (indices.isEmpty() && waitForStatus != null) {
+            // The unscoped form examines no shard, so its status is a statement about the control plane
+            // and nothing else; waiting for it to be green would be waiting for a claim about shards that
+            // nobody has looked at -- the confident partial answer this surface refuses to give a search,
+            // and there is no reason health gets to give it. A caller who wants green over shards names
+            // the index whose shards they mean.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "unscoped_wait_for_status",
+                    "wait_for_status needs an index: GET /_cluster/health examines no shard, so there is no shard status to wait for; "
+                        + "ask /_cluster/health/{index}, or wait_for_nodes for the fleet"
+                )
+            );
         }
         final Ask ask = new Ask(indices, waitForStatus, nodesWanted, timeout, "shards".equals(level));
 
@@ -191,6 +276,17 @@ public final class ClusterHealthHandler extends BaseRestHandler {
             }
             render(channel, health, ask);
         });
+    }
+
+    /**
+     * The status a health answer travels under: core's 408 when a wait ran out, else 200.
+     *
+     * <p>A readiness script that does {@code curl -f ...?wait_for_nodes=3&timeout=30s} reads the status
+     * code and nothing else; a 200 whose body said {@code timed_out: true} passed such a script on a
+     * two-node fleet. Core answers 408 for exactly this reason.
+     */
+    private static RestStatus statusOf(Health health, Ask ask) {
+        return satisfied(health, ask) ? RestStatus.OK : RestStatus.REQUEST_TIMEOUT;
     }
 
     private static String refuse(
@@ -266,7 +362,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
         if (health.missing != null) {
             return true;
         }
-        if (ask.waitForNodes() != null && health.nodes < ask.waitForNodes()) {
+        if (ask.waitForNodes() != null && ask.waitForNodes().satisfiedBy(health.nodes) == false) {
             return false;
         }
         // green satisfies a wait for yellow as well as for green, because green is strictly better and
@@ -289,8 +385,23 @@ public final class ClusterHealthHandler extends BaseRestHandler {
         }
 
         final long now = metadata.clock().getAsLong();
+        // Whether each owner named by a head is alive, asked once per owner per answer rather than once
+        // per shard: an index whose thousand shards one node holds costs one lease read, not a thousand.
+        final Map<String, Boolean> ownersAlive = new java.util.HashMap<>();
         for (String index : ask.indices()) {
-            final Optional<IndexDescriptor> descriptor = metadata.describe(index);
+            final Optional<IndexDescriptor> descriptor;
+            try {
+                descriptor = metadata.describe(index);
+            } catch (Exception e) {
+                // The same rule a head read gets: a control plane that cannot be read is the red that
+                // matters here, reported rather than thrown, because a health endpoint answering 500 when
+                // things are unhealthy is the one shape it must not have.
+                final IndexHealth unreadable = new IndexHealth();
+                unreadable.status = "red";
+                health.indices.put(index, unreadable);
+                health.status = "red";
+                continue;
+            }
             if (descriptor.isEmpty()) {
                 health.missing = index;
                 return health;
@@ -301,7 +412,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
                 String state;
                 try {
                     final var head = metadata.heads().read(index, shard);
-                    if (head.isEmpty() || head.get().ownerNodeId() == null || head.get().leaseExpiresAtMillis() <= now) {
+                    if (head.isEmpty() || head.get().ownerNodeId() == null || held(metadata, head.get(), now, ownersAlive) == false) {
                         // Dormant, not unassigned. "Unassigned" in classic means allocation failed and
                         // nobody can serve this; here it means nobody is writing to it right now, and the
                         // next write activates it. Reporting it as unassigned would be the inverse lie --
@@ -332,11 +443,38 @@ public final class ClusterHealthHandler extends BaseRestHandler {
         return health;
     }
 
+    /**
+     * Whether a head's owner still holds it, by the liveness rule the rest of the shell uses.
+     *
+     * <p>The head's own stamp is a floor that is never renewed -- one lease renewal covers every shard a
+     * node holds, which is the whole saving of batched liveness -- so a shard an active writer has held
+     * for longer than one TTL has a stamp in the past and a live owner. Classifying on the stamp alone
+     * reported every such shard as dormant thirty seconds after activation, and an autoscaler reading
+     * {@code dormant_shards} would have concluded a busy index had scaled to zero.
+     */
+    private static boolean held(
+        MetadataPlane metadata,
+        org.opensearch.serverless.metadata.ShardHead head,
+        long now,
+        Map<String, Boolean> ownersAlive
+    ) {
+        if (head.isHeldAt(now)) {
+            return true;
+        }
+        return ownersAlive.computeIfAbsent(head.ownerNodeId() + "/" + head.ownerEphemeralId(), owner -> metadata.heads().isHeld(head, now));
+    }
+
     private void render(org.opensearch.rest.RestChannel channel, Health health, Ask ask) throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.field("cluster_name", clusterName());
             builder.field("status", health.status);
+            if (health.indices.isEmpty()) {
+                // What the status above is a statement about. Without an index no shard was examined, so
+                // green here means "this node can read the control plane and count the fleet" and must
+                // not be read as a claim about shards; the field says so where a client will see it.
+                builder.field("status_scope", "control_plane");
+            }
             builder.field("timed_out", satisfied(health, ask) == false);
             builder.field("number_of_nodes", health.nodes);
             // There is no cluster manager to discover; core's field, with the value that is true here.
@@ -405,7 +543,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
                 builder.endObject();
             }
             builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            channel.sendResponse(new BytesRestResponse(statusOf(health, ask), builder));
         }
     }
 

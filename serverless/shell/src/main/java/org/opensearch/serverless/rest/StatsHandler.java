@@ -8,16 +8,22 @@
 
 package org.opensearch.serverless.rest;
 
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.store.ObjectStores;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -35,21 +41,39 @@ import java.util.function.Supplier;
  * node has been near its limit for an hour or was hit by one enormous request. These are the numbers behind
  * those refusals.
  *
+ * <p><b>And what it costs.</b> The object store is priced per request, and the RFC treats request counts
+ * as service levels from day one; until now the only counter lived in the test kit, so a deployment could
+ * not see its own bill forming. The store's counters, the block cache's, the scheduler's and this node's
+ * own lease are reported here from memory: nothing below reads the object store to describe it.
+ *
  * <p><b>Counters, not a diagnosis.</b> Nothing here is derived, thresholded or averaged. A number that has
  * been through a formula is a number whose formula becomes the thing you have to understand before you can
- * trust it, and every one of these has a meaning an operator already knows.
+ * trust it, and every one of these has a meaning an operator already knows. The one exception is
+ * {@code implied_s3_requests}, which is labelled as the estimate it is.
  */
 public final class StatsHandler extends BaseRestHandler {
 
     private final Supplier<ServerlessNode> node;
+    private final Supplier<MetadataPlane> plane;
+
+    /**
+     * Creates the handler without a metadata plane; the store, scheduler and lease sections are then absent.
+     *
+     * @param node supplies the node being asked about
+     */
+    public StatsHandler(Supplier<ServerlessNode> node) {
+        this(node, () -> null);
+    }
 
     /**
      * Creates the handler.
      *
      * @param node supplies the node being asked about
+     * @param plane supplies the metadata plane, for the object store's counters and this node's lease
      */
-    public StatsHandler(Supplier<ServerlessNode> node) {
+    public StatsHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
         this.node = node;
+        this.plane = plane;
     }
 
     @Override
@@ -65,6 +89,7 @@ public final class StatsHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final ServerlessNode serving = node.get();
+        final MetadataPlane metadata = plane.get();
         return channel -> {
             try (XContentBuilder builder = channel.newBuilder()) {
                 builder.startObject();
@@ -74,16 +99,28 @@ public final class StatsHandler extends BaseRestHandler {
                 // What it is serving, split the way the design splits it: a writer holds a shard-head and
                 // can accept writes, a reader holds a commit and cannot. Reporting one number for both
                 // would hide the distinction the whole architecture turns on.
-                final var open = serving.reconciler().openShards();
-                final var readers = serving.reconciler().readerShards();
+                final Set<ShardId> open = serving.reconciler().openShards();
+                final Set<ShardId> frozen = serving.reconciler().frozenShards();
+                // A frozen view is a reader the reconciler keeps in its reader set and leaves out of its
+                // open set, so "open minus readers" went to zero with one writer and one view open, and
+                // negative with two views and none. Counted directly instead: a writer is an open shard
+                // that is not a reader, and a reader is a reader that is not a view.
+                final Set<ShardId> readers = new java.util.HashSet<>(serving.reconciler().readerShards());
+                readers.removeAll(frozen);
+                long writers = 0;
+                for (ShardId shard : open) {
+                    if (readers.contains(shard) == false) {
+                        writers++;
+                    }
+                }
                 builder.startObject("shards");
                 builder.field("open", open.size());
                 builder.field("readers", readers.size());
-                builder.field("writers", open.size() - readers.size());
+                builder.field("writers", writers);
                 // Counted apart from both: a frozen view is a reader that no policy will take away, so
                 // folding it into the reader count would make a node look like it had readers it could
                 // shed.
-                builder.field("frozen_views", serving.reconciler().frozenShards().size());
+                builder.field("frozen_views", frozen.size());
                 builder.endObject();
 
                 builder.startArray("roles");
@@ -116,9 +153,124 @@ public final class StatsHandler extends BaseRestHandler {
                 builder.field("rejections", pressure.getCoordinatingRejections());
                 builder.endObject();
 
+                objectStore(builder, metadata);
+                blockCache(builder, serving);
+                scheduler(builder, serving);
+                lease(builder, serving, metadata);
+                heldShards(builder, serving, readers, frozen);
+
                 builder.endObject();
                 channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
             }
         };
+    }
+
+    /** The object store's request counters since this node started, when the store is the metered one. */
+    private static void objectStore(XContentBuilder builder, MetadataPlane metadata) throws IOException {
+        builder.startObject("object_store");
+        final ObjectStores.Metered metered = metadata != null && metadata.blobStore() instanceof ObjectStores.Metered counted
+            ? counted
+            : null;
+        if (metered == null) {
+            // Said rather than reported as zeros: a zero would be a claim that no request was made.
+            builder.field("metered", false);
+            builder.endObject();
+            return;
+        }
+        builder.field("metered", true);
+        builder.field("register_reads", metered.registerReads());
+        builder.field("register_cas", metered.registerWrites());
+        builder.field("blob_reads", metered.blobReads());
+        builder.field("blob_writes", metered.blobWrites());
+        builder.field("listings", metered.listings());
+        builder.field("deletes", metered.deletes());
+        builder.field("bytes_read", metered.bytesRead());
+        builder.field("bytes_written", metered.bytesWritten());
+        builder.field("errors", metered.errors());
+        // An estimate, labelled as one: a compare-and-swap is one call here and two requests on S3.
+        builder.field("implied_s3_requests", metered.impliedS3Requests());
+        builder.endObject();
+    }
+
+    /** The block cache's hit rate and what it has actually pulled from the store. */
+    private static void blockCache(XContentBuilder builder, ServerlessNode serving) throws IOException {
+        final var cache = serving.blockCache();
+        builder.startObject("block_cache");
+        builder.field("hits", cache.hits());
+        builder.field("misses", cache.misses());
+        builder.field("bytes_fetched", cache.bytesFetched());
+        builder.endObject();
+    }
+
+    /** What the three drivers have done, when a scheduler is driving this node. */
+    private static void scheduler(XContentBuilder builder, ServerlessNode serving) throws IOException {
+        if (serving.signals() instanceof org.opensearch.serverless.reconcile.ReconcileScheduler scheduler) {
+            final var counts = scheduler.counts();
+            builder.startObject("scheduler");
+            builder.field("renewals", counts.renewals());
+            builder.field("publishes", counts.publishes());
+            builder.field("activations", counts.activations());
+            builder.field("backstops", counts.backstops());
+            builder.endObject();
+        }
+    }
+
+    /**
+     * This node's own lease, from the membership snapshot it already holds.
+     *
+     * <p>The number an operator needs before shards vanish: a lease that is about to lapse under a healthy
+     * node is a renewal that is taking too long, and it is invisible until the peers start stealing.
+     */
+    private static void lease(XContentBuilder builder, ServerlessNode serving, MetadataPlane metadata) throws IOException {
+        if (metadata == null) {
+            return;
+        }
+        final long now = metadata.clock().getAsLong();
+        builder.startObject("lease");
+        builder.field("valid_now", metadata.membership().selfLeaseValidAt(now));
+        final String self = serving.localNode().getId();
+        for (var lease : metadata.membership().current()) {
+            if (self.equals(lease.nodeId())) {
+                builder.field("expires_at_millis", lease.expiresAtMillis());
+                builder.field("expires_in_millis", lease.expiresAtMillis() - now);
+            }
+        }
+        builder.field("ttl_millis", metadata.leaseTtlMillis());
+        builder.field("known_nodes", metadata.membership().current().size());
+        builder.endObject();
+    }
+
+    /**
+     * Every shard this node holds, one line each: which, as what, at what term, how far it has written,
+     * and when it was last asked for anything. The per-node list the fleet-wide view deliberately does
+     * not offer, and it is cheap because it is read from memory.
+     */
+    private static void heldShards(XContentBuilder builder, ServerlessNode serving, Set<ShardId> readers, Set<ShardId> frozen)
+        throws IOException {
+        final List<ShardId> held = new ArrayList<>(serving.reconciler().heldShards());
+        held.sort(Comparator.comparing(ShardId::getIndexName).thenComparing(s -> s.getIndex().getUUID()).thenComparingInt(ShardId::id));
+        builder.startArray("held_shards");
+        for (ShardId shard : held) {
+            builder.startObject();
+            builder.field("index", shard.getIndexName());
+            builder.field("uuid", shard.getIndex().getUUID());
+            builder.field("shard", shard.id());
+            builder.field("kind", frozen.contains(shard) ? "frozen_view" : readers.contains(shard) ? "reader" : "writer");
+            final var opened = serving.reconciler().shard(shard);
+            if (opened != null) {
+                try {
+                    builder.field("term", opened.getOperationPrimaryTerm());
+                    builder.field("max_seq_no", opened.seqNoStats().getMaxSeqNo());
+                } catch (Exception e) {
+                    // Closing under us. The line still names the shard; the numbers are simply absent.
+                }
+            }
+            final var lastUsed = serving.reconciler().lastUsed(shard);
+            if (lastUsed.isPresent()) {
+                builder.field("last_used_millis", lastUsed.getAsLong());
+            }
+            builder.endObject();
+        }
+        builder.endArray();
     }
 }
