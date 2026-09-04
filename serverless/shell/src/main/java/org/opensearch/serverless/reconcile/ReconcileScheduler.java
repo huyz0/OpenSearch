@@ -293,6 +293,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         publishes.incrementAndGet();
         try {
             final var published = loop.publishDirty();
+            loop.noteForSweep(published);
             final var fenced = loop.drainFenced();
             if (fenced.isEmpty() == false) {
                 ownershipDoubted(fenced.iterator().next().getIndexName(), fenced.iterator().next().id());

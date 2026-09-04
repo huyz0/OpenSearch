@@ -28,6 +28,11 @@ dependencies {
   // loading modules, not about adding an endpoint"; M57 made that decision by choosing painless the way the
   // transport had always been chosen, so this is that decision applied a third time rather than a new one.
   implementation project(':modules:ingest-common')
+  // Mustache for search templates and rank-eval templates, rank-eval for its metrics, and the common
+  // search-pipeline processors -- each chosen by name, the same decision as painless and ingest-common.
+  implementation project(':modules:lang-mustache')
+  implementation project(':modules:rank-eval')
+  implementation project(':modules:search-pipeline-common')
   // Object storage. Used through RepositoryPlugin#getRepositories, the supported API, rather than by
   // reaching into the plugin's package-private constructors -- which is what the R11 test harness had to
   // do and is not something production code should copy.

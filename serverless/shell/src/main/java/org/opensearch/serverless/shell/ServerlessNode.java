@@ -89,6 +89,9 @@ import static java.util.Collections.emptyMap;
  */
 public final class ServerlessNode implements Closeable {
 
+    /** The pool fanned-out shard work runs on; see the thread pool's construction for why it is separate. */
+    public static final String FANOUT_POOL = "serverless_fanout";
+
     private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(ServerlessNode.class);
 
     /** Accepts writer activation: takes ownership of shards and indexes into them. */
@@ -187,7 +190,20 @@ public final class ServerlessNode implements Closeable {
         final Environment environment = new Environment(settings, null);
         final ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
 
-        this.threadPool = new ThreadPool(settings);
+        // A pool of its own for fanned-out shard work. The coordinator of a search waits on GENERIC for
+        // its shard tasks; when those tasks also ran on GENERIC, enough concurrent searches parked every
+        // thread waiting for tasks no thread was free to run. A forwarded search handler ran on SEARCH and
+        // blocked on the query phase forked to SEARCH, with the same shape. Both now run here, and this
+        // pool waits on nothing that runs on it.
+        this.threadPool = new ThreadPool(
+            settings,
+            new org.opensearch.threadpool.ScalingExecutorBuilder(
+                FANOUT_POOL,
+                1,
+                Math.max(8, 4 * org.opensearch.common.util.concurrent.OpenSearchExecutors.allocatedProcessors(settings)),
+                org.opensearch.common.unit.TimeValue.timeValueSeconds(30)
+            )
+        );
         boolean success = false;
         NodeEnvironment openedEnvironment = null;
         try {
@@ -426,7 +442,11 @@ public final class ServerlessNode implements Closeable {
             analysisRegistry,
             new IndexNameExpressionResolver(new ThreadContext(settings)),
             new IndicesModule(this.plugins.filter(org.opensearch.plugins.MapperPlugin.class)).getMapperRegistry(),
-            new NamedWriteableRegistry(Collections.emptyList()),
+            // The search module's writeables, not an empty registry. The shard request cache stores a
+            // query result serialised and reads it back through this registry on a hit -- so with an empty
+            // one, the second identical size:0 aggregation on a shard failed with "Unknown NamedWriteable
+            // category [AggregationBuilder]" while the first succeeded, which reads as a flaky server.
+            namedWriteableRegistry(),
             threadPool,
             indexScopedSettings(),
             circuitBreakerService(),
@@ -682,7 +702,8 @@ public final class ServerlessNode implements Closeable {
             plane.blobStore(),
             shardBase,
             blockCache,
-            indexName + "#" + shardNumber
+            // The uuid, not the name: a recreated index reuses its name and none of its bytes.
+            storageUuidOf(indexSettings) + "#" + shardNumber
         );
     }
 
@@ -761,7 +782,7 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DeleteByQueryHandler(() -> this, () -> metadataPlane)));
         // Snapshot/restore, backed by this deployment's own object store rather than a distinct
@@ -791,6 +812,16 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.TemplateHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PipelineHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StoredScriptHandler(() -> metadataPlane, () -> this)));
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.SearchPipelineHandler(() -> metadataPlane, () -> this))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.SearchTemplateHandler(() -> this, () -> metadataPlane))
+        );
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RankEvalHandler(() -> this, () -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RolloverHandler(() -> this, () -> metadataPlane)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DataStreamHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(
             guarded.apply(new org.opensearch.serverless.rest.ValidateAndResolveHandler(() -> metadataPlane, () -> this))
         );
@@ -927,15 +958,6 @@ public final class ServerlessNode implements Closeable {
                 "/_search/scroll",
                 "scroll holds a search context open on a node; use a point in time (POST /{index}/_pit) with "
                     + "search_after, which is held in the object store and is not tied to one node" },
-            {
-                "/_scripts/{id}",
-                // The old reason stopped being true the moment an engine was registered. Painless runs here
-                // now; what a stored script needs is somewhere for ScriptService to look it up, and that is
-                // cluster state. AWS OpenSearch Serverless refuses stored scripts for the same practical
-                // reason and supports inline ones, which is where this lands too.
-                "stored scripts resolve through cluster state -- ScriptService is a ClusterStateApplier and "
-                    + "reads them from the cluster metadata -- and there is no cluster state here. Inline "
-                    + "scripts work: send the source in the query, the aggregation or the update" },
             { "/_ilm/policy/{name}", "index lifecycle management is not part of this surface" },
             // Found by driving a running node rather than by reading this list: twenty-two endpoints a real
             // client reaches for were answering core's default 400 "no handler found for uri", which reads
@@ -956,10 +978,6 @@ public final class ServerlessNode implements Closeable {
                     + "shard this node may not own is not something this node can do" },
             { "/{index}/_open", noClosedState },
             { "/{index}/_close", noClosedState },
-            {
-                "/{index}/_rollover",
-                "rollover creates the next index and moves an alias to it atomically; the alias "
-                    + "move is the part this design cannot do, since each alias is its own compare-and-swap" },
             { "/{index}/_shrink/{target}", reshaping },
             { "/{index}/_split/{target}", reshaping },
             { "/{index}/_clone/{target}", reshaping },
@@ -988,27 +1006,133 @@ public final class ServerlessNode implements Closeable {
                 "the script-execution sandbox endpoint is not routed; inline scripts run " + "in a query, an aggregation or an update" },
             { "/_index_template/_simulate_index/{name}", simulate },
             { "/_index_template/_simulate/{name}", simulate },
+            // The nameless form is the one in the spec, and it used to match POST /_index_template/{name}
+            // and store a live template called "_simulate".
+            { "/_index_template/_simulate", simulate },
             { "/_component_template/_simulate/{name}", simulate },
+            { "/_component_template/_simulate", simulate },
             // Found by comparing this surface against AWS OpenSearch Serverless and Elastic Cloud
             // Serverless: every one of these is an endpoint a real client reaches for, and every one of them
             // fell through to core's default 400 rather than the 501 D2 promises. Being absent is a
             // decision; looking like a typo is not.
             {
-                "/{index}/_rank_eval",
-                "ranking evaluation issues a set of searches and scores how well each "
-                    + "ranked a known-good answer. Every part of that is a search this surface already serves and "
-                    + "arithmetic over the results, so it belongs in the harness doing the evaluating rather than "
-                    + "in the node being evaluated" },
-            {
                 "/_field_caps",
                 "name an index or a prefix: GET /{index}/_field_caps answers for what it can reach, and "
                     + "asking every index in the deployment what fields it has is the inventory operation "
                     + "this design refuses" },
-            { "/_search/pipeline/{id}", "search pipelines are not implemented here" },
             {
                 "/_cat/templates",
                 "listing templates as a table is not routed; GET /_index_template returns them all, and "
-                    + "GET /_index_template/{prefix}* narrows by name" } }) {
+                    + "GET /_index_template/{prefix}* narrows by name" },
+            // Found by walking every path in rest-api-spec against a running node (ServerlessSpecCoverageTests)
+            // rather than by hand: each of these is a sibling of a path already refused above -- the
+            // index-less form, the {name} form, the {metric} form -- that the refusal did not cover, so it
+            // fell through to core's default 400 "no handler found for uri" while its sibling answered 501
+            // with a reason. Same reason, same answer, every spelling.
+            { "/_cat/templates/{name}", "GET /_index_template/{name} answers for one template" },
+            { "/_cat/aliases/{name}", "aliases are found by name here, not enumerated; GET /_alias/{name} answers for one" },
+            { "/_cat/allocation/{nodeId}", noAllocator },
+            { "/_cat/count/{index}", "GET /{index}/_count answers for one index, and takes a prefix pattern" },
+            { "/_cat/fielddata/{fields}", "fielddata is per-shard memory this surface does not report" },
+            { "/_cat/recovery/{index}", noAllocator },
+            { "/_cat/segments/{index}", "per-shard Lucene detail is not exposed" },
+            { "/_cat/shards/{index}", "GET /_cluster/health/{index}?level=shards reports one index's shards, bounded" },
+            { "/_cat/snapshots/{repo}", "GET /_snapshot/{repo}/_all lists a repository's snapshots" },
+            { "/_cat/thread_pool/{thread_pool_patterns}", "GET /_serverless/stats answers for the node it is sent to" },
+            { "/_cat/segment_replication", "there is no segment replication here: a shard's redundancy is the object store" },
+            { "/_cat/segment_replication/{index}", "there is no segment replication here: a shard's redundancy is the object store" },
+            { "/_cluster/state/{metric}", noGlobalState },
+            { "/_cluster/state/{metric}/{index}", noGlobalState },
+            { "/_cluster/stats/nodes/{nodeId}", noGlobalState },
+            { "/_cluster/decommission/awareness", noAllocator },
+            { "/_cluster/decommission/awareness/{name}/_status", noAllocator },
+            { "/_cluster/decommission/awareness/{name}/{value}", noAllocator },
+            { "/_cluster/voting_config_exclusions", noClusterManager },
+            { "/_cluster/routing/awareness/weights", noAllocator },
+            { "/_cluster/routing/awareness/{attribute}/weights", noAllocator },
+            { "/_dangling/{index_uuid}", "there is no cluster state here, so an index exists exactly when its descriptor does" },
+            { "/_script_context", "the context catalogue is not served; PUT /_scripts/{id}/{context} checks a script against one" },
+            { "/_script_language", "the language catalogue is not served; painless and mustache are the languages here" },
+            { "/{index}/_block/{block}", noClosedState },
+            { "/_cache/clear", "there is no cluster-wide operation to clear a cache" },
+            {
+                "/_data_stream",
+                "listing every data stream is the enumeration this design refuses; GET /_data_stream/{name} answers for "
+                    + "one, and takes a prefix pattern" },
+            { "/_data_stream/_stats", "store sizes are not reported here; GET /_data_stream/{name} lists a stream's backing indices" },
+            {
+                "/_data_stream/{name}/_stats",
+                "store sizes are not reported here; GET /_data_stream/{name} lists a stream's backing indices" },
+            { "/_template", "legacy templates are not served; composable templates are, at /_index_template" },
+            { "/_template/{name}", "legacy templates are not served; composable templates are, at /_index_template/{name}" },
+            { "/_flush", "there is no flush to ask for: durability is the write-ahead log" },
+            { "/_refresh", "refresh is per-write here: pass refresh=true on the write that must be visible" },
+            { "/_forcemerge", "merging is the shard writer's own decision" },
+            { "/_recovery", noAllocator },
+            { "/_segments", "per-shard Lucene detail is not exposed" },
+            { "/_shard_stores", noAllocator },
+            { "/_upgrade", "there is no upgrade to run: an index is served by whatever version serves it" },
+            { "/{index}/_upgrade", "there is no upgrade to run: an index is served by whatever version serves it" },
+            { "/_mapping", enumeration },
+            { "/_mapping/field/{fields}", enumeration },
+            { "/_settings", enumeration },
+            { "/_settings/{name}", enumeration },
+            { "/_stats/{metric}", indexEnumeration },
+            {
+                "/{index}/_stats/{metric}",
+                "per-shard statistics are not exposed; GET /_serverless/stats answers for the node it is sent to" },
+            { "/_validate/query", "name an index: GET /{index}/_validate/query answers for what it can reach" },
+            {
+                "/_ingest/processor/grok",
+                "the grok pattern catalogue is not served; a pipeline naming a grok processor is compiled at PUT" },
+            { "/_mtermvectors", "term vectors are a per-shard Lucene detail this surface does not expose" },
+            { "/{index}/_mtermvectors", "term vectors are a per-shard Lucene detail this surface does not expose" },
+            { "/{index}/_termvectors", "term vectors are a per-shard Lucene detail this surface does not expose" },
+            { "/_nodes/hot_threads", "per-node diagnostics are not served; GET /_serverless/stats answers for the node it is sent to" },
+            {
+                "/_nodes/{nodeId}/hot_threads",
+                "per-node diagnostics are not served; GET /_serverless/stats answers for the node it is sent to" },
+            { "/_nodes/reload_secure_settings", "secure settings are read at start; there is no reload" },
+            { "/_nodes/{nodeId}/reload_secure_settings", "secure settings are read at start; there is no reload" },
+            { "/_nodes/usage", "feature usage is not counted here" },
+            { "/_nodes/{nodeId}/usage", "feature usage is not counted here" },
+            { "/_nodes/usage/{metric}", "feature usage is not counted here" },
+            { "/_nodes/{nodeId}/usage/{metric}", "feature usage is not counted here" },
+            { "/_nodes/{nodeId}/stats", "GET /_serverless/stats answers for the node it is sent to" },
+            { "/_nodes/stats/{metric}", "GET /_serverless/stats answers for the node it is sent to" },
+            { "/_nodes/{nodeId}/stats/{metric}", "GET /_serverless/stats answers for the node it is sent to" },
+            { "/_nodes/stats/{metric}/{index_metric}", "GET /_serverless/stats answers for the node it is sent to" },
+            { "/_nodes/{nodeId}/stats/{metric}/{index_metric}", "GET /_serverless/stats answers for the node it is sent to" },
+            { "/_rank_eval", "name an index: ranking evaluation belongs in the harness doing the evaluating" },
+            { "/_reindex/{task_id}/_rethrottle", noReindex },
+            { "/_update_by_query/{task_id}/_rethrottle", noReindex },
+            { "/_delete_by_query/{task_id}/_rethrottle", "delete_by_query runs inline here and is not throttled" },
+            { "/_remotestore/_restore", "the object store is the store; there is no separate remote store to restore from" },
+            { "/_remotestore/stats/{index}", "the object store is the store; there is no separate remote store to report on" },
+            { "/_remotestore/stats/{index}/{shard_id}", "the object store is the store; there is no separate remote store to report on" },
+            { "/_search_shards", "shards here are placed by id and served by whichever node holds them; there is no allocation to report" },
+            {
+                "/{index}/_search_shards",
+                "shards here are placed by id and served by whichever node holds them; there is no allocation to report" },
+            {
+                "/_snapshot/{repo}/_cleanup",
+                "a repository here is a namespace in this deployment's own object store, swept by its own collector" },
+            { "/_snapshot/{repo}/{snapshot}/_clone/{target}", "cloning a snapshot is not served; take a new one" },
+            { "/_snapshot/_status", "every snapshot here is taken synchronously, so there is no in-progress status to report" },
+            { "/_snapshot/{repo}/_status", "every snapshot here is taken synchronously, so there is no in-progress status to report" },
+            {
+                "/_snapshot/{repo}/{snapshot}/_status",
+                "every snapshot here is taken synchronously, so there is no in-progress status to report" },
+            {
+                "/_snapshot/{repo}/{snapshot}/{index}/_status",
+                "every snapshot here is taken synchronously, so there is no in-progress status to report" },
+            { "/_tasks/_cancel", "there is no cluster-wide task registry" },
+            { "/_tasks/{task_id}", "there is no cluster-wide task registry" },
+            { "/_tasks/{task_id}/_cancel", "there is no cluster-wide task registry" },
+            { "/_list/wlm_stats", "workload management is not part of this surface" },
+            {
+                "/{index}/_mapping/field/{fields}",
+                "GET /{index}/_mapping returns the whole mapping, which is one register read either way" } }) {
             controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
         }
         return controller;
@@ -1109,6 +1233,41 @@ public final class ServerlessNode implements Closeable {
      */
     public String clusterName() {
         return org.opensearch.cluster.ClusterName.CLUSTER_NAME_SETTING.get(settings).value();
+    }
+
+    private final java.util.Map<String, long[]> appliedDescriptorVersions = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Applies mapping and settings changes made elsewhere to the shards this node holds open.
+     *
+     * <p>A mapping or settings update reached only the node that served it; every other node's open
+     * shard kept the old one until it was reopened. One descriptor read per open index per heartbeat --
+     * the heartbeat already reads a head per shard -- and a refresh only when a version moved.
+     */
+    private void refreshDescriptorsOfOpenIndices(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        final java.util.Set<String> indices = new java.util.LinkedHashSet<>();
+        for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
+            indices.add(shardId.getIndexName());
+        }
+        for (String indexName : indices) {
+            try {
+                final var descriptor = plane.describe(indexName);
+                if (descriptor.isEmpty()) {
+                    continue;
+                }
+                final long[] applied = appliedDescriptorVersions.computeIfAbsent(indexName, k -> new long[] { -1L, -1L });
+                if (applied[0] != descriptor.get().mappingVersion()) {
+                    reconciler.refreshMapping(indexName, descriptor.get());
+                    applied[0] = descriptor.get().mappingVersion();
+                }
+                if (applied[1] != descriptor.get().settingsVersion()) {
+                    reconciler.refreshSettings(indexName, descriptor.get());
+                    applied[1] = descriptor.get().settingsVersion();
+                }
+            } catch (Exception e) {
+                logger.warn("could not refresh the descriptor of " + indexName + " on this node's open shards", e);
+            }
+        }
     }
 
     private void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
@@ -1278,6 +1437,11 @@ public final class ServerlessNode implements Closeable {
         // zero.
         final java.util.Map<Integer, Long> terms = new java.util.HashMap<>();
         pit.shards().forEach((shard, commit) -> terms.put(shard, commit.term()));
+        if (reconciler.openShards().size() >= org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD) {
+            throw new IllegalStateException(
+                "this node holds " + reconciler.openShards().size() + " shards, the cap; the view was not opened here"
+            );
+        }
         return reconciler.openFrozenReader(
             descriptor.toIndexMetadata(terms),
             pit.id(),
@@ -1326,7 +1490,7 @@ public final class ServerlessNode implements Closeable {
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
         reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId());
+        final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId(), localNode.getEphemeralId());
 
         // Phase 4 has only writer shards, and a node that does not accept writer activation must not
         // open one. Phase 5 adds reader shards, at which point a search-only node opens those instead of
@@ -1388,11 +1552,18 @@ public final class ServerlessNode implements Closeable {
             // lease first is what makes the invariant hold rather than merely usually hold.
             renewOwnLease(plane);
         }
+        // The incarnation being activated, so a head left by a deleted index of the same name is not
+        // mistaken for a live owner of this one.
+        final String indexUuid = plane.describe(indexName).map(IndexDescriptor::uuid).orElse(null);
+        if (indexUuid == null) {
+            return java.util.Optional.empty();
+        }
         final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
             indexName,
             shardNumber,
             localNode.getId(),
-            localNode.getEphemeralId()
+            localNode.getEphemeralId(),
+            indexUuid
         );
         if (acquisition.acquired() == false) {
             return java.util.Optional.empty();
@@ -1431,6 +1602,7 @@ public final class ServerlessNode implements Closeable {
         // down to anyway -- per-shard mode now pays it too, and that is the honest cost of being
         // reachable.
         renewOwnLease(plane);
+        refreshDescriptorsOfOpenIndices(plane);
 
         for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
             if (reconciler.readerShards().contains(shardId)) {
@@ -1441,7 +1613,12 @@ public final class ServerlessNode implements Closeable {
             // us -- but it is a read, not a write, and that is the whole saving. This used to have an
             // else-branch that renewed each head individually; that mode is gone.
             final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
-            if (head.isPresent() && localNode.getId().equals(head.get().ownerNodeId())) {
+            final boolean ours = head.isPresent() && localNode.getId().equals(head.get().ownerNodeId())
+            // This incarnation's, not a previous one's under the same node id.
+                && (head.get().ownerEphemeralId() == null || localNode.getEphemeralId().equals(head.get().ownerEphemeralId()))
+                // And for this index, not a deleted one of the same name.
+                && (head.get().indexUuid() == null || head.get().indexUuid().equals(shardId.getIndex().getUUID()));
+            if (ours) {
                 continue;
             }
             reconciler.releaseShard(shardId, "lease lost: the shard-head no longer names " + nodeName);
@@ -1485,12 +1662,34 @@ public final class ServerlessNode implements Closeable {
         served.put(indexName, descriptor);
         readerShards.add(new java.util.AbstractMap.SimpleEntry<>(indexName, shardNumber));
 
-        final java.util.List<ShardAssignment> assignments = new java.util.ArrayList<>();
-        for (var entry : readerShards) {
-            final long term = plane.segmentPublisher(entry.getKey(), entry.getValue())
+        if (reconciler.openShards().size() >= org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD
+            && localShardOf(indexName, shardNumber) == null) {
+            // Readers used to be uncapped: a wide search burst could open thousands of shards on one
+            // node. The same ceiling demand-driven writers have applies, and idle release makes room.
+            throw new IllegalStateException(
+                "this node holds "
+                    + reconciler.openShards().size()
+                    + " shards, the cap; "
+                    + indexName
+                    + "["
+                    + shardNumber
+                    + "] was not opened"
+            );
+        }
+        // One manifest read: the shard being opened. Every other reader's term is what was read when it
+        // was opened. This used to re-read every held reader's manifest on every open -- the 500th reader
+        // cost 500 reads before its own.
+        final String openingKey = indexName + "#" + shardNumber;
+        readerTerms.put(
+            openingKey,
+            plane.segmentPublisher(indexName, shardNumber)
                 .readManifest()
                 .map(org.opensearch.serverless.store.CommitManifest::term)
-                .orElse(1L);
+                .orElse(1L)
+        );
+        final java.util.List<ShardAssignment> assignments = new java.util.ArrayList<>();
+        for (var entry : readerShards) {
+            final long term = readerTerms.getOrDefault(entry.getKey() + "#" + entry.getValue(), 1L);
             assignments.add(new ShardAssignment(entry.getKey(), entry.getValue(), term));
         }
         final ClusterState view = projector.project(served.values(), assignments);
@@ -1712,6 +1911,12 @@ public final class ServerlessNode implements Closeable {
                 e
             );
         }
+        // And once more after the PUT landed. A successor seals the log only after this node's lease has
+        // expired, so a record written while the lease was valid on both sides of the PUT is ahead of
+        // any seal. A writer that paused across the expiry may have landed its record behind one, and
+        // the successor never replays it: that record must not be acknowledged, and it is not -- the
+        // shard is released and the caller sees a failure it can retry against the new owner.
+        ensureOwnLeaseIsStillValid(shardId);
     }
 
     /**
@@ -1761,6 +1966,10 @@ public final class ServerlessNode implements Closeable {
                 mapperService.close();
             }
             if (merged.equals(current.get().mapping())) {
+                // Another node already grew it. The descriptor is right; this node's open shard is not,
+                // and without this refresh every write carrying the field failed here until the shard
+                // reopened.
+                reconciler.refreshMapping(indexName, current.get());
                 return;
             }
             final var updated = current.get().withMapping(merged);
@@ -2065,7 +2274,7 @@ public final class ServerlessNode implements Closeable {
                         BulkOutcome.deleted(operation.id(), result.isFound(), result.getSeqNo(), result.getTerm(), result.getVersion())
                     );
                 } else {
-                    final var result = shard.applyIndexOperationOnPrimary(
+                    var result = shard.applyIndexOperationOnPrimary(
                         item.requireAbsent()
                             ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
                             : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
@@ -2081,6 +2290,27 @@ public final class ServerlessNode implements Closeable {
                         org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
                         false
                     );
+                    if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
+                        // The same growth a single-document write gets. A batch used to fail every item
+                        // carrying a new field while the same document through PUT /_doc succeeded.
+                        growMapping(shardId, result.getRequiredMappingUpdate());
+                        result = shard.applyIndexOperationOnPrimary(
+                            item.requireAbsent()
+                                ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
+                                : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                            org.opensearch.index.VersionType.INTERNAL,
+                            new org.opensearch.index.mapper.SourceToParse(
+                                shardId.getIndexName(),
+                                operation.id(),
+                                new org.opensearch.core.common.bytes.BytesArray(operation.source()),
+                                org.opensearch.common.xcontent.XContentType.JSON
+                            ),
+                            item.ifSeqNo(),
+                            item.ifPrimaryTerm(),
+                            org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+                            false
+                        );
+                    }
                     if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
                         // A lost condition is a FAILURE carrying a VersionConflictEngineException rather
                         // than a thrown one, so the item has to be inspected rather than only its type
@@ -2446,6 +2676,24 @@ public final class ServerlessNode implements Closeable {
 
     private volatile org.opensearch.core.xcontent.NamedXContentRegistry searchRegistry;
 
+    /**
+     * Returns the search registry with rank-eval's metric parsers added.
+     *
+     * @return a registry that parses a ranking-evaluation body
+     */
+    public synchronized org.opensearch.core.xcontent.NamedXContentRegistry rankEvalXContentRegistry() {
+        if (rankEvalRegistry == null) {
+            final java.util.List<org.opensearch.core.xcontent.NamedXContentRegistry.Entry> entries = new java.util.ArrayList<>(
+                searchModule().getNamedXContents()
+            );
+            entries.addAll(new org.opensearch.index.rankeval.RankEvalNamedXContentProvider().getNamedXContentParsers());
+            rankEvalRegistry = new org.opensearch.core.xcontent.NamedXContentRegistry(entries);
+        }
+        return rankEvalRegistry;
+    }
+
+    private volatile org.opensearch.core.xcontent.NamedXContentRegistry rankEvalRegistry;
+
     private volatile ServerlessClient client;
 
     private volatile org.opensearch.watcher.ResourceWatcherService resourceWatcherService;
@@ -2490,13 +2738,51 @@ public final class ServerlessNode implements Closeable {
                 settings,
                 org.opensearch.script.ScriptModule.CORE_CONTEXTS.values()
             );
-            scriptService = new org.opensearch.script.ScriptService(
+            // Mustache too, chosen the same way: search templates and rank-eval templates render through
+            // it, and it is the one engine core registers for the template context.
+            final org.opensearch.script.ScriptEngine mustache = new org.opensearch.script.mustache.MustacheModulePlugin().getScriptEngine(
                 settings,
-                Map.of(painless.getType(), painless),
-                org.opensearch.script.ScriptModule.CORE_CONTEXTS
+                org.opensearch.script.ScriptModule.CORE_CONTEXTS.values()
+            );
+            // Stored scripts come from a register rather than from cluster state; see StoredScripts.
+            scriptService = new org.opensearch.serverless.script.ServerlessScriptService(
+                settings,
+                Map.of(painless.getType(), painless, mustache.getType(), mustache),
+                org.opensearch.script.ScriptModule.CORE_CONTEXTS,
+                new org.opensearch.serverless.script.StoredScripts(() -> metadataPlane)
             );
         }
         return scriptService;
+    }
+
+    /**
+     * Returns this node's copy of the stored scripts.
+     *
+     * @return the cache
+     */
+    public org.opensearch.serverless.script.StoredScripts storedScripts() {
+        return ((org.opensearch.serverless.script.ServerlessScriptService) scriptService()).stored();
+    }
+
+    private volatile org.opensearch.search.pipeline.ServerlessSearchPipelines searchPipelines;
+
+    /**
+     * Returns the search-pipeline compiler, built over the common module's processor factories.
+     *
+     * @return the compiler
+     */
+    public synchronized org.opensearch.search.pipeline.ServerlessSearchPipelines searchPipelines() {
+        if (searchPipelines == null) {
+            searchPipelines = new org.opensearch.search.pipeline.ServerlessSearchPipelines(
+                new Environment(settings, null),
+                scriptService(),
+                indicesService().getAnalysis(),
+                threadPool,
+                searchXContentRegistry(),
+                namedWriteableRegistry()
+            );
+        }
+        return searchPipelines;
     }
 
     private volatile org.opensearch.serverless.ingest.IngestPipelines ingestPipelines;
@@ -2586,6 +2872,15 @@ public final class ServerlessNode implements Closeable {
             indexingPressure = new org.opensearch.index.IndexingPressure(settings);
         }
         return indexingPressure;
+    }
+
+    /**
+     * Returns the node's settings.
+     *
+     * @return the settings this node was started with
+     */
+    public Settings settings() {
+        return settings;
     }
 
     /**
@@ -2939,6 +3234,40 @@ public final class ServerlessNode implements Closeable {
         if (metadataPlane == null) {
             metadataPlane = plane;
         }
+    }
+
+    private final java.util.Map<String, Long> readerTerms = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private org.opensearch.core.index.shard.ShardId localShardOf(String indexName, int shardNumber) {
+        return reconciler.openShards()
+            .stream()
+            .filter(s -> s.getIndexName().equals(indexName) && s.id() == shardNumber)
+            .findFirst()
+            .orElse(null);
+    }
+
+    private volatile String transportToken;
+
+    /**
+     * Returns the secret this deployment's nodes present to one another on forwarded requests.
+     *
+     * @return the secret, or null before a metadata plane is adopted
+     */
+    public String transportToken() {
+        final var plane = metadataPlane;
+        if (plane == null) {
+            return null;
+        }
+        String token = transportToken;
+        if (token == null) {
+            try {
+                token = plane.transportSecret();
+                transportToken = token;
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        }
+        return token;
     }
 
     private void ensureStarted() {

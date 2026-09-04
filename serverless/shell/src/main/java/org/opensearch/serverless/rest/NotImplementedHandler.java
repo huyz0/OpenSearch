@@ -57,7 +57,9 @@ public final class NotImplementedHandler extends BaseRestHandler {
             new Route(RestRequest.Method.GET, path),
             new Route(RestRequest.Method.POST, path),
             new Route(RestRequest.Method.PUT, path),
-            new Route(RestRequest.Method.DELETE, path)
+            new Route(RestRequest.Method.DELETE, path),
+            // HEAD too: an existence check on a refused path is refused, not 405.
+            new Route(RestRequest.Method.HEAD, path)
         );
     }
 

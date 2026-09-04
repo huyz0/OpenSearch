@@ -313,7 +313,12 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
 
             send(http, "PUT", "/library?shards=1", MAPPING);
             assertEquals("a write with no body must be refused", 400, send(http, "PUT", "/library/_doc/1", null).status());
-            assertEquals("a search with no query must be refused", 400, send(http, "GET", "/library/_search", null).status());
+            // A search with no body is match_all, as in core; a body that does not parse is the bad request.
+            assertEquals(
+                "a search that does not parse must be refused",
+                400,
+                send(http, "POST", "/library/_search", "{\"query\":{\"no_such_query\":{}}}").status()
+            );
         }
     }
 

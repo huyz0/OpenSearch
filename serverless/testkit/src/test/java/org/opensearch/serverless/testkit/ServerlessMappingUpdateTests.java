@@ -305,10 +305,8 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
                 { "/_reindex", "search_after" },
                 // The list keeps shrinking, which is the point of it: four went in M59 and _explain went in
                 // M60, whose refusal -- "the fan-out here merges hits rather than exposing per-shard scoring
-                // internals" -- turned out to describe no part of an explain. What is left is refused for a
-                // reason that survived contact.
-                { "/alpha/_rank_eval", "harness doing the evaluating" },
-                // Templates exist since M56; only their table rendering is unrouted.
+                // internals" -- turned out to describe no part of an explain; and _rank_eval, served since
+                // M62. Templates exist since M56; only their table rendering is unrouted.
                 { "/_cat/templates", "GET /_index_template returns them all" } }) {
                 final Answer refused = call("GET", expected[0], null);
                 assertEquals(expected[0] + " must refuse explicitly: " + refused.body(), 501, refused.status());

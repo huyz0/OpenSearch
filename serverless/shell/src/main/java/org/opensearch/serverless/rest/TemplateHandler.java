@@ -87,6 +87,31 @@ public final class TemplateHandler extends BaseRestHandler {
         final String name = request.param("name");
         final String body = request.hasContent() ? request.content().utf8ToString() : null;
         final RestRequest.Method method = request.method();
+        final boolean create = request.paramAsBoolean("create", false);
+        // Hints: there is no cluster manager to time out against, and cause is a log annotation.
+        request.param("cause");
+        request.param("master_timeout");
+        request.param("cluster_manager_timeout");
+        request.param("timeout");
+        request.param("flat_settings");
+        request.param("local");
+
+        if (name != null && name.startsWith("_")) {
+            // Not a template name: an underscore-prefixed segment here is an API this shell does not
+            // implement. Without this, POST /_index_template/_simulate -- core's own simulate endpoint --
+            // matched the {name} placeholder and stored a live template called "_simulate" with a 200.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "not_implemented",
+                    "'"
+                        + name
+                        + "' is not a template: names beginning with an underscore are reserved for APIs, and "
+                        + "this shell does not implement this one"
+                )
+            );
+        }
 
         final MetadataPlane metadata = plane.get();
         final var serving = node.get();
@@ -105,27 +130,46 @@ public final class TemplateHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 final TemplateStore store = component ? metadata.componentTemplates() : metadata.indexTemplates();
-                switch (method) {
-                    case PUT, POST -> put(channel, store, component, name, body);
-                    case GET -> get(channel, store, component, name);
-                    case HEAD -> head(channel, store, name);
-                    case DELETE -> delete(channel, store, name);
-                    default -> channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.METHOD_NOT_ALLOWED,
-                            "method_not_allowed",
-                            method + " is not supported here"
-                        )
-                    );
-                }
+                final String action = switch (method) {
+                    case PUT, POST -> component
+                        ? org.opensearch.action.admin.indices.template.put.PutComponentTemplateAction.NAME
+                        : org.opensearch.action.admin.indices.template.put.PutComposableIndexTemplateAction.NAME;
+                    case DELETE -> component
+                        ? org.opensearch.action.admin.indices.template.delete.DeleteComponentTemplateAction.NAME
+                        : org.opensearch.action.admin.indices.template.delete.DeleteComposableIndexTemplateAction.NAME;
+                    default -> component
+                        ? org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.NAME
+                        : org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.NAME;
+                };
+                IndexAdminHandler.gate(
+                    serving,
+                    action,
+                    new org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.Request(name),
+                    () -> {
+                        switch (method) {
+                            case PUT, POST -> put(channel, store, component, name, body, create);
+                            case GET -> get(channel, store, component, name);
+                            case HEAD -> head(channel, store, name);
+                            case DELETE -> delete(channel, store, name);
+                            default -> channel.sendResponse(
+                                IndexAdminHandler.error(
+                                    channel,
+                                    RestStatus.METHOD_NOT_ALLOWED,
+                                    "method_not_allowed",
+                                    method + " is not supported here"
+                                )
+                            );
+                        }
+                        return null;
+                    }
+                );
             } catch (TemplateStore.TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_templates", e.getMessage());
             } catch (IllegalArgumentException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a template failure", nested);
                 }
@@ -133,8 +177,14 @@ public final class TemplateHandler extends BaseRestHandler {
         });
     }
 
-    private void put(org.opensearch.rest.RestChannel channel, TemplateStore store, boolean component, String name, String body)
-        throws IOException {
+    private void put(
+        org.opensearch.rest.RestChannel channel,
+        TemplateStore store,
+        boolean component,
+        String name,
+        String body,
+        boolean create
+    ) throws IOException {
         final Map<String, Object> parsed;
         try {
             parsed = org.opensearch.common.xcontent.XContentHelper.convertToMap(
@@ -156,6 +206,30 @@ public final class TemplateHandler extends BaseRestHandler {
                 "a component template must not name index_patterns: it is composed by an index template, which "
                     + "decides what it applies to"
             );
+        }
+        // Stored verbatim and read selectively, so what the resolver does not read must be refused here
+        // rather than kept: a template carrying aliases round-tripped through GET looking honoured, and
+        // never created one. version and _meta are stored and returned, which is all core does with them.
+        if (parsed.get("template") instanceof Map<?, ?> template
+            && template.get("aliases") instanceof Map<?, ?> aliases
+            && aliases.isEmpty() == false) {
+            sendQuietly(
+                channel,
+                RestStatus.NOT_IMPLEMENTED,
+                "unsupported_template",
+                "template.aliases is not supported: aliases are not created with an index here. Create the index, "
+                    + "then PUT /{index}/_alias/{name}"
+            );
+            return;
+        }
+        if (parsed.get("data_stream") != null && (parsed.get("data_stream") instanceof Map<?, ?>) == false) {
+            sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", "data_stream must be an object");
+            return;
+        }
+        if (create && store.get(name).isPresent()) {
+            // create=true is "add, do not replace", and replacing would be exactly what it asked not to do.
+            sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", "template [" + name + "] already exists");
+            return;
         }
         store.put(name, body);
         try (XContentBuilder builder = channel.newBuilder()) {

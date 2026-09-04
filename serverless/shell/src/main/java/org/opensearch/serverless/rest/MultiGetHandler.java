@@ -108,6 +108,32 @@ public final class MultiGetHandler extends BaseRestHandler {
         // What the request as a whole asked for, which an individual document may override.
         final org.opensearch.search.fetch.subphase.FetchSourceContext requestSource =
             org.opensearch.search.fetch.subphase.FetchSourceContext.parseFromRestRequest(request);
+        final String storedFields = request.param("stored_fields");
+        final String routing = request.param("routing");
+        // Hints; see GetHandler.
+        request.param("preference");
+        request.param("realtime");
+        request.param("refresh");
+        if (storedFields != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_read",
+                    "stored_fields is not supported: a get here returns the document's source, filtered by _source"
+                )
+            );
+        }
+        if (routing != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_read",
+                    "routing is not supported: a document is placed by its id alone"
+                )
+            );
+        }
         if (request.hasContentOrSourceParam() == false) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a multi-get needs a body naming the documents")
@@ -141,7 +167,7 @@ public final class MultiGetHandler extends BaseRestHandler {
                 respond(channel, items);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a multi-get failure", nested);
                 }
@@ -176,7 +202,15 @@ public final class MultiGetHandler extends BaseRestHandler {
                     // A document may name its own _source, which is the whole reason a multi-get takes
                     // objects rather than ids: one request can want the body of one document and only the
                     // field names of another.
-                    items.add(new Item(index.toString(), id.toString(), perDocumentSource(doc.get("_source"), requestSource)));
+                    final Item item = new Item(index.toString(), id.toString(), perDocumentSource(doc.get("_source"), requestSource));
+                    // Refused per item rather than dropped: a document's own routing or stored_fields
+                    // used to be read into the map and never looked at again.
+                    if (doc.get("routing") != null || doc.get("_routing") != null) {
+                        item.fail("unsupported_read", "routing is not supported: a document is placed by its id alone");
+                    } else if (doc.get("stored_fields") != null || doc.get("_stored_fields") != null) {
+                        item.fail("unsupported_read", "stored_fields is not supported: a get here returns the document's source");
+                    }
+                    items.add(item);
                 }
                 return null;
             }
@@ -243,6 +277,10 @@ public final class MultiGetHandler extends BaseRestHandler {
         final ShardOperations operations = new ShardOperations(serving, metadata);
         final List<Callable<Boolean>> tasks = new ArrayList<>(items.size());
         for (Item item : items) {
+            if (item.failureType != null) {
+                // Refused while parsing; there is nothing to read for it.
+                continue;
+            }
             tasks.add(() -> {
                 try {
                     item.document = operations.get(item.index, item.id).document();
@@ -290,6 +328,13 @@ public final class MultiGetHandler extends BaseRestHandler {
                     continue;
                 }
                 final boolean found = item.document != null && item.document.found();
+                if (found) {
+                    // The same token a single get reports, so a caller building a conditional write from a
+                    // multi-get has one. These were never rendered here, only on GET /{index}/_doc/{id}.
+                    builder.field("_version", item.document.version());
+                    builder.field("_seq_no", item.document.seqNo());
+                    builder.field("_primary_term", item.document.primaryTerm());
+                }
                 builder.field("found", found);
                 final String source = found ? SourceFiltering.apply(item.document.source(), item.fetchSource) : null;
                 if (source != null) {

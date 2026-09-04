@@ -19,7 +19,6 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
-import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.WalRecord;
@@ -104,7 +103,22 @@ public final class BulkHandler extends BaseRestHandler {
         // parameters were not all consumed, which would turn a deliberate refusal into a 400 about
         // something else.
         final String defaultIndex = request.param("index");
-        final boolean refresh = request.paramAsBoolean("refresh", false);
+        final boolean refresh = IndexAdminHandler.refresh(request);
+        final String defaultPipeline = request.param("pipeline");
+        final String routing = request.param("routing");
+        final boolean requireAlias = request.paramAsBoolean("require_alias", false);
+        // Hints with one possible answer here, and the _source trio, which shapes only the response of an
+        // update action -- the one action this batch refuses. Consumed so a client that sends them is not
+        // turned away; see DocumentHandler for why timeout and wait_for_active_shards are hints.
+        for (String hint : new String[] {
+            "timeout",
+            "wait_for_active_shards",
+            "_source",
+            "_source_includes",
+            "_source_excludes",
+            "type" }) {
+            request.param(hint);
+        }
         final byte[] body = request.hasContent() ? org.opensearch.core.common.bytes.BytesReference.toBytes(request.content()) : null;
 
         final MetadataPlane metadata = plane.get();
@@ -135,6 +149,32 @@ public final class BulkHandler extends BaseRestHandler {
             );
         }
 
+        if (routing != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_write",
+                    "routing is not supported: a document is placed by its id alone, so a routing value would be "
+                        + "accepted and change nothing"
+                )
+            );
+        }
+        if (requireAlias) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_write",
+                    "require_alias is not supported: writes here name an index, and an alias resolves on read"
+                )
+            );
+        }
+        for (Item item : items) {
+            if (item.pipeline == null) {
+                item.pipeline = defaultPipeline;
+            }
+        }
         final ServerlessNode serving = node.get();
         // The coordinator runs on GENERIC and the per-shard groups run on WRITE. It used to be the other
         // way round for a moment, with both on WRITE, which is a deadlock waiting for enough concurrent
@@ -153,6 +193,7 @@ public final class BulkHandler extends BaseRestHandler {
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
                 route(serving, metadata, items);
+                shape(serving, metadata, items);
                 // One gate call for the whole batch, under the bulk action, rather than one per item.
                 //
                 // A privilege evaluator written for OpenSearch expects to see indices:data/write/bulk with
@@ -165,10 +206,10 @@ public final class BulkHandler extends BaseRestHandler {
                     dispatch(serving, items, refresh);
                     return null;
                 });
-                respond(channel, items, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt));
+                respond(channel, items, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt), refresh);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a bulk failure", nested);
                 }
@@ -202,7 +243,7 @@ public final class BulkHandler extends BaseRestHandler {
     }
 
     private void route(ServerlessNode serving, MetadataPlane metadata, List<Item> items) throws IOException {
-        final Map<String, Optional<IndexDescriptor>> described = new HashMap<>();
+        final Map<String, Optional<MetadataPlane.WriteTarget>> targets = new HashMap<>();
         for (Item item : items) {
             if (item.failed()) {
                 continue;
@@ -224,18 +265,68 @@ public final class BulkHandler extends BaseRestHandler {
                 );
                 continue;
             }
-            final Optional<IndexDescriptor> descriptor = described.computeIfAbsent(item.index, name -> {
+            final Optional<MetadataPlane.WriteTarget> target = targets.computeIfAbsent(item.index, name -> {
                 try {
-                    return metadata.describe(name);
+                    return metadata.writeTarget(name);
                 } catch (IOException e) {
                     return Optional.empty();
                 }
             });
-            if (descriptor.isEmpty()) {
+            if (target.isEmpty()) {
                 item.fail(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + item.index);
                 continue;
             }
-            item.shard = DocumentRouting.shardFor(descriptor.get(), item.operation.id());
+            if (target.get().dataStream() != null && (item.requireAbsent == false || item.operation.isDeletion())) {
+                item.fail(
+                    RestStatus.BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "only write ops with an op_type of create are allowed in data streams; address the backing index ["
+                        + target.get().index().name()
+                        + "] for anything else"
+                );
+                continue;
+            }
+            // The backing index is where the write lands; the name the caller wrote is what the item reports.
+            item.writtenIndex = target.get().index().name();
+            item.shard = DocumentRouting.shardFor(target.get().index(), item.operation.id());
+        }
+    }
+
+    /**
+     * Runs each item's ingest pipeline, before anything is written.
+     *
+     * <p>The same rule as the single-document path: a document is shaped and then stored, and a caller
+     * must never be told a write succeeded against a document the pipeline was supposed to change and did
+     * not. An action line's own {@code pipeline} wins over the request's, as in core. A pipeline that is
+     * missing or fails is that item's failure, not the batch's; a document the pipeline drops is a
+     * {@code noop}, which is not an error and not a write. Compiled once per distinct pipeline per batch.
+     */
+    private void shape(ServerlessNode serving, MetadataPlane metadata, List<Item> items) {
+        final Map<String, org.opensearch.ingest.Pipeline> compiled = new HashMap<>();
+        for (Item item : items) {
+            if (item.failed() || item.pipeline == null || item.operation.isDeletion()) {
+                continue;
+            }
+            try {
+                org.opensearch.ingest.Pipeline pipeline = compiled.get(item.pipeline);
+                if (pipeline == null) {
+                    final var stored = metadata.pipelines().get(item.pipeline);
+                    if (stored.isEmpty()) {
+                        item.fail(RestStatus.BAD_REQUEST, "pipeline_missing", "no such pipeline: " + item.pipeline);
+                        continue;
+                    }
+                    pipeline = serving.ingestPipelines().compile(item.pipeline, stored.get());
+                    compiled.put(item.pipeline, pipeline);
+                }
+                final var outcome = serving.ingestPipelines().run(pipeline, item.index, item.operation.id(), item.operation.source());
+                if (outcome.dropped()) {
+                    item.noop(serving.localNode().getId());
+                } else {
+                    item.operation = new WalRecord(item.operation.id(), outcome.source());
+                }
+            } catch (Exception e) {
+                item.fail(RestStatus.BAD_REQUEST, "pipeline_failed", e.getMessage() == null ? e.toString() : e.getMessage());
+            }
         }
     }
 
@@ -251,8 +342,8 @@ public final class BulkHandler extends BaseRestHandler {
     private void dispatch(ServerlessNode serving, List<Item> items, boolean refresh) throws IOException {
         final Map<String, List<Item>> groups = new LinkedHashMap<>();
         for (Item item : items) {
-            if (item.failed() == false) {
-                groups.computeIfAbsent(item.index + "[" + item.shard + "]", key -> new ArrayList<>()).add(item);
+            if (item.failed() == false && item.status == null) {
+                groups.computeIfAbsent(item.writtenIndex + "[" + item.shard + "]", key -> new ArrayList<>()).add(item);
             }
         }
         final List<java.util.concurrent.Callable<Void>> tasks = new ArrayList<>(groups.size());
@@ -278,7 +369,7 @@ public final class BulkHandler extends BaseRestHandler {
     }
 
     private void applyGroup(ServerlessNode serving, List<Item> group, boolean refresh) throws IOException {
-        final String index = group.get(0).index;
+        final String index = group.get(0).writtenIndex;
         final int shard = group.get(0).shard;
         final List<ServerlessNode.BulkOperation> operations = new ArrayList<>(group.size());
         for (Item item : group) {
@@ -341,12 +432,7 @@ public final class BulkHandler extends BaseRestHandler {
             // 503 rather than the exception's own status, for the reason the single-write path gives:
             // a forward that fails means the routing was stale, and stale routing is a retry.
             serving.signals().ownershipDoubted(index, shard);
-            failGroup(
-                group,
-                RestStatus.SERVICE_UNAVAILABLE,
-                "forward_failed",
-                "could not forward to " + owner + ", which the shard-head named as owner: " + e.getMessage()
-            );
+            failGroup(group, RestStatus.SERVICE_UNAVAILABLE, "forward_failed", IndexAdminHandler.forwardFailureMessage(owner, e));
         }
     }
 
@@ -373,7 +459,7 @@ public final class BulkHandler extends BaseRestHandler {
         }
     }
 
-    private void respond(org.opensearch.rest.RestChannel channel, List<Item> items, long tookMillis) throws IOException {
+    private void respond(org.opensearch.rest.RestChannel channel, List<Item> items, long tookMillis, boolean refreshed) throws IOException {
         boolean errors = false;
         for (Item item : items) {
             if (item.failed()) {
@@ -405,6 +491,11 @@ public final class BulkHandler extends BaseRestHandler {
                     builder.field("type", item.errorType);
                     builder.field("reason", item.errorReason);
                     builder.endObject();
+                } else if ("noop".equals(item.result)) {
+                    // Dropped by its pipeline: nothing was written, so there is no sequence identity to
+                    // report, the same as core's answer for a dropped document.
+                    builder.field("status", item.status.getStatus());
+                    builder.field("result", item.result);
                 } else {
                     builder.field("status", item.status.getStatus());
                     builder.field("result", item.result);
@@ -420,6 +511,9 @@ public final class BulkHandler extends BaseRestHandler {
                     // The same promise the single-document path makes, and the reason bulk did not have
                     // to weaken it: the whole batch is in the log before any of this response exists.
                     builder.field("durable", "write-ahead log");
+                    if (refreshed) {
+                        builder.field("forced_refresh", true);
+                    }
                 }
                 builder.endObject();
                 builder.endObject();
@@ -528,6 +622,16 @@ public final class BulkHandler extends BaseRestHandler {
                         action.index = parser.text();
                     } else if ("_id".equals(field)) {
                         action.id = parser.text();
+                    } else if ("op_type".equals(field)) {
+                        // {"index":{"op_type":"create"}} is {"create":{}} spelled the other way, and core
+                        // accepts both. This used to be read and dropped, so a create was an overwrite.
+                        action.opType = parser.text();
+                    } else if ("routing".equals(field) || "_routing".equals(field)) {
+                        action.routing = parser.text();
+                    } else if ("pipeline".equals(field)) {
+                        action.pipeline = parser.text();
+                    } else if ("require_alias".equals(field)) {
+                        action.requireAlias = parser.booleanValue();
                     } else if (EXTERNAL_VERSION_FIELDS.contains(field)) {
                         // Read and kept, not merely noticed: a client that asked for a version comparison
                         // and got an unconditional write believing it got one is the confident wrong
@@ -558,6 +662,10 @@ public final class BulkHandler extends BaseRestHandler {
         private String source;
         private String conditional;
         private String misspelled;
+        private String opType;
+        private String routing;
+        private String pipeline;
+        private boolean requireAlias;
         private long ifSeqNo = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
         private long ifPrimaryTerm = 0L;
 
@@ -580,10 +688,26 @@ public final class BulkHandler extends BaseRestHandler {
                 index,
                 "delete".equals(name) ? WalRecord.deletion(documentId) : new WalRecord(documentId, source == null ? "" : source)
             );
-            item.requireAbsent = "create".equals(name);
+            item.requireAbsent = "create".equals(name) || "create".equals(opType);
             item.ifSeqNo = ifSeqNo;
             item.ifPrimaryTerm = ifPrimaryTerm;
-            if (supported == false) {
+            item.pipeline = pipeline;
+            if (opType != null && "create".equals(opType) == false && "index".equals(opType) == false) {
+                item.fail(RestStatus.BAD_REQUEST, "bad_request", "op_type must be create or index, not [" + opType + "]");
+            } else if (routing != null) {
+                item.fail(
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_action",
+                    "routing is not supported: a document is placed by its id alone, so a routing value would be "
+                        + "accepted and change nothing"
+                );
+            } else if (requireAlias) {
+                item.fail(
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_action",
+                    "require_alias is not supported: writes here name an index, and an alias resolves on read"
+                );
+            } else if (supported == false) {
                 item.fail(
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_action",
@@ -631,7 +755,9 @@ public final class BulkHandler extends BaseRestHandler {
     /** One operation and, eventually, what became of it. */
     private static final class Item {
         private final String index;
-        private final WalRecord operation;
+        private String writtenIndex;
+        private WalRecord operation;
+        private String pipeline;
         private int shard = -1;
         private RestStatus status;
         private String result;
@@ -661,6 +787,13 @@ public final class BulkHandler extends BaseRestHandler {
             this.status = status;
             this.errorType = type;
             this.errorReason = reason;
+        }
+
+        /** Dropped by its pipeline: answered, not written. */
+        void noop(String nodeId) {
+            this.nodeId = nodeId;
+            this.status = RestStatus.OK;
+            this.result = "noop";
         }
 
         void succeed(ServerlessNode.BulkOutcome outcome, String nodeId) {

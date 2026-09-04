@@ -68,6 +68,13 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
     @SuppressWarnings("unchecked")
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final MetadataPlane metadata = plane.get();
+        // Hints: there are no defaults rendered from a settings registry here, and no cluster manager to
+        // time out against. flat_settings is consumed; settings here are rendered nested.
+        request.param("include_defaults");
+        request.param("master_timeout");
+        request.param("cluster_manager_timeout");
+        request.param("timeout");
+        request.paramAsBoolean("flat_settings", false);
         if (metadata == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
@@ -134,7 +141,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                 respond(channel, written, true);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a cluster settings write failure", nested);
                 }

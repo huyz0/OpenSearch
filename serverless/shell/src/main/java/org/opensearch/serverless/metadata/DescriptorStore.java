@@ -68,15 +68,44 @@ public final class DescriptorStore {
      * @throws IOException if the write fails
      */
     public long create(IndexDescriptor descriptor) throws IOException {
-        final BlobRegisterCasResult result = container.createRegisterIfAbsent(
-            RegisterMap.descriptorBlob(descriptor.name()),
-            descriptor.toBytes()
-        );
-        if (result.applied() == false) {
-            // Name uniqueness, arbitrated by the object store rather than by a cluster-manager.
-            throw new IndexAlreadyExistsException(descriptor.name());
+        Names.validateIndexOrAlias(descriptor.name());
+        return createRegister(descriptor.name(), descriptor.toBytes());
+    }
+
+    /**
+     * Creates a register under a name that is either absent or a tombstone.
+     *
+     * <p><b>A tombstone is kept, not removed, and creation swaps over it.</b> A register's generation is
+     * minted by the store and restarts at 1 when a blob is deleted and re-created, so a delete followed
+     * by a create handed a recreated name the same generation numbers its predecessor had -- and every
+     * compare-and-swap on this surface expects a generation: a mapping update that read the old index's
+     * descriptor at generation 1 then wrote it over the new index's descriptor at generation 1, uuid and
+     * all, and the collector deleted the new index's shards as orphans. Swapping over the tombstone keeps
+     * the generation moving, so a number read before a delete never matches a number after it.
+     *
+     * @param name the register name
+     * @param value what to store
+     * @return the generation as stored
+     * @throws IOException if the store cannot be read or written
+     * @throws IndexAlreadyExistsException if the name is taken by a live record
+     */
+    private long createRegister(String name, org.opensearch.core.common.bytes.BytesReference value) throws IOException {
+        final String blobName = RegisterMap.descriptorBlob(name);
+        // Put-if-absent first, so the common case -- a name never used -- stays one request. Only a name
+        // that is taken is read, to tell a tombstone from a live record.
+        final BlobRegisterCasResult created = container.createRegisterIfAbsent(blobName, value);
+        if (created.applied()) {
+            return created.currentGeneration();
         }
-        return result.currentGeneration();
+        final Optional<BlobRegister> current = container.readRegister(blobName);
+        if (current.isPresent() && isTombstone(current.get().value())) {
+            final BlobRegisterCasResult swapped = container.compareAndSwapRegister(blobName, current.get().generation(), value);
+            if (swapped.applied()) {
+                return swapped.currentGeneration();
+            }
+        }
+        // Name uniqueness, arbitrated by the object store rather than by a cluster-manager.
+        throw new IndexAlreadyExistsException(name);
     }
 
     /**
@@ -87,6 +116,7 @@ public final class DescriptorStore {
      * @throws IOException if the register exists but cannot be read or parsed
      */
     public Optional<IndexDescriptor> get(String indexName) throws IOException {
+        Names.validateIndexOrAlias(indexName);
         final Optional<BlobRegister> register = container.readRegister(RegisterMap.descriptorBlob(indexName));
         if (register.isEmpty()) {
             return Optional.empty();
@@ -142,11 +172,8 @@ public final class DescriptorStore {
     }
 
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
-        final BlobRegisterCasResult result = container.createRegisterIfAbsent(RegisterMap.descriptorBlob(alias.name()), alias.toBytes());
-        if (result.applied() == false) {
-            throw new IndexAlreadyExistsException(alias.name());
-        }
-        return result.currentGeneration();
+        Names.validateIndexOrAlias(alias.name());
+        return createRegister(alias.name(), alias.toBytes());
     }
 
     /**
@@ -159,6 +186,7 @@ public final class DescriptorStore {
      * @throws IOException if the register cannot be read or parsed
      */
     public Resolution resolve(String name) throws IOException {
+        Names.validateIndexOrAlias(name);
         final Optional<BlobRegister> register = container.readRegister(RegisterMap.descriptorBlob(name));
         if (register.isEmpty() || isTombstone(register.get().value())) {
             return new Resolution(null, null);
@@ -241,6 +269,7 @@ public final class DescriptorStore {
      * @throws IOException if the register cannot be read
      */
     public long generationOf(String indexName) throws IOException {
+        Names.validateIndexOrAlias(indexName);
         return container.readRegister(RegisterMap.descriptorBlob(indexName))
             .map(BlobRegister::generation)
             .orElse(BlobRegister.ABSENT_GENERATION);
@@ -302,7 +331,7 @@ public final class DescriptorStore {
         if (swapped.applied() == false) {
             return false;
         }
-        container.deleteBlobsIgnoringIfNotExists(List.of(blobName));
+        // The tombstone stays: see createRegister for why a deleted name must keep its generation.
         return true;
     }
 
@@ -475,6 +504,7 @@ public final class DescriptorStore {
      * @throws IOException if the listing fails
      */
     public List<String> namesWithPrefix(String prefix, int cap) throws IOException {
+        Names.validatePrefix(prefix);
         if (cap < 1) {
             throw new IllegalArgumentException("cap must be positive, got " + cap);
         }

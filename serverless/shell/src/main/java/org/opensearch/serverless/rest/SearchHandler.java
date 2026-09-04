@@ -85,18 +85,49 @@ public final class SearchHandler extends BaseRestHandler {
         );
     }
 
+    /**
+     * The parameters core's own search action exempts from the unconsumed-parameter check, because they
+     * are read while the response is rendered rather than while the request is parsed. {@code typed_keys}
+     * is the one that matters most: the official Java client sets it on every search unconditionally, so a
+     * handler that did not know the name could not serve that client at all.
+     */
+    private static final java.util.Set<String> RESPONSE_PARAMS = java.util.Set.of(
+        org.opensearch.rest.action.search.RestSearchAction.TYPED_KEYS_PARAM,
+        org.opensearch.rest.action.search.RestSearchAction.TOTAL_HITS_AS_INT_PARAM,
+        org.opensearch.rest.action.search.RestSearchAction.INCLUDE_NAMED_QUERIES_SCORE_PARAM
+    );
+
+    @Override
+    protected java.util.Set<String> responseParams() {
+        return RESPONSE_PARAMS;
+    }
+
+    /**
+     * What resolving the names in a request produced: the indices to fan out over, or the refusal.
+     *
+     * @param indices each index and its shard count, in request order
+     * @param skipped names {@code ignore_unavailable} dropped, so the answer can say so
+     * @param status the refusal's status, or null when the names resolved
+     * @param type the refusal's error type, or null
+     * @param reason the refusal's reason, or null
+     */
+    record Resolution(java.util.LinkedHashMap<String, IndexDescriptor> indices, java.util.List<String> skipped, RestStatus status,
+        String type, String reason) {
+        static Resolution refuse(RestStatus status, String type, String reason) {
+            return new Resolution(null, null, status, type, reason);
+        }
+
+        boolean refused() {
+            return status != null;
+        }
+    }
+
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        // Every parameter read before any early return, or BaseRestHandler turns a refusal into a 400
-        // about an unconsumed parameter instead of the one being made here.
-        // A bare /_search names no index, and means every index -- which this shell already expresses as a
-        // prefix pattern, resolved by one bounded listing.
-        final String index = request.param("index") == null ? "*" : request.param("index");
         final boolean counting = request.path().endsWith("/_count");
-        final String q = request.param("q");
-        final int sizeParam = request.paramAsInt("size", 10);
-        final int fromParam = request.paramAsInt("from", 0);
-        final boolean hasBody = request.hasContent();
+        // Read here as well as in plan(): plan runs after this method returns, and BaseRestHandler checks
+        // for unread parameters in between.
+        request.param("pit");
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
@@ -104,61 +135,171 @@ public final class SearchHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-
         final ServerlessNode serving = node.get();
-        final SearchSourceBuilder source;
-        if (hasBody) {
-            try (
-                XContentParser parser = XContentType.JSON.xContent()
-                    .createParser(
-                        serving.searchXContentRegistry(),
-                        DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
-                        request.content().streamInput()
-                    )
-            ) {
-                source = SearchSourceBuilder.fromXContent(parser, true);
-            } catch (Exception e) {
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "bad_query",
-                        "could not parse the search body: " + e.getMessage()
-                    )
-                );
+
+        // Core's own request parser, for the same reason q= uses core's own query-string parser: it is
+        // what these parameters mean in OpenSearch. This handler used to read six of them by hand and let
+        // BaseRestHandler reject the other forty as "unrecognized parameter", which is how the official
+        // Java client (typed_keys on every search) and OpenSearch Dashboards (track_total_hits and
+        // max_concurrent_shard_requests on every search) came to be unable to search this shell at all.
+        // Everything RestSearchAction parses into the SearchSourceBuilder -- sort, _source, stored_fields,
+        // docvalue_fields, track_total_hits, track_scores, timeout, terminate_after, explain, version,
+        // seq_no_primary_term, df, default_operator, analyzer, lenient -- is then forwarded to every shard
+        // exactly as a body field would be, so it is honoured rather than merely accepted. The URL wins over
+        // the body for size, from and q, which is core's precedence; this handler had it the other way
+        // round.
+        final org.opensearch.action.search.SearchRequest searchRequest = new org.opensearch.action.search.SearchRequest();
+        final SearchSourceBuilder source = new SearchSourceBuilder();
+        searchRequest.source(source);
+        final org.opensearch.search.builder.PointInTimeBuilder bodyPit;
+        try {
+            if (request.hasContent()) {
+                try (
+                    XContentParser parser = XContentType.JSON.xContent()
+                        .createParser(
+                            serving.searchXContentRegistry(),
+                            DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                            request.content().streamInput()
+                        )
+                ) {
+                    source.parseXContent(parser, true);
+                }
             }
-        } else if (q != null && q.isBlank() == false) {
-            // Core's own query-string parser, which is what "q=" means in OpenSearch. It was a hand-rolled
-            // split on the first colon, so "q=field:value" worked and "q=hello" -- a bare term across all
-            // fields, the simplest thing a caller can type -- was a 400. The colon form still parses, and
-            // now parses as the query-string syntax it always looked like rather than as a lookalike.
-            source = new SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.queryStringQuery(q));
-        } else if (counting) {
-            // A count with neither a body nor a q= is "how many documents are there", which is a
-            // well-formed question and the most common way the endpoint is called.
-            source = new SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.matchAllQuery());
-        } else {
+            // The body's pit block is taken out before core sees the request. Core's preparePointInTime
+            // decodes the id as a SearchContextId -- a base64 record of shard contexts on nodes -- and
+            // this shell's ids are the names of its own register entries. Read here, honoured below.
+            bodyPit = source.pointInTimeBuilder();
+            source.pointInTimeBuilder(null);
+            org.opensearch.rest.action.search.RestSearchAction.parseSearchRequest(
+                searchRequest,
+                request,
+                null,
+                null,
+                size -> source.size(size)
+            );
+            if (counting) {
+                // _count's own parameter, which _search does not have.
+                final float minScore = request.paramAsFloat("min_score", -1f);
+                if (minScore != -1f) {
+                    source.minScore(minScore);
+                }
+            }
+        } catch (Exception e) {
+            // Everything else is consumed on the way out, or BaseRestHandler reports the parameter it did
+            // not get to instead of the parse failure that stopped it getting there.
+            IndexAdminHandler.consumeAllParams(request);
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "send a search body, or a q= query string")
+                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "could not parse the search: " + e.getMessage())
             );
         }
 
-        if (counting) {
-            // A count asks how many, not which. Fetching hits to throw them away would make the cheap
-            // question cost the same as the expensive one.
-            source.size(0);
-            source.from(0);
-        }
+        // Off the HTTP thread from here: resolving names, reading a point in time and refreshing membership
+        // are object-store round trips, and they used to run on the Netty worker that should have been
+        // reading the next request.
+        return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                plan(request, searchRequest, source, bodyPit, counting).accept(channel);
+            } catch (Exception e) {
+                try {
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                } catch (IOException nested) {
+                    logger.error("failed to report a search failure", nested);
+                }
+            }
+        });
+    }
 
-        // Defaults that belong to the request rather than to the shard, applied only where the body did
-        // not speak. A body's own size wins; the query parameter is the fallback it always was.
-        if (counting == false && source.size() < 0) {
-            source.size(sizeParam);
+    /**
+     * Everything after parsing: refusals, defaults, the point in time, name resolution and the fan-out.
+     *
+     * <p>Split from {@link #prepareRequest} so a search that arrives some other way -- rendered from a
+     * template, say -- runs exactly the search a plain body would, rather than a second copy of this.
+     *
+     * @param request the request, for its remaining parameters and its rendering parameters
+     * @param searchRequest what core parsed into the request
+     * @param parsedSource what core parsed into the source
+     * @param bodyPit the body's point-in-time block, or null
+     * @param counting whether this is a count
+     * @return what to run
+     * @throws IOException if a register cannot be read
+     */
+    RestChannelConsumer plan(
+        RestRequest request,
+        org.opensearch.action.search.SearchRequest searchRequest,
+        SearchSourceBuilder parsedSource,
+        org.opensearch.search.builder.PointInTimeBuilder bodyPit,
+        boolean counting
+    ) throws IOException {
+        final MetadataPlane metadata = plane.get();
+        final ServerlessNode serving = node.get();
+        // Parameters core parsed into the request rather than into the source, each answered on its own
+        // terms. Three change what the answer would be, and are refused. The rest are hints a classic
+        // coordinator may already decline to follow -- which replica, whether to cache, how many shards
+        // to ask at once -- and are consumed without effect: there is one copy of every shard here, the
+        // fan-out's width is fixed, and a hint that cannot be followed is not a reason to refuse the
+        // search that carried it.
+        if (searchRequest.scroll() != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_search",
+                    "scroll holds a search context open on a node; use a point in time (POST /{index}/_search/point_in_time) "
+                        + "with search_after, which is held in the object store and is not tied to one node"
+                )
+            );
         }
-        if (source.from() < 0) {
-            source.from(fromParam);
+        if (searchRequest.routing() != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_search",
+                    "routing is not supported: a document here is placed by its id alone, so there is no routing "
+                        + "value by which a search could narrow to fewer shards"
+                )
+            );
         }
-        source.trackTotalHits(true);
+        final boolean failOnPartial = Boolean.FALSE.equals(searchRequest.allowPartialSearchResults());
+
+        // A search pipeline, named by the search_pipeline parameter or the body, or defined inline in the
+        // body. Its request processors run here, over the request core parsed, before anything is
+        // resolved or fanned out -- so a filter_query processor narrows what every shard is asked -- and
+        // its response processors run over the response the fan-out builds, before it is rendered.
+        final org.opensearch.search.pipeline.PipelinedRequest pipelined;
+        if (searchRequest.pipeline() != null || parsedSource.searchPipelineSource() != null) {
+            try {
+                if (parsedSource.searchPipelineSource() != null) {
+                    pipelined = serving.searchPipelines()
+                        .transformRequest("_ad_hoc_pipeline", parsedSource.searchPipelineSource(), searchRequest);
+                } else {
+                    final Optional<String> stored = metadata.searchPipelines().get(searchRequest.pipeline());
+                    if (stored.isEmpty()) {
+                        return channel -> channel.sendResponse(
+                            IndexAdminHandler.error(
+                                channel,
+                                RestStatus.BAD_REQUEST,
+                                "pipeline_missing",
+                                "no such search pipeline: " + searchRequest.pipeline()
+                            )
+                        );
+                    }
+                    pipelined = serving.searchPipelines().transformRequest(searchRequest.pipeline(), stored.get(), searchRequest);
+                }
+            } catch (Exception e) {
+                return channel -> channel.sendResponse(IndexAdminHandler.failure(channel, e));
+            }
+        } else {
+            pipelined = null;
+        }
+        final java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess = pipelined == null
+            ? response -> response
+            : response -> serving.searchPipelines().transformResponse(pipelined, response);
+        // What the request processors left, when there were any: the pipelined request is a copy, and its
+        // source is the one every shard must be asked with.
+        final SearchSourceBuilder source = pipelined == null ? parsedSource : pipelined.source();
+
+        applyDefaults(source, counting);
 
         final String unsupported = whatCannotBeMerged(source);
         if (unsupported != null) {
@@ -168,8 +309,22 @@ public final class SearchHandler extends BaseRestHandler {
         }
 
         // A frozen view answers for itself: it already knows which index and which shards, so none of the
-        // name resolution below applies to it.
-        final String pitId = request.param("pit");
+        // name resolution below applies to it. Two spellings: this shell's ?pit= and OpenSearch's own body
+        // block. The body block used to parse and then be ignored, so a client paging a point in time by
+        // the book got a live search that looked frozen -- the moving result set the feature exists to
+        // prevent.
+        final String pitParam = request.param("pit");
+        final String pitId;
+        if (bodyPit != null) {
+            if (pitParam != null && pitParam.equals(bodyPit.getId()) == false) {
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "the pit named in the body and in ?pit= differ")
+                );
+            }
+            pitId = bodyPit.getId();
+        } else {
+            pitId = pitParam;
+        }
         if (pitId != null) {
             final var pit = metadata.pointInTime(pitId);
             if (pit.isEmpty() || pit.get().expiredAt(metadata.clock().getAsLong())) {
@@ -185,13 +340,28 @@ public final class SearchHandler extends BaseRestHandler {
                     )
                 );
             }
-            final var frozen = pit.get();
+            org.opensearch.serverless.metadata.PointInTime frozen = pit.get();
+            if (bodyPit != null && bodyPit.getKeepAlive() != null) {
+                // OpenSearch's keep_alive on a search extends the view from now. This shell's expiry is
+                // absolute, so extending it is a new record with a later deadline -- one write, and only
+                // when it actually moves the deadline later, since a keep_alive shorter than what remains
+                // asks for nothing.
+                final long until = metadata.clock().getAsLong() + Math.min(
+                    bodyPit.getKeepAlive().millis(),
+                    PointInTimeHandler.MAX_KEEP_ALIVE_MILLIS
+                );
+                if (until > frozen.expiresAtMillis()) {
+                    frozen = new org.opensearch.serverless.metadata.PointInTime(frozen.id(), frozen.index(), until, frozen.shards());
+                    metadata.extendPointInTime(frozen);
+                }
+            }
+            final var view = frozen;
             return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
                 try {
-                    respondFrozen(channel, serving, metadata, frozen, source, counting);
+                    respondFrozen(channel, serving, metadata, view, source, counting, request, failOnPartial, postProcess);
                 } catch (Exception e) {
                     try {
-                        channel.sendResponse(new BytesRestResponse(channel, e));
+                        channel.sendResponse(IndexAdminHandler.failure(channel, e));
                     } catch (IOException nested) {
                         logger.error("failed to report a frozen search failure", nested);
                     }
@@ -199,39 +369,127 @@ public final class SearchHandler extends BaseRestHandler {
             });
         }
 
-        // Several indices, named one by one or matched by a prefix.
-        //
-        // A comma-separated list is resolved by looking each name up, which costs one register read per
-        // name and no listing. A prefix pattern costs one bounded listing on top of that -- a single
-        // ListObjectsV2 with a maximum key count, whose cost is set by the cap rather than by the
-        // population, so a deployment with a hundred million indices pays what one with ten pays.
-        //
-        // That is why §6.3's refusal of enumeration does not refuse this. The rule was never "listings are
-        // forbidden"; it was that a request must not cost the size of the deployment and must not answer
-        // from a subset while looking complete. A capped listing costs a fixed amount, and a pattern that
-        // matches more than the cap is refused rather than truncated.
-        //
-        // A pattern that is not a prefix stays refused, and the reason is the same one: `*-2026` cannot be
-        // answered by a listing at all, only by reading every name in the deployment and matching each.
+        // A bare /_search names no index, and means every index -- which this shell already expresses as a
+        // prefix pattern, resolved by one bounded listing.
+        final String index = searchRequest.indices().length == 0 ? "*" : String.join(",", searchRequest.indices());
+        // ignore_unavailable and allow_no_indices, from core's own IndicesOptions parsing. allow_no_indices
+        // defaults to true in core and is honoured here only when the caller wrote it: a pattern matching
+        // nothing answering 200 with no hits is the confident empty answer this surface refuses by default,
+        // and a default nobody chose is not the caller saying they mean it.
+        final boolean ignoreUnavailable = searchRequest.indicesOptions().ignoreUnavailable()
+            || (request.hasParam("allow_no_indices") && searchRequest.indicesOptions().allowNoIndices());
+        final Resolution resolved = resolveIndices(metadata, serving, index, ignoreUnavailable);
+        if (resolved.refused()) {
+            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, resolved.status(), resolved.type(), resolved.reason()));
+        }
+
+        // Membership is the address book and the placement input, so refresh once per search rather
+        // than per shard.
+        try {
+            metadata.membership().refresh();
+        } catch (Exception e) {
+            logger.warn("could not refresh membership before searching", e);
+        }
+
+        // Off the HTTP thread. executeQueryPhase hands work to the search pool and this waits for it;
+        // waiting on the transport thread that is meant to be reading the next request resets the
+        // connection, which surfaces to the client as RST_STREAM rather than as anything diagnosable.
+        return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                respond(
+                    channel,
+                    serving,
+                    metadata,
+                    resolved.indices(),
+                    resolved.skipped(),
+                    source,
+                    counting,
+                    request,
+                    failOnPartial,
+                    postProcess
+                );
+            } catch (Exception e) {
+                try {
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                } catch (IOException nested) {
+                    logger.error("failed to report a search failure", nested);
+                }
+            }
+        });
+    }
+
+    /**
+     * The defaults a request gets where its body did not speak.
+     *
+     * <p>Shared with {@code _msearch}, so a search inside a batch is the same search it would be on its
+     * own. {@code track_total_hits} is left exactly as the caller set it -- this used to force it on after
+     * parsing, so a caller asking for a cheaper count got the expensive one and was told {@code eq}.
+     *
+     * @param source the parsed search
+     * @param counting whether this is a {@code _count}, which fetches nothing and counts everything
+     */
+    static void applyDefaults(SearchSourceBuilder source, boolean counting) {
+        if (counting) {
+            // A count asks how many, not which. Fetching hits to throw them away would make the cheap
+            // question cost the same as the expensive one, and a count is exact by definition.
+            source.size(0);
+            source.from(0);
+            source.trackTotalHits(true);
+            return;
+        }
+        if (source.size() < 0) {
+            source.size(10);
+        }
+        if (source.from() < 0) {
+            source.from(0);
+        }
+    }
+
+    /**
+     * Turns the names in a request into the indices to fan out over.
+     *
+     * <p>Extracted from the request path so {@code _msearch} resolves a line the way {@code _search}
+     * resolves a request -- aliases, prefix patterns, {@code ignore_unavailable} and the refusals all
+     * included. Before this, a multi-search silently dropped a named index that did not exist, which is the
+     * confident narrower answer everything else on this surface refuses.
+     *
+     * <p>A comma-separated list is resolved by looking each name up, which costs one register read per
+     * name and no listing. A prefix pattern costs one bounded listing on top of that -- a single
+     * ListObjectsV2 with a maximum key count, whose cost is set by the cap rather than by the
+     * population, so a deployment with a hundred million indices pays what one with ten pays.
+     *
+     * <p>That is why §6.3's refusal of enumeration does not refuse this. The rule was never "listings are
+     * forbidden"; it was that a request must not cost the size of the deployment and must not answer
+     * from a subset while looking complete. A capped listing costs a fixed amount, and a pattern that
+     * matches more than the cap is refused rather than truncated.
+     *
+     * <p>A pattern that is not a prefix stays refused, and the reason is the same one: {@code *-2026}
+     * cannot be answered by a listing at all, only by reading every name in the deployment and matching
+     * each.
+     *
+     * @param metadata the metadata plane
+     * @param serving the node, for its pattern cap
+     * @param index the names as the caller wrote them, comma-separated
+     * @param ignoreUnavailable whether a name that is not there is an expectation rather than a mistake
+     * @return the indices and their shard counts, or the refusal
+     * @throws IOException if a register cannot be read
+     */
+    static Resolution resolveIndices(MetadataPlane metadata, ServerlessNode serving, String index, boolean ignoreUnavailable)
+        throws IOException {
         final java.util.List<String> requested = java.util.List.of(index.split(",", -1));
         for (String name : requested) {
             if (name.isEmpty()) {
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "unsupported_search", "an empty index name was given")
-                );
+                return Resolution.refuse(RestStatus.BAD_REQUEST, "unsupported_search", "an empty index name was given");
             }
             if (name.indexOf('?') >= 0 || isPrefixPattern(name) == false && name.indexOf('*') >= 0) {
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.NOT_IMPLEMENTED,
-                        "unsupported_search",
-                        "only a trailing-wildcard pattern is supported, and ["
-                            + name
-                            + "] is not one: matching it would mean reading every index name in the "
-                            + "deployment, which this system does not offer on a request path. Use a "
-                            + "prefix like [logs-*], or name the indices you want."
-                    )
+                return Resolution.refuse(
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_search",
+                    "only a trailing-wildcard pattern is supported, and ["
+                        + name
+                        + "] is not one: matching it would mean reading every index name in the "
+                        + "deployment, which this system does not offer on a request path. Use a "
+                        + "prefix like [logs-*], or name the indices you want."
                 );
             }
         }
@@ -251,9 +509,7 @@ public final class SearchHandler extends BaseRestHandler {
             try {
                 matched = metadata.namesWithPrefix(prefix, serving.patternCap());
             } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage())
-                );
+                return Resolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             }
             for (String match : matched) {
                 if (names.contains(match) == false) {
@@ -269,11 +525,10 @@ public final class SearchHandler extends BaseRestHandler {
         // avoid, and a typo is far more likely than an absence somebody planned for.
         //
         // But a caller searching yesterday's and today's index, on a day that has only just started, is
-        // saying something different — they know one of these may not exist yet and they mean it. That is
+        // saying something different -- they know one of these may not exist yet and they mean it. That is
         // exactly what ignore_unavailable means everywhere else, and refusing to offer it forces them to
         // either guess or make two requests. It has to be asked for explicitly, which is what makes the
         // distinction real rather than a default nobody chose.
-        final boolean ignoreUnavailable = request.paramAsBoolean("ignore_unavailable", false);
         for (String name : requested) {
             if (isPrefixPattern(name) && fromPattern.stream().noneMatch(match -> match.startsWith(name.substring(0, name.length() - 1)))) {
                 if (ignoreUnavailable) {
@@ -283,12 +538,10 @@ public final class SearchHandler extends BaseRestHandler {
                 // hits and a complete flag is the confident empty answer this surface exists to avoid. A
                 // caller who means "whatever is there, possibly nothing" says so with ignore_unavailable,
                 // the same way they do for a named index that may not exist yet.
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + name + "]")
-                );
+                return Resolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + name + "]");
             }
         }
-        final java.util.LinkedHashMap<String, Integer> indices = new java.util.LinkedHashMap<>();
+        final java.util.LinkedHashMap<String, IndexDescriptor> indices = new java.util.LinkedHashMap<>();
         final java.util.List<String> skipped = new java.util.ArrayList<>();
         for (String name : names) {
             // One read tells us whether the name is an index or an alias, because both live in the same
@@ -309,12 +562,19 @@ public final class SearchHandler extends BaseRestHandler {
                     skipped.add(name);
                     continue;
                 }
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name)
-                );
+                return Resolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name);
             }
             if (resolved.index() != null) {
-                indices.put(name, resolved.index().numberOfShards());
+                if (serving.isSystemIndex(name)) {
+                    // Checked here, on the resolved name, and not only on the path parameter: a comma list,
+                    // a prefix pattern or a body index used to walk straight past the guard.
+                    return Resolution.refuse(
+                        RestStatus.FORBIDDEN,
+                        "system_index",
+                        "[" + name + "] belongs to a plugin and is not reachable through the request path"
+                    );
+                }
+                indices.put(name, resolved.index());
                 continue;
             }
             for (String target : resolved.alias().indices()) {
@@ -329,16 +589,20 @@ public final class SearchHandler extends BaseRestHandler {
                         skipped.add(target);
                         continue;
                     }
-                    return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.NOT_FOUND,
-                            "index_not_found",
-                            "alias [" + name + "] names [" + target + "], which does not exist"
-                        )
+                    return Resolution.refuse(
+                        RestStatus.NOT_FOUND,
+                        "index_not_found",
+                        "alias [" + name + "] names [" + target + "], which does not exist"
                     );
                 }
-                indices.put(target, behind.get().numberOfShards());
+                if (serving.isSystemIndex(target)) {
+                    return Resolution.refuse(
+                        RestStatus.FORBIDDEN,
+                        "system_index",
+                        "[" + target + "] belongs to a plugin and is not reachable through the request path"
+                    );
+                }
+                indices.put(target, behind.get());
             }
         }
         if (indices.isEmpty()) {
@@ -346,38 +610,13 @@ public final class SearchHandler extends BaseRestHandler {
             // not for: the caller allowed for *some* of their indices to be missing, not all of them, and
             // an empty answer over nothing at all is indistinguishable from an empty answer over
             // everything.
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_FOUND,
-                    "index_not_found",
-                    "none of the indices named exist: " + String.join(", ", names)
-                )
+            return Resolution.refuse(
+                RestStatus.NOT_FOUND,
+                "index_not_found",
+                "none of the indices named exist: " + String.join(", ", names)
             );
         }
-
-        // Membership is the address book and the placement input, so refresh once per search rather
-        // than per shard.
-        try {
-            metadata.membership().refresh();
-        } catch (Exception e) {
-            logger.warn("could not refresh membership before searching", e);
-        }
-
-        // Off the HTTP thread. executeQueryPhase hands work to the search pool and this waits for it;
-        // waiting on the transport thread that is meant to be reading the next request resets the
-        // connection, which surfaces to the client as RST_STREAM rather than as anything diagnosable.
-        return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
-            try {
-                respond(channel, serving, metadata, indices, skipped, source, counting);
-            } catch (Exception e) {
-                try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
-                } catch (IOException nested) {
-                    logger.error("failed to report a search failure", nested);
-                }
-            }
-        });
+        return new Resolution(indices, skipped, null, null, null);
     }
 
     /**
@@ -397,7 +636,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @param source the parsed search
      * @return why it cannot be served, or null
      */
-    private static String whatCannotBeMerged(SearchSourceBuilder source) {
+    static String whatCannotBeMerged(SearchSourceBuilder source) {
         if (source.searchAfter() != null) {
             // The two things that make a cursor a cursor. Without a sort there is no order for "after" to
             // be after, and OpenSearch's own answer to search_after with from is the same refusal: the
@@ -424,6 +663,18 @@ public final class SearchHandler extends BaseRestHandler {
         if (source.profile()) {
             return "profile is not supported";
         }
+        if (source.slice() != null) {
+            // Refused here rather than left to fail on the shard, where Lucene's own message -- "slice
+            // cannot be used outside of a scroll context or PIT context" -- names two things this surface
+            // does not have in the terms core has them.
+            return "slice is not supported: a sliced search partitions one scroll or point-in-time context, and a "
+                + "search here runs over each shard's own reader rather than over a context it could partition";
+        }
+        if (source.indexBoosts() != null && source.indexBoosts().isEmpty() == false) {
+            // The per-index boost is fixed at 1.0 where each shard's request is built, so accepting one
+            // would rank a multi-index search as if it had not been given.
+            return "indices_boost is not supported: every shard is queried at the same boost";
+        }
         return null;
     }
 
@@ -442,11 +693,11 @@ public final class SearchHandler extends BaseRestHandler {
      * @throws IOException if the search fails; a filter's own refusal is a runtime exception and passes
      *     through carrying the plugin's status
      */
-    private static <T> T gated(
+    static <T> T gated(
         ServerlessNode serving,
         java.util.Collection<String> indices,
         SearchSourceBuilder source,
-        org.opensearch.common.CheckedSupplier<T, Exception> work
+        org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
     ) throws IOException {
         try {
             return serving.actionGate()
@@ -455,7 +706,13 @@ public final class SearchHandler extends BaseRestHandler {
                     // Every index the search covers, so a filter evaluating privileges sees all of them
                     // rather than the first one named.
                     new org.opensearch.action.search.SearchRequest(indices.toArray(new String[0]), source),
-                    work,
+                    // The source as the filters left it: a document-level security query a filter folded
+                    // into the request reaches every shard, rather than being silently ignored.
+                    admitted -> work.apply(
+                        admitted instanceof org.opensearch.action.search.SearchRequest rewritten && rewritten.source() != null
+                            ? rewritten.source()
+                            : source
+                    ),
                     searchView()
                 );
         } catch (IOException | RuntimeException e) {
@@ -495,31 +752,7 @@ public final class SearchHandler extends BaseRestHandler {
                 public org.opensearch.core.action.ActionResponse show(
                     org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome
                 ) {
-                    final SearchHit[] hits = outcome.hits().toArray(new SearchHit[0]);
-                    final org.opensearch.search.SearchHits searchHits = new org.opensearch.search.SearchHits(
-                        hits,
-                        new org.apache.lucene.search.TotalHits(outcome.total(), org.apache.lucene.search.TotalHits.Relation.EQUAL_TO),
-                        Float.NaN
-                    );
-                    final var internal = new org.opensearch.search.internal.InternalSearchResponse(
-                        searchHits,
-                        outcome.aggregations(),
-                        null,
-                        null,
-                        false,
-                        null,
-                        1
-                    );
-                    return new org.opensearch.action.search.SearchResponse(
-                        internal,
-                        null,
-                        outcome.shards(),
-                        outcome.answered(),
-                        0,
-                        0L,
-                        org.opensearch.action.search.ShardSearchFailure.EMPTY_ARRAY,
-                        org.opensearch.action.search.SearchResponse.Clusters.EMPTY
-                    );
+                    return toResponse(outcome, null, 0L, null);
                 }
 
                 @Override
@@ -528,12 +761,18 @@ public final class SearchHandler extends BaseRestHandler {
                     org.opensearch.serverless.shard.ShardOperations.SearchOutcome original
                 ) {
                     if (response instanceof org.opensearch.action.search.SearchResponse answered) {
+                        final org.apache.lucene.search.TotalHits total = answered.getHits().getTotalHits();
                         return new org.opensearch.serverless.shard.ShardOperations.SearchOutcome(
-                            answered.getHits().getTotalHits() == null ? original.total() : answered.getHits().getTotalHits().value(),
+                            total == null ? original.total() : total.value(),
                             java.util.List.of(answered.getHits().getHits()),
                             original.shards(),
                             original.answered(),
-                            (org.opensearch.search.aggregations.InternalAggregations) answered.getAggregations()
+                            (org.opensearch.search.aggregations.InternalAggregations) answered.getAggregations(),
+                            total == null ? original.relation() : total.relation(),
+                            answered.getHits().getMaxScore(),
+                            answered.isTimedOut(),
+                            answered.isTerminatedEarly(),
+                            java.util.List.of(answered.getShardFailures())
                         );
                     }
                     // A filter that replaced the response with something that is not a search answer.
@@ -565,38 +804,55 @@ public final class SearchHandler extends BaseRestHandler {
         MetadataPlane metadata,
         org.opensearch.serverless.metadata.PointInTime pit,
         SearchSourceBuilder source,
-        boolean counting
+        boolean counting,
+        org.opensearch.core.xcontent.ToXContent.Params params,
+        boolean failOnPartial,
+        java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess
     ) throws IOException {
         final long startNanos = System.nanoTime();
         final var outcome = gated(
             serving,
             java.util.List.of(pit.index()),
             source,
-            () -> SearchFanout.runFrozen(serving, metadata, pit, source)
+            admitted -> SearchFanout.runFrozen(serving, metadata, pit, admitted)
         );
-        render(channel, java.util.Map.of(pit.index(), pit.shards().size()), java.util.List.of(), outcome, tookMillis(startNanos), counting);
+        render(
+            channel,
+            java.util.List.of(),
+            outcome,
+            source,
+            tookMillis(startNanos),
+            counting,
+            pit.id(),
+            params,
+            failOnPartial,
+            postProcess
+        );
     }
 
     private void respond(
         org.opensearch.rest.RestChannel channel,
         ServerlessNode serving,
         MetadataPlane metadata,
-        java.util.Map<String, Integer> indices,
+        java.util.Map<String, IndexDescriptor> indices,
         java.util.List<String> skipped,
         SearchSourceBuilder source,
-        boolean counting
+        boolean counting,
+        org.opensearch.core.xcontent.ToXContent.Params params,
+        boolean failOnPartial,
+        java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess
     ) throws IOException {
         final long startNanos = System.nanoTime();
         // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
         // fan-out rather than going through ShardOperations, so the gate has to meet it where it works.
-        final var outcome = gated(serving, indices.keySet(), source, () -> SearchFanout.run(serving, metadata, indices, source));
-        render(channel, indices, skipped, outcome, tookMillis(startNanos), counting);
+        final var outcome = gated(serving, indices.keySet(), source, admitted -> SearchFanout.run(serving, metadata, indices, admitted));
+        render(channel, skipped, outcome, source, tookMillis(startNanos), counting, null, params, failOnPartial, postProcess);
     }
 
     /**
      * Wall-clock elapsed since a search began, for the {@code took} field real OpenSearch always reports.
      *
-     * <p>Measured around the fan-out only — parsing and validating the request happens before this is
+     * <p>Measured around the fan-out only -- parsing and validating the request happens before this is
      * called, the same boundary a classic node's own {@code took} is measured from.
      *
      * @param startNanos {@link System#nanoTime()} at the moment the fan-out began
@@ -607,190 +863,169 @@ public final class SearchHandler extends BaseRestHandler {
     }
 
     /**
-     * Writes a count, which is a search's total without its hits.
+     * Builds the response a classic node would build from what the fan-out found.
      *
-     * <p>{@code count} is exact rather than a lower bound, because this shell always tracks the total —
-     * there is no {@code track_total_hits} ceiling to hit. The {@code _shards} block is the same one a
-     * search reports, and for the same reason: a count assembled from some of the shards is a different
-     * number from a count assembled from all of them, and a caller must be able to tell.
+     * <p><b>Core's own response object, so core's own renderer.</b> This shell used to write a search
+     * response field by field, and every field it did not write was silently absent: {@code highlight},
+     * {@code _explanation}, {@code _version}, {@code matched_queries}, {@code inner_hits} were all
+     * computed on the shard and dropped here. A real {@link org.opensearch.action.search.SearchResponse}
+     * renders itself, honours {@code typed_keys} and {@code rest_total_hits_as_int}, writes
+     * {@code _score: null} for an unscored hit the way every client's parser expects, and lists the shard
+     * failures it was given. It is also what a plugin's {@code Client} hands back, so the two agree by
+     * construction.
      *
-     * @param channel the channel to answer on
-     * @param outcome what the fan-out returned
-     * @throws IOException if writing fails
+     * <p>{@code hits.total} is omitted when the caller disabled counting, exactly as core omits it.
+     *
+     * @param outcome what the fan-out found
+     * @param source what was asked, for whether the total was tracked; null means it was
+     * @param tookMillis how long it took
+     * @param pitId the view searched, or null
+     * @return the response
      */
-    private void renderCount(org.opensearch.rest.RestChannel channel, org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome)
-        throws IOException {
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("count", outcome.total());
-            builder.startObject("_shards");
-            builder.field("total", outcome.shards());
-            builder.field("successful", outcome.answered());
-            builder.field("skipped", 0);
-            builder.field("failed", outcome.shards() - outcome.answered());
-            builder.endObject();
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
+    public static org.opensearch.action.search.SearchResponse toResponse(
+        org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome,
+        SearchSourceBuilder source,
+        long tookMillis,
+        String pitId
+    ) {
+        final boolean tracked = source == null
+            || source.trackTotalHitsUpTo() == null
+            || source.trackTotalHitsUpTo() != org.opensearch.search.internal.SearchContext.TRACK_TOTAL_HITS_DISABLED;
+        final org.opensearch.search.SearchHits hits = new org.opensearch.search.SearchHits(
+            outcome.hits().toArray(new SearchHit[0]),
+            tracked ? new org.apache.lucene.search.TotalHits(outcome.total(), outcome.relation()) : null,
+            outcome.maxScore()
+        );
+        final var internal = new org.opensearch.search.internal.InternalSearchResponse(
+            hits,
+            outcome.aggregations(),
+            null,
+            null,
+            outcome.timedOut(),
+            outcome.terminatedEarly(),
+            1
+        );
+        return new org.opensearch.action.search.SearchResponse(
+            internal,
+            null,
+            outcome.shards(),
+            outcome.answered(),
+            0,
+            tookMillis,
+            outcome.failures().toArray(new org.opensearch.action.search.ShardSearchFailure[0]),
+            org.opensearch.action.search.SearchResponse.Clusters.EMPTY,
+            pitId
+        );
     }
 
     /**
      * Writes the answer, wherever it came from.
      *
      * <p>Shared by the ordinary search and the frozen one, because a caller must not be able to tell which
-     * path answered from the shape of the response — the difference between them is which commits were
+     * path answered from the shape of the response -- the difference between them is which commits were
      * read, not what a result looks like.
      */
     private void render(
         org.opensearch.rest.RestChannel channel,
-        java.util.Map<String, Integer> indices,
         java.util.List<String> skipped,
         org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome,
+        SearchSourceBuilder source,
         long tookMillis,
-        boolean counting
+        boolean counting,
+        String pitId,
+        org.opensearch.core.xcontent.ToXContent.Params params,
+        boolean failOnPartial,
+        java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess
     ) throws IOException {
+        if (failOnPartial && outcome.failures().isEmpty() == false) {
+            // allow_partial_search_results=false: the caller said a partial answer is no answer. The
+            // first shard's own failure is the response, with its own status, which is what a classic
+            // coordinator does with the same flag.
+            final Throwable cause = outcome.failures().get(0).getCause();
+            channel.sendResponse(new BytesRestResponse(channel, cause instanceof Exception e ? e : new IOException(cause)));
+            return;
+        }
+        final org.opensearch.action.search.SearchResponse response = postProcess.apply(toResponse(outcome, source, tookMillis, pitId));
         if (counting) {
-            renderCount(channel, outcome);
+            renderCount(channel, response, source, params);
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {
-            renderInto(builder, indices, skipped, outcome, tookMillis);
+            builder.startObject();
+            renderInto(builder, skipped, response, outcome.complete(), params);
+            builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
     }
 
     /**
-     * Writes one search's answer into a builder the caller owns.
+     * Writes a count, which is a search's total without its hits.
+     *
+     * <p>The {@code _shards} block is core's own broadcast header, failures included, and for the same
+     * reason a search reports one: a count assembled from some of the shards is a different number from a
+     * count assembled from all of them, and a caller must be able to tell.
+     */
+    private void renderCount(
+        org.opensearch.rest.RestChannel channel,
+        org.opensearch.action.search.SearchResponse response,
+        SearchSourceBuilder source,
+        org.opensearch.core.xcontent.ToXContent.Params params
+    ) throws IOException {
+        try (XContentBuilder builder = channel.newBuilder()) {
+            builder.startObject();
+            if (source.terminateAfter() != org.opensearch.search.internal.SearchContext.DEFAULT_TERMINATE_AFTER) {
+                builder.field("terminated_early", response.isTerminatedEarly());
+            }
+            builder.field("count", response.getHits().getTotalHits().value());
+            org.opensearch.rest.action.RestActions.buildBroadcastShardsHeader(
+                builder,
+                params,
+                response.getTotalShards(),
+                response.getSuccessfulShards(),
+                0,
+                response.getFailedShards(),
+                response.getShardFailures()
+            );
+            builder.endObject();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        }
+    }
+
+    /**
+     * Writes one search's answer into a builder the caller owns, without the enclosing braces.
      *
      * <p>Extracted so {@code _msearch} produces the same body inside its array that {@code _search} produces
-     * on its own. A second renderer would agree with this one until somebody changed one of them, and the
-     * difference would surface as two response shapes for the same query.
+     * on its own -- and can add its per-item {@code status} inside the same object. A second renderer would
+     * agree with this one until somebody changed one of them, and the difference would surface as two
+     * response shapes for the same query.
      *
-     * @param builder the builder to write into, positioned where an object may start
-     * @param indices the indices searched, and how many shards each contributed
+     * <p>Two fields follow core's: {@code complete} has no real-OpenSearch equivalent -- a classic
+     * coordinating node always fans out to every shard it can resolve, so "how much of the index answered"
+     * is not a question it ever has to answer -- and {@code skipped_indices} names what
+     * {@code ignore_unavailable} dropped, which {@code _shards.skipped} (a shard count) does not.
+     *
+     * @param builder the builder to write into, positioned inside an open object
      * @param skipped indices a pattern named that do not exist
-     * @param outcome what the fan-out returned
-     * @param tookMillis how long it took
+     * @param response the response, as core would have built it
+     * @param complete whether every shard answered
+     * @param params the request's rendering parameters, for {@code typed_keys} and friends
      * @throws IOException if writing fails
      */
     static void renderInto(
         XContentBuilder builder,
-        java.util.Map<String, Integer> indices,
         java.util.List<String> skipped,
-        org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome,
-        long tookMillis
+        org.opensearch.action.search.SearchResponse response,
+        boolean complete,
+        org.opensearch.core.xcontent.ToXContent.Params params
     ) throws IOException {
-        {
-            builder.startObject();
-            builder.field("took", tookMillis);
-            // Always false: nothing on this path enforces a search timeout, so there is nothing that could
-            // make this true yet. Stated rather than omitted, because a caller checking this field before
-            // trusting a result must see an honest answer, not an absent key that happens to read as falsy.
-            builder.field("timed_out", false);
-            builder.startObject("_shards");
-            builder.field("total", outcome.shards());
-            // successful/failed, real OpenSearch's own field names -- searched/unreachable were this
-            // shell's own names for the identical count and are gone now, not aliased: a client reading
-            // the real names must get real values, not a second, shell-specific spelling to maintain.
-            builder.field("successful", outcome.answered());
-            builder.field("skipped", 0);
-            builder.field("failed", outcome.shards() - outcome.answered());
-            builder.endObject();
-            // Stated, not implied. A caller reading only "total" would otherwise have no way to tell a
-            // complete answer from one computed over a fraction of the index. No real-OpenSearch field
-            // says this; a coordinating node there always fans out to every shard it can resolve, so
-            // "how much of the index answered" is not a question a classic search ever has to answer.
-            builder.field("complete", outcome.complete());
-            if (skipped.isEmpty() == false) {
-                // Named, not merely counted -- _shards.skipped above is real OpenSearch's count (always 0
-                // here, since nothing on this path skips a shard the way a throttled search can there);
-                // this is a shell-specific list of index *names* dropped by ignore_unavailable, which has
-                // no real-OpenSearch equivalent at all. A caller who asked to ignore what is missing still
-                // has to be able to tell which of their indices this answer does not cover -- otherwise the
-                // flag turns a visible absence into an invisible one, which is worse than the refusal it
-                // replaced.
-                builder.startArray("skipped_indices");
-                for (String name : skipped) {
-                    builder.value(name);
-                }
-                builder.endArray();
-            }
-            builder.startObject("hits");
-            builder.startObject("total");
-            builder.field("value", outcome.total());
-            // Always "eq": trackTotalHits(true) is forced on every search this handler runs (see the
-            // request-parsing side), so "value" is never a lower bound and "relation" never needs to say
-            // otherwise -- unlike real OpenSearch, which reports "gte" once a search stops counting past a
-            // configured ceiling. Nothing here has that ceiling yet, so "eq" is the honest constant.
-            builder.field("relation", "eq");
-            builder.endObject();
-            float maxScore = Float.NaN;
-            for (SearchHit hit : outcome.hits()) {
-                if (Float.isNaN(hit.getScore()) == false && (Float.isNaN(maxScore) || hit.getScore() > maxScore)) {
-                    maxScore = hit.getScore();
-                }
-            }
-            if (Float.isNaN(maxScore) == false) {
-                builder.field("max_score", maxScore);
-            }
-            builder.startArray("hits");
-            for (SearchHit hit : outcome.hits()) {
-                builder.startObject();
-                // The hit's own index, not the request's: a search over several indices returns hits from
-                // several, and telling a caller they all came from the first one named would be a lie that
-                // reads like a formatting detail.
-                builder.field("_index", hit.getIndex() == null ? String.join(",", indices.keySet()) : hit.getIndex());
-                builder.field("_id", hit.getId());
-                if (Float.isNaN(hit.getScore()) == false) {
-                    builder.field("_score", hit.getScore());
-                }
-                if (hit.getFields().isEmpty() == false) {
-                    // script_fields and docvalue_fields. They were computed and then dropped: a caller asking
-                    // for a derived value got hits carrying nothing, which looks like the script produced
-                    // nothing rather than like the renderer forgot it. Values are always an array, as
-                    // OpenSearch returns them, because a field may be multi-valued and a client that
-                    // sometimes gets a scalar has to branch on it.
-                    builder.startObject("fields");
-                    for (var field : hit.getFields().entrySet()) {
-                        builder.startArray(field.getKey());
-                        for (Object value : field.getValue().getValues()) {
-                            builder.value(value);
-                        }
-                        builder.endArray();
-                    }
-                    builder.endObject();
-                }
-                if (hit.getSortValues() != null && hit.getSortValues().length > 0) {
-                    // The cursor a caller sends back as search_after. It was already being relied on by
-                    // paginating clients, which had to re-derive it from the sorted field values.
-                    builder.startArray("sort");
-                    for (Object value : hit.getSortValues()) {
-                        builder.value(value);
-                    }
-                    builder.endArray();
-                }
-                final String hitSource = hit.getSourceAsString();
-                if (hitSource != null && hitSource.isEmpty() == false) {
-                    // Raw, so a document comes back as an object. It used to be written with
-                    // builder.field(String, String), which returned the whole source as one escaped
-                    // string that every client had to unescape before it could read a document.
-                    builder.rawField(
-                        "_source",
-                        new java.io.ByteArrayInputStream(hitSource.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-                        XContentType.JSON
-                    );
-                }
-                builder.endObject();
+        response.innerToXContent(builder, params);
+        builder.field("complete", complete);
+        if (skipped.isEmpty() == false) {
+            builder.startArray("skipped_indices");
+            for (String name : skipped) {
+                builder.value(name);
             }
             builder.endArray();
-            builder.endObject();
-            if (outcome.aggregations() != null) {
-                // Rendered by the aggregations themselves, which is the only way the shape matches what a
-                // classic node returns: every aggregation type knows its own output, and a hand-written
-                // renderer would agree with them until somebody used one it had not met.
-                outcome.aggregations().toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
-            }
-            builder.endObject();
         }
     }
 }

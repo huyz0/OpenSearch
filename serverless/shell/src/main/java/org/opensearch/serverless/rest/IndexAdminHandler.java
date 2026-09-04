@@ -125,7 +125,9 @@ public final class IndexAdminHandler extends BaseRestHandler {
             // reads, so neither costs an object-store request that GET did not already make.
             new Route(RestRequest.Method.GET, "/{index}/_mapping"),
             new Route(RestRequest.Method.GET, "/{index}/_mappings"),
-            new Route(RestRequest.Method.GET, "/{index}/_settings")
+            new Route(RestRequest.Method.GET, "/{index}/_settings"),
+            // One setting, or a prefix of them, out of the same descriptor read.
+            new Route(RestRequest.Method.GET, "/{index}/_settings/{name}")
         );
     }
 
@@ -133,6 +135,25 @@ public final class IndexAdminHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final MetadataPlane metadata = plane.get();
         final String index = request.param("index");
+        // Hints, each with one possible answer here: no cluster manager to time out against, one copy of
+        // each shard for wait_for_active_shards, no closed or hidden indices for expand_wildcards to
+        // reach, no defaults rendered. Consumed so a client library that always sends them is not turned
+        // away with "unrecognized parameter". flat_settings is a rendering choice and is honoured below.
+        for (String hint : new String[] {
+            "local",
+            "include_defaults",
+            "ignore_unavailable",
+            "allow_no_indices",
+            "expand_wildcards",
+            "master_timeout",
+            "cluster_manager_timeout",
+            "timeout",
+            "wait_for_active_shards",
+            "include_type_name" }) {
+            request.param(hint);
+        }
+        final boolean flatSettings = request.paramAsBoolean("flat_settings", false);
+        final String settingName = request.param("name");
         if (metadata == null) {
             return channel -> channel.sendResponse(
                 error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "this node has no metadata plane configured")
@@ -165,7 +186,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         // Which projection of the descriptor this path asks for. _mapping and _settings are the same read
         // as GET /{index}, rendered narrower, so neither adds an object-store request.
         final View view;
-        if (request.path().endsWith("/_settings")) {
+        if (request.path().endsWith("/_settings") || settingName != null) {
             view = View.SETTINGS;
         } else if (request.path().endsWith("/_mapping") || request.path().endsWith("/_mappings")) {
             view = View.MAPPING;
@@ -209,24 +230,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                             org.opensearch.action.admin.indices.create.CreateIndexAction.NAME,
                             new org.opensearch.action.admin.indices.create.CreateIndexRequest(index),
                             () -> {
-                                // What matching templates contribute, layered under whatever the request
-                                // said. A caller who spelled out a mapping is not overruled by
-                                // configuration they may not know exists.
-                                final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolve(
-                                    metadata.indexTemplates().all(),
-                                    metadata.componentTemplates().all(),
-                                    index
-                                );
-                                resolvedShards.set(CreateRequest.shardsWith(shards, create.explicitShards, inherited));
-                                metadata.createIndex(
-                                    new IndexDescriptor(
-                                        index,
-                                        UUID.randomUUID().toString(),
-                                        resolvedShards.get(),
-                                        CreateRequest.mappingWith(mapping, inherited),
-                                        CreateRequest.settingsWith(create.settings, inherited)
-                                    )
-                                );
+                                resolvedShards.set(createIndex(metadata, index, create).numberOfShards());
                                 return null;
                             }
                         );
@@ -269,11 +273,22 @@ public final class IndexAdminHandler extends BaseRestHandler {
                     try (XContentBuilder builder = channel.newBuilder()) {
                         builder.startObject();
                         builder.startObject(index);
+                        if (view == View.FULL) {
+                            // Core's shape, keyed by alias name. Verified against each alias record, so an
+                            // alias that lost its creation race or has since moved on is not listed; the
+                            // cost is one register read per alias that names this index, and nothing for
+                            // an index nothing names.
+                            builder.startObject("aliases");
+                            for (String alias : metadata.aliasesOf(descriptor.get())) {
+                                builder.startObject(alias).endObject();
+                            }
+                            builder.endObject();
+                        }
                         if (view != View.SETTINGS) {
                             renderMapping(builder, descriptor.get());
                         }
                         if (view != View.MAPPING) {
-                            renderSettings(builder, descriptor.get());
+                            renderSettings(builder, descriptor.get(), settingName);
                         }
                         builder.endObject();
                         builder.endObject();
@@ -366,31 +381,63 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * @param descriptor the index
      * @throws IOException if writing fails
      */
-    private static void renderSettings(XContentBuilder builder, IndexDescriptor descriptor) throws IOException {
-        builder.startObject("settings");
-        builder.startObject("index");
+    private static void renderSettings(XContentBuilder builder, IndexDescriptor descriptor, String only) throws IOException {
+        final java.util.Map<String, String> settings = new java.util.LinkedHashMap<>();
         // Strings, not numbers, because that is what OpenSearch returns: settings are a string map there.
-        builder.field("number_of_shards", Integer.toString(descriptor.numberOfShards()));
+        settings.put("number_of_shards", Integer.toString(descriptor.numberOfShards()));
         // Zero, and true: a shard here has exactly one writer, and its redundancy is the object store
         // rather than a second copy. Reporting it is more honest than omitting it, because a client
         // reading a replica count gets the real one.
-        builder.field("number_of_replicas", "0");
-        builder.field("uuid", descriptor.uuid());
-        builder.field("provided_name", descriptor.name());
+        settings.put("number_of_replicas", "0");
+        settings.put("uuid", descriptor.uuid());
+        settings.put("provided_name", descriptor.name());
+        // Recorded at creation since M62; a descriptor from before then has neither, and omitting them is
+        // truer than inventing a moment or a version.
+        if (descriptor.createdAtMillis() != 0L) {
+            settings.put("creation_date", Long.toString(descriptor.createdAtMillis()));
+        }
+        if (descriptor.createdVersionId() != 0) {
+            settings.put("version.created", Integer.toString(descriptor.createdVersionId()));
+        }
         for (String key : descriptor.extraSettings().keySet()) {
             final String bare = key.startsWith(IndexMetadata.INDEX_SETTING_PREFIX)
                 ? key.substring(IndexMetadata.INDEX_SETTING_PREFIX.length())
                 : key;
-            builder.field(bare, descriptor.extraSettings().get(key));
+            settings.put(bare, descriptor.extraSettings().get(key));
+        }
+        builder.startObject("settings");
+        builder.startObject("index");
+        for (java.util.Map.Entry<String, String> setting : settings.entrySet()) {
+            if (only == null || matchesSettingName(setting.getKey(), only)) {
+                if ("version.created".equals(setting.getKey())) {
+                    // Nested, as core renders it: settings.index.version.created.
+                    builder.startObject("version").field("created", setting.getValue()).endObject();
+                } else {
+                    builder.field(setting.getKey(), setting.getValue());
+                }
+            }
         }
         builder.endObject();
         builder.endObject();
     }
 
+    /** {@code GET /{index}/_settings/{name}}: an exact name, with or without the {@code index.} prefix, or a trailing-star prefix. */
+    private static boolean matchesSettingName(String bare, String wanted) {
+        for (String each : wanted.split(",")) {
+            final String name = each.startsWith(IndexMetadata.INDEX_SETTING_PREFIX)
+                ? each.substring(IndexMetadata.INDEX_SETTING_PREFIX.length())
+                : each;
+            if (name.endsWith("*") ? bare.startsWith(name.substring(0, name.length() - 1)) : bare.equals(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** A refusal raised while parsing, carrying the status and type the caller should see. */
-    private static final class RefusedException extends Exception {
-        private final RestStatus status;
-        private final String type;
+    static final class RefusedException extends Exception {
+        final RestStatus status;
+        final String type;
 
         RefusedException(RestStatus status, String type, String reason) {
             super(reason);
@@ -419,12 +466,41 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * send. The two cannot be confused: a mapping's top level is {@code properties}, {@code _source},
      * {@code dynamic} and the like.
      */
-    private static final class CreateRequest {
-        private final int shards;
-        private final String mapping;
-        private final Settings settings;
+    /**
+     * Creates an index from a request, with what matching templates contribute layered under it.
+     *
+     * <p>A caller who spelled out a mapping is not overruled by configuration they may not know exists.
+     * Shared with rollover and data streams, which create indices the same way from a body of their own.
+     *
+     * @param metadata the metadata plane
+     * @param index the name
+     * @param create the request
+     * @return the descriptor as created
+     * @throws IOException if a register cannot be read or written
+     */
+    static IndexDescriptor createIndex(MetadataPlane metadata, String index, CreateRequest create) throws IOException {
+        final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolve(
+            metadata.indexTemplates().all(),
+            metadata.componentTemplates().all(),
+            index
+        );
+        final IndexDescriptor descriptor = new IndexDescriptor(
+            index,
+            UUID.randomUUID().toString(),
+            CreateRequest.shardsWith(create.shards, create.explicitShards, inherited),
+            CreateRequest.mappingWith(create.mapping, inherited),
+            CreateRequest.settingsWith(create.settings, inherited)
+        ).createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id);
+        metadata.createIndex(descriptor);
+        return descriptor;
+    }
+
+    static final class CreateRequest {
+        final int shards;
+        final String mapping;
+        final Settings settings;
         /** Whether the caller named a shard count, as opposed to falling through to the default of one. */
-        private final boolean explicitShards;
+        final boolean explicitShards;
 
         /**
          * The shard count to create with: the caller's if they gave one, else a template's, else the default.
@@ -508,7 +584,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
             return result.isEmpty() ? null : result;
         }
 
-        private CreateRequest(int shards, String mapping, Settings settings) {
+        CreateRequest(int shards, String mapping, Settings settings) {
             this(shards, mapping, settings, false);
         }
 
@@ -532,6 +608,27 @@ public final class IndexAdminHandler extends BaseRestHandler {
                     false,
                     org.opensearch.common.xcontent.XContentType.JSON
                 ).v2();
+            } catch (Exception e) {
+                throw new RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "the body is not a JSON object");
+            }
+            return parse(parsed, body, fromQuery);
+        }
+
+        /**
+         * Reads a create-index body already parsed, for a caller that builds one -- a rollover carrying the
+         * body's settings and mappings to the index it creates.
+         *
+         * @param parsed the body
+         * @param body the body's text, for the bare-mapping form
+         * @param fromQuery the shard count the query gave, 1 when it gave none
+         * @return the request
+         * @throws RefusedException if the body asks for something refused
+         */
+        static CreateRequest parse(Map<String, Object> parsed, String body, int fromQuery) throws RefusedException {
+            try {
+                if (parsed == null) {
+                    throw new IllegalArgumentException("no body");
+                }
             } catch (Exception e) {
                 throw new RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "could not parse the request body: " + e.getMessage());
             }
@@ -618,6 +715,120 @@ public final class IndexAdminHandler extends BaseRestHandler {
             final Settings carried = rest.build();
             return new CreateRequest(shards, mapping, carried.isEmpty() ? null : carried, requested != null || fromQuery != 1);
         }
+    }
+
+    /**
+     * Reads every parameter a request carries, so a refusal made before a handler got to them all renders
+     * as itself rather than as BaseRestHandler's "unrecognized parameter" about whichever one it had not
+     * reached yet.
+     *
+     * @param request the request
+     */
+    /**
+     * Runs work under the plugins' action filters, named as core names the action.
+     *
+     * <p>The same call every handler makes, so the table of what is gated is the table of handlers that
+     * call this -- not a list kept elsewhere that drifts. Two-thirds of this surface used to reach the
+     * metadata plane directly, and a security plugin's privilege evaluation never ran for any of it.
+     *
+     * @param <T> what the work returns
+     * @param serving the node, or null before one is wired
+     * @param action core's action name
+     * @param request the request a filter evaluates, carrying the indices it touches
+     * @param work what to do if admitted
+     * @return what the work returned
+     * @throws Exception a filter's refusal, or the work's failure
+     */
+    /**
+     * Words a failed forward for the caller, telling a deadline apart from a refusal.
+     *
+     * <p>A forward that timed out is not "stale routing, retry": the owner may have applied the write
+     * and been slow to answer, and a client that retries an auto-id write on that message writes the
+     * document twice. The deadline case says so, so the client can read before it writes again.
+     *
+     * @param owner the node the request was forwarded to
+     * @param e what went wrong
+     * @return the message
+     */
+    public static String forwardFailureMessage(String owner, Exception e) {
+        if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.transport.ReceiveTimeoutTransportException.class) != null
+            || org.opensearch.ExceptionsHelper.unwrap(
+                e,
+                org.opensearch.common.util.concurrent.UncategorizedExecutionException.class
+            ) != null && e.getMessage() != null && e.getMessage().contains("imeout")) {
+            return "the owner "
+                + owner
+                + " did not answer within the deadline; the operation may or may not have been applied there, so read before retrying a write";
+        }
+        return "could not forward to " + owner + ", which the shard-head named as owner: " + e.getMessage();
+    }
+
+    public static <T> T gate(
+        org.opensearch.serverless.shell.ServerlessNode serving,
+        String action,
+        org.opensearch.action.ActionRequest request,
+        org.opensearch.common.CheckedSupplier<T, Exception> work
+    ) throws Exception {
+        return serving == null ? work.get() : serving.actionGate().run(action, request, work);
+    }
+
+    /**
+     * Renders an uncaught failure without the node's internals.
+     *
+     * <p>Core's own renderer, except that an object-store failure carrying a filesystem path is answered
+     * as what it is -- an object-store failure naming the blob -- rather than with the absolute path of
+     * a file on this node's disk.
+     *
+     * @param channel the channel to answer on
+     * @param e the failure
+     * @return the response
+     * @throws IOException if rendering fails
+     */
+    static BytesRestResponse failure(org.opensearch.rest.RestChannel channel, Exception e) throws IOException {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof java.nio.file.FileSystemException fs) {
+                final String blob = fs.getFile() == null ? "?" : java.nio.file.Path.of(fs.getFile()).getFileName().toString();
+                return error(
+                    channel,
+                    RestStatus.INTERNAL_SERVER_ERROR,
+                    "object_store_failure",
+                    cause.getClass().getSimpleName() + " on blob [" + blob + "]"
+                );
+            }
+            if (cause == cause.getCause()) {
+                break;
+            }
+        }
+        return new BytesRestResponse(channel, e);
+    }
+
+    static void consumeAllParams(RestRequest request) {
+        for (String name : java.util.List.copyOf(request.params().keySet())) {
+            request.param(name);
+        }
+    }
+
+    /**
+     * Reads {@code refresh} the way core reads it: {@code true}, {@code false}, bare (meaning true) or
+     * {@code wait_for}.
+     *
+     * <p>{@code wait_for} means "answer once this write is visible to search". A write here is made
+     * visible by refreshing the shard before answering, which is what {@code true} does -- so the two
+     * spellings ask for the same thing at the same cost, and {@code wait_for} is honoured by doing it.
+     * This used to be parsed as a boolean, which made a spelling every client library offers a 400.
+     *
+     * @param request the request
+     * @return whether to refresh before answering
+     */
+    static boolean refresh(RestRequest request) {
+        final String value = request.param("refresh");
+        if (value == null) {
+            return false;
+        }
+        if (value.isEmpty() || "wait_for".equals(value)) {
+            return true;
+        }
+        return org.opensearch.common.Booleans.parseBoolean(value);
     }
 
     /**

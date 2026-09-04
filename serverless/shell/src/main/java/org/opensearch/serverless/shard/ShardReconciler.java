@@ -332,6 +332,13 @@ public final class ShardReconciler {
                 // createShard and recovery: the store exists but nothing has opened it yet. Using
                 // EMPTY_STORE here instead would call Store#createEmpty and delete exactly this.
                 publisher.restoreInto(shard.store().directory(), shardId);
+            } else {
+                // A reader keeps its local directory across releases, and the history bootstrap below
+                // writes a local segments_{N+1} over the remote segments_N. The writer's next publish is
+                // also segments_{N+1}, and the directory prefers the local file -- so a reopened reader
+                // loaded its own stale commit and recorded the new manifest as current, one commit behind
+                // forever. Local commit files are dropped first; the remote ones are the truth.
+                dropLocalCommits(shard.store().directory());
             }
             // A reader skips the download entirely: its directory already sees the published files and
             // fetches the blocks a query touches. Both still need a translog, because recovery reads
@@ -610,6 +617,19 @@ public final class ShardReconciler {
      * than continued. Operations the previous writer had accepted but not committed are lost here; that
      * is what a write-ahead log is for, and this phase does not have one (see phase 4's notes).
      */
+    /** Removes local {@code segments_*} and {@code pending_segments_*} files so a remote commit is what opens. */
+    private static void dropLocalCommits(org.apache.lucene.store.Directory directory) throws IOException {
+        for (String name : directory.listAll()) {
+            if (name.startsWith("segments_") || name.startsWith("pending_segments_")) {
+                try {
+                    directory.deleteFile(name);
+                } catch (java.nio.file.NoSuchFileException | java.io.FileNotFoundException ignored) {
+                    // remote-only, which is the state we want
+                }
+            }
+        }
+    }
+
     private void bootstrapTranslogFor(IndexShard shard) throws IOException {
         shard.store().bootstrapNewHistory();
         final org.apache.lucene.index.SegmentInfos segmentInfos = shard.store().readLastCommittedSegmentsInfo();
@@ -744,6 +764,11 @@ public final class ShardReconciler {
         if (indexService == null) {
             return;
         }
+        if (indexService.getMetadata().getMappingVersion() >= descriptor.mappingVersion()) {
+            // Already holding this mapping or a newer one. Core asserts that a mapping re-applied at the
+            // same version is byte-identical to what it holds, and the descriptor's rendering is not.
+            return;
+        }
         indexService.updateMapping(indexService.getMetadata(), descriptor.toIndexMetadata(java.util.Map.of()));
     }
 
@@ -771,6 +796,9 @@ public final class ShardReconciler {
         }
         final IndexService indexService = indicesService.indexService(index);
         if (indexService == null) {
+            return;
+        }
+        if (indexService.getMetadata().getSettingsVersion() >= descriptor.settingsVersion()) {
             return;
         }
         indexService.updateMetadata(indexService.getMetadata(), descriptor.toIndexMetadata(java.util.Map.of()));

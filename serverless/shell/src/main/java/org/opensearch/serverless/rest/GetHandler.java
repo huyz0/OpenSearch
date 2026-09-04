@@ -96,11 +96,65 @@ public final class GetHandler extends BaseRestHandler {
         // way; see SourceFiltering.
         final org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource = org.opensearch.search.fetch.subphase.FetchSourceContext
             .parseFromRestRequest(request);
+        final String storedFields = request.param("stored_fields");
+        final String routing = request.param("routing");
+        final String version = request.param("version");
+        final String versionType = request.param("version_type");
+        // Hints. A get is served by the shard's owner and sees every acknowledged write, which is what
+        // realtime=true and refresh=true ask for and more than realtime=false needs; there is one copy of
+        // each shard for preference to choose between. Consumed so a client that always sends them is not
+        // turned away, and answered with the realtime field the response already carries.
+        request.param("realtime");
+        request.param("refresh");
+        request.param("preference");
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+            );
+        }
+        if (storedFields != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_read",
+                    "stored_fields is not supported: a get here returns the document's source, filtered by _source"
+                )
+            );
+        }
+        if (routing != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_read",
+                    "routing is not supported: a document is placed by its id alone, so a routing value would be "
+                        + "accepted and change nothing"
+                )
+            );
+        }
+        if (version != null || versionType != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_read",
+                    "version on a get asks for external versioning, which this system does not have; the response "
+                        + "carries the _seq_no and _primary_term a conditional write compares against"
+                )
+            );
+        }
+        if (sourceOnly && fetchSource != null && fetchSource.fetchSource() == false) {
+            // Core's own refusal, with its own words: the endpoint exists to return the source.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "action_request_validation_exception",
+                    "fetching source can not be disabled"
+                )
             );
         }
         final Optional<IndexDescriptor> descriptor = metadata.describe(index);
@@ -117,7 +171,7 @@ public final class GetHandler extends BaseRestHandler {
                 answer(channel, serving, metadata, index, id, shard, bodyless, fetchSource, sourceOnly);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a read failure", nested);
                 }
@@ -175,14 +229,22 @@ public final class GetHandler extends BaseRestHandler {
             return;
         }
         if (sourceOnly) {
-            // The document, and nothing wrapped around it. A missing document is still a 404 -- returning an
-            // empty body with a 200 would be indistinguishable from a document that happens to be empty.
-            final String only = document.found() ? SourceFiltering.apply(document.source(), fetchSource) : null;
-            channel.sendResponse(
-                only == null
-                    ? new BytesRestResponse(status, BytesRestResponse.TEXT_CONTENT_TYPE, "")
-                    : new BytesRestResponse(status, XContentType.JSON.mediaType(), only)
-            );
+            // The document, and nothing wrapped around it. A missing document is a 404 carrying core's own
+            // error object -- this used to be an empty text/plain body, which a client parsing errors
+            // structurally could not read at all.
+            if (document.found() == false) {
+                channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.NOT_FOUND,
+                        "resource_not_found_exception",
+                        "Document not found [" + index + "]/[" + document.id() + "]"
+                    )
+                );
+                return;
+            }
+            final String only = SourceFiltering.apply(document.source(), fetchSource);
+            channel.sendResponse(new BytesRestResponse(status, XContentType.JSON.mediaType(), only == null ? "{}" : only));
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {

@@ -14,7 +14,6 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -40,7 +39,6 @@ public final class SearchFanout {
      * @param serving the node coordinating the search
      * @param metadata the metadata plane
      * @param index the index
-     * @param shards how many shards it has
      * @param source the query, with its own from and size
      * @return what was found and how completely
      * @throws IOException if the search fails outright
@@ -48,11 +46,10 @@ public final class SearchFanout {
     public static ShardOperations.SearchOutcome run(
         ServerlessNode serving,
         MetadataPlane metadata,
-        String index,
-        int shards,
+        org.opensearch.serverless.cluster.IndexDescriptor index,
         SearchSourceBuilder source
     ) throws IOException {
-        return run(serving, metadata, java.util.Map.of(index, shards), source);
+        return run(serving, metadata, java.util.Map.of(index.name(), index), source);
     }
 
     /**
@@ -114,6 +111,7 @@ public final class SearchFanout {
         // why. Without this the response was "no shard could be opened" with nothing behind it, which is
         // the shape of an answer and none of the content.
         final java.util.concurrent.atomic.AtomicReference<Exception> firstFailure = new java.util.concurrent.atomic.AtomicReference<>();
+        final List<org.opensearch.action.search.ShardSearchFailure> failures = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>();
         for (Integer shard : pit.shards().keySet()) {
             tasks.add(() -> {
@@ -121,49 +119,37 @@ public final class SearchFanout {
                     return askOneFrozenShard(serving, metadata, pit, shard, perShard);
                 } catch (Exception e) {
                     firstFailure.compareAndSet(null, e);
+                    failures.add(failure(pit.index(), shard, e));
                     throw e;
                 }
             });
         }
         final List<ShardAnswer> answers;
         try {
-            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), Fanout.DEFAULT_CONCURRENCY, tasks);
+            answers = Fanout.run(serving.threadPool().executor(ServerlessNode.FANOUT_POOL), Fanout.DEFAULT_CONCURRENCY, tasks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted while searching the point in time " + pit.id(), e);
         }
-
-        long total = 0;
-        int answered = 0;
-        final List<SearchHit> merged = new ArrayList<>();
-        final List<org.opensearch.search.aggregations.InternalAggregations> shardAggregations = new ArrayList<>();
-        for (ShardAnswer answer : answers) {
-            if (answer == null) {
-                continue;
+        final Merged merged = merge(serving, answers, source);
+        try {
+            if (merged.answered == 0) {
+                final Exception cause = firstFailure.get();
+                if (cause instanceof RuntimeException runtime) {
+                    throw runtime;
+                }
+                throw new IOException("no shard of the point in time " + pit.id() + " could be opened", cause);
             }
-            total += answer.total;
-            merged.addAll(answer.hits);
-            if (answer.aggregations != null) {
-                shardAggregations.add(answer.aggregations);
-            }
-            answered++;
+            return merged.outcome(serving, source, pit.shards().size(), from, size, failures);
+        } finally {
+            merged.release(serving);
         }
-        if (answered == 0) {
-            final Exception cause = firstFailure.get();
-            if (cause instanceof RuntimeException runtime) {
-                throw runtime;
-            }
-            throw new IOException("no shard of the point in time " + pit.id() + " could be opened", cause);
-        }
-        merged.sort(order(source));
-        final List<SearchHit> page = merged.stream().skip(from).limit(size).collect(java.util.stream.Collectors.toList());
-        return new ShardOperations.SearchOutcome(total, page, pit.shards().size(), answered, reduce(serving, source, shardAggregations));
     }
 
     public static ShardOperations.SearchOutcome run(
         ServerlessNode serving,
         MetadataPlane metadata,
-        java.util.Map<String, Integer> indices,
+        java.util.Map<String, org.opensearch.serverless.cluster.IndexDescriptor> indices,
         SearchSourceBuilder source
     ) throws IOException {
         final int from = Math.max(0, source.from());
@@ -190,16 +176,36 @@ public final class SearchFanout {
         // confident empty answer this surface exists to avoid -- so the first failure is carried out and
         // becomes the response.
         final java.util.concurrent.atomic.AtomicReference<Exception> firstFailure = new java.util.concurrent.atomic.AtomicReference<>();
+        // Why each shard that did not answer did not answer, kept for the response rather than only for
+        // the log. _shards.failed used to be a bare count: a caller could see that a shard was missing
+        // from the answer and had no way to learn whether it was a circuit breaker, a peer that timed out
+        // or a shard nobody is serving -- which are three different things to do next.
+        final List<org.opensearch.action.search.ShardSearchFailure> failures = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>();
-        for (java.util.Map.Entry<String, Integer> index : indices.entrySet()) {
-            for (int shard = 0; shard < index.getValue(); shard++) {
+        for (java.util.Map.Entry<String, org.opensearch.serverless.cluster.IndexDescriptor> index : indices.entrySet()) {
+            for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
                 final int number = shard;
                 final String name = index.getKey();
+                final org.opensearch.serverless.cluster.IndexDescriptor descriptor = index.getValue();
                 tasks.add(() -> {
                     try {
-                        return askOneShard(serving, metadata, name, number, perShard);
+                        final ShardAnswer answer = askOneShard(serving, metadata, descriptor, number, perShard);
+                        if (answer == null) {
+                            failures.add(
+                                failure(
+                                    name,
+                                    number,
+                                    new org.opensearch.action.NoShardAvailableActionException(
+                                        new ShardId(new org.opensearch.core.index.Index(name, "_na_"), number),
+                                        "no node is serving shard " + number + " of " + name
+                                    )
+                                )
+                            );
+                        }
+                        return answer;
                     } catch (Exception e) {
                         firstFailure.compareAndSet(null, e);
+                        failures.add(failure(name, number, e));
                         throw e;
                     }
                 });
@@ -208,44 +214,170 @@ public final class SearchFanout {
         }
         final List<ShardAnswer> answers;
         try {
-            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), Fanout.DEFAULT_CONCURRENCY, tasks);
+            answers = Fanout.run(serving.threadPool().executor(ServerlessNode.FANOUT_POOL), Fanout.DEFAULT_CONCURRENCY, tasks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted while searching " + indices.keySet(), e);
         }
 
-        long total = 0;
-        int answered = 0;
-        final List<SearchHit> merged = new ArrayList<>();
-        final List<org.opensearch.search.aggregations.InternalAggregations> shardAggregations = new ArrayList<>();
-        for (ShardAnswer answer : answers) {
-            if (answer == null) {
-                continue;
+        final Merged merged = merge(serving, answers, source);
+        try {
+            if (merged.answered == 0 && shards > 0) {
+                final Exception cause = firstFailure.get();
+                if (cause instanceof RuntimeException runtime) {
+                    // Rethrown as itself, so a circuit-breaking exception still answers 429 and a security
+                    // refusal still answers 403 rather than every failure collapsing into one status.
+                    throw runtime;
+                }
+                if (cause != null) {
+                    throw new IOException("no shard of " + indices.keySet() + " could answer this search", cause);
+                }
+                throw new IOException("no shard of " + indices.keySet() + " could answer this search; no node is serving them");
             }
-            total += answer.total;
-            merged.addAll(answer.hits);
-            if (answer.aggregations != null) {
-                shardAggregations.add(answer.aggregations);
+            return merged.outcome(serving, source, shards, from, size, failures);
+        } finally {
+            merged.release(serving);
+        }
+    }
+
+    /** The breaker a coordinator's working set is charged to, which is core's request breaker. */
+    private static org.opensearch.core.common.breaker.CircuitBreaker breaker(ServerlessNode serving) {
+        return serving.circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST);
+    }
+
+    /** What the shards that answered add up to, before the window is cut. */
+    private static final class Merged {
+        /** Bytes charged to the request breaker for what this holds, given back by {@link #release}. */
+        private long reserved;
+
+        private void release(ServerlessNode serving) {
+            if (reserved > 0) {
+                breaker(serving).addWithoutBreaking(-reserved);
+                reserved = 0;
             }
-            answered++;
         }
 
-        if (answered == 0 && shards > 0) {
-            final Exception cause = firstFailure.get();
-            if (cause instanceof RuntimeException runtime) {
-                // Rethrown as itself, so a circuit-breaking exception still answers 429 and a security
-                // refusal still answers 403 rather than every failure collapsing into one status.
-                throw runtime;
-            }
-            if (cause != null) {
-                throw new IOException("no shard of " + indices.keySet() + " could answer this search", cause);
-            }
-            throw new IOException("no shard of " + indices.keySet() + " could answer this search; no node is serving them");
-        }
+        private long total;
+        private int answered;
+        private org.apache.lucene.search.TotalHits.Relation relation = org.apache.lucene.search.TotalHits.Relation.EQUAL_TO;
+        private float maxScore = Float.NaN;
+        private boolean timedOut;
+        private Boolean terminatedEarly;
+        private final List<SearchHit> hits = new ArrayList<>();
+        private final List<org.opensearch.search.aggregations.InternalAggregations> aggregations = new ArrayList<>();
 
-        merged.sort(order(source));
-        final List<SearchHit> page = merged.stream().skip(from).limit(size).collect(java.util.stream.Collectors.toList());
-        return new ShardOperations.SearchOutcome(total, page, shards, answered, reduce(serving, source, shardAggregations));
+        private ShardOperations.SearchOutcome outcome(
+            ServerlessNode serving,
+            SearchSourceBuilder source,
+            int shards,
+            int from,
+            int size,
+            List<org.opensearch.action.search.ShardSearchFailure> failures
+        ) {
+            hits.sort(order(source));
+            final List<SearchHit> page = hits.stream().skip(from).limit(size).collect(java.util.stream.Collectors.toList());
+            // In shard order rather than in the order the failures happened to be recorded, so two runs of
+            // the same broken search report the same list.
+            final List<org.opensearch.action.search.ShardSearchFailure> ordered = new ArrayList<>(failures);
+            ordered.sort(
+                java.util.Comparator.comparing((org.opensearch.action.search.ShardSearchFailure f) -> f.index() == null ? "" : f.index())
+                    .thenComparingInt(org.opensearch.action.search.ShardSearchFailure::shardId)
+            );
+            return new ShardOperations.SearchOutcome(
+                total,
+                page,
+                shards,
+                answered,
+                reduce(serving, source, aggregations),
+                relation,
+                maxScore,
+                timedOut,
+                terminatedEarly,
+                ordered
+            );
+        }
+    }
+
+    /**
+     * Adds up what the shards answered, the way a classic coordinator's reduce does.
+     *
+     * <p>A total is a sum, and it is exact only while every shard's was; a search that stopped counting on
+     * one shard has a lower bound, not a count. {@code timed_out} is true if any shard ran out of time.
+     * {@code terminated_early} is null unless some shard was asked, and true if any of those stopped
+     * early. The best score is the best over every shard's own best -- computed over everything each
+     * shard looked at, not over the page that survived the cut, which is what real OpenSearch's
+     * {@code max_score} means.
+     */
+    private static Merged merge(ServerlessNode serving, List<ShardAnswer> answers, SearchSourceBuilder source) {
+        final Merged merged = new Merged();
+        // The window every shard was asked for. The merge keeps at most twice that many hits at any moment:
+        // once the pile is that deep it is sorted and cut back to the window, so a wide index costs the
+        // coordinator two windows of hits rather than a window per shard.
+        final int window = Math.max(1, Math.max(0, source.from()) + Math.max(0, source.size()));
+        final java.util.Comparator<SearchHit> order = order(source);
+        final org.opensearch.core.common.breaker.CircuitBreaker breaker = breaker(serving);
+        try {
+            for (ShardAnswer answer : answers) {
+                if (answer == null) {
+                    continue;
+                }
+                // Charged to core's request breaker before it is kept, so a reply too large for this node
+                // is a 429 rather than an out-of-memory error. Counted as the bytes a hit carries -- its
+                // source and its id -- which is what a wide window actually holds.
+                long bytes = 0L;
+                for (SearchHit hit : answer.hits) {
+                    bytes += (hit.getId() == null ? 0L : hit.getId().length()) + (hit.getSourceRef() == null
+                        ? 0L
+                        : hit.getSourceRef().length());
+                }
+                breaker.addEstimateBytesAndMaybeBreak(bytes, "serverless_search_merge");
+                merged.reserved += bytes;
+                merged.hits.addAll(answer.hits);
+                if (merged.hits.size() > 2 * window) {
+                    merged.hits.sort(order);
+                    merged.hits.subList(window, merged.hits.size()).clear();
+                }
+                absorbInto(merged, answer);
+            }
+        } catch (RuntimeException e) {
+            merged.release(serving);
+            throw e;
+        }
+        return merged;
+    }
+
+    /** Folds everything but the hits of one shard's answer into the running total. */
+    private static void absorbInto(Merged merged, ShardAnswer answer) {
+        merged.total += answer.total;
+        if (answer.aggregations != null) {
+            merged.aggregations.add(answer.aggregations);
+        }
+        if (answer.relation == org.apache.lucene.search.TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO) {
+            merged.relation = org.apache.lucene.search.TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
+        }
+        if (Float.isNaN(answer.maxScore) == false && (Float.isNaN(merged.maxScore) || answer.maxScore > merged.maxScore)) {
+            merged.maxScore = answer.maxScore;
+        }
+        merged.timedOut |= answer.timedOut;
+        if (answer.terminatedEarly != null) {
+            merged.terminatedEarly = merged.terminatedEarly == null
+                ? answer.terminatedEarly
+                : merged.terminatedEarly || answer.terminatedEarly;
+        }
+        merged.answered++;
+    }
+
+    /** One shard's reason for not answering, addressed the way a real response addresses one. */
+    private static org.opensearch.action.search.ShardSearchFailure failure(String index, int shard, Exception cause) {
+        return new org.opensearch.action.search.ShardSearchFailure(
+            cause,
+            new org.opensearch.search.SearchShardTarget(
+                null,
+                new ShardId(new org.opensearch.core.index.Index(index, "_na_"), shard),
+                null,
+                org.opensearch.action.OriginalIndices.NONE
+            )
+        );
     }
 
     /**
@@ -286,7 +418,12 @@ public final class SearchFanout {
             org.opensearch.search.aggregations.InternalAggregation.ReduceContext.forFinalReduction(
                 serving.bigArrays(),
                 serving.scriptService(),
-                count -> {},
+                // Core's bucket bound and core's breaker: a reduce that would build more buckets than
+                // search.max_buckets allows is refused, where a no-op consumer let it build them all.
+                new org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer(
+                    org.opensearch.search.aggregations.MultiBucketConsumerService.MAX_BUCKET_SETTING.get(serving.settings()),
+                    breaker(serving)
+                ),
                 pipelines
             )
         );
@@ -314,10 +451,16 @@ public final class SearchFanout {
         // Which way round each key runs comes from the request, not from the hits: a hit carries its sort
         // values and no idea whether smaller means earlier.
         final boolean[] descending = new boolean[source.sorts().size()];
+        final boolean[] missingFirst = new boolean[source.sorts().size()];
         for (int i = 0; i < descending.length; i++) {
             descending[i] = source.sorts().get(i).order() == org.opensearch.search.sort.SortOrder.DESC;
+            // Where a document without the field goes, which core decides independently of direction:
+            // missing last unless the sort says _first. The merge used to negate the null placement along
+            // with the comparison, so a descending keyword sort put missing documents first.
+            missingFirst[i] = source.sorts().get(i) instanceof org.opensearch.search.sort.FieldSortBuilder field
+                && "_first".equals(field.missing());
         }
-        return (a, b) -> compareSortValues(a, b, descending);
+        return (a, b) -> compareSortValues(a, b, descending, missingFirst);
     }
 
     /**
@@ -328,7 +471,7 @@ public final class SearchFanout {
      * happen where it should not — a shard running an older build, a field missing from one shard's mapping
      * — and the failure it prevents is a page that silently begins in the wrong place.
      */
-    private static int compareSortValues(SearchHit a, SearchHit b, boolean[] descending) {
+    private static int compareSortValues(SearchHit a, SearchHit b, boolean[] descending, boolean[] missingFirst) {
         final Object[] left = a.getRawSortValues();
         final Object[] right = b.getRawSortValues();
         if (left == null || left.length == 0) {
@@ -338,6 +481,14 @@ public final class SearchFanout {
             return -1;
         }
         for (int i = 0; i < left.length && i < right.length; i++) {
+            if (left[i] == null || right[i] == null) {
+                if (left[i] == null && right[i] == null) {
+                    continue;
+                }
+                // Placed by the sort's own missing rule, not by direction.
+                final boolean first = i < missingFirst.length && missingFirst[i];
+                return (left[i] == null) == first ? -1 : 1;
+            }
             final int comparison = compareOne(left[i], right[i]);
             if (comparison != 0) {
                 return i < descending.length && descending[i] ? -comparison : comparison;
@@ -364,6 +515,11 @@ public final class SearchFanout {
         if (left instanceof Comparable comparable && left.getClass() == right.getClass()) {
             return comparable.compareTo(right);
         }
+        if (left instanceof Number l && right instanceof Number r) {
+            // A long from one index and a double from another are still numbers, and comparing their
+            // rendered forms put "10" before "9.5".
+            return Double.compare(l.doubleValue(), r.doubleValue());
+        }
         // Different types for the same key means the shards disagree about the field. Ordering them by
         // their rendered form is arbitrary but stable, which beats an exception in the middle of a merge.
         return String.valueOf(left).compareTo(String.valueOf(right));
@@ -379,11 +535,51 @@ public final class SearchFanout {
         private final long total;
         private final List<SearchHit> hits;
         private final org.opensearch.search.aggregations.InternalAggregations aggregations;
+        private final org.apache.lucene.search.TotalHits.Relation relation;
+        private final float maxScore;
+        private final boolean timedOut;
+        private final Boolean terminatedEarly;
 
-        ShardAnswer(long total, List<SearchHit> hits, org.opensearch.search.aggregations.InternalAggregations aggregations) {
+        ShardAnswer(org.opensearch.serverless.shard.ShardQuery.Result result) {
+            this(
+                result.total(),
+                result.hits(),
+                result.aggregations(),
+                result.relation(),
+                result.maxScore(),
+                result.timedOut(),
+                result.terminatedEarly()
+            );
+        }
+
+        ShardAnswer(org.opensearch.serverless.transport.ForwardedSearchResponse answer) {
+            this(
+                answer.total(),
+                answer.hits(),
+                answer.aggregations(),
+                answer.relation(),
+                answer.maxScore(),
+                answer.timedOut(),
+                answer.terminatedEarly()
+            );
+        }
+
+        private ShardAnswer(
+            long total,
+            List<SearchHit> hits,
+            org.opensearch.search.aggregations.InternalAggregations aggregations,
+            org.apache.lucene.search.TotalHits.Relation relation,
+            float maxScore,
+            boolean timedOut,
+            Boolean terminatedEarly
+        ) {
             this.total = total;
             this.hits = hits;
             this.aggregations = aggregations;
+            this.relation = relation;
+            this.maxScore = maxScore;
+            this.timedOut = timedOut;
+            this.terminatedEarly = terminatedEarly;
         }
     }
 
@@ -397,7 +593,7 @@ public final class SearchFanout {
      *
      * @param serving the node running the search
      * @param metadata the metadata plane
-     * @param index the index
+     * @param descriptor the index
      * @param shard the shard number
      * @param perShard the query, sized to cover the whole window on its own
      * @return what the shard answered, or null if no candidate could answer for it
@@ -406,15 +602,15 @@ public final class SearchFanout {
     private static ShardAnswer askOneShard(
         ServerlessNode serving,
         MetadataPlane metadata,
-        String index,
+        org.opensearch.serverless.cluster.IndexDescriptor descriptor,
         int shard,
         SearchSourceBuilder perShard
     ) throws IOException {
-        final ShardId local = localShard(serving, index, shard);
+        final String index = descriptor.name();
+        final ShardId local = localShard(serving, descriptor, shard);
         if (local != null) {
             serving.markUsed(local);
-            final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard);
-            return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+            return new ShardAnswer(org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard));
         }
         // Not here. Choose a reader by placement -- NOT the shard's owner, which is the writer: routing
         // searches to writers would couple search capacity to write capacity and make per-index search
@@ -429,21 +625,31 @@ public final class SearchFanout {
                 2
             )
         );
-        metadata.heads().read(index, shard).map(h -> h.ownerNodeId()).ifPresent(owner -> {
-            if (owner != null && targets.contains(owner) == false) {
-                targets.add(owner);
+        Exception lastFailure = null;
+        // The owner is the last resort, and its head is read only when the placement candidates could
+        // not answer: a head read per shard per search was the largest single cost of a hot search.
+        boolean triedOwner = false;
+        for (int attempt = 0; attempt <= targets.size(); attempt++) {
+            final String target;
+            if (attempt < targets.size()) {
+                target = targets.get(attempt);
+            } else if (triedOwner == false) {
+                triedOwner = true;
+                final String owner = metadata.heads().read(index, shard).map(h -> h.ownerNodeId()).orElse(null);
+                if (owner == null || targets.contains(owner)) {
+                    break;
+                }
+                target = owner;
+            } else {
+                break;
             }
-        });
-
-        for (String target : targets) {
             try {
                 if (serving.localNode().getId().equals(target)) {
                     // We are the placement for this shard but do not hold it yet. Open it here rather
                     // than asking ourselves over the network.
                     final ShardId opened = serving.serveAsReader(metadata, index, shard);
                     serving.markUsed(opened);
-                    final var mine = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), opened, perShard);
-                    return new ShardAnswer(mine.total(), mine.hits(), mine.aggregations());
+                    return new ShardAnswer(org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), opened, perShard));
                 }
                 // The search bound, not the write bound: a peer that is merely busy should cost latency,
                 // not coverage.
@@ -451,23 +657,36 @@ public final class SearchFanout {
                 if (peer.isEmpty()) {
                     continue;
                 }
-                final var answer = serving.router()
-                    .forwardSearch(peer.get(), new org.opensearch.serverless.transport.ForwardedSearchRequest(index, shard, perShard));
-                return new ShardAnswer(answer.total(), answer.hits(), answer.aggregations());
+                return new ShardAnswer(
+                    serving.router()
+                        .forwardSearch(
+                            peer.get(),
+                            new org.opensearch.serverless.transport.ForwardedSearchRequest(index, shard, perShard, descriptor.uuid())
+                        )
+                );
             } catch (Exception e) {
                 // Try the next candidate. A shard that failed to answer is not a shard with no matches,
                 // so it only counts as searched if one of them succeeded.
                 LOG.warn("shard " + shard + " of " + index + " was not served by " + target, e);
+                lastFailure = e;
             }
+        }
+        if (lastFailure != null) {
+            // Every candidate was tried and the last one's reason is the best account of why. Thrown
+            // rather than swallowed into a null, so the response can carry it in _shards.failures instead
+            // of a count with nothing behind it.
+            throw lastFailure instanceof IOException io ? io : new IOException(lastFailure);
         }
         return null;
     }
 
-    private static ShardId localShard(ServerlessNode serving, String index, int shard) {
+    private static ShardId localShard(ServerlessNode serving, org.opensearch.serverless.cluster.IndexDescriptor descriptor, int shard) {
+        // By uuid as well as name: a shard of a deleted index of the same name is still open here until
+        // the next heartbeat notices, and it must not answer for the recreated one.
         return serving.reconciler()
             .openShards()
             .stream()
-            .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
+            .filter(s -> s.getIndexName().equals(descriptor.name()) && s.id() == shard && s.getIndex().getUUID().equals(descriptor.uuid()))
             .findFirst()
             .orElse(null);
     }
@@ -499,8 +718,7 @@ public final class SearchFanout {
     ) throws Exception {
         final ShardId local = localFrozenView(serving, pit, shard);
         if (local != null) {
-            final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard);
-            return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+            return new ShardAnswer(org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), local, perShard));
         }
         // Keyed by the view's underlying index and shard, the same key live placement uses -- not by the
         // view id -- so a view's placement agrees with its live shard's where a node is likely to already
@@ -518,19 +736,19 @@ public final class SearchFanout {
                     // We are the placement for this shard but had not opened it yet. Open it here rather
                     // than forwarding to ourselves over the network.
                     final var shardId = serving.openFrozenView(metadata, pit, shard);
-                    final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard);
-                    return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+                    return new ShardAnswer(org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard));
                 }
                 final var peer = serving.router().peer(target, serving.router().searchForwardTimeout());
                 if (peer.isEmpty()) {
                     continue;
                 }
-                final var answer = serving.router()
-                    .forwardFrozenSearch(
-                        peer.get(),
-                        new org.opensearch.serverless.transport.ForwardedFrozenSearchRequest(pit, shard, perShard)
-                    );
-                return new ShardAnswer(answer.total(), answer.hits(), answer.aggregations());
+                return new ShardAnswer(
+                    serving.router()
+                        .forwardFrozenSearch(
+                            peer.get(),
+                            new org.opensearch.serverless.transport.ForwardedFrozenSearchRequest(pit, shard, perShard)
+                        )
+                );
             } catch (Exception e) {
                 // Try the next candidate, same as the live path: a shard that failed to answer is not a
                 // shard with no matches, so it only counts as searched once one candidate has succeeded.
@@ -541,8 +759,7 @@ public final class SearchFanout {
         // role at all. Open it here: the unconditional fallback every call used before placement existed,
         // so a stale or unlucky routing decision costs this node a cold open and never a wrong answer.
         final var shardId = serving.openFrozenView(metadata, pit, shard);
-        final var result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard);
-        return new ShardAnswer(result.total(), result.hits(), result.aggregations());
+        return new ShardAnswer(org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard));
     }
 
     private static ShardId localFrozenView(ServerlessNode serving, org.opensearch.serverless.metadata.PointInTime pit, int shard) {

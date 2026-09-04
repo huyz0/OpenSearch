@@ -157,7 +157,9 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
                 "/alpha/_update/new1?refresh=true",
                 "{\"doc\":{\"msg\":\"born-here\",\"n\":9},\"doc_as_upsert\":true}"
             );
-            assertEquals(created.body(), 200, created.status());
+            // 201, as core answers an upsert that created the document: DocWriteResponse.status() is
+            // CREATED for a created result, and a client that branches on the status expects it.
+            assertEquals(created.body(), 201, created.status());
             assertTrue("the result must say created: " + created.body(), created.body().contains("\"result\":\"created\""));
 
             final Response got = send(http, "GET", "/alpha/_doc/new1", null);
@@ -181,7 +183,9 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
                 "/alpha/_update/new2?refresh=true",
                 "{\"doc\":{\"n\":1},\"upsert\":{\"msg\":\"from-upsert\",\"n\":0}}"
             );
-            assertEquals(created.body(), 200, created.status());
+            // 201, as core answers an upsert that created the document: DocWriteResponse.status() is
+            // CREATED for a created result, and a client that branches on the status expects it.
+            assertEquals(created.body(), 201, created.status());
             assertTrue("the result must say created: " + created.body(), created.body().contains("\"result\":\"created\""));
 
             final Response got = send(http, "GET", "/alpha/_doc/new2", null);
@@ -270,9 +274,10 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
             final Response got = send(http, "GET", "/alpha/_doc/1", null);
             assertTrue("the script's edit must reach the document: " + got.body(), got.body().contains("\"n\":2"));
 
+            // A stored script that does not exist: resolved through the store, and not found there.
             final Response stored = send(http, "POST", "/alpha/_update/1", "{\"script\":{\"id\":\"somewhere\"}}");
-            assertEquals(stored.body(), 400, stored.status());
-            assertTrue("must say why: " + stored.body(), stored.body().contains("stored script cannot be used here"));
+            assertEquals(stored.body(), 404, stored.status());
+            assertTrue("must say why: " + stored.body(), stored.body().contains("unable to find script [somewhere]"));
         }
     }
 

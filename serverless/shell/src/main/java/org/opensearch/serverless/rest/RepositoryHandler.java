@@ -72,7 +72,10 @@ public final class RepositoryHandler extends BaseRestHandler {
             new Route(RestRequest.Method.PUT, "/_snapshot/{repo}"),
             new Route(RestRequest.Method.POST, "/_snapshot/{repo}"),
             new Route(RestRequest.Method.GET, "/_snapshot/{repo}"),
-            new Route(RestRequest.Method.DELETE, "/_snapshot/{repo}")
+            new Route(RestRequest.Method.DELETE, "/_snapshot/{repo}"),
+            // Verification, which used to fall through to the snapshot handler as a snapshot named
+            // "_verify" and fail on a missing indices list.
+            new Route(RestRequest.Method.POST, "/_snapshot/{repo}/_verify")
         );
     }
 
@@ -84,6 +87,40 @@ public final class RepositoryHandler extends BaseRestHandler {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
+        }
+        // Hints: there is no cluster manager to time out against, and a repository here is a namespace
+        // in this deployment's own object store, which is verified by the deployment running at all.
+        request.param("master_timeout");
+        request.param("cluster_manager_timeout");
+        request.param("timeout");
+        request.param("verify");
+        if (request.path().endsWith("/_verify")) {
+            return channel -> dispatch(channel, () -> {
+                if (metadata.describeRepository(repoParam).isEmpty()) {
+                    channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_FOUND,
+                            "repository_missing_exception",
+                            "[" + repoParam + "] missing"
+                        )
+                    );
+                    return;
+                }
+                // Core's VerifyRepositoryResponse: the nodes that could reach the repository. Every node
+                // here reaches the one object store, and this one is answering.
+                final var serving = node.get();
+                try (XContentBuilder builder = channel.newBuilder()) {
+                    builder.startObject();
+                    builder.startObject("nodes");
+                    builder.startObject(serving.localNode().getId());
+                    builder.field("name", serving.localNode().getName());
+                    builder.endObject();
+                    builder.endObject();
+                    builder.endObject();
+                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                }
+            });
         }
         if (repoParam == null || "_all".equals(repoParam) || "*".equals(repoParam)) {
             // GET /_snapshot, GET /_snapshot/_all and GET /_snapshot/* are the same request on real
@@ -274,7 +311,7 @@ public final class RepositoryHandler extends BaseRestHandler {
             work.run();
         } catch (Exception e) {
             try {
-                channel.sendResponse(new BytesRestResponse(channel, e));
+                channel.sendResponse(IndexAdminHandler.failure(channel, e));
             } catch (IOException nested) {
                 logger.error("failed to report a repository administration failure", nested);
             }

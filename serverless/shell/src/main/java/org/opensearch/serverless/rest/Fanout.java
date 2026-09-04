@@ -49,6 +49,9 @@ public final class Fanout {
      */
     public static final int DEFAULT_CONCURRENCY = 8;
 
+    /** The longest a fan-out waits for its tasks. */
+    public static final org.opensearch.common.unit.TimeValue TIMEOUT = org.opensearch.common.unit.TimeValue.timeValueMinutes(5);
+
     private Fanout() {}
 
     /**
@@ -89,7 +92,11 @@ public final class Fanout {
             }
             // Establishes happens-before with every countDown above, so the plain array is safely
             // published without synchronizing each write.
-            done.await();
+            // Bounded, so a fan-out whose task hangs in the object store fails rather than pinning the
+            // coordinator's thread forever.
+            if (done.await(TIMEOUT.millis(), java.util.concurrent.TimeUnit.MILLISECONDS) == false) {
+                throw new InterruptedException("fanned-out work did not finish within " + TIMEOUT);
+            }
         }
         return (List<T>) java.util.Arrays.asList(results);
     }

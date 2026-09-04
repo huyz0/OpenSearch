@@ -52,22 +52,44 @@ public final class ServerlessRootHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.GET, "/"));
+        // HEAD is what every client library's ping() sends. Core registers both; this registered only GET,
+        // so the first thing a client did on connecting was fail.
+        return List.of(new Route(RestRequest.Method.GET, "/"), new Route(RestRequest.Method.HEAD, "/"));
     }
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
+        if (request.method() == RestRequest.Method.HEAD) {
+            return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.OK, ""));
+        }
+        // Core's MainResponse field for field, because this is the document a client reads before it reads
+        // anything else: Dashboards checks version.distribution and version.number here, the Java client
+        // checks that it is talking to something at all. Two fields carry this deployment's own facts
+        // where core's are node facts -- node_id, and flavour -- and are additive.
+        final org.opensearch.Build build = org.opensearch.Build.CURRENT;
         return channel -> {
             try (XContentBuilder builder = channel.newBuilder()) {
                 builder.startObject();
                 builder.field("name", nodeName);
-                builder.field("node_id", nodeIdSupplier.get());
                 builder.field("cluster_name", clusterName);
+                // There is no cluster state to mint a uuid in. Core's own placeholder for "not known", so a
+                // client comparing it against a stored value sees the value core would show before state
+                // is recovered rather than a made-up one.
+                builder.field("cluster_uuid", org.opensearch.cluster.ClusterState.UNKNOWN_UUID);
+                builder.field("node_id", nodeIdSupplier.get());
                 builder.field("flavour", "serverless");
-                builder.startObject("version");
-                builder.field("number", Version.CURRENT.toString());
-                builder.endObject();
-                builder.field("tagline", "The object store is the only source of truth");
+                builder.startObject("version")
+                    .field("distribution", build.getDistribution())
+                    .field("number", build.getQualifiedVersion())
+                    .field("build_type", build.type().displayName())
+                    .field("build_hash", build.hash())
+                    .field("build_date", build.date())
+                    .field("build_snapshot", build.isSnapshot())
+                    .field("lucene_version", Version.CURRENT.luceneVersion.toString())
+                    .field("minimum_wire_compatibility_version", Version.CURRENT.minimumCompatibilityVersion().toString())
+                    .field("minimum_index_compatibility_version", Version.CURRENT.minimumIndexCompatibilityVersion().toString())
+                    .endObject();
+                builder.field("tagline", org.opensearch.action.main.MainResponse.TAGLINE);
                 builder.endObject();
                 channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
             }

@@ -81,6 +81,12 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
      */
     private static final int TEST_ITERATIONS = 10_000;
 
+    /**
+     * A work factor slow enough that a check outlasts the time it takes to open a dozen connections, for
+     * the test that needs the checker queue to fill.
+     */
+    private static final int SLOW_ITERATIONS = 1_000_000;
+
     /** Lets a test move the credential cache's clock without sleeping. */
     private final AtomicLong authClock = new AtomicLong(1_000_000L);
 
@@ -379,6 +385,10 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
      * fleet the node that removes an account is not the only node serving requests, and the others go on
      * accepting the removed credential for up to the TTL. Bounded is the property being claimed; a cache
      * that never re-checked would pass every other test in this file.
+     *
+     * <p>The document is deleted straight out of the index, which is a change that does not move the
+     * marker; {@link #testAnAccountChangedElsewhereStopsWorkingWithinASecond} covers a change that does.
+     * The TTL is the bound that holds regardless.
      */
     public void testACredentialRemovedElsewhereStopsWorkingWhenTheCacheExpires() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -418,6 +428,168 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
                 401,
                 send(node, "GET", "/", basic("phasma", "chrome"), null).status()
             );
+        }
+    }
+
+    /**
+     * An account removed or rotated on another node stops working here within a second, not a TTL.
+     *
+     * <p>The other node is a second {@link CredentialStore} over the same client: its own cache, the same
+     * index. Its change moves the marker, and this node's cache -- which is holding the old credential
+     * as verified -- consults the marker at most once a second and drops everything when it has moved.
+     * The TTL here is sixty seconds and the clock moves by one, which is the difference being claimed.
+     */
+    public void testAnAccountChangedElsewhereStopsWorkingWithinASecond() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        final Settings settings = nodeSettings("auth-marker");
+        final ServerlessAuthPlugin plugin = authPlugin(settings);
+
+        try (ServerlessNode node = new ServerlessNode(settings, List.of(plugin))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            ready(node, plane, clock);
+            assertEquals(
+                200,
+                send(node, "PUT", "/_serverless/security/users/snoke", basic(ADMIN, ADMIN_PASSWORD), "{\"password\":\"supreme\"}").status()
+            );
+            assertEquals(
+                "the account works, and is now cached here",
+                200,
+                send(node, "GET", "/", basic("snoke", "supreme"), null).status()
+            );
+
+            final CredentialStore elsewhere = new CredentialStore(settings, node::client, authClock::get);
+            final long before = elsewhere.version();
+            assertNotEquals("creating the account moved the marker", 0L, before);
+            assertTrue(elsewhere.remove("snoke"));
+            assertNotEquals("and removing it moved it again", before, elsewhere.version());
+            assertEquals("both stores read the same marker", elsewhere.version(), plugin.store().version());
+
+            // No clock movement: this second's look at the marker has already happened, so the cached
+            // credential is still honoured. That is the window, and it is a second rather than a TTL.
+            assertEquals(
+                "within the second the cache is still trusted",
+                200,
+                send(node, "GET", "/", basic("snoke", "supreme"), null).status()
+            );
+
+            authClock.addAndGet(1_001L);
+            assertEquals(
+                "a second later the marker is consulted, the cache dropped, and the account is gone",
+                401,
+                send(node, "GET", "/", basic("snoke", "supreme"), null).status()
+            );
+
+            // The same for a rotation, which is the change that leaves a document behind.
+            elsewhere.put("snoke", "supreme-2".toCharArray());
+            authClock.addAndGet(1_001L);
+            assertEquals(200, send(node, "GET", "/", basic("snoke", "supreme-2"), null).status());
+            elsewhere.put("snoke", "supreme-3".toCharArray());
+            assertEquals(
+                "within the second the old password is still cached",
+                200,
+                send(node, "GET", "/", basic("snoke", "supreme-2"), null).status()
+            );
+            authClock.addAndGet(1_001L);
+            assertEquals("and a second later it is not", 401, send(node, "GET", "/", basic("snoke", "supreme-2"), null).status());
+            assertEquals("while the new one is", 200, send(node, "GET", "/", basic("snoke", "supreme-3"), null).status());
+        }
+    }
+
+    /**
+     * A run of failures earns a wait, the wait is answered at the door, and it ends when the clock says.
+     *
+     * <p>Five is the default threshold, one second the first wait, and the plugin's clock is the test's,
+     * so the recovery is a number added to it rather than a sleep. The by-address key is checked with a
+     * second name from the same address, which is what a guesser rotating names looks like from here.
+     */
+    public void testRepeatedFailuresAreThrottledAndRecoverAfterTheDelay() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Settings settings = nodeSettings("auth-throttle");
+        try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
+            node.start();
+            node.setMetadataPlane(plane(clock));
+
+            for (int i = 0; i < 5; i++) {
+                final Response wrong = send(node, "GET", "/", basic(ADMIN, "guess-" + i), null);
+                assertEquals("failure " + (i + 1) + " is checked and refused: " + wrong.body(), 401, wrong.status());
+            }
+
+            final Response throttled = send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null);
+            assertEquals("the right password is refused too while the wait lasts: " + throttled.body(), 429, throttled.status());
+            assertEquals("and told how long: " + throttled.headers(), "1", throttled.header("Retry-After"));
+            assertTrue("and why: " + throttled.body(), throttled.body().contains("too_many_attempts"));
+            assertEquals(
+                "a different name from the same address is waiting too",
+                429,
+                send(node, "GET", "/", basic("somebody-else", "whatever"), null).status()
+            );
+
+            // The wait ends; the next failure is checked, and doubles the wait.
+            authClock.addAndGet(1_001L);
+            assertEquals(401, send(node, "GET", "/", basic(ADMIN, "guess-6"), null).status());
+            final Response doubled = send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null);
+            assertEquals(429, doubled.status());
+            assertEquals("the sixth failure earns two seconds", "2", doubled.header("Retry-After"));
+            authClock.addAndGet(1_000L);
+            assertEquals(
+                "halfway through it is still a second",
+                "1",
+                send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null).header("Retry-After")
+            );
+
+            authClock.addAndGet(1_000L);
+            final Response recovered = send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null);
+            assertEquals("after the wait the right password is served: " + recovered.body(), 200, recovered.status());
+
+            // A success cleared the count, so the next run starts from nothing.
+            for (int i = 0; i < 4; i++) {
+                assertEquals(401, send(node, "GET", "/", basic(ADMIN, "guess-again-" + i), null).status());
+            }
+            assertEquals("four failures earn no wait", 200, send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null).status());
+        }
+    }
+
+    /**
+     * When the checker queue is full the next request is told so, rather than queued without limit.
+     *
+     * <p>A queue of one behind four threads, each check slow enough that nothing finishes before all the
+     * requests have arrived: at most five are checked and the rest find the queue full. The bound is what
+     * is asserted -- at least one refusal, and nothing but refusals and checks -- not the exact split,
+     * which depends on how fast twelve connections open.
+     */
+    public void testAFullCheckerQueueIsRefusedRatherThanQueuedWithoutLimit() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Settings settings = Settings.builder()
+            .put(nodeSettings("auth-queue"))
+            .put("serverless.auth.hash.iterations", SLOW_ITERATIONS)
+            .put("serverless.auth.check.queue_size", 1)
+            // Off, so that the first failures to finish do not turn the later arrivals into 429s.
+            .put("serverless.auth.throttle.max_delay", "0s")
+            .build();
+        try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
+            node.start();
+            node.setMetadataPlane(plane(clock));
+
+            final List<Response> answers = sendConcurrently(node, 12, basic(ADMIN, "not-the-password"));
+            int refused = 0;
+            int checked = 0;
+            for (Response answer : answers) {
+                if (answer.status() == 503) {
+                    assertTrue("a refusal must say what is full: " + answer.body(), answer.body().contains("queue is full"));
+                    assertNotNull("and when to retry: " + answer.headers(), answer.header("Retry-After"));
+                    refused++;
+                } else {
+                    assertEquals("anything not refused at the door was checked: " + answer.body(), 401, answer.status());
+                    checked++;
+                }
+            }
+            assertTrue("with four threads and a queue of one, twelve at once must overflow: " + answers, refused >= 1);
+            assertTrue("and the ones that fit must be checked: " + answers, checked >= 1);
+
+            // The node is not stuck: once the checks drain, an ordinary login is served.
+            assertEquals(200, send(node, "GET", "/", basic(ADMIN, ADMIN_PASSWORD), null).status());
         }
     }
 
@@ -667,6 +839,9 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         expectThrows(IllegalArgumentException.class, () -> CredentialStore.validateUsername(""));
         expectThrows(IllegalArgumentException.class, () -> CredentialStore.validateUsername(null));
         expectThrows(IllegalArgumentException.class, () -> CredentialStore.validateUsername("quote\"injected"));
+        // Legal by the character class, and the marker's document id: an account with that name would be
+        // overwritten by the next change to any other.
+        expectThrows(IllegalArgumentException.class, () -> CredentialStore.validateUsername("_version"));
         CredentialStore.validateUsername("ok.name-1@example");
     }
 
@@ -771,6 +946,29 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
 
     private static Response send(ServerlessNode node, String method, String path, String authorization, String body) throws Exception {
         return sendTo(node.boundHttpAddress().publishAddress(), method, path, authorization, body);
+    }
+
+    /** Sends the same request {@code count} times at once, on one client, and waits for every answer. */
+    private static List<Response> sendConcurrently(ServerlessNode node, int count, String authorization) throws Exception {
+        final org.opensearch.core.common.transport.TransportAddress address = node.boundHttpAddress().publishAddress();
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
+            final List<java.util.concurrent.CompletableFuture<HttpResponse<String>>> inFlight = new java.util.ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                final HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + "/"))
+                    .timeout(Duration.ofSeconds(120))
+                    .header("Authorization", authorization)
+                    .GET()
+                    .build();
+                inFlight.add(client.sendAsync(request, HttpResponse.BodyHandlers.ofString()));
+            }
+            final List<Response> answers = new java.util.ArrayList<>();
+            for (java.util.concurrent.CompletableFuture<HttpResponse<String>> future : inFlight) {
+                final HttpResponse<String> response = future.get();
+                answers.add(new Response(response.statusCode(), response.body(), response.headers()));
+            }
+            return answers;
+        }
     }
 
     private static Response sendTo(

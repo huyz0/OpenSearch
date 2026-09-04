@@ -72,7 +72,15 @@ public final class AnalyzeHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.GET, "/{index}/_analyze"), new Route(RestRequest.Method.POST, "/{index}/_analyze"));
+        return List.of(
+            new Route(RestRequest.Method.GET, "/{index}/_analyze"),
+            new Route(RestRequest.Method.POST, "/{index}/_analyze"),
+            // Without an index: the built-in analyzers, from the node's own registry. Both compared
+            // serverless products serve this, and it needs no mapping -- "standard" and its siblings are
+            // the node's, not any index's.
+            new Route(RestRequest.Method.GET, "/_analyze"),
+            new Route(RestRequest.Method.POST, "/_analyze")
+        );
     }
 
     /** What an analyze request asked for. */
@@ -105,7 +113,15 @@ public final class AnalyzeHandler extends BaseRestHandler {
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                answer(channel, metadata, serving, index, ask);
+                IndexAdminHandler.gate(
+                    serving,
+                    org.opensearch.action.admin.indices.analyze.AnalyzeAction.NAME,
+                    new org.opensearch.action.admin.indices.analyze.AnalyzeAction.Request(index),
+                    () -> {
+                        answer(channel, metadata, serving, index, ask);
+                        return null;
+                    }
+                );
             } catch (IllegalArgumentException e) {
                 try {
                     channel.sendResponse(
@@ -121,7 +137,7 @@ public final class AnalyzeHandler extends BaseRestHandler {
                 }
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report an analyze failure", nested);
                 }
@@ -197,6 +213,19 @@ public final class AnalyzeHandler extends BaseRestHandler {
         String index,
         Ask ask
     ) throws Exception {
+        if (index == null) {
+            if (ask.field() != null) {
+                throw new IllegalArgumentException("field [" + ask.field() + "] needs an index whose mapping defines it");
+            }
+            // Core's own default without an index, and core's own registry.
+            final String using = ask.analyzer() == null ? "standard" : ask.analyzer();
+            final Analyzer chosen = serving.indicesService().getAnalysis().getAnalyzer(using);
+            if (chosen == null) {
+                throw new IllegalArgumentException("failed to find global analyzer [" + using + "]");
+            }
+            render(channel, chosen, using, ask);
+            return;
+        }
         final Optional<IndexDescriptor> descriptor = metadata.describe(index);
         if (descriptor.isEmpty()) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
@@ -237,22 +266,26 @@ public final class AnalyzeHandler extends BaseRestHandler {
                 using = "default";
             }
 
-            try (XContentBuilder builder = channel.newBuilder()) {
-                builder.startObject();
-                builder.startArray("tokens");
-                int carried = 0;
-                for (String each : ask.text()) {
-                    carried = tokens(builder, chosen, ask.field() == null ? "text" : ask.field(), each, carried);
-                }
-                builder.endArray();
-                // Additive, and useful precisely because this endpoint is used to settle disagreements: a
-                // caller seeing tokens it did not expect wants to know which analyzer produced them.
-                builder.field("analyzer_used", using);
-                builder.endObject();
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-            }
+            render(channel, chosen, using, ask);
         } finally {
             mapperService.close();
+        }
+    }
+
+    private static void render(org.opensearch.rest.RestChannel channel, Analyzer chosen, String using, Ask ask) throws IOException {
+        try (XContentBuilder builder = channel.newBuilder()) {
+            builder.startObject();
+            builder.startArray("tokens");
+            int carried = 0;
+            for (String each : ask.text()) {
+                carried = tokens(builder, chosen, ask.field() == null ? "text" : ask.field(), each, carried);
+            }
+            builder.endArray();
+            // Additive, and useful precisely because this endpoint is used to settle disagreements: a
+            // caller seeing tokens it did not expect wants to know which analyzer produced them.
+            builder.field("analyzer_used", using);
+            builder.endObject();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
     }
 
@@ -275,6 +308,9 @@ public final class AnalyzeHandler extends BaseRestHandler {
             final OffsetAttribute offset = stream.addAttribute(OffsetAttribute.class);
             final TypeAttribute type = stream.addAttribute(TypeAttribute.class);
             final PositionIncrementAttribute increment = stream.addAttribute(PositionIncrementAttribute.class);
+            final org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute length = stream.addAttribute(
+                org.apache.lucene.analysis.tokenattributes.PositionLengthAttribute.class
+            );
             stream.reset();
             while (stream.incrementToken()) {
                 position += increment.getPositionIncrement();
@@ -286,6 +322,11 @@ public final class AnalyzeHandler extends BaseRestHandler {
                 // Positions are one sequence across several strings, which is what makes a phrase query
                 // spanning them behave the way this says it will.
                 builder.field("position", position - 1);
+                if (length.getPositionLength() > 1) {
+                    // Core reports it only when a token spans more than one position, which is the only
+                    // case in which it says anything.
+                    builder.field("positionLength", length.getPositionLength());
+                }
                 builder.endObject();
             }
             stream.end();

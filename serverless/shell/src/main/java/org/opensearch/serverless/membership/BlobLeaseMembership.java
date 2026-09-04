@@ -92,8 +92,31 @@ public final class BlobLeaseMembership implements MembershipSource {
         final String name = LEASE_PREFIX + self.nodeId();
         BlobRegisterCasResult result = container.compareAndSwapRegister(name, ownGeneration, renewed.toBytes());
         if (result.applied() == false) {
-            // Re-read and retry once against the generation actually stored.
+            // Re-read and retry once against the generation actually stored -- unless what is stored is
+            // another live incarnation under this node id. Two processes with one id share every head
+            // and every term, and the exactly-one-writer property has nothing left to stand on; refusing
+            // to renew is what lets this node fence itself out of writes rather than fight.
             final Optional<BlobRegister> actual = container.readRegister(name);
+            if (actual.isPresent()) {
+                try (java.io.InputStream in = actual.get().value().streamInput()) {
+                    final NodeLease other = NodeLease.fromStream(in);
+                    if (other.ephemeralId() != null
+                        && other.ephemeralId().equals(self.ephemeralId()) == false
+                        && other.expiresAtMillis() > clock.getAsLong()) {
+                        throw new IOException(
+                            "duplicate node id ["
+                                + self.nodeId()
+                                + "]: another live process ("
+                                + other.ephemeralId()
+                                + ") holds this node's lease; this node will not renew"
+                        );
+                    }
+                } catch (IOException e) {
+                    throw e;
+                } catch (Exception ignored) {
+                    // An unreadable lease is not a duplicate; fall through to the retry.
+                }
+            }
             final long actualGeneration = actual.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
             result = container.compareAndSwapRegister(name, actualGeneration, renewed.toBytes());
             if (result.applied() == false) {

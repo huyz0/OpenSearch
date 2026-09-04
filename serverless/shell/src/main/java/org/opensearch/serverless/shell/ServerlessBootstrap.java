@@ -296,6 +296,16 @@ public final class ServerlessBootstrap implements Closeable {
         // publish or renew through a half-shut data plane, and a renewal racing the release below would
         // put the lease back after we dropped it.
         scheduler.close();
+        try {
+            // Publish and release what this node owns, so its shards are claimable at a fresh term the
+            // moment a peer or this node's own restart wants them.
+            final int handed = loop.handOverAll();
+            if (handed > 0) {
+                logger.info("handed over {} shard(s) on shutdown", handed);
+            }
+        } catch (Exception e) {
+            logger.warn("could not hand over this node's shards; peers will take them over when the lease lapses", e);
+        }
         loop.close();
         try {
             // Drop the lease rather than let it lapse. Without this a node that shut down cleanly stays

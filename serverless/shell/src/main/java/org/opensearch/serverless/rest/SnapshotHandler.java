@@ -75,25 +75,48 @@ import java.util.regex.Pattern;
  */
 public final class SnapshotHandler extends BaseRestHandler {
 
-    private static final Set<String> RESTORE_KNOWN_KEYS = Set.of(
+    /** What a restore here reads. Everything else core's restore accepts is refused with its reason, below. */
+    private static final Set<String> RESTORE_KNOWN_KEYS = Set.of("indices", "rename_pattern", "rename_replacement");
+
+    /**
+     * Core's other restore fields, each with why it is refused rather than accepted and ignored. An
+     * allowlist used to admit all of these and act on three, which told a caller -- by answering 400 for
+     * an unknown key -- that a known key was honoured.
+     */
+    private static final java.util.Map<String, String> RESTORE_REFUSED_KEYS = java.util.Map.ofEntries(
+        java.util.Map.entry("partial", "a restore here creates every shard of an index or refuses; there is no partial index to make"),
+        java.util.Map.entry("include_global_state", "there is no global state in a snapshot here to restore"),
+        java.util.Map.entry("include_aliases", "aliases are not captured in a snapshot here"),
+        java.util.Map.entry("rename_alias_pattern", "aliases are not captured in a snapshot here"),
+        java.util.Map.entry("rename_alias_replacement", "aliases are not captured in a snapshot here"),
+        java.util.Map.entry(
+            "index_settings",
+            "settings come from the snapshot; change them on the restored index with PUT /{index}/_settings"
+        ),
+        java.util.Map.entry(
+            "ignore_index_settings",
+            "settings come from the snapshot; change them on the restored index with PUT /{index}/_settings"
+        ),
+        java.util.Map.entry("settings", "repository settings are fixed when the repository is registered"),
+        java.util.Map.entry(
+            "storage_type",
+            "a restored index is served from this deployment's own object store; there is no other storage type"
+        ),
+        java.util.Map.entry("source_remote_store_repository", "there is one object store here, and it is the repository"),
+        java.util.Map.entry("source_remote_translog_repository", "there is one object store here, and it is the repository"),
+        java.util.Map.entry("alias_write_index_policy", "aliases are not captured in a snapshot here"),
+        java.util.Map.entry("ignore_unavailable", "a restore names the indices it wants; one the snapshot did not capture is a 404"),
+        java.util.Map.entry("allow_no_indices", "a restore names the indices it wants; patterns are not matched against the snapshot"),
+        java.util.Map.entry("expand_wildcards", "a restore names the indices it wants; patterns are not matched against the snapshot")
+    );
+
+    /** What a create here reads. */
+    private static final Set<String> CREATE_KNOWN_KEYS = Set.of(
         "indices",
-        "partial",
-        "settings",
-        "include_global_state",
-        "include_aliases",
-        "rename_pattern",
-        "rename_replacement",
-        "rename_alias_pattern",
-        "rename_alias_replacement",
-        "index_settings",
-        "ignore_index_settings",
-        "storage_type",
-        "source_remote_store_repository",
-        "source_remote_translog_repository",
-        "alias_write_index_policy",
         "ignore_unavailable",
-        "allow_no_indices",
-        "expand_wildcards"
+        "partial",
+        "include_global_state",
+        "metadata"
     );
 
     private final Supplier<MetadataPlane> plane;
@@ -138,8 +161,23 @@ public final class SnapshotHandler extends BaseRestHandler {
         }
         final boolean waitForCompletion = request.paramAsBoolean("wait_for_completion", false);
 
+        // Hints: there is no cluster manager to time out against.
+        request.param("master_timeout");
+        request.param("cluster_manager_timeout");
         if (request.path().endsWith("/_restore")) {
             final Map<String, Object> body = request.hasContent() ? parseBody(request) : Map.of();
+            for (Map.Entry<String, String> refused : RESTORE_REFUSED_KEYS.entrySet()) {
+                if (body.containsKey(refused.getKey())) {
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_IMPLEMENTED,
+                            "unsupported_restore",
+                            refused.getKey() + " is not supported: " + refused.getValue()
+                        )
+                    );
+                }
+            }
             final String unknown = firstUnknownKey(body, RESTORE_KNOWN_KEYS);
             if (unknown != null) {
                 return channel -> channel.sendResponse(
@@ -156,6 +194,19 @@ public final class SnapshotHandler extends BaseRestHandler {
             case PUT:
             case POST: {
                 final Map<String, Object> body = request.hasContent() ? parseBody(request) : Map.of();
+                final String unknownCreateKey = firstUnknownKey(body, CREATE_KNOWN_KEYS);
+                if (unknownCreateKey != null) {
+                    // The same check the restore path has always made, which the create path did not: an
+                    // unknown key was accepted and dropped.
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.BAD_REQUEST,
+                            "unknown_parameter",
+                            "Unknown parameter " + unknownCreateKey
+                        )
+                    );
+                }
                 final List<String> indices = readIndices(body.get("indices"));
                 if (indices.isEmpty()) {
                     return channel -> channel.sendResponse(
@@ -169,7 +220,12 @@ public final class SnapshotHandler extends BaseRestHandler {
                 }
                 final boolean ignoreUnavailable = readBoolean(body.get("ignore_unavailable"), false);
                 final boolean partial = readBoolean(body.get("partial"), false);
-                final boolean includeGlobalState = readBoolean(body.get("include_global_state"), true);
+                // Read, and reported as what happened rather than as what was asked: there is no global
+                // state here to capture, so a snapshot never includes it. Core's default is true, and
+                // refusing that default would refuse every client that sends it; echoing true would report
+                // a capture that did not happen.
+                readBoolean(body.get("include_global_state"), true);
+                final boolean includeGlobalState = false;
                 return channel -> dispatch(
                     channel,
                     () -> handleCreate(
@@ -542,7 +598,10 @@ public final class SnapshotHandler extends BaseRestHandler {
             final SnapshotRecord.SnapshottedIndex capturedIndex = record.indices().get(restoring.getKey());
             final String newUuid = UUIDs.randomBase64UUID();
             metadata.createIndex(
-                new IndexDescriptor(restoring.getValue(), newUuid, capturedIndex.numberOfShards(), capturedIndex.mapping(), null)
+                new IndexDescriptor(restoring.getValue(), newUuid, capturedIndex.numberOfShards(), capturedIndex.mapping(), null).createdAt(
+                    metadata.clock().getAsLong(),
+                    org.opensearch.Version.CURRENT.id
+                )
             );
             for (Map.Entry<Integer, CommitManifest> shard : capturedIndex.shards().entrySet()) {
                 final BlobPath sourceBase = record.shallow()
@@ -723,7 +782,7 @@ public final class SnapshotHandler extends BaseRestHandler {
             work.run();
         } catch (Exception e) {
             try {
-                channel.sendResponse(new BytesRestResponse(channel, e));
+                channel.sendResponse(IndexAdminHandler.failure(channel, e));
             } catch (IOException nested) {
                 logger.error("failed to report a snapshot operation failure", nested);
             }

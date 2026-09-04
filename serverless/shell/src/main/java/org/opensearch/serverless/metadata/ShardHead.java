@@ -42,6 +42,7 @@ import java.util.Objects;
 public final class ShardHead {
 
     private final String indexName;
+    private final String indexUuid;
     private final int shardId;
     private final long term;
     private final String ownerNodeId;
@@ -59,7 +60,36 @@ public final class ShardHead {
      * @param leaseExpiresAtMillis when the owner's claim lapses
      */
     public ShardHead(String indexName, int shardId, long term, String ownerNodeId, String ownerEphemeralId, long leaseExpiresAtMillis) {
+        this(indexName, shardId, term, ownerNodeId, ownerEphemeralId, leaseExpiresAtMillis, null);
+    }
+
+    /**
+     * Creates a head bound to one incarnation of its index.
+     *
+     * <p>Heads are keyed by index name, and a name outlives an index: a delete and a recreate keep the
+     * name and change the uuid. A head that carries the uuid it was acquired for can be told from a head
+     * left behind by the previous incarnation, which is how a recreated index stops inheriting a writer
+     * that is still serving the deleted one.
+     *
+     * @param indexName the index name
+     * @param shardId the shard number
+     * @param term the term
+     * @param ownerNodeId the owner, or null when released
+     * @param ownerEphemeralId the owner's ephemeral id
+     * @param leaseExpiresAtMillis the acquisition stamp
+     * @param indexUuid the index uuid this head was acquired for, or null for a head written before this
+     */
+    public ShardHead(
+        String indexName,
+        int shardId,
+        long term,
+        String ownerNodeId,
+        String ownerEphemeralId,
+        long leaseExpiresAtMillis,
+        String indexUuid
+    ) {
         this.indexName = Objects.requireNonNull(indexName);
+        this.indexUuid = indexUuid;
         this.shardId = shardId;
         if (term < 1) {
             throw new IllegalArgumentException("shard-head term must be positive, got " + term);
@@ -75,6 +105,15 @@ public final class ShardHead {
      *
      * @return the index
      */
+    /**
+     * Returns the uuid of the index incarnation this head was acquired for.
+     *
+     * @return the uuid, or null for a head written before uuids were recorded
+     */
+    public String indexUuid() {
+        return indexUuid;
+    }
+
     public String indexName() {
         return indexName;
     }
@@ -149,6 +188,9 @@ public final class ShardHead {
             builder.field("owner_node_id", ownerNodeId);
             builder.field("owner_ephemeral_id", ownerEphemeralId);
             builder.field("lease_expires_at_millis", leaseExpiresAtMillis);
+            if (indexUuid != null) {
+                builder.field("index_uuid", indexUuid);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -167,6 +209,7 @@ public final class ShardHead {
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
         ) {
             String index = null;
+            String uuid = null;
             String owner = null;
             String ephemeral = null;
             int shard = -1;
@@ -180,6 +223,7 @@ public final class ShardHead {
                 } else if (token.isValue() || token == XContentParser.Token.VALUE_NULL) {
                     switch (field == null ? "" : field) {
                         case "index" -> index = parser.textOrNull();
+                        case "index_uuid" -> uuid = parser.textOrNull();
                         case "shard" -> shard = parser.intValue();
                         case "term" -> term = parser.longValue();
                         case "owner_node_id" -> owner = parser.textOrNull();
@@ -194,7 +238,7 @@ public final class ShardHead {
             if (index == null || shard < 0 || term < 1) {
                 throw new IOException("malformed shard head: missing a required field");
             }
-            return new ShardHead(index, shard, term, owner, ephemeral, expiry);
+            return new ShardHead(index, shard, term, owner, ephemeral, expiry, uuid);
         }
     }
 

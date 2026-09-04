@@ -112,6 +112,21 @@ public final class ClusterHealthHandler extends BaseRestHandler {
         // Reading them and answering immediately is truthful; refusing them would be pedantry.
         request.param("wait_for_no_relocating_shards");
         request.param("wait_for_no_initializing_shards");
+        // Hints: no cluster manager to time out against or to be local to, no awareness attributes, no
+        // closed indices for expand_wildcards. _cat/health's ts, time and help shape a table that is
+        // rendered one way here.
+        for (String hint : new String[] {
+            "local",
+            "master_timeout",
+            "cluster_manager_timeout",
+            "expand_wildcards",
+            "awareness_attribute",
+            "ensure_node_weighed_in",
+            "ts",
+            "time",
+            "help" }) {
+            request.param(hint);
+        }
         final TimeValue timeout = request.paramAsTime("timeout", DEFAULT_TIMEOUT);
         final String catUnsupported = cat ? CatTable.unsupported(request) : null;
         request.param("format");
@@ -323,6 +338,8 @@ public final class ClusterHealthHandler extends BaseRestHandler {
             builder.field("status", health.status);
             builder.field("timed_out", satisfied(health, ask) == false);
             builder.field("number_of_nodes", health.nodes);
+            // There is no cluster manager to discover; core's field, with the value that is true here.
+            builder.field("discovered_cluster_manager", false);
             // Every node here holds shards -- an ingest node writes them and a search node serves them --
             // so there is no data/non-data split to report and the two counts are the same number.
             builder.field("number_of_data_nodes", health.nodes);
@@ -344,6 +361,10 @@ public final class ClusterHealthHandler extends BaseRestHandler {
                 builder.field("dormant_shards", health.dormantShards);
                 final int total = health.activeShards + health.unservableShards;
                 builder.field("active_shards_percent_as_number", total == 0 ? 100.0d : (100.0d * health.activeShards) / total);
+                builder.field(
+                    "active_shards_percent",
+                    String.format(java.util.Locale.ROOT, "%.1f%%", total == 0 ? 100.0d : (100.0d * health.activeShards) / total)
+                );
             }
 
             builder.field("number_of_pending_tasks", 0);
@@ -403,10 +424,18 @@ public final class ClusterHealthHandler extends BaseRestHandler {
 
     private void run(org.opensearch.rest.RestChannel channel, org.opensearch.common.CheckedRunnable<Exception> work) {
         try {
-            work.run();
+            IndexAdminHandler.gate(
+                node.get(),
+                org.opensearch.action.admin.cluster.health.ClusterHealthAction.NAME,
+                new org.opensearch.action.admin.cluster.health.ClusterHealthRequest(),
+                () -> {
+                    work.run();
+                    return null;
+                }
+            );
         } catch (Exception e) {
             try {
-                channel.sendResponse(new BytesRestResponse(channel, e));
+                channel.sendResponse(IndexAdminHandler.failure(channel, e));
             } catch (IOException nested) {
                 logger.error("failed to report a health failure", nested);
             }

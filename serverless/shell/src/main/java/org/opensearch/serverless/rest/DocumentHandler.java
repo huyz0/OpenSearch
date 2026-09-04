@@ -91,19 +91,29 @@ public final class DocumentHandler extends BaseRestHandler {
         // Read every parameter before any early return: BaseRestHandler rejects a request whose
         // parameters were not all consumed, which would turn a deliberate refusal into a 400.
         final String index = request.param("index");
-        final boolean requireAbsent = request.path().contains("/_create/");
+        // op_type=create is the same request as the /_create/ path, and core accepts either spelling.
+        final String opType = request.param("op_type");
+        final boolean requireAbsent = request.path().contains("/_create/") || "create".equals(opType);
         // An absent id is generated, exactly as _bulk has always done, because routing is a function of
         // the id and so it must exist before the request can be placed at all.
         final String id = request.param("id") == null ? org.opensearch.common.UUIDs.base64UUID() : request.param("id");
         final String source = request.hasContent() ? request.content().utf8ToString() : null;
-        final boolean refresh = request.paramAsBoolean("refresh", false);
+        final boolean refresh = IndexAdminHandler.refresh(request);
         final boolean deletion = request.method() == RestRequest.Method.DELETE;
         // Read, not merely present-checked, so every parameter is consumed regardless of which branch
         // below returns -- the class-level idiom this handler already follows.
         final String ifSeqNoParam = request.param("if_seq_no");
         final String ifPrimaryTermParam = request.param("if_primary_term");
         final String version = request.param("version");
+        final String versionType = request.param("version_type");
         final String pipeline = request.param("pipeline");
+        final String routing = request.param("routing");
+        final boolean requireAlias = request.paramAsBoolean("require_alias", false);
+        // Hints with one possible answer here: there is one copy of each shard, so wait_for_active_shards
+        // can only be 1, and a write is acknowledged when its log write returns, which is what timeout
+        // would bound. Consumed so a client that always sends them is not turned away.
+        request.param("timeout");
+        request.param("wait_for_active_shards");
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
@@ -111,7 +121,40 @@ public final class DocumentHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        if (version != null) {
+        if (opType != null && "create".equals(opType) == false && "index".equals(opType) == false) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "bad_request",
+                    "op_type must be create or index, not [" + opType + "]"
+                )
+            );
+        }
+        if (routing != null) {
+            // Refused rather than ignored: a document here is placed by its id alone, and a caller
+            // supplying a routing value expects it to decide the shard.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_write",
+                    "routing is not supported: a document is placed by its id alone, so a routing value would be "
+                        + "accepted and change nothing"
+                )
+            );
+        }
+        if (requireAlias) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_write",
+                    "require_alias is not supported: writes here name an index, and an alias resolves on read"
+                )
+            );
+        }
+        if (version != null || versionType != null) {
             // Still refused, and for a reason that did not go away when if_seq_no arrived. External
             // versioning asks this system to order writes by a number the caller maintains and this
             // system does not; optimistic concurrency asks it to compare against a number the engine
@@ -206,10 +249,38 @@ public final class DocumentHandler extends BaseRestHandler {
             );
         }
 
-        final Optional<IndexDescriptor> descriptor = metadata.describe(index);
-        if (descriptor.isEmpty()) {
+        // An index by name, or a data stream's newest backing index. The name the caller wrote is the one
+        // the response reports, as core reports it; the routing is the backing index's.
+        final Optional<MetadataPlane.WriteTarget> target = metadata.writeTarget(index);
+        if (target.isEmpty()) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index)
+            );
+        }
+        if (target.get().dataStream() != null && (deletion || requireAbsent == false)) {
+            // Core's own rule: a data stream is append-only through its name, and anything else addresses
+            // the backing index directly.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "only write ops with an op_type of create are allowed in data streams; address the backing index ["
+                        + target.get().index().name()
+                        + "] for anything else"
+                )
+            );
+        }
+        final Optional<IndexDescriptor> descriptor = Optional.of(target.get().index());
+        final String writtenIndex = descriptor.get().name();
+        if (node.get() != null && node.get().isSystemIndex(writtenIndex)) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.FORBIDDEN,
+                    "system_index",
+                    "[" + writtenIndex + "] belongs to a plugin and is not reachable through the request path"
+                )
             );
         }
 
@@ -218,12 +289,12 @@ public final class DocumentHandler extends BaseRestHandler {
         final ShardId shardId = serving.reconciler()
             .openShards()
             .stream()
-            .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
+            .filter(s -> s.getIndexName().equals(writtenIndex) && s.id() == shard && s.getIndex().getUUID().equals(descriptor.get().uuid()))
             .findFirst()
             .orElse(null);
 
         if (shardId == null || serving.reconciler().readerShards().contains(shardId)) {
-            final var head = metadata.heads().read(index, shard);
+            final var head = metadata.heads().read(writtenIndex, shard);
             final String owner = head.map(h -> h.ownerNodeId()).orElse(null);
             if (owner != null && owner.equals(serving.localNode().getId())) {
                 // The head names this node and this node has no open shard. That is not a routing
@@ -238,7 +309,7 @@ public final class DocumentHandler extends BaseRestHandler {
                         channel,
                         RestStatus.SERVICE_UNAVAILABLE,
                         "activation_in_progress",
-                        "this node is acquiring shard " + shard + " of " + index + "; retry"
+                        "this node is acquiring shard " + shard + " of " + writtenIndex + "; retry"
                     )
                 );
             }
@@ -246,13 +317,18 @@ public final class DocumentHandler extends BaseRestHandler {
                 // Forward rather than refuse. The client should not have to know which node owns which
                 // shard; that is exactly the knowledge the shard-head exists to hold.
                 return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
-                    try {
+                    // Accounted on this node for as long as the forward is in flight, exactly as a local
+                    // write is: the bytes are held here until the owner answers, whichever node applies them.
+                    try (
+                        org.opensearch.common.lease.Releasable forwarded = serving.indexingPressure()
+                            .markCoordinatingOperationStarted(shapedSource == null ? 0L : shapedSource.length(), false)
+                    ) {
                         final var peer = serving.router().peer(owner);
                         if (peer.isEmpty()) {
                             // The head names an owner that holds no live lease. That is precisely a
                             // dead writer nobody has noticed yet, and this request is the first thing
                             // in the system to prove it -- so say so rather than waiting for a timer.
-                            serving.signals().ownershipDoubted(index, shard);
+                            serving.signals().ownershipDoubted(writtenIndex, shard);
                             channel.sendResponse(
                                 IndexAdminHandler.error(
                                     channel,
@@ -269,14 +345,14 @@ public final class DocumentHandler extends BaseRestHandler {
                         final var ack = gated(
                             serving,
                             deletion,
-                            index,
+                            writtenIndex,
                             id,
                             shapedSource,
                             () -> serving.router()
                                 .forwardIndex(
                                     peer.get(),
                                     new org.opensearch.serverless.transport.ForwardedIndexRequest(
-                                        index,
+                                        writtenIndex,
                                         shard,
                                         id,
                                         shapedSource == null ? "" : shapedSource,
@@ -290,12 +366,13 @@ public final class DocumentHandler extends BaseRestHandler {
                         );
                         respond(
                             channel,
-                            index,
+                            writtenIndex,
                             id,
                             shard,
                             ack.ownerNodeId(),
                             deletion,
-                            new ServerlessNode.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found())
+                            new ServerlessNode.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
+                            refresh
                         );
                     } catch (Exception e) {
                         // A lost compare-and-swap is not a routing problem, and must not be dressed as
@@ -326,7 +403,7 @@ public final class DocumentHandler extends BaseRestHandler {
                         // The owner was reachable and still refused or failed. Either it lost the shard
                         // between our read and its receipt, or it is going away. Same conclusion: the
                         // head we routed on is not to be trusted.
-                        serving.signals().ownershipDoubted(index, shard);
+                        serving.signals().ownershipDoubted(writtenIndex, shard);
                         try {
                             // 503, not the exception's own status. A forward that fails means routing was
                             // stale, and stale routing is a retry -- rendering it as a 500 tells a client
@@ -337,7 +414,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                     channel,
                                     RestStatus.SERVICE_UNAVAILABLE,
                                     "forward_failed",
-                                    "could not forward to " + owner + ", which the shard-head named as owner: " + e.getMessage()
+                                    IndexAdminHandler.forwardFailureMessage(owner, e)
                                 )
                             );
                         } catch (IOException nested) {
@@ -348,15 +425,15 @@ public final class DocumentHandler extends BaseRestHandler {
             }
             // No owner at all. Nothing will fix this except some node activating the shard, and the
             // only reason anyone would is that a write arrived -- which just happened.
-            serving.signals().ownershipDoubted(index, shard);
+            serving.signals().ownershipDoubted(writtenIndex, shard);
             // Through the shared error helper, so this renders the same nested "error" object every other
             // deliberate refusal on this surface does. It used to build its own body with "error" as a bare
             // string -- the exact shape M47 removed everywhere else, missed here because this one path
             // builds its response by hand. The owner is still named: a bare "wrong node" makes the client
             // guess, and guessing at ownership is how two writers end up believing the same thing.
             final String reason = owner == null
-                ? "no node currently owns shard " + shard + " of " + index + "; activate it before writing"
-                : "this node does not own shard " + shard + " of " + index + "; it is owned by " + owner;
+                ? "no node currently owns shard " + shard + " of " + writtenIndex + "; activate it before writing"
+                : "this node does not own shard " + shard + " of " + writtenIndex + "; it is owned by " + owner;
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.MISDIRECTED_REQUEST, "not_the_writer", reason)
             );
@@ -372,12 +449,15 @@ public final class DocumentHandler extends BaseRestHandler {
                 org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
+                // The document as it will be written, pipeline applied -- the same one the forwarded path
+                // shows its filters. A redaction filter that saw the pre-pipeline source here inspected a
+                // different document from the one that landed, depending on which node the request reached.
                 final ServerlessNode.WriteOutcome outcome = gated(
                     serving,
                     deletion,
-                    index,
+                    writtenIndex,
                     id,
-                    source,
+                    shapedSource,
                     () -> deletion
                         ? serving.delete(shardId, id, ifSeqNo, ifPrimaryTerm)
                         : serving.index(shardId, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent)
@@ -388,10 +468,10 @@ public final class DocumentHandler extends BaseRestHandler {
                     // hits and no error, which reads as data loss and is not.
                     serving.reconciler().shard(shardId).refresh("serverless-rest-refresh");
                 }
-                respond(channel, index, id, shard, serving.localNode().getId(), deletion, outcome);
+                respond(channel, index, id, shard, serving.localNode().getId(), deletion, outcome, refresh);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a write failure", nested);
                 }
@@ -437,7 +517,8 @@ public final class DocumentHandler extends BaseRestHandler {
         int shard,
         String writtenBy,
         boolean deletion,
-        ServerlessNode.WriteOutcome outcome
+        ServerlessNode.WriteOutcome outcome,
+        boolean refreshed
     ) throws IOException {
         {
             final boolean found = outcome.found();
@@ -469,6 +550,10 @@ public final class DocumentHandler extends BaseRestHandler {
                 // in the log before this response exists, so a successor replaying that log removes the
                 // document again rather than resurrecting it.
                 builder.field("durable", "write-ahead log");
+                if (refreshed) {
+                    // Core's own flag for "this write was made visible before answering".
+                    builder.field("forced_refresh", true);
+                }
                 // Which node actually holds the shard. Useful when the write was forwarded, and never
                 // misleading when it was not.
                 builder.field("_node", writtenBy);

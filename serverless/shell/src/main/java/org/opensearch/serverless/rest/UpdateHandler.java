@@ -71,10 +71,17 @@ public final class UpdateHandler extends BaseRestHandler {
             return new org.opensearch.script.Script(source);
         }
         if (given instanceof java.util.Map<?, ?> map) {
+            @SuppressWarnings("unchecked")
+            final java.util.Map<String, Object> storedParams = map.get("params") instanceof java.util.Map
+                ? (java.util.Map<String, Object>) map.get("params")
+                : java.util.Map.of();
             if (map.get("id") != null) {
-                throw new IllegalArgumentException(
-                    "a stored script cannot be used here: stored scripts resolve through cluster state, which this "
-                        + "design does not have. Send the source inline"
+                // A stored script, resolved by the script service from this deployment's own register.
+                return new org.opensearch.script.Script(
+                    org.opensearch.script.ScriptType.STORED,
+                    null,
+                    String.valueOf(map.get("id")),
+                    storedParams
                 );
             }
             final Object source = map.get("source");
@@ -110,11 +117,21 @@ public final class UpdateHandler extends BaseRestHandler {
         // into a 400 about an unconsumed parameter.
         final String index = request.param("index");
         final String id = request.param("id");
-        final boolean refresh = request.paramAsBoolean("refresh", false);
+        final boolean refresh = IndexAdminHandler.refresh(request);
         final String ifSeqNoParam = request.param("if_seq_no");
         final String ifPrimaryTermParam = request.param("if_primary_term");
         final String version = request.param("version");
+        final String versionType = request.param("version_type");
         final boolean detectNoopParam = request.paramAsBoolean("detect_noop", true);
+        final int retryOnConflict = request.paramAsInt("retry_on_conflict", 0);
+        final String routing = request.param("routing");
+        final boolean requireAlias = request.paramAsBoolean("require_alias", false);
+        final org.opensearch.search.fetch.subphase.FetchSourceContext wantSource = org.opensearch.search.fetch.subphase.FetchSourceContext
+            .parseFromRestRequest(request);
+        // Hints with one possible answer here; see DocumentHandler.
+        request.param("timeout");
+        request.param("wait_for_active_shards");
+        request.param("lang");
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
@@ -122,7 +139,41 @@ public final class UpdateHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        if (version != null) {
+        if (routing != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_write",
+                    "routing is not supported: a document is placed by its id alone"
+                )
+            );
+        }
+        if (requireAlias) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_write",
+                    "require_alias is not supported: writes here name an index, and an alias resolves on read"
+                )
+            );
+        }
+        if (wantSource != null && wantSource.fetchSource()) {
+            // Refused rather than silently omitted. Core answers _source on an update with a "get" block
+            // carrying the document as written; this path does not carry the written document back from the
+            // shard, so accepting the parameter would answer without the one thing it asked for.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_write",
+                    "_source on an update is not supported: the written document is not returned. GET /{index}/_doc/{id} "
+                        + "reads it back, realtime, from the shard that wrote it"
+                )
+            );
+        }
+        if (version != null || versionType != null) {
             // Same refusal as a plain write, for the same reason: see DocumentHandler. External
             // versioning is a model this system does not keep; optimistic concurrency is one it does.
             return channel -> channel.sendResponse(
@@ -219,19 +270,34 @@ public final class UpdateHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             final var operations = new ShardOperations(serving, metadata);
             try {
-                final var outcome = operations.update(
-                    index,
-                    id,
-                    doc,
-                    upsert,
-                    docAsUpsert,
-                    detectNoop,
-                    refresh,
-                    ifSeqNo,
-                    ifPrimaryTerm,
-                    script,
-                    scriptedUpsert
-                );
+                ShardOperations.UpdateOutcome outcome = null;
+                // retry_on_conflict, honoured the way core honours it: an unconditional update is a read
+                // followed by a compare-and-swap against what was read, and a lost race is retried from a
+                // fresh read up to the count the caller allowed. A caller who passed their own condition
+                // gets exactly one attempt, since retrying would be retrying against a token they chose.
+                final int attempts = ifSeqNoParam == null ? 1 + Math.max(0, retryOnConflict) : 1;
+                for (int attempt = 0; attempt < attempts; attempt++) {
+                    try {
+                        outcome = operations.update(
+                            index,
+                            id,
+                            doc,
+                            upsert,
+                            docAsUpsert,
+                            detectNoop,
+                            refresh,
+                            ifSeqNo,
+                            ifPrimaryTerm,
+                            script,
+                            scriptedUpsert
+                        );
+                        break;
+                    } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
+                        if (attempt == attempts - 1) {
+                            throw e;
+                        }
+                    }
+                }
                 respond(channel, index, id, outcome);
             } catch (ShardOperations.NoSuchIndexException e) {
                 sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
@@ -250,7 +316,7 @@ public final class UpdateHandler extends BaseRestHandler {
                 );
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report an update failure", nested);
                 }
@@ -283,9 +349,9 @@ public final class UpdateHandler extends BaseRestHandler {
             builder.endObject();
             builder.field("_node", outcome.servedBy());
             builder.endObject();
-            // 200 for all three results, matching classic OpenSearch: created, updated and noop are all a
-            // successfully-answered request, and the "result" field is where the distinction lives.
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            // 201 when the upsert created the document, 200 otherwise -- what core's DocWriteResponse
+            // answers, and what a client that branches on the status before reading "result" expects.
+            channel.sendResponse(new BytesRestResponse("created".equals(outcome.result()) ? RestStatus.CREATED : RestStatus.OK, builder));
         }
     }
 }

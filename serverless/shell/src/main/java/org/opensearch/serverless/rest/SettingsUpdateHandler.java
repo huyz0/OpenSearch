@@ -85,6 +85,18 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final String index = request.param("index");
         final String body = request.hasContent() ? request.content().utf8ToString() : null;
+        final boolean preserveExisting = request.paramAsBoolean("preserve_existing", false);
+        // Hints; see IndexAdminHandler.
+        for (String hint : new String[] {
+            "timeout",
+            "master_timeout",
+            "cluster_manager_timeout",
+            "ignore_unavailable",
+            "allow_no_indices",
+            "expand_wildcards",
+            "flat_settings" }) {
+            request.param(hint);
+        }
 
         if (body == null || body.isBlank()) {
             return channel -> channel.sendResponse(
@@ -149,10 +161,18 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                apply(channel, metadata, serving, index, requested);
+                IndexAdminHandler.gate(
+                    serving,
+                    org.opensearch.action.admin.indices.settings.put.UpdateSettingsAction.NAME,
+                    new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(requested, index),
+                    () -> {
+                        apply(channel, metadata, serving, index, requested, preserveExisting);
+                        return null;
+                    }
+                );
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a settings update failure", nested);
                 }
@@ -222,7 +242,8 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
         MetadataPlane metadata,
         org.opensearch.serverless.shell.ServerlessNode serving,
         String index,
-        Settings requested
+        Settings requested,
+        boolean preserveExisting
     ) throws Exception {
         for (int attempt = 0; attempt < ATTEMPTS; attempt++) {
             final long generation = metadata.descriptorGeneration(index);
@@ -234,7 +255,14 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
 
             // Layered over what is already there, not replacing it: PUT _settings in OpenSearch merges, so a
             // caller changing one setting does not silently clear the others.
-            final Settings.Builder merged = Settings.builder().put(current.get().extraSettings()).put(requested);
+            // preserve_existing, as core means it: a setting already present keeps its value, and only
+            // the ones not yet set are taken from the request.
+            final Settings.Builder merged = Settings.builder().put(current.get().extraSettings());
+            for (String key : requested.keySet()) {
+                if (preserveExisting == false || current.get().extraSettings().hasValue(key) == false) {
+                    merged.put(key, requested.get(key));
+                }
+            }
             merged.remove(IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
             final Settings result = merged.build();
             if (result.equals(current.get().extraSettings())) {

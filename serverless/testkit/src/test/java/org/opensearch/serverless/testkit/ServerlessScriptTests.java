@@ -226,16 +226,17 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = running(plane(clock, createTempDir()), clock, "script-stored")) {
             assertNotNull(node);
-            final Answer refused = call("PUT", "/_scripts/mine", "{\"script\":{\"lang\":\"painless\",\"source\":\"1\"}}");
-            assertEquals(refused.body(), 501, refused.status());
-            assertTrue("naming what is missing: " + refused.body(), refused.has("resolve through cluster state"));
-            assertFalse("the old reason must be gone: " + refused.body(), refused.has("no scripting engine is registered"));
-            assertTrue("and pointing at what works: " + refused.body(), refused.has("Inline scripts work"));
+            // Served since M62: stored scripts live in a register of their own, and the script service
+            // resolves an id from it rather than from cluster state.
+            final Answer stored = call("PUT", "/_scripts/mine", "{\"script\":{\"lang\":\"painless\",\"source\":\"ctx._source.n = 5\"}}");
+            assertEquals(stored.body(), 200, stored.status());
 
             // Referring to one from an update is refused by name rather than compiled into nothing.
             final Answer byId = call("POST", "/alpha/_update/1", "{\"script\":{\"id\":\"mine\"}}");
-            assertEquals(byId.body(), 400, byId.status());
-            assertTrue(byId.body(), byId.has("stored script cannot be used here"));
+            assertEquals(byId.body(), 200, byId.status());
+            final Answer missing = call("POST", "/alpha/_update/1", "{\"script\":{\"id\":\"nowhere\"}}");
+            assertEquals(missing.body(), 404, missing.status());
+            assertTrue(missing.body(), missing.has("unable to find script [nowhere]"));
         }
     }
 
@@ -262,7 +263,6 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
                 "/alpha/_close",
                 "/alpha/_open",
                 "/alpha/_recovery",
-                "/alpha/_rollover",
                 "/alpha/_shrink/beta",
                 "/_cat/master",
                 "/_cat/plugins",
@@ -283,7 +283,8 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
 
             final Answer subApi = call("GET", "/_nodes/hot_threads", null);
             assertEquals(subApi.body(), 501, subApi.status());
-            assertTrue("a node API is not a node id: " + subApi.body(), subApi.has("node API rather than a node id"));
+            // Its own refusal now, with the same substance: not "no live node matches [hot_threads]".
+            assertTrue("a node API is not a node id: " + subApi.body(), subApi.has("not_implemented") && subApi.has("_serverless/stats"));
 
             final Answer repo = call("GET", "/_snapshot/_status", null);
             assertEquals(repo.body(), 501, repo.status());

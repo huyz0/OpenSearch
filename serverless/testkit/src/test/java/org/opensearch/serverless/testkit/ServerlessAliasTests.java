@@ -136,14 +136,17 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
 
             final Response read = send(node, "GET", "/_alias/both", null);
             assertEquals(read.body(), 200, read.status());
-            assertTrue("it must say what it names, in order: " + read.body(), read.body().contains("[\"one\",\"two\"]"));
+            // Core's shape, keyed by index, in the order the alias names them.
+            assertTrue("it must say what it names: " + read.body(), read.body().contains("\"one\":{\"aliases\":{\"both\":{}}}"));
+            assertTrue("in order: " + read.body(), read.body().indexOf("\"one\"") < read.body().indexOf("\"two\""));
 
             // Replacing is a delete and a create, said plainly rather than offered as an update that could
             // quietly lose a concurrent one.
             assertEquals(400, send(node, "PUT", "/_alias/both", "{\"indices\":[\"one\"]}").status());
             assertEquals(200, send(node, "DELETE", "/_alias/both", null).status());
             assertEquals(200, send(node, "PUT", "/_alias/both", "{\"indices\":[\"one\"]}").status());
-            assertTrue(send(node, "GET", "/_alias/both", null).body().contains("[\"one\"]"));
+            // Core's shape, keyed by index: {"one":{"aliases":{"both":{}}}}.
+            assertTrue(send(node, "GET", "/_alias/both", null).body().contains("\"one\":{\"aliases\":{\"both\":{}}}"));
 
             assertEquals("deleting it twice finds nothing the second time", 200, send(node, "DELETE", "/_alias/both", null).status());
             assertEquals(404, send(node, "DELETE", "/_alias/both", null).status());

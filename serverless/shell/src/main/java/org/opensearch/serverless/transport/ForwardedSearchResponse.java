@@ -31,6 +31,10 @@ public final class ForwardedSearchResponse extends TransportResponse {
     private final long total;
     private final List<SearchHit> hits;
     private final org.opensearch.search.aggregations.InternalAggregations aggregations;
+    private final org.apache.lucene.search.TotalHits.Relation relation;
+    private final float maxScore;
+    private final boolean timedOut;
+    private final Boolean terminatedEarly;
 
     /**
      * Creates a response.
@@ -56,9 +60,47 @@ public final class ForwardedSearchResponse extends TransportResponse {
      * @param aggregations this shard's aggregations, or null if none were asked for
      */
     public ForwardedSearchResponse(long total, List<SearchHit> hits, org.opensearch.search.aggregations.InternalAggregations aggregations) {
+        this(total, hits, aggregations, org.apache.lucene.search.TotalHits.Relation.EQUAL_TO, Float.NaN, false, null);
+    }
+
+    /**
+     * Creates a response carrying everything the shard's query phase reported about itself.
+     *
+     * <p>A peer's shard can time out, stop early or stop counting exactly as a local one can, and the wire
+     * used to drop all of it, so a forwarded shard could never be the reason a response said
+     * {@code timed_out: true}. Carried whole rather than reconstructed: the coordinating node has no way
+     * to recompute any of these from the hits alone.
+     *
+     * @param result what the shard answered
+     */
+    public ForwardedSearchResponse(org.opensearch.serverless.shard.ShardQuery.Result result) {
+        this(
+            result.total(),
+            result.hits(),
+            result.aggregations(),
+            result.relation(),
+            result.maxScore(),
+            result.timedOut(),
+            result.terminatedEarly()
+        );
+    }
+
+    private ForwardedSearchResponse(
+        long total,
+        List<SearchHit> hits,
+        org.opensearch.search.aggregations.InternalAggregations aggregations,
+        org.apache.lucene.search.TotalHits.Relation relation,
+        float maxScore,
+        boolean timedOut,
+        Boolean terminatedEarly
+    ) {
         this.total = total;
         this.hits = List.copyOf(hits);
         this.aggregations = aggregations;
+        this.relation = relation;
+        this.maxScore = maxScore;
+        this.timedOut = timedOut;
+        this.terminatedEarly = terminatedEarly;
     }
 
     /**
@@ -76,6 +118,12 @@ public final class ForwardedSearchResponse extends TransportResponse {
         }
         this.hits = List.copyOf(read);
         this.aggregations = in.readBoolean() ? org.opensearch.search.aggregations.InternalAggregations.readFrom(in) : null;
+        this.relation = in.readBoolean()
+            ? org.apache.lucene.search.TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO
+            : org.apache.lucene.search.TotalHits.Relation.EQUAL_TO;
+        this.maxScore = in.readFloat();
+        this.timedOut = in.readBoolean();
+        this.terminatedEarly = in.readOptionalBoolean();
     }
 
     @Override
@@ -89,6 +137,10 @@ public final class ForwardedSearchResponse extends TransportResponse {
         if (aggregations != null) {
             aggregations.writeTo(out);
         }
+        out.writeBoolean(relation == org.apache.lucene.search.TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        out.writeFloat(maxScore);
+        out.writeBoolean(timedOut);
+        out.writeOptionalBoolean(terminatedEarly);
     }
 
     /**
@@ -98,6 +150,42 @@ public final class ForwardedSearchResponse extends TransportResponse {
      */
     public org.opensearch.search.aggregations.InternalAggregations aggregations() {
         return aggregations;
+    }
+
+    /**
+     * Returns whether the total is exact or a lower bound.
+     *
+     * @return the relation
+     */
+    public org.apache.lucene.search.TotalHits.Relation relation() {
+        return relation;
+    }
+
+    /**
+     * Returns the best score among the shard's top docs, or NaN when unscored.
+     *
+     * @return the score
+     */
+    public float maxScore() {
+        return maxScore;
+    }
+
+    /**
+     * Returns whether the shard hit the search timeout.
+     *
+     * @return true if it did
+     */
+    public boolean timedOut() {
+        return timedOut;
+    }
+
+    /**
+     * Returns whether {@code terminate_after} stopped the shard, or null when it was not asked for.
+     *
+     * @return the flag
+     */
+    public Boolean terminatedEarly() {
+        return terminatedEarly;
     }
 
     /**

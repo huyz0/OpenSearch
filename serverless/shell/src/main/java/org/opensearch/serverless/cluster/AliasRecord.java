@@ -45,6 +45,9 @@ public final class AliasRecord {
 
     private final String name;
     private final List<String> indices;
+    private final boolean dataStream;
+    private final long generation;
+    private final String timestampField;
 
     /**
      * Creates an alias.
@@ -53,8 +56,64 @@ public final class AliasRecord {
      * @param indices the indices it stands for, in the order given
      */
     public AliasRecord(String name, List<String> indices) {
+        this(name, indices, false, 0L, null);
+    }
+
+    /**
+     * Creates a record that may be a data stream.
+     *
+     * <p>A data stream here is an alias with a generation: its indices are its backing indices in order,
+     * the last of them is the one a write goes to, and the generation is the number the next backing
+     * index is named with. Nothing else about it is different from an alias, which is why it is one.
+     *
+     * @param name the name
+     * @param indices the indices, oldest first for a data stream
+     * @param dataStream whether this is a data stream
+     * @param generation the data stream's generation, 0 for an alias
+     * @param timestampField the data stream's timestamp field, null for an alias
+     */
+    public AliasRecord(String name, List<String> indices, boolean dataStream, long generation, String timestampField) {
         this.name = name;
         this.indices = List.copyOf(indices);
+        this.dataStream = dataStream;
+        this.generation = generation;
+        this.timestampField = timestampField;
+    }
+
+    /**
+     * Reports whether this is a data stream rather than a plain alias.
+     *
+     * @return true for a data stream
+     */
+    public boolean dataStream() {
+        return dataStream;
+    }
+
+    /**
+     * Returns the data stream's generation: how many backing indices it has ever had.
+     *
+     * @return the generation, 0 for an alias
+     */
+    public long generation() {
+        return generation;
+    }
+
+    /**
+     * Returns the data stream's timestamp field.
+     *
+     * @return the field, or null for an alias
+     */
+    public String timestampField() {
+        return timestampField;
+    }
+
+    /**
+     * Returns the index a write through this name goes to: the newest backing index of a data stream.
+     *
+     * @return the write index, or null for a plain alias, which is not written through
+     */
+    public String writeIndex() {
+        return dataStream ? indices.get(indices.size() - 1) : null;
     }
 
     /**
@@ -90,6 +149,13 @@ public final class AliasRecord {
                 builder.value(index);
             }
             builder.endArray();
+            // Written only for a data stream, so an alias record is byte-identical to what this class wrote
+            // before data streams existed.
+            if (dataStream) {
+                builder.field("data_stream", true);
+                builder.field("generation", generation);
+                builder.field("timestamp_field", timestampField);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -121,7 +187,10 @@ public final class AliasRecord {
             if (indices.isEmpty()) {
                 throw new IOException("alias " + name + " stands for no indices");
             }
-            return new AliasRecord(name.toString(), indices);
+            final boolean dataStream = Boolean.TRUE.equals(body.get("data_stream"));
+            final long generation = body.get("generation") instanceof Number n ? n.longValue() : 0L;
+            final String timestampField = body.get("timestamp_field") == null ? null : String.valueOf(body.get("timestamp_field"));
+            return new AliasRecord(name.toString(), indices, dataStream, generation, timestampField);
         }
     }
 

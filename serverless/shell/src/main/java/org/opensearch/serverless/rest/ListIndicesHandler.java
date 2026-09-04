@@ -10,7 +10,6 @@ package org.opensearch.serverless.rest;
 
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.rest.BaseRestHandler;
-import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
@@ -71,7 +70,13 @@ public final class ListIndicesHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.GET, "/_list/indices/{index}"));
+        return List.of(
+            new Route(RestRequest.Method.GET, "/_list/indices/{index}"),
+            // The spelling both AWS OpenSearch Serverless and Elastic Cloud Serverless keep of the _cat
+            // family, served under the same bounded-prefix rule: a name or a prefix pattern answers, and
+            // the bare /_cat/indices stays refused as the enumeration it is.
+            new Route(RestRequest.Method.GET, "/_cat/indices/{index}")
+        );
     }
 
     @Override
@@ -81,11 +86,40 @@ public final class ListIndicesHandler extends BaseRestHandler {
         final String unsupportedCat = CatTable.unsupported(request);
         request.param("format");
         request.paramAsBoolean("v", false);
-        request.param("size");
+        final String size = request.param("size");
+        // _cat/indices hints: the columns are fixed here, there is no closed state or health to filter
+        // on, and sizes are not reported. Consumed so a client sending them is not turned away.
+        for (String hint : new String[] {
+            "bytes",
+            "time",
+            "help",
+            "health",
+            "pri",
+            "expand_wildcards",
+            "local",
+            "master_timeout",
+            "cluster_manager_timeout",
+            "sort" }) {
+            request.param(hint);
+        }
 
         if (unsupportedCat != null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_cat_parameter", unsupportedCat)
+            );
+        }
+        if (size != null) {
+            // Refused for the reason next_token is. A page size is the other half of a paginated walk, and
+            // this used to consume it and answer with everything -- so a caller asking for ten and getting
+            // four hundred could not tell whether the parameter was honoured, ignored or misspelt.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_parameter",
+                    "size is not supported: this listing is not paginated. A prefix narrow enough to fit under "
+                        + "the pattern cap returns in one page, and one too broad is refused rather than truncated"
+                )
             );
         }
         if (nextToken != null) {
@@ -114,14 +148,22 @@ public final class ListIndicesHandler extends BaseRestHandler {
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                answer(channel, request, metadata, serving, index);
+                IndexAdminHandler.gate(
+                    serving,
+                    org.opensearch.action.admin.indices.get.GetIndexAction.NAME,
+                    new org.opensearch.action.admin.indices.get.GetIndexRequest().indices(index),
+                    () -> {
+                        answer(channel, request, metadata, serving, index);
+                        return null;
+                    }
+                );
             } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
                 // The refusal that makes this endpoint honest. An answer cut off at a limit looks exactly
                 // like a complete one, so the caller is told to narrow the prefix instead.
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a list failure", nested);
                 }
@@ -136,7 +178,8 @@ public final class ListIndicesHandler extends BaseRestHandler {
         org.opensearch.serverless.shell.ServerlessNode serving,
         String index
     ) throws Exception {
-        final List<String> names = IndexPatterns.expand(metadata, index, serving.patternCap());
+        final List<String> names = new java.util.ArrayList<>(IndexPatterns.expand(metadata, index, serving.patternCap()));
+        names.removeIf(serving::isSystemIndex);
         final CatTable table = new CatTable("index", "uuid", "pri", "rep", "status", "mapping_version");
         for (String name : names) {
             final Optional<IndexDescriptor> descriptor = metadata.describe(name);

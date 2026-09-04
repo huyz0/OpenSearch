@@ -90,6 +90,19 @@ public final class MappingUpdateHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final String index = request.param("index");
         final String body = request.hasContent() ? request.content().utf8ToString() : null;
+        // Hints; see IndexAdminHandler. write_index_only concerns an alias with a write index, which this
+        // surface does not have -- a mapping update names an index.
+        for (String hint : new String[] {
+            "write_index_only",
+            "timeout",
+            "master_timeout",
+            "cluster_manager_timeout",
+            "ignore_unavailable",
+            "allow_no_indices",
+            "expand_wildcards",
+            "include_type_name" }) {
+            request.param(hint);
+        }
 
         if (body == null || body.isBlank()) {
             return channel -> channel.sendResponse(
@@ -107,10 +120,18 @@ public final class MappingUpdateHandler extends BaseRestHandler {
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                apply(channel, metadata, serving, index, body);
+                IndexAdminHandler.gate(
+                    serving,
+                    org.opensearch.action.admin.indices.mapping.put.PutMappingAction.NAME,
+                    new org.opensearch.action.admin.indices.mapping.put.PutMappingRequest(index),
+                    () -> {
+                        apply(channel, metadata, serving, index, body);
+                        return null;
+                    }
+                );
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a mapping update failure", nested);
                 }

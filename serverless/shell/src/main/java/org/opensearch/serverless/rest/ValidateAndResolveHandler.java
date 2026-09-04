@@ -11,6 +11,7 @@ package org.opensearch.serverless.rest;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
@@ -75,7 +76,19 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
         final String index = request.param("index");
         final String names = request.param("name");
         final boolean explain = request.paramAsBoolean("explain", false);
-        final String body = request.hasContent() ? request.content().utf8ToString() : null;
+        // q= and its companions, parsed as _search parses them and validated by being built. rewrite and
+        // all_shards shape an explanation this does not produce (validation here is parsing, not a rewrite
+        // on a shard), and the index options cannot change how a name resolves here; consumed as hints.
+        final QueryBuilder fromUrl = org.opensearch.rest.action.RestActions.urlParamsToQueryBuilder(request);
+        for (String hint : new String[] { "rewrite", "all_shards", "ignore_unavailable", "allow_no_indices", "expand_wildcards" }) {
+            request.param(hint);
+        }
+        final String body = request.hasContent() ? request.content().utf8ToString()
+            : fromUrl == null ? null
+            : org.opensearch.core.common.Strings.toString(
+                org.opensearch.common.xcontent.XContentType.JSON,
+                new SearchSourceBuilder().query(fromUrl)
+            );
 
         final MetadataPlane metadata = plane.get();
         final var serving = node.get();
@@ -88,15 +101,31 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 if (resolving) {
-                    resolve(channel, metadata, serving, names);
+                    IndexAdminHandler.gate(
+                        serving,
+                        org.opensearch.action.admin.indices.resolve.ResolveIndexAction.NAME,
+                        new org.opensearch.action.admin.indices.resolve.ResolveIndexAction.Request(new String[] { names }),
+                        () -> {
+                            resolve(channel, metadata, serving, names);
+                            return null;
+                        }
+                    );
                 } else {
-                    validate(channel, metadata, serving, index, body, explain);
+                    IndexAdminHandler.gate(
+                        serving,
+                        org.opensearch.action.admin.indices.validate.query.ValidateQueryAction.NAME,
+                        new org.opensearch.action.admin.indices.validate.query.ValidateQueryRequest(index),
+                        () -> {
+                            validate(channel, metadata, serving, index, body, explain);
+                            return null;
+                        }
+                    );
                 }
             } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a validate or resolve failure", nested);
                 }
@@ -170,14 +199,25 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
         org.opensearch.serverless.shell.ServerlessNode serving,
         String names
     ) throws IOException {
-        final List<String> wanted = IndexPatterns.expand(metadata, names, serving.patternCap());
+        final List<String> wanted = new java.util.ArrayList<>(IndexPatterns.expand(metadata, names, serving.patternCap()));
+        wanted.removeIf(serving::isSystemIndex);
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.startArray("indices");
             for (String name : wanted) {
-                if (metadata.describe(name).isPresent()) {
+                final var described = metadata.describe(name);
+                if (described.isPresent()) {
                     builder.startObject();
                     builder.field("name", name);
+                    // Core lists the aliases only when there are some.
+                    final List<String> aliases = metadata.aliasesOf(described.get());
+                    if (aliases.isEmpty() == false) {
+                        builder.startArray("aliases");
+                        for (String alias : aliases) {
+                            builder.value(alias);
+                        }
+                        builder.endArray();
+                    }
                     builder.startArray("attributes").value("open").endArray();
                     builder.endObject();
                 }

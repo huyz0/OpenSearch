@@ -63,6 +63,7 @@ public final class WalStore {
     private static final java.util.regex.Pattern SEAL_NAME = java.util.regex.Pattern.compile("seal-\\d{20}");
 
     private final AtomicLong ordinal = new AtomicLong();
+    private volatile long seededTerm = -1L;
     private volatile List<String> previousSnapshot = List.of();
 
     /**
@@ -129,8 +130,34 @@ public final class WalStore {
         // Zero-padded so a lexicographic listing is a chronological one. Within a term there is exactly
         // one writer, so the ordinal needs no coordination. A batch takes one ordinal and its records
         // replay in the order they were written, so the total order over a term is (ordinal, position).
+        seed(term);
         final String name = String.format(java.util.Locale.ROOT, "%020d", ordinal.incrementAndGet());
-        containerFor(term).writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, false);
+        // Refused on collision, never overwritten. A store instance is rebuilt on every local release of a
+        // shard, and a shard reopened at the same term replayed records 1..N and then appended its next
+        // write as record 1 -- over the record it had just replayed. With the ordinal seeded from what
+        // the container holds this does not happen, and if it somehow did, failing the write (which
+        // releases the shard, see ServerlessNode) is the honest outcome rather than a silent overwrite.
+        containerFor(term).writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, true);
+    }
+
+    /**
+     * Starts the ordinal after the highest record already in the term, once per term.
+     *
+     * <p>One listing, paid the first time a term is written to by this instance. Within a term there is
+     * exactly one writer, so after seeding the counter needs no coordination.
+     */
+    private synchronized void seed(long term) throws IOException {
+        if (seededTerm == term) {
+            return;
+        }
+        long highest = 0L;
+        for (String name : containerFor(term).listBlobs().keySet()) {
+            if (RECORD_NAME.matcher(name).matches()) {
+                highest = Math.max(highest, Long.parseLong(name));
+            }
+        }
+        ordinal.set(highest);
+        seededTerm = term;
     }
 
     /**

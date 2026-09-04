@@ -46,7 +46,7 @@ public final class BlockCacheDirectory extends FilterDirectory {
     private final BlockCache cache;
     private final String cacheScope;
 
-    private record RemoteFile(BlobContainer container, String blobName, long length) {
+    private record RemoteFile(BlobContainer container, String blobName, long length, String termDir) {
     }
 
     private BlockCacheDirectory(Directory local, Map<String, RemoteFile> remote, BlockCache cache, String cacheScope) {
@@ -124,7 +124,10 @@ public final class BlockCacheDirectory extends FilterDirectory {
                 });
                 final Long length = lengths.get(entry.getKey());
                 if (length != null) {
-                    files.put(entry.getKey(), new RemoteFile(blobStore.blobContainer(shardBase.add(termDir)), entry.getKey(), length));
+                    files.put(
+                        entry.getKey(),
+                        new RemoteFile(blobStore.blobContainer(shardBase.add(termDir)), entry.getKey(), length, termDir)
+                    );
                 }
             }
         }
@@ -168,7 +171,9 @@ public final class BlockCacheDirectory extends FilterDirectory {
                 file.container(),
                 cache,
                 file.blobName(),
-                cacheScope + "/" + name,
+                // The term directory is part of the key: a same-named file from another term is other
+                // bytes, and a cache that keyed on the name alone served them as this file's.
+                cacheScope + "/" + file.termDir() + "/" + name,
                 file.length()
             );
         }

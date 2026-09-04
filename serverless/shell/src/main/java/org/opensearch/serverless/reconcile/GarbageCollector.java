@@ -117,6 +117,40 @@ public final class GarbageCollector {
      * @throws IOException if listing or deleting fails
      */
     public ShardSweep sweepShard(MetadataPlane plane, String indexName, int shardId, Set<String> previousCandidates) throws IOException {
+        return sweepShard(
+            plane,
+            indexName,
+            shardId,
+            previousCandidates,
+            plane.livePointsInTime(plane.clock().getAsLong()),
+            plane.liveSnapshots()
+        );
+    }
+
+    /**
+     * Sweeps one shard against views and snapshots the caller has already read.
+     *
+     * <p>Read before this is called and before this lists anything, which keeps the safety rule the
+     * per-shard form documents: a view or snapshot taken while a sweep runs is seen or not seen, never
+     * half-seen. What changes is who pays for the read -- once per pass rather than once per shard.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param previousCandidates what a previous sweep saw unreferenced, or null for everything
+     * @param views every live view
+     * @param snapshots every live snapshot
+     * @return what was deleted and what is now a candidate
+     * @throws IOException if a listing or a delete fails
+     */
+    public ShardSweep sweepShard(
+        MetadataPlane plane,
+        String indexName,
+        int shardId,
+        Set<String> previousCandidates,
+        List<org.opensearch.serverless.metadata.PointInTime> views,
+        List<org.opensearch.serverless.metadata.SnapshotRecord> snapshots
+    ) throws IOException {
         final SegmentPublisher publisher = plane.segmentPublisher(indexName, shardId);
         final Optional<CommitManifest> manifest = publisher.readManifest();
         if (manifest.isEmpty()) {
@@ -144,7 +178,7 @@ public final class GarbageCollector {
         // Read once per sweep of a shard rather than once per blob, and read *before* the listing below:
         // a view taken while this sweep is running is one whose files this sweep may already have listed
         // as orphans, so it must be seen first or not at all.
-        for (org.opensearch.serverless.metadata.PointInTime pit : plane.livePointsInTime(plane.clock().getAsLong())) {
+        for (org.opensearch.serverless.metadata.PointInTime pit : views) {
             if (pit.index().equals(indexName) || pit.index().isEmpty()) {
                 referenced.addAll(pit.referencedBlobs(shardId));
             }
@@ -157,7 +191,6 @@ public final class GarbageCollector {
         // SnapshotRecord#referencedBlobs for why that is tighter than the point-in-time check just above,
         // not merely different. The uuid is resolved only when at least one snapshot exists anywhere in
         // the deployment, so a deployment that has never taken one pays nothing extra for this at all.
-        final List<org.opensearch.serverless.metadata.SnapshotRecord> snapshots = plane.liveSnapshots();
         if (snapshots.isEmpty() == false) {
             final Optional<org.opensearch.serverless.cluster.IndexDescriptor> descriptor = plane.describe(indexName);
             if (descriptor.isPresent()) {

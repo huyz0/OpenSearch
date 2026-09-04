@@ -247,9 +247,10 @@ public class ServerlessAliasShapeTests extends OpenSearchTestCase {
         try (ServerlessNode node = running(plane(clock, createTempDir()), "alias-refused")) {
             assertNotNull(node);
 
+            // Served since M62: a body-less evaluation is a bad request, not a refusal and not a missing index.
             final Answer rankEval = call("GET", "/logs-a/_rank_eval", null);
-            assertEquals(rankEval.body(), 501, rankEval.status());
-            assertTrue("the reason must be the real one: " + rankEval.body(), rankEval.has("belongs in the harness doing the evaluating"));
+            assertEquals(rankEval.body(), 400, rankEval.status());
+            assertTrue(rankEval.body(), rankEval.has("could not parse the evaluation"));
 
             // Enumerating every alias is still the inventory operation this design refuses.
             assertEquals(501, call("GET", "/_alias", null).status());

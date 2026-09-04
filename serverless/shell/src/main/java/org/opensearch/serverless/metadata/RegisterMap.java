@@ -155,6 +155,30 @@ public final class RegisterMap {
         return base.add("pipelines");
     }
 
+    /**
+     * Where stored scripts live: one register per script id, beside a version marker.
+     *
+     * <p>Core keeps stored scripts in cluster state and every node's {@code ScriptService} reads them from
+     * the state it last applied. There is no cluster state here, so scripts keep company with templates and
+     * pipelines, and each node applies the store to its own {@code ScriptService} when the marker moves.
+     *
+     * @param base the deployment root
+     * @return the scripts container
+     */
+    public static BlobPath scripts(BlobPath base) {
+        return base.add("scripts");
+    }
+
+    /**
+     * Where search pipelines live: one register per pipeline id, the same shape as ingest pipelines.
+     *
+     * @param base the deployment root
+     * @return the search-pipeline container
+     */
+    public static BlobPath searchPipelines(BlobPath base) {
+        return base.add("search_pipelines");
+    }
+
     public static BlobPath repositories(BlobPath base) {
         return base.add("repositories");
     }

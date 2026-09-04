@@ -126,12 +126,31 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or written
      */
     public Acquisition acquire(String indexName, int shardId, String nodeId, String ephemeralId) throws IOException {
+        return acquire(indexName, shardId, nodeId, ephemeralId, null);
+    }
+
+    /**
+     * Attempts to take ownership of a shard of one incarnation of an index.
+     *
+     * <p>A head left by a previous incarnation -- same name, different uuid -- is dead however live its
+     * owner looks: that owner is serving a deleted index. It is overwritten at the next term, which is
+     * also what fences the old writer's publishes.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param nodeId the acquiring node
+     * @param ephemeralId the acquiring node's ephemeral id
+     * @param indexUuid the uuid of the index being activated, or null to skip the check
+     * @return whether the caller acquired it, and the authoritative head either way
+     * @throws IOException if the register cannot be read or written
+     */
+    public Acquisition acquire(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
         final String name = RegisterMap.shardHeadBlob(indexName, shardId);
         final long now = clock.getAsLong();
         final Optional<BlobRegister> existing = container.readRegister(name);
 
         if (existing.isEmpty()) {
-            final ShardHead head = new ShardHead(indexName, shardId, 1L, nodeId, ephemeralId, now + leaseTtlMillis);
+            final ShardHead head = new ShardHead(indexName, shardId, 1L, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid);
             final BlobRegisterCasResult created = container.createRegisterIfAbsent(name, head.toBytes());
             if (created.applied()) {
                 return Acquisition.won(head);
@@ -145,11 +164,12 @@ public final class ShardHeadStore {
         try (InputStream in = existing.get().value().streamInput()) {
             current = ShardHead.fromStream(in);
         }
-        if (isHeld(current, now) && nodeId.equals(current.ownerNodeId()) == false) {
+        final boolean otherIncarnation = indexUuid != null && current.indexUuid() != null && indexUuid.equals(current.indexUuid()) == false;
+        if (otherIncarnation == false && isHeld(current, now) && nodeId.equals(current.ownerNodeId()) == false) {
             return Acquisition.heldByAnother(current);
         }
 
-        final ShardHead next = new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis);
+        final ShardHead next = new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), next.toBytes());
         if (result.applied()) {
             return Acquisition.won(next);

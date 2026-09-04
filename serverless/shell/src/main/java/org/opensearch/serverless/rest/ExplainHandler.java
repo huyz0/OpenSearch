@@ -15,7 +15,6 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.QueryBuilder;
-import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestChannel;
@@ -80,8 +79,39 @@ public final class ExplainHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final String index = request.param("index");
         final String id = request.param("id");
-        final String q = request.param("q");
         final boolean hasBody = request.hasContent();
+        // q= with its companions, through core's own query-string parser -- df, analyzer, default_operator,
+        // lenient and analyze_wildcard are consumed by it and mean what they mean on _search.
+        final QueryBuilder fromUrl = org.opensearch.rest.action.RestActions.urlParamsToQueryBuilder(request);
+        final String routing = request.param("routing");
+        final String storedFields = request.param("stored_fields");
+        final org.opensearch.search.fetch.subphase.FetchSourceContext wantSource = org.opensearch.search.fetch.subphase.FetchSourceContext
+            .parseFromRestRequest(request);
+        // A hint: there is one copy of each shard for preference to choose between.
+        request.param("preference");
+        if (routing != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_explain",
+                    "routing is not supported: a document is placed by its id alone"
+                )
+            );
+        }
+        if (storedFields != null || (wantSource != null && wantSource.fetchSource())) {
+            // Refused rather than silently omitted: core answers these with a "get" block carrying the
+            // document, and this explains a score without fetching the document back.
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_explain",
+                    "_source and stored_fields on an explain are not supported: the document is not returned with its "
+                        + "explanation. GET /{index}/_doc/{id} reads it"
+                )
+            );
+        }
 
         final MetadataPlane metadata = plane.get();
         final ServerlessNode serving = node.get();
@@ -124,11 +154,11 @@ public final class ExplainHandler extends BaseRestHandler {
                 );
             }
             query = source.query();
-        } else if (q != null && q.isBlank() == false) {
+        } else if (fromUrl != null) {
             // The same parser search's q= uses, so the two shorthands cannot mean different things -- which
             // matters more here than anywhere: explaining a query the caller did not write is worse than
             // refusing, because the explanation would be correct about the wrong query.
-            query = QueryBuilders.queryStringQuery(q);
+            query = fromUrl;
         } else {
             // No match-all default, unlike _count. "How many documents are there" is a question; "explain
             // this document against nothing in particular" is not one, and answering it with match_all
@@ -138,7 +168,7 @@ public final class ExplainHandler extends BaseRestHandler {
             );
         }
 
-        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.SEARCH).execute(() -> {
+        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 final ShardOperations operations = new ShardOperations(serving, metadata);
                 respond(channel, index, id, operations.explain(index, id, query));
@@ -148,7 +178,7 @@ public final class ExplainHandler extends BaseRestHandler {
                 sendQuietly(channel, RestStatus.SERVICE_UNAVAILABLE, "not_here", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report an explain failure", nested);
                 }

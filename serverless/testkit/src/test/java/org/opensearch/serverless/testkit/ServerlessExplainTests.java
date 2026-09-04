@@ -146,7 +146,11 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
             assertTrue(missing.body(), missing.has("\"matched\":false"));
             assertFalse("nothing to explain about a document that is not there: " + missing.body(), missing.has("\"explanation\""));
 
-            assertEquals("an index that is not there is also a 404", 404, call("POST", "/ghost/_explain/1", "{\"query\":{\"match_all\":{}}}").status());
+            assertEquals(
+                "an index that is not there is also a 404",
+                404,
+                call("POST", "/ghost/_explain/1", "{\"query\":{\"match_all\":{}}}").status()
+            );
         }
     }
 

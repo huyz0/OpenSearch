@@ -331,11 +331,144 @@ public final class MetadataPlane {
     }
 
     public Optional<Long> updateAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
-        return descriptors.updateAlias(alias, expectedGeneration);
+        // Which indices this alias named before, so the ones it stops naming can be told.
+        final DescriptorStore.Resolution before = descriptors.resolve(alias.name());
+        final java.util.List<String> previously = before.alias() == null ? java.util.List.of() : before.alias().indices();
+        for (String index : alias.indices()) {
+            if (previously.contains(index) == false) {
+                noteAlias(index, alias.name(), true);
+            }
+        }
+        final Optional<Long> applied = descriptors.updateAlias(alias, expectedGeneration);
+        if (applied.isPresent()) {
+            for (String index : previously) {
+                if (alias.indices().contains(index) == false) {
+                    noteAlias(index, alias.name(), false);
+                }
+            }
+            // And once more for what it names now: a concurrent removal may have taken the hint between
+            // the note above and the swap, and a live alias with no hint is the one thing the hint must
+            // never be.
+            for (String index : alias.indices()) {
+                noteAlias(index, alias.name(), true);
+            }
+        }
+        return applied;
     }
 
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
-        return descriptors.createAlias(alias);
+        // The hint before the truth: an index that lists an alias which was never created over-approximates
+        // and is filtered on read; an alias that exists and is listed nowhere would be invisible to the
+        // reverse question, which is the failure this ordering prevents.
+        for (String index : alias.indices()) {
+            noteAlias(index, alias.name(), true);
+        }
+        try {
+            final long generation = descriptors.createAlias(alias);
+            for (String index : alias.indices()) {
+                noteAlias(index, alias.name(), true);
+            }
+            return generation;
+        } catch (IndexAlreadyExistsException e) {
+            // The hint was written for an alias that was not created; take it back so a name that keeps
+            // losing this race does not accumulate a stale entry per attempt.
+            for (String index : alias.indices()) {
+                noteAlias(index, alias.name(), false);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Answers which aliases name an index, verified.
+     *
+     * <p>The descriptor's {@code aliased_by} list is a hint that may carry a name whose alias was never
+     * created or has since stopped naming this index. Each name costs one register read to confirm, which
+     * is bounded by how many aliases name the index rather than by how many exist -- the enumeration this
+     * design refuses.
+     *
+     * @param descriptor the index
+     * @return the aliases that currently name it, in the order they were recorded
+     * @throws IOException if a register cannot be read
+     */
+    public java.util.List<String> aliasesOf(IndexDescriptor descriptor) throws IOException {
+        final java.util.List<String> confirmed = new java.util.ArrayList<>();
+        for (String name : descriptor.aliasedBy()) {
+            final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+            if (resolved.alias() != null && resolved.alias().indices().contains(descriptor.name())) {
+                confirmed.add(name);
+            }
+        }
+        return confirmed;
+    }
+
+    /**
+     * Adds or removes an alias name on an index's descriptor, under compare-and-swap.
+     *
+     * <p>Best effort on the way out: a lost race against a concurrent mapping or settings update is retried
+     * a few times, and a hint that could not be written is logged rather than failing the alias operation
+     * it accompanies -- the alias record stays the truth either way, and an absent hint costs a reverse
+     * lookup one name until the next alias change rewrites it.
+     */
+    private void noteAlias(String index, String alias, boolean add) throws IOException {
+        for (int attempt = 0; attempt < 4; attempt++) {
+            final long generation = descriptors.generationOf(index);
+            final Optional<IndexDescriptor> current = descriptors.get(index);
+            if (current.isEmpty()) {
+                return;
+            }
+            final java.util.List<String> names = new java.util.ArrayList<>(current.get().aliasedBy());
+            if (add ? names.contains(alias) : names.contains(alias) == false) {
+                return;
+            }
+            if (add) {
+                names.add(alias);
+            } else {
+                names.remove(alias);
+            }
+            if (descriptors.update(current.get().withAliasedBy(names), generation).isPresent()) {
+                return;
+            }
+        }
+        // Said out loud: a reverse lookup on this index will miss this alias until its membership next
+        // changes, which is a wrong answer worth an operator's attention rather than a silent one.
+        LOGGER.warn(
+            "could not record that alias [{}] {} index [{}]; the reverse lookup may miss it",
+            alias,
+            add ? "names" : "no longer names",
+            index
+        );
+    }
+
+    /**
+     * Where a write addressed to a name goes.
+     *
+     * @param index the index the write lands in
+     * @param dataStream the data stream the name resolved through, or null when the name was an index
+     */
+    public record WriteTarget(IndexDescriptor index, org.opensearch.serverless.cluster.AliasRecord dataStream) {
+    }
+
+    /**
+     * Resolves the name a write is addressed to: an index by name, or a data stream's newest backing index.
+     *
+     * <p>A plain alias is not written through: an alias here names indices for reading, and which of
+     * several a write should land in is the question a data stream's generation answers and an alias does
+     * not.
+     *
+     * @param name the name
+     * @return the target, or empty when the name is neither an index nor a data stream
+     * @throws IOException if a register cannot be read
+     */
+    public Optional<WriteTarget> writeTarget(String name) throws IOException {
+        final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+        if (resolved.index() != null) {
+            return Optional.of(new WriteTarget(resolved.index(), null));
+        }
+        if (resolved.alias() != null && resolved.alias().dataStream()) {
+            return descriptors.get(resolved.alias().writeIndex()).map(backing -> new WriteTarget(backing, resolved.alias()));
+        }
+        return Optional.empty();
     }
 
     /**
@@ -361,10 +494,17 @@ public final class MetadataPlane {
      */
     public boolean deleteAlias(String name) throws IOException {
         final long generation = descriptors.generationOf(name);
-        if (descriptors.resolve(name).alias() == null) {
+        final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+        if (resolved.alias() == null) {
             return false;
         }
-        return descriptors.deleteIfUnchanged(name, generation);
+        final boolean deleted = descriptors.deleteIfUnchanged(name, generation);
+        if (deleted) {
+            for (String index : resolved.alias().indices()) {
+                noteAlias(index, name, false);
+            }
+        }
+        return deleted;
     }
 
     /**
@@ -380,6 +520,22 @@ public final class MetadataPlane {
         final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
         final var bytes = pit.toBytes();
         container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), true);
+    }
+
+    /**
+     * Moves a frozen view's deadline later.
+     *
+     * <p>The same record with a later expiry, written over the old one. Nothing about which commits the
+     * view holds changes -- a keep-alive extends a view, it does not refresh it -- so the collector's view
+     * of what is referenced is unchanged and only the reaper's deadline moves.
+     *
+     * @param pit the view, carrying its new deadline
+     * @throws IOException if the write fails
+     */
+    public void extendPointInTime(PointInTime pit) throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
+        final var bytes = pit.toBytes();
+        container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), false);
     }
 
     /**
@@ -482,10 +638,23 @@ public final class MetadataPlane {
                 LOGGER.warn("could not read the point in time " + name + "; leaving it alone", e);
             }
         }
-        if (expired.isEmpty() == false) {
-            container.deleteBlobsIgnoringIfNotExists(expired);
+        // Re-read each candidate just before deleting it: a search on another node may have extended
+        // the view between the first read and now, and a caller told an extension succeeded must not
+        // lose the view on its next page.
+        final java.util.List<String> stillExpired = new java.util.ArrayList<>();
+        for (String name : expired) {
+            try (java.io.InputStream in = container.readBlob(name)) {
+                if (PointInTime.fromStream(in).expiredAt(nowMillis)) {
+                    stillExpired.add(name);
+                }
+            } catch (Exception e) {
+                // Gone already, or unreadable: either way not this pass's to delete.
+            }
         }
-        return expired.size();
+        if (stillExpired.isEmpty() == false) {
+            container.deleteBlobsIgnoringIfNotExists(stillExpired);
+        }
+        return stillExpired.size();
     }
 
     /**
@@ -511,20 +680,19 @@ public final class MetadataPlane {
         return descriptors.namesWithPrefix(prefix, cap);
     }
 
-    /**
-     * Reads an index descriptor.
-     *
-     * @param indexName the index
-     * @return the descriptor, or empty
-     * @throws IOException if the read fails
-     */
+    private final java.util.Map<String, TemplateStore.Cache> storeCaches = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private TemplateStore.Cache cacheFor(org.opensearch.common.blobstore.BlobPath path) {
+        return storeCaches.computeIfAbsent(path.buildAsString(), key -> new TemplateStore.Cache());
+    }
+
     /**
      * Returns the store holding index templates.
      *
      * @return the index-template store
      */
     public TemplateStore indexTemplates() {
-        return new TemplateStore(blobStore.blobContainer(RegisterMap.indexTemplates(base)));
+        return new TemplateStore(blobStore.blobContainer(RegisterMap.indexTemplates(base)), cacheFor(RegisterMap.indexTemplates(base)));
     }
 
     /**
@@ -541,12 +709,33 @@ public final class MetadataPlane {
      *
      * @return the pipeline store
      */
+    /**
+     * Returns the stored-script store.
+     *
+     * @return the store
+     */
+    public StoredScriptStore scripts() {
+        return new StoredScriptStore(blobStore.blobContainer(RegisterMap.scripts(base)), cacheFor(RegisterMap.scripts(base)));
+    }
+
+    /**
+     * Returns the search-pipeline store.
+     *
+     * @return the store
+     */
+    public TemplateStore searchPipelines() {
+        return new TemplateStore(blobStore.blobContainer(RegisterMap.searchPipelines(base)), cacheFor(RegisterMap.searchPipelines(base)));
+    }
+
     public TemplateStore pipelines() {
-        return new TemplateStore(blobStore.blobContainer(RegisterMap.pipelines(base)));
+        return new TemplateStore(blobStore.blobContainer(RegisterMap.pipelines(base)), cacheFor(RegisterMap.pipelines(base)));
     }
 
     public TemplateStore componentTemplates() {
-        return new TemplateStore(blobStore.blobContainer(RegisterMap.componentTemplates(base)));
+        return new TemplateStore(
+            blobStore.blobContainer(RegisterMap.componentTemplates(base)),
+            cacheFor(RegisterMap.componentTemplates(base))
+        );
     }
 
     public Optional<IndexDescriptor> describe(String indexName) throws IOException {
@@ -591,7 +780,22 @@ public final class MetadataPlane {
      * @throws IOException if the register cannot be read or written
      */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId) throws IOException {
-        final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId);
+        return activate(indexName, shardId, nodeId, ephemeralId, null);
+    }
+
+    /**
+     * Attempts to take ownership of a shard of one incarnation of an index.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param nodeId the acquiring node
+     * @param ephemeralId the acquiring node's ephemeral id
+     * @param indexUuid the uuid of the index being activated
+     * @return the outcome, carrying the winner's head either way
+     * @throws IOException if the register cannot be read or written
+     */
+    public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
+        final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId, indexUuid);
         if (acquisition.acquired()) {
             // Record the claim so this node can find it again without reading the world. Written after
             // the compare-and-swap, never before: if the process dies in between, the node simply does
@@ -628,6 +832,23 @@ public final class MetadataPlane {
      * @throws IOException if the object store cannot be read
      */
     public Truth truthFor(String nodeId) throws IOException {
+        return truthFor(nodeId, null);
+    }
+
+    /**
+     * Reads what one incarnation of a node owns, as the heads say.
+     *
+     * <p>A head is inherited only when its owner's ephemeral id is this incarnation's. A node restarted
+     * with the same id used to inherit every head its previous incarnation held -- and serve them at the
+     * old term while every peer read those heads as dead and took them at the next. The heads a restart
+     * leaves behind are re-acquired through the ordinary path, which bumps the term and seals the log.
+     *
+     * @param nodeId the node
+     * @param ephemeralId this incarnation's ephemeral id, or null to inherit by node id alone
+     * @return the descriptors to know about and the shards to serve
+     * @throws IOException if a register cannot be read
+     */
+    public Truth truthFor(String nodeId, String ephemeralId) throws IOException {
         final Map<String, IndexDescriptor> hosted = new LinkedHashMap<>();
         final List<ShardAssignment> assignments = new ArrayList<>();
 
@@ -653,11 +874,21 @@ public final class MetadataPlane {
             if (head.isEmpty() || nodeId.equals(head.get().ownerNodeId()) == false) {
                 continue;
             }
+            if (ephemeralId != null
+                && head.get().ownerEphemeralId() != null
+                && ephemeralId.equals(head.get().ownerEphemeralId()) == false) {
+                // A previous incarnation's head. Not ours to serve at its term; see the javadoc.
+                continue;
+            }
             final Optional<IndexDescriptor> descriptor = hosted.containsKey(indexName)
                 ? Optional.of(hosted.get(indexName))
                 : descriptors.get(indexName);
             if (descriptor.isEmpty()) {
                 // The index was deleted underneath us. Not an error: the shard is going away too.
+                continue;
+            }
+            if (head.get().indexUuid() != null && head.get().indexUuid().equals(descriptor.get().uuid()) == false) {
+                // The index was deleted and recreated underneath us; the head is the old incarnation's.
                 continue;
             }
             // The term comes from the head, which is the one monotonic number every node touching this
@@ -933,6 +1164,42 @@ public final class MetadataPlane {
      *
      * @return the register
      */
+    /**
+     * Returns the secret every node of this deployment presents on a forwarded transport request.
+     *
+     * <p>The object store is the trust root of this design: a node that can read it is a member. The
+     * transport port used to trust its callers on the strength of reaching it, which is no strength at all
+     * without TLS. The secret is minted once, by whichever node reads first, under put-if-absent, and every
+     * node reads the same one; a forwarded request that does not carry it is refused. It is not a
+     * substitute for TLS on the wire -- a network plugin supplies that -- but it is what stops a stranger
+     * on the port from writing to a shard this node owns.
+     *
+     * @return the secret
+     * @throws IOException if the register cannot be read or created
+     */
+    public String transportSecret() throws IOException {
+        final var container = blobStore.blobContainer(RegisterMap.clusterConfig(base));
+        final Optional<org.opensearch.common.blobstore.BlobRegister> existing = container.readRegister(TRANSPORT_SECRET_BLOB);
+        if (existing.isPresent()) {
+            return existing.get().value().utf8ToString();
+        }
+        final byte[] fresh = new byte[32];
+        new java.security.SecureRandom().nextBytes(fresh);
+        final String minted = org.opensearch.common.hash.MessageDigests.toHexString(fresh);
+        final var created = container.createRegisterIfAbsent(
+            TRANSPORT_SECRET_BLOB,
+            new org.opensearch.core.common.bytes.BytesArray(minted.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        );
+        if (created.applied()) {
+            return minted;
+        }
+        return container.readRegister(TRANSPORT_SECRET_BLOB)
+            .map(r -> r.value().utf8ToString())
+            .orElseThrow(() -> new IOException("transport secret vanished"));
+    }
+
+    private static final String TRANSPORT_SECRET_BLOB = "transport-secret";
+
     public ClusterConfig clusterConfig() {
         return clusterConfig;
     }

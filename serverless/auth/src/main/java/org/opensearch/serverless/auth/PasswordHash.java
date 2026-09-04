@@ -39,11 +39,12 @@ import java.util.Locale;
  * returns early leaks, through timing, how much of a derived key a guess got right. That is a narrow
  * channel and a real one, and avoiding it costs a method call.
  *
- * <p><b>What this does not defend against.</b> Verifying a name that does not exist returns quickly, while
- * verifying one that does spends the full derivation, so the response time tells an attacker whether a
- * username is real. Closing that means deriving against a dummy record for unknown users, which
- * {@link CredentialStore} does not do; the exposure is that account names are enumerable, and it is
- * written down rather than papered over.
+ * <p><b>A miss costs the same as a wrong password.</b> Verifying a name that does not exist would
+ * otherwise return as soon as the lookup did, while verifying one that does spends the full derivation,
+ * and the difference in response time would tell an attacker which usernames are real. So
+ * {@link CredentialStore} derives against a {@link #decoy decoy record} when there is no account to
+ * check: a record with a fixed salt and a digest nothing derives to, verified with exactly the code path
+ * a real record takes. The answer is the same and so is the bill.
  */
 public final class PasswordHash {
 
@@ -111,6 +112,29 @@ public final class PasswordHash {
             return false;
         }
         return MessageDigest.isEqual(expected, derive(password, salt, iterations));
+    }
+
+    /**
+     * A record that nothing verifies against, for spending a derivation on an account that is not there.
+     *
+     * <p>The salt is fixed and the digest is all zeros. {@link #verify} parses it, derives at the given
+     * work factor and compares -- the same work a real record costs -- and the comparison fails unless a
+     * password derives to sixty-four zero bytes, which is not a thing that happens. Built once by
+     * {@link CredentialStore} at the work factor it stores new records with, so the decoy keeps pace with
+     * the setting rather than with a compiled-in number.
+     *
+     * @param iterations the work factor, matching what stored records cost
+     * @return the record
+     */
+    static String decoy(int iterations) {
+        final Base64.Encoder encoder = Base64.getEncoder().withoutPadding();
+        return SCHEME
+            + "$"
+            + iterations
+            + "$"
+            + encoder.encodeToString(new byte[SALT_BYTES])
+            + "$"
+            + encoder.encodeToString(new byte[KEY_BITS / 8]);
     }
 
     private static byte[] derive(char[] password, byte[] salt, int iterations) {

@@ -19,9 +19,12 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.transport.client.Client;
 
+import java.security.SecureRandom;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -42,10 +45,21 @@ import java.util.function.Supplier;
  * <p><b>Verified credentials are cached, and the cost is stated.</b> A derivation is a few hundred
  * milliseconds by design, and a lookup is a get that may cross the network; paying both per request would
  * put authentication an order of magnitude above the request it protects. The cache holds a fingerprint of
- * the credential, never the password and never the stored record, for a short TTL. What it costs is that a
- * password change takes effect on other nodes only when their entries expire; the node that made the
- * change drops its own immediately. That window is a real property of the system rather than an
- * implementation detail, which is why it is a setting.
+ * the credential, never the password and never the stored record, for a short TTL. The node that makes a
+ * change drops its own entries immediately; every other node learns of it through the marker below, and
+ * the TTL is the bound that still holds when the marker is bypassed.
+ *
+ * <p><b>A marker, so that a change made on one node reaches the others in a second rather than a TTL.</b>
+ * There is no cluster state to carry "account X changed", and having every node re-read the account on
+ * every request is the cost the cache exists to avoid. So the index carries one reserved document, moved
+ * on every account change after the change itself is written, and a node consults it at most once a
+ * second when it is about to trust its cache: one small read, and when the marker has moved the whole
+ * cache is dropped and every cached credential is checked again on its next use. It is a random value
+ * rather than a counter because the plugin {@link Client} reports sequence numbers as unassigned and does
+ * not honour a compare-and-swap, so a read-increment-write from two nodes could lose an increment, and a
+ * lost increment is a change nobody would ever see; two random values cannot collapse into one that way.
+ * The read never runs on the thread that read the request: {@link #isCached} declines when the check is
+ * due, which sends the request to the checker pool, and {@link #verify} pays for the read there.
  *
  * <p><b>Every failure is a denial.</b> An unreadable store, an unparseable record, a missing index: none
  * of them authenticate anybody. The distinction the caller does get is <em>why</em>, because "no such
@@ -94,16 +108,39 @@ public final class CredentialStore {
 
     private static final Verdict REJECTED = new Verdict(null, null);
 
+    /**
+     * The marker's document id, which no account may have.
+     *
+     * <p>The same name {@code StoredScriptStore} gives its register, because it is the same idea. It is
+     * a legal username by the character class, so {@link #validateUsername} refuses it by name.
+     */
+    static final String MARKER = "_version";
+
+    /** How long a node trusts its cache before it looks at the marker again. */
+    static final long MARKER_INTERVAL_MILLIS = 1_000L;
+
+    private static final SecureRandom RANDOM = new SecureRandom();
+
     private final Supplier<Client> client;
     private final LongSupplier clock;
     private final String index;
     private final String bootstrapUser;
     private final String bootstrapRecord;
+    private final String decoy;
     private final int iterations;
     private final long cacheTtlMillis;
     private final TimeValue timeout;
 
     private final Map<String, Long> cache;
+
+    /** When the marker was last consulted, so the check costs one read a second and not one a request. */
+    private final AtomicLong markerCheckedAt;
+
+    /** Set when {@link #isCached} claimed a check and sent the request on; {@link #verify} pays for it. */
+    private final AtomicBoolean markerPending = new AtomicBoolean();
+
+    /** The marker as this node last saw it; 0 before any read and when there is none. */
+    private volatile long markerSeen;
 
     /**
      * Builds the store.
@@ -138,6 +175,10 @@ public final class CredentialStore {
             // handed over.
             this.bootstrapRecord = PasswordHash.encode(password.getChars(), iterations);
         }
+        this.decoy = PasswordHash.decoy(iterations);
+        // Due at once, so the first check after start reads the marker rather than trusting a value it
+        // never saw.
+        this.markerCheckedAt = new AtomicLong(clock.getAsLong() - MARKER_INTERVAL_MILLIS);
 
         final int capacity = ServerlessAuthPlugin.CACHE_SIZE.get(settings);
         this.cache = new LinkedHashMap<>(16, 0.75f, true) {
@@ -168,6 +209,9 @@ public final class CredentialStore {
             throw new IllegalArgumentException(
                 "a username must be 1-64 characters of letters, digits, underscore, dot, at-sign or hyphen, but was [" + user + "]"
             );
+        }
+        if (MARKER.equals(user)) {
+            throw new IllegalArgumentException("[" + user + "] is reserved");
         }
     }
 
@@ -206,6 +250,14 @@ public final class CredentialStore {
         if (user == null || user.isEmpty() || password == null || password.length == 0) {
             return false;
         }
+        if (claimMarkerCheck()) {
+            // The marker is due, and reading it is a client call that does not belong on this thread.
+            // Declining sends this one request the slow way, where verify() reads the marker and then
+            // finds the cache entry still there if the marker has not moved; every other request in the
+            // same second stays on the fast path.
+            markerPending.set(true);
+            return false;
+        }
         return cachedAndFresh(user + " " + PasswordHash.fingerprint(user, password));
     }
 
@@ -224,30 +276,46 @@ public final class CredentialStore {
         if (user == null || user.isEmpty() || password == null || password.length == 0) {
             return REJECTED;
         }
+        if (markerPending.compareAndSet(true, false) || claimMarkerCheck()) {
+            refreshMarker();
+        }
         final String key = user + " " + PasswordHash.fingerprint(user, password);
         if (cachedAndFresh(key)) {
             return new Verdict(user, null);
         }
-        if (bootstrapUser.equals(user) && PasswordHash.verify(password, bootstrapRecord)) {
-            remember(key);
-            return new Verdict(user, null);
+        boolean derived = false;
+        if (bootstrapUser.equals(user)) {
+            derived = true;
+            if (PasswordHash.verify(password, bootstrapRecord)) {
+                remember(key);
+                return new Verdict(user, null);
+            }
         }
         // Falls through when the configured name is offered with a different password, rather than
         // refusing: the same name may also exist in the index, and short-circuiting here would make the
         // configured account impossible to override.
-        final String record;
+        String record;
         try {
             record = lookup(user);
         } catch (IndexNotFoundException e) {
             // No account has ever been created. That is "no such user", not "broken": a fresh deployment
             // is in this state until the configured account creates the first one.
-            return REJECTED;
+            record = null;
         } catch (Exception e) {
             return new Verdict(null, "the account store could not be read: " + rootMessage(e));
         }
-        if (record != null && PasswordHash.verify(password, record)) {
-            remember(key);
-            return new Verdict(user, null);
+        if (record != null) {
+            if (PasswordHash.verify(password, record)) {
+                remember(key);
+                return new Verdict(user, null);
+            }
+            return REJECTED;
+        }
+        if (derived == false) {
+            // No account, so nothing to check against -- and answering now would answer faster than a
+            // wrong password does, which tells the caller the name is not real. The decoy costs the same
+            // derivation a real record would; the configured name skips it because it already paid one.
+            PasswordHash.verify(password, decoy);
         }
         return REJECTED;
     }
@@ -275,6 +343,10 @@ public final class CredentialStore {
             require().index(request).actionGet(timeout);
         }
         forget(user);
+        // After the record, so a node that sees the new marker sees the new record. A bump that fails
+        // leaves the account written and the caller with an error; retrying rewrites the same record and
+        // moves the marker, which is the right way for that to resolve.
+        bump();
     }
 
     /**
@@ -285,8 +357,9 @@ public final class CredentialStore {
      * @throws Exception if the removal fails
      */
     public boolean remove(String user) throws Exception {
+        final boolean deleted;
         try {
-            return require().delete(new DeleteRequest(index, user).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE))
+            deleted = require().delete(new DeleteRequest(index, user).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE))
                 .actionGet(timeout)
                 .getResult() == org.opensearch.action.DocWriteResponse.Result.DELETED;
         } catch (IndexNotFoundException e) {
@@ -297,6 +370,33 @@ public final class CredentialStore {
             // account until the entry aged out.
             forget(user);
         }
+        if (deleted) {
+            bump();
+        }
+        return deleted;
+    }
+
+    /**
+     * Reads the marker.
+     *
+     * <p>One small read, and the whole of what another node's change costs this one until the marker
+     * has moved. A random value rather than a count, for the reason the class comment gives.
+     *
+     * @return the marker, or 0 when no account has ever been changed
+     * @throws Exception if the store cannot be read
+     */
+    public long version() throws Exception {
+        final GetResponse response;
+        try {
+            response = require().get(new GetRequest(index, MARKER)).actionGet(timeout);
+        } catch (IndexNotFoundException e) {
+            return 0L;
+        }
+        if (response.isExists() == false) {
+            return 0L;
+        }
+        final Object marker = response.getSource().get("marker");
+        return marker instanceof Number ? ((Number) marker).longValue() : 0L;
     }
 
     /**
@@ -315,6 +415,10 @@ public final class CredentialStore {
     }
 
     private String lookup(String user) throws Exception {
+        if (MARKER.equals(user)) {
+            // The marker is a document in the account index and is not an account.
+            return null;
+        }
         final GetResponse response = require().get(new GetRequest(index, user)).actionGet(timeout);
         if (response.isExists() == false) {
             return null;
@@ -331,7 +435,10 @@ public final class CredentialStore {
                     new CreateIndexRequest(index).settings(Settings.builder().put("index.number_of_shards", 1))
                         // The hash is not indexed: nothing searches for one, and a field that is not
                         // indexed cannot be matched against by anyone who reaches the search API.
-                        .mapping("{\"properties\":{\"user\":{\"type\":\"keyword\"},\"hash\":{\"type\":\"keyword\",\"index\":false}}}")
+                        .mapping(
+                            "{\"properties\":{\"user\":{\"type\":\"keyword\"},\"hash\":{\"type\":\"keyword\",\"index\":false},"
+                                + "\"marker\":{\"type\":\"long\",\"index\":false}}}"
+                        )
                 )
                 .actionGet(timeout);
         } catch (org.opensearch.ResourceAlreadyExistsException e) {
@@ -348,6 +455,44 @@ public final class CredentialStore {
             throw new IllegalStateException("this node has not finished starting");
         }
         return available;
+    }
+
+    private void bump() throws Exception {
+        final org.opensearch.core.xcontent.XContentBuilder source = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()
+            .startObject()
+            .field("marker", RANDOM.nextLong())
+            .endObject();
+        require().index(new IndexRequest(index).id(MARKER).source(source).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE))
+            .actionGet(timeout);
+        // Deliberately not recorded as seen: this node's own next check will find it moved and drop a
+        // cache it just cleaned itself, which is one spurious drop per change. Recording it would hide
+        // a change another node made in the same second, and a hidden change is the one this exists
+        // to prevent.
+    }
+
+    /** Claims the once-a-second slot for reading the marker; true for exactly one caller per interval. */
+    private boolean claimMarkerCheck() {
+        final long now = clock.getAsLong();
+        final long last = markerCheckedAt.get();
+        return now - last >= MARKER_INTERVAL_MILLIS && markerCheckedAt.compareAndSet(last, now);
+    }
+
+    private void refreshMarker() {
+        final long current;
+        try {
+            current = version();
+        } catch (Exception e) {
+            // An unreadable store is the bad day the cache and the configured account exist for. Going
+            // on trusting what was verified, until it ages out, is the TTL doing its job; turning a store
+            // outage into a logout for every cached caller would be the opposite of the recovery path.
+            return;
+        }
+        if (current != markerSeen) {
+            markerSeen = current;
+            synchronized (cache) {
+                cache.clear();
+            }
+        }
     }
 
     private boolean cachedAndFresh(String key) {

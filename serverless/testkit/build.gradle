@@ -128,3 +128,12 @@ tasks.named('check').configure {
   // developer without a container gets a loud skip instead of a red build.
   dependsOn 's3Test'
 }
+
+// The REST API spec, on the test classpath. ServerlessSpecCoverageTests walks every path in it against a
+// running node and asserts each is served or refused with a reason -- never core's default 400 "no
+// handler found for uri". Copied from the spec module rather than duplicated, so the list cannot drift.
+tasks.named('processTestResources').configure {
+  from(project(':rest-api-spec').file('src/main/resources/rest-api-spec/api')) {
+    into 'rest-api-spec/api'
+  }
+}

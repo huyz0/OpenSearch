@@ -128,21 +128,39 @@ public final class UsersHandler extends BaseRestHandler {
         if (pool == null) {
             return channel -> error(channel, RestStatus.SERVICE_UNAVAILABLE, "not_started", "this node has not finished starting");
         }
-        return channel -> pool.execute(() -> {
+        return channel -> {
             try {
-                run(channel, method, user, password);
-            } catch (Exception e) {
-                try {
-                    respond(channel, e);
-                } catch (IOException nested) {
-                    logger.error("failed to report an account management failure", nested);
-                }
-            } finally {
+                pool.execute(() -> {
+                    try {
+                        run(channel, method, user, password);
+                    } catch (Exception e) {
+                        try {
+                            respond(channel, e);
+                        } catch (IOException nested) {
+                            logger.error("failed to report an account management failure", nested);
+                        }
+                    } finally {
+                        if (password != null) {
+                            Arrays.fill(password, '\0');
+                        }
+                    }
+                });
+            } catch (org.opensearch.core.concurrency.OpenSearchRejectedExecutionException e) {
+                // The pool's queue is bounded, and this is the bound being reached: the same answer the
+                // request path gives, because the operator retrying is the fix in both places.
                 if (password != null) {
                     Arrays.fill(password, '\0');
                 }
+                final BytesRestResponse busy = errorResponse(
+                    channel,
+                    RestStatus.SERVICE_UNAVAILABLE,
+                    "authentication_overloaded",
+                    "this node's authentication queue is full; retry"
+                );
+                busy.addHeader("Retry-After", "1");
+                channel.sendResponse(busy);
             }
-        });
+        };
     }
 
     private void run(RestChannel channel, RestRequest.Method method, String user, char[] password) throws Exception {
@@ -187,6 +205,10 @@ public final class UsersHandler extends BaseRestHandler {
     }
 
     private static void error(RestChannel channel, RestStatus status, String type, String reason) {
+        channel.sendResponse(errorResponse(channel, status, type, reason));
+    }
+
+    private static BytesRestResponse errorResponse(RestChannel channel, RestStatus status, String type, String reason) {
         try {
             final XContentBuilder body = channel.newErrorBuilder()
                 .startObject()
@@ -196,7 +218,7 @@ public final class UsersHandler extends BaseRestHandler {
                 .endObject()
                 .field("status", status.getStatus())
                 .endObject();
-            channel.sendResponse(new BytesRestResponse(status, body));
+            return new BytesRestResponse(status, body);
         } catch (IOException e) {
             throw new java.io.UncheckedIOException(e);
         }

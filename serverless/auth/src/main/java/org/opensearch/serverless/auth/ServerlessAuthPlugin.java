@@ -11,6 +11,7 @@ package org.opensearch.serverless.auth;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.network.NetworkAddress;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
@@ -23,6 +24,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
+import org.opensearch.http.HttpChannel;
 import org.opensearch.identity.PluginSubject;
 import org.opensearch.identity.Subject;
 import org.opensearch.identity.tokens.AuthToken;
@@ -37,11 +39,13 @@ import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
 import org.opensearch.rest.RestHeaderDefinition;
+import org.opensearch.rest.RestRequest;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
@@ -81,6 +85,25 @@ import java.util.function.UnaryOperator;
  * transport call, so the transport port must be treated as trusted and kept off any network a client can
  * reach. And a path with no registered handler answers 404 without being authenticated, because the
  * wrapper wraps handlers; that leaks which endpoints exist and nothing else.
+ *
+ * <p><b>Basic credentials need TLS on the HTTP layer, and this plugin does not supply it.</b> A Basic
+ * header is the password in Base64, which is to say in the clear: on a plain-text port every credential
+ * this plugin checks has already crossed the network readable by anyone on the path, and nothing here can
+ * make that safe after the fact. TLS is a network plugin's job. One implements
+ * {@link org.opensearch.plugins.NetworkPlugin#getHttpTransports}, registers an {@code HttpServerTransport}
+ * that terminates TLS -- the security plugin's netty transport is the shape -- and the operator selects
+ * it with {@code http.type}; this plugin leaves the transport and HTTP defaults exactly as it found them.
+ * Until such a plugin is installed, the HTTP port must be reachable only over a network that is itself
+ * trusted, which is the rule the transport port already lives under.
+ *
+ * <p><b>What an unauthenticated caller can make this node do, and the three bounds on it.</b> Every
+ * unrecognised credential costs a slow derivation, which is the point of the derivation, and a caller
+ * with no credential at all can ask for as many as they like. So: the {@link #newCheckerPool checker
+ * pool} is small and its queue is bounded, and a request that finds the queue full is answered 503 with a
+ * {@code Retry-After} rather than queued without limit; a run of failed attempts against one account or
+ * from one address earns a {@link LoginThrottle wait}, during which attempts are answered 429 at the door
+ * with no derivation and no read of the store; and a name that does not exist costs the same derivation
+ * a wrong password does, so the answer's timing does not say which names are real.
  */
 public final class ServerlessAuthPlugin extends Plugin implements org.opensearch.plugins.SystemIndexPlugin, IdentityPlugin {
 
@@ -147,6 +170,46 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
     );
 
     /**
+     * How many consecutive failures an account, or a remote address, may make before attempts are made
+     * to wait.
+     */
+    public static final Setting<Integer> THROTTLE_FAILURES = Setting.intSetting(
+        "serverless.auth.throttle.failures",
+        5,
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The longest wait a run of failures can earn. It starts at one second and doubles per failure up to
+     * this; zero switches the throttle off.
+     */
+    public static final Setting<TimeValue> THROTTLE_MAX_DELAY = Setting.timeSetting(
+        "serverless.auth.throttle.max_delay",
+        TimeValue.timeValueSeconds(60),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How many uncached checks may wait for a checker thread before the node says it is busy.
+     *
+     * <p>Sized as a wait rather than as a count: the pool has {@link #CHECKER_THREADS} threads and a check
+     * costs a derivation, so the default is a few seconds of backlog at the default work factor, after
+     * which a 503 with a {@code Retry-After} is a better answer than a request that is served a minute
+     * late.
+     */
+    public static final Setting<Integer> CHECK_QUEUE_SIZE = Setting.intSetting(
+        "serverless.auth.check.queue_size",
+        64,
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /** Threads that may be deriving at once, which is the CPU an unauthenticated caller can occupy. */
+    static final int CHECKER_THREADS = 4;
+
+    /**
      * Where the authenticated principal is left for the rest of the request to find.
      *
      * <p>A transient rather than a header, because a header would be copied onto outgoing requests and
@@ -160,6 +223,7 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
     private static final org.apache.logging.log4j.Logger LOGGER = org.apache.logging.log4j.LogManager.getLogger(ServerlessAuthPlugin.class);
 
     private final CredentialStore store;
+    private final LoginThrottle throttle;
     private final AtomicReference<Client> client = new AtomicReference<>();
     private final AtomicReference<ThreadContext> context = new AtomicReference<>();
     private final AtomicReference<java.util.concurrent.ExecutorService> checkers = new AtomicReference<>();
@@ -175,7 +239,7 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
      * @param settings the node settings
      */
     public ServerlessAuthPlugin(Settings settings) {
-        this.store = new CredentialStore(settings, client::get, System::currentTimeMillis);
+        this(settings, System::currentTimeMillis);
     }
 
     /**
@@ -197,6 +261,7 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
 
     private ServerlessAuthPlugin(Settings settings, java.util.function.LongSupplier clock) {
         this.store = new CredentialStore(settings, client::get, clock);
+        this.throttle = new LoginThrottle(THROTTLE_FAILURES.get(settings), THROTTLE_MAX_DELAY.get(settings).millis(), clock);
     }
 
     /**
@@ -229,7 +294,18 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(INDEX, BOOTSTRAP_USER, BOOTSTRAP_PASSWORD, ITERATIONS, CACHE_TTL, CACHE_SIZE, LOOKUP_TIMEOUT);
+        return List.of(
+            INDEX,
+            BOOTSTRAP_USER,
+            BOOTSTRAP_PASSWORD,
+            ITERATIONS,
+            CACHE_TTL,
+            CACHE_SIZE,
+            LOOKUP_TIMEOUT,
+            THROTTLE_FAILURES,
+            THROTTLE_MAX_DELAY,
+            CHECK_QUEUE_SIZE
+        );
     }
 
     @Override
@@ -264,17 +340,22 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
      * once bounds what they can take, at the price of queueing logins during such a flood -- which is the
      * right way round.
      *
-     * @param settings the node settings, for thread naming
+     * <p><b>Fixed, with a bounded queue.</b> The earlier shape was a scaling pool over an unbounded queue,
+     * which bounded the CPU and left the memory open: every request past the fourth waited in a list that
+     * grew as fast as an attacker could send, each one holding a channel and a decoded credential. A
+     * fixed pool with a queue of {@link #CHECK_QUEUE_SIZE} rejects the next one instead, and the request
+     * path turns that rejection into a 503 with a {@code Retry-After}. Four threads sitting idle is the
+     * cost, and it is not much of one.
+     *
+     * @param settings the node settings, for thread naming and the queue bound
      * @param threadContext the context checkers run under
      * @return the pool
      */
     private static java.util.concurrent.ExecutorService newCheckerPool(Settings settings, ThreadContext threadContext) {
-        return org.opensearch.common.util.concurrent.OpenSearchExecutors.newScaling(
+        return org.opensearch.common.util.concurrent.OpenSearchExecutors.newFixed(
             "serverless_auth",
-            1,
-            4,
-            30,
-            java.util.concurrent.TimeUnit.SECONDS,
+            CHECKER_THREADS,
+            CHECK_QUEUE_SIZE.get(settings),
             org.opensearch.common.util.concurrent.OpenSearchExecutors.daemonThreadFactory(settings, "serverless_auth"),
             threadContext
         );
@@ -311,9 +392,13 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
      * for the convenience of writing this in one branch. So a miss is handed to {@link #newCheckerPool a
      * pool of this plugin's own} and the handler runs from there.
      *
-     * <p>Refusals that need no work at all -- no header, the wrong scheme, an unreadable one -- are
-     * answered inline, because dispatching in order to say "no credentials were offered" would let an
-     * unauthenticated caller queue work on this node.
+     * <p>Refusals that need no work at all -- no header, the wrong scheme, an unreadable one, and a caller
+     * whose run of failures has earned a wait -- are answered inline, because dispatching in order to say
+     * "no credentials were offered" would let an unauthenticated caller queue work on this node. The wait
+     * is checked before the cache on purpose: a throttled account is refused even with its right password
+     * for the length of the wait, which is the lockout the throttle's own comment prices, and answering
+     * from the cache instead would let the guesser learn, from which answer came back, when a guess was
+     * right.
      *
      * @param threadContext the node's thread context, where an authenticated principal is left
      * @param headersToCopy the headers the controller preserves, none of which this uses
@@ -346,6 +431,20 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
                 return;
             }
 
+            final String address = remoteAddress(request);
+            final long wait = throttle.retryAfterSeconds(offered[0], address);
+            if (wait > 0) {
+                refuse(
+                    channel,
+                    RestStatus.TOO_MANY_REQUESTS,
+                    "too_many_attempts",
+                    "too many failed attempts for this account or from this address; try again in " + wait + "s",
+                    false,
+                    wait
+                );
+                return;
+            }
+
             final char[] password = offered[1].toCharArray();
             final boolean known;
             try {
@@ -354,6 +453,7 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
                 Arrays.fill(password, '\0');
             }
             if (known) {
+                throttle.succeeded(offered[0], address);
                 admit(threadContext, offered[0]);
                 original.handleRequest(request, channel, client);
                 return;
@@ -366,20 +466,48 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
                 refuse(channel, RestStatus.SERVICE_UNAVAILABLE, "authentication_unavailable", "this node has not finished starting", false);
                 return;
             }
-            pool.execute(() -> {
-                try {
-                    if (check(threadContext, offered[0], offered[1], channel)) {
-                        original.handleRequest(request, channel, client);
-                    }
-                } catch (Exception e) {
+            try {
+                pool.execute(() -> {
                     try {
-                        channel.sendResponse(new BytesRestResponse(channel, e));
-                    } catch (Exception nested) {
-                        LOGGER.error("failed to report an authentication failure", nested);
+                        if (check(threadContext, offered[0], offered[1], address, channel)) {
+                            original.handleRequest(request, channel, client);
+                        }
+                    } catch (Exception e) {
+                        try {
+                            channel.sendResponse(new BytesRestResponse(channel, e));
+                        } catch (Exception nested) {
+                            LOGGER.error("failed to report an authentication failure", nested);
+                        }
                     }
-                }
-            });
+                });
+            } catch (org.opensearch.core.concurrency.OpenSearchRejectedExecutionException e) {
+                // The queue is full. Not a 429: this caller did nothing wrong, the node is simply busy
+                // checking, and a second from now it may well not be.
+                refuse(
+                    channel,
+                    RestStatus.SERVICE_UNAVAILABLE,
+                    "authentication_overloaded",
+                    "this node's authentication queue is full; retry",
+                    false,
+                    1
+                );
+            }
         };
+    }
+
+    /**
+     * Names the caller's address for the throttle, or null when the channel has none to give.
+     *
+     * <p>The address and not the port: every connection has a fresh port, and a key that changed per
+     * connection would count nothing.
+     */
+    private static String remoteAddress(RestRequest request) {
+        final HttpChannel http = request.getHttpChannel();
+        final InetSocketAddress remote = http == null ? null : http.getRemoteAddress();
+        if (remote == null || remote.getAddress() == null) {
+            return null;
+        }
+        return NetworkAddress.format(remote.getAddress());
     }
 
     /**
@@ -388,11 +516,12 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
      * @param threadContext where the principal is left on success
      * @param user the username offered
      * @param secret the password offered
+     * @param address the caller's address, for the throttle
      * @param channel the channel to refuse on
      * @return true if the handler should run
      * @throws Exception if the refusal cannot be written
      */
-    private boolean check(ThreadContext threadContext, String user, String secret, RestChannel channel) throws Exception {
+    private boolean check(ThreadContext threadContext, String user, String secret, String address, RestChannel channel) throws Exception {
         final char[] password = secret.toCharArray();
         final CredentialStore.Verdict verdict;
         try {
@@ -402,13 +531,16 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
         }
 
         if (verdict.unavailable() != null) {
-            // Not a 401. The caller may well have offered a perfectly good credential, and telling them it
-            // was rejected would send them to change a password that was never the problem.
+            // Not a 401, and not a failure the throttle counts: the caller may well have offered a
+            // perfectly good credential, and telling them it was rejected would send them to change a
+            // password that was never the problem.
             return refuse(channel, RestStatus.SERVICE_UNAVAILABLE, "authentication_unavailable", verdict.unavailable(), false);
         }
         if (verdict.authenticated() == false) {
+            throttle.failed(user, address);
             return refuse(channel, RestStatus.UNAUTHORIZED, "authentication_failed", "the credentials offered were not accepted", true);
         }
+        throttle.succeeded(user, address);
         admit(threadContext, verdict.principal());
         return true;
     }
@@ -451,6 +583,17 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
     }
 
     private static boolean refuse(RestChannel channel, RestStatus status, String type, String reason, boolean challenge) {
+        return refuse(channel, status, type, reason, challenge, 0);
+    }
+
+    private static boolean refuse(
+        RestChannel channel,
+        RestStatus status,
+        String type,
+        String reason,
+        boolean challenge,
+        long retryAfterSeconds
+    ) {
         final org.opensearch.core.xcontent.XContentBuilder body;
         final BytesRestResponse response;
         try {
@@ -470,6 +613,11 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
             // Without this a browser or a client library has no way to know it should offer a credential,
             // and a 401 with no challenge reads as a broken server rather than a locked door.
             response.addHeader("WWW-Authenticate", "Basic realm=\"" + REALM + "\", charset=\"UTF-8\"");
+        }
+        if (retryAfterSeconds > 0) {
+            // A 429 or a 503 without this is a refusal with no advice; with it, a well-behaved client
+            // waits exactly as long as it is told to and a badly-behaved one is refused again for free.
+            response.addHeader("Retry-After", Long.toString(retryAfterSeconds));
         }
         channel.sendResponse(response);
         return false;

@@ -62,7 +62,38 @@ public final class TemplateResolver {
     }
 
     /** What matching templates contributed, before the request is layered on top. */
-    public record Inherited(Map<String, Object> settings, Map<String, Object> mappings, String from) {
+    public record Inherited(Map<String, Object> settings, Map<String, Object> mappings, String from, Map<String, Object> dataStream) {
+        /**
+         * Creates an inheritance with no data-stream block.
+         *
+         * @param settings the settings
+         * @param mappings the mappings
+         * @param from the winning template, or null
+         */
+        public Inherited(Map<String, Object> settings, Map<String, Object> mappings, String from) {
+            this(settings, mappings, from, null);
+        }
+
+        /**
+         * Reports whether the winning template declares a data stream.
+         *
+         * @return true if it does
+         */
+        public boolean isDataStream() {
+            return dataStream != null;
+        }
+
+        /**
+         * Returns the data stream's timestamp field, core's default when the block does not name one.
+         *
+         * @return the field name
+         */
+        public String timestampField() {
+            if (dataStream != null && dataStream.get("timestamp_field") instanceof Map<?, ?> field && field.get("name") != null) {
+                return String.valueOf(field.get("name"));
+            }
+            return "@timestamp";
+        }
     }
 
     /**
@@ -115,7 +146,7 @@ public final class TemplateResolver {
         }
         merge(settings, mappings, winning);
 
-        return new Inherited(settings, mappings, winner);
+        return new Inherited(settings, mappings, winner, winning.get("data_stream") instanceof Map<?, ?> block ? cast(block) : null);
     }
 
     /** Pulls the {@code template} block's settings and mappings into the accumulators. */

@@ -256,21 +256,15 @@ public final class ServerlessClient extends AbstractClient {
         if (source.from() < 0) {
             source.from(0);
         }
+        final long startNanos = System.nanoTime();
         final var outcome = operations.search(request.indices()[0], source);
-        final org.opensearch.search.SearchHits hits = new org.opensearch.search.SearchHits(
-            outcome.hits().toArray(new org.opensearch.search.SearchHit[0]),
-            new org.apache.lucene.search.TotalHits(outcome.total(), org.apache.lucene.search.TotalHits.Relation.EQUAL_TO),
-            outcome.hits().isEmpty() ? Float.NaN : outcome.hits().get(0).getScore()
-        );
-        return new org.opensearch.action.search.SearchResponse(
-            new org.opensearch.action.search.SearchResponseSections(hits, null, null, false, false, null, 1),
-            null,
-            outcome.shards(),
-            outcome.answered(),
-            0,
-            0L,
-            org.opensearch.action.search.ShardSearchFailure.EMPTY_ARRAY,
-            org.opensearch.action.search.SearchResponse.Clusters.EMPTY
+        // The same response a REST caller gets, built by the same code, so a plugin reading
+        // shard failures or a timed-out flag sees what a user would see.
+        return org.opensearch.serverless.rest.SearchHandler.toResponse(
+            outcome,
+            source,
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos),
+            null
         );
     }
 
@@ -286,7 +280,12 @@ public final class ServerlessClient extends AbstractClient {
         }
         final int shards = request.settings().getAsInt("index.number_of_shards", 1);
         final String mapping = request.mappings() == null || request.mappings().isEmpty() ? "{\"properties\":{}}" : request.mappings();
-        metadata.createIndex(new IndexDescriptor(request.index(), org.opensearch.common.UUIDs.randomBase64UUID(), shards, mapping, null));
+        metadata.createIndex(
+            new IndexDescriptor(request.index(), org.opensearch.common.UUIDs.randomBase64UUID(), shards, mapping, null).createdAt(
+                metadata.clock().getAsLong(),
+                org.opensearch.Version.CURRENT.id
+            )
+        );
         return new CreateIndexResponse(true, true, request.index());
     }
 

@@ -50,6 +50,26 @@ than truncated, because an answer that stopped at a limit looks exactly like a c
 rather than an empty result. `ignore_unavailable` turns a named index that cannot be reached into a
 `skipped` entry rather than a failure, and only when the caller asked for that.
 
+**API compatibility.** Measured below the route table, not just at it ([`m61-api-compatibility-notes.md`](m61-api-compatibility-notes.md)).
+The official Java client and OpenSearch Dashboards can search this shell: search parameters go through core's
+own `parseSearchRequest`, the response is a real `SearchResponse` rendered by core, so `typed_keys`,
+`rest_total_hits_as_int`, `highlight`, `_explanation`, `_shards.failures`, `timed_out` and `pit_id` are what
+core would answer. Every path in `rest-api-spec` is served or refused with a reason -- `ServerlessSpecCoverageTests`
+walks the spec against a running node and fails on core's default 400 or a 405. Every handler sorts its
+parameters into honoured, consumed-as-a-hint, or refused-with-a-reason, and nothing is accepted and silently
+dropped: alias options, restore fields, bulk action-line fields and template blocks that cannot be kept are
+refused, not acknowledged. `refresh=wait_for`, `op_type`, `retry_on_conflict`, a body `pit` block, the
+standard point-in-time delete and list, `_ingest/pipeline/_simulate`, `_analyze` without an index and
+`_cat/indices/{prefix}*` are served. M62 ([`m62-remaining-compatibility-notes.md`](m62-remaining-compatibility-notes.md))
+took what M61 left: an index records when and by what it was created; `GET /_alias/{name}` is core's shape
+and `GET /{index}/_alias` answers the reverse question from a hint each descriptor carries, verified against
+the alias records it names; **stored scripts** live in a register with a change marker and resolve through
+one overridden `ScriptService` method; **search templates** (`lang-mustache`), **ranking evaluation**
+(`rank-eval`) and **search pipelines** (`search-pipeline-common`) are served through the modules chosen by
+name, the way painless and ingest-common were; **rollover** is one compare-and-swap of the alias after the
+index is created, with `max_age` and `max_docs` evaluated against what is recorded; **data streams** are
+aliases with a generation, written through to their newest `.ds-` backing index and rolled over in place.
+
 **Point in time.** `POST /{index}/_pit` freezes each shard's commit into a record and returns an id; a
 search quoting it reads that commit however far the writer has moved on, which is what makes paging with
 `search_after` return a consistent result set rather than a moving one. The garbage collector treats a
@@ -237,6 +257,16 @@ it is refused for. An index name beginning with an underscore is an API this she
 so, rather than being reported as a missing index — and the same backstop covers node selectors and repository
 names. A genuinely missing index is still a 404.
 
+M63 ([`m63-review-fixes-notes.md`](m63-review-fixes-notes.md)) took every finding of the September review
+([`serverless-index-review-2026-09.md`](serverless-index-review-2026-09.md)): names are validated before they
+become paths, the system-index guard checks the written target, transport is authenticated with a deployment
+secret, generations never restart, shards and heads are identified by uuid, the WAL ordinal is seeded and a
+write is acknowledged only if the lease was valid on both sides of the append, the action gate covers the
+whole surface, no thread pool waits on itself, mapping and settings changes reach every node, `_bulk` grows
+a mapping, `_delete_by_query` is conditional with `version_conflicts` and `conflicts=`, every write is under
+indexing pressure, the search coordinator's working set is bounded and inside the breakers, and error
+bodies name a blob rather than a path.
+
 ## What is deliberately refused
 
 These are decisions, not gaps. Each answers 501 with a reason.
@@ -348,6 +378,9 @@ These are decisions, not gaps. Each answers 501 with a reason.
 504 tests across five Gradle tasks — `test`, `pluginTest` (a real plugin installed from its assembled zip),
 `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off) and `s3Test` (against
 live MinIO and SeaweedFS endpoints) — none skipped.
+
+M63's fixes were verified by running the whole task twice at the end, and `:serverless:shell:precommit`
+passes.
 
 Every load-bearing claim has a planted-defect canary: the defect is introduced, the failing test is watched,
 and the defect reverted. A compile failure does not count as caught. Two canaries in this run passed, which

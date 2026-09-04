@@ -79,7 +79,11 @@ final class CatTable {
      * @throws IOException if writing fails
      */
     void send(RestChannel channel, RestRequest request) throws IOException {
-        if ("json".equals(request.param("format"))) {
+        // Any structured format the channel can render -- json, yaml, cbor, smile -- comes out of the
+        // same builder, since the channel picks the content type from the format parameter itself. Only
+        // text is drawn by hand.
+        final String format = request.param("format");
+        if (format != null && "text".equals(format) == false) {
             try (XContentBuilder builder = channel.newBuilder()) {
                 builder.startArray();
                 for (List<String> row : rows) {

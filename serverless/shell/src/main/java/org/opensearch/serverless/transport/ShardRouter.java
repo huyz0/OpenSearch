@@ -99,26 +99,38 @@ public final class ShardRouter {
         );
         transportService.registerRequestHandler(
             ForwardedSearchRequest.ACTION,
-            ThreadPool.Names.SEARCH,
+            org.opensearch.serverless.shell.ServerlessNode.FANOUT_POOL,
             ForwardedSearchRequest::new,
             this::handleSearch
         );
         transportService.registerRequestHandler(
             ForwardedExplainRequest.ACTION,
-            ThreadPool.Names.SEARCH,
+            org.opensearch.serverless.shell.ServerlessNode.FANOUT_POOL,
             ForwardedExplainRequest::new,
             this::handleExplain
         );
         transportService.registerRequestHandler(
             ForwardedFrozenSearchRequest.ACTION,
-            ThreadPool.Names.SEARCH,
+            org.opensearch.serverless.shell.ServerlessNode.FANOUT_POOL,
             ForwardedFrozenSearchRequest::new,
             this::handleFrozenSearch
         );
     }
 
     private void handleIndex(ForwardedIndexRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
+        requireToken();
         final ShardId shardId = localShard(request.index(), request.shard());
+        // Accounted on the owner as a primary operation, the way core accounts a write that arrived from
+        // a coordinating node: a flood of forwarded writes used to be invisible to this node's pressure.
+        try (
+            org.opensearch.common.lease.Releasable primary = node.indexingPressure()
+                .markPrimaryOperationStarted(request.source() == null ? 0L : request.source().length(), false)
+        ) {
+            handleIndexAccounted(request, channel, shardId);
+        }
+    }
+
+    private void handleIndexAccounted(ForwardedIndexRequest request, TransportChannel channel, ShardId shardId) throws Exception {
         if (shardId == null) {
             // Ownership moved between the sender reading the head and this arriving. Failing is right:
             // the sender re-reads and retries, and accepting a write for a shard we do not own is the
@@ -129,7 +141,16 @@ public final class ShardRouter {
         if (request.deletion()) {
             outcome = node.delete(shardId, request.id(), request.ifSeqNo(), request.ifPrimaryTerm());
         } else {
-            outcome = node.index(shardId, request.id(), request.source(), request.ifSeqNo(), request.ifPrimaryTerm());
+            // requireAbsent travels on the wire and used to be dropped here, so a forwarded _create was an
+            // overwrite -- and a data-stream write, which is create-only, was one too.
+            outcome = node.index(
+                shardId,
+                request.id(),
+                request.source(),
+                request.ifSeqNo(),
+                request.ifPrimaryTerm(),
+                request.requireAbsent()
+            );
         }
         if (request.refresh()) {
             node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
@@ -147,7 +168,18 @@ public final class ShardRouter {
     }
 
     private void handleBulk(ForwardedBulkRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
+        requireToken();
         final ShardId shardId = localShard(request.index(), request.shard());
+        long bytes = 0L;
+        for (var operation : request.batch()) {
+            bytes += operation.record().toBytes().length();
+        }
+        try (org.opensearch.common.lease.Releasable primary = node.indexingPressure().markPrimaryOperationStarted(bytes, false)) {
+            handleBulkAccounted(request, channel, shardId);
+        }
+    }
+
+    private void handleBulkAccounted(ForwardedBulkRequest request, TransportChannel channel, ShardId shardId) throws Exception {
         if (shardId == null) {
             // Same refusal as a forwarded single write, and for the same reason: ownership moved between
             // the sender reading the head and this arriving. Refusing the whole batch is right -- every
@@ -162,7 +194,8 @@ public final class ShardRouter {
     }
 
     private void handleGet(ForwardedGetRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
-        final ShardId shardId = localShard(request.index(), request.shard());
+        requireToken();
+        final ShardId shardId = writerShard(request.index(), request.shard());
         if (shardId == null) {
             // Refuse rather than open it as a reader, which is what handleSearch does here and is right
             // there. A get was forwarded to this node precisely because the shard-head named it the
@@ -175,7 +208,8 @@ public final class ShardRouter {
     }
 
     private void handleExplain(ForwardedExplainRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
-        final ShardId shardId = localShard(request.index(), request.shard());
+        requireToken();
+        final ShardId shardId = writerShard(request.index(), request.shard());
         if (shardId == null) {
             // Refused rather than opened as a reader, following handleGet and not handleSearch. An explain
             // was forwarded here because the shard-head named this node the owner; if the shard is not open
@@ -188,27 +222,86 @@ public final class ShardRouter {
     }
 
     private void handleSearch(ForwardedSearchRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
-        ShardId shardId = localShard(request.index(), request.shard());
+        requireToken();
+        ShardId shardId = localShard(request.index(), request.shard(), request.indexUuid());
         if (shardId == null) {
             // Open it. This is the property that makes placement a hint rather than a requirement: a
             // node asked for a shard it does not have fetches the manifest and serves, so a stale or
             // unlucky routing decision costs a cold read and never a wrong answer.
             shardId = node.serveAsReader(plane.get(), request.index(), request.shard());
+            if (request.indexUuid() != null && request.indexUuid().equals(shardId.getIndex().getUUID()) == false) {
+                throw new IllegalStateException("index [" + request.index() + "] was recreated while this search was in flight");
+            }
         }
         node.markUsed(shardId);
         final ShardQuery.Result result = ShardQuery.execute(node.searchService(), shardId, request.source());
-        channel.sendResponse(new ForwardedSearchResponse(result.total(), result.hits(), result.aggregations()));
+        channel.sendResponse(new ForwardedSearchResponse(result));
     }
 
     private void handleFrozenSearch(ForwardedFrozenSearchRequest request, TransportChannel channel, org.opensearch.tasks.Task task)
         throws Exception {
+        requireToken();
         // No "not held" refusal here, unlike handleIndex/handleGet: a view has no owner to be stale about,
         // and openFrozenView is idempotent -- opening it here for the first time is exactly what placement
         // being a hint means. plane.get() rather than the request: the view travelled the wire, but which
         // object store to open its files from is this node's own configuration, never the sender's.
         final ShardId shardId = node.openFrozenView(plane.get(), request.pit(), request.shard());
         final ShardQuery.Result result = ShardQuery.execute(node.searchService(), shardId, request.source());
-        channel.sendResponse(new ForwardedSearchResponse(result.total(), result.hits(), result.aggregations()));
+        channel.sendResponse(new ForwardedSearchResponse(result));
+    }
+
+    /** The header a forwarded request carries its deployment secret in. */
+    static final String TOKEN_HEADER = "x-serverless-transport-token";
+
+    /** Puts the deployment secret on the outgoing request's context, restored when the try closes. */
+    private org.opensearch.common.util.concurrent.ThreadContext.StoredContext withToken() {
+        // Added to the caller's context rather than to a fresh one: the caller's own headers -- the
+        // authenticated principal a plugin set -- must travel with the forwarded request too.
+        final org.opensearch.common.util.concurrent.ThreadContext context = transportService.getThreadPool().getThreadContext();
+        final String token = node.transportToken();
+        if (token != null && context.getHeader(TOKEN_HEADER) == null) {
+            context.putHeader(TOKEN_HEADER, token);
+        }
+        return () -> {};
+    }
+
+    /**
+     * Refuses a forwarded request that does not carry this deployment's secret.
+     *
+     * <p>Every handler below calls this first. The transport port used to serve anyone who reached it; a
+     * caller that has not read the object store is not a member, whatever address it came from.
+     */
+    private void requireToken() {
+        final String expected = node.transportToken();
+        final String presented = transportService.getThreadPool().getThreadContext().getHeader(TOKEN_HEADER);
+        if (expected == null
+            || presented == null
+            || java.security.MessageDigest.isEqual(
+                expected.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                presented.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+            ) == false) {
+            throw new org.opensearch.OpenSearchSecurityException(
+                "forwarded request without a valid transport token",
+                org.opensearch.core.rest.RestStatus.FORBIDDEN
+            );
+        }
+    }
+
+    private ShardId localShard(String index, int shard, String indexUuid) {
+        final ShardId found = localShard(index, shard);
+        return found == null || indexUuid == null || indexUuid.equals(found.getIndex().getUUID()) ? found : null;
+    }
+
+    /**
+     * The shard as this node holds it for writing, or null if it holds it only as a search reader.
+     *
+     * <p>A forwarded get or explain was sent here because the head named this node the owner. A reader
+     * opened for a search is a published commit, not the owner's live shard, and answering from it
+     * stamped {@code realtime: true} on a document that was missing every unpublished write.
+     */
+    private ShardId writerShard(String index, int shard) {
+        final ShardId found = localShard(index, shard);
+        return found == null || node.reconciler().readerShards().contains(found) ? null : found;
     }
 
     private ShardId localShard(String index, int shard) {
@@ -244,7 +337,17 @@ public final class ShardRouter {
         if (metadata == null) {
             return Optional.empty();
         }
-        final var lease = metadata.membership().read(nodeId);
+        // The membership snapshot first: it is refreshed every pass and costs nothing to consult, where
+        // a lease read per forwarded write was one of the larger costs of a hot write path. The store is
+        // read only for a node the snapshot has not seen yet.
+        Optional<org.opensearch.serverless.membership.NodeLease> lease = metadata.membership()
+            .current()
+            .stream()
+            .filter(l -> nodeId.equals(l.nodeId()))
+            .findFirst();
+        if (lease.isEmpty()) {
+            lease = metadata.membership().read(nodeId);
+        }
         if (lease.isEmpty()) {
             return Optional.empty();
         }
@@ -313,13 +416,15 @@ public final class ShardRouter {
     public ForwardedIndexResponse forwardIndex(DiscoveryNode peer, ForwardedIndexRequest request) {
         final PlainActionFuture<ForwardedIndexResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        transportService.sendRequest(
-            peer,
-            ForwardedIndexRequest.ACTION,
-            request,
-            TransportRequestOptions.builder().withTimeout(timeout).build(),
-            new Handler<>(future, ForwardedIndexResponse::new)
-        );
+        try (var ignored = withToken()) {
+            transportService.sendRequest(
+                peer,
+                ForwardedIndexRequest.ACTION,
+                request,
+                TransportRequestOptions.builder().withTimeout(timeout).build(),
+                new Handler<>(future, ForwardedIndexResponse::new)
+            );
+        }
         return future.actionGet(timeout);
     }
 
@@ -338,13 +443,15 @@ public final class ShardRouter {
     public ForwardedBulkResponse forwardBulk(DiscoveryNode peer, ForwardedBulkRequest request) {
         final PlainActionFuture<ForwardedBulkResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        transportService.sendRequest(
-            peer,
-            ForwardedBulkRequest.ACTION,
-            request,
-            TransportRequestOptions.builder().withTimeout(timeout).build(),
-            new Handler<>(future, ForwardedBulkResponse::new)
-        );
+        try (var ignored = withToken()) {
+            transportService.sendRequest(
+                peer,
+                ForwardedBulkRequest.ACTION,
+                request,
+                TransportRequestOptions.builder().withTimeout(timeout).build(),
+                new Handler<>(future, ForwardedBulkResponse::new)
+            );
+        }
         return future.actionGet(timeout);
     }
 
@@ -360,13 +467,15 @@ public final class ShardRouter {
         // The write bound, not the search one. A get is a point lookup on the owner rather than a fan-out,
         // so it is the cheaper of the two and has no reason to wait as long as a query.
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        transportService.sendRequest(
-            peer,
-            ForwardedGetRequest.ACTION,
-            request,
-            TransportRequestOptions.builder().withTimeout(timeout).build(),
-            new Handler<>(future, ForwardedGetResponse::new)
-        );
+        try (var ignored = withToken()) {
+            transportService.sendRequest(
+                peer,
+                ForwardedGetRequest.ACTION,
+                request,
+                TransportRequestOptions.builder().withTimeout(timeout).build(),
+                new Handler<>(future, ForwardedGetResponse::new)
+            );
+        }
         return future.actionGet(timeout);
     }
 
@@ -382,13 +491,15 @@ public final class ShardRouter {
         // The get bound rather than the search one, for the reason a get uses it: this is a point lookup on
         // one shard with no fan-out to wait behind.
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        transportService.sendRequest(
-            peer,
-            ForwardedExplainRequest.ACTION,
-            request,
-            TransportRequestOptions.builder().withTimeout(timeout).build(),
-            new Handler<>(future, ForwardedExplainResponse::new)
-        );
+        try (var ignored = withToken()) {
+            transportService.sendRequest(
+                peer,
+                ForwardedExplainRequest.ACTION,
+                request,
+                TransportRequestOptions.builder().withTimeout(timeout).build(),
+                new Handler<>(future, ForwardedExplainResponse::new)
+            );
+        }
         return future.actionGet(timeout);
     }
 
@@ -402,13 +513,15 @@ public final class ShardRouter {
     public ForwardedSearchResponse forwardSearch(DiscoveryNode peer, ForwardedSearchRequest request) {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
         final TimeValue timeout = searchForwardTimeout();
-        transportService.sendRequest(
-            peer,
-            ForwardedSearchRequest.ACTION,
-            request,
-            TransportRequestOptions.builder().withTimeout(timeout).build(),
-            new Handler<>(future, ForwardedSearchResponse::new)
-        );
+        try (var ignored = withToken()) {
+            transportService.sendRequest(
+                peer,
+                ForwardedSearchRequest.ACTION,
+                request,
+                TransportRequestOptions.builder().withTimeout(timeout).build(),
+                new Handler<>(future, ForwardedSearchResponse::new)
+            );
+        }
         return future.actionGet(timeout);
     }
 
@@ -425,13 +538,15 @@ public final class ShardRouter {
     public ForwardedSearchResponse forwardFrozenSearch(DiscoveryNode peer, ForwardedFrozenSearchRequest request) {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
         final TimeValue timeout = searchForwardTimeout();
-        transportService.sendRequest(
-            peer,
-            ForwardedFrozenSearchRequest.ACTION,
-            request,
-            TransportRequestOptions.builder().withTimeout(timeout).build(),
-            new Handler<>(future, ForwardedSearchResponse::new)
-        );
+        try (var ignored = withToken()) {
+            transportService.sendRequest(
+                peer,
+                ForwardedFrozenSearchRequest.ACTION,
+                request,
+                TransportRequestOptions.builder().withTimeout(timeout).build(),
+                new Handler<>(future, ForwardedSearchResponse::new)
+            );
+        }
         return future.actionGet(timeout);
     }
 

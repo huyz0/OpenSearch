@@ -172,7 +172,13 @@ public final class BackgroundReconciler implements Closeable {
         if (passes++ % REAP_EVERY_PASSES == 0) {
             reapExpiredViews();
         }
+        // One small register read: the stored scripts are re-read only when their marker has moved, which
+        // is how a script put on another node reaches this one without a listing per pass.
+        node.storedScripts().refresh(false);
         // Only what was published, so the sweep costs nothing at all on a shard nobody is writing to.
+        // Edge-triggered publishes are swept here too: only the backstop's result used to enter the
+        // watch set, so a burst-then-idle shard kept its merged-away segments forever.
+        published.addAll(drainPendingSweeps());
         sweepPublished(published);
         return new TickResult(released, activated, published, refreshHints(nowMillis));
     }
@@ -281,6 +287,22 @@ public final class BackgroundReconciler implements Closeable {
         final GarbageCollector collector = new GarbageCollector(plane.blobStore(), plane.basePath());
         final Set<ShardId> toSweep = new LinkedHashSet<>(published);
         toSweep.addAll(unreferencedFor.keySet());
+        if (toSweep.isEmpty()) {
+            // Nothing published and nothing on watch: an idle pass costs no listing at all.
+            return deleted;
+        }
+        // The views and snapshots every shard's sweep checks against, read once per pass rather than once
+        // per shard: at a hundred published shards and a thousand views that was a hundred thousand reads
+        // a pass.
+        final java.util.List<org.opensearch.serverless.metadata.PointInTime> views;
+        final java.util.List<org.opensearch.serverless.metadata.SnapshotRecord> snapshots;
+        try {
+            views = plane.livePointsInTime(plane.clock().getAsLong());
+            snapshots = plane.liveSnapshots();
+        } catch (Exception e) {
+            logger.warn("could not read the views and snapshots a sweep must respect; sweeping nothing this pass", e);
+            return deleted;
+        }
         for (ShardId shardId : toSweep) {
             if (node.reconciler().openShards().contains(shardId) == false || node.reconciler().readerShards().contains(shardId)) {
                 // Not ours to sweep any more. Forgetting what we had seen is the safe direction: the next
@@ -302,7 +324,7 @@ public final class BackgroundReconciler implements Closeable {
                 }
             }
             try {
-                final var swept = collector.sweepShard(plane, shardId.getIndexName(), shardId.id(), eligible);
+                final var swept = collector.sweepShard(plane, shardId.getIndexName(), shardId.id(), eligible, views, snapshots);
                 deleted.addAll(swept.deleted());
                 final Map<String, Integer> next = new java.util.HashMap<>();
                 for (String candidate : swept.candidates()) {
@@ -643,7 +665,9 @@ public final class BackgroundReconciler implements Closeable {
                 // Not ours any more; renewLeases will deal with it and this must not race it.
                 return false;
             }
-            node.publishShard(shardId, head.get().term());
+            synchronized (publishLock(shardId)) {
+                node.publishShard(shardId, head.get().term());
+            }
             if (plane.heads().release(shardId.getIndexName(), shardId.id(), node.localNode().getId()) == false) {
                 // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
                 // closing it while the head still points here is the one outcome to avoid.
@@ -651,6 +675,9 @@ public final class BackgroundReconciler implements Closeable {
                 return false;
             }
             node.reconciler().releaseShard(shardId, reason);
+            // And forget the claim, so a node that churns through shards does not read a head per stale
+            // claim on every heartbeat for the rest of its life.
+            plane.forgetAssignment(node.localNode().getId(), shardId.getIndexName(), shardId.id());
             return true;
         } catch (Exception e) {
             // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
@@ -768,12 +795,20 @@ public final class BackgroundReconciler implements Closeable {
                 );
                 continue;
             }
-            final boolean alreadyHeld = node.reconciler()
+            final ShardId open = node.reconciler()
                 .openShards()
                 .stream()
-                .anyMatch(s -> s.getIndexName().equals(candidate.getKey()) && s.id() == candidate.getValue());
-            if (alreadyHeld) {
-                continue;
+                .filter(s -> s.getIndexName().equals(candidate.getKey()) && s.id() == candidate.getValue())
+                .findFirst()
+                .orElse(null);
+            if (open != null) {
+                if (node.reconciler().readerShards().contains(open) == false) {
+                    continue;
+                }
+                // Held as a reader. That used to count as held, so a node that had searched a shard could
+                // never become its writer until idle release let the reader go. A reader holds no head
+                // and no unpublished write, so closing it costs nothing.
+                node.reconciler().releaseShard(open, "reopening as a writer");
             }
             node.activateWriter(plane, candidate.getKey(), candidate.getValue()).ifPresent(shardId -> {
                 taken.add(shardId);
@@ -873,7 +908,9 @@ public final class BackgroundReconciler implements Closeable {
                 continue;
             }
             try {
-                node.publishShard(shardId, head.get().term());
+                synchronized (publishLock(shardId)) {
+                    node.publishShard(shardId, head.get().term());
+                }
             } catch (org.opensearch.serverless.store.StaleWriterException e) {
                 // A newer term has already published. This node is a zombie for this shard: it read a
                 // head that named it, and by the time it wrote, it did not. Stop serving it now rather
@@ -933,6 +970,53 @@ public final class BackgroundReconciler implements Closeable {
         wanted.clear();
         dirty.clear();
         fenced.clear();
+    }
+
+    private final Set<ShardId> pendingSweeps = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Notes shards published outside a pass, so the next pass sweeps what they left behind.
+     *
+     * @param published the shards an edge-triggered publish uploaded
+     */
+    public void noteForSweep(Collection<ShardId> published) {
+        pendingSweeps.addAll(published);
+    }
+
+    private Set<ShardId> drainPendingSweeps() {
+        final Set<ShardId> drained = new LinkedHashSet<>(pendingSweeps);
+        pendingSweeps.removeAll(drained);
+        return drained;
+    }
+
+    /**
+     * Publishes and releases every writer shard this node holds, for a clean shutdown.
+     *
+     * <p>Without this a node that stopped cleanly left its heads in place, and on restart with the same id
+     * inherited them at the old term while every peer read them as dead. Handing them over is what makes
+     * a restart a handover rather than a failover: the next owner acquires at a fresh term, and nothing
+     * this node acknowledged is behind a seal.
+     *
+     * @return how many shards were handed over
+     */
+    public int handOverAll() {
+        int handed = 0;
+        for (ShardId shardId : new java.util.ArrayList<>(node.reconciler().openShards())) {
+            if (node.reconciler().readerShards().contains(shardId)) {
+                continue;
+            }
+            if (letGo(shardId, "shutting down")) {
+                handed++;
+            }
+        }
+        return handed;
+    }
+
+    private final java.util.concurrent.ConcurrentHashMap<ShardId, Object> publishLocks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** One lock per shard, so the backstop and the edge-triggered publish of one shard do not overlap. */
+    private Object publishLock(ShardId shardId) {
+        return publishLocks.computeIfAbsent(shardId, key -> new Object());
     }
 
     /** What one reconciliation pass did. */

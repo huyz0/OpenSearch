@@ -63,7 +63,14 @@ public final class PipelineHandler extends BaseRestHandler {
             new Route(RestRequest.Method.POST, "/_ingest/pipeline/{id}"),
             new Route(RestRequest.Method.GET, "/_ingest/pipeline/{id}"),
             new Route(RestRequest.Method.DELETE, "/_ingest/pipeline/{id}"),
-            new Route(RestRequest.Method.GET, "/_ingest/pipeline")
+            new Route(RestRequest.Method.GET, "/_ingest/pipeline"),
+            // Simulation: run a pipeline over documents without writing them. Both AWS and Elastic ship
+            // it, and it needs nothing a stored pipeline does not already have -- the same compiler, run
+            // over the documents in the body instead of over a write.
+            new Route(RestRequest.Method.POST, "/_ingest/pipeline/_simulate"),
+            new Route(RestRequest.Method.GET, "/_ingest/pipeline/_simulate"),
+            new Route(RestRequest.Method.POST, "/_ingest/pipeline/{id}/_simulate"),
+            new Route(RestRequest.Method.GET, "/_ingest/pipeline/{id}/_simulate")
         );
     }
 
@@ -72,6 +79,12 @@ public final class PipelineHandler extends BaseRestHandler {
         final String id = request.param("id");
         final String body = request.hasContent() ? request.content().utf8ToString() : null;
         final RestRequest.Method method = request.method();
+        final boolean simulate = request.path().endsWith("/_simulate");
+        final boolean verbose = request.paramAsBoolean("verbose", false);
+        // Hints: there is no cluster manager to time out against.
+        request.param("master_timeout");
+        request.param("cluster_manager_timeout");
+        request.param("timeout");
 
         final MetadataPlane metadata = plane.get();
         final var serving = node.get();
@@ -85,28 +98,67 @@ public final class PipelineHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a pipeline body is required")
             );
         }
+        if (simulate && verbose) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_parameter",
+                    "verbose is not supported: it reports each processor's intermediate document, which this does "
+                        + "not collect; the final document is reported"
+                )
+            );
+        }
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 final TemplateStore store = metadata.pipelines();
-                switch (method) {
-                    case PUT, POST -> put(channel, serving, store, id, body);
-                    case GET -> get(channel, store, id);
-                    case DELETE -> delete(channel, store, id);
-                    default -> channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.METHOD_NOT_ALLOWED,
-                            "method_not_allowed",
-                            method + " is not supported here"
-                        )
+                if (simulate) {
+                    IndexAdminHandler.gate(
+                        serving,
+                        org.opensearch.action.ingest.SimulatePipelineAction.NAME,
+                        new org.opensearch.action.ingest.SimulatePipelineRequest(
+                            new org.opensearch.core.common.bytes.BytesArray(body == null ? "{}" : body),
+                            org.opensearch.common.xcontent.XContentType.JSON
+                        ),
+                        () -> {
+                            simulate(channel, serving, store, id, body);
+                            return null;
+                        }
                     );
+                    return;
                 }
+                final String action = switch (method) {
+                    case PUT, POST -> org.opensearch.action.ingest.PutPipelineAction.NAME;
+                    case DELETE -> org.opensearch.action.ingest.DeletePipelineAction.NAME;
+                    default -> org.opensearch.action.ingest.GetPipelineAction.NAME;
+                };
+                IndexAdminHandler.gate(
+                    serving,
+                    action,
+                    new org.opensearch.action.ingest.GetPipelineRequest(id == null ? new String[0] : new String[] { id }),
+                    () -> {
+                        switch (method) {
+                            case PUT, POST -> put(channel, serving, store, id, body);
+                            case GET -> get(channel, store, id);
+                            case DELETE -> delete(channel, store, id);
+                            default -> channel.sendResponse(
+                                IndexAdminHandler.error(
+                                    channel,
+                                    RestStatus.METHOD_NOT_ALLOWED,
+                                    "method_not_allowed",
+                                    method + " is not supported here"
+                                )
+                            );
+                        }
+                        return null;
+                    }
+                );
             } catch (TemplateStore.TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_pipelines", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a pipeline failure", nested);
                 }
@@ -142,6 +194,133 @@ public final class PipelineHandler extends BaseRestHandler {
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
+    }
+
+    /**
+     * Runs a pipeline over the documents in the body, and reports each as it would have been written.
+     *
+     * <p>Core's simulate shape: {@code docs[]} of {@code {doc: {_index, _id, _source, _ingest}}}, an
+     * {@code error} object for a document a processor failed on, and an empty object for one the pipeline
+     * dropped. The pipeline is the stored one when the path names an id, or the one in the body.
+     */
+    private void simulate(
+        org.opensearch.rest.RestChannel channel,
+        org.opensearch.serverless.shell.ServerlessNode serving,
+        TemplateStore store,
+        String id,
+        String body
+    ) throws IOException {
+        if (body == null || body.isBlank()) {
+            sendQuietly(channel, RestStatus.BAD_REQUEST, "missing_body", "a simulate body is required, naming docs and a pipeline");
+            return;
+        }
+        final Map<String, Object> parsed;
+        try {
+            parsed = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                new org.opensearch.core.common.bytes.BytesArray(body.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                false,
+                org.opensearch.common.xcontent.XContentType.JSON
+            ).v2();
+        } catch (Exception e) {
+            sendQuietly(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not parse the body: " + e.getMessage());
+            return;
+        }
+        final String source;
+        if (id != null) {
+            final var stored = store.get(id);
+            if (stored.isEmpty()) {
+                sendQuietly(channel, RestStatus.NOT_FOUND, "pipeline_missing", "no such pipeline: " + id);
+                return;
+            }
+            source = stored.get();
+        } else if (parsed.get("pipeline") instanceof Map<?, ?> inline) {
+            source = toJson(inline);
+        } else {
+            sendQuietly(
+                channel,
+                RestStatus.BAD_REQUEST,
+                "missing_pipeline",
+                "name a stored pipeline in the path, or send one under 'pipeline'"
+            );
+            return;
+        }
+        final org.opensearch.ingest.Pipeline pipeline;
+        try {
+            pipeline = serving.ingestPipelines().compile(id == null ? "_simulate" : id, source);
+        } catch (Exception e) {
+            sendQuietly(
+                channel,
+                RestStatus.BAD_REQUEST,
+                "invalid_pipeline",
+                (e.getMessage() == null ? e.toString() : e.getMessage())
+                    + ". Available processors: "
+                    + String.join(", ", serving.ingestPipelines().available())
+            );
+            return;
+        }
+        if (!(parsed.get("docs") instanceof List<?> docs) || docs.isEmpty()) {
+            sendQuietly(channel, RestStatus.BAD_REQUEST, "missing_docs", "a simulate body needs a non-empty 'docs' array");
+            return;
+        }
+        try (XContentBuilder builder = channel.newBuilder()) {
+            builder.startObject();
+            builder.startArray("docs");
+            for (Object each : docs) {
+                builder.startObject();
+                if (!(each instanceof Map<?, ?> doc)) {
+                    writeError(builder, "illegal_argument_exception", "each entry in docs must be an object");
+                    builder.endObject();
+                    continue;
+                }
+                final String index = doc.get("_index") == null ? "_index" : String.valueOf(doc.get("_index"));
+                final String docId = doc.get("_id") == null ? "_id" : String.valueOf(doc.get("_id"));
+                final Object given = doc.get("_source");
+                if ((given instanceof Map<?, ?>) == false) {
+                    writeError(builder, "illegal_argument_exception", "each document needs a _source object");
+                    builder.endObject();
+                    continue;
+                }
+                final String docSource = toJson((Map<?, ?>) given);
+                try {
+                    final var outcome = serving.ingestPipelines().run(pipeline, index, docId, docSource);
+                    if (outcome.dropped() == false) {
+                        builder.startObject("doc");
+                        builder.field("_index", index);
+                        builder.field("_id", docId);
+                        builder.rawField(
+                            "_source",
+                            new java.io.ByteArrayInputStream(outcome.source().getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                            org.opensearch.common.xcontent.XContentType.JSON
+                        );
+                        builder.startObject("_ingest");
+                        builder.field("timestamp", java.time.Instant.now().toString());
+                        builder.endObject();
+                        builder.endObject();
+                    }
+                } catch (Exception e) {
+                    writeError(builder, "exception", e.getMessage() == null ? e.toString() : e.getMessage());
+                }
+                builder.endObject();
+            }
+            builder.endArray();
+            builder.endObject();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String toJson(Map<?, ?> map) throws IOException {
+        try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            builder.map((Map<String, Object>) map);
+            return org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
+        }
+    }
+
+    private static void writeError(XContentBuilder builder, String type, String reason) throws IOException {
+        builder.startObject("error");
+        builder.field("type", type);
+        builder.field("reason", reason);
+        builder.endObject();
     }
 
     private void get(org.opensearch.rest.RestChannel channel, TemplateStore store, String id) throws IOException {

@@ -31,6 +31,7 @@ public final class ForwardedSearchRequest extends TransportRequest {
     private final String index;
     private final int shard;
     private final SearchSourceBuilder source;
+    private final String indexUuid;
 
     /**
      * Creates a request.
@@ -40,9 +41,22 @@ public final class ForwardedSearchRequest extends TransportRequest {
      * @param source the query as the client sent it
      */
     public ForwardedSearchRequest(String index, int shard, SearchSourceBuilder source) {
+        this(index, shard, source, null);
+    }
+
+    /**
+     * Creates a request for one shard of one incarnation of an index.
+     *
+     * @param index the index
+     * @param shard the shard to query
+     * @param source the query as the client sent it
+     * @param indexUuid the uuid the coordinator resolved, so the peer does not answer from a recreated index
+     */
+    public ForwardedSearchRequest(String index, int shard, SearchSourceBuilder source, String indexUuid) {
         this.index = index;
         this.shard = shard;
         this.source = source;
+        this.indexUuid = indexUuid;
     }
 
     /**
@@ -56,6 +70,7 @@ public final class ForwardedSearchRequest extends TransportRequest {
         this.index = in.readString();
         this.shard = in.readVInt();
         this.source = new SearchSourceBuilder(in);
+        this.indexUuid = in.readOptionalString();
     }
 
     @Override
@@ -64,6 +79,16 @@ public final class ForwardedSearchRequest extends TransportRequest {
         out.writeString(index);
         out.writeVInt(shard);
         source.writeTo(out);
+        out.writeOptionalString(indexUuid);
+    }
+
+    /**
+     * Returns the uuid the coordinator resolved the index to.
+     *
+     * @return the uuid, or null from an older coordinator
+     */
+    public String indexUuid() {
+        return indexUuid;
     }
 
     /**

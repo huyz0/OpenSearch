@@ -41,21 +41,97 @@ public final class ShardQuery {
 
     private ShardQuery() {}
 
+    /** The longest one shard's query or fetch may take before the search fails rather than hangs. */
+    private static final org.opensearch.common.unit.TimeValue WAIT = org.opensearch.common.unit.TimeValue.timeValueMinutes(5);
+
     /** One shard's answer. */
     public static final class Result {
 
         private final long total;
         private final List<SearchHit> hits;
         private final org.opensearch.search.aggregations.InternalAggregations aggregations;
+        private final org.apache.lucene.search.TotalHits.Relation relation;
+        private final float maxScore;
+        private final boolean timedOut;
+        private final Boolean terminatedEarly;
 
         Result(long total, List<SearchHit> hits) {
             this(total, hits, null);
         }
 
         Result(long total, List<SearchHit> hits, org.opensearch.search.aggregations.InternalAggregations aggregations) {
+            this(total, hits, aggregations, org.apache.lucene.search.TotalHits.Relation.EQUAL_TO, Float.NaN, false, null);
+        }
+
+        /**
+         * Creates a result carrying everything the query phase reported about itself.
+         *
+         * <p>These four used to be dropped on the floor between the shard and the caller: a shard that
+         * timed out, or stopped early because the caller asked it to, or stopped counting past a ceiling,
+         * said so in its {@code QuerySearchResult} and nothing read it. The response then claimed
+         * {@code timed_out: false} and {@code relation: eq} as constants, which were true only because the
+         * information that could make them false was thrown away here.
+         *
+         * @param total how many matched, or a lower bound when counting stopped early
+         * @param hits the fetched hits
+         * @param aggregations the unreduced aggregations, or null
+         * @param relation whether {@code total} is exact or a lower bound
+         * @param maxScore the best score in this shard's top docs, or NaN when unscored
+         * @param timedOut whether the shard hit the search timeout
+         * @param terminatedEarly whether {@code terminate_after} stopped it, or null when not asked
+         */
+        public Result(
+            long total,
+            List<SearchHit> hits,
+            org.opensearch.search.aggregations.InternalAggregations aggregations,
+            org.apache.lucene.search.TotalHits.Relation relation,
+            float maxScore,
+            boolean timedOut,
+            Boolean terminatedEarly
+        ) {
             this.total = total;
             this.hits = hits;
             this.aggregations = aggregations;
+            this.relation = relation;
+            this.maxScore = maxScore;
+            this.timedOut = timedOut;
+            this.terminatedEarly = terminatedEarly;
+        }
+
+        /**
+         * Returns whether {@link #total()} is exact or a lower bound.
+         *
+         * @return the relation
+         */
+        public org.apache.lucene.search.TotalHits.Relation relation() {
+            return relation;
+        }
+
+        /**
+         * Returns the best score among this shard's top docs.
+         *
+         * @return the score, or NaN when the query was not scored
+         */
+        public float maxScore() {
+            return maxScore;
+        }
+
+        /**
+         * Returns whether the shard ran out of time.
+         *
+         * @return true if the search timeout was hit
+         */
+        public boolean timedOut() {
+            return timedOut;
+        }
+
+        /**
+         * Returns whether {@code terminate_after} stopped the shard.
+         *
+         * @return true or false when it was asked for, null when it was not
+         */
+        public Boolean terminatedEarly() {
+            return terminatedEarly;
         }
 
         /**
@@ -194,8 +270,13 @@ public final class ShardQuery {
 
         final PlainActionFuture<SearchPhaseResult> queryFuture = PlainActionFuture.newFuture();
         searchService.executeQueryPhase(shardRequest, true, task, queryFuture, ThreadPool.Names.SEARCH, false);
-        final SearchPhaseResult queryResult = queryFuture.actionGet();
-        final long total = queryResult.queryResult().topDocs().topDocs.totalHits.value();
+        final SearchPhaseResult queryResult = queryFuture.actionGet(WAIT);
+        final org.opensearch.common.lucene.search.TopDocsAndMaxScore topDocs = queryResult.queryResult().topDocs();
+        final long total = topDocs.topDocs.totalHits.value();
+        final org.apache.lucene.search.TotalHits.Relation relation = topDocs.topDocs.totalHits.relation();
+        final float maxScore = topDocs.maxScore;
+        final boolean timedOut = queryResult.queryResult().searchTimedOut();
+        final Boolean terminatedEarly = queryResult.queryResult().terminatedEarly();
 
         // A single-shard request resolves to query-and-fetch, so the hits are already here and the
         // reader context has already been freed. Asking for it again produced "No search context found",
@@ -208,7 +289,15 @@ public final class ShardQuery {
             ? queryResult.queryResult().consumeAggs().expand()
             : null;
         if (queryResult.fetchResult() != null && queryResult.fetchResult().hits() != null) {
-            return new Result(total, withScores(queryResult.fetchResult().hits().getHits(), scoreDocs, sortFormats, shardId), aggregations);
+            return new Result(
+                total,
+                withScores(queryResult.fetchResult().hits().getHits(), scoreDocs, sortFormats, shardId),
+                aggregations,
+                relation,
+                maxScore,
+                timedOut,
+                terminatedEarly
+            );
         }
 
         final List<Integer> docIds = new ArrayList<>();
@@ -219,12 +308,20 @@ public final class ShardQuery {
             searchService.freeReaderContext(queryResult.getContextId());
             // No hits does not mean no aggregations: a terms aggregation over an index with size 0 is the
             // ordinary way to ask for one.
-            return new Result(total, List.of(), aggregations);
+            return new Result(total, List.of(), aggregations, relation, maxScore, timedOut, terminatedEarly);
         }
         try {
             final PlainActionFuture<FetchSearchResult> fetchFuture = PlainActionFuture.newFuture();
             searchService.executeFetchPhase(new ShardFetchRequest(queryResult.getContextId(), docIds, null), task, fetchFuture);
-            return new Result(total, withScores(fetchFuture.actionGet().hits().getHits(), scoreDocs, sortFormats, shardId), aggregations);
+            return new Result(
+                total,
+                withScores(fetchFuture.actionGet(WAIT).hits().getHits(), scoreDocs, sortFormats, shardId),
+                aggregations,
+                relation,
+                maxScore,
+                timedOut,
+                terminatedEarly
+            );
         } finally {
             // The reader is pinned until this runs; leaking one keeps a commit's files alive forever.
             searchService.freeReaderContext(queryResult.getContextId());

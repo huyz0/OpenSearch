@@ -72,6 +72,7 @@ public final class NodesHandler extends BaseRestHandler {
         return List.of(
             new Route(RestRequest.Method.GET, "/_nodes"),
             new Route(RestRequest.Method.GET, "/_nodes/{nodeId}"),
+            new Route(RestRequest.Method.GET, "/_nodes/{nodeId}/{metric}"),
             new Route(RestRequest.Method.GET, "/_cat/nodes")
         );
     }
@@ -80,6 +81,27 @@ public final class NodesHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final boolean cat = request.path().startsWith("/_cat");
         final String wanted = request.param("nodeId");
+        final String metric = request.param("metric");
+        // Hints: there is no cluster manager to time out against, and settings are not rendered.
+        request.param("timeout");
+        request.param("flat_settings");
+        if (metric != null || (wanted != null && "_all".equals(wanted) == false && NODE_METRICS.contains(wanted))) {
+            // GET /_nodes/os is a metric, not a node id, and GET /_nodes/{id}/jvm asks for one. This used
+            // to answer "no live node matches [os]", a confident wrong answer about something that was
+            // never a name.
+            final String asked = metric != null ? metric : wanted;
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "not_implemented",
+                    "the node info metric '"
+                        + asked
+                        + "' is not reported here: GET /_nodes reports each node's name, address, roles and version, "
+                        + "and GET /_serverless/stats answers for the node it is sent to"
+                )
+            );
+        }
         final String unsupported = cat ? CatTable.unsupported(request) : null;
         // Consumed whether or not it is used, because BaseRestHandler rejects a request whose parameters
         // were not all read -- the same trap that turned refusals on placeholder paths into 400s.
@@ -205,6 +227,23 @@ public final class NodesHandler extends BaseRestHandler {
      * refusing a node whose name collides with an API and telling every caller of a real API that their node
      * is missing, and the second is the far more likely mistake to make.
      */
+    /** The metric names core's nodes-info API takes as its second path segment. */
+    private static final java.util.Set<String> NODE_METRICS = java.util.Set.of(
+        "settings",
+        "os",
+        "process",
+        "jvm",
+        "thread_pool",
+        "transport",
+        "http",
+        "plugins",
+        "ingest",
+        "aggregations",
+        "indices",
+        "search_pipelines",
+        "_all"
+    );
+
     private static final java.util.Set<String> NODE_SUB_APIS = java.util.Set.of(
         "hot_threads",
         "usage",
@@ -245,10 +284,18 @@ public final class NodesHandler extends BaseRestHandler {
 
     private void run(org.opensearch.rest.RestChannel channel, org.opensearch.common.CheckedRunnable<Exception> work) {
         try {
-            work.run();
+            IndexAdminHandler.gate(
+                node.get(),
+                org.opensearch.action.admin.cluster.node.info.NodesInfoAction.NAME,
+                new org.opensearch.action.admin.cluster.node.info.NodesInfoRequest(),
+                () -> {
+                    work.run();
+                    return null;
+                }
+            );
         } catch (Exception e) {
             try {
-                channel.sendResponse(new BytesRestResponse(channel, e));
+                channel.sendResponse(IndexAdminHandler.failure(channel, e));
             } catch (IOException nested) {
                 logger.error("failed to report a nodes failure", nested);
             }

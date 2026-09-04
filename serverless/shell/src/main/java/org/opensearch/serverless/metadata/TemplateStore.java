@@ -69,6 +69,22 @@ public final class TemplateStore {
     private static final String PREFIX = "template-";
 
     private final BlobContainer container;
+    private final Cache cache;
+
+    /** The register that moves on every change, so a reader can tell whether its copy is current. */
+    static final String VERSION_BLOB = "_version";
+
+    /**
+     * A node's copy of one store's contents, valid while the marker has not moved.
+     *
+     * <p>Shared across the {@code TemplateStore} instances the plane hands out for one container, which
+     * is what makes reading every template on every index creation cost one small register read rather
+     * than a listing and a read per template.
+     */
+    public static final class Cache {
+        private volatile long version = -1L;
+        private volatile Map<String, String> contents;
+    }
 
     /**
      * Creates a store over one container.
@@ -76,7 +92,46 @@ public final class TemplateStore {
      * @param container the register container holding these templates
      */
     public TemplateStore(BlobContainer container) {
+        this(container, new Cache());
+    }
+
+    /**
+     * Creates a store whose listings are served from a shared cache while the marker has not moved.
+     *
+     * @param container the container
+     * @param cache the cache shared by every store over this container on this node
+     */
+    public TemplateStore(BlobContainer container, Cache cache) {
         this.container = container;
+        this.cache = cache;
+    }
+
+    /**
+     * Reads the marker.
+     *
+     * @return the number of changes ever made, or 0 when none has been
+     * @throws IOException if the read fails
+     */
+    public long version() throws IOException {
+        final Optional<org.opensearch.common.blobstore.BlobRegister> register = container.readRegister(VERSION_BLOB);
+        return register.isEmpty() ? 0L : Long.parseLong(register.get().value().utf8ToString().trim());
+    }
+
+    private void bump() throws IOException {
+        for (int attempt = 0; attempt < 10; attempt++) {
+            final Optional<org.opensearch.common.blobstore.BlobRegister> register = container.readRegister(VERSION_BLOB);
+            final long current = register.isEmpty() ? 0L : Long.parseLong(register.get().value().utf8ToString().trim());
+            final org.opensearch.core.common.bytes.BytesArray next = new org.opensearch.core.common.bytes.BytesArray(
+                Long.toString(current + 1).getBytes(StandardCharsets.UTF_8)
+            );
+            final org.opensearch.common.blobstore.BlobRegisterCasResult result = register.isEmpty()
+                ? container.createRegisterIfAbsent(VERSION_BLOB, next)
+                : container.compareAndSwapRegister(VERSION_BLOB, register.get().generation(), next);
+            if (result.applied()) {
+                return;
+            }
+        }
+        throw new IOException("could not move the store's marker: it is being changed concurrently");
     }
 
     /**
@@ -88,12 +143,14 @@ public final class TemplateStore {
      * @throws IOException if the write fails
      */
     public void put(String name, String source) throws IOException {
+        Names.validateId(name, "template");
         final Map<String, String> existing = all();
         if (existing.containsKey(name) == false && existing.size() >= MAX_TEMPLATES) {
             throw new TooManyTemplatesException(MAX_TEMPLATES);
         }
         final byte[] bytes = source.getBytes(StandardCharsets.UTF_8);
         container.writeBlob(PREFIX + name, new java.io.ByteArrayInputStream(bytes), bytes.length, false);
+        bump();
     }
 
     /**
@@ -104,6 +161,7 @@ public final class TemplateStore {
      * @throws IOException if the read fails
      */
     public Optional<String> get(String name) throws IOException {
+        Names.validateId(name, "template");
         try (InputStream in = container.readBlob(PREFIX + name)) {
             return Optional.of(new String(in.readAllBytes(), StandardCharsets.UTF_8));
         } catch (java.nio.file.NoSuchFileException e) {
@@ -126,10 +184,12 @@ public final class TemplateStore {
      * @throws IOException if the delete fails
      */
     public boolean delete(String name) throws IOException {
+        Names.validateId(name, "template");
         if (get(name).isEmpty()) {
             return false;
         }
         container.deleteBlobsIgnoringIfNotExists(List.of(PREFIX + name));
+        bump();
         return true;
     }
 
@@ -140,6 +200,20 @@ public final class TemplateStore {
      * @throws IOException if listing or reading fails
      */
     public Map<String, String> all() throws IOException {
+        // One register read tells whether the copy is current; the listing and the reads happen only
+        // when something changed.
+        final long version = version();
+        final Map<String, String> cached = cache.contents;
+        if (cached != null && cache.version == version) {
+            return cached;
+        }
+        final Map<String, String> fresh = java.util.Collections.unmodifiableMap(readAll());
+        cache.contents = fresh;
+        cache.version = version;
+        return fresh;
+    }
+
+    private Map<String, String> readAll() throws IOException {
         final Map<String, String> templates = new TreeMap<>();
         final List<String> blobs = new ArrayList<>(container.listBlobs().keySet());
         for (String blob : blobs) {

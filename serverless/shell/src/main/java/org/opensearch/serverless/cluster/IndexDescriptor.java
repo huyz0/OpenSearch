@@ -22,6 +22,7 @@ import org.opensearch.indices.replication.common.ReplicationType;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -61,6 +62,9 @@ public final class IndexDescriptor {
     private final long mappingVersion;
     private final long settingsVersion;
     private final Settings extraSettings;
+    private final long createdAtMillis;
+    private final int createdVersionId;
+    private final List<String> aliasedBy;
 
     /**
      * Creates a descriptor.
@@ -122,6 +126,35 @@ public final class IndexDescriptor {
         long mappingVersion,
         long settingsVersion
     ) {
+        this(name, uuid, numberOfShards, mapping, extraSettings, mappingVersion, settingsVersion, 0L, 0, List.of());
+    }
+
+    /**
+     * Creates a descriptor carrying when and by what it was created, and which aliases name it.
+     *
+     * @param name the index name
+     * @param uuid the index uuid
+     * @param numberOfShards the shard count
+     * @param mapping the mapping, or null
+     * @param extraSettings the settings beyond the shard count
+     * @param mappingVersion how many times the mapping has changed
+     * @param settingsVersion how many times the settings have changed
+     * @param createdAtMillis when the index was created, or 0 when not recorded
+     * @param createdVersionId the id of the OpenSearch version that created it, or 0 when not recorded
+     * @param aliasedBy the aliases believed to name this index; verified against each alias record on read
+     */
+    public IndexDescriptor(
+        String name,
+        String uuid,
+        int numberOfShards,
+        String mapping,
+        Settings extraSettings,
+        long mappingVersion,
+        long settingsVersion,
+        long createdAtMillis,
+        int createdVersionId,
+        List<String> aliasedBy
+    ) {
         this.name = Objects.requireNonNull(name);
         this.uuid = Objects.requireNonNull(uuid);
         if (numberOfShards < 1) {
@@ -142,6 +175,85 @@ public final class IndexDescriptor {
         this.mappingVersion = mappingVersion;
         this.settingsVersion = settingsVersion;
         this.extraSettings = extraSettings == null ? Settings.EMPTY : extraSettings;
+        this.createdAtMillis = createdAtMillis;
+        this.createdVersionId = createdVersionId;
+        this.aliasedBy = List.copyOf(aliasedBy);
+    }
+
+    /**
+     * Returns when the index was created.
+     *
+     * @return epoch millis, or 0 when the descriptor predates this being recorded
+     */
+    public long createdAtMillis() {
+        return createdAtMillis;
+    }
+
+    /**
+     * Returns the id of the OpenSearch version that created the index.
+     *
+     * @return the version id, or 0 when not recorded
+     */
+    public int createdVersionId() {
+        return createdVersionId;
+    }
+
+    /**
+     * Returns the aliases believed to name this index.
+     *
+     * <p><b>A hint, not the truth.</b> The alias record is the truth about what an alias names; this list
+     * is written beside it so the reverse question -- which aliases name this index -- can be answered
+     * without enumerating every alias. It is written before an alias is created and after one is removed,
+     * so it may over-approximate (a name whose creation then lost its race) and never under-approximates;
+     * a reader checks each name against its record and drops the ones that do not name this index.
+     *
+     * @return the alias names, possibly including stale ones
+     */
+    public List<String> aliasedBy() {
+        return aliasedBy;
+    }
+
+    /**
+     * Returns a copy stamped with its creation moment and version.
+     *
+     * @param createdAtMillis when
+     * @param createdVersionId by what
+     * @return the copy
+     */
+    public IndexDescriptor createdAt(long createdAtMillis, int createdVersionId) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            numberOfShards,
+            mapping,
+            extraSettings,
+            mappingVersion,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy
+        );
+    }
+
+    /**
+     * Returns a copy with a different set of alias names.
+     *
+     * @param aliases the names
+     * @return the copy
+     */
+    public IndexDescriptor withAliasedBy(List<String> aliases) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            numberOfShards,
+            mapping,
+            extraSettings,
+            mappingVersion,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliases
+        );
     }
 
     /**
@@ -240,7 +352,18 @@ public final class IndexDescriptor {
      * @return the updated descriptor
      */
     public IndexDescriptor withMapping(String merged) {
-        return new IndexDescriptor(name, uuid, numberOfShards, merged, extraSettings, mappingVersion + 1, settingsVersion);
+        return new IndexDescriptor(
+            name,
+            uuid,
+            numberOfShards,
+            merged,
+            extraSettings,
+            mappingVersion + 1,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy
+        );
     }
 
     /**
@@ -259,7 +382,18 @@ public final class IndexDescriptor {
      * @return the updated descriptor
      */
     public IndexDescriptor withSettings(Settings merged) {
-        return new IndexDescriptor(name, uuid, numberOfShards, mapping, merged, mappingVersion, settingsVersion + 1);
+        return new IndexDescriptor(
+            name,
+            uuid,
+            numberOfShards,
+            mapping,
+            merged,
+            mappingVersion,
+            settingsVersion + 1,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy
+        );
     }
 
     /**
@@ -288,6 +422,17 @@ public final class IndexDescriptor {
             }
             if (settingsVersion != 1L) {
                 builder.field("settings_version", settingsVersion);
+            }
+            // Each written only when known, so a descriptor that predates them is byte-identical to what
+            // this class wrote before, and one written by this version still parses on an older node.
+            if (createdAtMillis != 0L) {
+                builder.field("created_at_millis", createdAtMillis);
+            }
+            if (createdVersionId != 0) {
+                builder.field("created_version_id", createdVersionId);
+            }
+            if (aliasedBy.isEmpty() == false) {
+                builder.field("aliased_by", aliasedBy);
             }
             // Core's own settings serialization, rather than a flat key-to-string loop.
             //
@@ -326,6 +471,9 @@ public final class IndexDescriptor {
             long mappingVersion = 1L;
             long settingsVersion = 1L;
             int shards = -1;
+            long createdAtMillis = 0L;
+            int createdVersionId = 0;
+            final List<String> aliasedBy = new java.util.ArrayList<>();
             Settings parsedSettings = Settings.EMPTY;
             String field = null;
             XContentParser.Token token;
@@ -334,6 +482,14 @@ public final class IndexDescriptor {
                     field = parser.currentName();
                 } else if (token == XContentParser.Token.START_OBJECT && "settings".equals(field)) {
                     parsedSettings = Settings.fromXContent(parser);
+                } else if (token == XContentParser.Token.START_ARRAY && "aliased_by".equals(field)) {
+                    while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                        aliasedBy.add(parser.text());
+                    }
+                } else if (field != null && (token == XContentParser.Token.START_ARRAY || token == XContentParser.Token.START_OBJECT)) {
+                    // forward compatibility: a newer node may write a structure we do not know. Only under
+                    // a field name: the first token is the record's own opening brace.
+                    parser.skipChildren();
                 } else if (token.isValue()) {
                     switch (field == null ? "" : field) {
                         case "name" -> name = parser.text();
@@ -342,6 +498,8 @@ public final class IndexDescriptor {
                         case "mapping_version" -> mappingVersion = parser.longValue();
                         case "settings_version" -> settingsVersion = parser.longValue();
                         case "number_of_shards" -> shards = parser.intValue();
+                        case "created_at_millis" -> createdAtMillis = parser.longValue();
+                        case "created_version_id" -> createdVersionId = parser.intValue();
                         default -> {
                             // forward compatibility: a newer node may write fields we do not know
                         }
@@ -351,7 +509,18 @@ public final class IndexDescriptor {
             if (name == null || uuid == null || shards < 1) {
                 throw new IOException("malformed index descriptor: missing a required field");
             }
-            return new IndexDescriptor(name, uuid, shards, mapping, parsedSettings, mappingVersion, settingsVersion);
+            return new IndexDescriptor(
+                name,
+                uuid,
+                shards,
+                mapping,
+                parsedSettings,
+                mappingVersion,
+                settingsVersion,
+                createdAtMillis,
+                createdVersionId,
+                aliasedBy
+            );
         }
     }
 

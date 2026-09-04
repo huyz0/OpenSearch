@@ -89,7 +89,54 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final String index = request.param("index");
-        final String fields = request.param("fields", "*");
+        String fields = request.param("fields", "*");
+        // Hints; indices here resolve by the same rule everywhere and the flags cannot change it.
+        request.param("ignore_unavailable");
+        request.param("allow_no_indices");
+        request.param("expand_wildcards");
+        // The body, which core accepts as the other place to name fields, and which this used to ignore
+        // entirely: a POST naming three fields in its body was answered with every field.
+        if (request.hasContent()) {
+            try (var parser = request.contentParser()) {
+                final Map<String, Object> body = parser.map();
+                if (body.get("index_filter") != null) {
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_IMPLEMENTED,
+                            "unsupported_parameter",
+                            "index_filter is not supported: capabilities here come from the mapping, and a filter over "
+                                + "the data would need every shard opened to evaluate it"
+                        )
+                    );
+                }
+                if (body.get("runtime_mappings") != null) {
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(
+                            channel,
+                            RestStatus.NOT_IMPLEMENTED,
+                            "unsupported_parameter",
+                            "runtime_mappings are not supported"
+                        )
+                    );
+                }
+                if (body.get("fields") instanceof List<?> named && named.isEmpty() == false) {
+                    fields = String.join(",", named.stream().map(String::valueOf).toList());
+                } else if (body.get("fields") instanceof String one) {
+                    fields = one;
+                }
+            } catch (Exception e) {
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.BAD_REQUEST,
+                        "malformed_body",
+                        "could not parse the body: " + e.getMessage()
+                    )
+                );
+            }
+        }
+        final String wantedFields = fields;
         // Read so the request is fully consumed, and refused rather than ignored: an unmapped field is a
         // property of the data this endpoint does not read, so answering as though the parameter had been
         // honoured would be inventing an answer.
@@ -117,12 +164,20 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                answer(channel, metadata, serving, index, fields);
+                IndexAdminHandler.gate(
+                    serving,
+                    org.opensearch.action.fieldcaps.FieldCapabilitiesAction.NAME,
+                    new org.opensearch.action.fieldcaps.FieldCapabilitiesRequest().indices(index),
+                    () -> {
+                        answer(channel, metadata, serving, index, wantedFields);
+                        return null;
+                    }
+                );
             } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(new BytesRestResponse(channel, e));
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a field capabilities failure", nested);
                 }
@@ -137,7 +192,9 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
         String index,
         String fields
     ) throws Exception {
-        final List<String> names = IndexPatterns.expand(metadata, index, serving.patternCap());
+        final List<String> names = new java.util.ArrayList<>(IndexPatterns.expand(metadata, index, serving.patternCap()));
+        // A plugin's index is not described through the request path, whatever spelling reached it.
+        names.removeIf(serving::isSystemIndex);
         if (names.isEmpty()) {
             sendQuietly(channel, RestStatus.BAD_REQUEST, "no_index", "name an index or a prefix pattern");
             return;

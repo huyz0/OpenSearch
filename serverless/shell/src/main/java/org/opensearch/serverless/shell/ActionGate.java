@@ -181,16 +181,40 @@ public final class ActionGate {
      * @throws Exception if a filter refuses, or the operation fails
      */
     public <T> T run(String action, ActionRequest request, CheckedSupplier<T, Exception> work, ResponseView<T> view) throws Exception {
+        return run(action, request, admitted -> work.get(), view);
+    }
+
+    /**
+     * Runs work that takes the request as the filters left it.
+     *
+     * <p>A filter may proceed with a different request from the one it was given -- a document-level
+     * security query folded into a search's source, an index substituted. Work that closed over the
+     * original request silently ignored that; work that takes the admitted request sees it.
+     *
+     * @param <T> what the work returns
+     * @param action the action name
+     * @param request the request as the caller built it
+     * @param work what to do with the request the chain admitted
+     * @param view how the filters see the result
+     * @return what the work returned, or what a filter replaced it with
+     * @throws Exception a filter's refusal, or the work's failure
+     */
+    public <T> T run(
+        String action,
+        ActionRequest request,
+        org.opensearch.common.CheckedFunction<ActionRequest, T, Exception> work,
+        ResponseView<T> view
+    ) throws Exception {
         if (filters.isEmpty()) {
             // The overwhelmingly common case, and it must cost nothing: no task, no future, no chain, and
             // no response built for nobody to look at.
-            return work.get();
+            return work.apply(request);
         }
 
         final AtomicReference<T> result = new AtomicReference<>();
         ActionFilterChain<ActionRequest, ActionResponse> chain = (task, name, req, listener) -> {
             try {
-                final T done = work.get();
+                final T done = work.apply(req);
                 result.set(done);
                 listener.onResponse(view.show(done));
             } catch (Exception e) {

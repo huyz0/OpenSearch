@@ -226,7 +226,10 @@ public final class ShardOperations {
         final ShardId local = node.reconciler()
             .openShards()
             .stream()
-            .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
+            // Matched by uuid as well as name: a deleted and recreated index keeps its name and changes
+            // its uuid, and a writer that has not yet noticed the delete still holds the old one open under
+            // the same name. Matching by name alone acknowledged writes into that shard.
+            .filter(s -> s.getIndexName().equals(index) && s.id() == shard && s.getIndex().getUUID().equals(descriptor.get().uuid()))
             .filter(s -> node.reconciler().readerShards().contains(s) == false)
             .findFirst()
             .orElse(null);
@@ -371,11 +374,18 @@ public final class ShardOperations {
             @Override
             public Read read(org.opensearch.core.action.ActionResponse response, Read original) {
                 if (response instanceof org.opensearch.action.get.GetResponse answered) {
+                    // The sequence identity travels with the document. This used to rebuild it with the
+                    // three-argument constructor, whose defaults are the unassigned sentinels -- so with any
+                    // action filter installed, every get reported _seq_no -2 and _version -1, and the
+                    // conditional write a caller built on those tokens lost every time.
                     return new Read(
                         new org.opensearch.serverless.shell.ServerlessNode.Document(
                             answered.getId(),
                             answered.isExists(),
-                            answered.isSourceEmpty() ? null : answered.getSourceAsString()
+                            answered.isSourceEmpty() ? null : answered.getSourceAsString(),
+                            answered.getSeqNo(),
+                            answered.getPrimaryTerm(),
+                            answered.getVersion()
                         ),
                         original.servedBy(),
                         original.realtime()
@@ -424,7 +434,10 @@ public final class ShardOperations {
 
     private Read doGet(String index, String id) throws IOException {
         final Placement placement = place(index, id);
-        if (placement.local() != null) {
+        // Local only while the head agrees. A writer this node still holds after the head moved to another
+        // node is a writer that has not noticed it lost the shard, and its documents are behind the real
+        // owner's: the forward below asks the node the head names, which is the one answer that is fresh.
+        if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
             return new Read(node.get(placement.local(), id), node.localNode().getId(), true);
         }
         if (placement.owner() == null) {
@@ -477,7 +490,7 @@ public final class ShardOperations {
             // that fails arrives here as "connect_exception" and nothing else, which says a connection did
             // not happen and not one thing about why.
             throw new NotHereException(
-                "could not forward to " + placement.owner() + ", which the shard-head named as owner: " + e.getMessage(),
+                org.opensearch.serverless.rest.IndexAdminHandler.forwardFailureMessage(placement.owner(), e),
                 placement.owner(),
                 true,
                 e
@@ -571,7 +584,7 @@ public final class ShardOperations {
         } catch (Exception e) {
             node.signals().ownershipDoubted(index, placement.shard());
             throw new NotHereException(
-                "could not forward to " + placement.owner() + ", which the shard-head named as owner: " + e.getMessage(),
+                org.opensearch.serverless.rest.IndexAdminHandler.forwardFailureMessage(placement.owner(), e),
                 placement.owner(),
                 true,
                 e
@@ -587,6 +600,11 @@ public final class ShardOperations {
         private final int shards;
         private final int answered;
         private final org.opensearch.search.aggregations.InternalAggregations aggregations;
+        private final org.apache.lucene.search.TotalHits.Relation relation;
+        private final float maxScore;
+        private final boolean timedOut;
+        private final Boolean terminatedEarly;
+        private final java.util.List<org.opensearch.action.search.ShardSearchFailure> failures;
 
         /**
          * Creates the outcome.
@@ -616,11 +634,106 @@ public final class ShardOperations {
             int answered,
             org.opensearch.search.aggregations.InternalAggregations aggregations
         ) {
+            this(
+                total,
+                hits,
+                shards,
+                answered,
+                aggregations,
+                org.apache.lucene.search.TotalHits.Relation.EQUAL_TO,
+                Float.NaN,
+                false,
+                null,
+                java.util.List.of()
+            );
+        }
+
+        /**
+         * Creates the outcome with everything a real search response reports about how it went.
+         *
+         * <p>The first five are what the answer is; the rest are how much to trust it. A shard that
+         * timed out, or stopped counting past a ceiling, or could not be reached and why, all used to
+         * vanish between the fan-out and the response, which then stated {@code timed_out: false} and
+         * {@code relation: eq} as constants and reported a failed shard as a count with no cause.
+         *
+         * @param total how many matched, summed over the shards that answered
+         * @param hits the merged page
+         * @param shards how many shards were asked
+         * @param answered how many answered
+         * @param aggregations the combined aggregations, or null if none were asked for
+         * @param relation whether {@code total} is exact or a lower bound
+         * @param maxScore the best score over every shard's top docs, or NaN when unscored
+         * @param timedOut whether any shard hit the search timeout
+         * @param terminatedEarly whether {@code terminate_after} stopped any shard, or null if not asked
+         * @param failures why each unanswered shard did not answer
+         */
+        public SearchOutcome(
+            long total,
+            java.util.List<org.opensearch.search.SearchHit> hits,
+            int shards,
+            int answered,
+            org.opensearch.search.aggregations.InternalAggregations aggregations,
+            org.apache.lucene.search.TotalHits.Relation relation,
+            float maxScore,
+            boolean timedOut,
+            Boolean terminatedEarly,
+            java.util.List<org.opensearch.action.search.ShardSearchFailure> failures
+        ) {
             this.total = total;
             this.hits = hits;
             this.shards = shards;
             this.answered = answered;
             this.aggregations = aggregations;
+            this.relation = relation;
+            this.maxScore = maxScore;
+            this.timedOut = timedOut;
+            this.terminatedEarly = terminatedEarly;
+            this.failures = java.util.List.copyOf(failures);
+        }
+
+        /**
+         * Returns whether {@link #total()} is exact or a lower bound.
+         *
+         * @return the relation
+         */
+        public org.apache.lucene.search.TotalHits.Relation relation() {
+            return relation;
+        }
+
+        /**
+         * Returns the best score over every shard that answered.
+         *
+         * @return the score, or NaN when the query was not scored
+         */
+        public float maxScore() {
+            return maxScore;
+        }
+
+        /**
+         * Returns whether any shard hit the search timeout.
+         *
+         * @return true if one did
+         */
+        public boolean timedOut() {
+            return timedOut;
+        }
+
+        /**
+         * Returns whether {@code terminate_after} stopped any shard.
+         *
+         * @return true or false when it was asked for, null when it was not
+         */
+        public Boolean terminatedEarly() {
+            return terminatedEarly;
+        }
+
+        /**
+         * Returns why each shard that did not answer did not answer.
+         *
+         * @return one failure per unanswered shard, in shard order
+         */
+        public java.util.List<org.opensearch.action.search.ShardSearchFailure> failures() {
+            return failures;
         }
 
         /**
@@ -699,7 +812,7 @@ public final class ShardOperations {
             new org.opensearch.action.search.SearchRequest(new String[] { index }, source),
             () -> {
                 final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
-                return org.opensearch.serverless.rest.SearchFanout.run(node, plane, index, descriptor.numberOfShards(), source);
+                return org.opensearch.serverless.rest.SearchFanout.run(node, plane, descriptor, source);
             }
         );
     }
@@ -744,8 +857,16 @@ public final class ShardOperations {
 
         private final long matched;
         private final long deleted;
+        private final long versionConflicts;
+        private final String abortedOn;
 
         DeleteByQueryOutcome(long matched, long deleted) {
+            this(matched, deleted, 0L, null);
+        }
+
+        DeleteByQueryOutcome(long matched, long deleted, long versionConflicts, String abortedOn) {
+            this.versionConflicts = versionConflicts;
+            this.abortedOn = abortedOn;
             this.matched = matched;
             this.deleted = deleted;
         }
@@ -757,6 +878,24 @@ public final class ShardOperations {
          */
         public long matched() {
             return matched;
+        }
+
+        /**
+         * Returns how many matched documents had changed since the view was taken and were left alone.
+         *
+         * @return the count
+         */
+        public long versionConflicts() {
+            return versionConflicts;
+        }
+
+        /**
+         * Returns the id of the conflict the operation stopped at, or null if it did not stop.
+         *
+         * @return the id, or null
+         */
+        public String abortedOn() {
+            return abortedOn;
         }
 
         /**
@@ -816,15 +955,46 @@ public final class ShardOperations {
      */
     public DeleteByQueryOutcome deleteByQuery(String index, org.opensearch.index.query.QueryBuilder query, long maxDocs, boolean refresh)
         throws IOException {
+        return deleteByQuery(index, query, maxDocs, refresh, true);
+    }
+
+    /**
+     * Deletes every document a query matches, leaving alone any that changed after the query was frozen.
+     *
+     * <p>Each delete is conditional on the sequence number the frozen view saw, so a document rewritten
+     * between the view and the delete is a version conflict rather than a silent loss of the rewrite --
+     * which is what core's {@code conflicts=abort} and {@code conflicts=proceed} are about.
+     *
+     * @param index the index
+     * @param query the query
+     * @param maxDocs the most documents to visit
+     * @param refresh whether to make the deletions visible before returning
+     * @param abortOnConflict whether the first conflict stops the operation, as core does by default
+     * @return the outcome
+     * @throws NoSuchIndexException if the index does not exist
+     * @throws IOException if the query, a delete, or the point-in-time machinery fails
+     */
+    public DeleteByQueryOutcome deleteByQuery(
+        String index,
+        org.opensearch.index.query.QueryBuilder query,
+        long maxDocs,
+        boolean refresh,
+        boolean abortOnConflict
+    ) throws IOException {
         return gated(
             org.opensearch.index.reindex.DeleteByQueryAction.NAME,
             new org.opensearch.index.reindex.DeleteByQueryRequest(index),
-            () -> doDeleteByQuery(index, query, maxDocs, refresh)
+            () -> doDeleteByQuery(index, query, maxDocs, refresh, abortOnConflict)
         );
     }
 
-    private DeleteByQueryOutcome doDeleteByQuery(String index, org.opensearch.index.query.QueryBuilder query, long maxDocs, boolean refresh)
-        throws Exception {
+    private DeleteByQueryOutcome doDeleteByQuery(
+        String index,
+        org.opensearch.index.query.QueryBuilder query,
+        long maxDocs,
+        boolean refresh,
+        boolean abortOnConflict
+    ) throws Exception {
         final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
 
         // A frozen view, exactly as _pit takes one -- see the class javadoc for why the query is decided
@@ -853,6 +1023,7 @@ public final class ShardOperations {
         try {
             long visited = 0;
             long deleted = 0;
+            long conflicts = 0;
             for (Integer shard : shards.keySet()) {
                 final var frozenShardId = node.openFrozenView(plane, pit, shard);
                 Object[] cursor = null;
@@ -861,6 +1032,8 @@ public final class ShardOperations {
                         .sort(new org.opensearch.search.sort.FieldSortBuilder(org.opensearch.search.sort.FieldSortBuilder.DOC_FIELD_NAME))
                         .size((int) Math.min(DELETE_BY_QUERY_BATCH_SIZE, maxDocs - visited))
                         .trackTotalHits(false)
+                        // The sequence number each delete is conditional on.
+                        .seqNoAndPrimaryTerm(true)
                         .fetchSource(false);
                     if (cursor != null) {
                         page.searchAfter(cursor);
@@ -871,15 +1044,35 @@ public final class ShardOperations {
                         break;
                     }
                     final boolean lastPageOfShard = hits.size() < page.size() || visited + hits.size() >= maxDocs;
-                    for (int i = 0; i < hits.size(); i++) {
-                        final var hit = hits.get(i);
-                        visited++;
-                        // The refresh -- when asked for -- rides the last delete of the shard, not every
-                        // one: refreshing per document would refresh the shard once per document instead
-                        // of once for the whole operation.
-                        final boolean isLastOfShard = refresh && lastPageOfShard && i == hits.size() - 1;
-                        if (doDelete(index, hit.getId(), isLastOfShard)) {
-                            deleted++;
+                    long pageBytes = 0L;
+                    for (var hit : hits) {
+                        pageBytes += 64L + (hit.getId() == null ? 0 : hit.getId().length());
+                    }
+                    // A page of deletes is a page of writes, and accounted as one: this operation used to
+                    // be the only writer on the node that indexing pressure could not see.
+                    try (
+                        org.opensearch.common.lease.Releasable inFlight = node.indexingPressure()
+                            .markCoordinatingOperationStarted(pageBytes, false)
+                    ) {
+                        for (int i = 0; i < hits.size(); i++) {
+                            final var hit = hits.get(i);
+                            visited++;
+                            // The refresh -- when asked for -- rides the last delete of the shard, not every
+                            // one: refreshing per document would refresh the shard once per document instead
+                            // of once for the whole operation.
+                            final boolean isLastOfShard = refresh && lastPageOfShard && i == hits.size() - 1;
+                            try {
+                                if (doDeleteIfUnchanged(index, hit.getId(), isLastOfShard, hit.getSeqNo(), hit.getPrimaryTerm())) {
+                                    deleted++;
+                                }
+                            } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
+                                // Rewritten -- or already removed -- after the view was taken. Left alone,
+                                // and counted, rather than deleted regardless.
+                                conflicts++;
+                                if (abortOnConflict) {
+                                    return new DeleteByQueryOutcome(visited, deleted, conflicts, hit.getId());
+                                }
+                            }
                         }
                     }
                     cursor = hits.get(hits.size() - 1).getSortValues();
@@ -893,7 +1086,7 @@ public final class ShardOperations {
                 // A shard with no match never entered the loop above, so it never issued a delete and
                 // never needed a refresh -- correctly, since nothing changed on it to make visible.
             }
-            return new DeleteByQueryOutcome(visited, deleted);
+            return new DeleteByQueryOutcome(visited, deleted, conflicts, null);
         } finally {
             // Local shards first, then the record -- the same order _pit's own release does, so this node
             // is never left holding open frozen shards for a view no longer recorded anywhere.
@@ -1173,7 +1366,22 @@ public final class ShardOperations {
                 builder.map(merged);
                 mergedJson = org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
             }
-            final Written written = written(index, id, mergedJson, refresh, false, ifSeqNo, ifPrimaryTerm);
+            // The compare-and-swap an update is: against what was just read, unless the caller brought a
+            // condition of their own. This used to pass the caller's (unassigned) condition, so two
+            // concurrent partial updates each read, each wrote, and one merge was lost -- and the
+            // retry_on_conflict loop above this could never fire. A missing document is written as a
+            // create, so two concurrent upserts cannot both "create".
+            final boolean unconditional = ifSeqNo == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
+            final Written written = written(
+                index,
+                id,
+                mergedJson,
+                refresh,
+                false,
+                unconditional && existing.found() ? existing.seqNo() : ifSeqNo,
+                unconditional && existing.found() ? existing.primaryTerm() : ifPrimaryTerm,
+                unconditional && existing.found() == false
+            );
             return new UpdateOutcome(
                 result,
                 written.servedBy(),
@@ -1197,6 +1405,27 @@ public final class ShardOperations {
         // A forwarded acknowledgement does not carry found-ness; the single-document REST path has always
         // reported a forwarded delete as found, and this keeps that rather than inventing a new answer.
         return true;
+    }
+
+    /**
+     * Deletes a document only if it is still at the sequence number a frozen view saw it at.
+     *
+     * <p>A hit that carries no sequence number -- a shard that did not report one -- falls back to the
+     * unconditional delete, which is the behaviour this had for every document before.
+     */
+    private boolean doDeleteIfUnchanged(String index, String id, boolean refresh, long seqNo, long primaryTerm) throws IOException {
+        if (seqNo < 0 || primaryTerm <= 0) {
+            return doDelete(index, id, refresh);
+        }
+        final Placement placement = place(index, id);
+        if (placement.local() != null) {
+            final boolean found = node.delete(placement.local(), id, seqNo, primaryTerm).found();
+            if (refresh) {
+                node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
+            }
+            return found;
+        }
+        return forwardWritten(index, id, "", refresh, true, placement, seqNo, primaryTerm).outcome().found();
     }
 
     private String write(String index, String id, String source, boolean refresh, boolean deletion) throws IOException {
@@ -1343,7 +1572,7 @@ public final class ShardOperations {
             // that fails arrives here as "connect_exception" and nothing else, which says a connection did
             // not happen and not one thing about why.
             throw new NotHereException(
-                "could not forward to " + placement.owner() + ", which the shard-head named as owner: " + e.getMessage(),
+                org.opensearch.serverless.rest.IndexAdminHandler.forwardFailureMessage(placement.owner(), e),
                 placement.owner(),
                 true,
                 e

@@ -160,6 +160,17 @@ public final class SegmentPublisher {
         final long expected = existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, manifest.toBytes());
         if (result.applied() == false) {
+            // Who moved it. A newer term is the fence this exception exists for. The same term and the
+            // same writer is this node's own concurrent publish -- two of them used to race here, the loser
+            // was treated as a zombie, and the shard was closed while its head still named this node. The
+            // other publish's manifest is a valid commit of ours, so it is the answer.
+            final Optional<BlobRegister> now = container.readRegister(MANIFEST);
+            if (now.isPresent()) {
+                final CommitManifest current = parse(now.get());
+                if (current.term() == term && writerId != null && writerId.equals(current.writer())) {
+                    return current;
+                }
+            }
             throw new StaleWriterException(term, -1L);
         }
         return manifest;
