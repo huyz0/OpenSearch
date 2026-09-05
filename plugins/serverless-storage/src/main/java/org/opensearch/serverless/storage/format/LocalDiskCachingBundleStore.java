@@ -62,13 +62,30 @@ import java.util.zip.CRC32C;
  * companion, not a replacement: wrap this class in that one, and the decrypt cost this constructor
  * adds is only paid on a disk-cache hit that missed the (bounded, in-memory, plaintext) layer in
  * front of it, not on every read.
+ *
+ * <p><b>Interaction with the node-wide {@link DiskCacheSpaceGovernor}</b> (optional, and independent
+ * of {@link #maxBytesOnDisk}): the per-shard budget above cannot bound a node, since N shards times
+ * B bytes is what actually lands on the disk -- so when a governor is supplied, this store reports
+ * every write that lands bytes and every byte its own eviction reclaims to it, and the governor may
+ * delete files anywhere under the shared cache root, including files in <em>this</em> store's
+ * directory that {@link #currentTotalBytes} still counts. That counter can therefore drift high, and
+ * that is deliberately fine: per its own field comment, an inflated counter only ever costs a wasted
+ * directory listing, never an incorrect eviction, because {@link #evictIfOverBudget} re-verifies the
+ * real total against a fresh listing before it deletes anything. Drifting <em>low</em> would be the
+ * dangerous direction, and nothing the governor does can cause that -- it only ever deletes.
  */
 public final class LocalDiskCachingBundleStore implements BundleFileReader {
 
     private static final Logger logger = LogManager.getLogger(LocalDiskCachingBundleStore.class);
 
-    /** Sweep down to this fraction of {@link #maxBytesOnDisk} once eviction triggers, so a write sitting right at the line doesn't immediately re-trigger another sweep. */
-    private static final double EVICTION_TARGET_FRACTION = 0.9;
+    /**
+     * Sweep down to this fraction of {@link #maxBytesOnDisk} once eviction triggers, so a write
+     * sitting right at the line doesn't immediately re-trigger another sweep. Package-private
+     * because {@link DiskCacheSpaceGovernor} sweeps the node-wide tree down to the same fraction of
+     * its own budget, for the identical reason -- one definition, so the two tiers cannot drift
+     * apart into subtly different hysteresis.
+     */
+    static final double EVICTION_TARGET_FRACTION = 0.9;
 
     private final BundleFileReader delegate;
     private final Path cacheDirectory;
@@ -112,6 +129,10 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     // deleting anything, so a wrongly-inflated counter can never cause an incorrect eviction -- only
     // wasted, repeated full-directory listings), which this is what makes it possible to assert on.
     private final AtomicLong sweepCount = new AtomicLong();
+    // Optional and shared by every store on the node: the bound with the shape the disk actually
+    // has. Null leaves this class exactly what it was. See this class's javadoc for why the two
+    // budgets coexist and why the governor deleting files behind this store's back is harmless.
+    private final DiskCacheSpaceGovernor spaceGovernor;
 
     /**
      * Wraps a delegate reader with a plaintext-on-disk cache, unbounded (no eviction).
@@ -152,10 +173,33 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
         EncryptionKeyProvider encryptionKeyProvider,
         long maxBytesOnDisk
     ) throws IOException {
+        this(delegate, cacheDirectory, encryptionKeyProvider, maxBytesOnDisk, null);
+    }
+
+    /**
+     * Wraps a delegate reader with a disk cache bounded on two independent axes: optionally per
+     * shard by {@code maxBytesOnDisk}, and optionally node-wide by a {@code spaceGovernor} shared
+     * with every other store on this node -- see this class's own javadoc for why the per-shard
+     * budget alone cannot bound a node.
+     *
+     * @param delegate the underlying reader to consult on a cache miss.
+     * @param cacheDirectory the local directory to cache files in.
+     * @param encryptionKeyProvider {@code null} to cache plaintext on disk.
+     * @param maxBytesOnDisk {@code <= 0} (the default) leaves this shard's own cache unbounded.
+     * @param spaceGovernor {@code null} for no node-wide bound, matching every other constructor here.
+     */
+    public LocalDiskCachingBundleStore(
+        BundleFileReader delegate,
+        Path cacheDirectory,
+        EncryptionKeyProvider encryptionKeyProvider,
+        long maxBytesOnDisk,
+        DiskCacheSpaceGovernor spaceGovernor
+    ) throws IOException {
         this.delegate = delegate;
         this.cacheDirectory = cacheDirectory;
         this.encryptionKeyProvider = encryptionKeyProvider;
         this.maxBytesOnDisk = maxBytesOnDisk;
+        this.spaceGovernor = spaceGovernor;
         Files.createDirectories(cacheDirectory);
         // A real, one-time listing cost, same as evictIfOverBudget's own -- but paid once at
         // construction (e.g. engine open) rather than on every read, and only when eviction is
@@ -213,15 +257,24 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
             byte[] fresh = delegate.readFile(bundleName, entry);
             coldReadNanos.addAndGet(System.nanoTime() - start);
             byte[] onDisk = encryptIfNeeded(fresh);
+            // existedBefore here means this write is REPLACING a corrupted/checksum-mismatched
+            // entry (see the fall-through just above), not creating a brand-new one -- net out the
+            // old on-disk size so neither counter double-counts the same path's bytes. Measured
+            // only when some counter actually consumes it, so an entirely unbounded cache still
+            // pays no stat per miss.
+            boolean sizeTracked = maxBytesOnDisk > 0 || spaceGovernor != null;
+            long oldSizeOnDisk = sizeTracked && existedBefore ? sizeOnDiskOrZero(cachedPath) : 0L;
             if (maxBytesOnDisk > 0) {
-                // existedBefore here means this write is REPLACING a corrupted/checksum-mismatched
-                // entry (see the fall-through just above), not creating a brand-new one -- net out
-                // the old on-disk size so this doesn't double-count the same path's bytes.
-                long oldSizeOnDisk = existedBefore ? sizeOnDiskOrZero(cachedPath) : 0L;
                 currentTotalBytes.addAndGet(onDisk.length - oldSizeOnDisk);
             }
             writeAtomically(cachedPath, onDisk);
             maybeEvict();
+            if (spaceGovernor != null) {
+                // Reported after this shard's own eviction has had its turn, so a write that both
+                // shards can absorb locally never provokes a node-wide walk: whatever the local
+                // sweep just reclaimed has already been subtracted via recordBytesRemoved below.
+                spaceGovernor.recordBytesAdded(onDisk.length - oldSizeOnDisk);
+            }
             return fresh;
         }
     }
@@ -322,6 +375,12 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                 }
                 totalBytes -= entry.sizeBytes;
                 currentTotalBytes.addAndGet(-actualSizeBeingDeleted);
+                if (spaceGovernor != null) {
+                    // Bytes this shard reclaimed on its own are bytes the node-wide total must stop
+                    // counting; without this, the governor's running total would only ever grow and
+                    // it would sweep the whole tree over space that was already given back.
+                    spaceGovernor.recordBytesRemoved(actualSizeBeingDeleted);
+                }
                 evictedCount.incrementAndGet();
             } catch (IOException e) {
                 // Another thread's concurrent write/rename raced this file, or it's already gone --

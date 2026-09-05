@@ -49,6 +49,32 @@ public final class CacheStatsRegistry {
         diskCaches.put(key(indexUuid, shardId), new WeakReference<>(diskCache));
     }
 
+    /**
+     * Forgets the entry for (indexUuid, shardId) -- called when that shard's local data, cache
+     * directory included, is actually gone from this node. The {@link WeakReference} above means a
+     * stale entry is not a leak, but it is a lie until the store is collected: {@link #snapshotAll()}
+     * would keep reporting hit/miss counters for a shard this node no longer has. Idempotent; a key
+     * that was never registered simply isn't there.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard number within {@code indexUuid}
+     */
+    public void deregister(String indexUuid, int shardId) {
+        diskCaches.remove(key(indexUuid, shardId));
+    }
+
+    /**
+     * Forgets every shard entry for {@code indexUuid} at once -- the index-deletion counterpart to
+     * {@link #deregister}, which does not require knowing how many shards this node happened to
+     * host. Idempotent, and safe to call for an index that never had a reader shard here.
+     *
+     * @param indexUuid the UUID of the deleted index
+     */
+    public void deregisterIndex(String indexUuid) {
+        String prefix = indexUuid + "/";
+        diskCaches.keySet().removeIf(key -> key.startsWith(prefix));
+    }
+
     /** One reader shard's local disk cache stats, as reported by {@link #snapshotAll()}. */
     public record ShardCacheStats(String indexUuid, int shardId, long hitCount, long missCount, long averageColdReadLatencyMillis) {
 

@@ -1248,6 +1248,30 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Node-wide byte budget for the whole {@code <data path>/serverless_storage_cache} tree, across
+     * every reader shard on this node -- see {@link
+     * org.opensearch.serverless.storage.format.DiskCacheSpaceGovernor} for the sweep it configures.
+     *
+     * <p>This exists because {@link #SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING} is
+     * the wrong shape to protect a disk: a per-shard budget bounds a shard, and what fills the disk
+     * is N shards times that budget, with N decided by allocation rather than by the operator who
+     * set it. Both settings stay independent -- the per-shard one remains an optional extra cap on
+     * any single shard's share.
+     *
+     * <p>Unlike every other optional feature in this plugin, unset here does <b>not</b> mean off.
+     * A local disk cache is created for every reader shard on any node with a data path, so "unset"
+     * previously meant an untuned deployment cached to local disk without limit. Unset therefore
+     * derives a budget from the filesystem actually holding the cache root (10% of its total space,
+     * floored at 64MB) in {@code createComponents}; an explicitly configured value always wins, and
+     * an explicit {@code 0} still means unbounded, so an operator can deliberately opt out.
+     */
+    public static final Setting<ByteSizeValue> SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_SETTING = Setting.byteSizeSetting(
+        "serverless_storage.local_cache.max_bytes",
+        ByteSizeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-index opt-in into {@link #LAZY_DIRECTORY_STORE_TYPE} for that index's reader shard
      * copies, mirroring how {@link #SERVERLESS_STORAGE_ENABLED_SETTING} itself is an index-scoped
      * opt-in rather than a blanket node-wide default. Has no effect unless {@link
@@ -1301,6 +1325,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // actually available" reasoning as every other field in this group -- getEngineFactory reads
     // this to configure each reader shard's own LocalDiskCachingBundleStore eviction budget.
     private volatile long localCacheMaxBytesPerShard;
+    /**
+     * The one node-wide bound over {@link #localCacheRoot}, shared by every reader shard's store on
+     * this node -- {@code null} when there is no cache root at all, or when the budget resolved to
+     * "unbounded" (an explicit zero, or a filesystem this node could not query). Resolved once in
+     * {@code createComponents}, same as every other field in this group.
+     */
+    private volatile org.opensearch.serverless.storage.format.DiskCacheSpaceGovernor localCacheSpaceGovernor;
     private volatile ThreadPool threadPool;
     private volatile FileCache lazyDirectoryFileCache;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
@@ -1730,6 +1761,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING,
+            SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING,
             SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING,
@@ -2064,6 +2096,19 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             localCacheRoot = nodeEnvironment.nodeDataPaths()[0].resolve("serverless_storage_cache");
         }
         localCacheMaxBytesPerShard = SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING.get(environment.settings()).getBytes();
+        if (localCacheRoot != null) {
+            // Setting#exists, not "is the value zero": those mean opposite things here. Unset means
+            // "derive something sane, because the alternative is an unbounded cache on every
+            // untuned node"; an explicit zero is an operator deliberately asking for unbounded.
+            long nodeWideCacheBudgetBytes = resolveNodeWideLocalCacheBudgetBytes(environment.settings(), localCacheRoot);
+            localCacheSpaceGovernor = nodeWideCacheBudgetBytes > 0
+                ? new org.opensearch.serverless.storage.format.DiskCacheSpaceGovernor(localCacheRoot, nodeWideCacheBudgetBytes)
+                : null;
+            // Orphans from an index deleted while this node was down: no shard- or index-level
+            // lifecycle callback ever fires for those, so the only moment this node can tell a
+            // cached uuid apart from a deleted one is the first cluster state it actually trusts.
+            registerOrphanedCacheSweep();
+        }
         if (nodeEnvironment != null) {
             // Deliberately not ClusterService#localNode(): that reads ClusterService#state(), which
             // is both not yet available this early in node startup ("initial cluster state not set
@@ -2598,11 +2643,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // shard -- see InMemoryPlaintextBundleCache's javadoc) is what keeps the
                     // actually-hot working set decrypted, so most reads never pay that decrypt cost
                     // repeatedly; only a disk-cache hit that missed this layer does.
+                    // The per-shard budget and the node-wide governor are independent bounds and
+                    // either can be off; the governor is the one that actually protects the disk,
+                    // since N shards times a per-shard budget is what lands on it.
                     LocalDiskCachingBundleStore diskCache = new LocalDiskCachingBundleStore(
                         readPath,
                         shardCacheDir,
                         encryptionKeyProvider,
-                        localCacheMaxBytesPerShard
+                        localCacheMaxBytesPerShard,
+                        localCacheSpaceGovernor
                     );
                     cacheStatsRegistry.register(indexUuid, shardIdValue, diskCache);
                     readPath = new CachingBundleFileReader(sharedBundleCache, diskCache);
@@ -3257,6 +3306,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 }
                 releaseCloneLineageForDeletedIndex(index.getUUID(), indexSettings.getNumberOfShards());
                 deregisterFromWalShardRegistryForDeletedIndex(index.getUUID(), indexSettings.getNumberOfShards());
+                // The index's whole local disk cache subtree, in one go. afterIndexShardDeleted
+                // below already removes each shard's own directory as its data is wiped, but that
+                // leaves the now-empty <root>/<uuid> parent behind, and it does not fire at all for
+                // a shard this node cached for but no longer hosted at deletion time.
+                deleteLocalCacheDirectoryForDeletedIndex(index.getUUID());
                 // Round 006 item 6, found by the bug hunt that followed it: without this, a
                 // PinLedgerSweepTask started for this index (getEngineFactory, shard 0) was only ever
                 // torn down at full node close, so a workload that creates and deletes many serverless
@@ -3279,7 +3333,146 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     }
                 }
             }
+
+            /**
+             * Deliberately the shard-level callback this class's own javadoc argues AGAINST for
+             * {@code deleteClone} -- and the argument does not carry over, because the two are
+             * cleaning up opposite kinds of thing. {@code deleteClone} touches state shared across
+             * the cluster (a source index's GC pin), so firing it on a mere relocation would destroy
+             * something another node still depends on. This shard cache is purely node-local and
+             * purely derived: it holds a copy of bytes that still exist in the object store, for a
+             * shard whose local data this callback fires precisely because it has just been wiped
+             * from this node's disk. A cache for data that is gone is dead weight, and if the shard
+             * relocates back here later, re-fetching is the correct behaviour rather than a loss --
+             * which makes "fires on relocation too" a non-issue here instead of the bug it would be
+             * there. Without this, the only thing that ever removed a shard cache directory was
+             * deleting its whole index.
+             */
+            @Override
+            public void afterIndexShardDeleted(org.opensearch.core.index.shard.ShardId shardId, Settings shardIndexSettings) {
+                deleteLocalCacheDirectoryForDeletedShard(shardId.getIndex().getUUID(), shardId.id());
+            }
         });
+    }
+
+    /**
+     * The node-wide local disk cache budget this node will actually enforce: the explicitly
+     * configured {@link #SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_SETTING} if there is one (zero
+     * included, which means unbounded), otherwise {@link #deriveLocalCacheBudgetBytes}.
+     *
+     * @param settings the node settings to read the budget from.
+     * @param cacheRoot the cache root, used only to derive a default from its filesystem.
+     * @return the budget in bytes; {@code 0} means unbounded.
+     */
+    public static long resolveNodeWideLocalCacheBudgetBytes(Settings settings, Path cacheRoot) {
+        // Setting#exists, not "is the value zero": those mean opposite things here. Unset means
+        // "derive something sane, because the alternative is an unbounded cache on every untuned
+        // node"; an explicit zero is an operator deliberately asking for unbounded, and must survive
+        // as one. Public only so this decision is unit-testable on its own, without a node.
+        if (SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_SETTING.exists(settings)) {
+            return SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_SETTING.get(settings).getBytes();
+        }
+        return deriveLocalCacheBudgetBytes(cacheRoot);
+    }
+
+    /**
+     * 10% of the total space of the filesystem holding {@code cacheRoot}, floored at 64MB -- the
+     * derived node-wide cache budget used when {@link #SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_SETTING}
+     * is unset. A guess, and said to be one: it is chosen to be obviously safer than the previous
+     * behaviour (no bound at all on every untuned node), not because 10% is a number anyone measured.
+     * An operator with real numbers should set the setting rather than treat this as authoritative.
+     *
+     * <p>Returns {@code 0} -- meaning unbounded, exactly today's behaviour -- if the file store
+     * cannot be queried at all, rather than failing node startup over a cache sizing heuristic. The
+     * path is named in the warning so an operator can tell which filesystem refused to answer.
+     */
+    static long deriveLocalCacheBudgetBytes(Path cacheRoot) {
+        try {
+            // The root itself usually does not exist yet at createComponents time -- shard
+            // directories are created at reader-shard open -- so ask the nearest existing ancestor,
+            // which is on the same file store by construction (it is a node data path).
+            Path probe = cacheRoot;
+            while (probe != null && java.nio.file.Files.exists(probe) == false) {
+                probe = probe.getParent();
+            }
+            if (probe == null) {
+                logger.warn("could not find an existing ancestor of local cache root [{}]; leaving the disk cache unbounded", cacheRoot);
+                return 0L;
+            }
+            // Environment#getFileStore, not Files#getFileStore: core forbids the latter outright,
+            // because it is impacted by JDK-8034057 on some filesystems.
+            long totalSpace = org.opensearch.env.Environment.getFileStore(probe).getTotalSpace();
+            if (totalSpace <= 0) {
+                logger.warn("file store for local cache root [{}] reported no total space; leaving the disk cache unbounded", cacheRoot);
+                return 0L;
+            }
+            return Math.max(totalSpace / 10, 64L * 1024L * 1024L);
+        } catch (IOException | RuntimeException e) {
+            logger.warn("could not query the file store for local cache root [" + cacheRoot + "]; leaving the disk cache unbounded", e);
+            return 0L;
+        }
+    }
+
+    /**
+     * Registers the one-shot orphan sweep: a deletion that happened while this node was down leaves
+     * a {@code <root>/<uuid>} directory that no lifecycle callback on this node will ever fire for,
+     * so the first cluster state this node actually trusts is the only place the comparison can be
+     * made. States still carrying {@code STATE_NOT_RECOVERED_BLOCK} are skipped precisely because
+     * their metadata is not yet the real one -- acting on it would delete live indices' caches --
+     * and the listener removes itself the moment it has run once, since every deletion after that
+     * point is covered by the two lifecycle callbacks above.
+     */
+    private void registerOrphanedCacheSweep() {
+        final Path sweepRoot = localCacheRoot;
+        clusterService.addListener(new org.opensearch.cluster.ClusterStateListener() {
+            @Override
+            public void clusterChanged(org.opensearch.cluster.ClusterChangedEvent event) {
+                if (event.state().blocks().hasGlobalBlock(org.opensearch.gateway.GatewayService.STATE_NOT_RECOVERED_BLOCK)) {
+                    return;
+                }
+                clusterService.removeListener(this);
+                try {
+                    java.util.Set<String> liveIndexUuids = new java.util.HashSet<>();
+                    for (org.opensearch.cluster.metadata.IndexMetadata indexMetadata : event.state().metadata().indices().values()) {
+                        liveIndexUuids.add(indexMetadata.getIndexUUID());
+                    }
+                    int removed = org.opensearch.serverless.storage.format.DiskCacheSpaceGovernor.deleteOrphanedIndexCaches(
+                        sweepRoot,
+                        liveIndexUuids
+                    );
+                    if (removed > 0) {
+                        logger.info("removed [{}] orphaned local disk cache directories under [{}]", removed, sweepRoot);
+                    }
+                } catch (Exception e) {
+                    // A cluster-state listener that throws is a node-level problem; a cache
+                    // directory that survives is wasted disk the next node start retries.
+                    logger.warn("failed to sweep orphaned local disk cache directories under [" + sweepRoot + "]", e);
+                }
+            }
+        });
+    }
+
+    /**
+     * Removes {@code <root>/<uuid>/<shard>} and forgets its stats entry. Best-effort in the strict
+     * sense: this runs inside an {@code IndexEventListener} callback, where throwing would break a
+     * shard-removal sequence that has nothing to do with a cache, so a failure is logged and the
+     * directory left for the next index deletion or the orphan sweep to catch.
+     */
+    private void deleteLocalCacheDirectoryForDeletedShard(String indexUuid, int shardId) {
+        cacheStatsRegistry.deregister(indexUuid, shardId);
+        if (localCacheRoot == null) {
+            return;
+        }
+        org.opensearch.serverless.storage.format.DiskCacheSpaceGovernor.deleteShardCache(localCacheRoot, indexUuid, shardId);
+    }
+
+    /** The index-wide counterpart of {@link #deleteLocalCacheDirectoryForDeletedShard}, with the same never-throw contract. */
+    private void deleteLocalCacheDirectoryForDeletedIndex(String indexUuid) {
+        cacheStatsRegistry.deregisterIndex(indexUuid);
+        if (localCacheRoot == null) {
+            return;
+        }
+        org.opensearch.serverless.storage.format.DiskCacheSpaceGovernor.deleteIndexCache(localCacheRoot, indexUuid);
     }
 
     /**
