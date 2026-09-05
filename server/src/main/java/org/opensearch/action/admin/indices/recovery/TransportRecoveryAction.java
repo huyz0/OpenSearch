@@ -136,10 +136,7 @@ public class TransportRecoveryAction extends TransportBroadcastByNodeAction<Reco
 
     @Override
     protected ShardsIterator shards(ClusterState state, RecoveryRequest request, String[] concreteIndices) {
-        // state.allShardsIncludingRelocationTargets(...) resolves through the resolver attached to
-        // this state's own routing table (replacing an earlier static-registry lookup) -- same
-        // composition.
-        return state.allShardsIncludingRelocationTargets(concreteIndices);
+        return state.routingTable().allShardsIncludingRelocationTargets(concreteIndices);
     }
 
     @Override

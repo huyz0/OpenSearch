@@ -21,9 +21,7 @@ import org.opensearch.core.compress.Compressor;
 import org.opensearch.core.compress.NoneCompressor;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
-import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedIndexMetadata;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedMetadata;
-import org.opensearch.gateway.remote.ManifestIndexDescriptor;
 import org.opensearch.gateway.remote.RemoteClusterStateUtils;
 import org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm;
 import org.opensearch.index.remote.RemoteStoreEnums.PathType;
@@ -211,59 +209,6 @@ public class RemoteIndexMetadataTests extends OpenSearchTestCase {
         remoteObjectForUpload.setFullBlobName(new BlobPath().add(TEST_BLOB_PATH));
         UploadedMetadata uploadedMetadata = remoteObjectForUpload.getUploadedMetadata();
         assertEquals(uploadedMetadata.getUploadedFilename(), remoteObjectForUpload.getFullBlobName());
-    }
-
-    /**
-     * With the descriptor turned off -- the default -- the manifest entry is exactly what it was before
-     * CODEC_V5, so an existing repository sees no change.
-     */
-    public void testUploadedMetadataCarriesNoDescriptorByDefault() {
-        IndexMetadata indexMetadata = getIndexMetadata();
-        RemoteIndexMetadata remoteObjectForUpload = new RemoteIndexMetadata(
-            indexMetadata,
-            clusterUUID,
-            compressor,
-            namedXContentRegistry,
-            null,
-            null,
-            null
-        );
-        remoteObjectForUpload.setFullBlobName(new BlobPath().add(TEST_BLOB_PATH));
-
-        UploadedIndexMetadata uploadedMetadata = (UploadedIndexMetadata) remoteObjectForUpload.getUploadedMetadata();
-
-        assertNull(uploadedMetadata.getDescriptor());
-    }
-
-    /**
-     * With it on, the entry carries a descriptor taken from the very index being written to the blob, so
-     * the manifest and the blob cannot disagree. This is what lets a reader build {@code Metadata}
-     * without fetching the blob at all.
-     */
-    public void testUploadedMetadataCarriesTheDescriptorWhenEnabled() {
-        IndexMetadata indexMetadata = getIndexMetadata();
-        RemoteIndexMetadata remoteObjectForUpload = new RemoteIndexMetadata(
-            indexMetadata,
-            clusterUUID,
-            compressor,
-            namedXContentRegistry,
-            null,
-            null,
-            null,
-            true
-        );
-        remoteObjectForUpload.setFullBlobName(new BlobPath().add(TEST_BLOB_PATH));
-
-        UploadedIndexMetadata uploadedMetadata = (UploadedIndexMetadata) remoteObjectForUpload.getUploadedMetadata();
-
-        ManifestIndexDescriptor descriptor = uploadedMetadata.getDescriptor();
-        assertNotNull("the descriptor is the whole point of enabling it", descriptor);
-        assertEquals(ManifestIndexDescriptor.of(indexMetadata), descriptor);
-        assertEquals(indexMetadata.getState(), descriptor.getState());
-        assertEquals(indexMetadata.getAliases(), descriptor.getAliases());
-        assertEquals(indexMetadata.getTotalNumberOfShards(), descriptor.getTotalNumberOfShards());
-        assertEquals(indexMetadata.isHidden(), descriptor.isHidden());
-        assertEquals(indexMetadata.isSystem(), descriptor.isSystem());
     }
 
     public void testSerDe() throws IOException {

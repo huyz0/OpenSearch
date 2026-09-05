@@ -35,7 +35,6 @@ import org.opensearch.action.admin.cluster.health.ClusterHealthRequest;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.IndexRoutingTable;
-import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -46,6 +45,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -95,11 +95,7 @@ public final class ClusterStateHealth implements Iterable<ClusterIndexHealth>, W
         indices = new HashMap<>();
 
         for (String index : concreteIndices) {
-            // Resolved rather than read, for the same reason as ActiveShardCount. Skipping an index with
-            // no routing entry is not neutral here: it removes the index from every counter, so a
-            // cluster whose computed indices have no shards anywhere still reports GREEN. A false green
-            // is worse than a hang, because it makes every downstream test pass vacuously.
-            IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(index);
+            IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(index);
             IndexMetadata indexMetadata = clusterState.metadata().index(index);
             if (indexRoutingTable == null) {
                 continue;
@@ -158,7 +154,14 @@ public final class ClusterStateHealth implements Iterable<ClusterIndexHealth>, W
         if (ClusterHealthStatus.GREEN.equals(computeStatus)) {
             this.activeShardsPercent = 100;
         } else {
-            this.activeShardsPercent = activeShardsPercent(clusterState, concreteIndices);
+            List<ShardRouting> shardRoutings = clusterState.getRoutingTable().allShards();
+            int activeShardCount = 0;
+            int totalShardCount = 0;
+            for (ShardRouting shardRouting : shardRoutings) {
+                if (shardRouting.active()) activeShardCount++;
+                totalShardCount++;
+            }
+            this.activeShardsPercent = (((double) activeShardCount) / totalShardCount) * 100;
         }
     }
 
@@ -183,7 +186,7 @@ public final class ClusterStateHealth implements Iterable<ClusterIndexHealth>, W
         int computeDelayedUnassignedShards = 0;
 
         for (String index : concreteIndices) {
-            IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(index);
+            IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(index);
             IndexMetadata indexMetadata = clusterState.metadata().index(index);
             if (indexRoutingTable == null) {
                 continue;
@@ -238,41 +241,15 @@ public final class ClusterStateHealth implements Iterable<ClusterIndexHealth>, W
         if (ClusterHealthStatus.GREEN.equals(computeStatus)) {
             this.activeShardsPercent = 100;
         } else {
-            this.activeShardsPercent = activeShardsPercent(clusterState, concreteIndices);
-        }
-    }
-
-    /**
-     * Share of shards that are active, over the published routing table plus any computed entries.
-     *
-     * <p>Walking {@code routingTable().allShards()} alone misses every index whose routing is computed
-     * rather than published, so the percentage is taken over a table that does not contain them. In a
-     * cluster where all indices are computed that table is empty, and the division is zero over zero.
-     */
-    private static double activeShardsPercent(final ClusterState clusterState, final String[] concreteIndices) {
-        int activeShardCount = 0;
-        int totalShardCount = 0;
-        for (ShardRouting shardRouting : clusterState.getRoutingTable().allShards()) {
-            if (shardRouting.active()) activeShardCount++;
-            totalShardCount++;
-        }
-        for (String index : concreteIndices) {
-            if (clusterState.routingTable().hasIndex(index)) {
-                continue; // already counted above
+            List<ShardRouting> shardRoutings = clusterState.getRoutingTable().allShards();
+            int activeShardCount = 0;
+            int totalShardCount = 0;
+            for (ShardRouting shardRouting : shardRoutings) {
+                if (shardRouting.active()) activeShardCount++;
+                totalShardCount++;
             }
-            IndexRoutingTable computed = clusterState.getIndexRoutingTable(index);
-            if (computed == null) {
-                continue;
-            }
-            for (IndexShardRoutingTable shard : computed.getShards().values()) {
-                for (ShardRouting shardRouting : shard) {
-                    if (shardRouting.active()) activeShardCount++;
-                    totalShardCount++;
-                }
-            }
+            this.activeShardsPercent = (((double) activeShardCount) / totalShardCount) * 100;
         }
-        // No shards at all is not zero percent healthy, it is a cluster with nothing to be unhealthy about.
-        return totalShardCount == 0 ? 100 : (((double) activeShardCount) / totalShardCount) * 100;
     }
 
     /**

@@ -77,7 +77,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -806,15 +805,9 @@ public class GatewayMetaState implements Closeable {
         private boolean verifyManifestAndClusterState(ClusterMetadataManifest manifest, ClusterState clusterState) {
             assert manifest != null : "ClusterMetadataManifest is null";
             assert clusterState != null : "ClusterState is null";
-            // resolveIndices, not manifest.getIndices() directly: a sharded manifest's index list lives
-            // behind UploadedManifestShard references (see ClusterMetadataManifest#CODEC_V6's own doc),
-            // and comparing against an empty getIndices() here would fail this assertion on every single
-            // sharded write rather than actually verifying anything.
-            List<ClusterMetadataManifest.UploadedIndexMetadata> manifestIndices = remoteClusterStateService.getRemoteManifestManager()
-                .resolveIndices(manifest);
-            assert clusterState.metadata().indices().size() == manifestIndices.size()
+            assert clusterState.metadata().indices().size() == manifest.getIndices().size()
                 : "Number of indices in last accepted state and manifest are different";
-            manifestIndices.forEach(md -> {
+            manifest.getIndices().stream().forEach(md -> {
                 assert clusterState.metadata().indices().containsKey(md.getIndexName())
                     : "Last accepted state does not contain the index : " + md.getIndexName();
                 assert clusterState.metadata().indices().get(md.getIndexName()).getIndexUUID().equals(md.getIndexUUID())

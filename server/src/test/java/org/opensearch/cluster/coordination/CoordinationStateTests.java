@@ -48,7 +48,6 @@ import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.gateway.GatewayMetaState.RemotePersistedState;
 import org.opensearch.gateway.remote.ClusterMetadataManifest;
 import org.opensearch.gateway.remote.RemoteClusterStateService;
-import org.opensearch.gateway.remote.RemoteManifestManager;
 import org.opensearch.gateway.remote.model.RemoteClusterStateManifestInfo;
 import org.opensearch.repositories.fs.FsRepository;
 import org.opensearch.test.EqualsHashCodeTestUtils;
@@ -943,33 +942,8 @@ public class CoordinationStateTests extends OpenSearchTestCase {
         assertThat(persistedStateRegistry.getPersistedState(PersistedStateType.REMOTE), nullValue());
     }
 
-    /**
-     * Teaches a mocked {@link RemoteClusterStateService} to answer {@link
-     * RemoteClusterStateService#getRemoteManifestManager()}, which {@code RemotePersistedState}'s
-     * manifest/state consistency assertion goes through.
-     *
-     * <p>That assertion used to read {@code manifest.getIndices()} directly and needed nothing from the
-     * service. It now asks the manifest manager to resolve them, because a sharded manifest keeps its index
-     * list behind shard references and {@code getIndices()} is empty for one -- comparing against that would
-     * have failed the assertion on every sharded write instead of verifying anything. A bare mock answers
-     * null for the manager, so the assertion died with a {@link NullPointerException} before it could check
-     * anything at all; on a real node the service is started and the manager is there.
-     *
-     * <p>The stub delegates to {@code manifest.getIndices()}, which is what {@code resolveIndices} itself
-     * returns for an unsharded manifest -- so these tests assert exactly what they asserted before, rather
-     * than being weakened to get past the mock.
-     */
-    private static void stubManifestResolution(RemoteClusterStateService remoteClusterStateService) {
-        RemoteManifestManager manifestManager = Mockito.mock(RemoteManifestManager.class);
-        when(manifestManager.resolveIndices(any(ClusterMetadataManifest.class))).thenAnswer(
-            invocation -> invocation.<ClusterMetadataManifest>getArgument(0).getIndices()
-        );
-        when(remoteClusterStateService.getRemoteManifestManager()).thenReturn(manifestManager);
-    }
-
     public void testHandlePrePublishAndCommitWhenRemoteStateEnabled() throws IOException {
         final RemoteClusterStateService remoteClusterStateService = Mockito.mock(RemoteClusterStateService.class);
-        stubManifestResolution(remoteClusterStateService);
         final VotingConfiguration initialConfig = VotingConfiguration.of(node1);
         final ClusterState clusterState = clusterStateWithClusterManager(0L, 0L, node1, node1, initialConfig, initialConfig, 42L);
         final String previousClusterUUID = "prev-cluster-uuid";

@@ -334,25 +334,8 @@ public class OperationRouting {
         final Set<IndexShardRoutingTable> set = new HashSet<>();
         // we use set here and not list since we might get duplicates
         for (String index : concreteIndices) {
-            // Metadata first, deliberately. An index in neither metadata nor routing is genuinely
-            // missing and must still produce IndexNotFoundException; only an index that exists but
-            // has no routing entry takes the degraded path below.
+            final IndexRoutingTable indexRouting = indexRoutingTable(clusterState, index);
             final IndexMetadata indexMetadata = indexMetadata(clusterState, index);
-            IndexRoutingTable indexRouting = clusterState.routingTable().index(index);
-            if (indexRouting == null) {
-                // An installed supplier can compute the entry rather than reporting its absence, which
-                // is how a computed-placement index avoids publishing routing at all. Falls back to the
-                // pessimistic no-shard answer when nothing is installed or the supplier declines.
-                // clusterState.getIndexRoutingTable(index)
-                // replaces AbsentIndexRoutingSuppliers.supply(...) here -- same resolution (this branch has
-                // already confirmed the published lookup missed, so the redundant re-check inside
-                // getIndexRoutingTable costs one extra map lookup, not a behavior change), discovered
-                // through the resolver attached to this state's own routing table.
-                indexRouting = clusterState.getIndexRoutingTable(index);
-                if (indexRouting == null) {
-                    indexRouting = noShardsAvailable(indexMetadata);
-                }
-            }
             final Set<String> effectiveRouting = routing.get(index);
             if (effectiveRouting != null) {
                 for (String r : effectiveRouting) {
@@ -495,29 +478,6 @@ public class OperationRouting {
         }
     }
 
-    /**
-     * A routing table for an index that is present in metadata but has no {@link IndexRoutingTable}
-     * entry: the right number of shards, each with no copies anywhere.
-     *
-     * <p>This is what makes such an index behave like one whose shards merely happen to be
-     * unassigned -- a search returns HTTP 200 with a per-shard {@code NoShardAvailableActionException}
-     * for each -- rather than {@code IndexNotFoundException}, which is a 404 and says something that
-     * is not true.
-     *
-     * <p>Synthesising empty shards rather than skipping the index is the point. Skipping would leave
-     * the search with nothing to route to and it would return 200 with zero hits, silently, which is
-     * a worse answer than a loud failure for an index that exists and holds data. The failure a
-     * caller gets here is the same one it already knows how to handle and, for the
-     * scale-to-zero case, the same one that reactivation is racing to prevent.
-     */
-    private static IndexRoutingTable noShardsAvailable(IndexMetadata indexMetadata) {
-        IndexRoutingTable.Builder builder = IndexRoutingTable.builder(indexMetadata.getIndex());
-        for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
-            builder.addIndexShard(new IndexShardRoutingTable.Builder(new ShardId(indexMetadata.getIndex(), shardId)).build());
-        }
-        return builder.build();
-    }
-
     protected IndexRoutingTable indexRoutingTable(ClusterState clusterState, String index) {
         IndexRoutingTable indexRouting = clusterState.routingTable().index(index);
         if (indexRouting == null) {
@@ -526,16 +486,8 @@ public class OperationRouting {
         return indexRouting;
     }
 
-    /**
-     * The metadata lookup every other routing decision here is built on.
-     *
-     * <p>Routing a document means hashing its id against a shard count, and the shard count is the first
-     * thing a gated index cannot supply from cluster state. Repaired here rather than at each of the four
-     * callers below, because they all reach the same question through this method, and the routing-table
-     * lookup itself already has its supplier fallback and simply never ran, since this threw first.
-     */
     protected IndexMetadata indexMetadata(ClusterState clusterState, String index) {
-        IndexMetadata indexMetadata = clusterState.metadata().indexOrResolved(index);
+        IndexMetadata indexMetadata = clusterState.metadata().index(index);
         if (indexMetadata == null) {
             throw new IndexNotFoundException(index);
         }
@@ -543,28 +495,13 @@ public class OperationRouting {
     }
 
     protected IndexShardRoutingTable shards(ClusterState clusterState, String index, String id, String routing) {
-        final IndexMetadata indexMetadata = indexMetadata(clusterState, index);
-        int shardId = generateShardId(indexMetadata, id, routing);
-
-        // The single-document path resolves separately from searchShards, so it needs the same
-        // supplier fallback. Without this a computed index answers searches and fails writes and gets,
-        // which is worse than not supplying at all: the failure looks like a missing index rather than
-        // like an unsupported configuration.
-        if (clusterState.routingTable().hasIndex(index) == false) {
-            // clusterState.getIndexRoutingTable(index)
-            // replaces AbsentIndexRoutingSuppliers.supply(...) here -- same resolution (this branch has
-            // already confirmed the published lookup missed, so the redundant re-check inside
-            // getIndexRoutingTable costs one extra map lookup, not a behavior change), discovered through
-            // the resolver attached to this state's own routing table.
-            IndexRoutingTable supplied = clusterState.getIndexRoutingTable(index);
-            if (supplied != null) {
-                IndexShardRoutingTable shard = supplied.shard(shardId);
-                if (shard != null) {
-                    return shard;
-                }
-            }
-        }
+        int shardId = generateShardId(indexMetadata(clusterState, index), id, routing);
         return clusterState.getRoutingTable().shardRoutingTable(index, shardId);
+    }
+
+    public ShardId shardWithRecoveringChild(ClusterState clusterState, String index, String id, String routing, Index shardIndex) {
+        int shardId = generateShardId(indexMetadata(clusterState, index), id, routing, true);
+        return new ShardId(shardIndex, shardId);
     }
 
     public ShardId shardId(ClusterState clusterState, String index, String id, @Nullable String routing) {
@@ -573,6 +510,15 @@ public class OperationRouting {
     }
 
     public static int generateShardId(IndexMetadata indexMetadata, @Nullable String id, @Nullable String routing) {
+        return generateShardId(indexMetadata, id, routing, false);
+    }
+
+    public static int generateShardId(
+        IndexMetadata indexMetadata,
+        @Nullable String id,
+        @Nullable String routing,
+        boolean includeInProgressChild
+    ) {
         final String effectiveRouting;
         final int partitionOffset;
 
@@ -597,17 +543,26 @@ public class OperationRouting {
             return VirtualShardRoutingHelper.resolvePhysicalShardId(indexMetadata, vShardId);
         }
 
-        return calculateScaledShardId(indexMetadata, effectiveRouting, partitionOffset);
+        return calculateShardIdOfChild(indexMetadata, effectiveRouting, partitionOffset, includeInProgressChild);
     }
 
     private static int calculateScaledShardId(IndexMetadata indexMetadata, String effectiveRouting, int partitionOffset) {
+        return calculateShardIdOfChild(indexMetadata, effectiveRouting, partitionOffset, false);
+    }
+
+    private static int calculateShardIdOfChild(
+        IndexMetadata indexMetadata,
+        String effectiveRouting,
+        int partitionOffset,
+        boolean includeInProgressChild
+    ) {
         final int hash = Murmur3HashFunction.hash(effectiveRouting) + partitionOffset;
 
         // we don't use IMD#getNumberOfShards since the index might have been shrunk such that we need to use the size
         // of original index to hash documents
         int rootShardId = Math.floorMod(hash, indexMetadata.getRoutingNumShards()) / indexMetadata.getRoutingFactor();
 
-        return indexMetadata.getSplitShardsMetadata().getShardIdOfHash(rootShardId, hash, false);
+        return indexMetadata.getSplitShardsMetadata().getShardIdOfHash(rootShardId, hash, includeInProgressChild);
     }
 
     private void checkPreferenceBasedRoutingAllowed(Preference preference, @Nullable WeightedRoutingMetadata weightedRoutingMetadata) {

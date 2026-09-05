@@ -53,7 +53,13 @@ public class ShardPaginationStrategy implements PaginationStrategy<ShardRouting>
             Objects.isNull(shardStrategyToken) ? null : shardStrategyToken.lastIndexCreationTime
         );
         // Get the list of shards and indices belonging to current page.
-        this.pageData = getPageData(filteredIndices, clusterState, shardStrategyToken, pageParams.getSize(), shardIDs);
+        this.pageData = getPageData(
+            filteredIndices,
+            clusterState.getRoutingTable().getIndicesRouting(),
+            shardStrategyToken,
+            pageParams.getSize(),
+            shardIDs
+        );
     }
 
     private static List<IndexMetadata> getEligibleIndices(
@@ -96,7 +102,7 @@ public class ShardPaginationStrategy implements PaginationStrategy<ShardRouting>
      */
     private PageData getPageData(
         List<IndexMetadata> filteredIndices,
-        ClusterState clusterState,
+        Map<String, IndexRoutingTable> indicesRouting,
         final ShardStrategyToken token,
         final int numShardsRequired,
         int[] shardIDs
@@ -114,16 +120,7 @@ public class ShardPaginationStrategy implements PaginationStrategy<ShardRouting>
             // Always start from shardID 0 for all indices except for the first one which might be same as the last sent
             // index. To identify if an index is same as last sent index, verify both the index name and creation time.
             int startShardId = shardCount == 0 ? getStartShardIdForPageIndex(token, indexName, indexMetadata.getCreationDate()) : 0;
-            // Resolved rather than looked up, and null-guarded. The index list above comes from metadata,
-            // so it contains indices this map does not: an index whose routing is computed rather than
-            // published, and an index deleted between the two reads. Both dereferenced null here, which
-            // made a computed index a NullPointerException on this path rather than the missing row it is
-            // on the unpaginated one.
-            IndexRoutingTable indexRouting = clusterState.getIndexRoutingTable(indexName);
-            if (indexRouting == null) {
-                continue;
-            }
-            Map<Integer, IndexShardRoutingTable> indexShardRoutingTable = indexRouting.getShards();
+            Map<Integer, IndexShardRoutingTable> indexShardRoutingTable = indicesRouting.get(indexName).getShards();
             for (; startShardId < indexShardRoutingTable.size(); startShardId++) {
                 if (shardIdSet.isEmpty() == false && shardIdSet.contains(startShardId) == false) {
                     continue;

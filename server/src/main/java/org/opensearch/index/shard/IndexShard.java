@@ -3605,7 +3605,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
      * backwards: {@code lastSearcherAccess} is zero until something searches, so a shard that had never been
      * searched reported the entire uptime of the node as its idle time. A recovering shard would therefore
      * look maximally cold and be evicted before it finished opening. Zero is the safe direction, and it is
-     * the same answer {@link IndicesClusterStateService.Shard#idleMillis} defaults to for the same reason.
+     * the same answer a shard with no recorded search defaults to, for the same reason.
      *
      * <p>An open shard that has never been searched is not affected by that: its indexer's last write time
      * is set when the engine starts, so the figure is time since the shard opened, which is exactly right.

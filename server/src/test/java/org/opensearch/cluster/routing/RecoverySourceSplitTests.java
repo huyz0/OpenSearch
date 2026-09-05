@@ -45,9 +45,8 @@ public class RecoverySourceSplitTests extends OpenSearchTestCase {
     }
 
     public void testTypeEnumOrdinalStability() {
-        // IN_PLACE_SPLIT_SHARD's ordinal must be preserved; it is now second-to-last, with the
-        // newer IN_PLACE_MERGE_SHARD appended after it (which does not shift split's ordinal).
+        // IN_PLACE_SPLIT_SHARD must be at the end to preserve ordinals of existing types
         RecoverySource.Type[] types = RecoverySource.Type.values();
-        assertEquals(RecoverySource.Type.IN_PLACE_SPLIT_SHARD, types[types.length - 2]);
+        assertEquals(RecoverySource.Type.IN_PLACE_SPLIT_SHARD, types[types.length - 1]);
     }
 }

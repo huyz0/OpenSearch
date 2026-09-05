@@ -38,7 +38,6 @@ import org.opensearch.action.admin.cluster.node.stats.NodesStatsResponse;
 import org.opensearch.action.admin.cluster.state.ClusterStateRequest;
 import org.opensearch.action.admin.cluster.state.ClusterStateResponse;
 import org.opensearch.action.admin.indices.stats.CommonStatsFlags;
-import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.Table;
@@ -88,15 +87,6 @@ public class RestAllocationAction extends AbstractCatAction {
         final String[] nodes = Strings.splitStringByCommaToArray(request.param("nodes", "data:true"));
         final ClusterStateRequest clusterStateRequest = new ClusterStateRequest();
         clusterStateRequest.clear().routingTable(true);
-        // As in cat shards: an index whose routing is computed exists only in metadata, so without this
-        // its shards are missing from the per-node counts. Gated on registration so an ordinary cluster
-        // keeps the smaller response it has always had.
-        // IndexCatalog#isActive() -- see TransportCatShardsAction's identical call site: this decides what
-        // to REQUEST, before any ClusterState exists, which is one of the two reasons the catalog SPI is
-        // node-scoped and carries this question at all.
-        if (IndexCatalogRegistry.isActive()) {
-            clusterStateRequest.metadata(true);
-        }
         clusterStateRequest.local(request.paramAsBoolean("local", clusterStateRequest.local()));
         clusterStateRequest.clusterManagerNodeTimeout(
             request.paramAsTime("cluster_manager_timeout", clusterStateRequest.clusterManagerNodeTimeout())
@@ -145,10 +135,7 @@ public class RestAllocationAction extends AbstractCatAction {
     private Table buildTable(RestRequest request, final ClusterStateResponse state, final NodesStatsResponse stats) {
         final Map<String, Integer> allocs = new HashMap<>();
 
-        // state.getState().allShards() replaces the since-deleted
-        // AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered through the
-        // node's registered IndexCatalog.
-        for (ShardRouting shard : state.getState().allShards()) {
+        for (ShardRouting shard : state.getState().routingTable().allShards()) {
             String nodeId = "UNASSIGNED";
 
             if (shard.assignedToNode()) {

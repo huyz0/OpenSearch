@@ -36,8 +36,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterStateListener;
-import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
-import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexGraveyard;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
@@ -172,35 +170,6 @@ public class DanglingIndicesState implements ClusterStateListener {
     }
 
     /**
-     * Whether an index found on disk was deleted, consulting the descriptor as well as the graveyard.
-     *
-     * <p>This is the half of the off-cluster-state deletion story that actually prevents resurrection. Recording a
-     * tombstone prevents nothing until something reads it: a node partitioned during a delete rejoins
-     * holding shard data for an index cluster state no longer mentions, and without a durable no it
-     * imports that data back.
-     *
-     * <p>The graveyard is still consulted first and still authoritative when it answers. It is bounded
-     * though, purging its oldest tombstones once it exceeds its configured size, so an index deleted long
-     * enough ago is forgotten by it and remembered by the descriptor. For a gated index, where cluster
-     * state holds no per-index entry at all, the descriptor is the only record there is.
-     *
-     * <p>Absence of a descriptor is deliberately not treated as deletion. A supplier that is not
-     * installed, or one that declines, answers null, and importing nothing on that basis would discard
-     * live data on any cluster where the mechanism is off. Only an explicit tombstone counts.
-     */
-    private static boolean isDeleted(IndexGraveyard graveyard, Index index) {
-        if (graveyard.containsIndex(index)) {
-            return true;
-        }
-        // Deliberately still AbsentIndexDescriptorSuppliers directly rather than the
-        // IndexCatalog SPI: this reads descriptor.uuid() below and needs the three-way
-        // null/tombstoned/live distinction, which that catalog's generic, collapsed contract
-        // deliberately does not expose.
-        IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
-        return descriptor != null && descriptor.uuid().equals(index.getUUID()) && descriptor.exists() == false;
-    }
-
-    /**
      * Finds (@{link #findNewAndAddDanglingIndices}) and adds the new dangling indices
      * to the currently tracked dangling indices.
      */
@@ -209,7 +178,7 @@ public class DanglingIndicesState implements ClusterStateListener {
 
         // If a tombstone is created for a dangling index, we need to make sure that the
         // index is no longer considered dangling.
-        danglingIndices.keySet().removeIf(index -> isDeleted(graveyard, index));
+        danglingIndices.keySet().removeIf(graveyard::containsIndex);
 
         danglingIndices.putAll(findNewDanglingIndices(danglingIndices, metadata));
     }
@@ -234,7 +203,7 @@ public class DanglingIndicesState implements ClusterStateListener {
 
             for (IndexMetadata indexMetadata : indexMetadataList) {
                 Index index = indexMetadata.getIndex();
-                if (isDeleted(graveyard, index) == false) {
+                if (graveyard.containsIndex(index) == false) {
                     newIndices.put(index, stripAliases(indexMetadata));
                 }
             }

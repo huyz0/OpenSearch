@@ -36,8 +36,6 @@ import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.action.index.NodeMappingRefreshAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.decommission.DecommissionAttributeMetadata;
-import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
-import org.opensearch.cluster.metadata.ClaimedIndexLifecycleRegistry;
 import org.opensearch.cluster.metadata.ComponentTemplateMetadata;
 import org.opensearch.cluster.metadata.ComposableIndexTemplateMetadata;
 import org.opensearch.cluster.metadata.DataStreamMetadata;
@@ -118,11 +116,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
-import java.util.stream.Collectors;
 
 /**
  * Configures classes and services that affect the entire cluster.
@@ -149,7 +145,6 @@ public class ClusterModule extends AbstractModule {
     final ShardsAllocator shardsAllocator;
     private final ClusterManagerMetrics clusterManagerMetrics;
     private final Class<? extends ShardStateAction> shardStateActionClass;
-    private final ClaimedIndexLifecycle claimedIndexLifecycle;
 
     public ClusterModule(
         Settings settings,
@@ -177,29 +172,6 @@ public class ClusterModule extends AbstractModule {
         );
         this.clusterManagerMetrics = clusterManagerMetrics;
         this.shardStateActionClass = shardStateActionClass;
-        // The one plugin-supplied plane for indices held outside cluster state, selected here rather than in
-        // Node.java's block of registrations because most of its callers are injectable: the four metadata
-        // services bound below take it as a constructor argument, which is better than a static holder --
-        // nothing to keep in step, nothing to leak between tests.
-        //
-        // Two core call sites cannot take it that way. Metadata.Builder.put is a method on a data-structure
-        // builder and MetadataCreateIndexService.clusterStateCreateIndex is static, and both are places an
-        // index's record has to be written from. So the same instance selected here is also handed to
-        // ClaimedIndexLifecycleRegistry, which is what those two read. One plugin hook, one object, two ways
-        // of reaching it -- see that class's own javadoc.
-        List<ClaimedIndexLifecycle> lifecycles = clusterPlugins.stream()
-            .map(ClusterPlugin::getClaimedIndexLifecycle)
-            .filter(Optional::isPresent)
-            .map(Optional::get)
-            .collect(Collectors.toList());
-        if (lifecycles.size() > 1) {
-            throw new IllegalStateException("at most one ClusterPlugin may supply a ClaimedIndexLifecycle, but found " + lifecycles.size());
-        }
-        this.claimedIndexLifecycle = lifecycles.isEmpty() ? ClaimedIndexLifecycle.NOOP : lifecycles.get(0);
-        // Registered rather than left unset when empty, so a node built after one that had a plugin does not
-        // inherit the previous node's plane -- which is the one way a shared static holder goes wrong in an
-        // internal test cluster.
-        ClaimedIndexLifecycleRegistry.register(lifecycles.isEmpty() ? null : this.claimedIndexLifecycle);
     }
 
     public static List<Entry> getNamedWriteables() {
@@ -497,7 +469,6 @@ public class ClusterModule extends AbstractModule {
         bind(AllocationService.class).toInstance(allocationService);
         bind(ClusterService.class).toInstance(clusterService);
         bind(NodeConnectionsService.class).asEagerSingleton();
-        bind(ClaimedIndexLifecycle.class).toInstance(claimedIndexLifecycle);
         bind(MetadataDeleteIndexService.class).asEagerSingleton();
         bind(MetadataIndexStateService.class).asEagerSingleton();
         bind(MetadataMappingService.class).asEagerSingleton();

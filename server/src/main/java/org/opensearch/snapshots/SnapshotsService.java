@@ -64,7 +64,6 @@ import org.opensearch.cluster.SnapshotsInProgress.State;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.coordination.FailedToCommitClusterStateException;
 import org.opensearch.cluster.metadata.DataStream;
-import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
@@ -93,8 +92,6 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.index.IndexModule;
-import org.opensearch.index.IndexSettings;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManagerFactory;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -340,93 +337,6 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         final SnapshotId snapshotId = new SnapshotId(snapshotName, UUIDs.randomBase64UUID()); // new UUID for the snapshot
         Repository repository = repositoriesService.repository(request.repository());
 
-        // Refused here, on the calling transport thread, before repository.executeConsistentStateUpdate
-        // ever submits the real cluster-state-update task -- not inside that task's own execute(), where
-        // this check first lived. AbsentIndexDescriptorSuppliers' own resolvers (gatedAmong,
-        // metadataOrDescriptor when it has to synthesise) do a remote read and explicitly refuse to run on
-        // the cluster-state-update thread, matching the discipline this whole project already established
-        // for MetadataCreateIndexService#createGatedIndex and MetadataDeleteIndexService: every current
-        // caller resolves off that thread and passes the result in.
-        //
-        // Two distinct absences get refused here, for the same underlying reason
-        // ScaleIndexOperationValidator refuses a computed index before its own downstream checks: shards()
-        // resolves a requested index's primary shards by reading metadata.index(name) paired with
-        // routingTable.index(name), and reports every shard MISSING (surfacing as the misleading
-        // "Indices don't have primary shards [name]") whenever either lookup comes back null -- which
-        // happens for two structurally different, both genuinely-alive index shapes this plugin can
-        // produce, not just one:
-        // - a gated index: absent from metadata.indices() entirely (its metadata lives off cluster
-        // state), so metadata.index(name) itself returns null;
-        // - a computed-placement index: present in metadata.indices() but never publishes a routing
-        // table entry (routingTable.index(name) returns null), so routingTable is what's
-        // missing instead.
-        // Both have primary shards serving live traffic; "don't have primary shards" is false for either.
-        {
-            ClusterState stateForGatedCheck = clusterService.state();
-            List<String> namesForGatedCheck = Arrays.asList(indexNameExpressionResolver.concreteIndexNames(stateForGatedCheck, request));
-            List<String> gatedIndices = new ArrayList<>();
-            List<String> computedPlacementIndices = new ArrayList<>();
-            for (String indexName : namesForGatedCheck) {
-                IndexMetadata published = stateForGatedCheck.metadata().index(indexName);
-                if (published == null) {
-                    if (stateForGatedCheck.metadata().indexOrResolved(indexName) != null) {
-                        gatedIndices.add(indexName);
-                    }
-                    // stateForGatedCheck.routingTable().shouldPublishRouting(...) replaces the static
-                    // registry's AbsentIndexRoutingSuppliers.shouldPublishRouting(...)
-                    // here -- same predicate, discovered through the resolver attached to this state's own
-                    // routing table.
-                } else if (stateForGatedCheck.routingTable().shouldPublishRouting(published) == false) {
-                    computedPlacementIndices.add(indexName);
-                }
-            }
-            if (gatedIndices.isEmpty() == false || computedPlacementIndices.isEmpty() == false) {
-                StringBuilder message = new StringBuilder("Cannot snapshot: ");
-                if (gatedIndices.isEmpty() == false) {
-                    message.append(gatedIndices).append(" -- metadata is not stored in cluster state for these indices. ");
-                }
-                if (computedPlacementIndices.isEmpty() == false) {
-                    message.append(computedPlacementIndices)
-                        .append(" -- shard placement is computed rather than published for these indices. ");
-                }
-                message.append(
-                    "Snapshotting resolves primary shards from the published cluster-state routing table, "
-                        + "which neither of these index shapes has."
-                );
-                throw new SnapshotException(new Snapshot(repositoryName, snapshotId), message.toString());
-            }
-        }
-
-        // A snapshot named by wildcard on a cluster with gated indices succeeds and silently leaves every
-        // one of them out, because a gated index has no cluster state entry for a wildcard to match. That
-        // is the one outcome worth warning about: naming a gated index is refused loudly just above, and
-        // "snapshot everything" reporting SUCCESS having captured a subset is how an operator ends up
-        // believing they have a backup they do not have.
-        //
-        // Deliberately not a count of what was omitted. Counting means a descriptor prefix search on the
-        // snapshot path -- O(the gated population) work, on a branch whose premise is that per-index work
-        // was removed -- to produce a number nobody can act on differently. A fixed, honest warning is what
-        // the operator needs and it costs a boolean.
-        //
-        // Deliberately not a new field on SnapshotInfo either: the engine-native snapshot design kept that
-        // surface unchanged on purpose, and this is not the change that should be the first to break it.
-        //
-        // IndexCreationStrategyRegistry.isRegistered()
-        // replaces the plugin-owned static registry's isRegistered() here -- this call site only ever
-        // needed "is anything gated at all," never a specific name, so it needed no other change. See
-        // IndexCreationStrategyRegistry's own javadoc for why nothing is lost for a node without a
-        // ClusterPlugin supplying a strategy: it answers false unconditionally, exactly like
-        // the static registry did before anything registered with it.
-        if (IndexCreationStrategyRegistry.isRegistered() && mayHaveMatchedGatedIndices(request.indices())) {
-            logger.warn(
-                "snapshot [{}] resolves its indices by wildcard on a cluster with gated indices. Gated indices "
-                    + "have no cluster state entry for a wildcard to match, so they are not in this snapshot "
-                    + "and are not protected by it -- see the durability posture documentation for what does "
-                    + "protect them",
-                snapshotId
-            );
-        }
-
         if (repository.isReadOnly()) {
             listener.onFailure(new RepositoryException(repository.getMetadata().name(), "cannot create snapshot in a readonly repository"));
             return;
@@ -595,35 +505,7 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
 
                 createSnapshotPreValidations(currentState, repositoryData, repositoryName, snapshotName);
 
-                // Exclude warm-tiered pluggable-data-format indexes from V2 snapshots; they are
-                // not currently restorable. The rest of the cluster is captured normally.
-                final List<String> allIndices = new ArrayList<>(currentState.metadata().indices().keySet());
-                final List<String> excludedWarmDfa = new ArrayList<>();
-                final List<String> indices = new ArrayList<>();
-                for (String indexName : allIndices) {
-                    IndexMetadata idxMd = currentState.metadata().index(indexName);
-                    if (idxMd != null
-                        && IndexSettings.PLUGGABLE_DATAFORMAT_ENABLED_SETTING.get(idxMd.getSettings())
-                        && IndexModule.IS_WARM_INDEX_SETTING.get(idxMd.getSettings())) {
-                        excludedWarmDfa.add(indexName);
-                    } else {
-                        indices.add(indexName);
-                    }
-                }
-                if (excludedWarmDfa.isEmpty() == false) {
-                    logger.info(
-                        "[{}][{}] excluding [{}] warm-tiered pluggable data format index(es) from snapshot v2 (not currently supported)",
-                        repositoryName,
-                        snapshotName,
-                        excludedWarmDfa.size()
-                    );
-                    logger.trace(
-                        "[{}][{}] excluded warm-tiered pluggable data format indexes from snapshot v2: {}",
-                        repositoryName,
-                        snapshotName,
-                        excludedWarmDfa
-                    );
-                }
+                List<String> indices = new ArrayList<>(currentState.metadata().indices().keySet());
 
                 final List<String> dataStreams = indexNameExpressionResolver.dataStreamNames(
                     currentState,
@@ -694,6 +576,7 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
             public void clusterStateProcessed(String source, ClusterState oldState, final ClusterState newState) {
                 final ShardGenerations shardGenerations = buildShardsGenerationFromRepositoryData(
                     newState.metadata(),
+                    newState.routingTable(),
                     newEntry.indices(),
                     repositoryData
                 );
@@ -779,34 +662,6 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         }
         logger.info("Found {} orphan timestamps. Cleaning it up now", orphanPinnedEntities.size());
         deleteOrphanTimestamps(pinnedEntities, orphanPinnedEntities);
-    }
-
-    /**
-     * Whether this snapshot request names its indices in a way that would have matched gated indices had
-     * they been in cluster state -- which is exactly when omitting them is silent rather than refused.
-     *
-     * <p>All four spellings of "everything" count, because all four were measured to succeed while
-     * capturing only the ordinary indices: no indices set at all, {@code *}, {@code _all}, and a prefix
-     * wildcard that matches. So does any other wildcard, since a caller who wrote one cannot tell from the
-     * result which names it did not reach.
-     *
-     * <p>An exclusion such as {@code -foo} is a wildcard-shaped expression that does not by itself widen
-     * the match, but it only ever appears alongside something that does, and treating it as widening
-     * costs at most one extra warning on a request that was going to warn anyway.
-     */
-    static boolean mayHaveMatchedGatedIndices(String[] requestedIndices) {
-        if (requestedIndices == null || requestedIndices.length == 0) {
-            return true;
-        }
-        for (String requested : requestedIndices) {
-            if (requested == null) {
-                continue;
-            }
-            if (Regex.isSimpleMatchPattern(requested) || Metadata.ALL.equals(requested)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     static boolean isOrphanPinnedEntity(String repoName, Collection<String> snapshotUUIDs, String pinnedEntity) {
@@ -3551,14 +3406,11 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
             final String indexName = index.getName();
             final boolean isNewIndex = repositoryData.getIndices().containsKey(indexName) == false;
             IndexMetadata indexMetadata = metadata.index(indexName);
-            final IndexRoutingTable indexRoutingTable = indexMetadata == null ? null : routingTable.index(indexName);
-            // Both lookups have to be checked. An index in metadata with no routing entry has no shards to
-            // snapshot, which is the same situation as one that was deleted, so it takes the same branch
-            // rather than dereferencing null below.
-            if (indexMetadata == null || indexRoutingTable == null) {
+            if (indexMetadata == null) {
                 // The index was deleted before we managed to start the snapshot - mark it as missing.
                 builder.put(new ShardId(indexName, IndexMetadata.INDEX_UUID_NA_VALUE, 0), ShardSnapshotStatus.MISSING);
             } else {
+                final IndexRoutingTable indexRoutingTable = routingTable.index(indexName);
                 for (int i = 0; i < indexMetadata.getNumberOfShards(); i++) {
                     final ShardId shardId = indexRoutingTable.shard(i).shardId();
                     final String shardRepoGeneration;
@@ -3612,27 +3464,9 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         return Collections.unmodifiableMap(builder);
     }
 
-    /**
-     * Builds the per-shard generation map for a snapshot-v2 finalize.
-     *
-     * <p><b>Deliberately does not consult the routing table, where it used to.</b> The old version
-     * took a {@link RoutingTable}, looked up each index in it, and read {@code
-     * indexRoutingTable.shard(i).shardId()} inside the loop -- but only {@code shardId.id()} is ever
-     * used, and that is just {@code i}. The lookup laundered the loop counter into itself and
-     * contributed nothing else. It also dereferenced the result unguarded, so an index present in
-     * metadata and absent from routing threw {@link NullPointerException} here.
-     *
-     * <p>That mattered because of where the index list comes from: {@code createSnapshotV2} builds it
-     * from {@code metadata().indices().keySet()} and never filters on routing, so the precondition
-     * was "every index in metadata has a routing entry" -- exactly the invariant cold-index absence
-     * removes, reached by an ordinary create-snapshot call. Dropping the parameter removes the
-     * requirement rather than guarding it, which is better than either alternative: a guard that
-     * skipped such an index would have silently left it out of the snapshot.
-     *
-     * <p>Package-private for {@code SnapshotShardGenerationsTests}.
-     */
-    static ShardGenerations buildShardsGenerationFromRepositoryData(
+    private static ShardGenerations buildShardsGenerationFromRepositoryData(
         Metadata metadata,
+        RoutingTable routingTable,
         List<IndexId> indices,
         RepositoryData repositoryData
     ) {
@@ -3644,17 +3478,23 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
             final boolean isNewIndex = repositoryData.getIndices().containsKey(indexName) == false;
             IndexMetadata indexMetadata = metadata.index(indexName);
 
+            final IndexRoutingTable indexRoutingTable = routingTable.index(indexName);
             for (int i = 0; i < indexMetadata.getNumberOfShards(); i++) {
+                final ShardId shardId = indexRoutingTable.shard(i).shardId();
                 final String shardRepoGeneration;
 
                 if (isNewIndex) {
-                    assert shardGenerations.getShardGen(index, i) == null : "Found shard generation for new index [" + index + "]";
+                    assert shardGenerations.getShardGen(index, shardId.getId()) == null : "Found shard generation for new index ["
+                        + index
+                        + "]";
                     shardRepoGeneration = ShardGenerations.NEW_SHARD_GEN;
                 } else {
-                    shardRepoGeneration = shardGenerations.getShardGen(index, i);
+                    shardRepoGeneration = shardGenerations.getShardGen(index, shardId.id());
                 }
-                builder.put(index, i, shardRepoGeneration);
+                builder.put(index, shardId.id(), shardRepoGeneration);
+
             }
+
         }
 
         return builder.build();

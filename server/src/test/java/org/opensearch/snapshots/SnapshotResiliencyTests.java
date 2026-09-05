@@ -139,7 +139,6 @@ import org.opensearch.cluster.coordination.MockSinglePrioritizingExecutor;
 import org.opensearch.cluster.coordination.PersistedStateRegistry;
 import org.opensearch.cluster.coordination.PersistedStateRegistry.PersistedStateType;
 import org.opensearch.cluster.metadata.AliasValidator;
-import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.MetadataCreateIndexService;
@@ -2144,12 +2143,7 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                     threadPool
                 );
                 nodeConnectionsService = createTestNodeConnectionsService(clusterService.getSettings(), threadPool, transportService);
-                final MetadataMappingService metadataMappingService = new MetadataMappingService(
-                    clusterService,
-                    indicesService,
-                    threadPool,
-                    ClaimedIndexLifecycle.NOOP
-                );
+                final MetadataMappingService metadataMappingService = new MetadataMappingService(clusterService, indicesService);
                 indicesClusterStateService = new IndicesClusterStateService(
                     settings,
                     indicesService,
@@ -2240,16 +2234,14 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                 final MetadataDeleteIndexService metadataDeleteIndexService = new MetadataDeleteIndexService(
                     settings,
                     clusterService,
-                    allocationService,
-                    ClaimedIndexLifecycle.NOOP
+                    allocationService
                 );
                 final MetadataIndexAliasesService metadataIndexAliasesService = new MetadataIndexAliasesService(
                     clusterService,
                     indicesService,
                     new AliasValidator(),
                     metadataDeleteIndexService,
-                    namedXContentRegistry,
-                    ClaimedIndexLifecycle.NOOP
+                    namedXContentRegistry
                 );
                 actions.put(
                     IndicesAliasesAction.INSTANCE,

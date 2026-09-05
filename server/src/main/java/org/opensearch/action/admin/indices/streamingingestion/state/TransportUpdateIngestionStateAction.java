@@ -98,9 +98,7 @@ public class TransportUpdateIngestionStateAction extends TransportBroadcastByNod
             shardFilter = shardFilter.and(shardRouting -> shardSet.contains(shardRouting.shardId().getId()));
         }
 
-        // clusterState.allShards(...) resolves through the resolver attached to this state's own
-        // routing table (replacing an earlier static-registry lookup) -- same predicate/composition.
-        return clusterState.allShards(request.getIndex(), shardFilter, false);
+        return clusterState.routingTable().allShardsSatisfyingPredicate(request.getIndex(), shardFilter);
     }
 
     @Override

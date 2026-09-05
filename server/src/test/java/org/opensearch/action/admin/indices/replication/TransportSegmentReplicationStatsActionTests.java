@@ -17,6 +17,7 @@ import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.routing.AllocationId;
+import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardIterator;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
@@ -97,18 +98,11 @@ public class TransportSegmentReplicationStatsActionTests extends OpenSearchTestC
         SegmentReplicationStatsRequest segmentReplicationStatsRequest = mock(SegmentReplicationStatsRequest.class);
         String[] concreteIndices = new String[] { "test-index" };
         ClusterState clusterState = mock(ClusterState.class);
+        RoutingTable routingTables = mock(RoutingTable.class);
         ShardsIterator shardsIterator = mock(ShardIterator.class);
 
-        // Phase C4b of core-pluggability-refactor-plan.md: TransportSegmentReplicationStatsAction#shards
-        // now calls ClusterState#allShardsIncludingRelocationTargets directly (composing the
-        // resolver-aware getIndexRoutingTable internally) instead of
-        // the since-deleted AbsentIndexRoutingSuppliers.allShardsIncludingRelocationTargets(state, ...), which itself used to
-        // read state.routingTable().allShardsIncludingRelocationTargets(...) on the unregistered fast path.
-        // Stubbing the old RoutingTable-level method here would stub a call this mock's own
-        // ClusterState#allShardsIncludingRelocationTargets never makes (it's a real, unmocked method on the
-        // mocked ClusterState, so Mockito's default answer -- null -- would apply instead), so the new
-        // method is stubbed directly.
-        when(clusterState.allShardsIncludingRelocationTargets(concreteIndices)).thenReturn(shardsIterator);
+        when(clusterState.routingTable()).thenReturn(routingTables);
+        when(routingTables.allShardsIncludingRelocationTargets(any())).thenReturn(shardsIterator);
         assertEquals(shardsIterator, action.shards(clusterState, segmentReplicationStatsRequest, concreteIndices));
     }
 

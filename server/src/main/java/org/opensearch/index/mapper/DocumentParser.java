@@ -786,19 +786,6 @@ final class DocumentParser {
 
         // Handle value tokens (null and primitive values)
         Mapper existingMapper = mapper.getMapper(fieldName);
-        if (existingMapper == null && UnknownFieldRefresh.isRegistered()) {
-            // The shard may simply be behind. For a gated index the mapping lives outside cluster state and
-            // nothing broadcasts a change, so a field it does not know may already exist and have been
-            // inferred by another shard. There is no generation stamped on the request to
-            // compare against, so the miss itself is the trigger: this is exactly and only the moment being
-            // behind matters.
-            //
-            // Costs one null check on a path that is already rare, since a field is unknown at most once
-            // per shard: whatever happens next makes it known.
-            if (UnknownFieldRefresh.refreshed(context.mapperService(), context.indexSettings().getUUID(), fieldName)) {
-                existingMapper = mapper.getMapper(fieldName);
-            }
-        }
         if (existingMapper != null) {
             parseExistingFieldMapper(context, fieldName, existingMapper);
             return;

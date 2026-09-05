@@ -450,7 +450,6 @@ public class IndicesService extends AbstractLifecycleComponent
      * collaborator opening a shard needs. Null until then, and null on a node that holds no shards, so
      * {@link #indexServiceSafe} behaves exactly as it always has.
      */
-    private volatile Consumer<Index> onDemandShardOpener;
 
     private final Map<Index, List<PendingDelete>> pendingDeletes = new HashMap<>();
     private final AtomicInteger numUncompletedDeletes = new AtomicInteger();
@@ -1032,27 +1031,8 @@ public class IndicesService extends AbstractLifecycleComponent
         return indices.get(index.getUUID());
     }
 
-    /**
-     * Returns an IndexService for the specified index if exists otherwise a {@link IndexNotFoundException} is thrown.
-     */
-    @Override
-    public void setOnDemandShardOpener(Consumer<Index> opener) {
-        this.onDemandShardOpener = opener;
-    }
-
     public IndexService indexServiceSafe(Index index) {
         IndexService indexService = indices.get(index.getUUID());
-        if (indexService == null) {
-            // The on-demand opener's trigger. An index whose metadata never appears in cluster state is never built by
-            // cluster state application, so the first request for one of its shards is the only thing that
-            // can ask for it. Reached only on the way to throwing, so an ordinary cluster pays one null
-            // check on a path that was already about to fail.
-            Consumer<Index> opener = onDemandShardOpener;
-            if (opener != null) {
-                opener.accept(index);
-                indexService = indices.get(index.getUUID());
-            }
-        }
         if (indexService == null) {
             throw new IndexNotFoundException(index);
         }
@@ -1983,19 +1963,6 @@ public class IndicesService extends AbstractLifecycleComponent
         @Override
         public int compareTo(PendingDelete o) {
             return Integer.compare(shardId, o.shardId);
-        }
-    }
-
-    @Override
-    public boolean hasExistingShardData(ShardId shardId, String customDataPath) {
-        try {
-            return ShardPath.loadShardPath(logger, nodeEnv, shardId, customDataPath) != null;
-        } catch (Exception e) {
-            // Unreadable is not the same as absent, but treating it as absent here would recover the
-            // shard from an empty store, which is the outcome this call exists to prevent. Reporting
-            // "data present" makes the recovery fail loudly instead.
-            logger.warn(() -> new ParameterizedMessage("{} could not determine whether shard data exists", shardId), e);
-            return true;
         }
     }
 

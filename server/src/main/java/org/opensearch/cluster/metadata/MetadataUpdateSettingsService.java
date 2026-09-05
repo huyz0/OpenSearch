@@ -59,7 +59,6 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
-import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.ShardLimitValidator;
@@ -68,7 +67,6 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -140,60 +138,6 @@ public class MetadataUpdateSettingsService {
             .put(request.settings())
             .normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX)
             .build();
-
-        // Refused here rather than failed later. A gated index keeps no settings in cluster state and the
-        // descriptor has nowhere to put arbitrary ones, so this operation is not expressible for it at all.
-        // Without this the request reaches Metadata.getIndexSafe inside the state update task and comes back
-        // "no such index", which sends an operator looking for a deleted index rather than telling them the
-        // operation is unsupported.
-        //
-        // Checked on this thread, which is the transport thread that received the request, because resolving
-        // a descriptor is a remote read and the seam refuses to answer on the cluster state thread.
-        //
-        // This refusal was briefly replaced by an "off the cluster state thread" implementation that resolved
-        // each descriptor, republished it unchanged, and answered acknowledged. It moved the work off the
-        // thread, which it set out to do, and did not apply the settings: request.settings() was never read.
-        // So a caller's update was validated, discarded, and reported as successful -- the silent-success
-        // failure this area keeps producing, with the paragraph above still sitting over it explaining why it
-        // could not work. Restored, because the alternative is not "implement it here": settings have to have
-        // somewhere to live on the descriptor first, the way mappings were given somewhere to live, and until
-        // they do the honest answer to this request is no.
-        //
-        // Close and open are deliberately not refused alongside it. Those are expressible -- IndexDescriptor
-        // carries State, and their gated paths really do write descriptor.withState(...) -- which is the
-        // difference between an operation that is unsupported and one that merely has no cluster state entry.
-        // clusterService.state().metadata().gatedAmong(...) replaced AbsentIndexDescriptorSuppliers
-        // .gatedAmong(...) here -- same predicate, discovered through the resolver attached to this
-        // state's own metadata.
-        final java.util.List<Index> gated = clusterService.state().metadata().gatedAmong(request.indices());
-        if (gated.isEmpty() == false) {
-            // The index must still exist, and saying so first matters: an operator who mistyped a name needs
-            // "no such index", not "unsupported", or they will go looking for a feature gap instead of a typo.
-            //
-            // clusterService.state().metadata().existsOrResolved(...) replaced
-            // AbsentIndexDescriptorSuppliers.supply(...) + a manual null/exists() check -- this call only
-            // ever needed the collapsed "does it resolve" answer, never the raw descriptor's other fields.
-            for (Index index : gated) {
-                if (clusterService.state().metadata().existsOrResolved(index.getName()) == false) {
-                    listener.onFailure(new IndexNotFoundException(index.getName()));
-                    return;
-                }
-            }
-            // The namespace description comes from the registered strategy rather than core naming one
-            // product in an error a user reads.
-            listener.onFailure(
-                new UnsupportedOperationException(
-                    "cannot update settings on "
-                        + (gated.size() == 1 ? "index " + gated.get(0).getName() : "indices " + gated)
-                        + " in "
-                        + IndexCreationStrategyRegistry.describeClaimedNamespace()
-                        + (gated.size() == request.indices().length
-                            ? ": such an index keeps no settings in cluster state and has nowhere to record " + "arbitrary ones"
-                            : ": mixed request with these and ordinary indices is not supported")
-                )
-            );
-            return;
-        }
 
         validateRefreshIntervalSettings(normalizedSettings, clusterService.getClusterSettings());
         validateTranslogDurabilitySettings(normalizedSettings, clusterService.getClusterSettings(), clusterService.getSettings());
@@ -629,11 +573,13 @@ public class MetadataUpdateSettingsService {
             return;
         }
 
-        // Remote store is enabled only when there is at least one node and every node is a
-        // remote-store node (allMatch is vacuously true on an empty node set, which must not
-        // count as remote-store enabled).
-        Collection<DiscoveryNode> nodes = clusterService.state().nodes().getNodes().values();
-        boolean isRemoteStoreEnabled = !nodes.isEmpty() && nodes.stream().allMatch(DiscoveryNode::isRemoteStoreNode);
+        // Check if remote store is enabled
+        boolean isRemoteStoreEnabled = clusterService.state()
+            .nodes()
+            .getNodes()
+            .values()
+            .stream()
+            .allMatch(DiscoveryNode::isRemoteStoreNode);
         if (!isRemoteStoreEnabled) {
             throw new IllegalArgumentException(
                 "Setting ["
@@ -673,5 +619,4 @@ public class MetadataUpdateSettingsService {
             }
         }
     }
-
 }

@@ -46,6 +46,7 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 
 import static org.opensearch.cluster.metadata.DataStream.getDefaultBackingIndexName;
+import static org.opensearch.cluster.metadata.IndexMetadata.INDEX_HIDDEN_SETTING;
 
 /**
  * An index abstraction is a reference to one or more concrete indices.
@@ -147,22 +148,15 @@ public interface IndexAbstraction {
      */
     class Index implements IndexAbstraction {
 
-        /**
-         * Held as a {@link IndexMetadataHolder} rather than an {@link IndexMetadata}. There is one of
-         * these per index in {@code Metadata}'s {@code indicesLookup}, so a hard reference here would
-         * put every index in the cluster back on the heap regardless of what {@code Metadata} itself
-         * stores. Only {@link #getIndices()} and {@link #getWriteIndex()} materialize it; name, hidden
-         * and system are answered from the descriptor.
-         */
-        private final IndexMetadataHolder concreteIndex;
+        private final IndexMetadata concreteIndex;
         private final DataStream dataStream;
 
-        public Index(IndexMetadataHolder indexMetadata, DataStream dataStream) {
+        public Index(IndexMetadata indexMetadata, DataStream dataStream) {
             this.concreteIndex = indexMetadata;
             this.dataStream = dataStream;
         }
 
-        public Index(IndexMetadataHolder indexMetadata) {
+        public Index(IndexMetadata indexMetadata) {
             this(indexMetadata, null);
         }
 
@@ -178,12 +172,12 @@ public interface IndexAbstraction {
 
         @Override
         public List<IndexMetadata> getIndices() {
-            return Collections.singletonList(concreteIndex.get());
+            return Collections.singletonList(concreteIndex);
         }
 
         @Override
         public IndexMetadata getWriteIndex() {
-            return concreteIndex.get();
+            return concreteIndex;
         }
 
         @Override
@@ -193,7 +187,7 @@ public interface IndexAbstraction {
 
         @Override
         public boolean isHidden() {
-            return concreteIndex.isHidden();
+            return INDEX_HIDDEN_SETTING.get(concreteIndex.getSettings());
         }
 
         @Override
@@ -210,17 +204,11 @@ public interface IndexAbstraction {
     class Alias implements IndexAbstraction {
 
         private final String aliasName;
-        /** Unmaterialized, for the reason given on {@link Index#concreteIndex}. */
-        private final List<IndexMetadataHolder> referenceIndexMetadatas;
-        private final SetOnce<IndexMetadataHolder> writeIndex = new SetOnce<>();
+        private final List<IndexMetadata> referenceIndexMetadatas;
+        private final SetOnce<IndexMetadata> writeIndex = new SetOnce<>();
         private final boolean isHidden;
-        /**
-         * {@link #getIndices()}'s result, once something has asked for it. Benign race: two threads may
-         * both build it, and either answer is equal to the other.
-         */
-        private volatile List<IndexMetadata> resolvedIndexMetadatas;
 
-        public Alias(AliasMetadata aliasMetadata, IndexMetadataHolder indexMetadata) {
+        public Alias(AliasMetadata aliasMetadata, IndexMetadata indexMetadata) {
             this.aliasName = aliasMetadata.getAlias();
             this.referenceIndexMetadatas = new ArrayList<>();
             this.referenceIndexMetadatas.add(indexMetadata);
@@ -236,31 +224,14 @@ public interface IndexAbstraction {
             return aliasName;
         }
 
-        /**
-         * Materializes every member. Memoized, so this costs the same as the field read it replaced
-         * after the first call -- and callers that only need names or the write index should use
-         * {@link #getConcreteIndexAndAliasMetadatas()} or {@link #getWriteIndex()}, neither of which
-         * materializes the rest.
-         */
         @Override
         public List<IndexMetadata> getIndices() {
-            List<IndexMetadata> local = resolvedIndexMetadatas;
-            if (local != null) {
-                return local;
-            }
-            List<IndexMetadata> resolved = new ArrayList<>(referenceIndexMetadatas.size());
-            for (IndexMetadataHolder holder : referenceIndexMetadatas) {
-                resolved.add(holder.get());
-            }
-            resolved = Collections.unmodifiableList(resolved);
-            resolvedIndexMetadatas = resolved;
-            return resolved;
+            return referenceIndexMetadatas;
         }
 
         @Nullable
         public IndexMetadata getWriteIndex() {
-            IndexMetadataHolder holder = writeIndex.get();
-            return holder == null ? null : holder.get();
+            return writeIndex.get();
         }
 
         @Override
@@ -276,7 +247,7 @@ public interface IndexAbstraction {
 
         @Override
         public boolean isSystem() {
-            return referenceIndexMetadatas.stream().allMatch(IndexMetadataHolder::isSystem);
+            return referenceIndexMetadatas.stream().allMatch(IndexMetadata::isSystem);
         }
 
         /**
@@ -297,7 +268,7 @@ public interface IndexAbstraction {
 
                 @Override
                 public Tuple<String, AliasMetadata> next() {
-                    IndexMetadataHolder indexMetadata = referenceIndexMetadatas.get(index++);
+                    IndexMetadata indexMetadata = referenceIndexMetadatas.get(index++);
                     return new Tuple<>(indexMetadata.getIndex().getName(), indexMetadata.getAliases().get(aliasName));
                 }
             };
@@ -307,16 +278,13 @@ public interface IndexAbstraction {
             return referenceIndexMetadatas.get(0).getAliases().get(aliasName);
         }
 
-        void addIndex(IndexMetadataHolder indexMetadata) {
+        void addIndex(IndexMetadata indexMetadata) {
             this.referenceIndexMetadatas.add(indexMetadata);
-            // Only called while the lookup is still being built, but a memo taken before the last
-            // member arrives would be wrong, so drop it rather than rely on that ordering.
-            this.resolvedIndexMetadatas = null;
         }
 
         public void computeAndValidateAliasProperties() {
             // Validate write indices
-            List<IndexMetadataHolder> writeIndices = referenceIndexMetadatas.stream()
+            List<IndexMetadata> writeIndices = referenceIndexMetadatas.stream()
                 .filter(idxMeta -> Boolean.TRUE.equals(idxMeta.getAliases().get(aliasName).writeIndex()))
                 .collect(Collectors.toList());
 
@@ -340,7 +308,7 @@ public interface IndexAbstraction {
             }
 
             // Validate hidden status
-            final Map<Boolean, List<IndexMetadataHolder>> groupedByHiddenStatus = referenceIndexMetadatas.stream()
+            final Map<Boolean, List<IndexMetadata>> groupedByHiddenStatus = referenceIndexMetadatas.stream()
                 .collect(Collectors.groupingBy(idxMeta -> Boolean.TRUE.equals(idxMeta.getAliases().get(aliasName).isHidden())));
             if (isNonEmpty(groupedByHiddenStatus.get(true)) && isNonEmpty(groupedByHiddenStatus.get(false))) {
                 List<String> hiddenOn = groupedByHiddenStatus.get(true)
@@ -364,7 +332,7 @@ public interface IndexAbstraction {
             }
         }
 
-        private boolean isNonEmpty(List<IndexMetadataHolder> idxMetas) {
+        private boolean isNonEmpty(List<IndexMetadata> idxMetas) {
             return (Objects.isNull(idxMetas) || idxMetas.isEmpty()) == false;
         }
     }

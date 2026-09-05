@@ -18,7 +18,6 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.TimeoutTaskCancellationUtility;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.breaker.ResponseLimitBreachedException;
 import org.opensearch.common.breaker.ResponseLimitSettings;
@@ -65,17 +64,6 @@ public class TransportCatShardsAction extends HandledTransportAction<CatShardsRe
         clusterStateRequest.clusterManagerNodeTimeout(shardsRequest.clusterManagerNodeTimeout());
         if (Objects.isNull(shardsRequest.getPageParams())) {
             clusterStateRequest.clear().nodes(true).routingTable(true).indices(shardsRequest.getIndices());
-            // Metadata is the only place an index whose routing is computed appears, so without it the
-            // listing silently omits those shards. Requested only when a placement supplier is installed,
-            // because metadata is the expensive part of a cluster state response and an ordinary cluster
-            // must keep paying exactly what it paid before.
-            // IndexCatalog#isActive(), which exists precisely for call sites shaped like this one: it
-            // decides what to REQUEST, before any ClusterState exists at all. The predecessor SPI was
-            // attached per ClusterState instance, so it could not be consulted here and this line had to
-            // reach past it into the static registry; a node-scoped catalog can, and does.
-            if (IndexCatalogRegistry.isActive()) {
-                clusterStateRequest.metadata(true);
-            }
         } else {
             clusterStateRequest.clear().nodes(true).routingTable(true).indices(shardsRequest.getIndices()).metadata(true);
         }
@@ -114,12 +102,9 @@ public class TransportCatShardsAction extends HandledTransportAction<CatShardsRe
                             clusterStateResponse
                         );
                         catShardsResponse.setNodes(clusterStateResponse.getState().getNodes());
-                        // getState().allShards() resolves through the resolver attached to this state's
-                        // own routing table (replacing an earlier static-registry lookup) -- same
-                        // composition.
                         catShardsResponse.setResponseShards(
                             Objects.isNull(paginationStrategy)
-                                ? clusterStateResponse.getState().allShards()
+                                ? clusterStateResponse.getState().routingTable().allShards()
                                 : paginationStrategy.getRequestedEntities()
                         );
                         catShardsResponse.setPageToken(Objects.isNull(paginationStrategy) ? null : paginationStrategy.getResponseToken());

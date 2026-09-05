@@ -41,9 +41,9 @@ import org.opensearch.action.support.broadcast.BroadcastRequest;
 import org.opensearch.action.support.broadcast.BroadcastResponse;
 import org.opensearch.action.support.broadcast.BroadcastShardOperationFailedException;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
-import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.util.concurrent.CountDown;
@@ -165,27 +165,13 @@ public abstract class TransportBroadcastReplicationAction<
         List<ShardId> shardIds = new ArrayList<>();
         Set<String> concreteIndices = resolveIndices(request, clusterState).namesOfConcreteIndices();
         for (String index : concreteIndices) {
-            // Both lookups have to be guarded. The metadata check alone was not enough: an index present
-            // in metadata but absent from the routing table dereferenced null here. The rest of this
-            // family already treats an absent routing entry as no shards -- see
-            // RoutingTable#allShardsSatisfyingPredicate -- so do the same rather than fail the request.
-            //
-            // Resolving rather than looking up is what makes this work for a computed index. The guard
-            // above was correct before placements could be computed, when an absent entry really did
-            // mean no shards, but a
-            // computed index has shards and simply does not publish them. Looking up directly found
-            // nothing, so a refresh or a flush reported success having touched nothing at all, and every
-            // read afterwards saw a stale searcher. Silent, and indistinguishable from a broken write.
-            //
-            // The metadata half of that guard then reintroduced the same defect for a gated index, which
-            // has no metadata entry at all, measured in an integration run: a refresh over twenty gated
-            // tenants touched nothing, reported success, and the search that followed found 450 documents
-            // of a thousand that had genuinely been written. It is dropped because it is redundant rather than
-            // because it is inconvenient -- resolve already answers null for an index that is in neither
-            // table, which is the case the metadata check was standing in for.
-            IndexRoutingTable indexRouting = clusterState.getIndexRoutingTable(index);
-            if (indexRouting != null) {
-                for (IndexShardRoutingTable shardRouting : indexRouting.getShards().values()) {
+            IndexMetadata indexMetadata = clusterState.metadata().getIndices().get(index);
+            if (indexMetadata != null) {
+                for (IndexShardRoutingTable shardRouting : clusterState.getRoutingTable()
+                    .indicesRouting()
+                    .get(index)
+                    .getShards()
+                    .values()) {
                     shardIds.add(shardRouting.shardId());
                 }
             }

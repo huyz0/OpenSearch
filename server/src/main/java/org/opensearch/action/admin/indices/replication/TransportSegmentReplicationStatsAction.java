@@ -167,10 +167,7 @@ public class TransportSegmentReplicationStatsAction extends TransportBroadcastBy
 
     @Override
     protected ShardsIterator shards(ClusterState state, SegmentReplicationStatsRequest request, String[] concreteIndices) {
-        // state.allShardsIncludingRelocationTargets(...) resolves through the resolver attached to
-        // this state's own routing table (replacing an earlier static-registry lookup) -- same
-        // composition.
-        return state.allShardsIncludingRelocationTargets(concreteIndices);
+        return state.routingTable().allShardsIncludingRelocationTargets(concreteIndices);
     }
 
     @Override

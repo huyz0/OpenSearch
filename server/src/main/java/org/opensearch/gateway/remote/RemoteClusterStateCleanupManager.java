@@ -43,7 +43,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.opensearch.gateway.remote.RemoteClusterStateUtils.GLOBAL_METADATA_PATH_TOKEN;
 import static org.opensearch.gateway.remote.model.RemoteClusterMetadataManifest.MANIFEST;
@@ -229,35 +228,6 @@ public class RemoteClusterStateCleanupManager implements Closeable {
         List<BlobMetadata> staleManifestBlobMetadata
     ) throws IOException {
         try {
-            // Refuse to decide what is garbage from a manifest this node cannot fully read.
-            //
-            // The whole method works by subtraction: everything a retained manifest references goes
-            // into filesToKeep, and anything a stale manifest references that is not in that set is
-            // deleted. That is only sound while "references" can be enumerated. A manifest written by
-            // a newer codec parses here -- the parser dispatch falls back to the newest version this
-            // node knows -- but its unknown fields come back empty, so its references silently read
-            // as none, and the subtraction deletes blobs that are very much still in use.
-            //
-            // Manifest sharding is exactly that kind of change: it moves the index list out
-            // of getIndices() and behind shard blobs, so a node running today's code against a
-            // sharded manifest would compute an empty keep-set for every index in the cluster. This
-            // guard lands first, deliberately, so that a mixed-version cluster during that rollout
-            // stops sweeping rather than corrupting the repository. It costs nothing until such a
-            // manifest exists.
-            //
-            // Recorded as the loops run rather than in a scan beforehand: a separate pass would fetch
-            // every manifest a second time, and nothing is deleted until both loops have finished
-            // anyway, so noticing partway through is early enough.
-            //
-            // This method runs once per cleanup batch, so the guard is per batch rather than per
-            // sweep -- an earlier batch could in principle delete before a later one meets the
-            // unreadable manifest. It does not, for a reason rather than by luck: the caller passes
-            // the same newest `manifestsToRetain` blobs to every batch, and during a rolling upgrade
-            // the newer node's manifests are the newest ones, so a future-codec manifest is in the
-            // retained set the first batch sees. A future-codec manifest that is *stale* rather than
-            // retained can be missed by an earlier batch, but that direction only under-deletes.
-            AtomicInteger unreadableCodec = new AtomicInteger(ClusterMetadataManifest.CODEC_V0);
-
             Set<String> filesToKeep = new HashSet<>();
             Set<String> staleManifestPaths = new HashSet<>();
             Set<String> staleIndexMetadataPaths = new HashSet<>();
@@ -265,11 +235,6 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             Set<String> staleEphemeralAttributePaths = new HashSet<>();
             Set<String> staleIndexRoutingPaths = new HashSet<>();
             Set<String> staleIndexRoutingDiffPaths = new HashSet<>();
-            // The manifest shard blobs themselves (manifest/shards/...), as distinct from
-            // the index metadata blobs they name -- a shard blob that no retained manifest references
-            // any more is exactly as stale as a global-metadata or index-routing blob nothing keeps, and
-            // needs the same keep/delete treatment or it simply accumulates forever.
-            Set<String> staleManifestShardPaths = new HashSet<>();
 
             // todo: Avoid repetitive fetch of manifestsToRetain across batches if they were fetched earlier and are the same
             // (for example the first 10 if not new manifests are uploaded in between)
@@ -279,15 +244,7 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     clusterUUID,
                     blobMetadata.name()
                 );
-                unreadableCodec.accumulateAndGet(clusterMetadataManifest.getCodecVersion(), Math::max);
-                // The transitive half of the sharded-manifest cleanup: resolveIndices, not getIndices()
-                // directly. A sharded manifest's index list lives behind UploadedManifestShard
-                // references -- calling getIndices() here would compute an empty keep-set for every
-                // index the manifest actually references, and the very next thing this method does is
-                // delete everything not in that set. The unreadable-codec guard above already stops a node that
-                // cannot parse a future codec at all; this is the half that makes a node that *can*
-                // parse CODEC_V6 compute a correct keep-set rather than an empty one.
-                remoteManifestManager.resolveIndices(clusterMetadataManifest)
+                clusterMetadataManifest.getIndices()
                     .forEach(
                         uploadedIndexMetadata -> filesToKeep.add(
                             RemoteClusterStateUtils.getFormattedIndexFileName(uploadedIndexMetadata.getUploadedFilename())
@@ -328,8 +285,6 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     && clusterMetadataManifest.getDiffManifest().getIndicesRoutingDiffPath() != null) {
                     filesToKeep.add(clusterMetadataManifest.getDiffManifest().getIndicesRoutingDiffPath());
                 }
-                clusterMetadataManifest.getIndexMetadataShards()
-                    .forEach(uploadedManifestShard -> filesToKeep.add(uploadedManifestShard.getBlobName()));
             });
             staleManifestBlobMetadata.forEach(blobMetadata -> {
                 ClusterMetadataManifest clusterMetadataManifest = remoteManifestManager.fetchRemoteClusterMetadataManifest(
@@ -337,7 +292,6 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     clusterUUID,
                     blobMetadata.name()
                 );
-                unreadableCodec.accumulateAndGet(clusterMetadataManifest.getCodecVersion(), Math::max);
                 staleManifestPaths.add(
                     remoteManifestManager.getManifestFolderPath(clusterName, clusterUUID).buildAsString() + blobMetadata.name()
                 );
@@ -386,26 +340,10 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     }
                 }
 
-                // resolveIndices, same reasoning as the active-manifest loop above: a stale manifest's
-                // own index list may live behind shard references too, and those references have to be
-                // followed to find out which index blobs it actually named before deciding any of them
-                // are stale.
-                //
-                // Tolerant here and strict there, and the asymmetry is the point: this list produces
-                // deletion candidates, so a shard blob that cannot be read costs an under-delete (index
-                // blobs left in place), while the active loop's list produces the keep-set, where the
-                // same tolerance would delete still-referenced blobs. It also stops one unreadable shard
-                // blob from wedging every future sweep before it reaches the manifest delete below --
-                // see resolveIndicesToleratingMissingShards' own javadoc.
-                remoteManifestManager.resolveIndicesToleratingMissingShards(clusterMetadataManifest).forEach(uploadedIndexMetadata -> {
+                clusterMetadataManifest.getIndices().forEach(uploadedIndexMetadata -> {
                     String fileName = RemoteClusterStateUtils.getFormattedIndexFileName(uploadedIndexMetadata.getUploadedFilename());
                     if (filesToKeep.contains(fileName) == false) {
                         staleIndexMetadataPaths.add(fileName);
-                    }
-                });
-                clusterMetadataManifest.getIndexMetadataShards().forEach(uploadedManifestShard -> {
-                    if (filesToKeep.contains(uploadedManifestShard.getBlobName()) == false) {
-                        staleManifestShardPaths.add(uploadedManifestShard.getBlobName());
                     }
                 });
 
@@ -435,18 +373,6 @@ public class RemoteClusterStateCleanupManager implements Closeable {
 
             });
 
-            if (unreadableCodec.get() > ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION) {
-                logger.warn(
-                    "Skipping stale cluster metadata cleanup: a manifest was written with codec version [{}], newer than "
-                        + "this node understands [{}]. Its references cannot be enumerated, and the sets computed above are "
-                        + "therefore incomplete -- deleting on that basis would remove blobs still in use. Cleanup resumes "
-                        + "once every cluster-manager-eligible node is upgraded.",
-                    unreadableCodec.get(),
-                    ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION
-                );
-                return;
-            }
-
             if (staleManifestPaths.isEmpty()) {
                 logger.debug("No stale Remote Cluster Metadata files found");
                 return;
@@ -455,15 +381,13 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             logger.info(
                 "Processed [{}] manifests, Deleting [{}] stale Global Metadata files, "
                     + "[{}] stale Index Metadata files, [{}] stale Ephemeral Metadata files, "
-                    + "[{}] stale Index Routing files, [{}] stale Index routing diff files and "
-                    + "[{}] stale manifest shard files",
+                    + "[{}] stale Index Routing files and [{}] stale Index routing diff files",
                 staleManifestPaths.size(),
                 staleGlobalMetadataPaths.size(),
                 staleIndexMetadataPaths.size(),
                 staleEphemeralAttributePaths.size(),
                 staleIndexRoutingPaths.size(),
-                staleIndexRoutingDiffPaths.size(),
-                staleManifestShardPaths.size()
+                staleIndexRoutingDiffPaths.size()
             );
 
             deleteStalePaths(new ArrayList<>(staleGlobalMetadataPaths));
@@ -497,29 +421,6 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             // Delete Manifests in the very end to avoid dangling routing files in-case deletion of stale index routing
             // files after deleting manifests
             deleteStalePaths(new ArrayList<>(staleManifestPaths));
-
-            if (staleManifestShardPaths.isEmpty() == false) {
-                // AFTER the manifests, and that ordering is load-bearing rather than cosmetic -- it is the
-                // same rule the comment above states, applied to the one reference class that used to
-                // violate it. A manifest shard blob is reachable only through the manifest that names it,
-                // and reading it is how a later sweep enumerates that manifest's index blobs. Deleting the
-                // shard blobs first meant that if the manifest delete then failed transiently, every
-                // subsequent sweep had to resolve a still-stale sharded manifest whose shard blobs were
-                // already gone, threw on the missing blob, and never reached the manifest delete that
-                // would have ended it: cleanup wedged permanently and remote state grew without bound.
-                //
-                // Deleting after leaves the opposite residue if *this* delete is the one that fails: shard
-                // blobs whose manifest is already gone. Nothing reads them and nothing enumerates them
-                // again, so they leak -- but a bounded leak of at most one manifest's worth of shard blobs
-                // per failed sweep is categorically better than a sweep that can never make progress again,
-                // and the index metadata those shards referenced was already deleted above.
-                //
-                // Guarded, unlike the calls above: sharding is off by default (see
-                // RemoteManifestManager#CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING), so
-                // this set is empty on every cleanup sweep for a cluster that has never turned it on --
-                // no reason to make a blob-store round trip to delete nothing on every single sweep.
-                deleteStalePaths(new ArrayList<>(staleManifestShardPaths));
-            }
 
         } catch (IllegalStateException e) {
             logger.error("Error while fetching Remote Cluster Metadata manifests", e);

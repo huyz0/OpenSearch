@@ -109,7 +109,7 @@ import static org.opensearch.common.settings.Settings.writeSettingsToStream;
  * @opensearch.api
  */
 @PublicApi(since = "1.0.0")
-public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragment, VerifiableWriteable, IndexMetadataHolder {
+public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragment, VerifiableWriteable {
 
     public static final ClusterBlock INDEX_READ_ONLY_BLOCK = new ClusterBlock(
         5,
@@ -2042,21 +2042,10 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
         return isRemoteSnapshot;
     }
 
-    /**
-     * This metadata is already materialized, so it is its own holder. See {@link IndexMetadataHolder}
-     * for why {@link Metadata} stores indices behind that interface.
-     */
-    @Override
-    public IndexMetadata get() {
-        return this;
-    }
-
-    @Override
     public boolean isHidden() {
         return INDEX_HIDDEN_SETTING.get(settings);
     }
 
-    @Override
     public boolean isWarmIndex() {
         return settings.getAsBoolean(IndexModule.IS_WARM_INDEX_SETTING.getKey(), false);
     }

@@ -54,7 +54,6 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.AllocationId;
-import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Nullable;
@@ -569,13 +568,7 @@ public abstract class TransportReplicationAction<
         void runWithPrimaryShardReference(final PrimaryShardReference primaryShardReference) {
             try {
                 final ClusterState clusterState = clusterService.state();
-                // The twelfth site, found by T39 rather than by S52 or S53, because it is past the point
-                // every earlier attempt stopped at: it runs on the data node once the primary permit is
-                // held, which no gated write had ever reached.
-                final IndexMetadata indexMetadata = clusterState.metadata().indexOrResolved(primaryShardReference.routingEntry().index());
-                if (indexMetadata == null) {
-                    throw new IndexNotFoundException(primaryShardReference.routingEntry().index());
-                }
+                final IndexMetadata indexMetadata = clusterState.metadata().getIndexSafe(primaryShardReference.routingEntry().index());
 
                 final ClusterBlockException blockException = blockExceptions(clusterState, indexMetadata.getIndex().getName());
                 if (blockException != null) {
@@ -1003,10 +996,7 @@ public abstract class TransportReplicationAction<
                     finishAsFailed(blockException);
                 }
             } else {
-                // Site 10. The shard has been chosen by now, so this is the coordinator asking for the
-                // index's bones one last time before it hands the request to a node. Absent from cluster
-                // state is not absent from the cluster.
-                final IndexMetadata indexMetadata = state.metadata().indexOrResolved(request.shardId().getIndex());
+                final IndexMetadata indexMetadata = state.metadata().index(request.shardId().getIndex());
                 if (indexMetadata == null) {
                     // ensure that the cluster state on the node is at least as high as the node that decided that the index was there
                     if (state.version() < request.routedBasedOnClusterVersion()) {
@@ -1048,19 +1038,7 @@ public abstract class TransportReplicationAction<
                 assert request.waitForActiveShards() != ActiveShardCount.DEFAULT
                     : "request waitForActiveShards must be set in resolveRequest";
 
-                // Resolved, so that an index whose routing is computed rather than published finds its
-                // primary. Reading the table directly returns null here, the retry branch below fires on
-                // every attempt, and the write fails with "primary shard is not active" after the full
-                // request timeout. That is the original absent-means-no-shards pessimistic answer being
-                // given to a question that now has a better one.
-                //
-                // The OrNull behaviour is preserved for the case with no supplier: an index present in
-                // metadata and absent from routing still reaches the retry branch rather than throwing,
-                // which is what the original design wanted and what that branch already handled.
-                // state.resolveShard(...) resolves through the resolver attached to this state's own
-                // routing table (replacing an earlier static-registry lookup) -- same composition.
-                final IndexShardRoutingTable shardRoutingTable = state.resolveShard(request.shardId());
-                final ShardRouting primary = shardRoutingTable == null ? null : shardRoutingTable.primaryShard();
+                final ShardRouting primary = state.getRoutingTable().shardRoutingTable(request.shardId()).primaryShard();
                 if (primary == null || primary.active() == false) {
                     logger.trace(
                         "primary shard [{}] is not yet active, scheduling a retry: action [{}], request [{}], "

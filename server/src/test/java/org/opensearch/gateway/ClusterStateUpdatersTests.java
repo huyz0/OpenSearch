@@ -224,51 +224,6 @@ public class ClusterStateUpdatersTests extends OpenSearchTestCase {
         assertTrue(newState.blocks().hasGlobalBlock(STATE_NOT_RECOVERED_BLOCK));
     }
 
-    /**
-     * C20. State recovery rebuilds the routing table from metadata, so it is the second place that
-     * decides what gets published, and it has to respect the same opt-out index creation does.
-     *
-     * <p>Publishing here does not throw and does not look like a failure, which is what makes it worth a
-     * test: a supplier is only ever consulted when nothing is published, so one recovery would silently
-     * turn every computed index into an ordinary one whose shards are all UNASSIGNED, while the node
-     * kept contributing its own computed copy of the same shard.
-     */
-    public void testUpdateRoutingTableSkipsIndicesWhosePlacementIsComputed() {
-        final IndexMetadata computed = createIndexMetadata(
-            "computed-idx",
-            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2).build()
-        );
-        final IndexMetadata published = createIndexMetadata(
-            "classic-idx",
-            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2).build()
-        );
-        // The node-scoped catalog a real node gets from ClusterPlugin#getIndexCatalog(): resolution goes
-        // through IndexCatalogRegistry now, so a hand-built state needs only the registration a real node
-        // performs at startup. Cleared at the end of this test.
-        org.opensearch.cluster.metadata.IndexCatalogRegistry.register(new org.opensearch.cluster.metadata.SupplierBackedIndexCatalog());
-        final RoutingTable initialRoutingTable = RoutingTable.builder().build();
-        final ClusterState initialState = ClusterState.builder(ClusterState.EMPTY_STATE)
-            .metadata(Metadata.builder().put(computed, false).put(published, false).build())
-            .routingTable(initialRoutingTable)
-            .build();
-
-        org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.registerUnpublished(
-            metadata -> metadata.getIndex().getName().startsWith("computed-")
-        );
-        try {
-            final ClusterState newState = updateRoutingTable(initialState);
-
-            assertFalse(
-                "a computed index must come back from recovery with no routing entry, or the supplier is " + "never consulted again",
-                newState.routingTable().hasIndex(computed.getIndex())
-            );
-            assertTrue("an ordinary index must still have its routing rebuilt", newState.routingTable().hasIndex(published.getIndex()));
-        } finally {
-            org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.registerUnpublished(null);
-            org.opensearch.cluster.metadata.IndexCatalogRegistry.register(null);
-        }
-    }
-
     public void testUpdateRoutingTable() {
         final int numOfShards = randomIntBetween(1, 10);
 

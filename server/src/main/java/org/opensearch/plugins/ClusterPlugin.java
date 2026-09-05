@@ -32,9 +32,6 @@
 
 package org.opensearch.plugins;
 
-import org.opensearch.cluster.metadata.ClaimedIndexLifecycle;
-import org.opensearch.cluster.metadata.IndexCatalog;
-import org.opensearch.cluster.metadata.IndexCreationStrategy;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
@@ -46,7 +43,6 @@ import org.opensearch.common.settings.Settings;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
@@ -96,67 +92,6 @@ public interface ClusterPlugin {
      */
     default Collection<IndexNameExpressionResolver.ExpressionResolver> getIndexNameCustomResolvers() {
         return Collections.emptyList();
-    }
-
-    /**
-     * A fallback for the compound question core asks about an index with no published entry -- does it
-     * exist ({@link org.opensearch.cluster.metadata.IndexMetadata}), and where do its shards live ({@link
-     * org.opensearch.cluster.routing.IndexRoutingTable}) -- plus whether that index needs published routing
-     * at all and whether the feature is currently switched on. See {@link IndexCatalog}'s own javadoc for
-     * why this is a single seam, and why it is one hook rather than the two ({@code
-     * getIndexMetadataResolver}/{@code getIndexRoutingResolver}) it replaced.
-     *
-     * <p>Empty by default, so a node without this plugin resolves exactly as it always has. At most one
-     * plugin per node may supply one; {@code Node} enforces that and registers it with {@link
-     * org.opensearch.cluster.metadata.IndexCatalogRegistry}.
-     *
-     * @opensearch.experimental
-     */
-    default Optional<IndexCatalog> getIndexCatalog() {
-        return Optional.empty();
-    }
-
-    /**
-     * A plugin-owned decision of which index
-     * names/requests belong to a plugin-managed plane -- see {@link
-     * org.opensearch.cluster.metadata.IndexCreationStrategy}'s own javadoc. Empty by default, so a node
-     * without this plugin creates and deletes indices exactly as it always has.
-     *
-     * @opensearch.experimental
-     */
-    default Optional<IndexCreationStrategy> getIndexCreationStrategy() {
-        return Optional.empty();
-    }
-
-    /**
-     * The plugin-owned removal of an index's out-of-cluster-state record, performed as one operation when
-     * core deletes an index -- see {@link ClaimedIndexLifecycle}'s own javadoc for the shape and for the
-     * acknowledgement contract it carries. Replaces the pair of static seams deletion used to reach ({@code
-     * DurableTombstones} and {@code MappingGenerationStore.deleteMapping}), which between them had core
-     * running a storage-plane deletion protocol of its own.
-     *
-     * <p>Empty by default, so a node without this plugin deletes indices exactly as it always has. At most
-     * one plugin per node may supply one; {@code ClusterModule} enforces that and injects it into {@code
-     * MetadataDeleteIndexService}.
-     *
-     * @opensearch.experimental
-     */
-    default Optional<ClaimedIndexLifecycle> getClaimedIndexLifecycle() {
-        return Optional.empty();
-    }
-
-    /**
-     * A plugin-owned policy tuning {@link
-     * org.opensearch.indices.cluster.IndicesClusterStateService}'s on-demand-opened-index residency
-     * bookkeeping (sweep interval, idle-eviction threshold, max-open ceiling) -- see {@link
-     * org.opensearch.indices.cluster.IndexResidencyPolicy}'s own javadoc for exactly what this does and
-     * does not move out of core. Empty by default, so a node without this plugin uses the same numeric
-     * defaults it always has.
-     *
-     * @opensearch.experimental
-     */
-    default Optional<org.opensearch.indices.cluster.IndexResidencyPolicy> getIndexResidencyPolicy() {
-        return Optional.empty();
     }
 
     /**

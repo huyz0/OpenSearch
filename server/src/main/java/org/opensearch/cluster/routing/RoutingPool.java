@@ -9,10 +9,11 @@
 package org.opensearch.cluster.routing;
 
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.IndexMetadataHolder;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.allocation.RoutingAllocation;
 import org.opensearch.common.util.FeatureFlags;
+
+import static org.opensearch.action.admin.indices.tiering.TieringUtils.isWarmIndex;
 
 /**
  *  {@link RoutingPool} defines the different node types based on the assigned capabilities. The methods
@@ -55,16 +56,13 @@ public enum RoutingPool {
     }
 
     /**
-     * Can determine the appropriate {@link RoutingPool} for a given index.
-     * <p>Takes an {@link IndexMetadataHolder} rather than an {@link IndexMetadata} -- which is itself
-     * one -- so that {@link org.opensearch.cluster.metadata.Metadata} can classify every index it holds
-     * while totalling shard counts, without materializing the deferred ones.
+     * Can determine the appropriate {@link RoutingPool} for a given index using the {@link IndexMetadata}.
      * @param indexMetadata the index metadata object for which {@link RoutingPool} has to be determined.
      * @return {@link RoutingPool} for the given index.
      */
-    public static RoutingPool getIndexPool(IndexMetadataHolder indexMetadata) {
+    public static RoutingPool getIndexPool(IndexMetadata indexMetadata) {
         return indexMetadata.isRemoteSnapshot()
-            || (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG) && indexMetadata.isWarmIndex())
+            || (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG) && isWarmIndex(indexMetadata))
                 ? REMOTE_CAPABLE
                 : LOCAL_ONLY;
 

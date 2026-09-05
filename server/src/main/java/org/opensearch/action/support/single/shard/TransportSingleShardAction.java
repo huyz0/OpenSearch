@@ -48,7 +48,6 @@ import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.FailAwareWeightedRouting;
-import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
@@ -217,14 +216,7 @@ public abstract class TransportSingleShardAction<Request extends SingleShardRequ
                 throw blockException;
             }
 
-            ShardsIterator shardIt = shards(clusterState, internalRequest);
-            if (shardIt == null && resolveIndex(request)) {
-                IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(concreteSingleIndex);
-                if (indexRoutingTable != null) {
-                    shardIt = indexRoutingTable.randomAllActiveShardsIt();
-                }
-            }
-            this.shardIt = shardIt;
+            this.shardIt = shards(clusterState, internalRequest);
         }
 
         public void start() {

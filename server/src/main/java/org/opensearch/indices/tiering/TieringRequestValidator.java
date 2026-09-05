@@ -62,25 +62,6 @@ public class TieringRequestValidator {
         final TieringValidationResult tieringValidationResult = new TieringValidationResult(concreteIndices);
 
         for (Index index : concreteIndices) {
-            // First, because this is the only condition here that can never be satisfied. The others
-            // describe a state an operator can change: move the index to the hot tier, enable remote
-            // store, open it, wait for it to go green. Computed placement is a property of how the index
-            // was created, so reporting any of the others first would send someone to fix something that
-            // would not help. Tiering relocates shards through the allocator, and computed placement
-            // bypasses the allocator entirely.
-            //
-            // Without this the index was still refused, by validateIndexHealth returning false for an
-            // absent routing entry, and reported as "index is red" while being perfectly available.
-            // currentState.routingTable().shouldPublishRouting(...)
-            // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate,
-            // discovered through the resolver attached to this state's own routing table.
-            if (currentState.routingTable().shouldPublishRouting(currentState.metadata().index(index)) == false) {
-                tieringValidationResult.addToRejected(
-                    index,
-                    "index shard placement is computed rather than published, and tiering relocates shards through the allocator"
-                );
-                continue;
-            }
             if (!validateHotIndex(currentState, index)) {
                 tieringValidationResult.addToRejected(index, "index is not in the HOT tier");
                 continue;

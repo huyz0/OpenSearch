@@ -405,8 +405,6 @@ public abstract class TransportBroadcastByNodeAction<
                 }
             }
 
-            BroadcastEmptiness.assertEveryOpenIndexContributedShards(actionName, clusterState, concreteIndices, indicesWithShards);
-
             responses = new AtomicReferenceArray<>(nodeIds.size());
         }
 

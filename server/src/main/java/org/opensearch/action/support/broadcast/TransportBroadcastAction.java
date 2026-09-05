@@ -39,7 +39,6 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.TransportActions;
 import org.opensearch.action.support.TransportIndicesResolvingAction;
-import org.opensearch.action.support.broadcast.node.BroadcastEmptiness;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -64,8 +63,6 @@ import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
-import java.util.HashSet;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
@@ -152,7 +149,6 @@ public abstract class TransportBroadcastAction<
         private final Request request;
         private final ActionListener<Response> listener;
         private final ClusterState clusterState;
-        private final String[] concreteIndices;
         private final DiscoveryNodes nodes;
         private final GroupShardsIterator<ShardIterator> shardsIts;
         private final int expectedOps;
@@ -171,7 +167,7 @@ public abstract class TransportBroadcastAction<
                 throw blockException;
             }
             // update to concrete indices
-            this.concreteIndices = resolveIndices(request, clusterState).namesOfConcreteIndicesAsArray();
+            String[] concreteIndices = resolveIndices(request, clusterState).namesOfConcreteIndicesAsArray();
             blockException = checkRequestBlock(clusterState, request, concreteIndices);
             if (blockException != null) {
                 throw blockException;
@@ -187,7 +183,6 @@ public abstract class TransportBroadcastAction<
 
         public void start() {
             if (shardsIts.size() == 0) {
-                BroadcastEmptiness.assertEveryOpenIndexContributedShards(actionName, clusterState, concreteIndices, Set.of());
                 // no shards
                 try {
                     listener.onResponse(newResponse(request, new AtomicReferenceArray(0), clusterState));
@@ -311,11 +306,6 @@ public abstract class TransportBroadcastAction<
 
         protected void finishHim() {
             try {
-                Set<String> indicesWithShards = new HashSet<>();
-                for (ShardIterator shardIt : shardsIts) {
-                    indicesWithShards.add(shardIt.shardId().getIndexName());
-                }
-                BroadcastEmptiness.assertEveryOpenIndexContributedShards(actionName, clusterState, concreteIndices, indicesWithShards);
                 listener.onResponse(newResponse(request, shardsResponses, clusterState));
             } catch (Exception e) {
                 listener.onFailure(e);

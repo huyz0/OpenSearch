@@ -11,7 +11,6 @@ package org.opensearch.action.admin.indices.scale.searchonly;
 import org.opensearch.Version;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.test.OpenSearchTestCase;
@@ -39,7 +38,7 @@ public class ScaleIndexOperationValidatorTests extends OpenSearchTestCase {
 
     public void testValidateScalePrerequisites_NullIndexMetadata() {
         // When index metadata is null, validation should fail.
-        boolean result = validator.validateScalePrerequisites(null, RoutingTable.EMPTY_ROUTING_TABLE, "test-index", listener, true);
+        boolean result = validator.validateScalePrerequisites(null, "test-index", listener, true);
         assertFalse(result);
         verify(listener).onFailure(argThat(new ExceptionMatcher("Index [test-index] not found")));
     }
@@ -48,13 +47,7 @@ public class ScaleIndexOperationValidatorTests extends OpenSearchTestCase {
         // For scale-down, if the index is already marked as search-only, validation should fail.
         Settings settings = Settings.builder().put(IndexMetadata.INDEX_BLOCKS_SEARCH_ONLY_SETTING.getKey(), true).build();
         IndexMetadata indexMetadata = createTestIndexMetadata("test-index", settings, 1);
-        boolean result = validator.validateScalePrerequisites(
-            indexMetadata,
-            RoutingTable.EMPTY_ROUTING_TABLE,
-            "test-index",
-            listener,
-            true
-        );
+        boolean result = validator.validateScalePrerequisites(indexMetadata, "test-index", listener, true);
         assertFalse(result);
         verify(listener).onFailure(argThat(new ExceptionMatcher("already in search-only mode")));
     }
@@ -68,13 +61,7 @@ public class ScaleIndexOperationValidatorTests extends OpenSearchTestCase {
             .build();
         // Pass zero for the number of search-only replicas.
         IndexMetadata indexMetadata = createTestIndexMetadata("test-index", settings, 0);
-        boolean result = validator.validateScalePrerequisites(
-            indexMetadata,
-            RoutingTable.EMPTY_ROUTING_TABLE,
-            "test-index",
-            listener,
-            true
-        );
+        boolean result = validator.validateScalePrerequisites(indexMetadata, "test-index", listener, true);
         assertTrue(result);
     }
 
@@ -86,13 +73,7 @@ public class ScaleIndexOperationValidatorTests extends OpenSearchTestCase {
             .put(IndexMetadata.SETTING_REPLICATION_TYPE, "SEGMENT")
             .build();
         IndexMetadata indexMetadata = createTestIndexMetadata("test-index", settings, 1);
-        boolean result = validator.validateScalePrerequisites(
-            indexMetadata,
-            RoutingTable.EMPTY_ROUTING_TABLE,
-            "test-index",
-            listener,
-            true
-        );
+        boolean result = validator.validateScalePrerequisites(indexMetadata, "test-index", listener, true);
         assertFalse(result);
         verify(listener).onFailure(argThat(new ExceptionMatcher(IndexMetadata.SETTING_REMOTE_STORE_ENABLED)));
     }
@@ -105,13 +86,7 @@ public class ScaleIndexOperationValidatorTests extends OpenSearchTestCase {
             .put(IndexMetadata.SETTING_REPLICATION_TYPE, "OTHER")
             .build();
         IndexMetadata indexMetadata = createTestIndexMetadata("test-index", settings, 1);
-        boolean result = validator.validateScalePrerequisites(
-            indexMetadata,
-            RoutingTable.EMPTY_ROUTING_TABLE,
-            "test-index",
-            listener,
-            true
-        );
+        boolean result = validator.validateScalePrerequisites(indexMetadata, "test-index", listener, true);
         assertFalse(result);
         verify(listener).onFailure(argThat(new ExceptionMatcher("segment replication must be enabled")));
     }
@@ -124,13 +99,7 @@ public class ScaleIndexOperationValidatorTests extends OpenSearchTestCase {
             .put(IndexMetadata.SETTING_REPLICATION_TYPE, "SEGMENT")
             .build();
         IndexMetadata indexMetadata = createTestIndexMetadata("test-index", settings, 1);
-        boolean result = validator.validateScalePrerequisites(
-            indexMetadata,
-            RoutingTable.EMPTY_ROUTING_TABLE,
-            "test-index",
-            listener,
-            true
-        );
+        boolean result = validator.validateScalePrerequisites(indexMetadata, "test-index", listener, true);
         assertTrue(result);
         verify(listener, never()).onFailure(any());
     }
@@ -139,13 +108,7 @@ public class ScaleIndexOperationValidatorTests extends OpenSearchTestCase {
         // For scale-up, the index must be in search-only mode.
         Settings settings = Settings.builder().put(IndexMetadata.INDEX_BLOCKS_SEARCH_ONLY_SETTING.getKey(), false).build();
         IndexMetadata indexMetadata = createTestIndexMetadata("test-index", settings, 1);
-        boolean result = validator.validateScalePrerequisites(
-            indexMetadata,
-            RoutingTable.EMPTY_ROUTING_TABLE,
-            "test-index",
-            listener,
-            false
-        );
+        boolean result = validator.validateScalePrerequisites(indexMetadata, "test-index", listener, false);
         assertFalse(result);
         verify(listener).onFailure(argThat(new ExceptionMatcher("not in search-only mode")));
     }
@@ -154,13 +117,7 @@ public class ScaleIndexOperationValidatorTests extends OpenSearchTestCase {
         // Valid scale-up: the index is in search-only mode.
         Settings settings = Settings.builder().put(IndexMetadata.INDEX_BLOCKS_SEARCH_ONLY_SETTING.getKey(), true).build();
         IndexMetadata indexMetadata = createTestIndexMetadata("test-index", settings, 1);
-        boolean result = validator.validateScalePrerequisites(
-            indexMetadata,
-            RoutingTable.EMPTY_ROUTING_TABLE,
-            "test-index",
-            listener,
-            false
-        );
+        boolean result = validator.validateScalePrerequisites(indexMetadata, "test-index", listener, false);
         assertTrue(result);
         verify(listener, never()).onFailure(any());
     }

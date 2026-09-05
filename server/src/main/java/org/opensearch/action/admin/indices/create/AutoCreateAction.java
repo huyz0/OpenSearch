@@ -44,7 +44,6 @@ import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.ComposableIndexTemplate;
 import org.opensearch.cluster.metadata.ComposableIndexTemplate.DataStreamTemplate;
-import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
@@ -129,51 +128,22 @@ public final class AutoCreateAction extends ActionType<CreateIndexResponse> {
             ClusterState state,
             ActionListener<CreateIndexResponse> finalListener
         ) {
-            String indexName = indexNameExpressionResolver.resolveDateMathExpression(request.index());
-            CreateIndexClusterStateUpdateRequest updateRequest = new CreateIndexClusterStateUpdateRequest(
-                request.cause(),
-                indexName,
-                request.index()
-            ).ackTimeout(request.timeout())
-                .clusterManagerNodeTimeout(request.clusterManagerNodeTimeout())
-                .settings(request.settings())
-                .aliases(request.aliases())
-                .waitForActiveShards(request.waitForActiveShards())
-                .mappings(request.mappings());
-
-            // Auto-creation is the door index-per-tenant actually arrives through, and the name is enough to
-            // know which plane it belongs in -- no template to resolve, and no chance of disagreeing with the
-            // gate, which reads the same name.
-            //
-            // IndexCreationStrategyRegistry.claims(...) replaces an earlier static-registry check paired
-            // with a plugin-specific name test -- see MetadataCreateIndexService#createIndex's own
-            // comment for the same migration.
-            if (IndexCreationStrategyRegistry.claims(indexName, updateRequest)) {
-                createIndexService.createIndex(
-                    updateRequest,
-                    ActionListener.map(
-                        finalListener,
-                        resp -> new CreateIndexResponse(resp.isAcknowledged(), resp.isShardsAcknowledged(), indexName)
-                    )
-                );
-                return;
-            }
             AtomicReference<String> indexNameRef = new AtomicReference<>();
             ActionListener<ClusterStateUpdateResponse> listener = ActionListener.wrap(response -> {
-                String createdIndexName = indexNameRef.get();
-                assert createdIndexName != null;
+                String indexName = indexNameRef.get();
+                assert indexName != null;
                 if (response.isAcknowledged()) {
                     activeShardsObserver.waitForActiveShards(
-                        new String[] { createdIndexName },
+                        new String[] { indexName },
                         ActiveShardCount.DEFAULT,
                         request.timeout(),
                         shardsAcked -> {
-                            finalListener.onResponse(new CreateIndexResponse(true, shardsAcked, createdIndexName));
+                            finalListener.onResponse(new CreateIndexResponse(true, shardsAcked, indexName));
                         },
                         finalListener::onFailure
                     );
                 } else {
-                    finalListener.onResponse(new CreateIndexResponse(false, false, createdIndexName));
+                    finalListener.onResponse(new CreateIndexResponse(false, false, indexName));
                 }
             }, finalListener::onFailure);
             clusterService.submitStateUpdateTask(

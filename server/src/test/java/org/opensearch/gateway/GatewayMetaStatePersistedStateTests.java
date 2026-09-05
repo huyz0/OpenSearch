@@ -68,7 +68,6 @@ import org.opensearch.gateway.GatewayMetaState.RemotePersistedState;
 import org.opensearch.gateway.PersistedClusterStateService.Writer;
 import org.opensearch.gateway.remote.ClusterMetadataManifest;
 import org.opensearch.gateway.remote.RemoteClusterStateService;
-import org.opensearch.gateway.remote.RemoteManifestManager;
 import org.opensearch.gateway.remote.RemoteUploadStats;
 import org.opensearch.gateway.remote.model.RemoteClusterStateManifestInfo;
 import org.opensearch.index.recovery.RemoteStoreRestoreService;
@@ -757,34 +756,8 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
         }
     }
 
-    /**
-     * A mocked {@link RemoteClusterStateService} that can answer {@link
-     * RemoteClusterStateService#getRemoteManifestManager()}, which {@link
-     * GatewayMetaState.RemotePersistedState}'s manifest/state consistency assertion goes through.
-     *
-     * <p>That assertion used to read {@code manifest.getIndices()} directly and needed nothing from the
-     * service. It now asks the manifest manager to resolve them, because a sharded manifest keeps its index
-     * list behind shard references and {@code getIndices()} is empty for one -- comparing against that would
-     * have failed the assertion on every sharded write instead of verifying anything. A bare mock answers
-     * null for the manager, so the assertion died with a {@link NullPointerException} before it could check
-     * anything at all; on a real node the service is started and the manager is there.
-     *
-     * <p>The stub delegates to {@code manifest.getIndices()}, which is what {@code resolveIndices} itself
-     * returns for an unsharded manifest -- so these tests assert exactly what they asserted before, rather
-     * than being weakened to get past the mock.
-     */
-    private static RemoteClusterStateService mockRemoteClusterStateService() {
-        RemoteClusterStateService remoteClusterStateService = mock(RemoteClusterStateService.class);
-        RemoteManifestManager manifestManager = mock(RemoteManifestManager.class);
-        when(manifestManager.resolveIndices(any(ClusterMetadataManifest.class))).thenAnswer(
-            invocation -> invocation.<ClusterMetadataManifest>getArgument(0).getIndices()
-        );
-        when(remoteClusterStateService.getRemoteManifestManager()).thenReturn(manifestManager);
-        return remoteClusterStateService;
-    }
-
     public void testRemotePersistedState() throws IOException {
-        final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+        final RemoteClusterStateService remoteClusterStateService = Mockito.mock(RemoteClusterStateService.class);
         final ClusterMetadataManifest manifest = ClusterMetadataManifest.builder().clusterTerm(1L).stateVersion(5L).build();
         final String previousClusterUUID = "prev-cluster-uuid";
         Mockito.when(remoteClusterStateService.writeFullMetadata(Mockito.any(), Mockito.any()))
@@ -841,7 +814,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     }
 
     public void testRemotePersistedStateWithDifferentNodeConfiguration() throws IOException {
-        final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+        final RemoteClusterStateService remoteClusterStateService = Mockito.mock(RemoteClusterStateService.class);
         final String previousClusterUUID = "prev-cluster-uuid";
         final ClusterMetadataManifest manifest = ClusterMetadataManifest.builder()
             .clusterTerm(1L)
@@ -891,7 +864,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     }
 
     public void testRemotePersistentState_FollowerNode() throws IOException {
-        final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+        final RemoteClusterStateService remoteClusterStateService = Mockito.mock(RemoteClusterStateService.class);
         final ClusterMetadataManifest manifest = ClusterMetadataManifest.builder()
             .clusterTerm(1L)
             .stateVersion(5L)
@@ -956,7 +929,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     }
 
     public void testRemotePersistedStateNotCommitted() throws IOException {
-        final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+        final RemoteClusterStateService remoteClusterStateService = Mockito.mock(RemoteClusterStateService.class);
         final String previousClusterUUID = "prev-cluster-uuid";
         final ClusterMetadataManifest manifest = ClusterMetadataManifest.builder()
             .previousClusterUUID(previousClusterUUID)
@@ -996,7 +969,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     }
 
     public void testRemotePersistedStateExceptionOnFullStateUpload() throws IOException {
-        final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+        final RemoteClusterStateService remoteClusterStateService = Mockito.mock(RemoteClusterStateService.class);
         final String previousClusterUUID = "prev-cluster-uuid";
         Mockito.doThrow(IOException.class).when(remoteClusterStateService).writeFullMetadata(Mockito.any(), Mockito.any());
 
@@ -1014,7 +987,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
 
     public void testRemotePersistedStateFailureStats() throws IOException {
         RemoteUploadStats remoteStateStats = new RemoteUploadStats();
-        final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+        final RemoteClusterStateService remoteClusterStateService = Mockito.mock(RemoteClusterStateService.class);
         final String previousClusterUUID = "prev-cluster-uuid";
         Mockito.doThrow(IOException.class).when(remoteClusterStateService).writeFullMetadata(Mockito.any(), Mockito.any());
         when(remoteClusterStateService.getUploadStats()).thenReturn(remoteStateStats);
@@ -1039,7 +1012,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     public void testGatewayForRemoteState() throws IOException {
         MockGatewayMetaState gateway = null;
         try {
-            RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+            RemoteClusterStateService remoteClusterStateService = mock(RemoteClusterStateService.class);
             when(remoteClusterStateService.getLastKnownUUIDFromRemote("test-cluster")).thenReturn("test-cluster-uuid");
             RemoteStoreRestoreService remoteStoreRestoreService = mock(RemoteStoreRestoreService.class);
             when(remoteStoreRestoreService.restore(any(), any(), anyBoolean(), any())).thenReturn(
@@ -1085,7 +1058,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     public void testGatewayForRemoteStateForInitialBootstrap() throws IOException {
         MockGatewayMetaState gateway = null;
         try {
-            final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+            final RemoteClusterStateService remoteClusterStateService = mock(RemoteClusterStateService.class);
             when(remoteClusterStateService.getLastKnownUUIDFromRemote(clusterName.value())).thenReturn(ClusterState.UNKNOWN_UUID);
 
             final RemoteStoreRestoreService remoteStoreRestoreService = mock(RemoteStoreRestoreService.class);
@@ -1114,7 +1087,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     public void testGatewayForRemoteStateForNodeReplacement() throws IOException {
         MockGatewayMetaState gateway = null;
         try {
-            final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+            final RemoteClusterStateService remoteClusterStateService = mock(RemoteClusterStateService.class);
             when(remoteClusterStateService.getLastKnownUUIDFromRemote("test-cluster")).thenReturn("test-cluster-uuid");
             final ClusterState previousState = createClusterState(
                 randomNonNegativeLong(),
@@ -1162,7 +1135,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     public void testGatewayForRemoteStateForNodeReboot() throws IOException {
         MockGatewayMetaState gateway = null;
         try {
-            final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+            final RemoteClusterStateService remoteClusterStateService = mock(RemoteClusterStateService.class);
             final RemoteStoreRestoreService remoteStoreRestoreService = mock(RemoteStoreRestoreService.class);
             final PersistedStateRegistry persistedStateRegistry = persistedStateRegistry();
             final IndexMetadata indexMetadata = IndexMetadata.builder("test-index1")
@@ -1203,7 +1176,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
     public void testGatewayForRemoteStateForInitialBootstrapBlocksApplied() throws IOException {
         MockGatewayMetaState gateway = null;
         try {
-            final RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+            final RemoteClusterStateService remoteClusterStateService = mock(RemoteClusterStateService.class);
             when(remoteClusterStateService.getLastKnownUUIDFromRemote(clusterName.value())).thenReturn("test-cluster-uuid");
 
             final IndexMetadata indexMetadata = IndexMetadata.builder("test-index1")
@@ -1268,7 +1241,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
         MockGatewayMetaState gateway = null;
         MockGatewayMetaState gatewayMetaStateSpy = null;
         try {
-            RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+            RemoteClusterStateService remoteClusterStateService = mock(RemoteClusterStateService.class);
             when(remoteClusterStateService.getLastKnownUUIDFromRemote("test-cluster")).thenReturn("test-cluster-uuid");
             RemoteStoreRestoreService remoteStoreRestoreService = mock(RemoteStoreRestoreService.class);
             when(remoteStoreRestoreService.restore(any(), any(), anyBoolean(), any())).thenThrow(
@@ -1294,7 +1267,7 @@ public class GatewayMetaStatePersistedStateTests extends OpenSearchTestCase {
         MockGatewayMetaState gateway = null;
         final MockGatewayMetaState gatewayMetaStateSpy;
         try {
-            RemoteClusterStateService remoteClusterStateService = mockRemoteClusterStateService();
+            RemoteClusterStateService remoteClusterStateService = mock(RemoteClusterStateService.class);
             when(remoteClusterStateService.getLastKnownUUIDFromRemote("test-cluster")).thenReturn("test-cluster-uuid");
             RemoteStoreRestoreService remoteStoreRestoreService = mock(RemoteStoreRestoreService.class);
             when(remoteStoreRestoreService.restore(any(), any(), anyBoolean(), any())).thenThrow(

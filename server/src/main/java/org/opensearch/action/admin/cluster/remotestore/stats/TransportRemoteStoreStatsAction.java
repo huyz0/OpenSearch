@@ -80,18 +80,15 @@ public class TransportRemoteStoreStatsAction extends TransportBroadcastByNodeAct
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, RemoteStoreStatsRequest request, String[] concreteIndices) {
-        // clusterState.allShards(...) at both call sites below resolves through the resolver attached
-        // to this state's own routing table (replacing an earlier static-registry lookup) -- same
-        // composition.
         final List<ShardRouting> newShardRoutings = new ArrayList<>();
         if (request.shards().length > 0) {
-            clusterState.allShards(concreteIndices).getShardRoutings().forEach(shardRouting -> {
+            clusterState.routingTable().allShards(concreteIndices).getShardRoutings().forEach(shardRouting -> {
                 if (Arrays.asList(request.shards()).contains(Integer.toString(shardRouting.shardId().id()))) {
                     newShardRoutings.add(shardRouting);
                 }
             });
         } else {
-            newShardRoutings.addAll(clusterState.allShards(concreteIndices).getShardRoutings());
+            newShardRoutings.addAll(clusterState.routingTable().allShards(concreteIndices).getShardRoutings());
         }
         return new PlainShardsIterator(
             newShardRoutings.stream()

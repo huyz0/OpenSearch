@@ -35,7 +35,6 @@ package org.opensearch.cluster.routing;
 import org.opensearch.cluster.Diff;
 import org.opensearch.cluster.Diffable;
 import org.opensearch.cluster.DiffableUtils;
-import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.RecoverySource.RemoteStoreRecoverySource;
@@ -85,28 +84,6 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
     public RoutingTable(long version, final Map<String, IndexRoutingTable> indicesRouting) {
         this.version = version;
         this.indicesRouting = Collections.unmodifiableMap(indicesRouting);
-    }
-
-    /**
-     * Dispatches {@link org.opensearch.cluster.metadata.IndexCatalog#shouldPublishRouting} to the node's
-     * registered catalog, replacing direct calls to the pre-existing static registry, {@code
-     * AbsentIndexRoutingSuppliers#shouldPublishRouting}.
-     *
-     * <p>Lives here rather than on {@code ClusterState}, unlike {@link
-     * org.opensearch.cluster.ClusterState#getIndexRoutingTable}: this question only ever needs an {@link
-     * IndexMetadata}, which every real call site already has in hand, so there is no reason to require a
-     * full {@code ClusterState} the way resolving an actual routing table does.
-     *
-     * <p>Kept as an instance method on {@code RoutingTable} even though the catalog is now node-scoped and
-     * this body no longer reads any instance field: its eight callers all reach it through a routing table
-     * they already hold, and turning that into a static call at each of them would be churn with no gain.
-     *
-     * <p>{@code true} by default -- matching the catalog method's own default and the static registry's --
-     * so a node with no catalog registered, or one that declines/throws, always publishes routing, exactly
-     * today's behavior. See {@link IndexCatalogRegistry#shouldPublishRouting} for the throw handling.
-     */
-    public boolean shouldPublishRouting(IndexMetadata indexMetadata) {
-        return IndexCatalogRegistry.shouldPublishRouting(indexMetadata);
     }
 
     /**
@@ -187,45 +164,6 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
     public IndexShardRoutingTable shardRoutingTable(ShardId shardId) {
         IndexRoutingTable indexRouting = index(shardId.getIndexName());
         if (indexRouting == null || indexRouting.getIndex().equals(shardId.getIndex()) == false) {
-            throw new IndexNotFoundException(shardId.getIndex());
-        }
-        IndexShardRoutingTable shard = indexRouting.shard(shardId.id());
-        if (shard == null) {
-            throw new ShardNotFoundException(shardId);
-        }
-        return shard;
-    }
-
-    /**
-     * All shards for the provided {@link ShardId}, returning {@code null} when -- and only when -- the
-     * index has no {@link IndexRoutingTable} entry at all.
-     *
-     * <p>The null-returning sibling of {@link #shardRoutingTable(ShardId)}, added rather than changing
-     * that method's contract because it has more than twenty callers and most of them do want the
-     * exception. The two that do not are {@code TransportReplicationAction.ReroutePhase} and
-     * {@code TransportBulkAction}: both already have a "primary is not allocated yet, wait and retry"
-     * branch immediately below the lookup, and both were failing the request outright before ever
-     * reaching it, because the lookup threw first on an index present in metadata and absent from
-     * routing.
-     *
-     * <p><b>The narrowness is the design.</b> An unknown shard of an index that <em>is</em> in the
-     * routing table still throws {@link ShardNotFoundException}, and a {@link ShardId} carrying a
-     * different index UUID still throws {@link IndexNotFoundException}. Both are permanent errors and
-     * neither has anything to do with cold indices; a blanket null would have turned them into
-     * retry-until-timeout, reporting the wrong error after wasting the timeout. An existing
-     * {@code TransportReplicationActionTests} case caught exactly that when this method was first
-     * written the broad way.
-     *
-     * <p>So the only behaviour this changes is absence of the index from routing. Prefer
-     * {@link #shardRoutingTable(ShardId)} unless the caller has a real answer for that state.
-     */
-    @Nullable
-    public IndexShardRoutingTable shardRoutingTableOrNull(ShardId shardId) {
-        IndexRoutingTable indexRouting = index(shardId.getIndexName());
-        if (indexRouting == null) {
-            return null;
-        }
-        if (indexRouting.getIndex().equals(shardId.getIndex()) == false) {
             throw new IndexNotFoundException(shardId.getIndex());
         }
         IndexShardRoutingTable shard = indexRouting.shard(shardId.id());

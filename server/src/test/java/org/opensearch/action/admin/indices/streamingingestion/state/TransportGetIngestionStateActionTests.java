@@ -44,7 +44,6 @@ import java.util.List;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -91,13 +90,8 @@ public class TransportGetIngestionStateActionTests extends OpenSearchTestCase {
         request.setShards(new int[] { 0, 1 });
         ClusterState clusterState = mock(ClusterState.class);
         ShardsIterator shardsIterator = mock(ShardsIterator.class);
-        // Phase C4b of core-pluggability-refactor-plan.md: TransportGetIngestionStateAction#shards now
-        // calls ClusterState#allShards(String[], Predicate, boolean) directly instead of
-        // the since-deleted AbsentIndexRoutingSuppliers.allShards(state, ...), which itself used to read
-        // state.routingTable().allShardsSatisfyingPredicate(...) on the unregistered fast path. Stubbing
-        // the old RoutingTable-level method here would stub a call this mock's own
-        // ClusterState#allShards never makes, so the new method is stubbed directly.
-        when(clusterState.allShards(any(), any(), anyBoolean())).thenReturn(shardsIterator);
+        when(clusterState.routingTable()).thenReturn(mock(org.opensearch.cluster.routing.RoutingTable.class));
+        when(clusterState.routingTable().allShardsSatisfyingPredicate(any(), any())).thenReturn(shardsIterator);
 
         Metadata metadata = mock(Metadata.class);
         IndexMetadata indexMetadata = mock(IndexMetadata.class);
@@ -217,9 +211,8 @@ public class TransportGetIngestionStateActionTests extends OpenSearchTestCase {
         ClusterState clusterState = mock(ClusterState.class);
         ShardsIterator shardsIterator = mock(ShardsIterator.class);
 
-        // See testShards' own comment for why the new ClusterState#allShards method is stubbed directly
-        // rather than the old RoutingTable-level one.
-        when(clusterState.allShards(any(), any(), anyBoolean())).thenReturn(shardsIterator);
+        when(clusterState.routingTable()).thenReturn(mock(org.opensearch.cluster.routing.RoutingTable.class));
+        when(clusterState.routingTable().allShardsSatisfyingPredicate(any(), any())).thenReturn(shardsIterator);
 
         Metadata metadata = mock(Metadata.class);
         IndexMetadata indexMetadata = mock(IndexMetadata.class);

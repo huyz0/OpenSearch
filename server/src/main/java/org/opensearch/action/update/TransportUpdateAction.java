@@ -51,8 +51,6 @@ import org.opensearch.action.support.single.instance.TransportInstanceSingleOper
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
-import org.opensearch.cluster.routing.IndexRoutingTable;
-import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.PlainShardIterator;
 import org.opensearch.cluster.routing.ShardIterator;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -213,22 +211,7 @@ public class TransportUpdateAction extends TransportInstanceSingleOperationActio
     @Override
     protected ShardIterator shards(ClusterState clusterState, UpdateRequest request) {
         if (request.getShardId() != null) {
-            // Resolved rather than looked up. This branch runs only on a retry, because the shard id is
-            // set after shards() has already succeeded once, so a computed index reaches it when a first
-            // attempt fails remotely. The empty iterator below means "not allocated yet, wait", which for
-            // an index whose routing is never published means waiting forever: a hang rather than an
-            // error, and harder to attribute than one.
-            IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(request.concreteIndex());
-            IndexShardRoutingTable shardRoutingTable = indexRoutingTable == null
-                ? null
-                : indexRoutingTable.shard(request.getShardId().getId());
-            if (shardRoutingTable == null) {
-                // In metadata but not in routing, or the shard is not in the table yet. An empty iterator
-                // makes the caller retry and wait for allocation, which is the branch it already has for
-                // "might be in the case between index gateway recovery and shardIt initialization".
-                return new PlainShardIterator(request.getShardId(), Collections.emptyList());
-            }
-            return shardRoutingTable.primaryShardIt();
+            return clusterState.routingTable().index(request.concreteIndex()).shard(request.getShardId().getId()).primaryShardIt();
         }
         ShardIterator shardIterator = clusterService.operationRouting()
             .indexShards(clusterState, request.concreteIndex(), request.id(), request.routing());

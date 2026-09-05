@@ -77,10 +77,6 @@ import org.opensearch.cluster.applicationtemplates.SystemTemplatesPlugin;
 import org.opensearch.cluster.applicationtemplates.SystemTemplatesService;
 import org.opensearch.cluster.coordination.PersistedStateRegistry;
 import org.opensearch.cluster.metadata.AliasValidator;
-import org.opensearch.cluster.metadata.IndexCatalog;
-import org.opensearch.cluster.metadata.IndexCatalogRegistry;
-import org.opensearch.cluster.metadata.IndexCreationStrategy;
-import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
 import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
@@ -192,8 +188,6 @@ import org.opensearch.indices.SystemIndices;
 import org.opensearch.indices.analysis.AnalysisModule;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
-import org.opensearch.indices.cluster.IndexResidencyPolicy;
-import org.opensearch.indices.cluster.IndexResidencyPolicyRegistry;
 import org.opensearch.indices.cluster.IndicesClusterStateService;
 import org.opensearch.indices.recovery.PeerRecoverySourceService;
 import org.opensearch.indices.recovery.PeerRecoveryTargetService;
@@ -766,56 +760,6 @@ public class Node implements Closeable {
             clusterService.addStateApplier(scriptService);
             resourcesToClose.add(clusterService);
 
-            // Give the node its plugin-supplied
-            // IndexCatalog, if any ClusterPlugin on this node provides one. A one-time registration, the
-            // same shape as IndexCreationStrategy below: the catalog is node-scoped, so unlike the two
-            // per-cluster-state resolvers this replaced, there is nothing to attach to each applied state
-            // and no high-priority ClusterStateApplier needed to seed from-scratch instances. See
-            // IndexCatalogRegistry's own javadoc for why that scope is the honest one.
-            List<IndexCatalog> indexCatalogs = clusterPlugins.stream()
-                .map(ClusterPlugin::getIndexCatalog)
-                .filter(Optional::isPresent)
-                .map(Optional::get)
-                .collect(toList());
-            if (indexCatalogs.size() > 1) {
-                throw new IllegalStateException("at most one ClusterPlugin may supply an IndexCatalog, but found " + indexCatalogs.size());
-            }
-            indexCatalogs.stream().findFirst().ifPresent(IndexCatalogRegistry::register);
-
-            // Give the node its plugin-supplied
-            // IndexCreationStrategy, if any ClusterPlugin on this node provides one. Unlike the catalog
-            // above, claims() is a pure, cheap, synchronous, purely-local predicate with no deadlock-safety
-            // concerns and nothing to propagate through cluster state -- a one-time registration here,
-            // mirroring exactly how DescriptorOnlyCreation.register(...) is called once from a plugin's own
-            // bootstrap today, is the whole of what's needed. See IndexCreationStrategyRegistry's own
-            // javadoc.
-            List<IndexCreationStrategy> indexCreationStrategies = clusterPlugins.stream()
-                .map(ClusterPlugin::getIndexCreationStrategy)
-                .filter(Optional::isPresent)
-                .map(Optional::get)
-                .collect(toList());
-            if (indexCreationStrategies.size() > 1) {
-                throw new IllegalStateException(
-                    "at most one ClusterPlugin may supply an IndexCreationStrategy, but found " + indexCreationStrategies.size()
-                );
-            }
-            indexCreationStrategies.stream().findFirst().ifPresent(IndexCreationStrategyRegistry::register);
-
-            // Give the node its plugin-supplied
-            // IndexResidencyPolicy, if any ClusterPlugin on this node provides one. Same one-registration-
-            // at-startup shape as IndexCreationStrategy immediately above, for the same reason -- see
-            // IndexResidencyPolicyRegistry's own javadoc.
-            List<IndexResidencyPolicy> indexResidencyPolicies = clusterPlugins.stream()
-                .map(ClusterPlugin::getIndexResidencyPolicy)
-                .filter(Optional::isPresent)
-                .map(Optional::get)
-                .collect(toList());
-            if (indexResidencyPolicies.size() > 1) {
-                throw new IllegalStateException(
-                    "at most one ClusterPlugin may supply an IndexResidencyPolicy, but found " + indexResidencyPolicies.size()
-                );
-            }
-            indexResidencyPolicies.stream().findFirst().ifPresent(IndexResidencyPolicyRegistry::register);
             final Set<Setting<?>> consistentSettings = settingsModule.getConsistentSettings();
             if (consistentSettings.isEmpty() == false) {
                 clusterService.addLocalNodeClusterManagerListener(

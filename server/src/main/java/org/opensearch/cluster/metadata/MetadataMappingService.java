@@ -49,7 +49,6 @@ import org.opensearch.common.Priority;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
@@ -60,7 +59,6 @@ import org.opensearch.index.mapper.DocumentMapper;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -83,24 +81,15 @@ public class MetadataMappingService {
 
     private final ClusterService clusterService;
     private final IndicesService indicesService;
-    private final ThreadPool threadPool;
-    private final ClaimedIndexLifecycle claimedIndexLifecycle;
     private final ClusterManagerTaskThrottler.ThrottlingKey putMappingTaskKey;
 
     final RefreshTaskExecutor refreshExecutor = new RefreshTaskExecutor();
     final PutMappingExecutor putMappingExecutor = new PutMappingExecutor();
 
     @Inject
-    public MetadataMappingService(
-        ClusterService clusterService,
-        IndicesService indicesService,
-        ThreadPool threadPool,
-        ClaimedIndexLifecycle claimedIndexLifecycle
-    ) {
+    public MetadataMappingService(ClusterService clusterService, IndicesService indicesService) {
         this.clusterService = clusterService;
         this.indicesService = indicesService;
-        this.threadPool = threadPool;
-        this.claimedIndexLifecycle = claimedIndexLifecycle;
 
         // Task is onboarded for throttling, it will get retried from associated TransportClusterManagerNodeAction.
         putMappingTaskKey = clusterService.registerClusterManagerTask(PUT_MAPPING, true);
@@ -244,20 +233,6 @@ public class MetadataMappingService {
             try {
                 for (PutMappingClusterStateUpdateRequest request : tasks) {
                     try {
-                        // A gated index has no metadata entry by design, so getIndexSafe below
-                        // would throw and a document carrying a new field would fail. Its mapping lives in
-                        // the store instead, and that is handled in putMapping before anything is submitted
-                        // here -- doing it in this method did it on the cluster manager's update
-                        // thread, and the store blocks.
-                        //
-                        // Deliberately not left here as a fallback. putMapping is the only submitter of this
-                        // executor, so a copy of the branch would be unreachable, and an unreachable copy of
-                        // a blocking call on this thread is worse than none: it reads as a safety net while
-                        // being the defect. If a gated request ever does arrive here, getIndexSafe fails it
-                        // loudly, which is the outcome that gets noticed.
-                        assert isGated(currentState, request) == false
-                            : "a put-mapping whose indices are all absent from cluster state reached the cluster state update "
-                                + "thread, which the GENERIC-pool dispatch in putMapping exists to prevent";
                         for (Index index : request.indices()) {
                             final IndexMetadata indexMetadata = currentState.metadata().getIndexSafe(index);
                             if (indexMapperServices.containsKey(indexMetadata.getIndex()) == false) {
@@ -282,16 +257,6 @@ public class MetadataMappingService {
         @Override
         public ClusterManagerTaskThrottler.ThrottlingKey getClusterManagerThrottlingKey() {
             return putMappingTaskKey;
-        }
-
-        /** Whether every index in this request is absent from cluster state, which is what gated means. */
-        boolean isGated(ClusterState currentState, PutMappingClusterStateUpdateRequest request) {
-            for (Index index : request.indices()) {
-                if (currentState.metadata().hasIndex(index.getName())) {
-                    return false;
-                }
-            }
-            return request.indices().length > 0;
         }
 
         private ClusterState applyRequest(
@@ -398,52 +363,6 @@ public class MetadataMappingService {
     }
 
     public void putMapping(final PutMappingClusterStateUpdateRequest request, final ActionListener<ClusterStateUpdateResponse> listener) {
-        // An index absent from cluster state cannot have its mapping changed by a cluster state update, so
-        // this request changes no cluster state at all and is handed to whatever holds the index instead.
-        // Doing it here, before any task is submitted, is what keeps it off the cluster manager's update
-        // thread.
-        //
-        // It used to be handled inside PutMappingExecutor#execute, which runs on that thread, against a
-        // store whose read and write both block. So every such put-mapping made two blocking round trips on
-        // the single thread whose serialization is the ceiling this whole design exists to remove -- the
-        // same mistake creation and deletion were already moved off, in the one metadata path that was not
-        // looked at. It was an assertion failure rather than merely slow: "Expected current thread to not be
-        // the cluster-manager service thread. Reason: [Blocking operation]".
-        //
-        // GENERIC rather than the calling thread, because TransportPutMappingAction declares
-        // ThreadPool.Names.SAME: the caller here is a transport thread, and blocking one of those trades a
-        // stalled cluster manager for a stalled transport pool.
-        //
-        // No "is a plane installed" test guards this any more, and dropping it is not a widening. The
-        // indices in this request were resolved against a state this node had already seen, and a node's
-        // state is monotonic, so their absence from the state read here means one of exactly two things:
-        // something outside cluster state holds them, or they were deleted in between. The plane answers the
-        // first. For the second -- and for a node with no plane at all -- ClaimedIndexLifecycle.NOOP fails
-        // with the IndexNotFoundException that getIndexSafe would have raised further down, which is the
-        // same answer the ordinary path gave, minus a cluster state task that was only ever going to fail.
-        if (putMappingExecutor.isGated(clusterService.state(), request)) {
-            threadPool.executor(ThreadPool.Names.GENERIC).execute(new AbstractRunnable() {
-                @Override
-                protected void doRun() {
-                    claimedIndexLifecycle.putMapping(List.of(request.indices()), request.source()).whenComplete((ignored, failure) -> {
-                        if (failure != null) {
-                            listener.onFailure(ClaimedIndexWrites.unwrap(failure));
-                        } else {
-                            listener.onResponse(new ClusterStateUpdateResponse(true));
-                        }
-                    });
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    // A plane that throws on the way in has applied nothing, which is a failed request and
-                    // not a silent success -- the same answer the returned stage's failure gets, applied to
-                    // the synchronous half.
-                    listener.onFailure(e);
-                }
-            });
-            return;
-        }
         clusterService.submitStateUpdateTask(
             "put-mapping " + Strings.arrayToCommaDelimitedString(request.indices()),
             request,

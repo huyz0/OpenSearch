@@ -15,10 +15,8 @@ import org.opensearch.common.remote.AbstractClusterMetadataWriteableBlobEntity;
 import org.opensearch.common.remote.BlobPathParameters;
 import org.opensearch.core.compress.Compressor;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
-import org.opensearch.gateway.remote.ClusterMetadataManifest;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedIndexMetadata;
 import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedMetadata;
-import org.opensearch.gateway.remote.ManifestIndexDescriptor;
 import org.opensearch.gateway.remote.RemoteClusterStateUtils;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
@@ -49,7 +47,6 @@ public class RemoteIndexMetadata extends AbstractClusterMetadataWriteableBlobEnt
     private RemoteStoreEnums.PathType pathType;
     private RemoteStoreEnums.PathHashAlgorithm pathHashAlgo;
     private String fixedPrefix;
-    private boolean writeDescriptor;
 
     public RemoteIndexMetadata(
         final IndexMetadata indexMetadata,
@@ -60,25 +57,11 @@ public class RemoteIndexMetadata extends AbstractClusterMetadataWriteableBlobEnt
         final RemoteStoreEnums.PathHashAlgorithm pathHashAlgo,
         final String fixedPrefix
     ) {
-        this(indexMetadata, clusterUUID, compressor, namedXContentRegistry, pathType, pathHashAlgo, fixedPrefix, false);
-    }
-
-    public RemoteIndexMetadata(
-        final IndexMetadata indexMetadata,
-        final String clusterUUID,
-        final Compressor compressor,
-        final NamedXContentRegistry namedXContentRegistry,
-        final RemoteStoreEnums.PathType pathType,
-        final RemoteStoreEnums.PathHashAlgorithm pathHashAlgo,
-        final String fixedPrefix,
-        final boolean writeDescriptor
-    ) {
         super(clusterUUID, compressor, namedXContentRegistry);
         this.indexMetadata = indexMetadata;
         this.pathType = pathType;
         this.pathHashAlgo = pathHashAlgo;
         this.fixedPrefix = fixedPrefix;
-        this.writeDescriptor = writeDescriptor;
     }
 
     public RemoteIndexMetadata(
@@ -134,19 +117,7 @@ public class RemoteIndexMetadata extends AbstractClusterMetadataWriteableBlobEnt
     @Override
     public UploadedMetadata getUploadedMetadata() {
         assert blobName != null;
-        if (writeDescriptor == false) {
-            return new UploadedIndexMetadata(indexMetadata.getIndex().getName(), indexMetadata.getIndexUUID(), blobName);
-        }
-        // Derived from the same IndexMetadata being written to the blob, so the manifest entry and the
-        // blob cannot disagree about the index they describe.
-        return new UploadedIndexMetadata(
-            indexMetadata.getIndex().getName(),
-            indexMetadata.getIndexUUID(),
-            blobName,
-            UploadedIndexMetadata.COMPONENT_PREFIX,
-            ClusterMetadataManifest.CODEC_V5,
-            ManifestIndexDescriptor.of(indexMetadata)
-        );
+        return new UploadedIndexMetadata(indexMetadata.getIndex().getName(), indexMetadata.getIndexUUID(), blobName);
     }
 
     @Override

@@ -63,10 +63,6 @@ public class TransportCreateIndexAction extends TransportClusterManagerNodeActio
     implements
         TransportIndicesResolvingAction<CreateIndexRequest> {
 
-    private static final org.apache.logging.log4j.Logger LOGGER = org.apache.logging.log4j.LogManager.getLogger(
-        TransportCreateIndexAction.class
-    );
-
     private final MetadataCreateIndexService createIndexService;
     private final MappingTransformerRegistry mappingTransformerRegistry;
 
@@ -113,48 +109,6 @@ public class TransportCreateIndexAction extends TransportClusterManagerNodeActio
             return state.blocks().createIndexBlockedException(ClusterBlockLevel.CREATE_INDEX);
         }
         return clusterBlockException;
-    }
-
-    /**
-     * A gated creation runs on the node that received it, rather than being sent to the cluster manager.
-     *
-     * <h4>Why the cluster manager is not needed</h4>
-     *
-     * It was never needed for this. Uniqueness comes from the descriptor store's register
-     * compare-and-swap, which is what makes two nodes admitting the same name at once resolvable rather
-     * than forbidden: one write wins and the loser is told the index already exists, exactly as a duplicate
-     * has always been told. What creation needs from cluster state is a *read* -- templates, scoped
-     * settings, the collision check against ordinary indices -- and every node has a snapshot of it.
-     *
-     * <p>T49 took gated creation off the cluster manager's state update thread, and measuring it a round
-     * later showed the node was still a funnel: every creation in the cluster executed on one machine's
-     * GENERIC pool, at a rate one machine can sustain. This is the other half of that, and it is what turns
-     * a per-cluster creation rate into a per-node one.
-     *
-     * <h4>Why only the certain case</h4>
-     *
-     * {@code MetadataCreateIndexService#certainlyGated} carries the argument, and the short version is that
-     * an admitted creation may still turn out to need cluster state, and the fallback that handles it can
-     * only run on the cluster manager. Anything short of certain keeps today's behaviour: sent to the
-     * cluster manager, decided there. An ordinary index is never certain, so an ordinary cluster is
-     * untouched by this -- {@code hasAdmissionCheck} answers false when nothing installed the gate, and the
-     * first condition inside is the gated setting.
-     */
-    @Override
-    protected boolean localExecute(CreateIndexRequest request) {
-        try {
-            final CreateIndexClusterStateUpdateRequest updateRequest = new CreateIndexClusterStateUpdateRequest(
-                request.cause().length() == 0 ? "api" : request.cause(),
-                resolveIndexName(request),
-                request.index()
-            ).settings(request.settings()).aliases(request.aliases()).context(request.context());
-            return createIndexService.certainlyGated(updateRequest, clusterService.state());
-        } catch (Exception e) {
-            // Deciding where to run must not be able to fail the request. The cluster manager is always a
-            // correct answer, so anything unexpected here becomes one.
-            LOGGER.debug("could not decide locally where to create [{}]: {}", request.index(), e);
-            return false;
-        }
     }
 
     @Override

@@ -93,9 +93,7 @@ public class TransportIndicesStatsAction extends TransportBroadcastByNodeAction<
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, IndicesStatsRequest request, String[] concreteIndices) {
-        // clusterState.allShards(...) resolves through the resolver attached to this state's own
-        // routing table (replacing an earlier static-registry lookup) -- same composition.
-        return clusterState.allShards(concreteIndices);
+        return clusterState.routingTable().allShards(concreteIndices);
     }
 
     @Override

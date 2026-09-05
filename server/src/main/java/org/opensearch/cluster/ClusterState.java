@@ -37,22 +37,17 @@ import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.coordination.CoordinationMetadata;
 import org.opensearch.cluster.coordination.CoordinationMetadata.VotingConfigExclusion;
 import org.opensearch.cluster.coordination.CoordinationMetadata.VotingConfiguration;
-import org.opensearch.cluster.metadata.IndexCatalog;
-import org.opensearch.cluster.metadata.IndexCatalogRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
-import org.opensearch.cluster.routing.PlainShardsIterator;
 import org.opensearch.cluster.routing.RoutingNode;
 import org.opensearch.cluster.routing.RoutingNodes;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
-import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
-import org.opensearch.common.Nullable;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.io.stream.BytesStreamOutput;
@@ -64,23 +59,19 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.VersionedNamedWriteable;
-import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.discovery.Discovery;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.Spliterators;
-import java.util.function.Predicate;
 import java.util.stream.StreamSupport;
 
 import static org.opensearch.cluster.coordination.Coordinator.ZEN1_BWC_TERM;
@@ -286,182 +277,6 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
 
     public RoutingTable getRoutingTable() {
         return routingTable();
-    }
-
-    /**
-     * {@code routingTable().index(indexName)}, falling back to the node's registered {@link IndexCatalog}
-     * (see that interface's own javadoc) on a miss.
-     *
-     * <p><b>This method is why the two resolver SPIs became one {@code IndexCatalog}.</b> It is a single
-     * compound question -- "does this index exist, and where do its shards live" -- and its body asks both
-     * halves four lines apart, behind one thread guard, because the second half needs the first half's
-     * answer as its input. The same pair recurs in {@code IndicesClusterStateService}, {@code
-     * TransportReplicationAction}, {@code SnapshotsService} and {@code ActiveShardCount}.
-     *
-     * <p>This -- not {@code RoutingTable#index(String)} itself -- is the seam: real routing resolution
-     * needs the index's {@link org.opensearch.cluster.metadata.IndexMetadata} (at minimum its shard
-     * count), which a bare {@link RoutingTable} does not hold but a {@link ClusterState} does, via {@link
-     * #metadata()}. Since this method is itself an explicit "please resolve" call (unlike a bare {@code
-     * routingTable().index(name)}), it deliberately calls {@link Metadata#indexOrResolved(String)} rather
-     * than the plain {@link Metadata#index(String)} -- see that method's own javadoc for why the two are
-     * not interchangeable. So this single method composes both halves correctly for any caller with a
-     * {@code ClusterState} in hand, which is nearly every core caller today ({@code OperationRouting},
-     * {@code IndexNameExpressionResolver}, the action layer) -- which is what lets those call sites
-     * migrate onto this one method instead of consulting the static registries directly.
-     *
-     * <p>The published routing entry is returned before anything else is touched, so an ordinary index
-     * costs exactly one map lookup here whether or not a catalog is registered.
-     *
-     * @return the resolved {@link org.opensearch.cluster.routing.IndexRoutingTable}, or {@code null} if
-     *         neither the routing table nor the catalog has one -- callers must treat this identically
-     *         to how they already treat a direct {@code routingTable().index(name)} miss.
-     */
-    @Nullable
-    public IndexRoutingTable getIndexRoutingTable(String indexName) {
-        IndexRoutingTable published = routingTable.index(indexName);
-        if (published != null) {
-            return published;
-        }
-        IndexCatalog catalog = IndexCatalogRegistry.get();
-        if (catalog == null) {
-            return null;
-        }
-        // See ClusterStateMutationThreads' own javadoc for why: independent of indexOrResolved(indexName)'s
-        // own identical guard below, since a catalog that answers may still do real (e.g. remote) work.
-        if (ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
-            return null;
-        }
-        IndexMetadata indexMetadata = metadata.indexOrResolved(indexName);
-        if (indexMetadata == null) {
-            return null;
-        }
-        return catalog.resolveRouting(this, indexMetadata);
-    }
-
-    /**
-     * The "no filter" predicate for {@link #allShards(String[], Predicate, boolean)}, held as a constant so
-     * the fast path can recognise it by identity and delegate to {@link RoutingTable#allShards(String[])}
-     * itself rather than to an equivalent method -- see that method's own javadoc for why the distinction
-     * matters (a test that stubs the exact method a caller used to call would not notice an
-     * equivalent-but-different one).
-     */
-    private static final Predicate<ShardRouting> ALL_SHARDS = shardRouting -> true;
-
-    /**
-     * Every shard of {@code concreteIndices}, resolving each index through {@link
-     * #getIndexRoutingTable(String)} rather than reading {@link #routingTable()} directly -- this is the
-     * batch read that replaced the static registry's since-deleted {@code allShards} helpers, and it is
-     * now the only one. Composed entirely from already-wired primitives ({@link
-     * #getIndexRoutingTable(String)}, itself already catalog-aware and thread-guarded) rather than adding
-     * new {@link IndexCatalog} surface -- this is a batch/predicate operation over what {@link
-     * IndexCatalog#resolveRouting} already answers per index, not a new question a catalog needs to
-     * answer.
-     *
-     * <p>Falls straight through to {@link RoutingTable}'s own equivalent methods when nothing is registered
-     * -- not merely behaviorally identical but the exact same call: a caller or test bound to a specific
-     * method (a mock verifying {@code allShards(String[])} was called, say) must see that exact call.
-     *
-     * @param includeRelocationTargets whether to add the target of a relocating shard, as recovery needs
-     */
-    public ShardsIterator allShards(String[] concreteIndices, Predicate<ShardRouting> predicate, boolean includeRelocationTargets) {
-        if (IndexCatalogRegistry.isRegistered() == false) {
-            if (includeRelocationTargets) {
-                return routingTable.allShardsIncludingRelocationTargets(concreteIndices);
-            }
-            if (predicate == ALL_SHARDS) {
-                return routingTable.allShards(concreteIndices);
-            }
-            return routingTable.allShardsSatisfyingPredicate(concreteIndices, predicate);
-        }
-        // A list rather than a set, because these callers rely on shard identity being preserved.
-        List<ShardRouting> shards = new ArrayList<>();
-        for (String index : concreteIndices) {
-            IndexRoutingTable indexRoutingTable = getIndexRoutingTable(index);
-            if (indexRoutingTable == null) {
-                continue;
-            }
-            for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
-                for (ShardRouting shardRouting : shardRoutingTable) {
-                    if (predicate.test(shardRouting) == false) {
-                        continue;
-                    }
-                    shards.add(shardRouting);
-                    if (includeRelocationTargets && shardRouting.relocating()) {
-                        shards.add(shardRouting.getTargetRelocatingShard());
-                    }
-                }
-            }
-        }
-        return new PlainShardsIterator(shards);
-    }
-
-    /** Every shard of the named indices, the common case. */
-    public ShardsIterator allShards(String[] concreteIndices) {
-        return allShards(concreteIndices, ALL_SHARDS, false);
-    }
-
-    /** Every shard of the named indices, plus the targets of any that are relocating. */
-    public ShardsIterator allShardsIncludingRelocationTargets(String[] concreteIndices) {
-        return allShards(concreteIndices, ALL_SHARDS, true);
-    }
-
-    /**
-     * Every shard in the cluster, including those of indices that publish no routing entry -- for the
-     * callers that name no indices at all ({@code _cat/shards}, {@code _cat/allocation}), which cannot use
-     * the array-taking overloads above because they have no list to pass and {@link
-     * RoutingTable#allShards()} takes its list from the routing table's own key set, which an unpublished
-     * index is not in. Enumerating {@link #metadata()} is acceptable here specifically -- callers of this
-     * overload already produce one row per shard, so they are inherently linear in shard count and the
-     * walk adds no asymptotic cost -- but would not be on a request path, which is why this is a separate
-     * overload rather than the array form's zero-length case.
-     */
-    public List<ShardRouting> allShards() {
-        if (IndexCatalogRegistry.isRegistered() == false) {
-            return routingTable.allShards();
-        }
-        List<ShardRouting> shards = new ArrayList<>(routingTable.allShards());
-        for (IndexMetadata indexMetadata : metadata()) {
-            if (routingTable.shouldPublishRouting(indexMetadata)) {
-                // Published, so routingTable.allShards() above already returned it.
-                continue;
-            }
-            IndexRoutingTable computed = getIndexRoutingTable(indexMetadata.getIndex().getName());
-            if (computed == null) {
-                continue;
-            }
-            for (IndexShardRoutingTable shardRoutingTable : computed) {
-                for (ShardRouting shardRouting : shardRoutingTable) {
-                    shards.add(shardRouting);
-                }
-            }
-        }
-        return shards;
-    }
-
-    /**
-     * One shard's routing table, from the published entry or the resolved one, or null if neither has it
-     * -- the shard-level read that replaced the static registry's since-deleted {@code resolveShard}
-     * helper, and now the only one. Delegates to {@link
-     * RoutingTable#shardRoutingTableOrNull} for the published case rather than reimplementing it, because
-     * the two absences it distinguishes are not the same absence: an index with no entry is a
-     * maybe-resolvable index and returns null; an index that <em>has</em> an entry without this shard is a
-     * caller asking for a shard that does not exist, and that must keep throwing {@link
-     * org.opensearch.index.shard.ShardNotFoundException}.
-     *
-     * <p>This is the exact call shape the earlier call-site migration deliberately left unmigrated at {@code
-     * TransportReplicationAction#resolveShard} and {@code IndicesClusterStateService}'s two uses, pending
-     * confirmation the published/absent distinction above would carry through a migration -- confirmed here
-     * by delegating to {@link RoutingTable#shardRoutingTableOrNull} exactly rather than reimplementing it,
-     * so the distinction is structurally preserved, not re-derived.
-     */
-    @Nullable
-    public IndexShardRoutingTable resolveShard(ShardId shardId) {
-        IndexShardRoutingTable published = routingTable.shardRoutingTableOrNull(shardId);
-        if (published != null) {
-            return published;
-        }
-        IndexRoutingTable computed = getIndexRoutingTable(shardId.getIndex().getName());
-        return computed == null ? null : computed.shard(shardId.id());
     }
 
     public ClusterBlocks blocks() {

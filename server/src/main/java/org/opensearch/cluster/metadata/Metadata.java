@@ -38,7 +38,6 @@ import org.apache.lucene.util.CollectionUtil;
 import org.opensearch.action.AliasesRequest;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterState.FeatureAware;
-import org.opensearch.cluster.ClusterStateMutationThreads;
 import org.opensearch.cluster.Diff;
 import org.opensearch.cluster.Diffable;
 import org.opensearch.cluster.DiffableUtils;
@@ -74,12 +73,8 @@ import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.plugins.MapperPlugin;
 
 import java.io.IOException;
-import java.util.AbstractCollection;
-import java.util.AbstractMap;
-import java.util.AbstractSet;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
@@ -271,14 +266,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     private final Settings persistentSettings;
     private final Settings settings;
     private final DiffableStringMap hashesOfConsistentSettings;
-    /**
-     * Indices, stored behind {@link IndexMetadataHolder} so an entry can be deferred rather than
-     * materialized. A materialized entry is the {@link IndexMetadata} itself -- no wrapper -- so this
-     * costs nothing when nothing opts in. See {@link IndexMetadataHolder}.
-     */
-    private final Map<String, IndexMetadataHolder> indices;
-    /** {@link #indices} seen as {@code Map<String, IndexMetadata>}; resolves an entry when it is read. */
-    private final Map<String, IndexMetadata> indicesView;
+    private final Map<String, IndexMetadata> indices;
     private final TemplatesMetadata templates;
     private final Map<String, Custom> customs;
 
@@ -305,7 +293,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         Settings transientSettings,
         Settings persistentSettings,
         DiffableStringMap hashesOfConsistentSettings,
-        final Map<String, IndexMetadataHolder> indices,
+        final Map<String, IndexMetadata> indices,
         final Map<String, IndexTemplateMetadata> templates,
         final Map<String, Custom> customs,
         String[] allIndices,
@@ -326,14 +314,12 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         this.settings = Settings.builder().put(persistentSettings).put(transientSettings).build();
         this.hashesOfConsistentSettings = hashesOfConsistentSettings;
         this.indices = Collections.unmodifiableMap(indices);
-        this.indicesView = new ResolvingIndexMap(this.indices);
         this.customs = Collections.unmodifiableMap(customs);
         this.templates = new TemplatesMetadata(templates);
         int totalNumberOfShards = 0;
         int totalOpenLocalOnlyIndexShards = 0;
         int totalOpenRemoteCapableIndexShards = 0;
-        // Descriptor-level reads only: a deferred index must survive metadata construction unresolved.
-        for (IndexMetadataHolder cursor : indices.values()) {
+        for (IndexMetadata cursor : indices.values()) {
             totalNumberOfShards += cursor.getTotalNumberOfShards();
             if (IndexMetadata.State.OPEN.equals(cursor.getState())) {
                 if (RoutingPool.getIndexPool(cursor) == RoutingPool.REMOTE_CAPABLE) {
@@ -406,9 +392,9 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     }
 
     public boolean equalsAliases(Metadata other) {
-        for (IndexMetadataHolder otherIndex : other.indices.values()) {
-            IndexMetadataHolder thisIndex = indices.get(otherIndex.getIndex().getName());
-            if (thisIndex == null || thisIndex.getIndex().getUUID().equals(otherIndex.getIndex().getUUID()) == false) {
+        for (IndexMetadata otherIndex : other.indices().values()) {
+            IndexMetadata thisIndex = index(otherIndex.getIndex());
+            if (thisIndex == null) {
                 return false;
             }
             if (otherIndex.getAliases().equals(thisIndex.getAliases()) == false) {
@@ -478,28 +464,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         boolean matchAllAliases = patterns.length == 0;
         final Map<String, List<AliasMetadata>> mapBuilder = new HashMap<>();
         for (String index : concreteIndices) {
-            IndexMetadataHolder indexMetadata = indices.get(index);
-            if (indexMetadata == null) {
-                // A gated index, which resolves by name and has no entry in this map -- and can genuinely
-                // hold aliases: MetadataIndexAliasesService#applyAliasActions has a dedicated branch that
-                // adds/removes plain (name-only) aliases on a gated index via ClaimedIndexLifecycle,
-                // entirely outside cluster state. Reporting none here (rather than resolving them through
-                // that same descriptor seam) is a completeness gap in responses like GET /index, tracked
-                // separately -- the intended fix is to give this method the same plugin-supplied catalog
-                // seam Metadata#index(String) is meant to get.
-                //
-                // It is NOT a filtering-safety gap: that same service now refuses any Add action
-                // for a gated index that carries a filter, an indexRouting/searchRouting value, or a
-                // writeIndex flag, specifically because IndexDescriptor#aliases is a bare List<String> with
-                // nowhere to record any of those, and this method (and filteringAliases below) both used to
-                // assume "no aliases" rather than "no filtered aliases" -- which was true by coincidence,
-                // not by any check. Any alias a gated index holds today is provably unfiltered by
-                // construction, so skipping filter resolution here remains correct.
-                //
-                // Without this `continue` the next line threw a NullPointerException, in production as well
-                // as under assertions, for GET /index on any gated name.
-                continue;
-            }
+            IndexMetadata indexMetadata = indices.get(index);
             List<AliasMetadata> filteredValues = new ArrayList<>();
             for (final AliasMetadata value : indexMetadata.getAliases().values()) {
                 boolean matched = matchAllAliases;
@@ -545,7 +510,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         final Map<String, MappingMetadata> indexMapBuilder = new HashMap<>();
         Arrays.stream(concreteIndices)
             .filter(indices.keySet()::contains)
-            .forEach((idx) -> indexMapBuilder.put(idx, filterFields(indices.get(idx).get().mapping(), fieldFilter.apply(idx))));
+            .forEach((idx) -> indexMapBuilder.put(idx, filterFields(indices.get(idx).mapping(), fieldFilter.apply(idx))));
 
         return Collections.unmodifiableMap(indexMapBuilder);
     }
@@ -559,20 +524,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         final SortedMap<String, IndexAbstraction> lookup = getIndicesLookup();
         for (String indexName : concreteIndices) {
             IndexAbstraction index = lookup.get(indexName);
-            if (index == null) {
-                // A gated index resolves by name and has no abstraction: getIndicesLookup is built from the
-                // metadata map and a gated index is deliberately absent from it. The assertion that stood
-                // here encoded "every concrete index is in the lookup", which gating makes false.
-                //
-                // Skipping is the correct answer rather than a lenient one. Neither IndexDescriptor nor
-                // DescriptorRepresentable can express a parent data stream, so a gated index provably has
-                // none, and reporting none is what this method owes its caller.
-                //
-                // This was a production fault as well as a failed assertion. Assertions are off outside
-                // tests, so the next line dereferenced null and threw -- from GET /index, on a name the
-                // catalog had just accepted as valid.
-                continue;
-            }
+            assert index != null;
             assert index.getType() == IndexAbstraction.Type.CONCRETE_INDEX;
             if (index.getParentDataStream() != null) {
                 builder.put(indexName, index.getParentDataStream());
@@ -827,107 +779,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     }
 
     public IndexMetadata index(String index) {
-        IndexMetadataHolder holder = indices.get(index);
-        return holder == null ? null : holder.get();
-    }
-
-    /**
-     * {@link #index(String)}'s published-metadata-only answer, falling back to
-     * the node's registered {@link IndexCatalog} on a miss. The design was corrected mid-development after
-     * a real regression it surfaced, described below.
-     *
-     * <p><b>Deliberately a separate, explicitly-named method -- not folded into {@link #index(String)}
-     * itself.</b> An earlier version of this change made {@code index(String)} auto-consult the catalog for
-     * every caller, on the premise that every caller "gets it for free" instead of remembering a second
-     * path. That premise turned out to be exactly backwards for a caller that relies on {@code
-     * index(String)}'s null-ness as a <em>distinguishing signal</em> rather than a plain existence check --
-     * confirmed via a real, {@code internalClusterTest}-verified regression: {@code
-     * MetadataDeleteIndexService#deleteIndices} uses {@code currentMetadata.index(index) == null} to decide
-     * whether an index is gated and needs the durable, retried tombstone-write path; auto-resolving there
-     * silently made that check say "no" for a genuinely gated index, and its tombstone stopped being written
-     * durably. This method exists so a caller that explicitly wants the fallback (a small, individually
-     * audited set of call sites) can ask for it by name, while every other caller of {@link #index(String)} --
-     * which is nearly every read path in the codebase, most of which were never audited for this pattern --
-     * keeps exactly its pre-existing behavior, unconditionally, with no auditing required.
-     *
-     * @see IndexCatalog for the full catalog contract, including the guarantee that this never
-     *      reaches a cluster-state-mutation thread.
-     */
-    public IndexMetadata indexOrResolved(String index) {
-        IndexMetadata published = index(index);
-        // The published map is consulted first and short-circuits before anything else is touched, so an
-        // ordinary index costs exactly what index(String) costs even on a node that has a catalog installed.
-        if (published != null || IndexCatalogRegistry.isRegistered() == false) {
-            return published;
-        }
-        // See ClusterStateMutationThreads' own javadoc for the deadlock this refusal prevents: a catalog
-        // may do real (e.g. remote) work to answer, and this thread needs to make progress before that work
-        // could complete on the one thread this codebase already knows must never be blocked this way.
-        if (ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
-            logger.debug("refusing to consult the IndexCatalog for [{}] on {}", index, Thread.currentThread().getName());
-            return null;
-        }
-        return IndexCatalogRegistry.resolveMetadata(this, index);
-    }
-
-    /**
-     * The {@link #indexOrResolved(String)} counterpart to {@link #index(Index)}: the published entry if its
-     * uuid matches, otherwise the catalog's answer if its uuid matches -- a caller with a concrete {@link
-     * Index} has already resolved a name to a uuid, and answering with metadata for a different uuid would
-     * serve a request against a deleted index's successor.
-     */
-    public IndexMetadata indexOrResolved(Index index) {
-        IndexMetadata resolved = indexOrResolved(index.getName());
-        if (resolved != null && resolved.getIndexUUID().equals(index.getUUID())) {
-            return resolved;
-        }
-        return null;
-    }
-
-    /**
-     * Whether a name resolves to something that
-     * exists, consulting the published lookup first and the node's registered {@link IndexCatalog} only on
-     * a miss -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#exists}.
-     *
-     * <p>Deliberately composed from {@link #indexOrResolved(String)} rather than a bespoke check: {@code
-     * AbsentIndexDescriptorSuppliers#exists}'s own body already collapses "no answer" and "a tombstoned
-     * descriptor" into the same false, exactly what {@code indexOrResolved} already does by construction
-     * (its own catalog chain returns null for both). A caller that needs to tell those two apart, or that
-     * needs the underlying descriptor's own fields (uuid, state, aliases), cannot use this method -- that is
-     * a real, narrower set of call sites the migration deliberately left on the static registry, since {@link
-     * IndexCatalog} correctly does not expose plugin-specific descriptor vocabulary.
-     */
-    public boolean existsOrResolved(String indexName) {
-        return getIndicesLookup().containsKey(indexName) || indexOrResolved(indexName) != null;
-    }
-
-    /**
-     * The names among {@code indices} that are
-     * gated, meaning this {@link Metadata} has no entry and the node's registered {@link IndexCatalog} does
-     * -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#gatedAmong}.
-     *
-     * <p>For the operations that cannot be expressed on a resolved index at all, so they can refuse clearly
-     * instead of failing on {@link #getIndexSafe} with "no such index" -- see that static registry's own
-     * javadoc for the full reasoning, unchanged here, only the discovery path is new.
-     */
-    public List<Index> gatedAmong(Index[] indices) {
-        if (indices == null) {
-            return List.of();
-        }
-        List<Index> gated = new ArrayList<>();
-        for (Index index : indices) {
-            if (index(index) == null && indexOrResolved(index) != null) {
-                gated.add(index);
-            }
-        }
-        return gated;
-    }
-
-    /**
-     * The index's entry without materializing it. Callers that only need a name, state, aliases or the
-     * hidden/system flags should prefer this to {@link #index(String)}; anything else should not.
-     */
-    public IndexMetadataHolder indexHolder(String index) {
         return indices.get(index);
     }
 
@@ -964,16 +815,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         throw new IndexNotFoundException(index);
     }
 
-    /**
-     * All indices. Reading an entry materializes it, so a caller that walks this map pays for every
-     * index in the cluster -- see {@link #indexHolders()} where that is not wanted.
-     */
     public Map<String, IndexMetadata> indices() {
-        return this.indicesView;
-    }
-
-    /** All indices, unmaterialized. See {@link IndexMetadataHolder}. */
-    public Map<String, IndexMetadataHolder> indexHolders() {
         return this.indices;
     }
 
@@ -1110,9 +952,9 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
      * @return Whether routing is required according to the mapping for the specified index and type
      */
     public boolean routingRequired(String concreteIndex) {
-        IndexMetadataHolder holder = indices.get(concreteIndex);
-        if (holder != null) {
-            MappingMetadata mappingMetadata = holder.get().mapping();
+        IndexMetadata indexMetadata = indices.get(concreteIndex);
+        if (indexMetadata != null) {
+            MappingMetadata mappingMetadata = indexMetadata.mapping();
             if (mappingMetadata != null) {
                 return mappingMetadata.routingRequired();
             }
@@ -1122,7 +964,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
     @Override
     public Iterator<IndexMetadata> iterator() {
-        return indicesView.values().iterator();
+        return indices.values().iterator();
     }
 
     public static boolean isGlobalStateEquals(Metadata metadata1, Metadata metadata2) {
@@ -1225,14 +1067,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         private final Settings transientSettings;
         private final Settings persistentSettings;
         private final Diff<DiffableStringMap> hashesOfConsistentSettings;
-        /**
-         * Declared as the concrete {@link DiffableUtils.MapDiff} rather than {@code Diff} so
-         * {@link #apply} can walk the deletes/diffs/upserts itself and leave every other index's holder
-         * alone. Going through {@code Diff#apply(Map)} would need the whole map as
-         * {@code Map<String, IndexMetadata>}, which materializes every deferred index on every applied
-         * cluster state -- the exact cost this storage split exists to avoid.
-         */
-        private final DiffableUtils.MapDiff<String, IndexMetadataHolder, Map<String, IndexMetadataHolder>> indices;
+        private final Diff<Map<String, IndexMetadata>> indices;
         private final Diff<Map<String, IndexTemplateMetadata>> templates;
         private final Diff<Map<String, Custom>> customs;
 
@@ -1244,12 +1079,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             transientSettings = after.transientSettings;
             persistentSettings = after.persistentSettings;
             hashesOfConsistentSettings = after.hashesOfConsistentSettings.diff(before.hashesOfConsistentSettings);
-            indices = DiffableUtils.diff(
-                before.indices,
-                after.indices,
-                DiffableUtils.getStringKeySerializer(),
-                IndexMetadataHolderSerializer.INSTANCE
-            );
+            indices = DiffableUtils.diff(before.indices, after.indices, DiffableUtils.getStringKeySerializer());
             templates = DiffableUtils.diff(
                 before.templates.getTemplates(),
                 after.templates.getTemplates(),
@@ -1258,6 +1088,8 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             customs = DiffableUtils.diff(before.customs, after.customs, DiffableUtils.getStringKeySerializer(), CUSTOM_VALUE_SERIALIZER);
         }
 
+        private static final DiffableUtils.DiffableValueReader<String, IndexMetadata> INDEX_METADATA_DIFF_VALUE_READER =
+            new DiffableUtils.DiffableValueReader<>(IndexMetadata::readFrom, IndexMetadata::readDiffFrom);
         private static final DiffableUtils.DiffableValueReader<String, IndexTemplateMetadata> TEMPLATES_DIFF_VALUE_READER =
             new DiffableUtils.DiffableValueReader<>(IndexTemplateMetadata::readFrom, IndexTemplateMetadata::readDiffFrom);
 
@@ -1269,7 +1101,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             transientSettings = Settings.readSettingsFromStream(in);
             persistentSettings = Settings.readSettingsFromStream(in);
             hashesOfConsistentSettings = DiffableStringMap.readDiffFrom(in);
-            indices = DiffableUtils.readJdkMapDiff(in, DiffableUtils.getStringKeySerializer(), IndexMetadataHolderSerializer.INSTANCE);
+            indices = DiffableUtils.readJdkMapDiff(in, DiffableUtils.getStringKeySerializer(), INDEX_METADATA_DIFF_VALUE_READER);
             templates = DiffableUtils.readJdkMapDiff(in, DiffableUtils.getStringKeySerializer(), TEMPLATES_DIFF_VALUE_READER);
             customs = DiffableUtils.readJdkMapDiff(in, DiffableUtils.getStringKeySerializer(), CUSTOM_VALUE_SERIALIZER);
         }
@@ -1290,12 +1122,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
         @Override
         public Metadata apply(Metadata part) {
-            // Hand the builder the pre-diff metadata as the reuse reference only -- deliberately not
-            // builder(part), which would also seed the index map and make the putAll in indices()
-            // below unable to express deletions. With the reference set, an unchanged index set lets
-            // build() reuse the previous indicesLookup and derived arrays instead of rebuilding them,
-            // which every node would otherwise redo on every metadata-touching cluster state.
-            Builder builder = builder().previousMetadata(part);
+            Builder builder = builder();
             builder.clusterUUID(clusterUUID);
             builder.clusterUUIDCommitted(clusterUUIDCommitted);
             builder.version(version);
@@ -1303,179 +1130,10 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             builder.transientSettings(transientSettings);
             builder.persistentSettings(persistentSettings);
             builder.hashesOfConsistentSettings(hashesOfConsistentSettings.apply(part.hashesOfConsistentSettings));
-            builder.indexHolders(indices.apply(part.indices));
+            builder.indices(indices.apply(part.indices));
             builder.templates(templates.apply(part.templates.getTemplates()));
             builder.customs(customs.apply(part.customs));
             return builder.build();
-        }
-    }
-
-    /**
-     * Lets the index map be diffed while its values are still {@link IndexMetadataHolder}.
-     *
-     * <p>Values go onto the wire as the {@link IndexMetadata} they resolve to and come back off it as
-     * {@link IndexMetadata}, so the serialized form is exactly what it was before {@link Metadata}
-     * started storing holders. What this buys is on the two ends the wire does not see: computing a
-     * diff compares holders, and two cluster states that share an unchanged index share its holder
-     * instance, so that comparison is settled by {@code equals} without materializing anything;
-     * applying a diff (see {@link MetadataDiff#apply}) touches only the indices that actually changed.
-     */
-    private static final class IndexMetadataHolderSerializer implements DiffableUtils.ValueSerializer<String, IndexMetadataHolder> {
-
-        static final IndexMetadataHolderSerializer INSTANCE = new IndexMetadataHolderSerializer();
-
-        @Override
-        public void write(IndexMetadataHolder value, StreamOutput out) throws IOException {
-            value.get().writeTo(out);
-        }
-
-        @Override
-        public IndexMetadataHolder read(StreamInput in, String key) throws IOException {
-            return IndexMetadata.readFrom(in);
-        }
-
-        @Override
-        public boolean supportsDiffableValues() {
-            return true;
-        }
-
-        @Override
-        public Diff<IndexMetadataHolder> diff(IndexMetadataHolder value, IndexMetadataHolder beforePart) {
-            return new IndexMetadataHolderDiff(value.get().diff(beforePart.get()));
-        }
-
-        @Override
-        public void writeDiff(Diff<IndexMetadataHolder> value, StreamOutput out) throws IOException {
-            value.writeTo(out);
-        }
-
-        @Override
-        public Diff<IndexMetadataHolder> readDiff(StreamInput in, String key) throws IOException {
-            return new IndexMetadataHolderDiff(IndexMetadata.readDiffFrom(in));
-        }
-    }
-
-    /** An {@link IndexMetadata} diff seen as a diff of the holder that wraps it. */
-    private static final class IndexMetadataHolderDiff implements Diff<IndexMetadataHolder> {
-
-        private final Diff<IndexMetadata> delegate;
-
-        IndexMetadataHolderDiff(Diff<IndexMetadata> delegate) {
-            this.delegate = delegate;
-        }
-
-        @Override
-        public IndexMetadataHolder apply(IndexMetadataHolder part) {
-            // Only reached for an index this diff actually changes, so materializing here is the point
-            // at which the work was always going to happen.
-            return delegate.apply(part.get());
-        }
-
-        @Override
-        public void writeTo(StreamOutput out) throws IOException {
-            delegate.writeTo(out);
-        }
-    }
-
-    /**
-     * The holder map seen as {@code Map<String, IndexMetadata>}, materializing an entry when it is
-     * read and not before. Key-only operations ({@code size}, {@code containsKey}, {@code keySet}) go
-     * straight to the underlying map and materialize nothing; walking {@code values()} or
-     * {@code entrySet()} materializes everything it walks past.
-     *
-     * <p>Read-only, like the {@code Collections.unmodifiableMap} it replaced: the inherited mutators
-     * throw and the iterator does not support removal.
-     */
-    private static final class ResolvingIndexMap extends AbstractMap<String, IndexMetadata> {
-
-        private final Map<String, IndexMetadataHolder> holders;
-
-        ResolvingIndexMap(Map<String, IndexMetadataHolder> holders) {
-            this.holders = holders;
-        }
-
-        @Override
-        public IndexMetadata get(Object key) {
-            IndexMetadataHolder holder = holders.get(key);
-            return holder == null ? null : holder.get();
-        }
-
-        @Override
-        public boolean containsKey(Object key) {
-            return holders.containsKey(key);
-        }
-
-        @Override
-        public int size() {
-            return holders.size();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return holders.isEmpty();
-        }
-
-        @Override
-        public Set<String> keySet() {
-            return holders.keySet();
-        }
-
-        /**
-         * Overridden rather than inherited from {@link AbstractMap}, which would route every value
-         * through {@link #entrySet()} and allocate an entry per index. {@link Metadata#iterator()} and
-         * {@code indices().values()} are common enough that the garbage is worth avoiding.
-         */
-        @Override
-        public Collection<IndexMetadata> values() {
-            return new AbstractCollection<IndexMetadata>() {
-                @Override
-                public Iterator<IndexMetadata> iterator() {
-                    final Iterator<IndexMetadataHolder> delegate = holders.values().iterator();
-                    return new Iterator<IndexMetadata>() {
-                        @Override
-                        public boolean hasNext() {
-                            return delegate.hasNext();
-                        }
-
-                        @Override
-                        public IndexMetadata next() {
-                            return delegate.next().get();
-                        }
-                    };
-                }
-
-                @Override
-                public int size() {
-                    return holders.size();
-                }
-            };
-        }
-
-        @Override
-        public Set<Map.Entry<String, IndexMetadata>> entrySet() {
-            return new AbstractSet<Map.Entry<String, IndexMetadata>>() {
-                @Override
-                public Iterator<Map.Entry<String, IndexMetadata>> iterator() {
-                    final Iterator<Map.Entry<String, IndexMetadataHolder>> delegate = holders.entrySet().iterator();
-                    return new Iterator<Map.Entry<String, IndexMetadata>>() {
-                        @Override
-                        public boolean hasNext() {
-                            return delegate.hasNext();
-                        }
-
-                        @Override
-                        public Map.Entry<String, IndexMetadata> next() {
-                            Map.Entry<String, IndexMetadataHolder> entry = delegate.next();
-                            return new AbstractMap.SimpleImmutableEntry<>(entry.getKey(), entry.getValue().get());
-                        }
-                    };
-                }
-
-                @Override
-                public int size() {
-                    return holders.size();
-                }
-            };
         }
     }
 
@@ -1558,12 +1216,10 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         private Settings persistentSettings = Settings.Builder.EMPTY_SETTINGS;
         private DiffableStringMap hashesOfConsistentSettings = new DiffableStringMap(Collections.emptyMap());
 
-        private final Map<String, IndexMetadataHolder> indices;
+        private final Map<String, IndexMetadata> indices;
         private final Map<String, IndexTemplateMetadata> templates;
         private final Map<String, Custom> customs;
-        // Not final: callers that build the index map themselves rather than seeding it from a
-        // previous Metadata still want the lookup-reuse check. See #previousMetadata(Metadata).
-        private Metadata previousMetadata;
+        private final Metadata previousMetadata;
 
         private Map<String, SortedMap<Long, String>> systemTemplatesLookup;
 
@@ -1590,36 +1246,11 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             this.previousMetadata = metadata;
         }
 
-        /**
-         * Supplies the previous {@link Metadata} purely so {@link #build()} can evaluate its
-         * incremental lookup-reuse check, <em>without</em> seeding this builder's indices, templates
-         * or customs from it.
-         *
-         * <p>This exists because {@link #Builder(Metadata)} does both at once, and that combination
-         * is wrong for callers that already hold the complete post-change index map -- notably
-         * {@link MetadataDiff#apply}. {@link #indices(Map)} is a {@code putAll} and therefore cannot
-         * express a deletion, so seeding from the previous metadata and then applying the new map
-         * would silently resurrect deleted indices. Setting only the reuse reference avoids that
-         * while still letting an unchanged index set skip the full {@code indicesLookup} rebuild.
-         *
-         * <p>The reuse check itself remains the guard on correctness: {@link #build()} recomputes
-         * whenever the index map differs (including alias changes, which live inside
-         * {@link IndexMetadata} and so make it unequal) or data-stream metadata changes.
-         */
-        public Builder previousMetadata(Metadata previousMetadata) {
-            this.previousMetadata = previousMetadata;
-            return this;
-        }
-
         public Builder put(IndexMetadata.Builder indexMetadataBuilder) {
             // we know its a new one, increment the version and store
             indexMetadataBuilder.version(indexMetadataBuilder.version() + 1);
             IndexMetadata indexMetadata = indexMetadataBuilder.build();
             indices.put(indexMetadata.getIndex().getName(), indexMetadata);
-            // The builder overload, which is what close and alias updates use. Hooking only the other one
-            // left the descriptor stale for exactly those, and the test that caught it asserted the state
-            // after a close rather than that some descriptor existed.
-            publishDescriptorIfIncremental(indexMetadata);
             return this;
         }
 
@@ -1632,43 +1263,10 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 indexMetadata = IndexMetadata.builder(indexMetadata).version(indexMetadata.getVersion() + 1).build();
             }
             indices.put(indexMetadata.getIndex().getName(), indexMetadata);
-            publishDescriptorIfIncremental(indexMetadata);
             return this;
         }
 
-        /**
-         * Records the descriptor for an index whose metadata just changed, so an index whose metadata
-         * lives off cluster state stays current.
-         *
-         * <p>Hooked at the two {@code put} overloads rather than at each of the twelve services that
-         * update index metadata, because enumerating those call sites is how a writer gets missed. Closing
-         * an index, changing an alias and resharding all arrive here.
-         *
-         * <p><b>Only when this builder is incremental</b>, which is what {@code previousMetadata} being
-         * present means. A builder started from scratch is rebuilding the whole world rather than changing
-         * one index: gateway recovery, remote cluster state restore and reading metadata from disk all do
-         * that, and publishing from them would mean a descriptor write per index on every recovery. At a
-         * hundred million indices that is slower than the recovery it accompanies.
-         *
-         * <p>Diff application sets {@code previousMetadata} too, so a state received from the cluster
-         * manager still publishes what changed in it. That is the case this must not skip, and it is why
-         * the discriminator is "did this builder start from an existing metadata" rather than "was this
-         * built locally".
-         */
-        private void publishDescriptorIfIncremental(IndexMetadata indexMetadata) {
-            if (previousMetadata == null) {
-                return;
-            }
-            ClaimedIndexLifecycleRegistry.recordChange(indexMetadata);
-        }
-
         public IndexMetadata get(String index) {
-            IndexMetadataHolder holder = indices.get(index);
-            return holder == null ? null : holder.get();
-        }
-
-        /** The index's entry without materializing it. See {@link IndexMetadataHolder}. */
-        public IndexMetadataHolder getHolder(String index) {
             return indices.get(index);
         }
 
@@ -1700,30 +1298,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
         public Builder indices(final Map<String, IndexMetadata> indices) {
             this.indices.putAll(indices);
-            return this;
-        }
-
-        /**
-         * Same as {@link #indices(Map)} but taking the entries unmaterialized, so a deferred index
-         * stays deferred. Note this is a {@code putAll} and so cannot express a deletion.
-         */
-        public Builder indexHolders(final Map<String, IndexMetadataHolder> indices) {
-            this.indices.putAll(indices);
-            return this;
-        }
-
-        /**
-         * Adds an index that will be materialized only if something reads it -- the point of
-         * {@link IndexMetadataHolder}. Nothing in core does this; it exists for a metadata store that
-         * can fetch one index at a time and would rather not hold every index resident.
-         *
-         * <p>The holder's descriptor (name, UUID, state, aliases, hidden and system flags, shard
-         * count, routing pool) must agree with what {@link IndexMetadataHolder#get()} would return, or
-         * the derived index arrays and {@code indicesLookup} will disagree with the metadata they
-         * describe.
-         */
-        public Builder putStub(final IndexMetadataHolder indexMetadata) {
-            indices.put(indexMetadata.getIndex().getName(), indexMetadata);
             return this;
         }
 
@@ -1929,7 +1503,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 indices = this.indices.keySet().toArray(new String[0]);
             }
             for (String index : indices) {
-                IndexMetadata indexMetadata = get(index);
+                IndexMetadata indexMetadata = this.indices.get(index);
                 if (indexMetadata == null) {
                     throw new IndexNotFoundException(index);
                 }
@@ -1947,7 +1521,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
          */
         public Builder updateNumberOfReplicas(final int numberOfReplicas, final String[] indices) {
             for (String index : indices) {
-                IndexMetadata indexMetadata = get(index);
+                IndexMetadata indexMetadata = this.indices.get(index);
                 if (indexMetadata == null) {
                     throw new IndexNotFoundException(index);
                 }
@@ -1965,7 +1539,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
          */
         public Builder updateNumberOfSearchReplicas(final int numberOfSearchReplicas, final String[] indices) {
             for (String index : indices) {
-                IndexMetadata indexMetadata = get(index);
+                IndexMetadata indexMetadata = this.indices.get(index);
                 if (indexMetadata == null) {
                     throw new IndexNotFoundException(index);
                 }
@@ -2079,7 +1653,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         }
 
         protected Metadata buildMetadataWithPreviousIndicesLookups() {
-            Metadata built = new Metadata(
+            return new Metadata(
                 clusterUUID,
                 clusterUUIDCommitted,
                 version,
@@ -2099,7 +1673,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 Collections.unmodifiableSortedMap(previousMetadata.indicesLookup),
                 systemTemplatesLookup
             );
-            return built;
         }
 
         protected Metadata buildMetadataWithRecomputedIndicesLookups() {
@@ -2115,12 +1688,11 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             final List<String> allClosedIndices = new ArrayList<>();
             final List<String> visibleClosedIndices = new ArrayList<>();
             final Set<String> allAliases = new HashSet<>();
-            // Descriptor-level reads only, so a deferred index survives a full rebuild of these arrays.
-            for (final IndexMetadataHolder indexMetadata : indices.values()) {
+            for (final IndexMetadata indexMetadata : indices.values()) {
                 final String name = indexMetadata.getIndex().getName();
                 boolean added = allIndices.add(name);
                 assert added : "double index named [" + name + "]";
-                final boolean visible = indexMetadata.isHidden() == false;
+                final boolean visible = IndexMetadata.INDEX_HIDDEN_SETTING.get(indexMetadata.getSettings()) == false;
                 if (visible) {
                     visibleIndices.add(name);
                 }
@@ -2151,7 +1723,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             ArrayList<String> duplicates = new ArrayList<>();
             if (aliasDuplicatesWithIndices.isEmpty() == false) {
                 // iterate again and constructs a helpful message
-                for (final IndexMetadataHolder cursor : indices.values()) {
+                for (final IndexMetadata cursor : indices.values()) {
                     for (String alias : aliasDuplicatesWithIndices) {
                         if (cursor.getAliases().containsKey(alias)) {
                             duplicates.add(alias + " (alias of " + cursor.getIndex() + ") conflicts with index");
@@ -2164,7 +1736,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             aliasDuplicatesWithDataStreams.retainAll(allDataStreams);
             if (aliasDuplicatesWithDataStreams.isEmpty() == false) {
                 // iterate again and constructs a helpful message
-                for (final IndexMetadataHolder cursor : indices.values()) {
+                for (final IndexMetadata cursor : indices.values()) {
                     for (String alias : aliasDuplicatesWithDataStreams) {
                         if (cursor.getAliases().containsKey(alias)) {
                             duplicates.add(alias + " (alias of " + cursor.getIndex() + ") conflicts with data stream");
@@ -2205,7 +1777,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             String[] allClosedIndicesArray = allClosedIndices.toArray(Strings.EMPTY_ARRAY);
             String[] visibleClosedIndicesArray = visibleClosedIndices.toArray(Strings.EMPTY_ARRAY);
 
-            Metadata built = new Metadata(
+            return new Metadata(
                 clusterUUID,
                 clusterUUIDCommitted,
                 version,
@@ -2225,7 +1797,6 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 indicesLookup,
                 systemTemplatesLookup
             );
-            return built;
         }
 
         private SortedMap<String, IndexAbstraction> buildIndicesLookup() {
@@ -2235,12 +1806,9 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             // If there are no indices, then skip data streams. This happens only when metadata is read from disk
             if (dataStreamMetadata != null && indices.size() > 0) {
                 for (DataStream dataStream : dataStreamMetadata.dataStreams().values()) {
-                    // IndexAbstraction.DataStream is @PublicApi and still takes materialized metadata,
-                    // so a data stream's backing indices are materialized here. Concrete indices and
-                    // aliases -- the overwhelming majority -- are not; see IndexAbstraction.Index.
                     List<IndexMetadata> backingIndices = dataStream.getIndices()
                         .stream()
-                        .map(index -> indices.get(index.getName()).get())
+                        .map(index -> indices.get(index.getName()))
                         .collect(Collectors.toList());
                     assert backingIndices.isEmpty() == false;
                     assert backingIndices.contains(null) == false;
@@ -2257,7 +1825,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 }
             }
 
-            for (final IndexMetadataHolder indexMetadata : indices.values()) {
+            for (final IndexMetadata indexMetadata : indices.values()) {
                 IndexAbstraction.Index index;
                 DataStream parent = indexToDataStreamLookup.get(indexMetadata.getIndex().getName());
                 if (parent != null) {

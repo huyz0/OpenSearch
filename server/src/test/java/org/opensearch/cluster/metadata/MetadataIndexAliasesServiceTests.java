@@ -72,8 +72,7 @@ public class MetadataIndexAliasesServiceTests extends OpenSearchTestCase {
         null,
         aliasValidator,
         deleteIndexService,
-        xContentRegistry(),
-        ClaimedIndexLifecycleRegistry.get()
+        xContentRegistry()
     );
 
     public MetadataIndexAliasesServiceTests() {
