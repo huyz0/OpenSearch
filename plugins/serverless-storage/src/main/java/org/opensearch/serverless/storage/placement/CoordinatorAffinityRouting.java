@@ -15,7 +15,6 @@ import org.opensearch.common.hash.MurmurHash3;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 
 /**
@@ -62,21 +61,37 @@ public final class CoordinatorAffinityRouting {
         for (DiscoveryNode node : nodes) {
             nodeIds.add(node.getId());
         }
-        Collections.sort(nodeIds);
-
+        // Not sorted, which it used to be on every call.
+        //
+        // Rendezvous hashing is order-independent by construction -- the winner is the maximum of a set of
+        // per-node weights, and a maximum does not care what order it is taken in. The sort was there to
+        // make a tie deterministic, and that job now belongs to getAffinityNodeId's own tie-break, which
+        // resolves ties to the lexicographically smallest node id: exactly what the sort produced, without
+        // the sort. The answer for any input is unchanged.
+        //
+        // It is worth removing rather than leaving because of who calls this. GatedIndexPrewarmer runs
+        // this once per active gated index on every node on every data-node join, so the sort was
+        // O(indices x nodes log nodes) of allocation and comparison on a membership change, to compute
+        // something that never needed the ordering.
         String bestNodeId = getAffinityNodeId(indexName, nodeIds);
         return bestNodeId != null ? nodes.get(bestNodeId) : null;
     }
 
     /**
-     * Computes the preferred node ID for an index name among a list of sorted node IDs.
+     * Computes the preferred node ID for an index name among a list of candidate node IDs.
+     *
+     * <p>The list no longer has to be sorted, and the parameter name kept saying it did. Rendezvous
+     * hashing takes a maximum over per-node weights, which is order-independent; the only thing ordering
+     * ever settled was a tie, and the tie-break below settles it explicitly instead -- to the
+     * lexicographically smallest node id, which is precisely what a sorted list produced. Callers that
+     * still pass a sorted list get the same answer they always did.
      *
      * @param indexName the name of the index
-     * @param sortedNodeIds sorted list of candidate node IDs
+     * @param nodeIds candidate node IDs, in any order
      * @return the node ID with highest rendezvous weight, or null if empty
      */
-    public static String getAffinityNodeId(String indexName, List<String> sortedNodeIds) {
-        if (indexName == null || sortedNodeIds == null || sortedNodeIds.isEmpty()) {
+    public static String getAffinityNodeId(String indexName, List<String> nodeIds) {
+        if (indexName == null || nodeIds == null || nodeIds.isEmpty()) {
             return null;
         }
 
@@ -86,10 +101,13 @@ public final class CoordinatorAffinityRouting {
         String bestNodeId = null;
         long maxWeight = Long.MIN_VALUE;
 
-        for (String nodeId : sortedNodeIds) {
+        for (String nodeId : nodeIds) {
             byte[] nodeIdBytes = nodeId.getBytes(StandardCharsets.UTF_8);
             long weight = MurmurHash3.hash128(nodeIdBytes, 0, nodeIdBytes.length, indexHash, new MurmurHash3.Hash128()).h1;
-            if (weight > maxWeight) {
+            // The tie-break is the sort's only remaining job, done here where it costs one comparison on
+            // the vanishingly rare equal weight rather than an O(n log n) sort on every call. Smallest id
+            // wins, which is the node a sorted list would have reached first.
+            if (weight > maxWeight || (weight == maxWeight && bestNodeId != null && nodeId.compareTo(bestNodeId) < 0)) {
                 maxWeight = weight;
                 bestNodeId = nodeId;
             }

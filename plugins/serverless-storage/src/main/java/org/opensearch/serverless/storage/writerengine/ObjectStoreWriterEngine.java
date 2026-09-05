@@ -111,6 +111,16 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     /** Same well-inside-the-TTL rationale as {@link #DIRECTORY_REFRESH_INTERVAL}. */
     private static final TimeValue LEASE_RENEWAL_INTERVAL = TimeValue.timeValueMillis(LEASE_TTL_MILLIS / 3);
 
+    /**
+     * The publish retry budget and its jittered exponential backoff bounds -- see {@link
+     * #publishWithRetry}'s own javadoc for why these exist at all and why the budget is modest
+     * (the backoff runs under the flush lock). Worst case is roughly 100 + 200 + 400 + 800 ms of
+     * ceiling, i.e. under 1.5 s of expected total wait, spread randomly.
+     */
+    static final int PUBLISH_ATTEMPTS = 5;
+    private static final long PUBLISH_BASE_BACKOFF_MILLIS = 100;
+    private static final long PUBLISH_MAX_BACKOFF_MILLIS = 2_000;
+
     private final ObjectStoreCommitHeadPublisher headPublisher;
     private final String indexUuid;
     private final int shardId;
@@ -123,12 +133,13 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
     /**
      * Whether {@link #walChunkService}'s {@code WalShardRegistry} registration has ever succeeded
-     * for this shard -- {@code true} makes {@link #registerWalShardIfNeeded} a no-op. Registration
-     * is retried on every {@link #renewLease} tick until it succeeds once, not just attempted once
-     * at construction: {@code WalGcSchedulerTask}'s safety bound is computed only over registered
-     * shards, so a shard that never registers is invisible to it and its WAL chunks could be GC'd
-     * while still needed for recovery -- a real data-loss gap a single, never-retried attempt left
-     * open.
+     * for this shard -- {@code true} makes {@link #registerWalShardIfNeeded} a no-op. Set by {@link
+     * #registerWalShardMandatory} during construction, which is now a hard precondition for this
+     * engine existing at all rather than a best-effort attempt: {@code WalGcSchedulerTask}'s safety
+     * bound is computed only over registered shards, so a shard that writes chunks while
+     * unregistered is invisible to it and its chunks can be deleted while still needed for recovery.
+     * {@link #renewLease}'s tick-level retry is kept purely as a safety net (see {@link
+     * #registerWalShardIfNeeded}), not as the mechanism.
      */
     private final AtomicBoolean walShardRegistered = new AtomicBoolean(false);
     /**
@@ -256,6 +267,47 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     // initializer here (even "= null") would execute afterward and clobber the value the override
     // assigns during super(). See rfc-serverless-opensearch.md &sect;7.1.1.
     private ObjectStoreDurabilityTranslogDeletionPolicy translogDeletionPolicy;
+
+    /**
+     * The manifest <em>this engine itself</em> most recently published, or {@code null} until it has
+     * published one. It is the delta base for the next publish (rfc-serverless-opensearch.md
+     * &sect;6.2: a bundle carries "the new files of one or more commits," not a full-shard rewrite
+     * per publication) -- see {@code ObjectStoreCommitPublisher}'s "delta bundling" javadoc.
+     *
+     * <p>Deliberately this engine's own in-memory record, never a manifest read back from the store.
+     * Carrying a file reference forward is only sound when the file name in the new commit and the
+     * file name in the base manifest come from the same continuously-running local {@code
+     * IndexWriter}, where Lucene's own file naming guarantees a name is never reused with different
+     * content. A manifest published by a compactor or by a previous writer describes a
+     * <em>different</em> Lucene index for the same shard, in which {@code _0.cfs} can perfectly well
+     * be different bytes. {@code ObjectStoreCommitHeadPublisher} additionally verifies that the live
+     * head still points at exactly this manifest before using it, so a compaction landing in between
+     * simply costs one full bundle and then delta bundling resumes.
+     *
+     * <p>Not volatile: written and read only from inside {@link #commitIndexWriter}, which
+     * {@code InternalEngine#flush} serialises under its own flush lock.
+     */
+    private CommitManifest lastPublishedManifest;
+
+    /**
+     * The fencing token this engine's own lease acquisition installed on the shard head -- {@code
+     * ShardHead#leaseTerm} at the moment this node took the lease. Presented on every publish, where
+     * {@code ShardHead#isStillHeldBy} refuses if the head no longer records this exact tenancy.
+     *
+     * <p>This exists because the primary term cannot serve as the fencing token for a gated index:
+     * {@code IndexDescriptor.FIRST_PRIMARY_TERM} is {@code 1} for every such shard and nothing
+     * advances it, so the old {@code leaseTerm > primaryTerm} comparison was {@code 1 > 1} and the
+     * refusal branch was unreachable -- two nodes could both believe they held the shard and both
+     * publish complete, divergent manifest lineages. The lease term in the shard head, advanced
+     * strictly on every takeover through the object store's own compare-and-swap, is the token
+     * instead; see {@code ObjectStoreCommitHeadPublisher#acquireOrRenewLease}.
+     *
+     * <p>Assigned once in the constructor (before this engine is usable) and only ever re-read; a
+     * renewal that comes back with a <em>different</em> token means this node was displaced and later
+     * re-acquired, which {@link #renewLease} treats as fatal rather than as a token refresh.
+     * Volatile because the renewal tick runs on {@code GENERIC} while publishes run on flush threads.
+     */
+    private volatile long acquiredLeaseTerm = -1L;
 
     // Same no-initializer pattern as translogDeletionPolicy above: createTranslogManager
     // (overridden below) is also called from inside super(engineConfig). Stays null when
@@ -598,7 +650,23 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this.walChunkService = walChunkService;
         this.encryptionKeyProvider = encryptionKeyProvider;
         this.dedicatedWalGcSchedulerTask = dedicatedWalGcSchedulerTask;
-        registerWalShardIfNeeded();
+        if (walChunkService == null) {
+            // rfc-serverless-opensearch.md &sect;13 says writes must "degrade to rejection, never to
+            // silent un-durability." With WAL mirroring off, this shard's only durability against
+            // node loss is the manifest published at flush: everything acknowledged after it is gone
+            // on node loss, with no error anywhere, and these shards have zero writer replicas by
+            // design so node loss is the expected failure, not a rare one. Nothing here can fix that
+            // (turning the feature on is a node-setting decision, not this engine's), but it must
+            // not be silent -- see this class's own report entry D5 and the
+            // serverless_storage.wal_mirroring.enabled setting's javadoc.
+            logger.warn(
+                "shard [{}][{}] is activating with WAL mirroring DISABLED: every write acknowledged since this shard's last "
+                    + "published manifest will be lost, silently, if this node is lost. Enable "
+                    + "serverless_storage.wal_mirroring.enabled for durability against node loss.",
+                indexUuid,
+                shardId
+            );
+        }
         // Acquired synchronously, before this engine is usable, so the lease is visible to any
         // observability/diagnostics code that inspects it (see acquireOrRenewLease's javadoc --
         // fencing correctness itself lives entirely in publishCommitAsHead, not here; compaction no
@@ -609,19 +677,27 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         // called for it, since a constructor that throws never produces an object for a caller to
         // close.
         try {
-            boolean acquired = headPublisher.acquireOrRenewLease(
+            // Before the lease, and before anything writes a WAL chunk: see
+            // registerWalShardMandatory's own javadoc for why an unregistered writer must not come
+            // up at all. Inside this try so its EngineException gets the same close-super treatment
+            // the lease failure below already has.
+            registerWalShardMandatory();
+            long now = System.currentTimeMillis();
+            java.util.OptionalLong acquired = headPublisher.acquireOrRenewLease(
                 indexUuid,
                 shardId,
                 engineConfig.getPrimaryTermSupplier().getAsLong(),
                 localNodeId,
-                System.currentTimeMillis() + LEASE_TTL_MILLIS
+                now + LEASE_TTL_MILLIS,
+                now
             );
-            if (acquired == false) {
+            if (acquired.isEmpty()) {
                 throw new EngineException(
                     engineConfig.getShardId(),
-                    "failed to acquire writer lease: a newer primary term already holds this shard's head"
+                    "failed to acquire writer lease: another node holds a live lease on this shard's head"
                 );
             }
+            this.acquiredLeaseTerm = acquired.getAsLong();
         } catch (EngineException e) {
             IOUtils.closeWhileHandlingException(super::close);
             throw e;
@@ -931,6 +1007,24 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     }
 
     /**
+     * Runs one lease-renewal tick synchronously instead of waiting out {@link
+     * #LEASE_RENEWAL_INTERVAL} -- test-only visibility, so a test can assert what {@link #renewLease}
+     * does with a "you have been superseded" answer without a 10-second sleep.
+     */
+    void renewLeaseForTesting() {
+        renewLease();
+    }
+
+    /**
+     * Whether this engine has been failed -- test-only visibility. Reads {@code Engine#failedEngine},
+     * which is {@code protected} and therefore only reachable from a subclass like this one, so a
+     * same-package test cannot check it directly.
+     */
+    boolean isEngineFailedForTesting() {
+        return failedEngine.get() != null;
+    }
+
+    /**
      * See {@link #activationWalPosition}'s own javadoc -- test-only visibility. Public, not
      * package-private like this class's other test-only accessors, specifically so a real
      * multi-node {@code internalClusterTest} (a different Gradle source set/package than this
@@ -1001,10 +1095,13 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * Fetches, filters, and decodes the WAL operations this shard needs to catch up on between the
      * last durably-published manifest and this writer's own {@link #activationWalPosition} --
      * {@code plugins/serverless-storage/formal/WalReplayFencing.tla}'s verified {@code FixedReplay}
-     * design, via {@link WalReplayRecovery}. The term floor passed is one term back from what this
-     * writer is activating under ({@code WalReplayFencing.tla}'s {@code ReplayFloor}), so a
-     * predecessor's legitimately-durable-but-not-yet-manifested records are not wrongly excluded by
-     * term alone -- see {@link org.opensearch.serverless.storage.wal.WalChunkReader
+     * design, via {@link WalReplayRecovery}. The term floor passed is the primary term of the last
+     * published manifest -- the boundary this replay actually starts from ({@code
+     * WalReplayFencing.tla}'s {@code ReplayFloor}) -- so a predecessor's
+     * legitimately-durable-but-not-yet-manifested records are not wrongly excluded by term alone,
+     * no matter how many terms since that manifest failed to publish anything. See the inline
+     * comment in the body for the two-failed-activations sequence that {@code currentTerm - 1} used
+     * to silently drop, and {@link org.opensearch.serverless.storage.wal.WalChunkReader
      * #filterByShardAndMinimumTerm}'s own javadoc for why that term filter needs the position
      * cutoff alongside it.
      *
@@ -1023,11 +1120,27 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         if (walChunkService == null) {
             return List.of();
         }
-        long currentTerm = engineConfig.getPrimaryTermSupplier().getAsLong();
-        long minPrimaryTerm = currentTerm - 1;
         Optional<CommitManifest> latestManifest = headPublisher.readLatestManifest(indexUuid, shardId);
         WalPosition lastDurableWalPosition = latestManifest.map(CommitManifest::walPosition).orElse(null);
-        return WalReplayRecovery.replayOperations(
+        // The term floor comes from the boundary that actually matters -- the term of the manifest
+        // whose WalPosition is this replay's own start -- NOT from arithmetic on the current term.
+        //
+        // It used to be currentTerm - 1, i.e. "one term back," which is only enough if every term
+        // published at least one manifest. Two consecutive failed activations break that, and they
+        // are not exotic: a writer at T1 acks WAL-durable records; the node dies; the term bumps to
+        // T2; T2's engine activates, replays T1's records locally, and dies again (OOM, node kill, a
+        // failed allocation, a publish failure) before it flushes anything; the term bumps to T3. T3
+        // then reads the last manifest -- still T1's -- and replays with floor T2, filtering out
+        // every T1-tagged record. Acknowledged data silently gone, and worse, the manifest's own
+        // WalPosition claims those chunks are covered, so WalGcSchedulerTask deletes them.
+        //
+        // Anything durable *after* the last published manifest was necessarily written under a term
+        // >= that manifest's own term, so that term is the correct, tight floor no matter how many
+        // terms since then failed to publish. 0 when nothing has ever been published (replay
+        // everything the position cutoff allows). The two-sided FixedReplay property of
+        // WalReplayFencing.tla is preserved: activationWalPosition remains the upper bound.
+        long minPrimaryTerm = latestManifest.map(CommitManifest::primaryTerm).orElse(0L);
+        WalReplayRecovery.ReplayResult result = WalReplayRecovery.replayOperationsWithReport(
             walChunkService.blobContainer(),
             indexUuid,
             shardId,
@@ -1036,6 +1149,20 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             activationWalPosition,
             encryptionKeyProvider
         );
+        if (result.isIncomplete()) {
+            // Surfaced at shard level rather than left as a log line inside the WAL layer (see
+            // WalReplayRecovery.ReplayResult's own javadoc): a recovery that knowingly dropped a
+            // corrupt trailing chunk's acknowledged operations is a fact an operator has to be able
+            // to correlate with this specific shard, not an anonymous WARN in the WAL package.
+            logger.error(
+                "shard [{}][{}] recovered with an INCOMPLETE WAL replay: the final chunk of its fenced range ({}) was corrupt "
+                    + "or truncated, so any acknowledged operations it carried have not been applied",
+                indexUuid,
+                shardId,
+                result.truncatedTailChunkSequence()
+            );
+        }
+        return result.operations();
     }
 
     /**
@@ -1123,24 +1250,72 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     }
 
     /**
-     * Best-effort, like {@link #refreshDirectoryEntry}: a transient failure here is logged and
-     * retried next tick rather than failing the engine, since the lease's own {@link
-     * #LEASE_TTL_MILLIS} margin -- renewed well before expiry, same rationale as {@link
-     * #DIRECTORY_REFRESH_INTERVAL} -- already bounds how stale a missed renewal can leave things.
-     * If renewals keep failing until the lease actually lapses, {@code CompactionSchedulerTask} may
-     * start treating this shard as available -- an efficiency question (a compactor briefly racing
-     * this still-live writer's own local merges), not a correctness one: publication remains
-     * protected by {@code ShardHead}'s own CAS, so nothing is lost or corrupted either way.
+     * A <em>transient failure</em> renewing (an I/O error, a brownout) is best-effort, like {@link
+     * #refreshDirectoryEntry}: logged and retried next tick rather than failing the engine, since
+     * the lease's own {@link #LEASE_TTL_MILLIS} margin -- renewed well before expiry, same rationale
+     * as {@link #DIRECTORY_REFRESH_INTERVAL} -- already bounds how stale a missed renewal can leave
+     * things. If renewals keep failing until the lease actually lapses, {@code
+     * CompactionSchedulerTask} may start treating this shard as available -- an efficiency question
+     * (a compactor briefly racing this still-live writer's own local merges), not a correctness one:
+     * publication remains protected by {@code ShardHead}'s own CAS.
+     *
+     * <p><b>A renewal that returns {@code false} is a completely different answer, and is now acted
+     * on.</b> {@link ObjectStoreCommitHeadPublisher#acquireOrRenewLease} returns {@code false}
+     * precisely when the live head already carries a {@code leaseTerm} newer than this writer's term
+     * -- durable, published evidence that another node has taken this shard. This method used to
+     * discard that return value entirely. Combined with {@link #index}/{@link #delete} never
+     * consulting the head at all, a writer partitioned from the cluster manager went on accepting
+     * and <em>acknowledging</em> writes -- durable in its local translog and in the shared WAL,
+     * tagged with its now-stale term -- until it next attempted a flush, which with {@code
+     * index.refresh_interval: -1} or a quiet-but-not-idle shard can be arbitrarily long. Every one
+     * of those records is then excluded by the new writer's {@code activationWalPosition} cutoff,
+     * exactly as designed: acknowledged, and lost.
+     *
+     * <p>Failing the engine here converts that unbounded silent-loss window into one bounded by
+     * {@link #LEASE_RENEWAL_INTERVAL} (10 s), which is rfc-serverless-opensearch.md &sect;13's honest
+     * "writes degrade to rejection, never to silent un-durability" behavior. This is a superseded
+     * writer, so there is nothing to preserve by staying up: it cannot publish (the head CAS fences
+     * it) and it must not keep acking.
      */
     private void renewLease() {
         try {
-            headPublisher.acquireOrRenewLease(
+            long now = System.currentTimeMillis();
+            java.util.OptionalLong renewed = headPublisher.acquireOrRenewLease(
                 indexUuid,
                 shardId,
                 engineConfig.getPrimaryTermSupplier().getAsLong(),
                 localNodeId,
-                System.currentTimeMillis() + LEASE_TTL_MILLIS
+                now + LEASE_TTL_MILLIS,
+                now
             );
+            if (renewed.isEmpty()) {
+                EngineException superseded = new EngineException(
+                    engineConfig.getShardId(),
+                    "writer lease superseded: another node holds a live lease on this shard's head, so this writer must stop "
+                        + "accepting writes it could never publish"
+                );
+                failEngine("writer lease superseded", superseded);
+                return;
+            }
+            if (renewed.getAsLong() != acquiredLeaseTerm) {
+                // The renewal succeeded, but under a NEW token -- meaning the lease had been taken
+                // over by someone else and this call took it back. That is not a heartbeat, it is a
+                // second tenancy, and this engine's local Lucene state may have diverged from
+                // whatever the intervening writer published. Adopting the new token here would let
+                // this engine publish a commit packaged under its first tenancy on top of that
+                // writer's lineage; failing instead is the only answer that cannot interleave two
+                // lineages.
+                EngineException displaced = new EngineException(
+                    engineConfig.getShardId(),
+                    "writer lease was taken over and re-acquired (fencing token moved from "
+                        + acquiredLeaseTerm
+                        + " to "
+                        + renewed.getAsLong()
+                        + "): this writer's local state may have diverged from what was published in between"
+                );
+                failEngine("writer lease taken over", displaced);
+                return;
+            }
         } catch (Exception e) {
             logger.warn("failed to renew writer lease, will retry next tick", e);
         }
@@ -1148,12 +1323,70 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     }
 
     /**
-     * Registers this shard in {@code WalShardRegistry}, retrying on every {@link #renewLease} tick
-     * until it succeeds once -- see {@link #walShardRegistered}'s own javadoc for why a single,
-     * never-retried attempt at construction left a real gap. Once per activation is still all this
-     * needs on the happy path (the grow-only registry only needs to know "has this shard ever used
-     * this container," not continuous confirmation -- see {@code WalShardRegistry}'s own javadoc),
-     * so {@link #walShardRegistered} makes every call after the first successful one a no-op.
+     * How many times {@link #registerWalShardMandatory} tries to register before giving up and
+     * refusing to activate, and the linear backoff base between those attempts. Deliberately small:
+     * this runs synchronously in the constructor, on the thread starting the shard, so the total
+     * worst-case stall is a few hundred milliseconds rather than a shard start that hangs.
+     */
+    private static final int WAL_REGISTRATION_ATTEMPTS = 4;
+    private static final long WAL_REGISTRATION_BACKOFF_BASE_MILLIS = 50;
+
+    /**
+     * Registers this shard in {@code WalShardRegistry} as a <b>hard precondition</b> for this engine
+     * becoming usable: bounded synchronous retry, and an {@link EngineException} if it never
+     * succeeds.
+     *
+     * <p>It used to be best-effort -- one attempt at construction, exception swallowed, retried on
+     * the next {@link #renewLease} tick 10 s later, with the engine coming up and writing WAL chunks
+     * in the meantime regardless. That is a data-loss gap, not merely a slow registration:
+     * {@code WalGcSchedulerTask#sweep} computes its deletable bound as the minimum covered chunk
+     * sequence over <em>registered</em> shards only, and chunk sequences are one global counter, so a
+     * busy registered shard's manifest can legitimately record a {@code WalPosition} above an
+     * unregistered shard's freshly-written chunk sequence. Those chunks are then deleted while that
+     * shard still needs them for replay. A writer that cannot register itself must not write into
+     * the shared container at all, which is exactly what refusing to activate enforces.
+     *
+     * @throws EngineException if registration did not succeed within {@link #WAL_REGISTRATION_ATTEMPTS}.
+     */
+    private void registerWalShardMandatory() {
+        if (walChunkService == null) {
+            return;
+        }
+        Exception lastFailure = null;
+        for (int attempt = 1; attempt <= WAL_REGISTRATION_ATTEMPTS; attempt++) {
+            try {
+                new org.opensearch.serverless.storage.wal.WalShardRegistry(walChunkService.blobContainer()).register(indexUuid, shardId);
+                walShardRegistered.set(true);
+                return;
+            } catch (Exception e) {
+                lastFailure = e;
+                if (attempt == WAL_REGISTRATION_ATTEMPTS) {
+                    break;
+                }
+                try {
+                    Thread.sleep(WAL_REGISTRATION_BACKOFF_BASE_MILLIS * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        throw new EngineException(
+            engineConfig.getShardId(),
+            "failed to register this shard in the WAL shard registry after "
+                + WAL_REGISTRATION_ATTEMPTS
+                + " attempts -- refusing to activate, because a writer whose chunks are invisible to WAL GC's safety bound "
+                + "could have those chunks deleted while it still needs them for replay",
+            lastFailure
+        );
+    }
+
+    /**
+     * The lease-renewal-tick safety net behind {@link #registerWalShardMandatory}: registration is
+     * proven at construction, but the registry is a shared, grow-only blob and a container-level
+     * rebuild/restore could in principle drop an entry, so every tick re-asserts it cheaply. A no-op
+     * once {@link #walShardRegistered} is set, which the constructor's own mandatory registration
+     * already did on the happy path -- so in practice this never issues a request at all.
      */
     private void registerWalShardIfNeeded() {
         if (walChunkService == null || walShardRegistered.get()) {
@@ -1309,58 +1542,157 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         WalPosition walPositionBeforeCommit = currentWalPosition();
         super.commitIndexWriter(writer, translogUUID);
 
-        try {
-            SegmentInfos segmentInfos = store.readLastCommittedSegmentsInfo();
-            long primaryTerm = engineConfig.getPrimaryTermSupplier().getAsLong();
-            long maxSeqNo = Long.parseLong(segmentInfos.userData.get(SequenceNumbers.MAX_SEQ_NO));
-            long localCheckpoint = Long.parseLong(segmentInfos.userData.get(SequenceNumbers.LOCAL_CHECKPOINT_KEY));
+        SegmentInfos segmentInfos = store.readLastCommittedSegmentsInfo();
+        long primaryTerm = engineConfig.getPrimaryTermSupplier().getAsLong();
+        long maxSeqNo = Long.parseLong(segmentInfos.userData.get(SequenceNumbers.MAX_SEQ_NO));
+        long localCheckpoint = Long.parseLong(segmentInfos.userData.get(SequenceNumbers.LOCAL_CHECKPOINT_KEY));
 
-            boolean published = headPublisher.publishCommitAsHead(
-                store.directory(),
-                segmentInfos,
-                indexUuid,
-                shardId,
-                primaryTerm,
-                maxSeqNo,
-                localCheckpoint,
-                walPositionBeforeCommit,
-                0,
-                PruningStats.empty()
-            );
-            if (published == false) {
-                throw new EngineException(
-                    engineConfig.getShardId(),
-                    "fenced out publishing local commit (segments generation "
-                        + segmentInfos.getGeneration()
-                        + ") under term "
-                        + primaryTerm
-                );
-            }
-            // Only now, after publishCommitAsHead has actually returned true (not merely
-            // uploaded -- see ObjectStoreCommitPublisher's own "never the reverse" invariant), is
-            // it safe to let local translog retention advance past these ops.
-            translogDeletionPolicy.recordDurablePublication(maxSeqNo);
-            if (publicationNotifier != null) {
-                // Dispatched, never called inline: commitIndexWriter can run synchronously inside
-                // a cluster-state-applier callback (IndicesClusterStateService#updateShard ->
-                // IndexShard#flush, on initial shard start/promotion), and
-                // WriterPublicationNotifier#notifyReaders calls clusterService.state(), which
-                // ClusterApplierService asserts against reentrantly from that exact call stack --
-                // caught by ServerlessStoragePublicationNotificationIT before this dispatch existed.
-                engineConfig.getThreadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
-                    try {
-                        publicationNotifier.notifyReaders(indexUuid, shardId);
-                    } catch (Exception e) {
-                        logger.warn("failed to notify readers of new publication for shard [" + indexUuid + "][" + shardId + "]", e);
-                    }
-                });
-            }
-        } catch (final EngineException ex) {
-            failEngine("object-store commit publication fenced out", ex);
+        Optional<CommitManifest> published;
+        try {
+            published = publishWithRetry(segmentInfos, primaryTerm, maxSeqNo, localCheckpoint, walPositionBeforeCommit);
+        } catch (final IOException ex) {
+            // Deliberately NOT failEngine. See publishWithRetry's own javadoc: an unpublished commit
+            // is already durable locally (Lucene commit above, plus the translog/WAL), so the honest
+            // response to a transient object-store failure is to fail this flush and retry the
+            // publish, not to destroy the shard. Core's InternalEngine#flush wraps this in a
+            // FlushFailedEngineException and calls maybeFailEngine, which only actually fails the
+            // engine on a tragic event -- and because this throw skips
+            // refreshLastCommittedSegmentInfos(), the very next flush still sees
+            // getProcessedLocalCheckpoint() ahead of the last-known commit and re-enters here, so
+            // the publish genuinely is retried rather than silently skipped.
             throw ex;
-        } catch (final Exception ex) {
-            failEngine("object-store commit publication failed", ex);
-            throw new IOException(ex);
         }
+        if (published.isEmpty()) {
+            // Fencing, and only fencing, fails the engine: a different term holds this shard's head,
+            // so this node is no longer its writer and must stop.
+            EngineException fenced = new EngineException(
+                engineConfig.getShardId(),
+                "fenced out publishing local commit (segments generation " + segmentInfos.getGeneration() + ") under term " + primaryTerm
+            );
+            failEngine("object-store commit publication fenced out", fenced);
+            throw fenced;
+        }
+
+        // Only now, after the publish has actually installed this commit as the head (not merely
+        // uploaded -- see ObjectStoreCommitPublisher's own "never the reverse" invariant), is it
+        // safe to let local translog retention advance past these ops.
+        translogDeletionPolicy.recordDurablePublication(maxSeqNo);
+        // The delta base for the NEXT publish (rfc-serverless-opensearch.md §6.2: a bundle carries
+        // "the new files of one or more commits," not the whole shard). Recorded only from this
+        // engine's own successful publish, never read back from the store, which is precisely what
+        // makes carrying file references forward safe -- see ObjectStoreCommitPublisher's own
+        // "delta bundling" javadoc for why a manifest published by anyone else (a compactor, a
+        // previous writer) must not be used as a delta base.
+        lastPublishedManifest = published.get();
+        if (publicationNotifier != null) {
+            // Dispatched, never called inline: commitIndexWriter can run synchronously inside
+            // a cluster-state-applier callback (IndicesClusterStateService#updateShard ->
+            // IndexShard#flush, on initial shard start/promotion), and
+            // WriterPublicationNotifier#notifyReaders calls clusterService.state(), which
+            // ClusterApplierService asserts against reentrantly from that exact call stack --
+            // caught by ServerlessStoragePublicationNotificationIT before this dispatch existed.
+            engineConfig.getThreadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+                try {
+                    publicationNotifier.notifyReaders(indexUuid, shardId);
+                } catch (Exception e) {
+                    logger.warn("failed to notify readers of new publication for shard [" + indexUuid + "][" + shardId + "]", e);
+                }
+            });
+        }
+    }
+
+    /**
+     * Publishes one commit with a bounded, jittered exponential retry budget, returning the
+     * published manifest, or {@link Optional#empty()} if this writer was <em>fenced out</em> (a
+     * different term holds the head).
+     *
+     * <p><b>There used to be no retry or backoff anywhere on this path at all.</b> Not in {@code
+     * BlobContainerShardStateStore}, not in {@code BlobContainerManifestStore#writeManifest}, not in
+     * {@code BlobContainerBundleStore#writeBundle} -- and {@link #commitIndexWriter} caught every
+     * {@code Exception} and called {@code failEngine}. One 503 from the object store on a LIST, a
+     * bundle PUT, a manifest PUT, or the head CAS therefore killed the shard. Under a brownout,
+     * every serverless-storage writer shard on every node failed within one {@code
+     * index.refresh_interval}, producing exactly the reallocation stampede
+     * rfc-serverless-opensearch.md &sect;13 says must not happen. {@link #maybePublishOnRefresh}'s
+     * own "failed async publish is logged and left for the next triggering refresh to retry" comment
+     * was simply not what the code did: by the time that catch ran, the engine was already failed.
+     *
+     * <p>Two separate changes make that comment true. Here: retry the whole publish a few times with
+     * exponential backoff and full jitter (jitter, not a fixed schedule, so a node's shards do not
+     * re-hammer a struggling object store in lockstep -- the same reasoning {@code
+     * JitteredScheduling} applies to this plugin's scheduled tasks). And in the caller: only a
+     * fencing result fails the engine; an exhausted I/O budget fails the flush instead.
+     *
+     * <p>The backoff runs on the flush thread, holding {@code InternalEngine}'s flush lock, so the
+     * budget is deliberately modest -- long enough to ride out a blip and a short brownout, short
+     * enough that flushes are not pinned for tens of seconds.
+     */
+    private Optional<CommitManifest> publishWithRetry(
+        SegmentInfos segmentInfos,
+        long primaryTerm,
+        long maxSeqNo,
+        long localCheckpoint,
+        WalPosition walPositionBeforeCommit
+    ) throws IOException {
+        IOException lastFailure = null;
+        for (int attempt = 1; attempt <= PUBLISH_ATTEMPTS; attempt++) {
+            try {
+                return headPublisher.publishCommitAsHeadReturningManifest(
+                    store.directory(),
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    primaryTerm,
+                    maxSeqNo,
+                    localCheckpoint,
+                    walPositionBeforeCommit,
+                    0,
+                    PruningStats.empty(),
+                    lastPublishedManifest,
+                    localNodeId,
+                    acquiredLeaseTerm
+                );
+            } catch (IOException e) {
+                lastFailure = e;
+                if (attempt == PUBLISH_ATTEMPTS) {
+                    break;
+                }
+                long ceiling = Math.min(PUBLISH_MAX_BACKOFF_MILLIS, PUBLISH_BASE_BACKOFF_MILLIS << (attempt - 1));
+                // Full jitter (uniform in [0, ceiling)), not equal jitter or a fixed schedule: with
+                // hundreds of shards per node retrying the same struggling object store, a
+                // deterministic schedule reconverges them into synchronized waves.
+                long sleepMillis = ceiling <= 0 ? 0 : org.opensearch.common.Randomness.get().nextLong(ceiling);
+                logger.warn(
+                    "publish attempt "
+                        + attempt
+                        + "/"
+                        + PUBLISH_ATTEMPTS
+                        + " failed for shard ["
+                        + indexUuid
+                        + "]["
+                        + shardId
+                        + "], retrying in "
+                        + sleepMillis
+                        + " ms",
+                    e
+                );
+                try {
+                    Thread.sleep(sleepMillis);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+        throw new IOException(
+            "failed to publish commit for shard ["
+                + indexUuid
+                + "]["
+                + shardId
+                + "] after "
+                + PUBLISH_ATTEMPTS
+                + " attempts -- the commit remains durable locally and the next flush will retry it",
+            lastFailure
+        );
     }
 }

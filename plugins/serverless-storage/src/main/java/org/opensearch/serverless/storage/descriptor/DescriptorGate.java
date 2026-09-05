@@ -84,7 +84,69 @@ public final class DescriptorGate {
         DEFAULT_WILDCARD_EXPANSION_LIMIT
     );
 
+    /**
+     * Whether this node was, at the last cluster state it observed, the elected cluster manager.
+     *
+     * <p>{@code null} means "nobody has said yet", which is deliberately treated as "go ahead" by {@link
+     * #writesRecordedDescriptorsHere}. The alternative -- defaulting to "not the manager" -- would silence
+     * every descriptor write on a node that has not yet applied a cluster state, including the very first
+     * one on a single-node cluster, which is a worse failure than the amplification the flag exists to
+     * bound.
+     *
+     * <p>Static, and per JVM rather than per node, for the same reason every other registry in this class
+     * is: the seams this plugin reaches core through are static. Under {@code InternalTestCluster} several
+     * nodes share the flag and the last writer wins, so a multi-node test behaves as it did before this
+     * existed. That is acceptable precisely because the flag is an amplification bound and not a
+     * correctness guard -- the write it suppresses is byte-identical to the one the manager makes.
+     *
+     * @see #observeElectedClusterManager(boolean)
+     */
+    private static final java.util.concurrent.atomic.AtomicReference<Boolean> LOCAL_NODE_IS_ELECTED_MANAGER =
+        new java.util.concurrent.atomic.AtomicReference<>();
+
     private DescriptorGate() {}
+
+    /**
+     * Records whether the local node is the elected cluster manager, from a cluster state this plugin was
+     * already listening to.
+     *
+     * <p>Fed by {@link MappingIndexWatcher}, which is registered as a cluster state listener exactly when
+     * this gate is installed, rather than by a listener of its own: the alternative needed a line in {@code
+     * ServerlessStoragePlugin}, and a second listener over the same events to answer one boolean is not
+     * worth a second registration to keep in step with this one. See {@link
+     * #writesRecordedDescriptorsHere} for what the answer is used for.
+     *
+     * @param elected whether the local node is the elected cluster manager in the observed state
+     */
+    public static void observeElectedClusterManager(boolean elected) {
+        LOCAL_NODE_IS_ELECTED_MANAGER.set(elected);
+    }
+
+    /**
+     * Whether this node should perform the descriptor write that accompanies a cluster state change.
+     *
+     * <p><b>One metadata change was N nodes writing one key.</b> {@code Metadata.Builder.put} calls
+     * {@code ClaimedIndexLifecycleRegistry.recordChange} on the cluster manager's state update thread
+     * <em>and</em> on every other node's applier thread as the diff is applied -- the sibling comment on
+     * {@link DescriptorBackedIndexLifecycle#recordChange} says exactly that, and removed the change-log
+     * append for exactly that reason while leaving the descriptor write beside it. So an alias added to one
+     * index on a 200-node cluster became 200 read-then-compare-and-swap pairs against a single key: one
+     * wins, 199 conflict and retry, most exhaust {@code BlobDescriptorBackend.put}'s three attempts and log
+     * "sustained contention" for contention the cluster inflicted on itself. Every one of those writers was
+     * producing identical bytes from the state they had all just received.
+     *
+     * <p>So exactly one writer suffices, and the manager is the natural one: it is where the change
+     * originated, it is already the single writer for change-log pruning, tombstone scrubbing and the GC
+     * tailer, and the descriptor being written here is a projection of a cluster state every node already
+     * holds. A follower that skips the write loses nothing it did not already have.
+     *
+     * @return {@code true} on the elected cluster manager, and on any node that has not yet observed a
+     *         cluster state at all
+     */
+    public static boolean writesRecordedDescriptorsHere() {
+        Boolean elected = LOCAL_NODE_IS_ELECTED_MANAGER.get();
+        return elected == null || elected;
+    }
 
     /** Applies a new expansion limit, which the plugin wires to its cluster setting. */
     public static void setWildcardExpansionLimit(int limit) {
@@ -586,6 +648,10 @@ public final class DescriptorGate {
         // Reset rather than leave, since the registries are static and a limit set by one test would
         // otherwise decide the behaviour of every suite that ran after it in the same JVM.
         WILDCARD_EXPANSION_LIMIT.set(DEFAULT_WILDCARD_EXPANSION_LIMIT);
+        // Back to "nobody has said yet" for the same reason: a test that left this node marked a follower
+        // would silence the descriptor writes of every suite that ran after it in this JVM, and the failure
+        // would look like a store that lost a write rather than like a flag nobody cleared.
+        LOCAL_NODE_IS_ELECTED_MANAGER.set(null);
         // Before the registration is cleared, and before the node this belongs to finishes closing: a
         // projection still on the executor has a client that is about to be shut under it, and abandoning it
         // leaves the field type counts for whatever it was writing under-reporting until that index's next

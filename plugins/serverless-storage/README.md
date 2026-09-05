@@ -83,24 +83,209 @@ Other index-level opt-ins:
 - `index.serverless_storage.wal.dedicated_stream` — gives the index its own WAL
   chunk stream instead of sharing one across indices.
 
+## WAL mirroring is now on by default
+
+`serverless_storage.wal_mirroring.enabled` and
+`serverless_storage.wal_flush.batching.enabled` both now default to **`true`**.
+They changed together on purpose, and if you turn one off you should think about
+the other.
+
+**Why mirroring flipped.** With it off, a serverless index kept its ordinary
+local translog as the only durability for anything not yet flushed. Kill the node
+and every write acknowledged since the last published manifest is gone —
+silently, with no error anywhere, on a shard that by design has zero writer
+replicas to recover from. That made the RFC's first goal ("the object store is
+the sole durable home of write-ahead data; local disk is strictly a cache") false
+in the shipped default, and broke its stated contract that writes degrade to
+rejection and never to silent un-durability.
+
+**Why batching had to flip with it.** Mirroring on with batching off flushes one
+WAL chunk per operation — roughly one object-store PUT per document — which is
+orders of magnitude over the RFC's own request budget and inverts the cost
+argument for having a node-level WAL at all. The durability contract is
+unchanged: `index.translog.durability=REQUEST` still waits for the upload.
+
+**WAL GC flipped with them.** `serverless_storage.wal_gc.interval` now defaults
+to **1 minute** instead of `-1` (off). WAL chunks are reclaimed by nothing else,
+so turning mirroring on while leaving its collector off would have traded a
+data-loss bug for an unbounded-storage bug. Its cadence is a cost choice, not a
+safety one: what is deletable is fixed by published state — a shard replays
+strictly forward from the position its own last published manifest covers — so
+sweeping more or less often changes only how much already-dead garbage is lying
+around, never what may be deleted. That is why this sweep needs no retention
+window, unlike segment GC.
+
+`serverless_storage.wal_mirroring.required` (default `false`) is the stricter
+option: a serverless writer shard that opens with no WAL service — because
+mirroring was turned off, or because the shared WAL container failed to resolve
+on that node — refuses to open rather than degrading. Either way it now logs a
+warning naming the index and shard.
+
+`serverless_storage.wal_flush.backlog_reject_threshold` also now defaults to
+512 MB rather than "unbounded", so the RFC's "bounded window then rejects" is
+true rather than aspirational.
+
 ## What's off by default
 
-Most background machinery (compaction, GC, WAL GC, scale-to-zero, scale-up,
-auto-split, auto-merge, WAL mirroring, WAL flush batching) ships disabled —
-either via an `enabled` flag or an `interval` defaulting to `-1`. Nothing runs
-until you turn it on. See `ServerlessStoragePlugin.java` for the full settings
-list and defaults, or `rfc-serverless-opensearch.md` for the reasoning behind
-each one.
+Most background machinery (compaction, GC, scale-to-zero, scale-up,
+auto-split, auto-merge) ships disabled — either via an `enabled` flag or an
+`interval` defaulting to `-1`. Nothing runs until you turn it on. See
+`ServerlessStoragePlugin.java` for the full settings list and defaults, or
+`rfc-serverless-opensearch.md` for the reasoning behind each one.
 
 Two worth knowing about up front:
 
-- `serverless_storage.wal_mirroring.enabled` (default `false`) — mirrors writes
-  to the WAL in the object store for durability. `serverless_storage.wal_flush.batching.enabled`
-  (default `false`) group-commits those WAL uploads instead of one PUT per
-  document; still off by default pending load testing against the RFC's cost
-  target (see `dynamic-partitioning-progress.md`'s WAL batching section).
 - `serverless_storage.encryption_key` — a base64 AES key stored in the node
-  keystore. Unset means bundles are written unencrypted.
+  keystore. Unset means bundles are written unencrypted. It must decode to
+  exactly 16, 24 or 32 raw bytes; anything else now fails node start with a
+  message naming the setting, rather than starting cleanly and failing every
+  write afterwards.
+- `serverless_storage.reclaim_on_index_delete` (default `false`) — **deleting a
+  serverless index currently frees no object-store bytes at all.** GC is per
+  shard and runs from a scheduler attached to a live shard, so once the index is
+  gone nothing is left that could sweep its prefix, and everything it ever wrote
+  stays in the bucket permanently. Turning this on reclaims a deleted shard's
+  prefix, refusing whenever a live pin (a clone hop, a snapshot, a PITR window)
+  still names it. It ships off for one release because it is the first code path
+  here that deletes a whole shard prefix in one call; leaving it off forever is
+  not the safe choice, it is the one where storage grows without bound.
+
+### GC and compaction now run without search replicas
+
+`serverless_storage.gc.interval` and `serverless_storage.compaction.interval`
+used to be settings you could turn on and have nothing happen. Both schedulers
+hung off the *reader* engine, and a reader shard requires
+`index.number_of_search_replicas`, which requires `remote_store.enabled`. The
+common serverless index — one writer shard, no search replicas — therefore had
+neither scheduler anywhere in the cluster, so object-store storage grew forever
+and quiescent shards never compacted, silently, no matter what the intervals
+said.
+
+Both are now started per shard by the plugin itself, on the node holding that
+shard's writer primary, and stopped when that shard closes or relocates. Nothing
+about the defaults changed: both intervals still default to `-1`, and setting
+them is still how you turn the work on. What changed is that setting them now
+does something.
+
+## Security boundaries and known gaps
+
+RFC §12 describes the encryption and credential-scoping model this plugin aims
+at. Several parts of it are not implemented, and the code's shape implies
+otherwise in a few places, which is more dangerous than a plain omission. What
+follows is what is actually true of a deployed node today. §3 already states that
+multi-tenant isolation is a non-goal for this repository; this section is the
+concrete form of that statement.
+
+### There is one encryption key per node, not one per index
+
+§12 describes a per-index data key, and the code looks like it has one:
+`EncryptionKeyProvider#currentKey(String indexUuid)` exists,
+`PerIndexEncryptionKeyProvider` exists and is tested, and both the WAL record
+path and the blob path call the per-index overload. **No node configuration can
+build a per-index provider.** `serverless_storage.encryption_key` is a single
+node-level secret and `StaticEncryptionKeyProvider` — which returns that one key
+for every index — is the only provider anything ever constructs.
+
+So a reader can follow every call site, find them all correct, and conclude that
+per-index key isolation works. It does not. The call sites are correct so that
+wiring a real provider becomes a configuration change rather than a code change;
+that is worth having, and it is not the same as having isolation. §12's "a
+compromised chunk yields nothing without per-index keys" is false as shipped.
+
+`PerIndexEncryptionKeyProvider`'s javadoc records what wiring it for real would
+take, and why the blocker is the key-provisioning lifecycle rather than the
+setting.
+
+### Blocks are bound to their position; blobs written before this build are not
+
+Each 64 KiB block is an independent AES-GCM envelope. Its tag now also covers
+associated data naming the index, shard, container path, blob name, format
+version, declared sizes and block index, so a block cannot be moved between
+blobs, between indices, or to a different offset, and a blob's cleartext header
+cannot be rewritten to truncate it. This holds under the single node-wide key,
+because it is an integrity property, not a key-separation one.
+
+Blobs written by earlier builds carry format version 1, which had no associated
+data at all. They are still readable, and they are still substitutable,
+reorderable and truncatable for as long as they exist. To migrate:
+
+1. Upgrade every node. New writes are version 2 from then on.
+2. Rewrite existing bundles — run compaction (`POST
+   .../{index_uuid}/{shard_id}/_compact`, or leave
+   `serverless_storage.compaction.interval` running), or reindex.
+3. Let `serverless_storage.gc.interval` reclaim the superseded manifests and
+   bundles. Until then the old objects are still in the bucket.
+4. Set `serverless_storage.encryption.require_authenticated_blocks: true` on
+   every node and restart. A version 1 blob is then refused rather than read.
+
+Step 4 last: setting it before step 3 finishes makes any surviving version 1 blob
+an unreadable shard. The default is `false` so that an upgrade does not turn
+existing data into an outage — the plugin has no way to know whether your bucket
+still holds version 1 objects, so it is your assertion to make.
+
+### Registers are neither encrypted nor authenticated
+
+Shard-head and pin registers pass through unencrypted, deliberately: they hold
+node ids, terms and generation numbers, not document data. The part that was not
+written down anywhere is that they are also **unauthenticated**. A caller with
+bucket write access can point a shard's head register at any manifest generation
+that exists, including a stale one, and every subsequent read is of a
+correctly-decrypting, correctly-authenticated, wrong commit. Term-fencing defends
+against concurrent writers inside the protocol; it does not defend against a
+writer outside it. Closing this needs a MAC over the register value, which is a
+wire-format change and is not done.
+
+### The shared write-ahead-log container is not credential-scoped at all
+
+`RestrictingBlobContainer` implements §12's tier model in-process: readers get
+GET-only, the writer/compaction tier gets GET+PUT, and GC alone gets DELETE. The
+**node-shared WAL container is not wrapped by it**. Every writer shard on the
+node therefore holds full read, write *and delete* on the node-shared WAL prefix
+— a prefix that by construction carries every other index's WAL records. §12 says
+deletion belongs to GC alone; for the WAL, it belongs to every writer. The
+per-record encryption on WAL records does not help, because deleting a chunk
+needs no key.
+
+The fix is the split `getEngineFactory` already performs for GC: wrap the shared
+WAL container delete-denied for writer shards, and give the WAL GC task its own
+unrestricted instance.
+
+Note also that everything `RestrictingBlobContainer` provides is an in-process
+assertion, not a boundary: the node's actual bucket credentials are unchanged, so
+it turns a bug into an exception on the code path that has the wrapper and does
+nothing about any other route. Real per-tier scoping is IAM, which §12 marks as
+out of scope here.
+
+### The plugin's own API has no index-level authorization
+
+None of this plugin's transport requests implement `IndicesRequest`, so every one
+of its actions is authorized as a cluster action. An operator cannot grant
+`_clone`, `_shrink`, `_split` or `_snapshot_release` on a subset of indices — the
+grant is cluster-wide — DLS/FLS never applies to anything this plugin exposes,
+and audit logs record no index for these operations. `_realtime_get` in
+particular is classified `cluster:monitor`, so a principal holding a monitoring
+role can probe document existence in any index. Treat every one of these APIs as
+cluster-admin-equivalent when granting privileges.
+
+### Key rotation is not supported
+
+Neither wire format records a key identifier, so there is no way at read time to
+know which key encrypted what. Changing the key an
+`EncryptionKeyProvider` returns makes all prior data permanently unreadable — a
+loud AEAD failure on every affected read, not silent corruption, but with no
+recovery. See `EncryptionKeyProvider`'s javadoc.
+
+### What is encrypted where, when a key is configured
+
+- **Object store:** ciphertext for bundles, manifests and segment data. Registers
+  are plaintext, by design (above).
+- **Local disk cache:** ciphertext, including the temporary files written during
+  a cache fill.
+- **Page cache:** ciphertext only, since the disk tier is encrypted.
+- **Heap:** plaintext, by design, in the shared in-memory bundle cache. Its keys
+  embed the index UUID and shard, so cached bytes cannot be served across
+  indices; cache-timing side channels between tenants remain, and §12 accepts
+  them as out of scope pending §3.
 
 ## Upgrading a blob store written by an older build
 

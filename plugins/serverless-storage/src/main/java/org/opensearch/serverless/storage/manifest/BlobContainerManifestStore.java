@@ -9,9 +9,6 @@
 package org.opensearch.serverless.storage.manifest;
 
 import org.opensearch.common.blobstore.BlobContainer;
-import org.opensearch.common.io.stream.BytesStreamOutput;
-import org.opensearch.core.common.bytes.BytesReference;
-import org.opensearch.core.common.io.stream.StreamInput;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -48,9 +45,10 @@ public final class BlobContainerManifestStore {
      * @param manifest the manifest to write
      */
     public void writeManifest(CommitManifest manifest) throws IOException {
-        BytesStreamOutput out = new BytesStreamOutput();
-        manifest.writeTo(out);
-        byte[] bytes = BytesReference.toBytes(out.bytes());
+        // Enveloped (magic + format version + trailing CRC32C), never a bare body -- see
+        // CommitManifestCodec's own javadoc for why the manifest, alone among this plugin's three
+        // persisted formats, used to have neither a version nor a checksum, and what that cost.
+        byte[] bytes = CommitManifestCodec.toBytes(manifest);
         try (InputStream in = new ByteArrayInputStream(bytes)) {
             blobContainer.writeBlobAtomic(manifest.manifestName(), in, bytes.length, true);
         }
@@ -66,7 +64,7 @@ public final class BlobContainerManifestStore {
     public CommitManifest readManifest(long primaryTerm, long generation) throws IOException {
         String name = CommitManifest.manifestName(primaryTerm, generation);
         try (InputStream in = blobContainer.readBlob(name)) {
-            return new CommitManifest(StreamInput.wrap(in.readAllBytes()));
+            return CommitManifestCodec.fromBytes(in.readAllBytes(), name);
         }
     }
 
@@ -139,7 +137,7 @@ public final class BlobContainerManifestStore {
                 continue;
             }
             try (InputStream in = blobContainer.readBlob(blobName)) {
-                CommitManifest manifest = new CommitManifest(StreamInput.wrap(in.readAllBytes()));
+                CommitManifest manifest = CommitManifestCodec.fromBytes(in.readAllBytes(), blobName);
                 manifests.add(manifest);
                 if (readCache != null) {
                     readCache.put(blobName, manifest);

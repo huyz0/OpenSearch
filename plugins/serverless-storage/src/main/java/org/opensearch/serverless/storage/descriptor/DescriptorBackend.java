@@ -100,6 +100,22 @@ public interface DescriptorBackend {
      * that generates a fresh uuid each attempt is asking a question this cannot answer, and will be told
      * the name is taken.
      *
+     * <h4>Not on any production path today, and why</h4>
+     *
+     * <b>Nothing outside this package's own tests calls this.</b> The production creation path,
+     * {@code DescriptorBackedIndexLifecycle.createIndex}, calls plain {@link #createAsync}, so a creation
+     * whose conditional write reached the store and whose acknowledgement was lost <em>is</em> reported to
+     * the client as a name collision on retry -- precisely the failure the paragraphs above say must not
+     * happen. That is the current behaviour, stated here rather than left to be inferred from a mechanism
+     * that looks wired and is not.
+     *
+     * <p>It is also not adoptable as it stands, which is the reason it is documented rather than either
+     * deleted or hooked up. The contract above requires a retry to resend the same descriptor, and core's
+     * {@code aggregateIndexSettings} mints a fresh {@code UUIDs.randomBase64UUID} on every attempt, so a
+     * re-executed creation arrives here as a different uuid and is correctly told the name is taken.
+     * Wiring this up therefore means stabilising the creation uuid across retries in core first; until
+     * that happens, calling it would change nothing except which line reports the collision.
+     *
      * @return {@link CreateOutcome#CREATED} if this call took the name, {@link CreateOutcome#ALREADY_MINE}
      *         if it was already held by a descriptor with this uuid, {@link CreateOutcome#TAKEN} if
      *         somebody else holds it.

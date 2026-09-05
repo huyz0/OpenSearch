@@ -370,9 +370,38 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
             if (numPartitions == null) {
                 numPartitions = targetNumPartitions.getAsInt();
                 byPartitionIndex = new String[numPartitions];
+            } else if (numPartitions != targetNumPartitions.getAsInt()) {
+                // Finding R-15. numPartitions used to be taken from whichever target this loop
+                // happened to see first, and any target whose partitionIndex fell outside the
+                // resulting array was silently skipped. Iteration is over
+                // IndexAbstraction#getIndices(), whose order is not contractual -- so a partially
+                // applied re-enable with a different target count produced a *non-deterministic*
+                // partition table, and therefore per-document write failures that depended on
+                // iteration order. Disagreement means the alias's assignment is mid-change or
+                // corrupt; refusing to build a table at all leaves writes going to the alias
+                // unrewritten (and failing loudly on a multi-index alias) instead of being routed by
+                // a table assembled from two different generations of the assignment.
+                logger.error(
+                    "write-routing alias [{}] has targets disagreeing about num_partitions ({} vs {}) -- refusing to route writes "
+                        + "through a partition table assembled from an inconsistent assignment; re-run the enable step",
+                    aliasName,
+                    numPartitions,
+                    targetNumPartitions.getAsInt()
+                );
+                return Optional.empty();
             }
             if (partitionIndex.getAsInt() < byPartitionIndex.length) {
                 byPartitionIndex[partitionIndex.getAsInt()] = targetMetadata.getIndex().getName();
+            } else {
+                logger.error(
+                    "write-routing alias [{}] target [{}] claims partition index {} but the table has only {} slots -- refusing "
+                        + "to route writes through an inconsistent assignment",
+                    aliasName,
+                    targetMetadata.getIndex().getName(),
+                    partitionIndex.getAsInt(),
+                    byPartitionIndex.length
+                );
+                return Optional.empty();
             }
         }
         if (numPartitions == null) {

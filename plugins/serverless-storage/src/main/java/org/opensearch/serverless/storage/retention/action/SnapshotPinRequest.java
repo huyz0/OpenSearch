@@ -89,6 +89,8 @@ public class SnapshotPinRequest extends ActionRequest {
         }
         if (snapshotId == null || snapshotId.isEmpty()) {
             validationException = addValidationError("snapshotId is required", validationException);
+        } else if (isWellFormedSnapshotId(snapshotId) == false) {
+            validationException = addValidationError(SNAPSHOT_ID_CHARSET_ERROR, validationException);
         } else if (snapshotId.equals(PitrRetentionPolicy.PITR_PIN_ID)) {
             // "pitr" is the reserved pinId PitrRetentionReconciler uses for its own internal
             // pins (see that class's own javadoc, and DurablePinRegistry#replacePin's "strips
@@ -106,6 +108,51 @@ public class SnapshotPinRequest extends ActionRequest {
 
     /** The message reported for an {@code indexUuid} carrying characters no real uuid contains. */
     static final String INDEX_UUID_CHARSET_ERROR = "indexUuid must contain only [A-Za-z0-9_-]";
+
+    /** The message reported for a {@code snapshotId} that is not a safe, single path segment. */
+    static final String SNAPSHOT_ID_CHARSET_ERROR =
+        "snapshotId must be 1-255 characters of [A-Za-z0-9._-], must not begin with '.' and must not contain '..'";
+
+    /** The reserved prefix the deep-snapshot export path mints its own per-shard pins under. */
+    static final String DEEP_SNAPSHOT_PIN_ID_PREFIX = "deep-";
+
+    /** The message reported for a {@code snapshotId} intruding on an internal pin-id namespace. */
+    static String reservedSnapshotIdError(String prefix) {
+        return "snapshotId beginning with [" + prefix + "] is reserved for internal use and cannot be used";
+    }
+
+    /**
+     * Whether {@code snapshotId} is a safe, self-contained name.
+     *
+     * <p>This is not cosmetic. The string becomes two durable things: a {@link PinRecord#pinId()}, and the
+     * blob name {@code "pin-ledger-" + snapshotId} written into the index's shard-0 container with no
+     * normalisation between here and the store. So an unvalidated id is a path and a namespace the caller
+     * chooses rather than a name it owns -- {@code ../../x} escapes the shard prefix on a filesystem-backed
+     * repository, and a colon-bearing id lands inside the {@code clone:<uuid>:<shard>} namespace, where
+     * {@code _snapshot_release}'s pin-id-wide removal would strip a live clone's only protection from its
+     * source. Restricting the alphabet to one path segment's worth of characters closes both at the boundary
+     * rather than at each use site, which is the same reasoning {@link #isWellFormedIndexUuid} already
+     * records for the uuid.
+     *
+     * <p>Dots are allowed because snapshot names legitimately carry them, but {@code ..} and a leading dot
+     * are not: they are the two spellings that make a name mean somewhere else.
+     *
+     * @param snapshotId the candidate name.
+     * @return {@code true} if it is safe to use as a pin id and a blob-name suffix.
+     */
+    static boolean isWellFormedSnapshotId(String snapshotId) {
+        if (snapshotId.length() > 255 || snapshotId.charAt(0) == '.' || snapshotId.contains("..")) {
+            return false;
+        }
+        for (int i = 0; i < snapshotId.length(); i++) {
+            char c = snapshotId.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
 
     /**
      * Whether {@code indexUuid} is drawn from the alphabet a real index UUID is drawn from --

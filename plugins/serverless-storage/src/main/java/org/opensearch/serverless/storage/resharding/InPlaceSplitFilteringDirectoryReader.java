@@ -45,7 +45,10 @@ public final class InPlaceSplitFilteringDirectoryReader extends AbstractIdFilter
     public InPlaceSplitFilteringDirectoryReader(DirectoryReader in, ShardRange range) throws IOException {
         // Reproduce core's real routing hash: effectiveRouting = routing != null ? routing : id,
         // exactly as OperationRouting#generateShardId resolves it, so search and GET-by-id agree.
-        super(in, (id, routing) -> InPlaceSplitPartitionFilter.matches(routing != null ? routing : id, range));
+        // `range` is a record, so it is a correct by-value membership-cache key (see
+        // AbstractIdFilteringDirectoryReader's cache javadoc): two wraps of the same segment for the
+        // same child range compute the same bitset and must share it.
+        super(in, range, (id, routing) -> InPlaceSplitPartitionFilter.matches(routing != null ? routing : id, range));
         this.range = range;
     }
 

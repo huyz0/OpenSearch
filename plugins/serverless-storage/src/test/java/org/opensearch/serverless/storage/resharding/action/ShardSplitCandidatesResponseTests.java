@@ -48,6 +48,95 @@ public class ShardSplitCandidatesResponseTests extends OpenSearchTestCase {
         return response.candidates().stream().filter(e -> e.indexUuid().equals(indexUuid) && e.shardId() == shardId).findFirst();
     }
 
+    /**
+     * Index metadata whose shard {@code shardId} is a committed in-place split child covering
+     * {@code [start, end]} of the hash space -- what a manifest-cloned child's size signal is read
+     * against.
+     */
+    private Metadata metadataWithSplitChild(String indexName, String indexUuid, int parentShardId, int childShardId) {
+        org.opensearch.cluster.metadata.SplitShardsMetadata.Builder splitBuilder =
+            new org.opensearch.cluster.metadata.SplitShardsMetadata.Builder(1);
+        splitBuilder.splitShard(parentShardId, 2);
+        splitBuilder.updateSplitMetadataForChildShards(
+            parentShardId,
+            java.util.Set.of(childShardId, childShardId + 1),
+            System.currentTimeMillis()
+        );
+        IndexMetadata indexMetadata = IndexMetadata.builder(indexName)
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, indexUuid)
+                    .build()
+            )
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .splitShardsMetadata(splitBuilder.build())
+            .build();
+        return Metadata.builder().put(indexMetadata, false).build();
+    }
+
+    /**
+     * Finding R-3. An in-place split child's manifest is a clone of its parent's and references the
+     * same file set, so {@code ObjectStoreWriterEngine#shardSizeInBytes()} reports the <em>whole
+     * parent's</em> size for each child -- and nothing ever physically rewrites an in-place child, so
+     * that number never falls. Comparing it against the size threshold made automatic
+     * split-for-size self-perpetuating: split a 10 GiB shard, get two children each reporting
+     * 10 GiB, each immediately a size candidate again, 2 -&gt; 4 -&gt; 8, with no terminating
+     * condition at all. The candidacy decision is now made against the share of the hash space the
+     * child actually owns.
+     */
+    public void testASplitChildsSizeIsScaledToTheHashRangeItOwns() {
+        long threshold = 10_000_000_000L; // 10 GiB
+        long reportedSize = 12_000_000_000L; // the whole parent, cloned into the child's manifest
+        // splitShard(0, 2) bisects the full hash space, so child shard 1 owns half of it and really
+        // holds about 6 GiB -- under the threshold.
+        Metadata metadata = metadataWithSplitChild(INDEX_NAME, INDEX_UUID, 0, 1);
+
+        NodeShardSplitCandidatesResponse writerNode = new NodeShardSplitCandidatesResponse(
+            node("writer"),
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 1, 1L, reportedSize))
+        );
+        ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
+            new ClusterName("test"),
+            List.of(writerNode),
+            List.of(),
+            1_000_000L,
+            threshold,
+            metadata
+        );
+        ShardSplitCandidateEntry entry = findEntry(response, INDEX_UUID, 1).orElseThrow();
+        assertEquals("the raw measurement is still reported honestly", reportedSize, entry.shardSizeInBytes());
+        assertTrue(
+            "the owned size must be materially smaller than the reported one for a half-range child, got " + entry.ownedSizeInBytes(),
+            entry.ownedSizeInBytes() < reportedSize * 3 / 4
+        );
+        assertFalse(
+            "a child owning roughly half a 12 GiB parent is not a 10 GiB shard, and treating it as one is what made "
+                + "split-for-size non-terminating",
+            entry.sizeCandidate()
+        );
+    }
+
+    public void testANeverSplitShardsSizeIsNotScaled() {
+        long reportedSize = 12_000_000_000L;
+        NodeShardSplitCandidatesResponse writerNode = new NodeShardSplitCandidatesResponse(
+            node("writer"),
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 1L, reportedSize))
+        );
+        ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
+            new ClusterName("test"),
+            List.of(writerNode),
+            List.of(),
+            1_000_000L,
+            10_000_000_000L,
+            metadataWith(INDEX_NAME, INDEX_UUID)
+        );
+        ShardSplitCandidateEntry entry = findEntry(response, INDEX_UUID, 0).orElseThrow();
+        assertEquals("a shard covering the whole hash space owns everything it reports", reportedSize, entry.ownedSizeInBytes());
+        assertTrue("and is still a size candidate, exactly as before", entry.sizeCandidate());
+    }
+
     public void testAShardOverThresholdIsACandidate() {
         NodeShardSplitCandidatesResponse writerNode = new NodeShardSplitCandidatesResponse(
             node("writer"),

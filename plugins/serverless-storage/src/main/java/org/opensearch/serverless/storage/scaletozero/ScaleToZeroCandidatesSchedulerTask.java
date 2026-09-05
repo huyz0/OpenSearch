@@ -17,6 +17,7 @@ import org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidate
 import org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidatesAction;
 import org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidatesRequest;
 import org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidatesResponse;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -54,6 +55,22 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
     private final AtomicReference<List<ScaleToZeroCandidateEntry>> latestCandidates = new AtomicReference<>(List.of());
 
     /**
+     * Wall-clock time the list in {@link #latestCandidates} was computed, or {@code 0} if none has
+     * been. Exists because that list is only ever replaced on a <em>successful</em> fan-out and is
+     * never invalidated on failure, so without a timestamp a consumer cannot tell a fresh verdict
+     * from an hour-old cached one -- see {@link #latestCandidatesAtMillis()} (finding N-4).
+     */
+    private final java.util.concurrent.atomic.AtomicLong latestCandidatesAtMillis = new java.util.concurrent.atomic.AtomicLong(0L);
+
+    /**
+     * Monotonic counter incremented once per successful evaluation. A consumer applying its own
+     * consecutive-tick hysteresis needs to know whether it is looking at a <em>new</em> observation
+     * or the same one again; comparing this is exact, where comparing timestamps or list contents is
+     * not (see finding N-4: drain hysteresis was counting one snapshot N times).
+     */
+    private final java.util.concurrent.atomic.AtomicLong evaluationSequence = new java.util.concurrent.atomic.AtomicLong(0L);
+
+    /**
      * Starts the scheduled evaluation without acting on its own candidates -- equivalent to calling
      * the other constructor with a {@code null} coordinator (policy-only, this class's original
      * scope before suspension itself existed).
@@ -87,7 +104,14 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
         this.client = client;
         this.clusterService = clusterService;
         this.suspensionCoordinator = suspensionCoordinator;
-        this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, interval, ThreadPool.Names.GENERIC);
+        // Jittered rather than started on the exact configured interval (finding L-10). Every node
+        // constructs this task at roughly the same moment after a cluster restart or a rolling
+        // upgrade, and scheduleWithFixedDelay never recomputes the delay, so an un-jittered start
+        // leaves every node's copy of this loop ticking in lockstep for the lifetime of the process
+        // -- a synchronised burst of cluster-manager work and object-store requests every interval,
+        // forever, which is exactly the recovery-stampede shape RFC section 13 asks the reconcilers
+        // to avoid. JitteredScheduling only ever extends the first interval, never shortens it.
+        this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
     private void evaluateSafely() {
@@ -101,38 +125,71 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
             // constructs this task, which is well before the node finishes starting up. Swallowed
             // and retried next tick, same tolerance every other scheduled task in this plugin
             // already has for a single failed attempt: nothing is corrupted by a skipped tick, only
-            // the staleness of latestCandidates() until the next successful one. A scheduled task's
-            // own recurring schedule must never die from a single tick's exception either way --
-            // Scheduler.scheduleWithFixedDelay doesn't reschedule a runnable that threw.
+            // the staleness of latestCandidates() until the next successful one.
+            //
+            // Finding L-11: this comment used to end "-- Scheduler.scheduleWithFixedDelay doesn't
+            // reschedule a runnable that threw", and six tasks in this plugin were written on that
+            // basis. It is not true. AbstractRunnable#run calls onAfter() in a finally block, and
+            // ReschedulingRunnable#onAfter reschedules unconditionally while its `run` flag is set,
+            // so even an escaping Error still reschedules; ThreadPool#scheduleWithFixedDelay also
+            // logs every failure at WARN. The catch is therefore belt-and-braces rather than
+            // load-bearing, and -- the reason the correction is worth making -- the tasks elsewhere
+            // in this plugin that catch only Exception, or only IOException, are equally safe and
+            // were never the latent wedges this comment implied they were. The one genuine wedge in
+            // the scheduler is ReschedulingRunnable#onRejection, which clears `run` permanently;
+            // on the GENERIC pool that is effectively unreachable outside shutdown.
             logger.warn("scale-to-zero candidate evaluation failed, will retry next tick", t);
         }
     }
+
+    /** Guards against two overlapping fan-outs running the suspension pass concurrently (finding S-4). */
+    private final java.util.concurrent.atomic.AtomicBoolean evaluationInFlight = new java.util.concurrent.atomic.AtomicBoolean();
 
     void evaluate() {
         if (clusterService.state().nodes().isLocalNodeElectedClusterManager() == false) {
             return; // not our turn -- see class javadoc for why only the cluster-manager runs this
         }
-        client.execute(ScaleToZeroCandidatesAction.INSTANCE, new ScaleToZeroCandidatesRequest(), new ActionListener<>() {
-            @Override
-            public void onResponse(ScaleToZeroCandidatesResponse response) {
-                latestCandidates.set(List.copyOf(response.candidates()));
-                long candidateCount = response.candidates().stream().filter(ScaleToZeroCandidateEntry::candidate).count();
-                logger.debug(
-                    "scale-to-zero evaluation: {} shard(s) observed, {} flagged as candidates",
-                    response.candidates().size(),
-                    candidateCount
-                );
-                if (suspensionCoordinator != null) {
-                    suspensionCoordinator.suspendCandidates(response.candidates());
-                    suspensionCoordinator.suspendReaderCandidates(response.candidates());
+        // Finding S-4 (this task has the identical shape to ScaleUpCandidatesSchedulerTask, where the
+        // finding was written): the fan-out is asynchronous, so a fan-out slower than the interval
+        // used to let two responses run the suspension pass concurrently. One at a time; a skipped
+        // tick costs nothing here, since suspension is idempotent and the next tick redoes it.
+        if (evaluationInFlight.compareAndSet(false, true) == false) {
+            logger.debug("skipping scale-to-zero evaluation: the previous fan-out has not completed yet");
+            return;
+        }
+        try {
+            client.execute(ScaleToZeroCandidatesAction.INSTANCE, new ScaleToZeroCandidatesRequest(), new ActionListener<>() {
+                @Override
+                public void onResponse(ScaleToZeroCandidatesResponse response) {
+                    try {
+                        latestCandidates.set(List.copyOf(response.candidates()));
+                        latestCandidatesAtMillis.set(System.currentTimeMillis());
+                        evaluationSequence.incrementAndGet();
+                        long candidateCount = response.candidates().stream().filter(ScaleToZeroCandidateEntry::candidate).count();
+                        logger.debug(
+                            "scale-to-zero evaluation: {} shard(s) observed, {} flagged as candidates",
+                            response.candidates().size(),
+                            candidateCount
+                        );
+                        if (suspensionCoordinator != null) {
+                            suspensionCoordinator.suspendCandidates(response.candidates());
+                            suspensionCoordinator.suspendReaderCandidates(response.candidates());
+                        }
+                    } finally {
+                        evaluationInFlight.set(false);
+                    }
                 }
-            }
 
-            @Override
-            public void onFailure(Exception e) {
-                logger.warn("scale-to-zero candidate evaluation failed, will retry next tick", e);
-            }
-        });
+                @Override
+                public void onFailure(Exception e) {
+                    evaluationInFlight.set(false);
+                    logger.warn("scale-to-zero candidate evaluation failed, will retry next tick", e);
+                }
+            });
+        } catch (RuntimeException e) {
+            evaluationInFlight.set(false);
+            throw e;
+        }
     }
 
     /**
@@ -142,6 +199,29 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
      */
     public List<ScaleToZeroCandidateEntry> latestCandidates() {
         return latestCandidates.get();
+    }
+
+    /**
+     * When {@link #latestCandidates()} was computed, in epoch millis, or {@code 0} if no evaluation
+     * has ever succeeded on this node.
+     *
+     * <p><b>Finding N-4.</b> The candidate list is replaced only on a successful fan-out and is
+     * never cleared on failure, so once the fan-out starts failing, consumers kept treating the last
+     * good list as current indefinitely. It also carried no age, so a consumer on a shorter interval
+     * than this task's re-read the identical snapshot many times -- which is how "sustained for 10
+     * consecutive ticks" came to be certified by a single observation. Consumers must check this
+     * before trusting the list.
+     */
+    public long latestCandidatesAtMillis() {
+        return latestCandidatesAtMillis.get();
+    }
+
+    /**
+     * How many evaluations have succeeded on this node. Strictly increasing; a consumer that only
+     * wants to count genuinely new observations compares this against the value it last saw.
+     */
+    public long evaluationSequence() {
+        return evaluationSequence.get();
     }
 
     /** Invokes {@link #evaluate()} synchronously, rather than waiting out the scheduled interval -- test-only visibility. */

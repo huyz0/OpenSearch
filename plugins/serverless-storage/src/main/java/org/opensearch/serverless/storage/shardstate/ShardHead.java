@@ -141,6 +141,56 @@ public final class ShardHead implements Writeable {
     }
 
     /**
+     * Whether a live lease is held here by some node other than {@code nodeId}.
+     *
+     * <p><b>This is the check that was missing, and its absence is why two nodes could both publish.</b>
+     * Fencing on this head was written entirely in terms of terms: {@code leaseTerm > primaryTerm} refuses,
+     * anything else proceeds. For an index whose primary term is a compile-time constant -- which is every
+     * gated index, since {@code IndexDescriptor.FIRST_PRIMARY_TERM} is {@code 1} and nothing advances it --
+     * that comparison is {@code 1 > 1}, which is false forever. The refusal branch was dead code, so a
+     * second node acquiring the lease while the first still believed it held it was told "acquired", and
+     * both went on publishing full manifests derived from two different local Lucene commits. The head then
+     * alternated between two lineages, each generation complete and each missing the other's acknowledged
+     * documents, with the compare-and-swap reporting success to both because a CAS on a counter serialises
+     * writes without saying anything about who is entitled to make them.
+     *
+     * <p>Identity is therefore compared directly rather than inferred from a term. A node id is the one
+     * thing about a writer that is always distinct and always known at both ends, and it needs no cluster
+     * manager step to advance.
+     *
+     * @param nodeId the node asking whether it may take the lease; a {@code null} id can never be the holder
+     * @param nowMillis the current time in epoch millis to check the lease expiry against
+     * @return {@code true} if a lease is held at {@code nowMillis} by a node that is not {@code nodeId}
+     */
+    public boolean isLeaseHeldByAnotherNodeAt(String nodeId, long nowMillis) {
+        return isLeaseHeldAt(nowMillis) && leaseHolderNodeId.equals(nodeId) == false;
+    }
+
+    /**
+     * Whether a writer holding {@code acquiredLeaseTerm} on node {@code nodeId} is still the writer this
+     * head recognises -- the publish-time half of the fencing {@link #isLeaseHeldByAnotherNodeAt} is the
+     * acquire-time half of.
+     *
+     * <p>Both halves are needed and neither implies the other. The node id alone would let a writer that
+     * lost the lease, had it taken over, and then re-acquired it publish a commit packaged under its
+     * <em>first</em> tenancy, whose segment set predates whatever the intervening writer published. The
+     * lease term alone would let a writer publish under a term some other node had acquired. Together they
+     * say "this exact tenancy is still the current one", which is what a fencing token means.
+     *
+     * <p>Deliberately not expressed in terms of expiry. An expired lease does not entitle anyone else to
+     * publish until they have actually taken it over, and a takeover is what advances {@link #leaseTerm};
+     * a writer whose lease has lapsed but which nobody has displaced is stale, not fenced, and failing it
+     * on a clock skew rather than on an observed takeover would turn a slow renewal into data loss.
+     *
+     * @param nodeId the publishing node's id
+     * @param acquiredLeaseTerm the {@link #leaseTerm} that node's own acquisition installed here
+     * @return {@code true} if this head still records exactly that tenancy
+     */
+    public boolean isStillHeldBy(String nodeId, long acquiredLeaseTerm) {
+        return leaseTerm == acquiredLeaseTerm && nodeId != null && nodeId.equals(leaseHolderNodeId);
+    }
+
+    /**
      * The head after a writer acquires or renews the lease (rfc-serverless-opensearch.md &sect;16
      * Phase 4.5's lease-acquisition note), leaving {@code primaryTerm} and {@code
      * latestManifestGeneration} completely untouched but advancing {@link #leaseTerm} to {@code
@@ -160,6 +210,39 @@ public final class ShardHead implements Writeable {
      */
     public ShardHead withRenewedLease(String nodeId, long leaseExpiryMillis, long acquiringTerm) {
         return new ShardHead(primaryTerm, nodeId, leaseExpiryMillis, latestManifestGeneration, Math.max(leaseTerm, acquiringTerm));
+    }
+
+    /**
+     * The head after a writer <em>takes over</em> a lease that was free or lapsed, advancing {@link
+     * #leaseTerm} strictly rather than merely to the acquirer's own term.
+     *
+     * <p><b>This is the monotonic fencing token a gated index cannot get from its primary term.</b> A
+     * published index's term is bumped by the cluster manager on every primary promotion; a gated index has
+     * no cluster manager step to bump it in, so {@code IndexDescriptor} pins every one of its shards at
+     * {@code FIRST_PRIMARY_TERM = 1} and says so in its own javadoc. {@link #withRenewedLease} takes
+     * {@code Math.max(leaseTerm, acquiringTerm)}, so against a constant term it is the identity function
+     * and {@code leaseTerm} never moves: there is no token, and every term comparison downstream is a
+     * comparison of 1 against 1.
+     *
+     * <p>Advancing here instead makes the <em>object store</em> the thing that counts, which is the one
+     * participant every writer must go through and the one that already serialises with a
+     * compare-and-swap. Each successful takeover installs a strictly higher {@code leaseTerm}, so the
+     * displaced writer's {@link #isStillHeldBy} check fails from that instant -- before the new writer has
+     * published anything, which is the window {@link #leaseTerm}'s own javadoc describes and which a
+     * publication-driven bump leaves open.
+     *
+     * <p>Renewal by the node that already holds the lease must <b>not</b> come through here: bumping on
+     * every heartbeat would fence the holder out against the token it is holding. Renewal is {@link
+     * #withRenewedLease}, which leaves {@code leaseTerm} where it is for the same holder.
+     *
+     * @param nodeId the node taking the lease over
+     * @param leaseExpiryMillis the epoch millis at which the new tenancy expires unless renewed
+     * @param acquiringTerm the acquiring writer's own primary term, which the new lease term is never below
+     * @return a new head whose lease is held by {@code nodeId} under a strictly higher {@code leaseTerm},
+     *         with {@code primaryTerm} and {@code latestManifestGeneration} untouched
+     */
+    public ShardHead withTakenOverLease(String nodeId, long leaseExpiryMillis, long acquiringTerm) {
+        return new ShardHead(primaryTerm, nodeId, leaseExpiryMillis, latestManifestGeneration, Math.max(leaseTerm, acquiringTerm) + 1);
     }
 
     /**

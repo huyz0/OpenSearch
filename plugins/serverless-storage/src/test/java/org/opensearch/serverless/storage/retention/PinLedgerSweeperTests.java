@@ -31,6 +31,14 @@ public class PinLedgerSweeperTests extends OpenSearchTestCase {
 
     private static final String INDEX_UUID = "idx-uuid-1";
 
+    /**
+     * An instant comfortably past {@link PinLedger#UNCONFIRMED_PIN_TTL_MILLIS} measured from a ledger
+     * written at 0. Below that, the sweeper deliberately refuses to clear a ledger no matter what the shards
+     * say -- a ledger is written before the first pin is taken, so "no shard holds this pin" means "not yet"
+     * as easily as it means "already released" until the fan-out could no longer be running.
+     */
+    private static final long PAST_THE_FAN_OUT_TTL_MILLIS = PinLedger.UNCONFIRMED_PIN_TTL_MILLIS + 1000;
+
     private Map<Integer, BlobContainer> shardContainers;
     private BlobContainerPinLedgerStore ledgerStore;
     private ShardCloner.ContainerResolver resolver;
@@ -60,10 +68,14 @@ public class PinLedgerSweeperTests extends OpenSearchTestCase {
     public void testALedgerWithNoLivePinsOnAnyShardIsCleared() throws Exception {
         ledgerStore.write(new PinLedger("pin-1", "idx", INDEX_UUID, 3, 0));
 
-        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(1000, Long.MAX_VALUE);
+        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(
+            PAST_THE_FAN_OUT_TTL_MILLIS,
+            Long.MAX_VALUE
+        );
 
         assertEquals(1, result.ledgersSeen());
         assertEquals(1, result.ledgersCleared());
+        assertEquals("nothing was held back: this ledger is well past the fan-out window", 0, result.ledgersWithinFanOutWindow());
         assertTrue(result.abandonedPastTtl().isEmpty());
         assertTrue("a cleared ledger must actually be gone from the store", ledgerStore.list().isEmpty());
     }
@@ -77,7 +89,10 @@ public class PinLedgerSweeperTests extends OpenSearchTestCase {
         ledgerStore.write(new PinLedger("pin-1", "idx", INDEX_UUID, 3, 0));
         pin(2, "pin-1", PinRecord.NEVER_EXPIRES);
 
-        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(1000, Long.MAX_VALUE);
+        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(
+            PAST_THE_FAN_OUT_TTL_MILLIS,
+            Long.MAX_VALUE
+        );
 
         assertEquals(0, result.ledgersCleared());
         assertTrue("the ledger must still be readable, unreleased", ledgerStore.read("pin-1").isPresent());
@@ -88,7 +103,10 @@ public class PinLedgerSweeperTests extends OpenSearchTestCase {
         ledgerStore.write(new PinLedger("pin-1", "idx", INDEX_UUID, 3, 0));
         pin(1, "pin-1", 500); // expires at 500
 
-        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(1000, Long.MAX_VALUE);
+        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(
+            PAST_THE_FAN_OUT_TTL_MILLIS,
+            Long.MAX_VALUE
+        );
 
         assertEquals(1, result.ledgersCleared());
         assertTrue(ledgerStore.list().isEmpty());
@@ -99,9 +117,41 @@ public class PinLedgerSweeperTests extends OpenSearchTestCase {
         ledgerStore.write(new PinLedger("pin-1", "idx", INDEX_UUID, 3, 0));
         pin(1, "some-other-pin", PinRecord.NEVER_EXPIRES);
 
-        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(1000, Long.MAX_VALUE);
+        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(
+            PAST_THE_FAN_OUT_TTL_MILLIS,
+            Long.MAX_VALUE
+        );
 
         assertEquals(1, result.ledgersCleared());
+    }
+
+    /**
+     * The fan-out race, which used to destroy the record of a pin that was about to exist on every shard.
+     *
+     * <p>The ledger is written BEFORE the first shard is pinned, deliberately, so that a coordinator dying
+     * mid-fan-out leaves something behind saying what it was doing. A sweep landing in that gap saw no live
+     * pin on any of the index's shards, concluded the pin had been released, and deleted the ledger -- while
+     * the fan-out went on to complete and report success. The pin then existed on every shard with nothing
+     * that could enumerate it: release fell back to the index's current shard count, which is wrong after a
+     * reshard, and a crashed coordinator left no trace at all.
+     */
+    public void testALedgerYoungerThanTheFanOutTtlIsNeverClearedNoMatterWhatTheShardsSay() throws Exception {
+        long writtenAt = 5_000;
+        ledgerStore.write(new PinLedger("nightly", "idx", INDEX_UUID, 3, writtenAt));
+
+        // 50 milliseconds later: the coordinator has written the ledger and has not reached shard 0 yet.
+        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, resolver).sweepOnce(writtenAt + 50, Long.MAX_VALUE);
+
+        assertEquals("no live pin exists yet, but that means 'not taken yet', not 'already released'", 0, result.ledgersCleared());
+        assertEquals(
+            "and the pass must say so rather than looking like it simply found nothing to do",
+            1,
+            result.ledgersWithinFanOutWindow()
+        );
+        assertTrue(
+            "the ledger must survive the whole window in which the fan-out could still be running",
+            ledgerStore.read("nightly").isPresent()
+        );
     }
 
     /** Still live and older than the TTL: reported, not deleted -- this class releases nothing. */
@@ -151,7 +201,10 @@ public class PinLedgerSweeperTests extends OpenSearchTestCase {
             ? unreadableShard1
             : shardContainers.get(shardId);
 
-        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, flakyResolver).sweepOnce(1000, Long.MAX_VALUE);
+        PinLedgerSweeper.SweepResult result = new PinLedgerSweeper(ledgerStore, flakyResolver).sweepOnce(
+            PAST_THE_FAN_OUT_TTL_MILLIS,
+            Long.MAX_VALUE
+        );
 
         assertEquals("an unreadable shard must not count as cleared", 0, result.ledgersCleared());
         assertTrue("must not be reported as abandoned either -- it was skipped, not judged", result.abandonedPastTtl().isEmpty());

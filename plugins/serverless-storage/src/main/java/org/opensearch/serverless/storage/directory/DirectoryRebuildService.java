@@ -37,6 +37,22 @@ import java.util.function.LongSupplier;
  * side of the directory; reader entries repopulate themselves the ordinary way, from the next
  * activation on whichever node picks the shard up next.
  *
+ * <p><b>No production caller, and not usable at target scale as written.</b> Nothing outside this class's
+ * own tests constructs it. Two things would have to change before anything should: the walk materialises
+ * {@code rootContainer.children()} as one map with an entry per index uuid -- ten million or more of them
+ * at the scale this plugin exists for, in heap, before a single shard is read -- and it then issues one
+ * {@code readRegister} GET per shard, serially, with no cursor to resume from if it is interrupted. The
+ * RFC's own estimate for this operation is "~100K LIST pages, a background sweep of minutes-to-hours";
+ * a hundred million serial GETs at ten milliseconds is eleven days, and the walk exhausts heap long before
+ * it gets there. Making it real means paging the listing rather than materialising it, parallelising
+ * across index-uuid prefixes the way {@code DescriptorEnumerator.allNamesInParallel} already does, storing
+ * a resume cursor, and reconstructing what it can from the listing itself -- the key names encode
+ * {@code <uuid>/<shardId>} -- so that a head is fetched only for a shard some caller actually asked about.
+ *
+ * <p>It is kept rather than deleted only because {@code BlobContainerManifestStore} cites it by name for
+ * the wholesale-enumeration tradeoff the two share. Deleting it is the other reasonable answer and needs
+ * that reference dropped in the same change.
+ *
  * <p>Requires a {@link BlobContainer} rooted <em>above</em> the per-shard split (i.e. the same
  * base path {@code ServerlessStoragePlugin} resolves {@code serverless_storage.base_path} to,
  * with an empty {@link org.opensearch.common.blobstore.BlobPath}) so {@link

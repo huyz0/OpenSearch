@@ -117,6 +117,43 @@ public final class DescriptorCache {
      */
     private final ConcurrentHashMap<String, CompletableFuture<IndexDescriptor>> inFlight = new ConcurrentHashMap<>();
 
+    /**
+     * How many invalidations have landed on a name while a read of it was outstanding.
+     *
+     * <p><b>Without this, an invalidation that arrives during a load is erased by that load.</b> {@link
+     * #invalidate} removed the cached entry and nothing else, and {@link #load} admitted its result
+     * unconditionally, so:
+     *
+     * <pre>
+     * t0  node B misses on "logs-a", takes the in-flight slot, and issues a readRegister
+     * t1  node A deletes "logs-a": tombstone durable, live key deleted, change-log entry appended
+     * t2  node B's tailer reads the DELETED entry and calls invalidate("logs-a") -- which removes nothing,
+     *     because the load has not admitted yet
+     * t3  node B's t0 read, issued before the delete, returns the *live* descriptor and admits it
+     * t4  for the whole freshness window -- a minute by default -- node B resolves "logs-a" as OPEN and
+     *     routes acknowledged writes to a shard whose index is deleted
+     * </pre>
+     *
+     * Every cross-node freshness mechanism in this design ends in {@link #invalidate}: the change tailer,
+     * and each of the backend's own write paths. All of them were subject to this, and the sequential
+     * version of it is the one case that <em>is</em> covered by a test, which is what made the concurrent
+     * version look handled.
+     *
+     * <p><b>Why a counter per outstanding read rather than a counter per name.</b> A permanent per-name
+     * epoch map is a leak: {@link #invalidate} is called for every name that changes anywhere in the
+     * cluster, most of which this node has never read and never will. An entry here exists only while at
+     * least one load of that name is in flight, so the map's size is bounded by concurrent misses rather
+     * than by cluster-wide change volume. {@code readers} is only ever mutated inside a {@link
+     * ConcurrentHashMap#compute} on its own key, which is what makes it safe without being volatile.
+     */
+    private final ConcurrentHashMap<String, LoadGuard> loads = new ConcurrentHashMap<>();
+
+    /** The invalidation counter for one name, alive only while a read of that name is outstanding. */
+    private static final class LoadGuard {
+        private final AtomicLong invalidations = new AtomicLong();
+        private int readers;
+    }
+
     private final LongSupplier clock;
     private final long ttlNanos;
     private final long collapseWaitMillis;
@@ -143,6 +180,17 @@ public final class DescriptorCache {
     private final AtomicLong collapsedWaits = new AtomicLong();
     private final AtomicLong collapseFallbacks = new AtomicLong();
 
+    /**
+     * Reads whose result was thrown away because the name was invalidated while they were in flight.
+     *
+     * <p>Counted rather than silent because it is the one thing that says the guard is doing something. A
+     * zero here across a cluster that deletes indices means either the race genuinely never happens or the
+     * guard is not wired to the invalidations that matter, and those are indistinguishable without a
+     * number. A large one means invalidation and reads are contending, which is a change-rate problem
+     * rather than a cache problem.
+     */
+    private final AtomicLong staleAdmissionsDropped = new AtomicLong();
+
     public DescriptorCache() {
         this(System::nanoTime, DEFAULT_TTL_NANOS, DEFAULT_COLLAPSE_WAIT_MILLIS, DEFAULT_CAPACITY, DEFAULT_BYTES);
     }
@@ -163,13 +211,26 @@ public final class DescriptorCache {
      *
      * @throws DescriptorUnavailableException if the loader could not tell whether the descriptor exists
      */
-    /** Computes a ±10% jittered TTL based on key hash code to prevent thundering herd spikes (T104). */
+    /**
+     * A per-name jittered freshness window, spreading re-reads that would otherwise land together (T104).
+     *
+     * <p>Derived from the name's hash rather than from a random number so it is stable for a name across
+     * calls and across nodes: a window that moved on every lookup would not spread anything, it would
+     * merely make freshness unpredictable.
+     *
+     * <p><b>The jitter only ever shortens the window; it used to run in both directions.</b> A &plusmn;10%
+     * spread makes {@code ttlNanos} neither an upper nor a lower bound on staleness, so a caller that has
+     * been told "at most a minute old" can be handed something older, and the invalidation-driven design
+     * this cache sits in reasons in exactly those terms. One-sided jitter spreads the herd just as well --
+     * what matters is that T names do not expire in the same tick, not which side of the nominal window
+     * they land on -- while keeping the configured TTL a real ceiling.
+     */
     private long jitteredTtl(String name) {
         if (ttlNanos <= 0) {
             return ttlNanos;
         }
         int hash = name.hashCode();
-        double factor = 0.9 + ((hash & Integer.MAX_VALUE) % 200 / 1000.0);
+        double factor = 0.9 + ((hash & Integer.MAX_VALUE) % 100 / 1000.0);
         return (long) (ttlNanos * factor);
     }
 
@@ -188,7 +249,18 @@ public final class DescriptorCache {
         // after the expensive call prevents nothing.
         CachedDescriptor cached = cache.get(name);
         long now = clock.getAsLong();
-        if (cached != null && now - cached.readAtNanos() < ttlNanos) {
+        // Jittered, like getIfFresh, and this is the path where the jitter was actually needed. It was
+        // computed for the thundering herd and then applied only to the non-blocking peek, which issues no
+        // read: this is the method that goes to the backend, so the mitigation was absent from the only
+        // path it could mitigate. A node that warms T tenants in one burst -- a mass reactivation, a
+        // prefetch over a wide bulk -- re-read all T of them in the same tick a window later, once per node
+        // per window, forever.
+        //
+        // The second effect matters as much: with the raw TTL here and a jittered one there, the two
+        // methods disagreed about whether the same entry was fresh, by up to ten percent in either
+        // direction. A cache whose two read paths answer differently for one entry is a cache whose hit
+        // rate is not a measurement of anything.
+        if (cached != null && now - cached.readAtNanos() < jitteredTtl(name)) {
             freshHits.incrementAndGet();
             return cached.descriptor();
         }
@@ -215,7 +287,18 @@ public final class DescriptorCache {
         } finally {
             // Completing an already-completed future is a no-op, so this only fires if the load threw an
             // Error. Without it a waiter would block until its own timeout for no reason.
-            mine.complete(null);
+            //
+            // Completed exceptionally rather than with null, and that changed when waiters stopped
+            // re-reading a shared null (see awaitOrLoadDirectly). While they re-read, a null here cost a
+            // wasted round trip; now that they trust it, a null here would report "there is no such index"
+            // on the strength of an OutOfMemoryError. Unavailability is the honest answer and the one this
+            // package is careful to keep separate from absence.
+            mine.completeExceptionally(
+                new DescriptorUnavailableException(
+                    name,
+                    new IllegalStateException("the descriptor read for [" + name + "] did not complete")
+                )
+            );
             inFlight.remove(name, mine);
         }
     }
@@ -235,11 +318,26 @@ public final class DescriptorCache {
     ) {
         try {
             IndexDescriptor shared = reader.get(collapseWaitMillis, TimeUnit.MILLISECONDS);
+            // Including a null one, which this used to re-read instead of sharing.
+            //
+            // Absence is deliberately never cached, so for a name that does not exist collapsing was
+            // switched off entirely: every waiter behind the reader issued its own read, and each of those
+            // reads costs *two* GETs at the backend (the live prefix, then the tombstone prefix). A request
+            // storm against a name that does not exist -- a client retrying against a deleted index, a
+            // typo'd name in a hot loop -- was therefore 2 x concurrency GETs with no cache and no
+            // collapse, which is the metastable cache-miss cliff this whole design is shaped to avoid.
+            //
+            // Sharing the null is not caching it: the answer came from a read issued moments ago by a
+            // caller that is still here, so a name created since is at most one collapse-window stale,
+            // where caching it would have made it a whole freshness window stale. Read-your-writes is
+            // preserved because nothing is stored -- the next caller to arrive after this reader is gone
+            // reads the store again.
             if (shared != null) {
                 collapsedWaits.incrementAndGet();
                 return shared;
             }
-            return load(name, loader, clock.getAsLong());
+            collapsedWaits.incrementAndGet();
+            return null;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             // Not null. Null means "there is no such descriptor" to every caller of this class, and that is
@@ -261,8 +359,16 @@ public final class DescriptorCache {
             if (e.getCause() instanceof DescriptorUnavailableException unavailable) {
                 throw unavailable;
             }
+            // Anything else is still a failure, and it used to be answered with null.
+            //
+            // Null means "there is no such index" to every caller of this class, and a client acting on
+            // that may go on to create an index that already exists -- the one conflation this package's
+            // own javadoc says must never happen. Any RuntimeException the loader raises that is not a
+            // DescriptorUnavailableException (an NPE on a malformed descriptor, a rejected execution, an
+            // IllegalStateException from admission) was being laundered into "no such index" for every
+            // waiter behind the reader, and only for waiters: the reader itself already rethrows.
             logger.debug("in-flight descriptor read for [{}] failed: {}", name, e);
-            return null;
+            throw new DescriptorUnavailableException(name, e.getCause() == null ? e : e.getCause());
         }
     }
 
@@ -274,6 +380,13 @@ public final class DescriptorCache {
      * prefetcher must not do. The read is counted here because it happened, and leaving it uncounted would
      * make the hit rate this cache reports flattering rather than true -- warmed names would look like hits
      * with no read behind them.
+     *
+     * <p><b>Not covered by {@link #loads}' invalidation guard, and it has no production caller today.</b>
+     * The guard has to be taken before the read is issued, and this method is handed a value that was read
+     * somewhere else, so there is nothing here to take it around. That is currently harmless because the
+     * only prefetcher, {@code BlobDescriptorBackend.warmAsync}, warms by calling {@link #get} per name and
+     * is therefore guarded. A future prefetcher that reads in bulk and admits through here would
+     * reintroduce the race, and would need to capture the guard around its own read instead.
      */
     public void warm(String name, IndexDescriptor descriptor) {
         if (descriptor == null) {
@@ -285,14 +398,63 @@ public final class DescriptorCache {
         admit(name, descriptor, clock.getAsLong());
     }
 
-    /** Runs the loader, counts the read, and admits a hit. A miss is deliberately not cached. */
+    /**
+     * Runs the loader, counts the read, and admits a hit unless the name was invalidated while the loader
+     * was running. A miss is deliberately not cached.
+     *
+     * <p>Every load path in this class goes through here -- the collapsing reader, the waiter that timed
+     * out, and the waiter that was handed a null -- so the guard is taken in one place rather than at three
+     * call sites, one of which would eventually be added without it. The guard is taken <em>before</em> the
+     * loader is called and released after admission, which is the whole of the window {@link #loads}
+     * describes.
+     *
+     * <p>The value is still returned to this caller when its admission is dropped. It is what the store
+     * answered, and the caller asked for an answer, not for a cache entry; what must not happen is that
+     * answer outliving the invalidation for every later caller.
+     */
     private IndexDescriptor load(String name, Function<String, IndexDescriptor> loader, long now) {
-        reads.incrementAndGet();
-        IndexDescriptor descriptor = loader.apply(name);
-        if (descriptor != null) {
-            admit(name, descriptor, now);
+        LoadGuard guard = beginLoad(name);
+        long invalidationsBefore = guard.invalidations.get();
+        try {
+            reads.incrementAndGet();
+            IndexDescriptor descriptor = loader.apply(name);
+            if (descriptor != null) {
+                if (guard.invalidations.get() == invalidationsBefore) {
+                    admit(name, descriptor, now);
+                } else {
+                    staleAdmissionsDropped.incrementAndGet();
+                    logger.debug("descriptor for [{}] was invalidated while it was being read; not admitting the result", name);
+                }
+            }
+            return descriptor;
+        } finally {
+            endLoad(name, guard);
         }
-        return descriptor;
+    }
+
+    /** Registers this thread as a reader of {@code name}, creating the guard if it is the first. */
+    private LoadGuard beginLoad(String name) {
+        return loads.compute(name, (key, guard) -> {
+            LoadGuard existing = guard == null ? new LoadGuard() : guard;
+            existing.readers++;
+            return existing;
+        });
+    }
+
+    /**
+     * Releases this thread's claim, removing the guard once the last reader of the name is done.
+     *
+     * <p>Identity-checked against the guard the caller began with, so a guard already removed and replaced
+     * by a later load is not decremented on this load's behalf.
+     */
+    private void endLoad(String name, LoadGuard guard) {
+        loads.computeIfPresent(name, (key, current) -> {
+            if (current != guard) {
+                return current;
+            }
+            current.readers--;
+            return current.readers <= 0 ? null : current;
+        });
     }
 
     /**
@@ -379,8 +541,19 @@ public final class DescriptorCache {
         return dropped[0];
     }
 
-    /** Drops a cached descriptor, which a write must do so it does not serve its own stale value. */
+    /**
+     * Drops a cached descriptor, which a write must do so it does not serve its own stale value.
+     *
+     * <p>The counter is bumped before the entry is removed, and the order is load-bearing: between the two
+     * statements an in-flight load may admit, and a load that admits after the bump is dropped by {@link
+     * #load}'s own check. The other order leaves that admission both un-dropped and un-removed. See {@link
+     * #loads} for the interleaving this closes.
+     */
     public void invalidate(String name) {
+        loads.computeIfPresent(name, (key, guard) -> {
+            guard.invalidations.incrementAndGet();
+            return guard;
+        });
         CachedDescriptor removed = cache.remove(name);
         if (removed != null) {
             cachedBytes.addAndGet(-removed.bytes());
@@ -445,6 +618,11 @@ public final class DescriptorCache {
         long hits = freshHits.get() + collapsedWaits.get();
         long total = hits + reads.get();
         return total == 0 ? Double.NaN : (double) hits / total;
+    }
+
+    /** Reads whose result was dropped rather than admitted because an invalidation overtook them. */
+    public long staleAdmissionsDroppedCount() {
+        return staleAdmissionsDropped.get();
     }
 
     /** How many descriptors are cached, which is what the capacity bounds and what a test checks. */

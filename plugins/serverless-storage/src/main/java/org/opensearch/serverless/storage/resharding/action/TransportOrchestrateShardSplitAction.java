@@ -34,9 +34,11 @@ import java.util.List;
  * {@link EnableWritePartitionRoutingAction} upstream of it) stops the source index from continuing
  * to accept writes under its own original name before or during that clone point and the stages
  * that follow it. A document written to the source in that window is captured only by the source,
- * never by any split target -- it will not appear through the new cutover alias. <b>Once cutover
- * succeeds, this class now fences the source automatically</b> (see {@link FenceSplitSourceAction},
- * called immediately after {@link CutoverSplitRoutingAction} below): a further direct write against
+ * never by any split target -- it will not appear through the new cutover alias. <b>When (and only
+ * when) the caller asks for write routing, this class fences the source once that routing is
+ * live</b> (see {@link FenceSplitSourceAction}, called from {@code fenceSourceStage} below, after
+ * {@link EnableWritePartitionRoutingAction} rather than before it -- see {@code writeRoutingStage}'s
+ * javadoc, finding R-7, for why fencing must never run on its own): a further direct write against
  * the source's own name is rejected by {@link
  * org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter}, so the
  * previously permanently-open "keep writing to the source forever, silently diverging, until {@link
@@ -174,16 +176,11 @@ public class TransportOrchestrateShardSplitAction extends HandledTransportAction
             ShardSplitAction.INSTANCE,
             new ShardSplitRequest(sourceIndexUuid, 0, targetMetadata.getIndex().getUUID(), 0, partitionIndex, targetIndexNames.size()),
             ActionListener.wrap(response -> splitStage(request, sourceIndexUuid, partitionIndex + 1, listener), e -> {
-                // A resumed retry re-splitting an already-split target hits one of two "already
-                // done" conditions, depending on exactly how far the prior attempt got before
-                // failing: ShardCloner#clone's own explicit refusal to CAS onto an already-
-                // published head ("already has a published head"), or -- since clone lineage is
-                // written *before* that CAS (see ShardCloner#clone's own javadoc for why: "so
-                // whenever a clone is visible, deleteClone can already find its way back to the
-                // pin it must remove") -- the underlying blob store's own atomic-write refusal to
-                // overwrite an already-written lineage blob ("already exists"). Both are treated
-                // as "already done," not a failure, the same resumability every other stage here
-                // has.
+                // A resumed retry re-splitting an already-split target hits ShardCloner#clone's
+                // own explicit refusal to CAS onto an already-published head, which is treated as
+                // "already done" rather than a failure -- the same resumability every other stage
+                // here has. Nothing else is: see isAlreadyDoneSplit's javadoc (finding R-10) for
+                // why the broader "already exists" match this used to also accept was unsafe.
                 if (isAlreadyDoneSplit(e)) {
                     splitStage(request, sourceIndexUuid, partitionIndex + 1, listener);
                 } else {
@@ -197,58 +194,119 @@ public class TransportOrchestrateShardSplitAction extends HandledTransportAction
         client.execute(
             CutoverSplitRoutingAction.INSTANCE,
             new CutoverSplitRoutingRequest(request.routingAliasName(), request.targetIndexNames()),
-            ActionListener.wrap(response -> fenceSourceStage(request, listener), listener::onFailure)
+            ActionListener.wrap(response -> {
+                if (response.isAcknowledged() == false) {
+                    // The alias update was committed but not acknowledged by every node within the
+                    // request's ack timeout, so some nodes may still resolve the old alias. Fencing
+                    // the source on top of that would take away the only entry point those nodes can
+                    // still see. Report the partial cutover instead of proceeding and hard-coding
+                    // `cutover=true` over it (finding R-15); a retry of the whole call is safe and
+                    // re-confirms every stage.
+                    listener.onFailure(
+                        new IllegalStateException(
+                            "cutover of alias ["
+                                + request.routingAliasName()
+                                + "] committed but was not acknowledged by all nodes within the timeout -- "
+                                + "refusing to fence the source or enable write routing on top of a partially-visible "
+                                + "cutover; retry this call once the cluster has caught up"
+                        )
+                    );
+                    return;
+                }
+                writeRoutingStage(request, listener);
+            }, listener::onFailure)
         );
     }
 
     /**
-     * Fences the source immediately once cutover has actually landed -- narrowing (not eliminating,
-     * see {@link org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata}'s own
-     * javadoc for the honest limitation) the "source keeps silently accepting writes forever" gap
-     * this class's own javadoc used to only be able to warn operators about, not close.
+     * <b>Finding R-7.</b> Write routing and source fencing are now one decision, in that order, and
+     * neither happens when {@code enable_write_routing} is false.
+     *
+     * <p>This used to be two independent stages, with fencing running <em>unconditionally</em>
+     * immediately after cutover and the write-routing stage returning early right afterwards when
+     * the (default, {@code false}) flag said not to enable routing. The result was that the plainly
+     * documented default invocation -- {@code POST .../_orchestrate_split/src?target_indices=a,b} --
+     * returned a success response and left the dataset with <b>no writable entry point at all</b>:
+     * direct writes to {@code src} rejected by the fence, and writes to the alias rejected by core
+     * because a multi-index alias with no {@code is_write_index} and no partition assignment has no
+     * write index. With no unfence primitive in existence at the time, the only escape was deleting
+     * the index.
+     *
+     * <p>Two changes close it, and both are needed. Here: a fence is only ever applied once write
+     * routing has actually been enabled, so the alias is a working write entry point before the
+     * source stops being one -- and a caller who does not ask for write routing keeps the source
+     * writable, which is the only coherent meaning "cutover reads, leave writes alone" can have.
+     * Separately, {@code UnfenceSplitSourceAction} now exists, so even a fence applied in error is
+     * recoverable without deleting data.
      */
-    private void fenceSourceStage(OrchestrateShardSplitRequest request, ActionListener<OrchestrateShardSplitResponse> listener) {
-        client.execute(
-            FenceSplitSourceAction.INSTANCE,
-            new FenceSplitSourceRequest(request.sourceIndexName(), request.routingAliasName()),
-            ActionListener.wrap(response -> writeRoutingStage(request, listener), listener::onFailure)
-        );
-    }
-
     private void writeRoutingStage(OrchestrateShardSplitRequest request, ActionListener<OrchestrateShardSplitResponse> listener) {
         if (request.enableWriteRouting() == false) {
-            listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, false));
+            listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, false, false));
             return;
         }
         client.execute(
             EnableWritePartitionRoutingAction.INSTANCE,
             new EnableWritePartitionRoutingRequest(request.routingAliasName(), request.targetIndexNames()),
+            ActionListener.wrap(response -> fenceSourceStage(request, listener), listener::onFailure)
+        );
+    }
+
+    /**
+     * Fences the source once write routing is live, so a direct write to the source's own name is
+     * rejected rather than silently diverging from the targets the alias now serves -- narrowing
+     * (not eliminating, see {@link
+     * org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata}'s own javadoc for the
+     * honest limitation) the "source keeps silently accepting writes forever" gap.
+     */
+    private void fenceSourceStage(OrchestrateShardSplitRequest request, ActionListener<OrchestrateShardSplitResponse> listener) {
+        client.execute(
+            FenceSplitSourceAction.INSTANCE,
+            new FenceSplitSourceRequest(request.sourceIndexName(), request.routingAliasName()),
             ActionListener.wrap(
-                response -> listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, true)),
+                response -> listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, true, true)),
                 listener::onFailure
             )
         );
     }
 
     /**
+     * The one sentinel that genuinely proves a target was already split: {@code ShardCloner#clone}
+     * refuses to CAS onto a head that is already published, and says so in exactly these words.
+     * Matching on a message is still a weak contract, but this one is authored by this plugin, is
+     * only ever produced by that single refusal, and positively establishes the thing the resume
+     * path needs to know -- that the target has a published head.
+     */
+    private static final String ALREADY_PUBLISHED_HEAD_SENTINEL = "already has a published head";
+
+    /**
      * Whether a failed {@link ShardSplitAction} call represents a target that some prior attempt
      * already split, not a genuine new failure.
      *
-     * <p><b>Known limitation, not a hidden one</b>: {@code ShardCloner#clone} writes a target's
-     * clone lineage blob *before* CAS-ing its head (see that method's own javadoc: "so whenever a
-     * clone is visible, deleteClone can already find its way back to the pin it must remove"). If
-     * a prior attempt crashed in the narrow window between those two writes, this treats the
-     * target as already-done even though its head was never actually published -- the same
-     * "logical-first, not a fully transactional multi-step primitive" shape {@code
-     * ShardSplitter}/{@code ShardCloner} already have everywhere else in this plugin, not a new gap
-     * this orchestration action introduces. A future strict-verification pass could check the
-     * target's head really is published (not just that lineage exists) before treating this as
-     * resumable; not attempted here.
+     * <p><b>Finding R-10: this used to also match {@code "already exists"}, and that was unsafe.</b>
+     * Blob stores, alias requests, {@code ResourceAlreadyExistsException} and a long tail of {@code
+     * IOException}s all produce messages containing that phrase for entirely unrelated reasons. A
+     * target whose split failed on, say, a blob-store error whose message happened to contain it was
+     * treated as done: cutover then put the alias in front of a target with <em>no published
+     * head</em>, and (before R-7 was fixed) fenced the source behind it, so every document hashing
+     * to that partition became unreachable and every write to it failed. Silently proceeding past a
+     * failure we did not understand is exactly how an empty index ends up serving live traffic.
+     *
+     * <p>The original reason for the broader match was real but much narrower: {@code
+     * ShardCloner#clone} writes a target's clone-lineage blob <em>before</em> CAS-ing its head, so a
+     * prior attempt that crashed between those two writes leaves a lineage blob whose re-write the
+     * blob store refuses with "already exists". That case now surfaces as an ordinary failure, which
+     * is the correct outcome: the target's head was never published, so it is <em>not</em> already
+     * split, and an operator being told so is strictly better than the alias silently pointing at
+     * it. The clean long-term fix -- a positive check that reads the target's head and its {@code
+     * shard-partition} descriptor and resumes only when the head is published with the expected
+     * {@code (partitionIndex, numPartitions)} -- needs a node-level action against the target's blob
+     * container, which this cluster-manager-side coordinator has no route to today; it is written up
+     * as deferred work rather than approximated here.
      */
     private static boolean isAlreadyDoneSplit(Exception e) {
         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
             String message = cause.getMessage();
-            if (message != null && (message.contains("already has a published head") || message.contains("already exists"))) {
+            if (message != null && message.contains(ALREADY_PUBLISHED_HEAD_SENTINEL)) {
                 return true;
             }
         }

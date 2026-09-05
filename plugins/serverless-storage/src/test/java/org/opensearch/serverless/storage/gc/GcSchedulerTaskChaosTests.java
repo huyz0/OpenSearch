@@ -95,6 +95,10 @@ public class GcSchedulerTaskChaosTests extends OpenSearchTestCase {
             writeGeneration(setupBundleStore, setupManifestStore, generation, farInThePast);
         }
         CommitManifest latest = writeGeneration(setupBundleStore, setupManifestStore, deletableGenerationCount + 1L, farInThePast);
+        // Writing a manifest blob is not publishing it any more: the sweep anchors "latest" to the head
+        // register and refuses to treat an unpublished manifest as one, so the setup has to move the head
+        // exactly as a real commit would.
+        TestShardHeads.publish(uncountedContainer, INDEX_UUID, SHARD_ID, PRIMARY_TERM, latest.generation());
 
         BlobContainer faultyContainer = new ProbabilisticFailingBlobContainer(uncountedContainer, random(), 0.3);
         BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(faultyContainer);
@@ -107,7 +111,9 @@ public class GcSchedulerTaskChaosTests extends OpenSearchTestCase {
             retentionWindowMillis,
             manifestStore,
             bundleStore,
-            pinRegistry
+            pinRegistry,
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(faultyContainer),
+            new BlobContainerGcSweepStateStore(faultyContainer, INDEX_UUID, SHARD_ID)
         );
         ThreadPool threadPool = new TestThreadPool(getTestName());
         try {

@@ -75,6 +75,13 @@ public class RestSnapshotReleaseAction extends BaseRestHandler {
                 "request body must contain a string \"index_uuid\", a numeric \"shard_id\", and a string \"snapshot_id\""
             );
         }
+        // See RestSnapshotPinAction's own guard: the shard-level request type accepts the deep-snapshot
+        // prefix because the export itself goes through it, so the operator-facing endpoint is where a
+        // hand-written release inside that namespace has to be refused -- releasing one would drop the pin
+        // holding a copy that is still being made.
+        if (((String) snapshotId).startsWith(SnapshotPinRequest.DEEP_SNAPSHOT_PIN_ID_PREFIX)) {
+            throw new IllegalArgumentException(SnapshotPinRequest.reservedSnapshotIdError(SnapshotPinRequest.DEEP_SNAPSHOT_PIN_ID_PREFIX));
+        }
         SnapshotReleaseRequest releaseRequest = new SnapshotReleaseRequest(
             (String) indexUuid,
             ((Number) shardId).intValue(),

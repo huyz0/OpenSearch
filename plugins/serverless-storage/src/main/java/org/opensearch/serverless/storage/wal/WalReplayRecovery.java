@@ -122,12 +122,73 @@ public final class WalReplayRecovery {
         long activationWalPosition,
         EncryptionKeyProvider encryptionKeyProvider
     ) throws IOException {
+        return replayOperationsWithReport(
+            walBlobContainer,
+            indexUuid,
+            shardId,
+            minPrimaryTerm,
+            lastDurableWalPosition,
+            activationWalPosition,
+            encryptionKeyProvider
+        ).operations();
+    }
+
+    /**
+     * The outcome of one replay: the operations to apply, plus whether replay stopped early on a
+     * corrupt trailing chunk. The second half exists because "we tolerated a corrupt chunk" is a
+     * shard-level <em>recovery-incomplete</em> fact the caller must be able to act on and surface,
+     * not a detail that belongs only in a log line -- see {@link #replayOperationsWithReport}.
+     *
+     * @param operations the operations to replay, in original append order.
+     * @param truncatedTailChunkSequence the chunk sequence replay stopped at because it was corrupt
+     *                                   or truncated, or {@code -1} if replay completed the whole range.
+     */
+    public record ReplayResult(List<Translog.Operation> operations, long truncatedTailChunkSequence) {
+        /** Whether replay stopped early on a corrupt trailing chunk, i.e. this recovery is knowingly incomplete. */
+        public boolean isIncomplete() {
+            return truncatedTailChunkSequence >= 0;
+        }
+    }
+
+    /**
+     * Same as the seven-argument {@link #replayOperations} overload, but reports whether replay
+     * stopped early on a corrupt trailing chunk instead of discarding that fact.
+     *
+     * <p><b>The corrupt-tail tolerance is now much narrower than it was.</b> It used to fire for the
+     * last chunk that happened to <em>exist</em> in the replay range, justified as "indistinguishable
+     * from an in-flight write that crashed mid-append." That justification does not survive contact
+     * with the two write paths that actually exist: a chunk blob is written with a single
+     * {@code writeBlob} call ({@code WalChunkService#writeChunkWithRetry}), which on any real object
+     * store is atomic -- a partially-visible object is not a state S3/GCS/Azure produce. On {@code
+     * FsBlobContainer} a crash genuinely can leave a partial file, but that chunk was by construction
+     * never acked (its flush had not returned). So in production the branch fired on genuine
+     * corruption of a chunk whose records <em>were</em> acked, and dropped them silently. Worse,
+     * "last existing chunk in the range" is computed over the blobs that exist, so a hole -- which a
+     * failed write used to leave behind on every retry, see {@code WalChunkService#writeChunkWithRetry}
+     * -- could make a mid-stream chunk look like the tail and take every record after it with it.
+     *
+     * <p>It now fires only when the corrupt chunk is the true final sequence of the fenced range
+     * ({@code chunkSequence == activationWalPosition - 1}), which is the only sequence a predecessor
+     * could still have been writing when this writer snapshotted its bound; anything else fails
+     * loudly. Even in that case the event is returned to the caller as {@link
+     * ReplayResult#isIncomplete()} and logged at ERROR, not WARN, because acknowledged operations may
+     * have been dropped.
+     */
+    public static ReplayResult replayOperationsWithReport(
+        BlobContainer walBlobContainer,
+        String indexUuid,
+        int shardId,
+        long minPrimaryTerm,
+        WalPosition lastDurableWalPosition,
+        long activationWalPosition,
+        EncryptionKeyProvider encryptionKeyProvider
+    ) throws IOException {
         if (activationWalPosition < 0) {
-            return List.of();
+            return new ReplayResult(List.of(), -1);
         }
         long fromChunkSequenceInclusive = lastDurableWalPosition == null ? 0 : lastDurableWalPosition.offset() + 1;
         if (fromChunkSequenceInclusive >= activationWalPosition) {
-            return List.of();
+            return new ReplayResult(List.of(), -1);
         }
 
         List<Long> chunkSequences = listChunkSequencesInRange(walBlobContainer, fromChunkSequenceInclusive, activationWalPosition);
@@ -135,37 +196,40 @@ public final class WalReplayRecovery {
         for (int i = 0; i < chunkSequences.size(); i++) {
             long chunkSequence = chunkSequences.get(i);
             byte[] chunkBytes = readChunkBytes(walBlobContainer, chunkSequence);
-            List<WalRecord> rawRecords;
+            WalChunkReader.ParsedChunk parsed;
             try {
-                rawRecords = WalChunkReader.readRecords(chunkBytes);
+                parsed = WalChunkReader.readChunk(chunkBytes);
             } catch (WalFormatException e) {
-                // A torn/corrupt chunk at the very end of the range this writer would replay is
-                // indistinguishable from an in-flight write that crashed mid-append (the last chunk
-                // sequence a predecessor was writing when it died, never fully flushed) -- treat it
-                // as "nothing more was durably written," not a fatal error, and stop replay here
-                // rather than failing the whole recovery over a write this shard's own activation
-                // never depended on completing. A torn chunk anywhere else in the range is real
-                // corruption of a chunk some LATER chunk was written after, so it must fail loudly.
-                if (i == chunkSequences.size() - 1) {
-                    logger.warn(
-                        "WAL chunk {} (the last chunk in this replay range) is corrupt or truncated -- "
-                            + "treating it as an incomplete tail write and stopping replay there: {}",
+                // Gated on the true final sequence of the fenced range, not merely on "the last blob
+                // that happens to exist" -- see this method's own javadoc for why that older test was
+                // both too broad (real corruption of acked records looked like a benign torn tail)
+                // and defeatable by a sequence hole.
+                if (chunkSequence == activationWalPosition - 1) {
+                    logger.error(
+                        "WAL chunk {} is the final chunk of this shard's fenced replay range and is corrupt or truncated -- "
+                            + "replay stops here and this recovery is INCOMPLETE: any acknowledged operations in that chunk "
+                            + "are not being applied for [{}][{}]: {}",
                         chunkSequence,
+                        indexUuid,
+                        shardId,
                         e
                     );
-                    break;
+                    return new ReplayResult(operations, chunkSequence);
                 }
                 throw e;
             }
-            List<WalRecord> records = WalChunkReader.filterByShardAndMinimumTerm(rawRecords, indexUuid, shardId, minPrimaryTerm);
+            List<WalRecord> records = WalChunkReader.filterByShardAndMinimumTerm(parsed.records(), indexUuid, shardId, minPrimaryTerm);
             if (encryptionKeyProvider != null) {
-                records = WalRecordCrypto.decryptAll(records, encryptionKeyProvider);
+                // The chunk's own format version, not this build's: records written before the
+                // identity-binding change carry no associated data, and a chunk written then is
+                // precisely what a node that has just upgraded and crashed needs to replay.
+                records = WalRecordCrypto.decryptAll(records, encryptionKeyProvider, parsed.formatVersion());
             }
             for (WalRecord record : records) {
                 operations.add(Translog.Operation.readOperation(StreamInput.wrap(record.payload())));
             }
         }
-        return operations;
+        return new ReplayResult(operations, -1);
     }
 
     /**

@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.gc;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.gc.BlobGcCandidateLog.LoggedCandidate;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -30,8 +31,19 @@ import java.util.function.LongSupplier;
  * drops the queue entry for what turns out to be durably pinned, and leaves everything else for the next
  * pass. This is the cheap, event-driven replacement for the manifest-discovery half of {@code
  * GcSchedulerTask}'s own sweep -- see that class and {@link GcCandidate}'s own javadoc for the fuller
- * reasoning and for what this deliberately does not take over (bundle orphan detection, and manifests
- * that were written but never became head).
+ * reasoning and for what this deliberately does not take over (whole-shard bundle orphan detection, and
+ * manifests that were written but never became head).
+ *
+ * <h2>Bundles</h2>
+ *
+ * Deleting a manifest and leaving its segment data behind reclaims kilobytes and leaks gigabytes, and both
+ * this tailer and {@code GcSchedulerTask} are independently off by default -- so an operator who read this
+ * class's own description of itself as "the cheap replacement for the manifest-discovery half" and enabled
+ * only this one got exactly that outcome, silently. This pass therefore deletes the bundles the manifest it
+ * is about to delete references <em>exclusively</em>, before deleting the manifest (see {@link
+ * #exclusivelyReferencedBundles} for why that narrower question needs no sustained-orphan window). It still
+ * does not do whole-shard orphan detection: a bundle written by a publish that crashed before writing any
+ * manifest is named by no candidate and remains {@code GcSchedulerTask}'s job.
  *
  * <h2>Why this can safely run on more than one node, unsynchronised</h2>
  *
@@ -65,6 +77,7 @@ public final class GcCandidateTailer {
     private final ShardContainerResolver containerResolver;
     private final long retentionWindowMillis;
     private final long lookbackMillis;
+    private final long maxClockSkewAllowanceMillis;
     private final LongSupplier clock;
 
     // Node-local, in-memory, reset on restart -- same status as every other read-cache in this package.
@@ -99,16 +112,40 @@ public final class GcCandidateTailer {
         long retentionWindowMillis,
         long lookbackMillis
     ) {
-        this(log, containerResolver, retentionWindowMillis, lookbackMillis, System::currentTimeMillis);
+        this(
+            log,
+            containerResolver,
+            retentionWindowMillis,
+            lookbackMillis,
+            System::currentTimeMillis,
+            GcSchedulerTask.MAX_CLOCK_SKEW_ALLOWANCE_MILLIS
+        );
     }
 
-    /** Test seam for the clock. */
+    /**
+     * Test seam for the clock, with the cross-node skew allowance set to zero -- a test driving a
+     * one-second retention window against timestamps it stamped itself is asserting the eligibility rule,
+     * not the margin, and would otherwise have to add five minutes of imaginary time to every assertion to
+     * say so. Production always uses {@link GcSchedulerTask#MAX_CLOCK_SKEW_ALLOWANCE_MILLIS}.
+     */
     GcCandidateTailer(
         BlobGcCandidateLog log,
         ShardContainerResolver containerResolver,
         long retentionWindowMillis,
         long lookbackMillis,
         LongSupplier clock
+    ) {
+        this(log, containerResolver, retentionWindowMillis, lookbackMillis, clock, 0L);
+    }
+
+    /** Test seam for the clock and the skew allowance together, for the tests that are about the margin itself. */
+    GcCandidateTailer(
+        BlobGcCandidateLog log,
+        ShardContainerResolver containerResolver,
+        long retentionWindowMillis,
+        long lookbackMillis,
+        LongSupplier clock,
+        long maxClockSkewAllowanceMillis
     ) {
         if (retentionWindowMillis <= 0) {
             throw new IllegalArgumentException("retentionWindowMillis must be > 0, got " + retentionWindowMillis);
@@ -127,6 +164,9 @@ public final class GcCandidateTailer {
         this.containerResolver = containerResolver;
         this.retentionWindowMillis = retentionWindowMillis;
         this.lookbackMillis = lookbackMillis;
+        // Same cap, same reason, as GcSchedulerTask: the allowance may not exceed the window it protects,
+        // or a deliberately short window silently becomes a five-minute one.
+        this.maxClockSkewAllowanceMillis = Math.min(maxClockSkewAllowanceMillis, retentionWindowMillis);
         this.clock = clock;
     }
 
@@ -216,12 +256,23 @@ public final class GcCandidateTailer {
             cachedCreatedAtMillis = manifest.createdAtMillis();
         }
 
-        if (clock.getAsLong() - cachedCreatedAtMillis < retentionWindowMillis) {
+        // Both comparisons are against timestamps another node stamped -- the manifest's createdAtMillis by
+        // its writer, a pin's expiry by its coordinator -- so both get the same skew allowance
+        // GcSchedulerTask applies, and in the same direction: wait longer before deleting, treat a pin as
+        // live for longer. A node whose clock ran fast would otherwise consider a manifest past retention
+        // before it was, and every provisional pin expired before it was, which are the two errors that
+        // combine into "deleted the generation a snapshot was still being taken of".
+        long nowMillis = clock.getAsLong();
+        if (nowMillis - cachedCreatedAtMillis < retentionWindowMillis + maxClockSkewAllowanceMillis) {
             return Outcome.NOT_YET_ELIGIBLE;
         }
 
         DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(container);
-        Set<ManifestId> pinned = pinRegistry.getPinnedManifestIds(candidate.indexUuid(), candidate.shardId(), clock.getAsLong());
+        Set<ManifestId> pinned = pinRegistry.getPinnedManifestIds(
+            candidate.indexUuid(),
+            candidate.shardId(),
+            nowMillis - maxClockSkewAllowanceMillis
+        );
         if (pinned.contains(candidate.manifestId())) {
             // Durably pinned -- this generation is protected, not garbage. Retiring the queue entry here
             // is deliberate, not merely "nothing to do": if the pin is later released, nothing currently
@@ -244,8 +295,57 @@ public final class GcCandidateTailer {
                 return Outcome.RESOLVED_ALREADY_GONE;
             }
         }
+        // Bundles first, then the manifest -- the ordering BlobContainerManifestStore#deleteManifests
+        // documents, and the one this class used to invert by not handling bundles at all. See
+        // exclusivelyReferencedBundles below for why an operator who enables only the tailer no longer
+        // reclaims kilobytes of manifest while leaking every byte of segment data underneath it.
+        Set<String> exclusiveBundles = exclusivelyReferencedBundles(manifestStore, manifest);
+        if (exclusiveBundles.isEmpty() == false) {
+            new BlobContainerBundleStore(container).deleteBundles(exclusiveBundles);
+        }
         manifestStore.deleteManifests(List.of(manifest));
         log.resolve(logged);
         return Outcome.RESOLVED_DELETED;
+    }
+
+    /**
+     * The bundles {@code doomed} references that no other manifest of the same shard does.
+     *
+     * <h4>Why this is safe without the sustained-orphan window {@code GcSchedulerTask} needs</h4>
+     *
+     * That window exists because a periodic sweep takes two independent listings and asks "is this bundle
+     * referenced by anything", which a bundle written moments ago by a publish still in flight answers
+     * wrongly. This asks a strictly narrower question: of the bundles <em>this one already-superseded,
+     * past-retention, unpinned manifest</em> names, which does nothing else name. A bundle in that set
+     * cannot become referenced later, because a future commit's file map is derived from the head's, and the
+     * head is in the listing taken here -- so any bundle a future commit will inherit is referenced by a
+     * manifest this computation already counted as live. And a bundle written but not yet named by any
+     * manifest (the crashed-publish case the sweep's window is really for) is never in {@code doomed}'s own
+     * reference set to begin with, so it is never a candidate here at all.
+     *
+     * <p>The listing is taken fresh rather than from a cache: what matters is which manifests exist right
+     * now, and this is the one place in this class where a stale answer would delete live data rather than
+     * merely defer work.
+     *
+     * @param manifestStore the shard's manifest store.
+     * @param doomed the manifest about to be deleted.
+     * @return bundle names safe to delete along with it; empty if every one is still shared.
+     */
+    private static Set<String> exclusivelyReferencedBundles(BlobContainerManifestStore manifestStore, CommitManifest doomed)
+        throws IOException {
+        Set<String> exclusive = new java.util.HashSet<>(doomed.referencedBundles());
+        if (exclusive.isEmpty()) {
+            return exclusive;
+        }
+        for (CommitManifest other : manifestStore.listManifests()) {
+            if (other.primaryTerm() == doomed.primaryTerm() && other.generation() == doomed.generation()) {
+                continue;
+            }
+            exclusive.removeAll(other.referencedBundles());
+            if (exclusive.isEmpty()) {
+                return exclusive;
+            }
+        }
+        return exclusive;
     }
 }

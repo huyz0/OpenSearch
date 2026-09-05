@@ -10,10 +10,14 @@ package org.opensearch.serverless.storage.resharding;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
+import org.apache.lucene.document.NumericDocValuesField;
+import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.ScoreDoc;
@@ -23,7 +27,9 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.index.mapper.IdFieldMapper;
+import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
@@ -40,6 +46,7 @@ import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
@@ -48,6 +55,16 @@ public class PartitionRewritePublisherTests extends OpenSearchTestCase {
     private static final String TARGET_INDEX_UUID = "target-idx";
     private static final int SHARD_ID = 0;
     private static final int DOC_COUNT = 100;
+
+    /**
+     * The {@code _id} of the one nested root document in every fixture built by {@link
+     * #publishTargetCommit()}. Named rather than numbered so an assertion failure says which
+     * document it is about.
+     */
+    private static final String NESTED_PARENT_ID = "nested-parent-doc";
+
+    /** The {@code _id} soft-deleted (by replacement) in every fixture -- see {@link #publishTargetCommit()}. */
+    private static final String SOFT_UPDATED_ID = "doc-0";
 
     private BlobContainer targetContainer;
     private BlobContainerBundleStore bundleStore;
@@ -66,16 +83,73 @@ public class PartitionRewritePublisherTests extends OpenSearchTestCase {
         partitionStore = new BlobContainerShardPartitionStore(targetContainer);
     }
 
+    /**
+     * Builds one root (non-nested) document the way an OpenSearch writer would: a stored, indexed
+     * {@code _id}, plus the {@code _primary_term} doc-values field that marks it a root document.
+     * That second field is not decoration -- it is exactly how {@code Queries.newNonNestedFilter}
+     * and this plugin's own filtering reader tell a root apart from a nested child.
+     */
+    private static Document rootDocument(String id) {
+        Document doc = new Document();
+        doc.add(new Field(IdFieldMapper.NAME, Uid.encodeId(id), IdFieldMapper.Defaults.FIELD_TYPE));
+        doc.add(new NumericDocValuesField(SeqNoFieldMapper.PRIMARY_TERM_NAME, 1L));
+        return doc;
+    }
+
+    /**
+     * Builds one nested child document: no stored {@code _id} and no {@code _primary_term}, which is
+     * exactly what {@code IdFieldMapper.NESTED_FIELD_TYPE} produces (it calls {@code setStored(true)}
+     * and then {@code setStored(false)} on the very next line).
+     */
+    private static Document nestedChildDocument(String marker) {
+        Document doc = new Document();
+        doc.add(new StringField("nested_marker", marker, Field.Store.YES));
+        return doc;
+    }
+
+    /**
+     * Publishes the fixture every test in this class works against.
+     *
+     * <p><b>Two additions that are the whole point (the review's own "cheapest next step").</b>
+     * Every fixture in this package used to build its source with a bare {@code IndexWriterConfig}
+     * and an {@code _id} field only, which is why two real bugs sat undetected behind it:
+     *
+     * <ul>
+     *   <li><b>R-9</b>: no fixture had ever taken a delete or an update, so no {@code __soft_deletes}
+     *       {@code FieldInfo} ever existed, so {@code IndexWriter.addIndexes}' call to {@code
+     *       FieldInfos.verifySoftDeletedFieldName} never fired. Any real index that has taken a
+     *       single {@code DELETE} or {@code _update} carries that FieldInfo, and the rewrite threw
+     *       {@code IllegalArgumentException} on it -- every tick, forever, after a full
+     *       materialisation, with no backoff. One {@code softUpdateDocument} here reproduces it.</li>
+     *   <li><b>R-8</b>: no fixture had ever contained a nested document, so nothing noticed that the
+     *       filtering reader rebuilt live docs from the <em>stored</em> {@code _id} and dropped every
+     *       document that did not have one -- which is every nested child document in existence.
+     *       One nested block here reproduces it.</li>
+     * </ul>
+     */
     private CommitManifest publishTargetCommit() throws Exception {
         ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
         CommitManifest manifest;
         try (Directory writerDirectory = new ByteBuffersDirectory()) {
-            try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+            try (
+                IndexWriter writer = new IndexWriter(
+                    writerDirectory,
+                    new IndexWriterConfig().setSoftDeletesField(Lucene.SOFT_DELETES_FIELD)
+                )
+            ) {
                 for (int i = 0; i < DOC_COUNT; i++) {
-                    Document doc = new Document();
-                    doc.add(new Field(IdFieldMapper.NAME, Uid.encodeId("doc-" + i), IdFieldMapper.Defaults.FIELD_TYPE));
-                    writer.addDocument(doc);
+                    writer.addDocument(rootDocument("doc-" + i));
                 }
+                // A nested block: children first, then the root, which is the order Lucene requires
+                // and the order the block-join and the split filter both rely on.
+                writer.addDocuments(List.of(nestedChildDocument("child-a"), rootDocument(NESTED_PARENT_ID)));
+                // A real update, leaving a soft-deleted old version behind. This is what puts a
+                // __soft_deletes FieldInfo into the segment.
+                writer.softUpdateDocument(
+                    new Term(IdFieldMapper.NAME, Uid.encodeId(SOFT_UPDATED_ID)),
+                    rootDocument(SOFT_UPDATED_ID),
+                    new NumericDocValuesField(Lucene.SOFT_DELETES_FIELD, 1)
+                );
                 writer.commit();
             }
             SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
@@ -136,8 +210,15 @@ public class PartitionRewritePublisherTests extends OpenSearchTestCase {
                 expectedIds.add(id);
             }
         }
+        boolean nestedParentBelongsHere = RoutingPartitionFilter.matches(NESTED_PARENT_ID, descriptor);
+        if (nestedParentBelongsHere) {
+            expectedIds.add(NESTED_PARENT_ID);
+        }
         assertFalse("this test needs a real, non-trivial partition to be meaningful", expectedIds.isEmpty());
 
+        // Before the R-9 fix this line threw IllegalArgumentException ("this index has
+        // [__soft_deletes] as soft-deletes already but soft-deletes field is not configured in IWC")
+        // as soon as the fixture contained a single update.
         assertTrue("a real rewrite must have been performed", publisher().rewrite());
 
         assertTrue(
@@ -157,17 +238,34 @@ public class PartitionRewritePublisherTests extends OpenSearchTestCase {
         try (DirectoryReader reader = DirectoryReader.open(rewrittenDirectory)) {
             IndexSearcher searcher = new IndexSearcher(reader);
             ScoreDoc[] hits = searcher.search(new MatchAllDocsQuery(), DOC_COUNT * 2).scoreDocs;
-            assertEquals(
-                "the physically rewritten bundle must contain exactly this partition's documents, no more, no fewer",
-                expectedIds.size(),
-                hits.length
-            );
             Set<String> actualIds = new HashSet<>();
+            int nestedChildCount = 0;
             for (ScoreDoc hit : hits) {
-                byte[] idBytes = reader.storedFields().document(hit.doc).getField(IdFieldMapper.NAME).binaryValue().bytes;
-                actualIds.add(Uid.decodeId(idBytes));
+                IndexableField idField = reader.storedFields().document(hit.doc).getField(IdFieldMapper.NAME);
+                if (idField == null) {
+                    // No stored _id: a nested child document. It is carried by its parent, so it is
+                    // counted separately rather than expected to appear in the id set.
+                    nestedChildCount++;
+                    continue;
+                }
+                actualIds.add(Uid.decodeId(idField.binaryValue().bytes));
             }
-            assertEquals(expectedIds, actualIds);
+            assertEquals(
+                "the physically rewritten bundle must contain exactly this partition's root documents, no more, no fewer "
+                    + "-- and the soft-deleted previous version of "
+                    + SOFT_UPDATED_ID
+                    + " must not have been resurrected",
+                expectedIds,
+                actualIds
+            );
+            // Finding R-8: the whole nested block moves with its parent, or not at all. Before the
+            // fix the child was dropped from live docs and physically deleted by this rewrite, while
+            // its parent was kept -- silent, permanent data loss with no error anywhere.
+            assertEquals(
+                "a nested child document must be carried by its parent's verdict, never dropped for having no stored _id",
+                nestedParentBelongsHere ? 1 : 0,
+                nestedChildCount
+            );
         }
     }
 

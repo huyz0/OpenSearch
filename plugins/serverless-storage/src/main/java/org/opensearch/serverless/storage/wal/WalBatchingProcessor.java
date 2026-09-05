@@ -54,7 +54,11 @@ import java.util.function.Supplier;
  * legacy path is structurally closed here, and the queue capacity is the uniform memory bound
  * instead (see {@code ServerlessStoragePlugin#SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING}).
  */
-public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalRecord> {
+// Not final purely for testability: WalMirroringTranslogPerLocationDurabilityTests needs to
+// intercept when put() *returns* (as opposed to when it enqueues) in order to reproduce, without
+// relying on thread-scheduling luck, the concurrent interleaving that used to let an acknowledged
+// write be reported durable before its chunk was uploaded. Nothing in production subclasses this.
+public class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalRecord> {
 
     private final WalChunkService walChunkService;
     private final EncryptionKeyProvider encryptionKeyProvider;

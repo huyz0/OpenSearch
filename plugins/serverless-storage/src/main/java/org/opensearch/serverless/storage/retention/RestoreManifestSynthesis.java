@@ -141,16 +141,22 @@ public final class RestoreManifestSynthesis {
      * The newest manifest in {@code manifests} by {@code (primaryTerm, generation)}, which is the one whose
      * WAL position a restore must adopt.
      *
-     * <p>Ordered by generation first and term second, matching {@link PitrRestoreResolution}'s tie-break, so
-     * both agree on what "newest" means. A shard with no manifests at all has nothing to restore and is
-     * refused by the caller before this is reached.
+     * <p>Ordered by {@link CommitManifest#isNewerThan}, which is term first and generation second -- the
+     * order {@link PitrRestoreResolution} and every part of garbage collection already use. This method used
+     * to order the other way round and claim, in this javadoc, that the two agreed. They did not, and the
+     * disagreement is reachable: a fenced writer computes its generation from the live head but stamps its
+     * own older term, so a stale orphan at (term 1, generation 6) can sit alongside a real head at (term 2,
+     * generation 5). Generation-first picks the orphan, and a restore would then adopt an abandoned writer's
+     * WAL position as the floor it refuses to replay beneath. One ordering, defined in one place, is the
+     * only version of this that stays true.
+     *
+     * <p>A shard with no manifests at all has nothing to restore and is refused by the caller before this is
+     * reached.
      */
     public static CommitManifest newest(List<CommitManifest> manifests) {
         CommitManifest newest = null;
         for (CommitManifest manifest : manifests) {
-            if (newest == null
-                || manifest.generation() > newest.generation()
-                || (manifest.generation() == newest.generation() && manifest.primaryTerm() > newest.primaryTerm())) {
+            if (newest == null || manifest.isNewerThan(newest)) {
                 newest = manifest;
             }
         }

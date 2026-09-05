@@ -174,7 +174,10 @@ public class TransportCompactionTriggerAction extends HandledTransportAction<Com
                     materializer,
                     commitPublisher,
                     policy,
-                    rebaseExecutor
+                    rebaseExecutor,
+                    // Operator-triggered compaction stages its merge in the same place the scheduled
+                    // one does; both are bounded by the node's data path, not the platform temp dir.
+                    plugin.compactionMergeWorkRootForTrigger()
                 );
                 listener.onResponse(new CompactionTriggerResponse(attempted));
             } catch (Exception e) {

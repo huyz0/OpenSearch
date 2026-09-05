@@ -212,7 +212,41 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
     // number once claimed. Recovery must tolerate that gap cleanly, the same "before-state
     // untouched, retry succeeds" shape ObjectStoreCommitHeadPublisherTests' kill-mid-bundle-upload/
     // kill-mid-manifest-write tests already established for the writer's other two-step writes.
-    public void testReplaySkipsAnOrphanedChunkSequenceLeftByAKilledMidChunkWrite() throws Exception {
+    /**
+     * An in-process retry must rewrite <em>its own already-claimed</em> sequence, not claim a fresh
+     * one.
+     *
+     * <p><b>This test previously asserted the exact opposite</b> ("the retry must claim a fresh
+     * sequence, never reuse the orphaned one", expecting sequence 1 and asserting that {@code log-0}
+     * does not exist). That expectation encoded a real acked-and-lost bug as though it were a
+     * requirement, so it is inverted here deliberately rather than worked around.
+     *
+     * <p>Why claiming a fresh sequence per attempt was wrong. A chunk sequence is claimed by a CAS on
+     * the shared register, and {@code ObjectStoreWriterEngine}'s {@code activationWalPosition} fences
+     * replay at whatever that register's generation was when a new writer activated. With a fresh
+     * claim per attempt: attempt 1 claims sequence 0; a new writer elsewhere snapshots its activation
+     * bound as 1; attempt 2 claims sequence 1 and succeeds; {@code flush()} returns and the operation
+     * is acknowledged. Replay is bounded <em>exclusively</em> by 1, so the chunk that actually
+     * carries that acknowledged operation is excluded, and the operation is silently lost. Reusing
+     * the sequence claimed <em>before</em> the snapshot gives the correct semantics: the claim is the
+     * moment the sequence is reserved, so a record written under it is visible to any writer that
+     * activated after the claim.
+     *
+     * <p>Two secondary consequences point the same way. Burning a sequence per failed attempt left a
+     * permanent hole that every later replay pays a {@code blobExists} probe for; and if a failing
+     * attempt ever did leave a partial blob behind, the old behaviour stranded that torn blob
+     * mid-sequence while writing the good chunk somewhere else -- which, since replay now only
+     * tolerates a corrupt chunk at the very last sequence of its fenced range, fails recovery loudly.
+     * Rewriting the same name overwrites the partial with the complete bytes instead
+     * ({@code writeBlob} is called with {@code failIfAlreadyExists=false}, which deletes and
+     * rewrites), and every attempt writes byte-identical content because the records are serialized
+     * once, outside the retry loop.
+     *
+     * <p>The genuine orphan case -- a sequence claimed by a process that died before writing
+     * anything, which nothing ever retries -- is unaffected by this and is covered by
+     * {@link #testReplaySkipsASequenceThatWasClaimedButNeverWritten} below.
+     */
+    public void testAnInProcessRetryRewritesItsOwnClaimedSequenceInsteadOfBurningIt() throws Exception {
         BlobContainer blobContainer = newBlobContainer();
         OneShotFailingOnWriteBlobContainer faulty = new OneShotFailingOnWriteBlobContainer(blobContainer);
         WalChunkService service = new WalChunkService(faulty, "epoch-0");
@@ -220,22 +254,60 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
         Translog.Index op0 = new Translog.Index("doc0", 0, 1, "src0".getBytes("UTF-8"));
         service.append(new WalRecord("idx", 0, 1, 0, serialize(op0)));
 
-        // flush() now carries the bounded retry itself (WalChunkService#writeChunkWithRetry, hoisted
-        // down from WalMirroringTranslog#flushWithRetry): the first attempt's claimNextChunkSequence()
-        // durably claims sequence 0, then writeBlob() is hit by the injected fault, so sequence 0 is
-        // permanently orphaned; the internal retry then claims the *next* sequence rather than
-        // reusing the orphaned one and succeeds. (Before the retry was hoisted, this same orphan was
-        // instead produced by the caller calling flush() a second time after it threw once.)
+        // The injected fault throws before delegating, so the first attempt writes nothing at all --
+        // the claim on sequence 0 is still ours and there is no partial blob to worry about.
         long chunkSequence = service.flush();
-        assertEquals("the retry must claim a fresh sequence, never reuse the orphaned one", 1, chunkSequence);
-        assertFalse(
-            "a killed write must never leave a partial/torn blob behind",
+        assertEquals("the retry must rewrite the sequence this call already claimed", 0, chunkSequence);
+        assertTrue(
+            "and that sequence must hold the complete chunk after the retry succeeds",
             blobContainer.blobExists(WalChunkNaming.blobName("epoch-0", 0))
+        );
+        assertEquals(
+            "a failed attempt must not burn a sequence: the register advanced exactly once, for the one claim",
+            1L,
+            service.currentChunkSequenceUpperBound()
         );
 
         List<Translog.Operation> operations = WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 2);
+        assertEquals("recovery must find the operation at the sequence that was claimed for it", 1, operations.size());
+        assertEquals(0L, operations.get(0).seqNo());
+    }
+
+    /**
+     * The orphan that genuinely still happens: a sequence is claimed, every write attempt for it
+     * fails, and the flush gives up -- so nothing is ever written there and no later attempt reuses
+     * it, because the records go back into the buffer and the next flush claims a sequence of its
+     * own. Replay must step over the resulting hole rather than treating a missing blob as the end of
+     * the range or as corruption.
+     *
+     * <p>This is the property the previous version of the test above was really reaching for; it just
+     * produced the hole by a route that is no longer how holes arise (and whose old behaviour was
+     * itself the bug). Producing it honestly here also exercises the buffer-restore path: the record
+     * that the failed flush could not write is still buffered, and the succeeding flush writes it.
+     */
+    public void testReplaySkipsASequenceThatWasClaimedButNeverWritten() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        // Exactly enough failures to exhaust one flush's whole retry budget, and no more, so the
+        // second flush succeeds.
+        FailFirstNWritesBlobContainer faulty = new FailFirstNWritesBlobContainer(blobContainer, WalChunkService.MAX_WRITE_ATTEMPTS);
+        WalChunkService service = new WalChunkService(faulty, "epoch-0");
+
+        Translog.Index op0 = new Translog.Index("doc0", 0, 1, "src0".getBytes("UTF-8"));
+        service.append(new WalRecord("idx", 0, 1, 0, serialize(op0)));
+
+        expectThrows(IOException.class, service::flush);
+        assertFalse(
+            "sequence 0 was claimed but never written -- a permanent hole",
+            blobContainer.blobExists(WalChunkNaming.blobName("epoch-0", 0))
+        );
+        assertEquals("the failed flush must have put its record back for a later one to retry", 1, service.bufferedRecordCount());
+
+        long chunkSequence = service.flush();
+        assertEquals("the next flush claims its own sequence; it cannot reuse a claim it did not make", 1, chunkSequence);
+
+        List<Translog.Operation> operations = WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 2);
         assertEquals(
-            "recovery must skip the orphaned gap at sequence 0 and recover exactly the operation that actually landed",
+            "recovery must skip the hole at sequence 0 and recover exactly the operation that actually landed",
             1,
             operations.size()
         );
@@ -303,7 +375,12 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
         expectThrows(WalFormatException.class, () -> WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 3));
     }
 
-    /** Fails the first {@code writeBlob} call, then delegates normally -- simulates a kill exactly between the CAS claim and the blob write. */
+    /**
+     * Fails the first {@code writeBlob} call, then delegates normally. It throws <em>before</em>
+     * delegating, so the failed attempt writes nothing at all -- which is what makes it the right
+     * fixture for a transient store error that an in-process retry recovers from, as opposed to a
+     * process death (nothing retries at all then) or a torn write (nothing here produces one).
+     */
     private static final class OneShotFailingOnWriteBlobContainer extends RegisterDelegatingBlobContainer {
 
         private boolean failed;
@@ -322,6 +399,31 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
             if (failed == false) {
                 failed = true;
                 throw new IOException("injected kill-mid-WAL-chunk failure writing " + blobName);
+            }
+            super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+    }
+
+    /** Fails the first {@code failures} calls to {@code writeBlob}, then delegates normally. */
+    private static final class FailFirstNWritesBlobContainer extends RegisterDelegatingBlobContainer {
+
+        private final int failures;
+        private int attempts;
+
+        FailFirstNWritesBlobContainer(BlobContainer delegate, int failures) {
+            super(delegate);
+            this.failures = failures;
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new FailFirstNWritesBlobContainer(child, failures);
+        }
+
+        @Override
+        public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
+            if (++attempts <= failures) {
+                throw new IOException("injected failure writing " + blobName);
             }
             super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
         }

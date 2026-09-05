@@ -304,7 +304,7 @@ public class ShardClonerTests extends OpenSearchTestCase {
         }
     }
 
-    public void testDeleteCloneRemovesExactlyThisClonesPinAndLineage() throws Exception {
+    public void testDeleteCloneRemovesExactlyThisClonesPinAndKeepsTheLineageRecord() throws Exception {
         publishSourceCommit();
         ShardCloner.clone(
             SOURCE_INDEX_UUID,
@@ -322,10 +322,13 @@ public class ShardClonerTests extends OpenSearchTestCase {
         assertEquals(1, sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).size());
         assertTrue(targetLineageStore.readLineage().isPresent());
 
+        // The resolver is now asked about the clone itself as well as its source: before releasing, the
+        // delete has to know whether anything clones THIS shard, so it can hand that dependant's pin down
+        // to the source rather than dropping it.
+        DurablePinRegistry targetPinRegistry = new BlobContainerDurablePinRegistry(targetContainer);
         ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, (indexUuid, shardId) -> {
-            assertEquals(SOURCE_INDEX_UUID, indexUuid);
             assertEquals(Integer.valueOf(SHARD_ID), shardId);
-            return sourcePinRegistry;
+            return SOURCE_INDEX_UUID.equals(indexUuid) ? sourcePinRegistry : targetPinRegistry;
         });
 
         assertTrue(
@@ -333,8 +336,9 @@ public class ShardClonerTests extends OpenSearchTestCase {
             sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).isEmpty()
         );
         assertTrue(
-            "deleteClone must remove the lineage record once the pin it points at is gone",
-            targetLineageStore.readLineage().isEmpty()
+            "the lineage record must survive: it is the only thing that makes the chain walkable for a clone "
+                + "of this clone, and deleting it bought nothing -- release is by pin id, which does not need it",
+            targetLineageStore.readLineage().isPresent()
         );
     }
 
@@ -495,11 +499,19 @@ public class ShardClonerTests extends OpenSearchTestCase {
             targetLineageStore,
             System.currentTimeMillis()
         );
-        ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, (indexUuid, shardId) -> sourcePinRegistry);
-        // Second call: lineage is already gone, so this must be a harmless no-op, not a failure.
-        ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, (indexUuid, shardId) -> {
-            throw new AssertionError("resolver must not be invoked once lineage is already gone");
-        });
+        DurablePinRegistry targetPinRegistry = new BlobContainerDurablePinRegistry(targetContainer);
+        java.util.function.BiFunction<String, Integer, DurablePinRegistry> resolver = (indexUuid, shardId) -> SOURCE_INDEX_UUID.equals(
+            indexUuid
+        ) ? sourcePinRegistry : targetPinRegistry;
+        ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, resolver);
+        // Second call: the lineage record deliberately survives now, so idempotency is no longer "the
+        // resolver is never consulted again" but the stronger property that consulting it again changes
+        // nothing -- every pin removal underneath is itself a no-op when the pin is already gone.
+        ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, resolver);
+        assertTrue(
+            "a second delete must leave the source exactly as the first one did",
+            sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).isEmpty()
+        );
     }
 
 }

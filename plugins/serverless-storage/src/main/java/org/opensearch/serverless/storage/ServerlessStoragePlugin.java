@@ -54,6 +54,7 @@ import org.opensearch.serverless.storage.allocation.SuspendedShardAllocationDeci
 import org.opensearch.serverless.storage.compaction.CompactionPolicy;
 import org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor;
 import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
+import org.opensearch.serverless.storage.compaction.CompactionSchedulerTask;
 import org.opensearch.serverless.storage.descriptor.DescriptorBackedIndexLifecycle;
 import org.opensearch.serverless.storage.descriptor.ServerlessGatedIndexResidencyPolicy;
 import org.opensearch.serverless.storage.descriptor.SupplierBackedIndexCreationStrategy;
@@ -67,6 +68,7 @@ import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
 import org.opensearch.serverless.storage.gc.BlobGcCandidateLog;
 import org.opensearch.serverless.storage.gc.GcCandidateTailer;
 import org.opensearch.serverless.storage.gc.GcSchedulerConfig;
+import org.opensearch.serverless.storage.gc.GcSchedulerTask;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
@@ -243,6 +245,31 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Refuses to read a block-encrypted blob written before per-block associated data existed
+     * ({@code BlockLayout} format version 1) instead of reading it unauthenticated.
+     *
+     * <p>Version 1 blocks are bare {@code IV||ciphertext||tag} envelopes under one key, with the
+     * header covered by nothing, so they can be swapped between blobs, reordered, or truncated and
+     * still decrypt cleanly -- see {@link
+     * org.opensearch.serverless.storage.security.EncryptingBlobContainer}'s javadoc for the full
+     * account and the migration. Version 2 blocks bind each block to its index, shard, blob name and
+     * offset, which is what makes those attacks fail.
+     *
+     * <p><b>Default {@code false}, and the default is the whole design of this setting.</b> An
+     * upgrade must not turn existing data into an unreadable shard, and this plugin has no way to
+     * know whether a given deployment still holds version 1 objects -- only the operator who ran
+     * compaction and waited out GC knows that. So the node keeps reading version 1 until an operator
+     * asserts otherwise by setting this. It is deliberately not dynamic: "are all my old objects
+     * gone" is a claim about durable state, and flipping it at runtime on a hunch would fail live
+     * reads rather than a restart.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_REQUIRE_AUTHENTICATED_BLOCKS_SETTING = Setting.boolSetting(
+        "serverless_storage.encryption.require_authenticated_blocks",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Budget for the node-shared in-memory plaintext bundle-file cache in front of every reader
      * shard's {@link LocalDiskCachingBundleStore} (one {@link InMemoryPlaintextBundleCache}
      * instance per node, not per shard -- see its javadoc for why a per-shard cache doesn't
@@ -415,22 +442,109 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * built per node incarnation (see {@link #createComponents}) and shared by every writer shard
      * on the node -- the entire reason this is a node-level service and not a per-shard one is the
      * cross-shard group-commit batching that sharing enables (&sect;6.4's cost-sanity argument).
-     * Default off: this is new wiring, without production experience behind it yet, unlike the
-     * commit-publish path it sits alongside.
+     *
+     * <p><b>Default flipped to {@code true}</b>
+     *
+     * <p>It defaulted to {@code false}, on the reasoning that this was new wiring without production
+     * experience behind it. That reasoning weighed the risk of the new path against nothing, when
+     * what it should have weighed it against is what the old path actually does: with mirroring off,
+     * {@code walChunkService} is null, {@code ObjectStoreWriterEngine#createTranslogManager} falls
+     * back to core's {@code LocalTranslog}, {@code currentWalPosition()} returns null and
+     * {@code engineRecoveryOperations()} returns empty. Durability against node loss is then
+     * <em>only</em> the last published manifest, and every write acknowledged since it is gone --
+     * silently, with no error anywhere -- on a shard that by design has zero writer replicas to
+     * recover from.
+     *
+     * <p>That makes &sect;2 goal 1 ("the object store is the sole durable home of segments and
+     * write-ahead data; local disk is strictly a cache") false in the shipped default, and it breaks
+     * &sect;13's stated contract that "writes degrade to rejection, never to silent un-durability".
+     * An acknowledged write that dies with the node is the one failure this whole design exists to
+     * remove, and it was the default.
+     *
+     * <p><b>This must stay paired with {@link #SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING},
+     * which also defaults to {@code true}.</b> They are not independent: mirroring on with batching
+     * off makes every indexing thread pay a synchronous PUT per operation -- roughly one object-store
+     * request per document, which inverts &sect;6.4's own cost argument for choosing a node-level WAL
+     * in the first place. Turning one on without the other is the configuration nobody wants; if you
+     * disable batching, consider whether you meant to disable mirroring too.
+     *
+     * <p><b>This also required flipping {@link #SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING}</b>, from
+     * disabled to one minute. WAL chunks are reclaimed by nothing else, so mirroring on with WAL GC
+     * off would have traded a data-loss bug for an unbounded-storage bug and shipped both defaults in
+     * the same release. That setting's javadoc carries the argument for why its cadence is a cost
+     * choice rather than a safety one -- what is deletable is fixed by published state, so sweeping
+     * more or less often changes only how much already-dead garbage is lying around.
      */
     public static final Setting<Boolean> SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING = Setting.boolSetting(
         "serverless_storage.wal_mirroring.enabled",
+        true,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Refuses to open a serverless writer shard that has no WAL service behind it, instead of
+     * opening one whose unflushed operations live only on local disk.
+     *
+     * <p><b>The gap this exists for</b>
+     *
+     * <p>rfc-serverless-opensearch.md &sect;2 goal 1 is that the object store is the <em>sole</em>
+     * durable home of segments and write-ahead data, and that local disk is strictly a cache. With
+     * {@link #SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING} off -- the default --
+     * {@code ObjectStoreWriterEngine#createTranslogManager} falls back to core's ordinary
+     * {@code LocalTranslog}, so an opted-in index keeps its local translog as the only durability
+     * for anything not yet flushed. Kill the node and every unflushed document is gone: exactly the
+     * classic failure mode this design exists to remove, present by default, in the configuration
+     * an operator gets by following the README.
+     *
+     * <p>What makes that worse than an unfinished feature is that it is <b>silent</b>. Nothing in
+     * the shard's state, the index's settings, or any log line says "this index is not actually
+     * durable in the object store." The index looks serverless, publishes to the object store, and
+     * recovers from a manifest -- all correct -- and the one property it is missing is the one
+     * nobody can observe until a node dies.
+     *
+     * <p>Setting this to {@code true} turns that into a shard that refuses to open, naming the
+     * setting that would fix it. It costs an outage on a misconfigured cluster and buys the
+     * guarantee the RFC claims.
+     *
+     * <p><b>What this is for now that mirroring is on by default</b>
+     *
+     * <p>{@link #SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING} now defaults to {@code true}, so
+     * the gap this setting was written to expose is closed in the default configuration. It is kept,
+     * and it is still worth having, because "mirroring is enabled" and "this shard actually got a
+     * WAL service" are not the same statement: a shard can still open with none if an operator
+     * turned mirroring off deliberately, or if the shared WAL container failed to resolve on this
+     * node. In both cases the shard opens and quietly stops being durable, and this setting is what
+     * turns that into a refusal to open.
+     *
+     * <p>Default {@code false} because the ordinary case is now handled by the default above, and a
+     * node that cannot resolve its WAL container has a configuration problem better surfaced as a
+     * loud warning plus an operator's explicit choice than as a mandatory shard failure.
+     *
+     * <p>Independent of this setting, a serverless writer shard opening without a WAL service logs a
+     * warning naming the index and shard -- see {@code getEngineFactory}. Silence was the real
+     * defect, and it stays fixed regardless of which way either default goes.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_WAL_MIRRORING_REQUIRED_SETTING = Setting.boolSetting(
+        "serverless_storage.wal_mirroring.required",
         false,
         Setting.Property.NodeScope
     );
 
     /**
-     * How often a reader shard's own background {@code CompactionSchedulerTask} evaluates whether
-     * its shard is worth compacting (rfc-serverless-opensearch.md &sect;16 Phase 4.5). A reader
-     * shard is this scheduler's home rather than a writer shard: a writer's own lease is always
-     * held while that writer is open, so a scheduler attached to the writer itself would always see
-     * its own lease as held and never do anything -- see {@code ObjectStoreReaderEngine}'s own
-     * javadoc. Non-positive (the default) disables background compaction scheduling entirely, same
+     * How often the node-level background {@code CompactionSchedulerTask} evaluates whether a shard
+     * is worth compacting (rfc-serverless-opensearch.md &sect;16 Phase 4.5).
+     *
+     * <p><b>This scheduler used to live on the reader engine, and that made this setting a no-op for
+     * most indices.</b> The original argument for the reader-shard home was that a writer always
+     * holds its own lease, so a writer-hosted scheduler would see the lease held and never act. That
+     * argument expired when the lease gate was removed from {@code maybeCompact}, and what remained
+     * was a scheduler reachable only through a reader engine -- which exists only when the index has
+     * {@code index.number_of_search_replicas > 0}, which requires {@code remote_store.enabled}. The
+     * ordinary serverless index has neither, so setting this interval on such a cluster changed
+     * nothing at all. It is now started per shard from {@code ServerlessStoragePlugin} itself, on
+     * the node holding that shard's writer primary, which every assigned shard has.
+     *
+     * <p>Non-positive (the default) disables background compaction scheduling entirely, same
      * shape as every other optional-feature-off default in this plugin -- a quiescent shard's
      * segments then only shrink via {@code _forcemerge} while a writer happens to be active, exactly
      * today's (pre-this-feature) behavior.
@@ -443,8 +557,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     /**
      * How often a split-target reader shard's own background {@code PartitionRewriteSchedulerTask}
-     * attempts a physical partition rewrite (rfc-serverless-opensearch.md &sect;16 Phase 5). Same
-     * reader-shard-is-the-home rationale as {@link #SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING}.
+     * attempts a physical partition rewrite (rfc-serverless-opensearch.md &sect;16 Phase 5). Still
+     * reader-hosted, unlike compaction and GC: a partition rewrite only ever applies to a split
+     * target, and that scheduler was not part of the move -- so on an index with no search replicas
+     * it remains reachable only through the on-demand {@code ShardPartitionRewriteAction} trigger.
      * Non-positive (the default) disables the background scheduler entirely -- a split target then
      * only ever gets physically rewritten via the on-demand {@code ShardPartitionRewriteAction}
      * trigger, exactly this feature's original, narrower scope before this scheduler existed.
@@ -456,9 +572,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
-     * How often a reader shard's own background {@code GcSchedulerTask} sweeps for deletable
-     * manifests/bundles (rfc-serverless-opensearch.md &sect;6.5). Same reader-shard-is-the-home
-     * rationale as {@link #SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING}. Non-positive (the
+     * How often the node-level background {@code GcSchedulerTask} sweeps for deletable
+     * manifests/bundles (rfc-serverless-opensearch.md &sect;6.5). Started per shard on the node
+     * holding that shard's writer primary -- see
+     * {@link #SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING} for why it is no longer the reader
+     * engine's job, and for the period in which setting this interval reclaimed nothing on an index
+     * with no search replicas. Non-positive (the
      * default) disables background GC entirely -- storage then only ever grows, exactly today's
      * (pre-this-feature) behavior, which is safe (nothing correctness-bearing depends on GC ever
      * running) but not sustainable to leave off indefinitely in a real deployment.
@@ -466,6 +585,40 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     public static final Setting<TimeValue> SERVERLESS_STORAGE_GC_INTERVAL_SETTING = Setting.timeSetting(
         "serverless_storage.gc.interval",
         TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Reclaims a deleted index's object-store bytes when its shards are removed, instead of leaving
+     * them in the bucket forever.
+     *
+     * <p><b>What is broken without it</b>
+     *
+     * <p>Deleting a serverless index frees <b>nothing</b>. GC is per shard and runs from a scheduler
+     * attached to a live shard, so once the index is gone there is nothing left that could ever
+     * sweep its prefix: every manifest, bundle and register it ever wrote stays in the bucket
+     * permanently. That is not a slow leak, it is 100% of a deleted index's storage, and the
+     * index-per-tenant fleet this design exists to enable is precisely the workload that creates and
+     * deletes indices continuously.
+     *
+     * <p><b>Why the default is {@code false}</b>
+     *
+     * <p>This is the first code path in the plugin that deletes a whole shard prefix in one call,
+     * reached from an index-deletion callback where the operator's intent is already irreversible.
+     * The safety check -- {@code DeletedShardReclaimer} refuses whenever a live pin names the shard,
+     * and a clone pins every lineage hop, a snapshot pins what it names, PITR pins its window -- is
+     * sound, but a bug in it would not lose the deleted index's bytes (those were meant to go), it
+     * would lose whatever the check got wrong about, and silently. One release behind a flag, in
+     * deployments that care more about the bill than the blast radius, is cheap insurance before
+     * flipping the default.
+     *
+     * <p><b>This default should be flipped</b>, and leaving it off forever is not the safe option --
+     * it is the option where storage grows without bound in exactly the deployment shape the RFC
+     * describes. Treat it as a one-release soak, not a permanent opt-in.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_RECLAIM_ON_INDEX_DELETE_SETTING = Setting.boolSetting(
+        "serverless_storage.reclaim_on_index_delete",
+        false,
         Setting.Property.NodeScope
     );
 
@@ -565,12 +718,37 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * #SERVERLESS_STORAGE_GC_INTERVAL_SETTING}'s sweep, this one needs no separate time-based
      * retention window setting -- see that task's own javadoc for why the minimum covered {@code
      * WalPosition} across every {@code WalShardRegistry}-known shard is already an airtight bound
-     * on its own. Non-positive (the default) disables it, and only takes effect when WAL mirroring
-     * itself is also enabled -- there is nothing to sweep otherwise.
+     * on its own. Non-positive disables it, and it only takes effect when WAL mirroring itself is
+     * also enabled -- there is nothing to sweep otherwise.
+     *
+     * <p><b>Default changed from disabled to one minute</b>
+     *
+     * <p>It defaulted to {@code -1}, which was harmless for exactly as long as nothing wrote WAL
+     * chunks. {@link #SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING} now defaults to {@code true},
+     * so every writer shard writes them continuously and, at the old default, nothing ever reclaimed
+     * one. Turning durability on while leaving its garbage collector off would have traded a
+     * data-loss bug for an unbounded-storage bug, and shipped both defaults in the same release.
+     *
+     * <p><b>Why cadence is a cost knob and not a safety knob.</b> What is deletable here is defined
+     * by published state, not by elapsed time: a shard replays strictly forward from the {@code
+     * WalPosition} its own last published manifest covers, so a sequence is needed by a shard if and
+     * only if it is above that shard's offset, and the minimum offset across every registered shard
+     * is a bound at or below which no registered shard can ever ask to replay again. Sweeping more
+     * often does not lower that bound and sweeping less often does not raise it. Cadence changes only
+     * how much already-deletable garbage is lying around -- which is why, unlike {@code
+     * GcSchedulerTask}, this sweep needs no retention window at all.
+     *
+     * <p><b>Why one minute.</b> Accumulation scales with {@code cadence x chunk rate x node count}:
+     * at the 200 ms flush interval that is roughly 300 chunks per node per sweep at one minute,
+     * 1,500 at five minutes, 18,000 at an hour. Sweep cost is {@code O(registered shards)} per tick
+     * and <em>independent of cadence</em>, so it is the term that constrains how often this can run
+     * -- and in steady state on an idle cluster a tick is a handful of cheap head reads and nothing
+     * else. It runs on the elected cluster-manager only, and the interval is jittered per instance,
+     * so a one-minute cadence is affordable.
      */
     public static final Setting<TimeValue> SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING = Setting.timeSetting(
         "serverless_storage.wal_gc.interval",
-        TimeValue.MINUS_ONE,
+        TimeValue.timeValueMinutes(1),
         Setting.Property.NodeScope
     );
 
@@ -1125,12 +1303,34 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * client's write waits for that upload is governed by the standard, already-dynamic {@code
      * index.translog.durability} ({@code REQUEST} waits, {@code ASYNC} does not) -- no plugin-specific
      * "wait or not" knob is added. Default off: this reshapes the durability-critical write path and
-     * has no production load-testing behind it yet, so flipping the default is a deliberately separate
-     * later decision.
+     * has no production load-testing behind it yet.
+     *
+     * <p><b>Default flipped to {@code true}.</b> rfc-serverless-opensearch.md &sect;5 principle 2 is
+     * "batch writes, stream reads", and with this off the write half of that principle was not
+     * merely unmet but inverted: {@code WalMirroringTranslog} flushed one WAL chunk per operation --
+     * its own comment says "roughly one PUT per document" -- which is the exact object-store request
+     * pattern &sect;18 risk 1 exists to avoid, at a cost an operator pays per document indexed.
+     *
+     * <p>The reason to leave it off was load testing that has not happened. That reason does not
+     * survive contact with what the alternative costs: with mirroring on and batching off,
+     * {@code WalMirroringTranslog} flushes one WAL chunk <em>per operation</em> -- its own comment
+     * says "roughly one PUT per document" -- which is orders of magnitude over &sect;6.4's own
+     * request budget and inverts the cost argument that justified a node-level WAL rather than a
+     * per-shard one. Batching is the design; it was never meant to be the exception.
+     *
+     * <p>The durability contract is unchanged ({@code index.translog.durability=REQUEST} still waits
+     * for the upload; batching changes what is uploaded together, not what a client is told is
+     * durable), and the 200 ms buffer interval is already inside the RFC's own stated 100--250 ms
+     * target. The remaining risk is a latency change under a load shape nobody has measured, bounded
+     * by a node setting anyone can turn back off.
+     *
+     * <p><b>Paired with {@link #SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING}</b>, which now also
+     * defaults to {@code true}. These two land together deliberately -- see that setting's javadoc
+     * for why turning mirroring on without batching is the one combination nobody wants.
      */
     public static final Setting<Boolean> SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING = Setting.boolSetting(
         "serverless_storage.wal_flush.batching.enabled",
-        false,
+        true,
         Setting.Property.NodeScope
     );
 
@@ -1189,14 +1389,25 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * over this threshold, the same exception type and rejection path {@code IndexingPressure} already
      * uses -- so it is recognized by the same downstream backpressure handling (see {@code
      * ReplicationOperation}) rather than needing plugin-specific 429 wiring. {@link ByteSizeValue#ZERO}
-     * (the default) disables rejection: the queue's own bounded {@link
+     * disables rejection: the queue's own bounded {@link
      * #SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING} capacity remains the only backstop, which
      * blocks the calling thread rather than rejecting it cleanly. Ignored entirely when batching is
      * off.
+     *
+     * <p><b>Default changed from {@link ByteSizeValue#ZERO} to 512 MB</b>, because zero made
+     * &sect;13's claim -- "buffered mode keeps a bounded window then rejects" -- false by
+     * construction: there was no bound and nothing ever rejected. The failure it left open is the
+     * bad one. Under sustained object-store slowness the backlog grows on the heap, and because the
+     * only backstop was a queue that <em>blocks</em> rather than rejects, the node degrades into
+     * stalled indexing threads and heap pressure instead of returning the 429 that tells a client
+     * to back off. 512 MB is chosen to be far above any legitimate steady-state backlog (at the
+     * 200 ms flush interval it is roughly 2.5 GB/s of sustained ingest before the bound is even
+     * approached) so it is a genuine circuit breaker rather than a throughput limit, and it is a
+     * node setting an operator can raise or zero out.
      */
     public static final Setting<ByteSizeValue> SERVERLESS_STORAGE_WAL_FLUSH_BACKLOG_REJECT_THRESHOLD_SETTING = Setting.byteSizeSetting(
         "serverless_storage.wal_flush.backlog_reject_threshold",
-        ByteSizeValue.ZERO,
+        new ByteSizeValue(512, org.opensearch.core.common.unit.ByteSizeUnit.MB),
         Setting.Property.NodeScope
     );
 
@@ -1321,6 +1532,31 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile String repositoryName;
     private volatile Supplier<RepositoriesService> repositoriesServiceSupplier;
     private volatile Path localCacheRoot;
+
+    /**
+     * Where compaction stages its merge. A sibling of the cache root and resolved the same way, because a
+     * merge writes a whole shard's worth of segments and the platform temp directory is routinely a small
+     * tmpfs that a large shard fills.
+     */
+    private volatile Path compactionMergeWorkRoot;
+
+    /**
+     * Where compaction stages its merge, for the operator-triggered path as well as the scheduled one.
+     *
+     * @return the merge work root on this node's data path
+     */
+    public Path compactionMergeWorkRootForTrigger() {
+        return compactionMergeWorkRoot();
+    }
+
+    private Path compactionMergeWorkRoot() {
+        Path root = compactionMergeWorkRoot;
+        if (root == null) {
+            throw new IllegalStateException("compaction was configured before the node environment was resolved");
+        }
+        return root;
+    }
+
     // Resolved once in createComponents, same "read the NodeScope setting where Environment is
     // actually available" reasoning as every other field in this group -- getEngineFactory reads
     // this to configure each reader shard's own LocalDiskCachingBundleStore eviction budget.
@@ -1335,6 +1571,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile ThreadPool threadPool;
     private volatile FileCache lazyDirectoryFileCache;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
+
+    /**
+     * Resolved once alongside {@link #encryptionKeyProvider}: see
+     * {@link #SERVERLESS_STORAGE_REQUIRE_AUTHENTICATED_BLOCKS_SETTING}. Read on every
+     * {@code resolveBlobContainer} call, so it is a field rather than a settings lookup per shard.
+     */
+    private volatile boolean requireAuthenticatedBlocks;
     private volatile String localNodeId = "unknown-node";
     private volatile InMemoryPlaintextBundleCache sharedBundleCache;
     /**
@@ -1381,6 +1624,57 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // access outside the lock that reads it as "already safe," reopening the exact race the lock
     // exists to close. Found by round 3 of the bug hunt for being redundant, not for being wrong.
     private boolean pinLedgerSweepTasksClosed = false;
+
+    /**
+     * The node-level compaction and GC schedulers, keyed by {@code <indexUuid>/<shardId>}.
+     *
+     * <p>These used to hang off {@code ObjectStoreReaderEngine}, which meant they existed only for
+     * indices that had search replicas -- and a search replica requires {@code remote_store.enabled},
+     * so the ordinary serverless index (one writer shard, no search replicas) had neither scheduler
+     * anywhere in the cluster and its object-store footprint grew forever. They now hang off the
+     * plugin instead, started for the shard's writer primary, which is the one copy that exists for
+     * every assigned shard exactly once.
+     *
+     * <p>Keyed per shard rather than per index because both tasks are per-shard: a four-shard index
+     * needs four sweeps over four different containers, and its shards may be on four nodes.
+     * Deduped by that key for the same reason {@link #pinLedgerSweepTasks} is deduped by index uuid
+     * -- {@code getEngineFactory} runs again on a restart-in-place or a relocation back, and two
+     * live schedulers for one shard would just do everything twice.
+     */
+    private final java.util.concurrent.ConcurrentMap<String, ShardMaintenanceTasks> shardMaintenanceTasks =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Guards {@link #shardMaintenanceTasks} exactly as {@link #pinLedgerSweepTasksLock} guards its
+     * own map, and for the identical reason: {@link #close()} drains in two non-atomic steps, so a
+     * shard opening concurrently with node shutdown could otherwise insert a freshly-scheduled task
+     * that {@code clear()} then discards without ever cancelling, leaving a live scheduler on a
+     * closing node.
+     */
+    private final Object shardMaintenanceTasksLock = new Object();
+
+    // Not volatile, for the same reason pinLedgerSweepTasksClosed is not: every access is already
+    // inside a block synchronized on shardMaintenanceTasksLock.
+    private boolean shardMaintenanceTasksClosed = false;
+
+    /**
+     * One shard's pair of background maintenance schedulers, held together so the map has one entry
+     * per shard rather than two parallel maps that could disagree about which shards are covered.
+     * Either half may be {@code null} when its interval is unset -- the pair is still worth holding,
+     * because "this shard is registered, with GC on and compaction off" is a real state.
+     */
+    private record ShardMaintenanceTasks(CompactionSchedulerTask compactionTask, GcSchedulerTask gcTask) implements java.io.Closeable {
+        @Override
+        public void close() {
+            if (compactionTask != null) {
+                compactionTask.close();
+            }
+            if (gcTask != null) {
+                gcTask.close();
+            }
+        }
+    }
+
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     // One shared instance node-wide, threaded into every shard's CompactionSchedulerConfig/
     // PartitionRewriteSchedulerConfig -- see RewriteAdmissionController's own javadoc for why these
@@ -1420,6 +1714,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // (the default) disables both the shared sweep (existing behavior) and any dedicated one.
     private volatile TimeValue walGcInterval;
     private volatile long gcRetentionWindowMillis;
+
+    /**
+     * Resolved once in {@code createComponents}: see
+     * {@link #SERVERLESS_STORAGE_RECLAIM_ON_INDEX_DELETE_SETTING}. Read from an index-deletion
+     * callback, so it is a field rather than a settings lookup per deleted shard.
+     */
+    private volatile boolean reclaimOnIndexDelete;
     // Non-null iff GcCandidateTailer is configured on -- read by getEngineFactory to decide whether a
     // writer's ObjectStoreCommitHeadPublisher gets a BlobGcCandidateLog to append to at all. See
     // GcCandidate's own javadoc for why a null log (the default) is a fully supported, zero-cost
@@ -1733,6 +2034,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
             SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING,
+            SERVERLESS_STORAGE_REQUIRE_AUTHENTICATED_BLOCKS_SETTING,
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
@@ -1743,9 +2045,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_REWRITES_SETTING,
             SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
+            SERVERLESS_STORAGE_WAL_MIRRORING_REQUIRED_SETTING,
             SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING,
             SERVERLESS_STORAGE_PARTITION_REWRITE_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_RECLAIM_ON_INDEX_DELETE_SETTING,
             SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
             SERVERLESS_STORAGE_GC_CANDIDATE_TAIL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_CANDIDATE_LOOKBACK_SETTING,
@@ -1940,8 +2244,79 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         }
 
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
+        // Node-capacity evaluation is nested inside the scale-to-zero interval check below, and that
+        // nesting is not incidental: NodeCapacitySignalService reads per-shard idleness from
+        // ScaleToZeroCandidatesSchedulerTask#latestCandidates(), so without that task there is
+        // nothing for it to compute a signal from.
+        //
+        // What made this worth failing on rather than tolerating is how it failed. Configuring
+        // node_capacity.eval_interval while leaving scale_to_zero.eval_interval at its -1 default
+        // silently built no service at all, and TransportNodeCapacityAction then answered
+        // NodeCapacitySignal.empty() with HTTP 200 -- so a control plane polling for scale-down
+        // candidates read a perfectly healthy, entirely unloaded fleet and acted on it. An empty
+        // answer and "this subsystem was never started" are indistinguishable over that API, which
+        // makes the misconfiguration invisible precisely to the automation that depends on it.
+        //
+        // Un-nesting was the other option and is worse: it would produce a service that starts,
+        // answers 200, and still has no idleness data to report -- the same lie, one layer down.
+        // Refusing at startup names both settings to the operator who set one of them.
+        TimeValue nodeCapacityEvalIntervalForValidation = SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING.get(
+            environment.settings()
+        );
+        if (nodeCapacityEvalIntervalForValidation.millis() > 0 && scaleToZeroEvalInterval.millis() <= 0) {
+            throw new IllegalArgumentException(
+                "["
+                    + SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING.getKey()
+                    + "] is set but ["
+                    + SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.getKey()
+                    + "] is not: node-capacity signals are derived from the scale-to-zero candidate "
+                    + "evaluation, so with that evaluation off this node would report an empty capacity "
+                    + "signal indistinguishable from a genuinely idle fleet. Set ["
+                    + SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.getKey()
+                    + "] as well, or unset ["
+                    + SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING.getKey()
+                    + "]"
+            );
+        }
         if (scaleToZeroEvalInterval.millis() > 0) {
             boolean suspendEnabled = SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.get(environment.settings());
+            // Suspending a writer shard can lose a write that was acknowledged between the suspend
+            // marker committing and the shard being evicted. ShardSuspensionCoordinator narrows that
+            // window as far as it can from the coordinator side (it re-reads the marker before
+            // cancelling, so a reactivation that already landed aborts the eviction) and its javadoc
+            // is explicit that this narrows rather than closes it. Closing it properly needs a fence
+            // installed in the same cluster-state update as the marker and released only once the
+            // engine reports its final publish landed -- a coordinator-to-engine channel that does
+            // not exist.
+            //
+            // WAL mirroring makes the remaining window harmless rather than merely narrow: an
+            // acknowledged write is already durable in the object store before the shard stops, so
+            // losing the race costs a reactivation and a replay, not data. With mirroring off, the
+            // same race costs the write, silently, on a shard that by design has no writer replica.
+            //
+            // This guard is cheap now in a way it would not have been before: wal_mirroring.enabled
+            // defaults to true, so it can only fire for an operator who enabled suspension AND
+            // deliberately turned mirroring off -- two explicit choices whose combination is the one
+            // configuration where scale-to-zero silently drops acknowledged writes. Refusing at
+            // startup names both.
+            // The setting, not the walMirroringEnabled field: that field is assigned further down in
+            // createComponents, so reading it here would see its default false and fire this guard
+            // for every deployment that enabled suspension, regardless of the real configuration.
+            if (suspendEnabled && SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.get(environment.settings()) == false) {
+                throw new IllegalArgumentException(
+                    "["
+                        + SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.getKey()
+                        + "] is enabled but ["
+                        + SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey()
+                        + "] is disabled: suspending a writer shard can lose a write acknowledged just before "
+                        + "the shard stops, and without WAL mirroring that write is not durable anywhere else. "
+                        + "Enable ["
+                        + SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey()
+                        + "] (its default), or disable ["
+                        + SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.getKey()
+                        + "] to keep evaluation observational"
+                );
+            }
             long cooldownMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_COOLDOWN_SETTING.get(environment.settings()).millis();
             this.scaleToZeroCandidatesSchedulerTask = new org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask(
                 threadPool,
@@ -2094,6 +2469,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         }
         if (nodeEnvironment != null && nodeEnvironment.nodeDataPaths().length > 0) {
             localCacheRoot = nodeEnvironment.nodeDataPaths()[0].resolve("serverless_storage_cache");
+            compactionMergeWorkRoot = nodeEnvironment.nodeDataPaths()[0].resolve("serverless_compaction_work");
         }
         localCacheMaxBytesPerShard = SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING.get(environment.settings()).getBytes();
         if (localCacheRoot != null) {
@@ -2135,6 +2511,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         TimeValue configuredGcInterval = SERVERLESS_STORAGE_GC_INTERVAL_SETTING.get(environment.settings());
         gcInterval = configuredGcInterval.millis() > 0 ? configuredGcInterval : null;
         gcRetentionWindowMillis = SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(environment.settings()).millis();
+        reclaimOnIndexDelete = SERVERLESS_STORAGE_RECLAIM_ON_INDEX_DELETE_SETTING.get(environment.settings());
         TimeValue configuredGcCandidateTailInterval = SERVERLESS_STORAGE_GC_CANDIDATE_TAIL_INTERVAL_SETTING.get(environment.settings());
         gcCandidateTailInterval = configuredGcCandidateTailInterval.millis() > 0 ? configuredGcCandidateTailInterval : null;
         gcCandidateLookbackMillis = SERVERLESS_STORAGE_GC_CANDIDATE_LOOKBACK_SETTING.get(environment.settings()).millis();
@@ -2152,10 +2529,62 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         rewriteAdmissionController = maxConcurrentRewrites > 0
             ? new org.opensearch.serverless.storage.scheduling.RewriteAdmissionController(maxConcurrentRewrites)
             : null;
+        requireAuthenticatedBlocks = SERVERLESS_STORAGE_REQUIRE_AUTHENTICATED_BLOCKS_SETTING.get(environment.settings());
+        // The master key never becomes a String on this path, and every intermediate copy is zeroed.
+        //
+        // It used to read `Base64.getDecoder().decode(new String(encryptionKey.getChars()))`. The
+        // SecureString itself was closed correctly by the try-with-resources, which made the leak
+        // easy to miss: the leak was the `new String(...)`. A String is immutable, so nothing can
+        // clear it; the base64 encoding of the node's master key therefore sat on the heap until a
+        // garbage collection that may never be observed, and any heap dump, OOM .hprof, or core
+        // dump taken in between contains it in full. Base64 is not obfuscation -- it is the exact
+        // key, one decode away, and it is trivially recognisable in a dump.
+        //
+        // The replacement encodes the char[] straight to UTF-8 bytes and decodes those, so the
+        // longest-lived copy is a byte[] we control and wipe. rawKeyBytes is wiped too, immediately
+        // after SecretKeySpec has taken its own defensive copy inside fromRawKeyBytes.
+        //
+        // This is best-effort, and worth being honest about the limit: the JVM may have moved any
+        // of these arrays during a GC before we overwrite them, leaving an unreachable copy behind.
+        // Wiping shrinks the window from "forever" to "until the next collection of that region",
+        // which is the most any Java process can do without off-heap key storage.
         try (SecureString encryptionKey = SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.get(environment.settings())) {
             if (encryptionKey.length() > 0) {
-                byte[] rawKeyBytes = Base64.getDecoder().decode(new String(encryptionKey.getChars()));
-                encryptionKeyProvider = StaticEncryptionKeyProvider.fromRawKeyBytes(rawKeyBytes);
+                byte[] base64Bytes = null;
+                byte[] rawKeyBytes = null;
+                java.nio.ByteBuffer encoded = null;
+                try {
+                    encoded = java.nio.charset.StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(encryptionKey.getChars()));
+                    base64Bytes = new byte[encoded.remaining()];
+                    encoded.get(base64Bytes);
+                    try {
+                        rawKeyBytes = Base64.getDecoder().decode(base64Bytes);
+                    } catch (IllegalArgumentException e) {
+                        // Fail node start with the setting's name in the message. Previously a
+                        // malformed value threw the JDK's own "Illegal base64 character" out of
+                        // createComponents with no indication of which of this plugin's 80-odd
+                        // settings produced it.
+                        throw new IllegalArgumentException(
+                            "["
+                                + SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.getKey()
+                                + "] is not valid base64; it must hold the base64 encoding of 16, 24 or 32 raw AES key bytes",
+                            e
+                        );
+                    }
+                    // Throws on a wrong key length -- see StaticEncryptionKeyProvider#fromRawKeyBytes
+                    // for why that check belongs at startup rather than at the first write.
+                    encryptionKeyProvider = StaticEncryptionKeyProvider.fromRawKeyBytes(rawKeyBytes);
+                } finally {
+                    if (encoded != null && encoded.hasArray()) {
+                        java.util.Arrays.fill(encoded.array(), (byte) 0);
+                    }
+                    if (base64Bytes != null) {
+                        java.util.Arrays.fill(base64Bytes, (byte) 0);
+                    }
+                    if (rawKeyBytes != null) {
+                        java.util.Arrays.fill(rawKeyBytes, (byte) 0);
+                    }
+                }
             }
         }
         // Only the config is resolved here (same "read the NodeScope setting where Environment is
@@ -2164,6 +2593,33 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // resolveSharedWalChunkService()'s own javadoc for why.
         walMirroringEnabled = SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.get(environment.settings());
         if (walMirroringEnabled) {
+            // Caught here, at component construction, rather than where it actually bites.
+            //
+            // The WAL path needs a real ThreadPool: the group-commit processor takes its
+            // ThreadContext and schedules on it, and WalGcSchedulerTask schedules on it too. Without
+            // one, nothing failed until the first writer shard opened, and then it failed as a raw
+            // NullPointerException inside resolveSharedWalChunkService -- several frames below
+            // getEngineFactory, naming a field rather than a cause, on a code path whose connection
+            // to "this plugin was constructed without a thread pool" is not visible from the stack.
+            //
+            // A real node always passes one, so reaching this is a construction error and not a
+            // configuration error: the only callers who can are tests that build the plugin
+            // partially. That is exactly why it should throw here and say so, instead of being
+            // tolerated -- the tolerant version is a plugin that comes up with WAL mirroring
+            // "enabled" and silently no WAL, which is the failure mode this whole area of the code
+            // has been removing rather than adding.
+            if (threadPool == null) {
+                throw new IllegalStateException(
+                    "["
+                        + SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey()
+                        + "] is enabled but createComponents was called with no ThreadPool: the shared WAL "
+                        + "service cannot batch, schedule its GC sweep, or propagate a thread context without "
+                        + "one. A real node always supplies a ThreadPool here, so this is a partially-constructed "
+                        + "plugin rather than a misconfiguration -- supply one, or disable ["
+                        + SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey()
+                        + "]"
+                );
+            }
             walPerShardBudgetBytes = SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING.get(environment.settings()).getBytes();
             walGcInterval = SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING.get(environment.settings());
             walFlushBatchingEnabled = SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING.get(environment.settings());
@@ -2432,6 +2888,109 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return org.opensearch.serverless.storage.clone.FallbackBundleFileReader.chain(readers);
     }
 
+    /** The {@link #shardMaintenanceTasks} key for one shard. */
+    private static String shardMaintenanceKey(String indexUuid, int shardId) {
+        return indexUuid + "/" + shardId;
+    }
+
+    /**
+     * Starts this shard's background compaction and GC schedulers on this node, unless it already
+     * has them.
+     *
+     * <p>Idempotent by key, which is what makes it safe to call from {@link #getEngineFactory}: that
+     * method runs again whenever the shard reopens -- a restart in place, a relocation back to this
+     * node, a failed-then-retried allocation -- and a second live scheduler for one shard would
+     * double its object-store request rate for no benefit.
+     *
+     * <p>Does nothing at all when both intervals are unset, which is still the default. This method
+     * makes the schedulers <em>reachable</em>; it does not turn them on. An operator who has never
+     * set {@code serverless_storage.gc.interval} still gets no GC -- the difference is that an
+     * operator who <em>has</em> set it now gets it for every serverless index, rather than only for
+     * indices that happen to have search replicas.
+     *
+     * @param indexUuid the shard's index UUID.
+     * @param shardId the shard's numeric id.
+     * @param shardStateStore the write-capable (delete-denied) shard state store compaction rebases through.
+     * @param compactionConfig the compaction scheduler's configuration, or {@code null} when the interval is unset.
+     * @param gcConfig the GC sweep's configuration, or {@code null} when the interval is unset.
+     */
+    private void startShardMaintenanceTasks(
+        String indexUuid,
+        int shardId,
+        ShardStateStore shardStateStore,
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig
+    ) {
+        if (compactionConfig == null && gcConfig == null) {
+            return;
+        }
+        if (threadPool == null) {
+            // createComponents has not run, which only a partially-constructed plugin can manage --
+            // a real node always supplies one. Returning is safe here in a way it is not for the WAL
+            // service: not scheduling maintenance costs deferred reclamation, whereas not building a
+            // WAL costs acknowledged writes, which is why createComponents refuses that case
+            // outright rather than degrading like this one does.
+            //
+            // Reachable only with WAL mirroring disabled, since createComponents now throws before
+            // this point otherwise. Kept rather than tightened to match: a scheduler that silently
+            // does not start is the lesser evil of the two, and turning it into a throw would make
+            // GC wiring a hard precondition of constructing any engine at all.
+            return;
+        }
+        synchronized (shardMaintenanceTasksLock) {
+            if (shardMaintenanceTasksClosed) {
+                return;
+            }
+            shardMaintenanceTasks.computeIfAbsent(shardMaintenanceKey(indexUuid, shardId), key -> {
+                CompactionSchedulerTask compactionTask = compactionConfig == null
+                    ? null
+                    : new CompactionSchedulerTask(
+                        threadPool,
+                        compactionConfig.interval(),
+                        indexUuid,
+                        shardId,
+                        shardStateStore,
+                        compactionConfig.manifestStore(),
+                        compactionConfig.materializer(),
+                        compactionConfig.commitPublisher(),
+                        compactionConfig.policy(),
+                        compactionConfig.rebaseExecutor(),
+                        compactionConfig.admissionController(),
+                        compactionConfig.mergeWorkRoot()
+                    );
+                GcSchedulerTask gcTask = gcConfig == null
+                    ? null
+                    : new GcSchedulerTask(threadPool, gcConfig.interval(), indexUuid, shardId, gcConfig);
+                return new ShardMaintenanceTasks(compactionTask, gcTask);
+            });
+        }
+    }
+
+    /**
+     * Cancels this shard's background compaction and GC schedulers on this node.
+     *
+     * <p>Called from {@code afterIndexShardClosed}, which fires on relocation as well as on real
+     * closure -- and relocation is exactly the case that matters. The writer primary moving to
+     * another node means that node starts its own pair; leaving this node's pair running would make
+     * two nodes sweep and compact the same shard. Both operations are safe under that redundancy (a
+     * sweep is idempotent, a publish is term-fenced), so this is a cost fix rather than a
+     * correctness one -- but the cost is object-store requests, which is the thing &sect;6.5's whole
+     * design exists to bound.
+     *
+     * <p>Idempotent: a shard that never started a pair here simply has no entry.
+     *
+     * @param indexUuid the shard's index UUID.
+     * @param shardId the shard's numeric id.
+     */
+    private void stopShardMaintenanceTasks(String indexUuid, int shardId) {
+        synchronized (shardMaintenanceTasksLock) {
+            ShardMaintenanceTasks tasks = shardMaintenanceTasks.remove(shardMaintenanceKey(indexUuid, shardId));
+            if (tasks != null) {
+                tasks.close();
+            }
+        }
+    }
+
     /**
      * Resolves this shard's own {@link BlobContainer} (index-UUID/shard-scoped, encryption-wrapped
      * if configured) -- shared by {@link #getEngineFactory} and {@link
@@ -2447,7 +3006,25 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // Wrapping here, at the one seam every downstream class already depends on
             // abstractly (BlobContainer), is the entire integration -- see
             // EncryptingBlobContainer's javadoc for the ranged-read tradeoff this implies.
-            blobContainer = new EncryptingBlobContainer(blobContainer, encryptionKeyProvider);
+            //
+            // (indexUuid, shardId) are now passed in, where before this seam built an
+            // index-agnostic wrapper. Two things follow, and only one of them is theoretical.
+            // The theoretical one: encryption now calls EncryptionKeyProvider#currentKey(indexUuid)
+            // rather than currentKey(), so a per-index-aware provider would finally be honoured --
+            // no such provider can be configured today (see PerIndexEncryptionKeyProvider), so this
+            // changes no behaviour yet, it just stops the call site from being the reason it
+            // couldn't. The real one: every block written from here on is cryptographically bound
+            // to this index and shard, so a block lifted out of another index's bundle no longer
+            // authenticates inside this one. That holds under the single node-wide key we actually
+            // ship, which is the point -- it is integrity, not key separation, and it does not need
+            // key separation to work.
+            blobContainer = new EncryptingBlobContainer(
+                blobContainer,
+                encryptionKeyProvider,
+                indexUuid,
+                shardId,
+                requireAuthenticatedBlocks
+            );
         }
         return blobContainer;
     }
@@ -2611,15 +3188,101 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 }
             }
 
+            // Compaction and GC configuration, built for EVERY serverless shard this node opens --
+            // not, as before, only inside the reader-shard branch below.
+            //
+            // The old placement made both schedulers unreachable for the ordinary serverless index.
+            // A reader shard only exists if the index has index.number_of_search_replicas > 0, which
+            // in turn requires remote_store.enabled. The common shape -- one writer shard, no search
+            // replicas -- therefore had no reader engine anywhere in the cluster, so no
+            // CompactionSchedulerTask and no GcSchedulerTask were ever constructed, no matter what
+            // serverless_storage.compaction.interval and serverless_storage.gc.interval were set to.
+            // Storage grew without bound and quiescent shards never compacted, silently: the
+            // settings were accepted, the intervals were parsed, and nothing ticked. This is the
+            // failure mode where a feature is configured, believed to be running, and is not.
+            //
+            // The original reason for the reader-only placement no longer holds. It was that a
+            // writer always holds its own lease, so a writer-hosted compaction scheduler would see
+            // the lease held and never act -- but the lease gate was removed from maybeCompact, and
+            // nothing has replaced it, so a writer-hosted scheduler is now simply a scheduler.
+            CompactionSchedulerConfig compactionConfig = compactionInterval == null
+                ? null
+                : new CompactionSchedulerConfig(
+                    compactionInterval,
+                    manifestStore,
+                    // Straight to the raw bundle store (via the lineage-fallback-aware read path,
+                    // not the possibly-cache-wrapped reader read path) -- a merge reads every input
+                    // segment file exactly once, so there's no hot-rereading benefit a cache would
+                    // give, matching ObjectStoreShardRecoveryStrategy's own "no caching layer needed"
+                    // choice for cross-node failover materialization.
+                    new ObjectStoreCommitMaterializer(chainedBundleReadPath(scopedContainer, lineageChain)),
+                    commitPublisher,
+                    CompactionPolicy.withDefaults(),
+                    new CompactionRebaseExecutor(shardStateStore, 5),
+                    rewriteAdmissionController,
+                    // Merge scratch on the node's own data path: a merge stages a whole shard's worth
+                    // of segments, which the platform temp directory is routinely too small to hold.
+                    compactionMergeWorkRoot()
+                );
+            // GC is the one tier &sect;15's credential-scoping model actually grants DELETE to
+            // ("the GC/reconciler role is the only DELETE-capable principal") -- built against
+            // its own store pair on the *unrestricted* blobContainer, deliberately not reusing
+            // manifestStore/bundleStore above (which are wired through the delete-denying
+            // scopedContainer and would throw the moment GcSchedulerTask's sweep tried to
+            // delete anything through them).
+            GcSchedulerConfig gcConfig = gcInterval == null
+                ? null
+                : new GcSchedulerConfig(
+                    gcInterval,
+                    gcRetentionWindowMillis,
+                    new BlobContainerManifestStore(blobContainer),
+                    // Raw bundle store, same "no hot-rereading benefit from a cache" reasoning as
+                    // the compaction config just above -- a sweep lists/deletes bundle names, it
+                    // never reads their contents at all.
+                    new BlobContainerBundleStore(blobContainer),
+                    pinRegistry,
+                    // The head, on the same unrestricted container the rest of GC uses. A sweep that
+                    // cannot read the head cannot tell a published manifest from one whose writer died
+                    // between writing it and CAS-ing the head, and deleting on that mistake destroys the
+                    // live head and its bundles -- see ManifestRetentionPolicy's own javadoc.
+                    new BlobContainerShardStateStore(blobContainer),
+                    // Cross-tick bookkeeping (the orphan clock, the last swept head) persisted per shard,
+                    // so a restart or relocation no longer resets it and stops bundles ever being freed.
+                    // That matters more now than it did when this config was built inside the reader
+                    // branch: the sweep's host is the writer primary, which relocates on every failover,
+                    // so an in-memory orphan clock would have been reset by exactly the events a
+                    // long-running deployment sees most.
+                    new org.opensearch.serverless.storage.gc.BlobContainerGcSweepStateStore(blobContainer, indexUuid, shardIdValue)
+                );
+            // One sweeper and one compactor per shard, on the node that holds its writer primary.
+            //
+            // Why the primary and not every copy: both tasks are node-local schedulers over
+            // cluster-wide durable state, so N copies would do the same work N times. A GC sweep is
+            // idempotent (deleting an already-deleted blob is the documented no-op) and a compaction
+            // publish is CAS-fenced by primary term, so redundancy would be safe -- it just costs
+            // object-store requests proportional to read fan-out, which is precisely the cost model
+            // §6.5 says a sweep must not have. A writer primary exists for every assigned shard,
+            // exactly once in the cluster, which is the property that makes it the right host.
+            //
+            // shardRouting is null for administrative calls (mapping validation and the like) that
+            // pass through getEngineFactory with no real shard behind them; shardIdValue's own
+            // fallback-to-0 must not be read as "this node hosts shard 0" in that case. Same guard
+            // the pin-ledger sweep above already uses, for the same reason.
+            if (shardRouting != null && shardRouting.primary() && shardRouting.isSearchOnly() == false) {
+                startShardMaintenanceTasks(indexUuid, shardIdValue, shardStateStore, compactionConfig, gcConfig);
+            }
+
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
             if (isReaderShard) {
                 // Credential scoping per tier, bullet 1 (rfc-serverless-opensearch.md &sect;15):
-                // "search-compute needs GET-only on data prefixes." This reader shard's own
-                // background CompactionSchedulerConfig/GcSchedulerConfig below still need write
-                // (and, for GC, delete) access, so they keep using scopedContainer/blobContainer
-                // directly -- only the query-serving trio (shardStateStore/manifestStore/readPath,
-                // what ObjectStoreReaderEngine itself actually reads from on every query and on its
-                // own background poll) gets this separate, strictly-narrower container.
+                // "search-compute needs GET-only on data prefixes." A reader shard now genuinely
+                // needs nothing beyond GET: the compaction and GC schedulers that used to hang off
+                // its engine -- and were the only reason it ever needed write or delete -- moved to
+                // the node-level tasks above, hosted on the writer primary. So the whole
+                // query-serving trio (shardStateStore/manifestStore/readPath, what
+                // ObjectStoreReaderEngine reads on every query and on its own background poll) gets
+                // this strictly-narrower container, and nothing on the reader path is left outside
+                // it.
                 BlobContainer readOnlyContainer = new org.opensearch.serverless.storage.security.RestrictingBlobContainer(
                     scopedContainer,
                     false,
@@ -2656,40 +3319,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     cacheStatsRegistry.register(indexUuid, shardIdValue, diskCache);
                     readPath = new CachingBundleFileReader(sharedBundleCache, diskCache);
                 }
-                CompactionSchedulerConfig compactionConfig = compactionInterval == null
-                    ? null
-                    : new CompactionSchedulerConfig(
-                        compactionInterval,
-                        manifestStore,
-                        // Straight to the raw bundle store (via the lineage-fallback-aware read path,
-                        // not the possibly-cache-wrapped readPath above) -- a merge reads every input
-                        // segment file exactly once, so there's no hot-rereading benefit a cache would
-                        // give, matching ObjectStoreShardRecoveryStrategy's own "no caching layer needed"
-                        // choice for cross-node failover materialization.
-                        new ObjectStoreCommitMaterializer(chainedBundleReadPath(scopedContainer, lineageChain)),
-                        commitPublisher,
-                        CompactionPolicy.withDefaults(),
-                        new CompactionRebaseExecutor(shardStateStore, 5),
-                        rewriteAdmissionController
-                    );
-                // GC is the one tier &sect;15's credential-scoping model actually grants DELETE to
-                // ("the GC/reconciler role is the only DELETE-capable principal") -- built against
-                // its own store pair on the *unrestricted* blobContainer, deliberately not reusing
-                // manifestStore/bundleStore above (which are wired through the delete-denying
-                // scopedContainer and would throw the moment GcSchedulerTask's sweep tried to
-                // delete anything through them).
-                GcSchedulerConfig gcConfig = gcInterval == null
-                    ? null
-                    : new GcSchedulerConfig(
-                        gcInterval,
-                        gcRetentionWindowMillis,
-                        new BlobContainerManifestStore(blobContainer),
-                        // Raw bundle store, same "no hot-rereading benefit from a cache" reasoning as
-                        // the compaction config just above -- a sweep lists/deletes bundle names, it
-                        // never reads their contents at all.
-                        new BlobContainerBundleStore(blobContainer),
-                        pinRegistry
-                    );
                 org.opensearch.serverless.storage.resharding.BlobContainerShardPartitionStore rawPartitionStore =
                     new org.opensearch.serverless.storage.resharding.BlobContainerShardPartitionStore(blobContainer);
                 org.opensearch.serverless.storage.resharding.ShardPartitionDescriptor partitionDescriptor;
@@ -2730,8 +3359,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         shardDirectory,
                         localNodeId,
                         readerShardAdmissionController,
-                        compactionConfig,
-                        gcConfig,
+                        // Both null, deliberately: compaction and GC for this shard now run from
+                        // the node-level tasks started above, on whichever node holds the writer
+                        // primary. Leaving them here as well would double every sweep and every
+                        // merge attempt for an index that happens to have search replicas -- and the
+                        // whole point of the move is that an index without them is covered too.
+                        null,
+                        null,
                         readerShardActivityRegistry,
                         partitionDescriptor,
                         partitionRewriteConfig,
@@ -2752,6 +3386,41 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // javadoc names -- the shared container and sharedWalChunkService itself are actually
             // built here, on this call, the first time any writer shard on this node needs one.
             org.opensearch.serverless.storage.wal.WalChunkService writerWalChunkService = resolveSharedWalChunkService();
+            // The durability gap made observable. Without a WalChunkService this shard's writer
+            // engine falls back to core's LocalTranslog, so everything not yet flushed lives on
+            // local disk only -- which contradicts rfc-serverless-opensearch.md §2 goal 1 ("the
+            // object store is the sole durable home of write-ahead data; local disk is strictly a
+            // cache") for the default configuration. That was true before this line too; what was
+            // missing was any way to find out. A warning per shard open is cheap and lands in the
+            // log of the node that would lose the data.
+            //
+            // See SERVERLESS_STORAGE_WAL_MIRRORING_REQUIRED_SETTING for why refusing outright is
+            // opt-in rather than the default, and for who owns flipping it.
+            if (writerWalChunkService == null) {
+                if (SERVERLESS_STORAGE_WAL_MIRRORING_REQUIRED_SETTING.get(settings)) {
+                    throw new IllegalStateException(
+                        "index ["
+                            + indexSettings.getIndex().getName()
+                            + "] has serverless storage enabled and ["
+                            + SERVERLESS_STORAGE_WAL_MIRRORING_REQUIRED_SETTING.getKey()
+                            + "] is set, but no write-ahead-log service is available on this node: set ["
+                            + SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey()
+                            + "] to true so unflushed operations are durable in the object store, or unset ["
+                            + SERVERLESS_STORAGE_WAL_MIRRORING_REQUIRED_SETTING.getKey()
+                            + "] to accept local-disk-only durability for them"
+                    );
+                }
+                logger.warn(
+                    "index [{}] shard [{}] is opening with serverless storage but no write-ahead-log service: "
+                        + "operations not yet flushed to a published commit are durable only on this node's local disk "
+                        + "and are lost if it is killed. Set [{}] to true for object-store durability, or [{}] to refuse "
+                        + "to open instead of degrading silently.",
+                    indexSettings.getIndex().getName(),
+                    shardIdValue,
+                    SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(),
+                    SERVERLESS_STORAGE_WAL_MIRRORING_REQUIRED_SETTING.getKey()
+                );
+            }
             org.opensearch.serverless.storage.wal.DedicatedWalGcConfig dedicatedWalGcConfig = null;
             if (writerWalChunkService != null && SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING.get(indexSettings.getSettings())) {
                 BlobContainer dedicatedWalContainer = resolveDedicatedWalContainer(indexUuid, shardIdValue);
@@ -3239,7 +3908,109 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     @Override
     public Collection<IndexCreationValidator> getIndexCreationValidators() {
-        return java.util.List.of(new ServerlessStorageRemoteClusterStateValidator(), new ServerlessStorageRecoveryStrategyValidator());
+        return java.util.List.of(
+            new ServerlessStorageRemoteClusterStateValidator(),
+            new ServerlessStorageRecoveryStrategyValidator(),
+            new UnbackedServerlessIndexValidator(settings)
+        );
+    }
+
+    /**
+     * Refuses to create a serverless-storage index on a cluster that has no object store configured
+     * for it -- which, because of the {@code serverless_} name prefix, is a thing an operator can do
+     * by accident with nothing but a {@code PUT}.
+     *
+     * <p><b>What is actually wrong today</b>
+     *
+     * <p>{@code ServerlessStorageIndexSettingProvider} sets {@code index.serverless_storage.enabled}
+     * for <em>any</em> index whose name starts with {@code serverless_}, and then injects this
+     * plugin's existing-shards allocator and {@code index.recovery.strategy=object-store} to match.
+     * That derivation is gated by nothing: not by {@code serverless_storage.enabled}, not by whether
+     * a blob store exists, not by anything. So on a cluster that installed this plugin and
+     * configured none of it, {@code PUT /serverless_foo} is accepted, and its shards then fail to
+     * open with an {@code IllegalStateException} out of {@code resolveContainer}, because there is
+     * no {@code serverless_storage.base_path} and no {@code serverless_storage.repository} to
+     * resolve a container from.
+     *
+     * <p>The failure is at least loud rather than silent, which is why this is a validator and not a
+     * rewrite of the derivation. But it is loud in the wrong place and to the wrong person: it
+     * surfaces as a red index on a cluster whose operator chose a name, not as an error on the
+     * request that chose it. And "an index name in a namespace the operator did not know was
+     * reserved silently selects a storage engine" is the shape of the problem, not the missing
+     * setting.
+     *
+     * <p><b>Why this condition and not "is the node setting on"</b>
+     *
+     * <p>Refusing every {@code serverless_} name unless {@code serverless_storage.enabled} is set
+     * would reserve the namespace more thoroughly, and it is what a from-scratch design would do.
+     * It also refuses names on clusters where the derivation is currently harmless. The condition
+     * here is the narrowest one that is unambiguously true: this index has asked for object-store
+     * storage -- by name or by setting, it does not matter which -- and this node cannot provide
+     * any. There is no configuration in which that combination is what someone wanted.
+     *
+     * <p>It deliberately catches the explicit opt-in too, not just the prefix. {@code PUT /idx}
+     * with {@code index.serverless_storage.enabled: true} against an unconfigured cluster fails in
+     * exactly the same way, and had exactly the same excuse.
+     */
+    static final class UnbackedServerlessIndexValidator implements IndexCreationValidator {
+
+        private final Settings nodeSettings;
+
+        /**
+         * @param nodeSettings the node's settings, read for the two ways a blob store can be configured.
+         */
+        UnbackedServerlessIndexValidator(Settings nodeSettings) {
+            this.nodeSettings = nodeSettings;
+        }
+
+        /** Decided entirely from settings; the mappings this would otherwise force core to build are not needed. */
+        @Override
+        public boolean requiresMappings() {
+            return false;
+        }
+
+        @Override
+        public void validate(org.opensearch.index.mapper.MapperService mapperService, org.opensearch.index.IndexSettings indexSettings) {
+            String indexName = indexSettings.getIndex().getName();
+            // Both, not just the setting. The setting alone would be enough in the normal flow --
+            // ServerlessStorageIndexSettingProvider derives it from the name before any validator
+            // runs -- but relying on that makes this check depend on the ordering of two things that
+            // are ordered by core, not by this plugin. The name is the durable fact about what the
+            // operator asked for, so it is checked directly.
+            boolean optedInBySetting = SERVERLESS_STORAGE_ENABLED_SETTING.get(indexSettings.getSettings());
+            boolean namedServerless = org.opensearch.serverless.storage.descriptor.DescriptorOnlyCreation.namesAServerlessIndex(indexName);
+            if (optedInBySetting == false && namedServerless == false) {
+                return;
+            }
+            // The raw settings, not the resolved basePath field: a cluster manager that never
+            // reached createComponents (or reached it before this setting was added to its
+            // keystore/config) would report a null basePath and refuse an index a data node could
+            // have served perfectly well. What is being checked is "did the operator configure a
+            // store at all", and that is a question about configuration.
+            boolean hasRepository = SERVERLESS_STORAGE_REPOSITORY_SETTING.get(nodeSettings).isEmpty() == false;
+            boolean hasBasePath = SERVERLESS_STORAGE_BASE_PATH_SETTING.get(nodeSettings).isEmpty() == false;
+            if (hasRepository || hasBasePath) {
+                return;
+            }
+            boolean byNameAlone = namedServerless && SERVERLESS_STORAGE_ENABLED_SETTING.exists(indexSettings.getSettings()) == false;
+            throw new IllegalArgumentException(
+                "index ["
+                    + indexName
+                    + "] would use serverless object-store storage"
+                    + (byNameAlone
+                        ? ", selected by its name alone: any index named ["
+                            + org.opensearch.serverless.storage.descriptor.DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX
+                            + "...] is opted in automatically"
+                        : "")
+                    + ", but neither ["
+                    + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
+                    + "] nor ["
+                    + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
+                    + "] is configured on this node, so its shards would have no object store to open from and "
+                    + "would fail to allocate. Configure one of those settings, or"
+                    + (byNameAlone ? " choose a name outside the reserved prefix." : " create the index without that setting.")
+            );
+        }
     }
 
     /**
@@ -3286,10 +4057,33 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             org.opensearch.cluster.metadata.SplitShardsMetadata splitShardsMetadata = indexService.getIndexSettings()
                 .getIndexMetadata()
                 .getSplitShardsMetadata();
-            org.opensearch.cluster.metadata.ShardRange range = splitShardsMetadata.getRangeOfShard(
-                openSearchDirectoryReader.shardId().id()
-            );
+            int shardNumber = openSearchDirectoryReader.shardId().id();
+            org.opensearch.cluster.metadata.ShardRange range = splitShardsMetadata.getRangeOfShard(shardNumber);
             if (range == null) {
+                // Fail closed. A shard that is known to be a split child but whose hash range this
+                // node cannot resolve -- a lagging cluster-state apply, or a child whose routing entry
+                // outlives its SplitShardsMetadata record through a merge commit -- used to fall
+                // through here and serve its ENTIRE unfiltered document set, which is the whole
+                // parent's. Two siblings in that state at once return every document twice, and the
+                // caller has no way to tell: the response is a successful search with wrong results.
+                //
+                // A hard error on one shard is strictly better. It is loud, it is scoped to the shard
+                // that is actually confused, and it is self-healing -- the next cluster-state apply
+                // that carries the range resolves it. Silent duplicate results are none of those.
+                //
+                // Note the guard is deliberately "is this a split child at all", not "is a split in
+                // progress": an ordinary, never-split shard has no range either, and that is the
+                // common path this must not touch.
+                if (splitShardsMetadata.getParentAndRangeOfChild(shardNumber) != null) {
+                    throw new IllegalStateException(
+                        "shard ["
+                            + shardNumber
+                            + "] of index ["
+                            + indexService.index().getName()
+                            + "] is an in-place split child but no hash range resolves for it on this node -- "
+                            + "refusing to serve its unfiltered document set"
+                    );
+                }
                 return directoryReader;
             }
             return new org.opensearch.serverless.storage.resharding.InPlaceSplitFilteringDirectoryReader(directoryReader, range);
@@ -3351,6 +4145,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             @Override
             public void afterIndexShardDeleted(org.opensearch.core.index.shard.ShardId shardId, Settings shardIndexSettings) {
                 deleteLocalCacheDirectoryForDeletedShard(shardId.getIndex().getUUID(), shardId.id());
+            }
+
+            /**
+             * Cancels the node-level compaction/GC pair {@code getEngineFactory} started for this
+             * shard. Deliberately the <em>closed</em> callback, not the <em>deleted</em> one above:
+             * a relocating shard is closed here but its data is never deleted, and a relocated
+             * shard's schedulers must stop on the node it left, not only when the index is dropped.
+             * See {@link #stopShardMaintenanceTasks}.
+             */
+            @Override
+            public void afterIndexShardClosed(
+                org.opensearch.core.index.shard.ShardId shardId,
+                org.opensearch.index.shard.IndexShard indexShard,
+                Settings shardIndexSettings
+            ) {
+                stopShardMaintenanceTasks(shardId.getIndex().getUUID(), shardId.id());
             }
         });
     }
@@ -3531,13 +4341,72 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         } catch (IOException e) {
                             throw new UncheckedIOException(e);
                         }
-                    }
+                    },
+                    // Releases this clone's pin at every hop of the lineage, not just the first -- the
+                    // symmetric half of ShardCloner#clone's ancestor pinning. Without it, a chain pinned at
+                    // three hops is released at one and the other two leak forever.
+                    this::resolveBlobContainer
                 );
+                reclaimDeletedShardBytes(indexUuid, shardId, targetContainer);
             } catch (Exception e) {
                 // See this method's own javadoc: logged-and-swallowed, not fatal to index deletion.
                 logger.warn("failed to release clone lineage/pin for deleted index " + indexUuid + "/" + shardId, e);
             }
         }
+    }
+
+    /**
+     * Actually reclaims a deleted shard's object-store bytes, gated behind
+     * {@link #SERVERLESS_STORAGE_RECLAIM_ON_INDEX_DELETE_SETTING}.
+     *
+     * <p><b>Why this is needed at all</b>
+     *
+     * <p>Deleting a serverless index reclaimed <b>zero</b> object-store bytes -- ever, in any
+     * configuration. GC is per shard and runs from a scheduler attached to a live shard, so the
+     * moment the index is gone there is nothing left that could ever sweep its prefix. Every
+     * manifest, every bundle and every register a deleted index ever wrote stayed in the bucket
+     * permanently, and an index-per-tenant fleet -- the shape this whole design exists to make
+     * possible -- is exactly the workload that creates and deletes indices constantly.
+     *
+     * <p>{@code DeletedShardReclaimer} refuses whenever a <em>live</em> pin names the shard. That is
+     * the whole safety argument, and it is stronger than it looks: a clone pins every hop of its
+     * lineage, a snapshot pins what it names, and PITR pins its window, so "no live pin" is exactly
+     * "nothing outside this shard depends on these bytes" -- without scanning every other index's
+     * lineage to find out.
+     *
+     * <p><b>Why it is off by default for now</b>
+     *
+     * <p>This is the first code path in the plugin that deletes a whole shard prefix in one call,
+     * and it is reached from an index-deletion callback where the operator's intent is already
+     * irreversible. Those two facts together are why it ships behind a flag for one release rather
+     * than on: a bug here does not lose the bytes of the index being deleted (they were meant to
+     * go), it loses the bytes of whatever the pin check got wrong about -- a clone source, a
+     * snapshot -- and that is silent until someone tries to read it. A release of real-world
+     * exercise with the flag on, in deployments that care more about the bill than the blast
+     * radius, is cheap insurance for flipping the default afterwards.
+     *
+     * <p>Failures are logged and swallowed by the caller, which is the right tolerance: leaving
+     * bytes behind costs money, and failing an index deletion costs availability.
+     *
+     * @param indexUuid the deleted index's UUID.
+     * @param shardId the shard within it.
+     * @param shardContainer that shard's own container, already resolved by the caller.
+     */
+    private void reclaimDeletedShardBytes(String indexUuid, int shardId, BlobContainer shardContainer) throws IOException {
+        if (reclaimOnIndexDelete == false) {
+            return;
+        }
+        org.opensearch.serverless.storage.gc.DeletedShardReclaimer.Outcome outcome =
+            org.opensearch.serverless.storage.gc.DeletedShardReclaimer.reclaimShard(
+                indexUuid,
+                shardId,
+                shardContainer,
+                System.currentTimeMillis()
+            );
+        // Logged at info, not debug: "we did not reclaim this shard because something still pins it"
+        // is the one outcome an operator chasing an unexpected storage bill needs to be able to find,
+        // and it is rare enough that it will not be noise.
+        logger.info("reclaim of deleted shard [{}][{}] finished with outcome [{}]", indexUuid, shardId, outcome);
     }
 
     /**
@@ -3691,6 +4560,19 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.resharding.action.FenceSplitSourceAction.INSTANCE,
                 org.opensearch.serverless.storage.resharding.action.TransportFenceSplitSourceAction.class
             ),
+            // The escape hatch for the fence directly above, and the reason it is not optional: a
+            // source fence is a cluster-state-durable write block on real data, and until this action
+            // existed the only way out of one was deleting the index. Orchestrated split used to fence
+            // by default, so a cluster can already be carrying an index that is unwritable and has no
+            // recovery path -- this DELETE is that path, on the same route the POST fence uses.
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.resharding.action.UnfenceSplitSourceAction.INSTANCE,
+                org.opensearch.serverless.storage.resharding.action.TransportUnfenceSplitSourceAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.resharding.action.CancelInPlaceSplitAction.INSTANCE,
+                org.opensearch.serverless.storage.resharding.action.TransportCancelInPlaceSplitAction.class
+            ),
             new ActionHandler<>(
                 org.opensearch.serverless.storage.resharding.action.DisableWritePartitionRoutingAction.INSTANCE,
                 org.opensearch.serverless.storage.resharding.action.TransportDisableWritePartitionRoutingAction.class
@@ -3778,6 +4660,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.resharding.action.RestEnableWritePartitionRoutingAction(),
             new org.opensearch.serverless.storage.resharding.action.RestDisableWritePartitionRoutingAction(),
             new org.opensearch.serverless.storage.resharding.action.RestFenceSplitSourceAction(),
+            new org.opensearch.serverless.storage.resharding.action.RestUnfenceSplitSourceAction(),
+            new org.opensearch.serverless.storage.resharding.action.RestCancelInPlaceSplitAction(),
             new org.opensearch.serverless.storage.resharding.action.RestProvisionSplitTargetsAction(),
             new org.opensearch.serverless.storage.resharding.action.RestOrchestrateShardSplitAction(),
             new org.opensearch.serverless.storage.deepsnapshot.action.RestIndexDeepSnapshotAction(),
@@ -4041,6 +4925,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // cancels its own scheduled task, the same as every other *SchedulerTask closed just above.
         // Setting the closed flag and draining happen under the same lock getEngineFactory's
         // check-then-insert uses, so a concurrent shard-0 open cannot slip a task in after the drain.
+        synchronized (shardMaintenanceTasksLock) {
+            shardMaintenanceTasksClosed = true;
+            shardMaintenanceTasks.values().forEach(ShardMaintenanceTasks::close);
+            shardMaintenanceTasks.clear();
+        }
         synchronized (pinLedgerSweepTasksLock) {
             pinLedgerSweepTasksClosed = true;
             pinLedgerSweepTasks.values().forEach(PinLedgerSweepTask::close);

@@ -17,6 +17,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.resharding.action.ShardSplitCandidatesAction;
 import org.opensearch.serverless.storage.resharding.action.ShardSplitCandidatesRequest;
 import org.opensearch.serverless.storage.resharding.action.ShardSplitCandidatesResponse;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -81,7 +82,14 @@ public final class InPlaceMergeTriggerSchedulerTask implements Closeable {
         this.client = client;
         this.clusterService = clusterService;
         this.triggerCoordinator = triggerCoordinator;
-        this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, interval, ThreadPool.Names.GENERIC);
+        // Jittered rather than started on the exact configured interval (finding L-10). Every node
+        // constructs this task at roughly the same moment after a cluster restart or a rolling
+        // upgrade, and scheduleWithFixedDelay never recomputes the delay, so an un-jittered start
+        // leaves every node's copy of this loop ticking in lockstep for the lifetime of the process
+        // -- a synchronised burst of cluster-manager work and object-store requests every interval,
+        // forever, which is exactly the recovery-stampede shape RFC section 13 asks the reconcilers
+        // to avoid. JitteredScheduling only ever extends the first interval, never shortens it.
+        this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
     private void evaluateSafely() {

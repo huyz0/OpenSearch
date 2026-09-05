@@ -99,12 +99,23 @@ public final class InMemoryPlaintextBundleCache {
         byte[] cached = stripe.get(key); // marks it most-recently-used within its own stripe
         if (cached != null) {
             hitCount.incrementAndGet();
-            return cached;
+            // A defensive copy, not the cached instance itself. Handing out the live array made
+            // this cache one Arrays.fill or one in-place decrypt away from poisoning every
+            // subsequent hit for that key, for every shard on the node, with no way to detect it --
+            // the entry would still have the right length and would never be re-verified, because
+            // this tier (unlike LocalDiskCachingBundleStore) has no checksum re-check on a hit. No
+            // caller mutates the array today, which is precisely why the bug would be latent until
+            // the day one does. The cost is one memcpy per hit; the alternative is an unbounded,
+            // silent, node-wide wrong-bytes class, and this tier exists in front of one that
+            // already re-verifies, so the memcpy is the cheap side of the trade.
+            return cached.clone();
         }
 
         missCount.incrementAndGet();
         byte[] fresh = onMiss.readFile(bundleName, entry);
-        stripe.put(key, fresh);
+        // The cached copy and the returned array are deliberately distinct for the same reason as
+        // the hit path above: the caller owns what it is handed and may do anything with it.
+        stripe.put(key, fresh.clone());
         return fresh;
     }
 
@@ -146,7 +157,18 @@ public final class InMemoryPlaintextBundleCache {
         return stripes.length;
     }
 
-    private static String cacheKey(String bundleName, BundleFileEntry entry) {
+    /**
+     * The content-addressed identity of one cached file: bundle name plus offset, length and
+     * CRC32C. Package-private rather than private so {@link CachingBundleFileReader} can key its
+     * own per-key single-flight map on exactly the same identity this cache keys entries on -- two
+     * independent definitions of "the same file" would silently let a fetch dedupe against the
+     * wrong entry, or fail to dedupe at all.
+     *
+     * @param bundleName the name of the bundle containing the file.
+     * @param entry the file's location and expected checksum within the bundle.
+     * @return the cache key for this file.
+     */
+    static String cacheKey(String bundleName, BundleFileEntry entry) {
         return bundleName + "-" + entry.offset() + "-" + entry.length() + "-" + entry.checksum();
     }
 

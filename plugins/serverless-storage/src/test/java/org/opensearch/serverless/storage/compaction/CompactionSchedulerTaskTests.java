@@ -116,7 +116,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
                 CompactionPolicy.withDefaults(),
-                new CompactionRebaseExecutor(shardStateStore, 10)
+                new CompactionRebaseExecutor(shardStateStore, 10),
+                createTempDir()
             );
             try {
                 assertBusy(() -> {
@@ -169,7 +170,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
                 CompactionPolicy.withDefaults(),
-                new CompactionRebaseExecutor(shardStateStore, 10)
+                new CompactionRebaseExecutor(shardStateStore, 10),
+                createTempDir()
             );
             try {
                 assertBusy(() -> {
@@ -221,7 +223,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
                 CompactionPolicy.withDefaults(),
-                new CompactionRebaseExecutor(shardStateStore, 10)
+                new CompactionRebaseExecutor(shardStateStore, 10),
+                createTempDir()
             );
 
             assertTrue("a 12-segment shard is over the default 10-segment threshold and must be a candidate", attempted);
@@ -305,7 +308,7 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
             // A high segment-count threshold (this single-segment manifest never crosses it) and a
             // low delete-ratio threshold (this manifest's real ratio does) -- isolates the
             // delete-ratio trigger specifically, not conflated with the segment-count one.
-            CompactionPolicy deleteRatioOnlyPolicy = new CompactionPolicy(1000, Long.MAX_VALUE, 0.3);
+            CompactionPolicy deleteRatioOnlyPolicy = new CompactionPolicy(1000, CompactionPolicy.MAX_TARGET_BUNDLE_SIZE_BYTES, 0.3);
             boolean attempted = CompactionSchedulerTask.maybeCompact(
                 INDEX_UUID,
                 SHARD_ID,
@@ -314,7 +317,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
                 deleteRatioOnlyPolicy,
-                new CompactionRebaseExecutor(shardStateStore, 10)
+                new CompactionRebaseExecutor(shardStateStore, 10),
+                createTempDir()
             );
 
             assertTrue("a shard whose real delete ratio crosses the policy's threshold must be a candidate", attempted);
@@ -354,7 +358,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
                 CompactionPolicy.withDefaults(),
-                new CompactionRebaseExecutor(shardStateStore, 10)
+                new CompactionRebaseExecutor(shardStateStore, 10),
+                createTempDir()
             );
 
             assertFalse("a 2-segment shard is well under threshold and must not be a candidate", attempted);
@@ -376,7 +381,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
             new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
             commitPublisher,
             CompactionPolicy.withDefaults(),
-            new CompactionRebaseExecutor(shardStateStore, 10)
+            new CompactionRebaseExecutor(shardStateStore, 10),
+            createTempDir()
         );
         assertFalse("a shard with no published head at all must be a safe no-op", attempted);
     }
@@ -392,7 +398,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
             new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
             commitPublisher,
             CompactionPolicy.withDefaults(),
-            new CompactionRebaseExecutor(shardStateStore, 10)
+            new CompactionRebaseExecutor(shardStateStore, 10),
+            createTempDir()
         );
         try {
             Thread.sleep(100);
@@ -459,7 +466,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
             new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
             commitPublisher,
             CompactionPolicy.withDefaults(),
-            new CompactionRebaseExecutor(shardStateStore, 10)
+            new CompactionRebaseExecutor(shardStateStore, 10),
+            createTempDir()
         );
         try {
             // Must not throw -- a SecurityException here means it escaped this task's own catch,
@@ -504,7 +512,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 commitPublisher,
                 CompactionPolicy.withDefaults(),
                 new CompactionRebaseExecutor(shardStateStore, 10),
-                admissionController
+                admissionController,
+                createTempDir()
             );
             try {
                 task.maybeCompactSafely();
@@ -553,7 +562,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 commitPublisher,
                 CompactionPolicy.withDefaults(),
                 new CompactionRebaseExecutor(shardStateStore, 10),
-                admissionController
+                admissionController,
+                createTempDir()
             );
             try {
                 task.maybeCompactSafely();

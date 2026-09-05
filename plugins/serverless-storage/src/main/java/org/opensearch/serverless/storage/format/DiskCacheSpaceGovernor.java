@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
@@ -48,10 +49,34 @@ import java.util.stream.Stream;
  * go when the node is out of disk is the coldest file on the node, which may well belong to a shard
  * that is nowhere near its own per-shard budget.
  *
- * <p>Same first-pass caveat as the per-shard policy: plain LRU-by-mtime over a directory walk,
- * evaluated synchronously on whichever request's write happened to cross the budget, not a tuned
- * admission-control policy and not a background schedule. A sweep failing must never fail the read
- * or write that triggered it -- the tree just stays over budget until the next successful sweep.
+ * <p><b>Where the sweep runs.</b> {@link #recordBytesAdded} is called from inside a
+ * {@code LocalDiskCachingBundleStore} read, i.e. a search thread servicing a cache miss, and the
+ * sweep it may trigger is a {@code Files.walk} plus two {@code stat} calls per file plus a full
+ * sort. The O(1) bail-out does not save that: the steady state of a <em>bounded</em> cache is
+ * <em>at</em> budget, oscillating between the target fraction and 100%, so a sweep runs roughly once
+ * per 10%-of-budget bytes written -- on a node with a 1&nbsp;TB cache of ~1&nbsp;MB entries, a
+ * ~1M-entry walk with ~2M stat calls, on a query thread. Two things were wrong with that and they
+ * are fixed independently.
+ *
+ * <p>The half that is fixed unconditionally is the <em>lock</em>: that call used to be made from
+ * inside the caller's per-cache-key monitor, so every other reader of the same file blocked behind
+ * the walk as well. {@code LocalDiskCachingBundleStore} now reports outside that monitor, so a sweep
+ * -- wherever it runs -- can no longer block an unrelated reader of the same entry.
+ *
+ * <p>The half that is opt-in is <em>which thread</em> walks the tree. Pass a {@link Executor} to the
+ * three-argument constructor and every sweep is handed to it; pass none and the sweep runs inline on
+ * the triggering thread, exactly as it always did. This class deliberately does not create a thread
+ * of its own: it is constructed once per node by the plugin and has no lifecycle -- no {@code
+ * close()}, nobody to call one -- so a thread it owned could never be shut down, and it would outlive
+ * every test that ever built a governor. The node already has a pool for exactly this kind of work
+ * ({@code ThreadPool.Names.GENERIC}), and handing that in is a one-line decision the plugin is the
+ * right place to make. Deciding to sweep stays edge-triggered by writes either way, so a tree that
+ * has stopped being written to and is over budget waits for the next write -- acceptable, because
+ * bytes only ever arrive by being written.
+ *
+ * <p>Same first-pass caveat as the per-shard policy: plain LRU-by-mtime over a directory walk, not
+ * a tuned admission-control policy. A sweep failing must never fail the read or write that
+ * triggered it -- the tree just stays over budget until the next successful sweep.
  */
 public final class DiskCacheSpaceGovernor {
 
@@ -74,6 +99,11 @@ public final class DiskCacheSpaceGovernor {
     private final AtomicBoolean sweepInProgress = new AtomicBoolean(false);
     private final AtomicLong evictedCount = new AtomicLong();
     private final AtomicLong sweepCount = new AtomicLong();
+    /**
+     * Where sweeps run. {@code null} means inline on the triggering thread -- see this class's own
+     * javadoc for why the off-thread option is supplied rather than owned.
+     */
+    private final java.util.concurrent.Executor sweepExecutor;
 
     /**
      * Creates a governor over {@code cacheRoot}, seeding its running total by walking whatever is
@@ -84,8 +114,24 @@ public final class DiskCacheSpaceGovernor {
      * @param maxTotalBytes the byte budget for the whole tree; {@code <= 0} leaves it unbounded.
      */
     public DiskCacheSpaceGovernor(Path cacheRoot, long maxTotalBytes) {
+        this(cacheRoot, maxTotalBytes, null);
+    }
+
+    /**
+     * Same, but running every sweep on {@code sweepExecutor} instead of on the thread whose write
+     * crossed the budget -- see this class's own javadoc for why that matters and why the executor
+     * is supplied rather than created here.
+     *
+     * @param cacheRoot the shared cache root, {@code <data path>/serverless_storage_cache}.
+     * @param maxTotalBytes the byte budget for the whole tree; {@code <= 0} leaves it unbounded.
+     * @param sweepExecutor runs each sweep; {@code null} runs them inline on the triggering thread.
+     *                      Must be an executor whose lifecycle someone else owns -- the node's
+     *                      {@code GENERIC} pool is the intended answer.
+     */
+    public DiskCacheSpaceGovernor(Path cacheRoot, long maxTotalBytes, java.util.concurrent.Executor sweepExecutor) {
         this.cacheRoot = cacheRoot;
         this.maxTotalBytes = maxTotalBytes;
+        this.sweepExecutor = sweepExecutor;
         this.currentTotalBytes = new AtomicLong(maxTotalBytes > 0 ? seedTotalBytes(cacheRoot) : 0L);
     }
 
@@ -144,15 +190,48 @@ public final class DiskCacheSpaceGovernor {
         if (sweepInProgress.compareAndSet(false, true) == false) {
             return;
         }
+        if (sweepExecutor == null) {
+            runSweep();
+            return;
+        }
+        try {
+            // Handed off -- see this class's own javadoc. The flag is cleared by the sweep task
+            // itself, so it still means "a sweep is outstanding" and still admits exactly one.
+            sweepExecutor.execute(this::runSweep);
+        } catch (RuntimeException rejectedOrShutDown) {
+            // Pool saturated or shutting down -- release the guard so a later write can try again
+            // rather than wedging the governor permanently on a sweep that never ran.
+            sweepInProgress.set(false);
+            logger.debug("could not schedule a node-wide disk cache sweep for [" + cacheRoot + "]", rejectedOrShutDown);
+        }
+    }
+
+    private void runSweep() {
         try {
             sweepIfOverBudget();
-        } catch (IOException e) {
-            // Never fail the read or write that triggered this -- the tree stays over budget until
-            // the next successful sweep, exactly as the per-shard sweep behaves.
+        } catch (IOException | RuntimeException e) {
+            // Never propagate out of the executor thread -- the tree stays over budget until the
+            // next successful sweep, exactly as the per-shard sweep behaves.
             logger.warn("failed to sweep the node-wide local disk cache tree [" + cacheRoot + "]", e);
         } finally {
             sweepInProgress.set(false);
         }
+    }
+
+    /**
+     * Waits for any outstanding sweep to finish, for tests that supplied an {@link Executor} and
+     * therefore cannot assume the sweep already ran. Returns immediately when sweeps are inline,
+     * because then there is never one outstanding once the triggering call has returned.
+     *
+     * @param timeoutMillis how long to wait for an outstanding sweep to finish.
+     * @return whether no sweep was outstanding by the time this returned.
+     */
+    boolean awaitSweepQuiescenceForTesting(long timeoutMillis) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (sweepInProgress.get() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5L);
+        }
+        return sweepInProgress.get() == false;
     }
 
     private void sweepIfOverBudget() throws IOException {

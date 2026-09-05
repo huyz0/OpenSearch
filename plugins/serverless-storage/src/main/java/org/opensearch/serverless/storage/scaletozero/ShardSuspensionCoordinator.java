@@ -169,8 +169,37 @@ public final class ShardSuspensionCoordinator {
     public void suspendCandidates(List<ScaleToZeroCandidateEntry> candidates) {
         for (ScaleToZeroCandidateEntry entry : candidates) {
             if (entry.candidate()) {
-                suspendWriterShard(entry.indexUuid(), entry.shardId());
+                suspendOneSafely(entry, false);
             }
+        }
+    }
+
+    /**
+     * Suspends one candidate, containing any failure to that candidate.
+     *
+     * <p><b>Finding L-4: why the containment matters.</b> This loop is driven from {@code
+     * ScaleToZeroCandidatesSchedulerTask}'s {@code client.execute} response listener, which is
+     * <em>outside</em> that task's own {@code evaluateSafely} try block. So an exception escaping one
+     * candidate did not merely skip that candidate: it aborted the loop, silently dropping every
+     * remaining candidate in the tick. And because the cause was deterministic (a shard id present in
+     * IndexMetadata but absent from the routing table -- exactly what a retired in-place-split parent
+     * is), it failed at the same point on every subsequent tick too, so scale-to-zero stopped working
+     * for the whole tail of the candidate list, permanently, with no error surfaced anywhere.
+     */
+    private void suspendOneSafely(ScaleToZeroCandidateEntry entry, boolean reader) {
+        try {
+            suspend(entry.indexUuid(), entry.shardId(), reader);
+        } catch (Exception e) {
+            logger.warn(
+                "failed to suspend serverless-storage "
+                    + (reader ? "reader" : "writer")
+                    + " shard ["
+                    + entry.indexUuid()
+                    + "]["
+                    + entry.shardId()
+                    + "]; continuing with the remaining candidates in this evaluation",
+                e
+            );
         }
     }
 
@@ -187,7 +216,7 @@ public final class ShardSuspensionCoordinator {
     public void suspendReaderCandidates(List<ScaleToZeroCandidateEntry> candidates) {
         for (ScaleToZeroCandidateEntry entry : candidates) {
             if (entry.readerCandidate()) {
-                suspendReaderShard(entry.indexUuid(), entry.shardId());
+                suspendOneSafely(entry, true);
             }
         }
     }
@@ -436,7 +465,7 @@ public final class ShardSuspensionCoordinator {
             indexMetadata,
             task.shardId,
             task.reader,
-            System.currentTimeMillis(),
+            skewSafeNow(indexMetadata, task),
             cooldownMillis
         ) == false) {
             logger.debug(
@@ -454,6 +483,43 @@ public final class ShardSuspensionCoordinator {
             ? SuspendedShardsMetadata.withReaderShardSuspended(indexMetadata, task.shardId)
             : SuspendedShardsMetadata.withShardSuspended(indexMetadata, task.shardId);
         return ClusterState.builder(currentState).metadata(Metadata.builder(currentState.metadata()).put(updated, true)).build();
+    }
+
+    /**
+     * The "now" to evaluate the reactivation cooldown against, with a clock-skew guard.
+     *
+     * <p><b>Finding L-6.</b> The cooldown compares a timestamp stamped by {@code
+     * TransportReactivateShardsAction} (via {@code threadPool.absoluteTimeInMillis()}) against a
+     * timestamp read here (via {@code System.currentTimeMillis()}). Both are wall clock, but they can
+     * be written and read by <em>different</em> cluster-manager nodes across a failover. If the
+     * writing node's clock was an hour ahead, {@code now - lastReactivatedAt} is negative on the new
+     * manager for a full hour, {@code isSuspensionAllowed} answers false the whole time, and no shard
+     * of that index can be suspended at all -- a silent, self-healing-only-after-an-hour
+     * scale-to-zero outage with nothing anywhere saying why.
+     *
+     * <p>A stamp in the future is not a real measurement, so it is not treated as one. The cooldown
+     * is pure hysteresis -- it exists to stop a shard flapping between suspended and awake, not to
+     * protect any invariant -- so the fail-open direction (ignore a nonsensical stamp, suspend
+     * normally) risks at worst one extra suspend/reactivate cycle, while the fail-closed direction
+     * risks the whole feature silently not working. The WARN is what makes the skew visible, which
+     * is the part that was missing entirely.
+     */
+    private long skewSafeNow(IndexMetadata indexMetadata, SuspendShardTask task) {
+        long now = System.currentTimeMillis();
+        long lastReactivatedAt = SuspendedShardsMetadata.lastReactivatedAtMillis(indexMetadata, task.shardId, task.reader);
+        if (lastReactivatedAt <= now) {
+            return now;
+        }
+        logger.warn(
+            "serverless-storage {} shard [{}][{}] carries a reactivation timestamp {} ms in the future -- the cluster-manager "
+                + "clocks disagree. Ignoring the suspension cooldown for this shard rather than blocking scale-to-zero until the "
+                + "clocks converge; check NTP on the cluster-manager-eligible nodes.",
+            task.role(),
+            task.indexUuid,
+            task.shardId,
+            lastReactivatedAt - now
+        );
+        return lastReactivatedAt + cooldownMillis + 1;
     }
 
     /**
@@ -508,6 +574,21 @@ public final class ShardSuspensionCoordinator {
             return;
         }
         IndexShardRoutingTable shardRoutingTable = indexRoutingTable.shard(shardId);
+        if (shardRoutingTable == null) {
+            // Finding L-4. IndexRoutingTable#shard(int) is a plain map lookup and returns null for a
+            // shard id the routing table does not contain -- which is not hypothetical now that
+            // in-place split exists: MetadataInPlaceSplitShardCommitService retires a parent's
+            // routing entry at commit while IndexMetadata.numberOfShards deliberately stays put, so
+            // a retired parent is precisely a shard id that is in metadata and not in routing. The
+            // two guards above null-checked the *index* routing table and this line then
+            // dereferenced the *shard* one, so that shard id NPE'd here.
+            logger.debug(
+                "skipping eviction of suspended serverless-storage shard [{}][{}] -- no routing entry for this shard id",
+                indexUuid,
+                shardId
+            );
+            return;
+        }
         // Writer suspension must evict every writer-role copy, not just the primary: a
         // serverless-storage index can have index.number_of_replicas > 0 (ServerlessStorageIndexSettingProvider
         // only rejects an explicitly requested SEGMENT replication.type, not ordinary writer
@@ -522,6 +603,43 @@ public final class ShardSuspensionCoordinator {
             toEvict = new java.util.ArrayList<>();
             toEvict.add(shardRoutingTable.primaryShard());
             toEvict.addAll(shardRoutingTable.writerReplicas());
+        }
+
+        // Finding L-1, the half of it that is closable here. The eviction below is a
+        // CancelAllocationCommand with allowPrimary=true: an abrupt force-unassign, not the
+        // coordinated handoff an ordinary relocation performs, so an operation acknowledged on the
+        // primary but not yet published to the object store is only recoverable if reactivation
+        // happens to land on the same node (or WAL mirroring is on, and it is off by default).
+        //
+        // The dangerous sequence is: the suspend marker commits; a client bulk lands in that window
+        // on a shard that is still STARTED and is acked; ShardReactivationActionFilter, having seen
+        // the marker, fires an asynchronous reactivation; and this eviction then cancels the primary
+        // anyway. Re-reading the marker from the *latest* state immediately before issuing the
+        // cancel closes the tail of that sequence: if a reactivation has already cleared the marker,
+        // this shard is no longer a suspension candidate and must not be evicted, whatever the state
+        // that was captured when this eviction was scheduled said.
+        //
+        // This narrows the window; it does not eliminate it. A write acked between the marker
+        // committing and the reactivation it triggered actually landing is still unprotected. Fully
+        // closing that needs a real fence -- a write block installed in the same cluster-state update
+        // as the marker, released only once the engine reports its final publish landed -- which
+        // needs the coordinator-to-engine channel this class's javadoc records as out of scope. That
+        // is written up as deferred work, not silently left as "safe".
+        ClusterState latestState = clusterService.state();
+        IndexMetadata latestMetadata = latestState == null ? null : findByUuid(latestState.metadata(), indexUuid);
+        if (latestMetadata != null) {
+            boolean stillSuspended = reader
+                ? SuspendedShardsMetadata.isReaderSuspended(latestMetadata, shardId)
+                : SuspendedShardsMetadata.isSuspended(latestMetadata, shardId);
+            if (stillSuspended == false) {
+                logger.debug(
+                    "skipping eviction of serverless-storage {} shard [{}][{}] -- it was reactivated before the eviction ran",
+                    reader ? "reader" : "writer",
+                    indexUuid,
+                    shardId
+                );
+                return;
+            }
         }
 
         ClusterRerouteRequest reroute = new ClusterRerouteRequest();

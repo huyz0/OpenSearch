@@ -226,16 +226,103 @@ public final class ObjectStoreCommitPublisher {
         String bundleNameSuffix,
         boolean verifyIdempotentContent
     ) throws IOException {
+        return publishCommit(
+            directory,
+            segmentInfos,
+            indexUuid,
+            shardId,
+            primaryTerm,
+            generation,
+            maxSeqNo,
+            localCheckpoint,
+            walPosition,
+            mappingVersion,
+            pruningStats,
+            bundleNameSuffix,
+            verifyIdempotentContent,
+            null
+        );
+    }
+
+    /**
+     * Same as the {@code verifyIdempotentContent} overload, plus <b>delta bundling</b>: when {@code
+     * deltaBase} is non-{@code null}, only the files of {@code segmentInfos} that {@code deltaBase}
+     * does not already describe are read and packed into this publication's bundle; the rest keep
+     * their existing {@link FileReference}s, pointing into the bundles they already live in.
+     *
+     * <p><b>Why this matters.</b> Without it, every publication read {@code segmentInfos.files(true)}
+     * -- <em>all</em> files of the commit, not the new ones -- fully into heap, and {@code
+     * BundleWriter.write} then allocated a second array holding header + every file concatenated. So
+     * each publish was a full-shard rewrite: at a 1 s refresh interval a 10 GiB shard uploaded 10 GiB
+     * per second of publication, every retained generation stored another full copy, two full-shard
+     * byte arrays sat on the flush thread outside any circuit breaker, and -- worst -- {@code
+     * BundleWriter} throws {@code IllegalArgumentException("bundle too large")} at {@code
+     * Integer.MAX_VALUE}, so a shard crossing ~2 GiB of committed segments failed on <em>every</em>
+     * flush, permanently, with no recovery path. rfc-serverless-opensearch.md &sect;6.2 specifies "the
+     * new files of one or more commits"; this is what implements that, and it is also the premise
+     * {@code BundleReferenceCounter} already assumes (bundle liveness is a reference count over
+     * manifests, so a carried-forward reference is exactly what keeps an older bundle live).
+     *
+     * <p><b>When a delta base is sound.</b> A file reference may be carried forward only if the file
+     * name in this commit and the file name in {@code deltaBase} necessarily denote the same bytes.
+     * Within one continuously-running local {@code IndexWriter} that is guaranteed by Lucene's own
+     * file naming (the segment counter is monotone and persisted in {@code segments_N}; a name is
+     * never reused with different content). Across <em>different</em> Lucene indexes for the same
+     * shard -- a compactor's merged commit, a previous writer's index -- it is not: {@code _0.cfs}
+     * can be entirely different bytes. Callers must therefore only pass a manifest they themselves
+     * published from the very same live {@code IndexWriter} (see {@code
+     * ObjectStoreWriterEngine#lastPublishedManifest} and the head check in {@code
+     * ObjectStoreCommitHeadPublisher}). Local file length is verified as a cheap extra guard; any
+     * mismatch simply drops that file back into the delta rather than trusting the base.
+     *
+     * @param deltaBase a manifest published by this same caller from this same local index, whose
+     *                  file references may be carried forward; {@code null} (every caller other than
+     *                  the writer engine's own steady-state publish) packs the full commit exactly as
+     *                  before.
+     * @return the manifest describing the packaged commit
+     */
+    public CommitManifest publishCommit(
+        Directory directory,
+        SegmentInfos segmentInfos,
+        String indexUuid,
+        int shardId,
+        long primaryTerm,
+        long generation,
+        long maxSeqNo,
+        long localCheckpoint,
+        WalPosition walPosition,
+        long mappingVersion,
+        PruningStats pruningStats,
+        String bundleNameSuffix,
+        boolean verifyIdempotentContent,
+        CommitManifest deltaBase
+    ) throws IOException {
         Collection<String> fileNames = segmentInfos.files(true);
+        Map<String, FileReference> carriedForward = new LinkedHashMap<>();
         List<BundleFileContent> contents = new java.util.ArrayList<>(fileNames.size());
         for (String fileName : fileNames) {
-            contents.add(new BundleFileContent(fileName, readFile(directory, fileName)));
+            FileReference reusable = reusableReference(directory, deltaBase, fileName);
+            if (reusable != null) {
+                carriedForward.put(fileName, reusable);
+            } else {
+                contents.add(new BundleFileContent(fileName, readFile(directory, fileName)));
+            }
+        }
+
+        // The candidate's content, by name, independent of which bundle each file ends up in: a
+        // carried-forward file's (length, checksum) is already recorded in the base manifest, and a
+        // freshly-read file's is computed from the bytes just read. This is what the idempotency
+        // check compares, so delta bundling does not weaken it.
+        Map<String, long[]> candidateDigest = new LinkedHashMap<>();
+        carriedForward.forEach((name, reference) -> candidateDigest.put(name, new long[] { reference.length(), reference.checksum() }));
+        for (BundleFileContent file : contents) {
+            candidateDigest.put(file.name(), new long[] { file.content().length, checksum(file.content()) });
         }
 
         if (manifestStore.manifestExists(primaryTerm, generation)) {
             CommitManifest existing = manifestStore.readManifest(primaryTerm, generation);
             if (verifyIdempotentContent) {
-                requireSameContent(primaryTerm, generation, contents, existing);
+                requireSameContent(primaryTerm, generation, candidateDigest, existing);
             }
             return existing;
         }
@@ -249,11 +336,33 @@ public final class ObjectStoreCommitPublisher {
             + "-"
             + generation
             + bundleNameSuffix;
-        SegmentBundle bundle = bundleStore.writeBundle(bundleName, contents);
 
-        Map<String, FileReference> files = new LinkedHashMap<>();
-        bundle.entries()
-            .forEach((name, entry) -> files.put(name, new FileReference(bundleName, entry.offset(), entry.length(), entry.checksum())));
+        Map<String, FileReference> files = new LinkedHashMap<>(carriedForward);
+        if (contents.isEmpty() == false) {
+            SegmentBundle bundle;
+            try {
+                bundle = bundleStore.writeBundle(bundleName, contents);
+            } catch (IOException e) {
+                // A bundle name is derived from exactly the same (indexUuid, shardId, primaryTerm,
+                // generation) tuple the manifest name is, so a foreign actor occupying this
+                // generation collides here first, and reports it as a prose IOException from the
+                // format layer. Re-probe the manifest to tell that lost race apart from a genuine
+                // store failure, and give the race its own type so the head publisher's retry loop
+                // can act on it instead of the engine dying. The probe costs a request only on this
+                // rare error path.
+                if (manifestStore.manifestExists(primaryTerm, generation)) {
+                    throw new ManifestGenerationCollisionException(
+                        primaryTerm,
+                        generation,
+                        "bundle [" + bundleName + "] is already occupied by another actor's content",
+                        e
+                    );
+                }
+                throw e;
+            }
+            bundle.entries()
+                .forEach((name, entry) -> files.put(name, new FileReference(bundleName, entry.offset(), entry.length(), entry.checksum())));
+        }
 
         long totalDocCount = segmentInfos.totalMaxDoc();
         long deletedDocCount = 0;
@@ -277,8 +386,49 @@ public final class ObjectStoreCommitPublisher {
             totalDocCount,
             deletedDocCount
         );
-        manifestStore.writeManifest(manifest);
+        try {
+            manifestStore.writeManifest(manifest);
+        } catch (IOException e) {
+            // writeManifest uses writeBlobAtomic(..., failIfAlreadyExists=true), so a foreign actor
+            // that took this generation between the probe above and now surfaces here. Same
+            // treatment as the bundle case: distinguish a lost race from a real failure, and give
+            // the race its own type. (Also closes the probe's own time-of-check/time-of-use window,
+            // which the probe alone never could.)
+            if (manifestStore.manifestExists(primaryTerm, generation) == false) {
+                throw e;
+            }
+            CommitManifest existing = manifestStore.readManifest(primaryTerm, generation);
+            if (verifyIdempotentContent == false || sameContent(candidateDigest, existing)) {
+                return existing;
+            }
+            throw new ManifestGenerationCollisionException(primaryTerm, generation, "a manifest with different content already exists", e);
+        }
         return manifest;
+    }
+
+    /**
+     * The base manifest's {@link FileReference} for {@code fileName} if it is safe to carry forward
+     * unchanged, or {@code null} if this file must be read and bundled fresh. See the delta-bundling
+     * overload's javadoc for why a length check is the right cheap guard here and why the caller's
+     * choice of {@code deltaBase} is what actually carries the correctness argument.
+     */
+    private static FileReference reusableReference(Directory directory, CommitManifest deltaBase, String fileName) {
+        if (deltaBase == null) {
+            return null;
+        }
+        FileReference reference = deltaBase.files().get(fileName);
+        if (reference == null) {
+            return null;
+        }
+        try {
+            if (directory.fileLength(fileName) != reference.length()) {
+                return null;
+            }
+        } catch (IOException e) {
+            // Can't cheaply confirm it -- fall back to bundling the file, which is always correct.
+            return null;
+        }
+        return reference;
     }
 
     /**
@@ -292,9 +442,48 @@ public final class ObjectStoreCommitPublisher {
         return manifestStore.readManifest(primaryTerm, generation);
     }
 
+    /**
+     * Deletes a manifest this caller wrote and then failed to install as the shard's head, so it
+     * does not linger in the container as a manifest that is discoverable by name but never became
+     * anything (rfc-serverless-opensearch.md &sect;6.3 keeps "list manifest names, highest term then
+     * generation" as a bootstrap/fallback discovery path, and a plain listing has no way to tell a
+     * CAS loser apart from the winner).
+     *
+     * <p><b>Callers must have already proven the head does not point at this manifest.</b> This
+     * method deliberately does not check: the caller re-reads the live head as part of its own retry
+     * anyway, so making the check here would cost a second read. See {@code
+     * ObjectStoreCommitHeadPublisher}'s use, which only calls this after confirming the head moved
+     * somewhere else.
+     *
+     * @param manifest the manifest to remove.
+     */
+    void deleteUnreferencedManifest(CommitManifest manifest) throws IOException {
+        manifestStore.deleteManifests(List.of(manifest));
+    }
+
     private static byte[] readFile(Directory directory, String fileName) throws IOException {
         try (IndexInput input = directory.openInput(fileName, IOContext.READONCE)) {
-            byte[] bytes = new byte[(int) input.length()];
+            long length = input.length();
+            // (int) length was a silent truncation for any single file over 2 GiB: the array came
+            // out short, readBytes filled only that much, and the bundle then described a file with
+            // wrong content and a checksum computed over the truncated bytes -- corruption that
+            // would only be discovered when something tried to open the segment. A single Lucene
+            // file over 2 GiB is entirely reachable on a large shard after a big merge. Failing
+            // loudly here is not a fix for the underlying cap (that needs the streaming bundle
+            // writer described in the B1 plan), but it is the difference between a detectable
+            // failure and silent corruption.
+            if (length > Integer.MAX_VALUE) {
+                throw new IOException(
+                    "file ["
+                        + fileName
+                        + "] is "
+                        + length
+                        + " bytes, which exceeds the "
+                        + Integer.MAX_VALUE
+                        + "-byte limit the in-memory bundle format can represent; a streaming bundle writer is required for this shard"
+                );
+            }
+            byte[] bytes = new byte[(int) length];
             input.readBytes(bytes, 0, bytes.length);
             return bytes;
         }
@@ -321,36 +510,47 @@ public final class ObjectStoreCommitPublisher {
      * {@code readManifest} the caller already just did -- {@code candidate} was built from the local
      * {@link Directory} before this method is ever reached.
      *
+     * <p>Compares by {@code name -> (length, checksum)} rather than by bundle placement, so it is
+     * unaffected by delta bundling: a carried-forward file's length and checksum come from the base
+     * manifest, a freshly-read file's from the bytes just read, and either way what is compared is
+     * the logical content of the commit -- exactly the property that decides whether an existing
+     * manifest is this caller's own prior attempt.
+     *
      * @param primaryTerm the primary term being published under, used only for the error message.
      * @param generation the manifest generation being published at, used only for the error message.
-     * @param candidate this call's own file content, as about to be bundled.
+     * @param candidateDigest this call's own {@code name -> {length, checksum}} view of the commit.
      * @param existing the manifest already found at {@code (primaryTerm, generation)}.
-     * @throws IOException if {@code existing} does not describe the exact same set of files (by name,
-     *                      length, and checksum) as {@code candidate}.
+     * @throws ManifestGenerationCollisionException if {@code existing} does not describe the exact
+     *         same set of files (by name, length, and checksum) as this call's own content. Typed,
+     *         not a bare {@link IOException}, so {@code ObjectStoreCommitHeadPublisher}'s retry loop
+     *         can treat it as the lost race it is instead of letting it fail the engine -- see that
+     *         exception's own javadoc.
      */
-    private static void requireSameContent(long primaryTerm, long generation, List<BundleFileContent> candidate, CommitManifest existing)
+    private static void requireSameContent(long primaryTerm, long generation, Map<String, long[]> candidateDigest, CommitManifest existing)
         throws IOException {
-        Map<String, FileReference> existingFiles = existing.files();
-        boolean matches = candidate.size() == existingFiles.size();
-        if (matches) {
-            for (BundleFileContent file : candidate) {
-                FileReference reference = existingFiles.get(file.name());
-                if (reference == null || reference.length() != file.content().length || reference.checksum() != checksum(file.content())) {
-                    matches = false;
-                    break;
-                }
-            }
-        }
-        if (matches == false) {
-            throw new IOException(
-                "manifest already exists at (primaryTerm="
-                    + primaryTerm
-                    + ", generation="
-                    + generation
-                    + ") with different content -- refusing to treat it as this caller's own idempotent retry "
-                    + "(likely a foreign write, e.g. a lost clone/shrink/split attempt, occupying this generation)"
+        if (sameContent(candidateDigest, existing) == false) {
+            throw new ManifestGenerationCollisionException(
+                primaryTerm,
+                generation,
+                "refusing to treat an existing manifest with different content as this caller's own idempotent retry "
+                    + "(a concurrent writer/compaction publish, or a lost clone/shrink/split attempt, occupies this generation)"
             );
         }
+    }
+
+    /** Whether {@code existing} describes exactly the same files, by name, length and checksum, as {@code candidateDigest}. */
+    private static boolean sameContent(Map<String, long[]> candidateDigest, CommitManifest existing) {
+        Map<String, FileReference> existingFiles = existing.files();
+        if (candidateDigest.size() != existingFiles.size()) {
+            return false;
+        }
+        for (Map.Entry<String, long[]> entry : candidateDigest.entrySet()) {
+            FileReference reference = existingFiles.get(entry.getKey());
+            if (reference == null || reference.length() != entry.getValue()[0] || reference.checksum() != entry.getValue()[1]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Computes the CRC32C checksum of {@code data}, matching {@code BundleWriter}'s own per-file checksum. */

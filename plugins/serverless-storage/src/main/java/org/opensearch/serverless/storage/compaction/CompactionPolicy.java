@@ -39,6 +39,15 @@ public final class CompactionPolicy {
         if (maxTargetBundleSizeBytes <= 0) {
             throw new IllegalArgumentException("maxTargetBundleSizeBytes must be > 0, got " + maxTargetBundleSizeBytes);
         }
+        if (maxTargetBundleSizeBytes > MAX_TARGET_BUNDLE_SIZE_BYTES) {
+            throw new IllegalArgumentException(
+                "maxTargetBundleSizeBytes must be <= "
+                    + MAX_TARGET_BUNDLE_SIZE_BYTES
+                    + " (the whole-file read ceiling -- see MAX_TARGET_BUNDLE_SIZE_BYTES for why a larger value can permanently"
+                    + " wedge a shard), got "
+                    + maxTargetBundleSizeBytes
+            );
+        }
         if (minDeleteRatioToCompact < 0 || minDeleteRatioToCompact > 1) {
             throw new IllegalArgumentException("minDeleteRatioToCompact must be in [0,1], got " + minDeleteRatioToCompact);
         }
@@ -47,9 +56,33 @@ public final class CompactionPolicy {
         this.minDeleteRatioToCompact = minDeleteRatioToCompact;
     }
 
-    /** Reasonable defaults: compact once there are 10+ segments, none of which alone already exceeds 5GB, or once 20%+ of docs are deleted. */
+    /**
+     * The largest a target bundle may be configured to be.
+     *
+     * <p>Not a tuning preference -- a hard limit the read path imposes. Every whole-file read in
+     * this plugin returns a {@code byte[]}, and {@code BlobContainerBundleStore#readRange} refuses
+     * any range above {@code Integer.MAX_VALUE} outright. A target bundle size above that permits
+     * compaction to produce a single merged segment whose {@code .fdt}, {@code .tim} or {@code
+     * .doc} crosses 2&nbsp;GiB, and once one does, <em>no reader can ever materialize that shard
+     * again and no future compaction can read it either</em> -- compaction materializes before it
+     * merges, so both paths hit the same wall, and there is no recovery short of hand-editing the
+     * manifest. {@code ObjectStoreCommitMaterializer} now streams large files past that ceiling,
+     * which fixes the reader; refusing to configure a size that produces them is the belt to that
+     * braces, and it is checked in the constructor rather than discovered in production.
+     */
+    public static final long MAX_TARGET_BUNDLE_SIZE_BYTES = Integer.MAX_VALUE;
+
+    /**
+     * Reasonable defaults: compact once there are 10+ segments, none of which alone already exceeds
+     * 1&nbsp;GiB, or once 20%+ of docs are deleted.
+     *
+     * <p>The target bundle size was 5&nbsp;GiB, which is above the 2&nbsp;GiB whole-file read
+     * ceiling described on {@link #MAX_TARGET_BUNDLE_SIZE_BYTES} -- so the shipped default
+     * explicitly permitted compaction to wedge a shard permanently. 1&nbsp;GiB sits comfortably
+     * under it with room for the fact that a "target" segment size is an aim, not a guarantee.
+     */
     public static CompactionPolicy withDefaults() {
-        return new CompactionPolicy(10, 5L * 1024 * 1024 * 1024, 0.2);
+        return new CompactionPolicy(10, 1024L * 1024 * 1024, 0.2);
     }
 
     /**

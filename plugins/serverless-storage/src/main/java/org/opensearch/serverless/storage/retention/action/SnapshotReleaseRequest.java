@@ -75,6 +75,10 @@ public class SnapshotReleaseRequest extends ActionRequest {
         }
         if (snapshotId == null || snapshotId.isEmpty()) {
             validationException = addValidationError("snapshotId is required", validationException);
+        } else if (SnapshotPinRequest.isWellFormedSnapshotId(snapshotId) == false) {
+            // See SnapshotPinRequest#isWellFormedSnapshotId: this string becomes a pin id and a blob-name
+            // suffix, so an unrestricted alphabet is a path and a namespace the caller picks.
+            validationException = addValidationError(SnapshotPinRequest.SNAPSHOT_ID_CHARSET_ERROR, validationException);
         } else if (snapshotId.equals(PitrRetentionPolicy.PITR_PIN_ID)) {
             // removePin(String, int, String) removes EVERY pin under this pinId -- accepting
             // "pitr" here would wipe out every internal PITR-window pin on this shard, exposing

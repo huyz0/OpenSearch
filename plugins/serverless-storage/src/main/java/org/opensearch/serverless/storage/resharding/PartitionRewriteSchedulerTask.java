@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.resharding;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.serverless.storage.scheduling.RewriteAdmissionController;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
@@ -77,7 +78,14 @@ public final class PartitionRewriteSchedulerTask implements Closeable {
     ) {
         this.publisher = publisher;
         this.admissionController = admissionController;
-        this.task = threadPool.scheduleWithFixedDelay(this::rewriteSafely, interval, ThreadPool.Names.GENERIC);
+        // Jittered rather than started on the exact configured interval (finding L-10). Every node
+        // constructs this task at roughly the same moment after a cluster restart or a rolling
+        // upgrade, and scheduleWithFixedDelay never recomputes the delay, so an un-jittered start
+        // leaves every node's copy of this loop ticking in lockstep for the lifetime of the process
+        // -- a synchronised burst of cluster-manager work and object-store requests every interval,
+        // forever, which is exactly the recovery-stampede shape RFC section 13 asks the reconcilers
+        // to avoid. JitteredScheduling only ever extends the first interval, never shortens it.
+        this.task = threadPool.scheduleWithFixedDelay(this::rewriteSafely, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
     /** Package-private, not private, purely so this task's own catch behavior is directly testable without reflection. */

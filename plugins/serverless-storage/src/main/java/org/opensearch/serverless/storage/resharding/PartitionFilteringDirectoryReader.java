@@ -55,7 +55,9 @@ public final class PartitionFilteringDirectoryReader extends AbstractIdFiltering
     public PartitionFilteringDirectoryReader(DirectoryReader in, ShardPartitionDescriptor descriptor) throws IOException {
         // This pre-existing equal-partition mechanism keys off _id only (its own self-consistent
         // scheme); the routing argument is intentionally ignored here.
-        super(in, (id, routing) -> RoutingPartitionFilter.matches(id, descriptor));
+        // `descriptor` is a record, so it is a correct by-value membership-cache key (see
+        // AbstractIdFilteringDirectoryReader's cache javadoc).
+        super(in, descriptor, (id, routing) -> RoutingPartitionFilter.matches(id, descriptor));
         this.descriptor = descriptor;
     }
 

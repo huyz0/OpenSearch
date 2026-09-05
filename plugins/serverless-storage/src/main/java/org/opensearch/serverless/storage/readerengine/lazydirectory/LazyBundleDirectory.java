@@ -20,6 +20,7 @@ import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.FileReference;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Deque;
@@ -43,20 +44,76 @@ import java.util.concurrent.Executor;
  * not reimplemented, since it already solves exactly this "lazy block-cached remote file" problem
  * for a different caller (searchable snapshots' own {@code RemoteSnapshotDirectory}).
  *
- * <p>{@link #advanceToManifest} lets this directory's file map grow additively as newer manifest
- * generations are published, the same additive semantics {@code ObjectStoreCommitMaterializer}
- * already has for the eager, fully-materialized directory this class is an alternative to -- a
- * file already listed is never removed or replaced (immutable manifests/bundles mean an existing
- * {@link FileReference} entry is always still correct), only new entries are added, so an
- * in-flight {@code IndexInput} reading an older file is never disturbed by a concurrent advance.
+ * <p><b>{@link #advanceToManifest} rebinds, and this class used to claim it never did.</b> The
+ * previous javadoc here asserted "a file already listed is never removed or replaced (immutable
+ * manifests/bundles mean an existing {@link FileReference} entry is always still correct)". That
+ * is false, and the way it is false is the interesting part: manifests and bundles are indeed
+ * immutable, but a Lucene <em>file name</em> is not a stable identifier across them. A compaction
+ * publishes its merged commit with a fresh Lucene generation and fresh segment names, and Lucene
+ * recycles both -- so a later manifest can legitimately bind {@code segments_1}, or {@code _0.si},
+ * to completely different bytes in a completely different bundle. {@code putAll} replaced those
+ * entries all along; only the documentation disagreed.
+ *
+ * <p>What <em>is</em> true, and is what the old sentence was reaching for, is that a rebind never
+ * disturbs a read already in progress: {@link #openInput} resolves a name to a {@link
+ * FileReference} once and hands that immutable triple to the {@code IndexInput}, which never
+ * consults this map again. A concurrent advance therefore cannot move an in-flight reader's bytes.
+ * The thing that genuinely was unsafe -- the shared block cache underneath those inputs being
+ * keyed by file name alone, so a rebound name served the previous file's blocks -- is fixed in
+ * {@link LazyBundleIndexInput}, by making the cache key content-addressed. A rebind is logged here
+ * rather than silently applied, because on a shard with no compaction it should never happen and is
+ * worth seeing if it does.
+ *
+ * <p>The file map is pruned to the union of the current and immediately-previous manifests' files
+ * on every advance, rather than growing forever. A reader shard has no {@code IndexWriter} and so
+ * no {@code IndexFileDeleter}; without this, {@link #listAll} returned every file name the shard
+ * had ever published, which is both an unbounded leak and (on the eager path's equivalent) part of
+ * what made a superseded commit selectable at all. One generation of slack is kept deliberately, so
+ * a searcher acquired just before an advance can still resolve anything its own commit references.
  */
 public final class LazyBundleDirectory extends Directory {
 
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(LazyBundleDirectory.class);
+
     private final Map<String, FileReference> filesByName;
     private final FSDirectory cacheDirectory;
+    /**
+     * {@code cacheDirectory}'s path, captured at construction.
+     *
+     * <p>Not read from {@code cacheDirectory.getDirectory()} inside {@link #close()}: {@code
+     * FSDirectory} throws {@link org.apache.lucene.store.AlreadyClosedException} from that accessor
+     * once it has been closed, and this directory is legitimately closed more than once -- {@code
+     * Store} wraps and closes it, a test may close it as well, and Lucene's own {@code
+     * FSDirectory#close} is documented as idempotent precisely because callers do this. Asking a
+     * closed directory where it lives turned a second, harmless close into a thrown exception.
+     */
+    private final Path cachePath;
     private final TransferManager transferManager;
+    /**
+     * The node-shared block cache {@code transferManager} writes into, or {@code null} when this
+     * directory was built without one (tests, and any caller that owns cleanup itself). Held only
+     * so {@link #close()} can prune this shard's entries out of it -- see that method.
+     */
+    private final org.opensearch.index.store.remote.filecache.FileCache fileCache;
     private final Lock noOpLock = NoLockFactory.INSTANCE.obtainLock(null, null);
+    private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile CommitManifest currentManifest;
+    /** The manifest before {@link #currentManifest}, whose files are retained for one more generation -- see this class's javadoc. */
+    private volatile CommitManifest previousManifest;
+
+    /**
+     * Builds a directory whose file map starts from {@code manifest}'s files, with no handle on the
+     * node-shared block cache -- so {@link #close()} deletes this shard's on-disk block files but
+     * cannot prune the in-memory cache entries naming them. Only appropriate when the caller owns
+     * that cleanup itself.
+     *
+     * @param manifest the commit manifest whose files seed this directory's file map
+     * @param cacheDirectory local on-disk directory {@link TransferManager} writes fetched blocks into
+     * @param transferManager fetches and caches blocks on demand
+     */
+    public LazyBundleDirectory(CommitManifest manifest, FSDirectory cacheDirectory, TransferManager transferManager) {
+        this(manifest, cacheDirectory, transferManager, null);
+    }
 
     /**
      * Builds a directory whose file map starts from {@code manifest}'s files.
@@ -64,12 +121,22 @@ public final class LazyBundleDirectory extends Directory {
      * @param manifest the commit manifest whose files seed this directory's file map
      * @param cacheDirectory local on-disk directory {@link TransferManager} writes fetched blocks into
      * @param transferManager fetches and caches blocks on demand
+     * @param fileCache the node-shared block cache backing {@code transferManager}, so {@link
+     *                  #close()} can prune this shard's entries out of it; {@code null} to skip that.
      */
-    public LazyBundleDirectory(CommitManifest manifest, FSDirectory cacheDirectory, TransferManager transferManager) {
+    public LazyBundleDirectory(
+        CommitManifest manifest,
+        FSDirectory cacheDirectory,
+        TransferManager transferManager,
+        org.opensearch.index.store.remote.filecache.FileCache fileCache
+    ) {
         this.filesByName = new ConcurrentHashMap<>(manifest.files());
         this.cacheDirectory = cacheDirectory;
+        this.cachePath = cacheDirectory.getDirectory();
         this.transferManager = transferManager;
+        this.fileCache = fileCache;
         this.currentManifest = manifest;
+        this.previousManifest = manifest;
     }
 
     /**
@@ -99,8 +166,36 @@ public final class LazyBundleDirectory extends Directory {
      * @param manifest the newer manifest generation whose files should be merged into this directory
      */
     public void advanceToManifest(CommitManifest manifest) {
-        filesByName.putAll(manifest.files());
+        for (Map.Entry<String, FileReference> entry : manifest.files().entrySet()) {
+            FileReference previous = filesByName.put(entry.getKey(), entry.getValue());
+            if (previous != null && previous.equals(entry.getValue()) == false) {
+                // Not an error -- the new manifest is authoritative and this is exactly what a
+                // compaction's recycled segment names look like -- but it is the condition that
+                // used to serve the OLD file's cached blocks under the new name, so it is worth
+                // being visible in a log rather than being the silent thing this class's javadoc
+                // used to claim could not happen at all.
+                logger.info(
+                    "manifest generation {} rebinds file [{}] from {} to {}; block cache keys are content-addressed so"
+                        + " the new bytes are what will be read",
+                    manifest.generation(),
+                    entry.getKey(),
+                    previous,
+                    entry.getValue()
+                );
+            }
+        }
+        CommitManifest supersededTwiceOver = previousManifest;
+        previousManifest = currentManifest;
         currentManifest = manifest;
+        // Anything referenced only by a manifest that is now two generations old can go: no reader
+        // this directory serves can still be resolving it (see this class's own javadoc for why one
+        // generation of slack is kept and no more). Purely a memory/listAll bound -- the block cache
+        // underneath is bounded separately and content-addressed, so nothing here invalidates it.
+        if (supersededTwiceOver != currentManifest && supersededTwiceOver != previousManifest) {
+            Set<String> retained = new java.util.HashSet<>(currentManifest.files().keySet());
+            retained.addAll(previousManifest.files().keySet());
+            filesByName.keySet().retainAll(retained);
+        }
     }
 
     /**
@@ -198,6 +293,7 @@ public final class LazyBundleDirectory extends Directory {
             name,
             ref.offset(),
             ref.length(),
+            ref.checksum(),
             cacheDirectory,
             transferManager
         );
@@ -221,7 +317,42 @@ public final class LazyBundleDirectory extends Directory {
         // nothing else ever will. Lucene's own FSDirectory#close is idempotent, so a caller that
         // also happens to hold and close the same cacheDirectory instance separately (e.g. a test)
         // is safe.
-        cacheDirectory.close();
+        //
+        // Closing it is not enough, though, and that gap was a real correctness bug rather than a
+        // disk-space one: this directory used to close the FSDirectory and delete nothing, leaving
+        // every fetched block file sitting under <shardPath>/lazy_directory_cache. On the next open
+        // of this shard on this node -- a relocation back, a node restart -- the in-memory FileCache
+        // starts empty but those files are still on disk, and core's TransferManager serves any file
+        // already present at the request path without validating it. Every block read of the new
+        // incarnation therefore short-circuited on the previous incarnation's bytes. Keying blocks
+        // by content (see LazyBundleIndexInput) makes that survivable, but leaving a whole shard's
+        // worth of stale blocks behind on every close is still not something this class should do
+        // when it is the sole owner of the directory.
+        if (closed.compareAndSet(false, true) == false) {
+            // Idempotent, like the FSDirectory underneath it. A second close must not re-prune a
+            // cache it already pruned, and must not fail the caller for tidying up twice.
+            return;
+        }
+        try {
+            cacheDirectory.close();
+        } finally {
+            if (fileCache != null) {
+                // Drop the in-memory entries naming files about to be deleted, so the cache's own
+                // accounting does not keep charging this node for bytes that no longer exist.
+                try {
+                    fileCache.prune(path -> path.startsWith(cachePath));
+                } catch (RuntimeException pruneFailure) {
+                    logger.warn("failed to prune the node block cache for [" + cachePath + "] on close", pruneFailure);
+                }
+            }
+            try {
+                org.opensearch.common.util.io.IOUtils.rm(cachePath);
+            } catch (IOException | RuntimeException removalFailure) {
+                // Best-effort: a leftover cache directory now only wastes disk, since the block keys
+                // are content-addressed. Never worth failing a shard close over.
+                logger.warn("failed to remove the lazy-directory block cache at [" + cachePath + "]", removalFailure);
+            }
+        }
     }
 
     @Override

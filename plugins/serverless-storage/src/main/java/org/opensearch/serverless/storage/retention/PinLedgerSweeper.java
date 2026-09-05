@@ -74,6 +74,7 @@ public final class PinLedgerSweeper {
     public SweepResult sweepOnce(long nowMillis, long unconfirmedAbandonedAfterMillis) throws IOException {
         List<PinLedger> ledgers = ledgerStore.list();
         int cleared = 0;
+        int withinFanOutWindow = 0;
         List<String> abandonedPastTtl = new ArrayList<>();
         for (PinLedger ledger : ledgers) {
             boolean stillLive;
@@ -93,6 +94,24 @@ public final class PinLedgerSweeper {
                 continue;
             }
             if (stillLive == false) {
+                // A ledger is written BEFORE the first shard is pinned, deliberately -- it is a record of
+                // intent, so that a coordinator that dies mid-fan-out leaves something behind saying what it
+                // was doing. That makes "no shard holds this pin" ambiguous for as long as the fan-out could
+                // still be running: it means either "already released" or "not taken yet". Deleting on the
+                // second reading destroys the only enumeration of a pin that is about to exist on every
+                // shard of the index, and release then falls back to the index's current shard count, which
+                // is wrong after a reshard. So a ledger younger than the fan-out's own provisional TTL is
+                // left alone regardless of what the shards say; past that TTL the ambiguity is gone, because
+                // an unconfirmed pin would have lapsed by then anyway.
+                if (nowMillis - ledger.createdAtMillis() <= PinLedger.UNCONFIRMED_PIN_TTL_MILLIS) {
+                    // Counted rather than silently skipped: "the sweep did nothing" and "the sweep
+                    // deliberately declined to judge this one yet" are different answers, and a caller that
+                    // cannot tell them apart -- a test asserting a pass really deletes, an operator asking
+                    // why a ledger is still there -- is left guessing at a decision this class made on
+                    // purpose.
+                    withinFanOutWindow++;
+                    continue;
+                }
                 ledgerStore.delete(ledger.pinId());
                 cleared++;
                 continue;
@@ -101,7 +120,7 @@ public final class PinLedgerSweeper {
                 abandonedPastTtl.add(ledger.pinId());
             }
         }
-        return new SweepResult(ledgers.size(), cleared, List.copyOf(abandonedPastTtl));
+        return new SweepResult(ledgers.size(), cleared, withinFanOutWindow, List.copyOf(abandonedPastTtl));
     }
 
     private boolean anyShardStillHoldsPin(PinLedger ledger, long nowMillis) throws IOException {
@@ -120,9 +139,14 @@ public final class PinLedgerSweeper {
     /**
      * @param ledgersSeen how many ledger entries this pass read.
      * @param ledgersCleared how many were deleted because nothing they named was still live.
+     * @param ledgersWithinFanOutWindow how many named no live pin but were too young to judge -- a ledger is
+     *                                  written before the first shard is pinned, so until {@link
+     *                                  PinLedger#UNCONFIRMED_PIN_TTL_MILLIS} has passed, "no live pin" means
+     *                                  "not taken yet" as readily as "already released". These are neither
+     *                                  cleared nor abandoned; they are simply not yet answerable.
      * @param abandonedPastTtl pin ids still live but older than the pass's own TTL -- worth logging,
      *                         not worth acting on: this class releases nothing.
      */
-    public record SweepResult(int ledgersSeen, int ledgersCleared, List<String> abandonedPastTtl) {
+    public record SweepResult(int ledgersSeen, int ledgersCleared, int ledgersWithinFanOutWindow, List<String> abandonedPastTtl) {
     }
 }

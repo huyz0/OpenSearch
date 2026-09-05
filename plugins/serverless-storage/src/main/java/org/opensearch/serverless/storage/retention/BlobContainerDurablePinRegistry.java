@@ -120,6 +120,30 @@ public final class BlobContainerDurablePinRegistry implements DurablePinRegistry
         });
     }
 
+    @Override
+    public void applyPinDiff(String indexUuid, int shardId, java.util.Collection<PinRecord> toAdd, java.util.Collection<PinRecord> toRemove)
+        throws IOException {
+        if (toAdd.isEmpty() && toRemove.isEmpty()) {
+            return;
+        }
+        mutate(indexUuid, shardId, current -> {
+            Set<PinRecord> next = new HashSet<>(current);
+            boolean changed = false;
+            // Add-then-remove within one computed set, so a pin named by both collections ends up removed --
+            // the same result the one-call-at-a-time default produces. `changed` is tracked from each set
+            // operation's own answer rather than by comparing the two sets afterwards: PinRecord equality
+            // excludes expiry, so a set comparison is exactly the check mutate's own javadoc explains is
+            // unsafe here.
+            for (PinRecord pin : toAdd) {
+                changed |= next.add(pin);
+            }
+            for (PinRecord pin : toRemove) {
+                changed |= next.remove(pin);
+            }
+            return changed ? next : current;
+        });
+    }
+
     private void mutate(String indexUuid, int shardId, UnaryOperator<Set<PinRecord>> mutation) throws IOException {
         String registerName = registerName(indexUuid, shardId);
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {

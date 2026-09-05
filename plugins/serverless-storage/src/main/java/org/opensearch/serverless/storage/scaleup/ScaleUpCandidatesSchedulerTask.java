@@ -17,6 +17,7 @@ import org.opensearch.serverless.storage.scaleup.action.ScaleUpCandidateEntry;
 import org.opensearch.serverless.storage.scaleup.action.ScaleUpCandidatesAction;
 import org.opensearch.serverless.storage.scaleup.action.ScaleUpCandidatesRequest;
 import org.opensearch.serverless.storage.scaleup.action.ScaleUpCandidatesResponse;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -85,7 +86,14 @@ public final class ScaleUpCandidatesSchedulerTask implements Closeable {
         this.client = client;
         this.clusterService = clusterService;
         this.expansionCoordinator = expansionCoordinator;
-        this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, interval, ThreadPool.Names.GENERIC);
+        // Jittered rather than started on the exact configured interval (finding L-10). Every node
+        // constructs this task at roughly the same moment after a cluster restart or a rolling
+        // upgrade, and scheduleWithFixedDelay never recomputes the delay, so an un-jittered start
+        // leaves every node's copy of this loop ticking in lockstep for the lifetime of the process
+        // -- a synchronised burst of cluster-manager work and object-store requests every interval,
+        // forever, which is exactly the recovery-stampede shape RFC section 13 asks the reconcilers
+        // to avoid. JitteredScheduling only ever extends the first interval, never shortens it.
+        this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
     private void evaluateSafely() {
@@ -100,29 +108,67 @@ public final class ScaleUpCandidatesSchedulerTask implements Closeable {
         }
     }
 
+    /** Guards against two overlapping fan-outs mutating the shared streak map -- see {@link #evaluate()} (finding S-4). */
+    private final java.util.concurrent.atomic.AtomicBoolean evaluationInFlight = new java.util.concurrent.atomic.AtomicBoolean();
+
     void evaluate() {
         if (clusterService.state().nodes().isLocalNodeElectedClusterManager() == false) {
             return; // not our turn -- see class javadoc for why only the cluster-manager runs this
         }
-        client.execute(ScaleUpCandidatesAction.INSTANCE, new ScaleUpCandidatesRequest(), new ActionListener<>() {
-            @Override
-            public void onResponse(ScaleUpCandidatesResponse response) {
-                long candidateCount = response.candidates().stream().filter(ScaleUpCandidateEntry::candidate).count();
-                logger.debug(
-                    "scale-up evaluation: {} shard(s) observed, {} flagged as candidates",
-                    response.candidates().size(),
-                    candidateCount
-                );
-                if (expansionCoordinator != null) {
-                    expansionCoordinator.expandCandidates(response.candidates());
+        // Finding S-4. This dispatches asynchronously and returns, so scheduleWithFixedDelay starts
+        // the next tick without waiting for the fan-out. If a fan-out outlasts the interval, two
+        // responses land concurrently on GENERIC threads and both call expandCandidates, which is
+        // not thread-safe as a whole -- and worse, SustainedCandidateTracker#filterSustained ends by
+        // retaining only the keys it observed, so a concurrent invocation with a different candidate
+        // set wipes the other's in-progress streaks. That defeats hysteresis in exactly the
+        // overloaded conditions where hysteresis matters most. One in-flight evaluation at a time;
+        // a skipped tick is strictly better than a corrupted streak map.
+        if (evaluationInFlight.compareAndSet(false, true) == false) {
+            logger.debug("skipping scale-up evaluation: the previous fan-out has not completed yet");
+            return;
+        }
+        try {
+            client.execute(ScaleUpCandidatesAction.INSTANCE, new ScaleUpCandidatesRequest(), new ActionListener<>() {
+                @Override
+                public void onResponse(ScaleUpCandidatesResponse response) {
+                    try {
+                        long candidateCount = response.candidates().stream().filter(ScaleUpCandidateEntry::candidate).count();
+                        logger.debug(
+                            "scale-up evaluation: {} shard(s) observed, {} flagged as candidates",
+                            response.candidates().size(),
+                            candidateCount
+                        );
+                        if (response.hasNodeFailures()) {
+                            // Finding S-5: a partial view is not a basis for expanding. The node that
+                            // did not answer may be the one holding the busiest copy, and expansion is
+                            // a one-way action on this path (nothing here ever reduces replica count).
+                            logger.warn(
+                                "skipping scale-up expansion this tick: {} node(s) failed to report their query rates, so the "
+                                    + "merged view is partial",
+                                response.failures().size()
+                            );
+                            return;
+                        }
+                        if (expansionCoordinator != null) {
+                            expansionCoordinator.expandCandidates(response.candidates());
+                        }
+                    } finally {
+                        evaluationInFlight.set(false);
+                    }
                 }
-            }
 
-            @Override
-            public void onFailure(Exception e) {
-                logger.warn("scale-up candidate evaluation failed, will retry next tick", e);
-            }
-        });
+                @Override
+                public void onFailure(Exception e) {
+                    evaluationInFlight.set(false);
+                    logger.warn("scale-up candidate evaluation failed, will retry next tick", e);
+                }
+            });
+        } catch (RuntimeException e) {
+            // A synchronous throw from client.execute would otherwise leave the flag set forever,
+            // permanently wedging this loop -- the same shape as finding N-2's pinned in-flight flag.
+            evaluationInFlight.set(false);
+            throw e;
+        }
     }
 
     /** Invokes {@link #evaluate()} synchronously, rather than waiting out the scheduled interval -- test-only visibility. */

@@ -674,7 +674,8 @@ public class ChaosMultiOperationRegressionTests extends OpenSearchTestCase {
             manifestStore,
             new ObjectStoreCommitMaterializer(bundleStore),
             commitPublisher,
-            CompactionPolicy.withDefaults()
+            CompactionPolicy.withDefaults(),
+            createTempDir()
         );
         CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, MAX_ATTEMPTS_PER_ROUND);
 

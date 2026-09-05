@@ -1480,9 +1480,10 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     manifestStore,
                     new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                     publisher,
-                    new org.opensearch.serverless.storage.compaction.CompactionPolicy(2, 5L * 1024 * 1024 * 1024, 0.99),
+                    new org.opensearch.serverless.storage.compaction.CompactionPolicy(2, 1024L * 1024 * 1024, 0.99),
                     new org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor(shardStateStore, 5),
-                    null
+                    null,
+                    createTempDir()
                 );
 
             try (
@@ -1528,12 +1529,28 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         }
     }
 
-    public void testReaderEnginesOwnBackgroundSchedulerSweepsASupersededUnpinnedManifestAndItsBundle() throws Exception {
-        // Same "implemented and tested in isolation, never actually wired into a running node" gap
-        // as CompactionSchedulerTask above, found for GcSchedulerTask/BundleReferenceCounter/
-        // ManifestRetentionPolicy while wiring the compaction scheduler in: nothing ever deleted a
-        // superseded manifest or its now-unreferenced bundle. See GcSchedulerTaskTests for the
-        // retention-window/pin-safety unit coverage; this proves the real scheduled wiring.
+    /**
+     * A reader shard no longer owns a GC sweeper, and this test now says so.
+     *
+     * <p>It used to assert the opposite -- that a reader engine's own background scheduler swept a
+     * superseded manifest -- because the schedulers hung off every engine. They have since moved to
+     * node-level tasks hosted on the writer primary, and {@code ServerlessStoragePlugin} passes
+     * {@code null} for both when it builds a reader's engine factory, deliberately: a reader shard's
+     * blob container is scoped GET-only, so a sweeper attached to it could not delete anything
+     * anyway, and leaving one there would double every sweep on any index that has search replicas.
+     *
+     * <p>What replaces the old premise is the property that actually matters to a reader now that
+     * something <em>else</em> does the deleting: the generation a live reader is serving must not be
+     * reclaimed out from under it. rfc-serverless-opensearch.md &sect;7.2 promises exactly that
+     * ("open searchers pin their manifest generation ... so GC never yanks a bundle out from under
+     * an in-flight query") and no reader pinned anything -- the sweep was handed an empty lease-pin
+     * set and the only protection was a retention window justified by a reader's lag being "bounded
+     * by the 5&nbsp;s poll interval", which it is not (a brownout swallows every poll, a suspended
+     * shard is frozen by design, and a long-lived searcher holds a Lucene reader whose generation
+     * nothing pins). The reader now takes a durable pin at open and moves it forward on every
+     * advance, and this checks both halves against the real retention policy every sweep uses.
+     */
+    public void testAReaderPinsTheGenerationItServesAndReleasesItOnceItHasMovedPast() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
         ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
@@ -1600,8 +1617,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     PruningStats.empty()
                 );
             }
-            // No lease held, gen 2 is the published latest -- gen 1 is superseded and unpinned, so
-            // once past the (deliberately tiny, for this test) retention window it must be swept.
+            // The head names gen 2. Gen 1 is superseded, so whether it survives depends only on pins
+            // and the retention window -- which is exactly what this test varies.
             assertEquals(
                 org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
                 shardStateStore.compareAndSet(
@@ -1612,46 +1629,126 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                 )
             );
 
-            org.opensearch.serverless.storage.gc.GcSchedulerConfig gcConfig = new org.opensearch.serverless.storage.gc.GcSchedulerConfig(
-                org.opensearch.common.unit.TimeValue.timeValueMillis(20),
-                1L, // effectively no retention delay -- the point here is the wiring, not the window
-                manifestStore,
-                bundleStore,
-                pinRegistry
+            org.opensearch.serverless.storage.gc.ManifestId gen1Id = new org.opensearch.serverless.storage.gc.ManifestId(
+                PRIMARY_TERM,
+                gen1.generation()
+            );
+            org.opensearch.serverless.storage.gc.ManifestId gen2Id = new org.opensearch.serverless.storage.gc.ManifestId(
+                PRIMARY_TERM,
+                gen2.generation()
             );
 
-            try (
-                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
-                    engineConfig,
-                    gen2,
-                    materializer,
-                    PRIMARY_TERM,
-                    shardStateStore,
+            // Deliberately opened on gen 1, the OLD generation: a reader lagging behind the head is
+            // the whole case the pinning exists for, and the case a retention window cannot bound.
+            ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                engineConfig,
+                gen1,
+                materializer,
+                PRIMARY_TERM,
+                shardStateStore,
+                manifestStore,
+                shardDirectory,
+                LOCAL_NODE_ID,
+                null,
+                // No compaction and no GC config: a reader engine owns neither any more. The sweep
+                // decision below is evaluated exactly as the node-level task evaluates it.
+                null,
+                null,
+                null,
+                null,
+                new org.opensearch.serverless.storage.retention.PitrRetentionConfig(
                     manifestStore,
-                    shardDirectory,
-                    LOCAL_NODE_ID,
-                    null,
-                    null,
-                    gcConfig
+                    pinRegistry,
+                    org.opensearch.common.unit.TimeValue.timeValueDays(1).millis()
                 )
-            ) {
+            );
+            try {
+                assertTrue(
+                    "a reader must pin the generation it is serving, or a sweep has nothing to honour",
+                    pinRegistry.getPinnedManifestIds(indexUuid, shardId).contains(gen1Id)
+                );
+
+                // The real retention policy every sweep runs, evaluated with a cutoff far in the
+                // future so the window itself can protect nothing -- the pin is the only thing left.
+                long farFuture = System.currentTimeMillis() + org.opensearch.common.unit.TimeValue.timeValueDays(365).millis();
+                java.util.List<CommitManifest> deletableWhileRead = org.opensearch.serverless.storage.gc.ManifestRetentionPolicy
+                    .computeDeletableManifests(
+                        manifestStore.listManifests(),
+                        gen2Id,
+                        farFuture,
+                        farFuture,
+                        java.util.Set.of(),
+                        pinRegistry.getPinnedManifestIds(indexUuid, shardId)
+                    );
+                assertFalse(
+                    "the generation this reader is serving is pinned -- no sweep may ever judge it deletable",
+                    deletableWhileRead.stream().anyMatch(m -> m.generation() == gen1.generation())
+                );
+
+                // Now let the reader advance to gen 2. Its pin must move with it, and gen 1 -- which
+                // nothing is serving any more -- must become reclaimable.
+                readerEngine.pollNow();
+                assertEquals(
+                    "the reader must have advanced to the head's generation",
+                    gen2.generation(),
+                    readerEngine.currentManifestGenerationForTesting()
+                );
+                java.util.Set<org.opensearch.serverless.storage.gc.ManifestId> pinsAfterAdvance = pinRegistry.getPinnedManifestIds(
+                    indexUuid,
+                    shardId
+                );
+                assertTrue("the pin must move forward with the reader", pinsAfterAdvance.contains(gen2Id));
+                assertFalse("and must not still hold the generation it moved past", pinsAfterAdvance.contains(gen1Id));
+
+                // A real scheduled sweep, driven from outside the engine exactly as the node-level
+                // task drives it, must now reclaim gen 1 and its now-orphaned bundle.
                 String gen1Bundle = gen1.referencedBundles().iterator().next();
                 String gen2Bundle = gen2.referencedBundles().iterator().next();
-                assertBusy(() -> {
-                    java.util.List<CommitManifest> remaining = manifestStore.listManifests();
-                    assertFalse(
-                        "gen 1 is superseded and unpinned -- the background scheduler must have swept it on its own",
-                        remaining.stream().anyMatch(m -> m.generation() == gen1.generation())
+                org.opensearch.serverless.storage.gc.GcSchedulerConfig gcConfig =
+                    new org.opensearch.serverless.storage.gc.GcSchedulerConfig(
+                        org.opensearch.common.unit.TimeValue.timeValueMillis(20),
+                        1L, // effectively no retention delay -- the point here is the pin, not the window
+                        manifestStore,
+                        bundleStore,
+                        pinRegistry,
+                        // The sweep reads the head now: a manifest blob alone is no longer proof of
+                        // publication, so a sweep without the head cannot tell a live commit from a
+                        // dead writer's orphan.
+                        shardStateStore,
+                        new org.opensearch.serverless.storage.gc.BlobContainerGcSweepStateStore(blobContainer, indexUuid, shardId)
                     );
-                    assertTrue(
-                        "gen 2 is the current latest -- it must never be swept",
-                        remaining.stream().anyMatch(m -> m.generation() == gen2.generation())
-                    );
-                    java.util.Set<String> remainingBundles = bundleStore.listBundleNames();
-                    assertFalse("gen 1's now-orphaned bundle must have been deleted too", remainingBundles.contains(gen1Bundle));
-                    assertTrue("gen 2's bundle must survive", remainingBundles.contains(gen2Bundle));
-                });
+                try (
+                    org.opensearch.serverless.storage.gc.GcSchedulerTask nodeLevelSweeper =
+                        new org.opensearch.serverless.storage.gc.GcSchedulerTask(
+                            engineConfig.getThreadPool(),
+                            gcConfig.interval(),
+                            indexUuid,
+                            shardId,
+                            gcConfig
+                        )
+                ) {
+                    assertBusy(() -> {
+                        java.util.List<CommitManifest> remaining = manifestStore.listManifests();
+                        assertFalse(
+                            "gen 1 is superseded and no longer pinned -- an external sweep must reclaim it",
+                            remaining.stream().anyMatch(m -> m.generation() == gen1.generation())
+                        );
+                        assertTrue(
+                            "gen 2 is both the head and the reader's pinned generation -- it must never be swept",
+                            remaining.stream().anyMatch(m -> m.generation() == gen2.generation())
+                        );
+                        java.util.Set<String> remainingBundles = bundleStore.listBundleNames();
+                        assertFalse("gen 1's now-orphaned bundle must have been deleted too", remainingBundles.contains(gen1Bundle));
+                        assertTrue("gen 2's bundle must survive", remainingBundles.contains(gen2Bundle));
+                    });
+                }
+            } finally {
+                readerEngine.close();
             }
+            assertTrue(
+                "closing a reader must release its pin, or the generation it was on could never be reclaimed",
+                pinRegistry.getPinnedManifestIds(indexUuid, shardId).isEmpty()
+            );
         } finally {
             writer.close();
             writerDirectory.close();

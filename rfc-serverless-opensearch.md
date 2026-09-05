@@ -1766,6 +1766,34 @@ explicit, one-endpoint-at-a-time review this batch did.
 
 ## 12. Security and Encryption Boundaries
 
+> **Status correction, read this before the section.** Several things this section describes as
+> implemented are not, and the code's shape implies otherwise, which is worse than a plain omission.
+> The authoritative, operator-facing account is `plugins/serverless-storage/README.md`, "Security
+> boundaries and known gaps". In summary:
+>
+> - **There is one key per node, not one per index.** `serverless_storage.encryption_key` is a single
+>   node-level secret and `StaticEncryptionKeyProvider` is the only provider any configuration
+>   builds. `EncryptionKeyProvider#currentKey(String indexUuid)` and `PerIndexEncryptionKeyProvider`
+>   exist and are tested, and both the WAL and blob paths call the per-index overload correctly, so
+>   the code reads as though per-index key domains work. No production path reaches one. This
+>   section's "a compromised chunk yields nothing without per-index keys" is **false as shipped**.
+> - **Ciphertext integrity binding now exists, and did not before.** Each block's GCM tag covers
+>   associated data naming its index, shard, container, blob, block index and the header's declared
+>   sizes, so blocks cannot be swapped between blobs or indices, reordered, or truncated by a header
+>   rewrite. Blobs written by earlier builds (format version 1) carry no associated data, are still
+>   readable, and remain substitutable until migrated -- see the README for the migration and for
+>   `serverless_storage.encryption.require_authenticated_blocks`.
+> - **Registers are unauthenticated as well as unencrypted.** The second half was never stated. A
+>   caller with bucket write access can repoint a shard's head register at any manifest generation.
+> - **The node-shared WAL container is not credential-scoped at all**, so every writer shard on a
+>   node holds DELETE on every other index's WAL records -- contradicting this section's own tier
+>   model, which reserves deletion to GC.
+> - **None of this plugin's transport actions implement `IndicesRequest`** (40 at the time of
+>   writing, and the count keeps growing), so index-level
+>   authorization, DLS/FLS and per-index audit do not apply to any of them.
+> - **Key rotation is absent**, and that one *is* documented honestly, at
+>   `security/EncryptionKeyProvider.java`.
+
 Disaggregation moves the trust boundary: today a shard's bytes live on nodes an operator
 controls; here they live in a shared object store and flow through shared node-level services.
 Three problems must be designed in, not bolted on:
@@ -2117,9 +2145,18 @@ RFC claims them deliberately rather than leaving them implicit:
   against a real advancing shard.
 
   **`SnapshotRestoreAction` closes the read side** -- "point the shard-heads at the pinned
-  manifests," literally: it CASes the shard's head to the (primaryTerm, generation) a snapshot
-  pins, bypassing `ShardHead#withPublishedGeneration`'s forward-only validation directly (a
-  restore is deliberately a rollback, not a publication). Deliberately refuses to proceed while
+  manifests."
+
+  > **Correction: this paragraph described an earlier implementation and understated the one that
+  > exists.** Restore does **not** bypass `ShardHead#withPublishedGeneration`'s forward-only
+  > validation, and it is not a rollback of the head. `RestoreManifestSynthesis` synthesizes a new
+  > manifest whose content is the pinned generation's and publishes it *forward*, at a generation
+  > above the current head, so the head only ever moves in one direction and every invariant the
+  > fencing protocol relies on -- including the ones the TLA+ specs check -- continues to hold
+  > during a restore. A reader that was mid-poll sees an ordinary new generation rather than a head
+  > that went backwards underneath it. The "deliberately a rollback, not a publication" framing
+  > below is the thing that changed; the lease-safety reasoning that follows it is unaffected and
+  > still accurate. Deliberately refuses to proceed while
   the shard's writer/compactor lease is currently held -- a live writer would either immediately
   overwrite the restore on its next flush or leave the head in a confusing state between the two.
   This surfaced a real, easy-to-miss timing gotcha the IT itself caught: closing an index stops
@@ -2174,13 +2211,47 @@ RFC claims them deliberately rather than leaving them implicit:
   bundles they reference, and *all WAL chunks* (a recovery to time T replays WAL from the
   newest manifest ≤ T forward to T, so chunks must survive as long as any manifest that might
   serve as a replay base). Cost is object retention, not infrastructure.
+
+  > **Status: the manifest half is built, the WAL half is not.** What ships is **restore to the
+  > last publication ≤ T**, not recovery *to* T. PITR retention pins manifests inside the window
+  > and `WalGcSchedulerTask`'s deletion bound is unaffected by those pins, so the WAL chunks this
+  > bullet requires to survive are not retained, and nothing replays them on restore -- the restore
+  > path deliberately does the opposite, publishing a synthesized manifest forward rather than
+  > replaying operations onto one. Recovery is therefore **commit-granular**: the achievable
+  > recovery point is the last published commit at or before T, and the gap between that and T is
+  > whatever the publication interval is, not zero.
+  >
+  > This is a real reduction in the guarantee, not a wording quibble: "recovery to time T" and
+  > "recovery to the last commit before T" differ by exactly the operations a user most wants back.
+  > `retention/PitrRetentionConfig`'s javadoc states the same thing at the code, and names what
+  > closing it would take: `WalGcSchedulerTask`'s bound becoming
+  > `min(published-past, oldest PITR-pinned manifest's WAL position)`, plus a seqNo-bounded replay
+  > on restore. The blocker on true instant precision is that `WalRecord` carries no timestamp, so
+  > it is a format change rather than a wiring change.
 - **Cross-cluster / cross-account restore** = grant read on the prefix + import manifests.
   Export to a foreign format (or deep-copy for isolation) remains available via the existing
   snapshot API surface, which stays supported as the *interchange* path (§11 gating decides
   which variants are exposed in serverless mode).
+
+  > **Status: NOT BUILT.** There is no import-manifests path and no repository-shaped interchange
+  > format anywhere in the plugin. This bullet describes a feature, not a fix, and it should be read
+  > as design intent rather than as something a deployment can do today. Recorded at
+  > `retention/package-info.java`.
+
 - **PIT/scroll resumability** (small but real win): a PIT context is a pinned manifest, not
   node-local reader state — so a reader crash no longer invalidates long-running scrolls;
   another reader can resume the same pinned generation.
+
+  > **Status: NOT BUILT.** A PIT context is still node-local reader state; nothing pins a manifest
+  > when one is opened, so GC can and will delete the generation a long-running scroll is reading,
+  > and a reader crash still invalidates it. The *mechanism* exists and is sufficient -- what is
+  > missing is only the call site. `retention/package-info.java` records the exact shape:
+  > `addPin(new PinRecord("pit:" + contextId, term, generation, nodeId, keepAliveExpiry + margin))`
+  > on acquisition, renewed with the keep-alive, and `removePin(indexUuid, shardId, "pit:" + contextId)`
+  > from the context's close listener. It is deferred rather than half-done deliberately: a pin taken
+  > without a matching release on *every* close path is strictly worse than no pin, because it
+  > retains bytes forever with nothing left to release them. The `pit:` namespace is already
+  > unreachable from the REST surface, since the snapshot-id alphabet has no colon.
 
 ## 15. Core Changes vs Plugin Code
 
@@ -2205,7 +2276,10 @@ RFC claims them deliberately rather than leaving them implicit:
    new head via `headPublisher.publishCommitAsHead(...)` -- no deletion-policy indirection needed;
    this list item was stale, carried over from before that override was written.
 4. ✅ Search-only routing → engine selection: `IndexShard` passes its routing into engine-factory
-   resolution (done via `IndexService.createShard` on this branch). The second half of this item
+   resolution (done via `IndexService.createShard` on this branch). **Correction to the description:**
+   the seam as landed is a `BiFunction<IndexSettings, ShardRouting, IndexerFactory>`
+   (`IndexService.java:188, 884`), i.e. it runs through `IndexerFactory`, not `EngineFactory` as the
+   wording here implies. The second half of this item
    ("reader shards must skip `ReplicationTracker` paths that assume a local checkpointable engine")
    turned out not to need any change either -- `ObjectStoreReaderEngine extends ReadOnlyEngine`,
    and core's own `ReadOnlyEngine` semantics already keep it out of those paths; nothing in the
@@ -2224,14 +2298,24 @@ RFC claims them deliberately rather than leaving them implicit:
    generalize. This list item is retained for history; the need it anticipated is met a different
    way.
 6. ✅ REST handler capability annotation (§11) -- **both the annotation and its enforcement are
-   now done.** `RestHandler#serverlessScope()` (`server/src/main/java/org/opensearch/rest/RestHandler.java`),
-   a default method returning a new `RestHandler.ServerlessScope` enum (`AVAILABLE`/`INTERNAL_ONLY`/
-   `UNAVAILABLE`), defaults to `UNAVAILABLE` -- matching §11's own "unannotated handlers default to
+   now done.** **Corrected names:** the API is `RestHandler#apiAvailabilityScope()` returning
+   `RestHandler.ApiAvailabilityScope` (`server/src/main/java/org/opensearch/rest/RestHandler.java:169-180`).
+   This entry previously called them `serverlessScope()` / `RestHandler.ServerlessScope`, which is
+   what they were named when it was written; no such method or type exists in the tree, and the rest
+   of this entry (written before the rename) still uses the old names in its narrative. It is a
+   default method returning `AVAILABLE`/`INTERNAL_ONLY`/`UNAVAILABLE` and defaulting to
+   `UNAVAILABLE` -- matching §11's own "unannotated handlers default to
    unavailable" design exactly. `RestHandler.Wrapper` delegates it like every other method on that
-   class, so a wrapped handler (deprecation wrapper, etc.) doesn't silently fall back to the
-   default and misreport its delegate's real availability. Every one of this plugin's own 9 REST
-   handlers overrides it to `AVAILABLE`, verified by a plugin test that iterates `getRestHandlers()`
-   and fails if any handler reports anything else.
+   class (`:259-262`), as does `DeprecationRestHandler` (`DeprecationRestHandler.java:95-98`), so a
+   wrapped handler doesn't silently fall back to the
+   default and misreport its delegate's real availability. **Corrected count:** every one of this
+   plugin's REST handlers overrides it to `AVAILABLE`, verified by a plugin test that iterates
+   `getRestHandlers()` and fails if any handler reports anything else. That is **40** handlers, not
+   the 9 this entry claimed -- the plugin's surface grew by more than four times and the sentence did
+   not. The plugin registers 40 transport actions alongside them. (38 of each at the time this
+   correction was first written; the split-source unfence and in-place-split cancel actions landed
+   immediately after. The point of the correction is that this number moves and the prose has to be
+   re-derived from `getActions()`/`getRestHandlers()` rather than remembered.)
 
    **Superseded: enforcement has since moved out of core entirely.** Everything from here to the end
    of this entry describes where enforcement first landed, inside `RestController`. It has been
@@ -2322,14 +2406,101 @@ RFC claims them deliberately rather than leaving them implicit:
    (stored in the `sharedWalChunkService` field) and every writer shard's `EngineFactory` receives
    the same instance, giving the one-WAL-per-node sharing rfc-serverless-opensearch.md &sect;6.4
    describes without any new core-level registration seam.
-8. ✅ Remote-store-upload opt-out: `EngineFactory#ownsRemoteSegmentDurability()`, a default-`false`
-   method landed on this branch (`server/src/main/java/org/opensearch/index/engine/EngineFactory.java`)
-   letting an `EngineFactory` declare it already keeps every segment durably reachable remotely by
-   its own mechanism, checked as one more condition guarding `RemoteStoreRefreshListener`'s
-   registration in `IndexShard#createEngineConfig`. See §18 risk #10 for the concrete waste this
-   closes (confirmed via `IndicesStatsResponse` upload-byte counts, not inferred) and why a broader
-   heuristic (e.g. inferring "owns durability" from a non-default `index.store.type`) wouldn't have
-   worked here.
+8. ✅ Remote-store-upload opt-out. **This entry named the wrong class and the wrong call site, and
+   is corrected here.** The method is `ShardRecoveryStrategy#ownsRemoteSegmentDurability()`
+   (`server/src/main/java/org/opensearch/index/shard/ShardRecoveryStrategy.java:178`), not
+   `EngineFactory#ownsRemoteSegmentDurability()`; `EngineFactory.java` is **byte-identical to
+   upstream** and was never touched by this branch. The check guarding `RemoteStoreRefreshListener`'s
+   registration is at `IndexShard.java:4974`, not in `IndexShard#createEngineConfig`.
+
+   The same correction applies to §16 Phase 2's `EngineFactory#recoverMissingLocalStore`, which does
+   not exist: it is `ShardRecoveryStrategy#recoverLocalStore` (`ShardRecoveryStrategy.java:116`)
+   plus `localStoreIsStale` (`:148`), branched in `StoreRecovery.java:484, 837-924, 1025`.
+
+   Both errors have the same root: the seam these two features actually landed on is a new core
+   interface, `ShardRecoveryStrategy`, which this list does not mention at all -- see the omitted
+   seams below. Attributing its methods to `EngineFactory` made the core footprint look smaller than
+   it is, which is the specific way this section misleads.
+
+   See §18 risk #10 for the concrete waste this closes (confirmed via `IndicesStatsResponse`
+   upload-byte counts, not inferred) and why a broader heuristic (e.g. inferring "owns durability"
+   from a non-default `index.store.type`) wouldn't have worked here.
+
+**Core seams this list omitted entirely.** The eight items above were the seams the design
+anticipated. They are not the seams the implementation needed, and the difference is not a rounding
+error -- it is most of the core footprint. Every item below is a new core production interface,
+registry or setting that `plugins/serverless-storage` depends on and that the list above does not
+mention:
+
+- **`index/shard/ShardRecoveryStrategy.java`** + `LocalLuceneShardRecoveryStrategy.java` + the new
+  `index.recovery.strategy` setting (`IndexModule.INDEX_RECOVERY_STRATEGY_SETTING`, `Final`),
+  touched by 15 core files. This is the seam items 4 and 8 above actually landed on.
+- **The gated-metadata plane** -- roughly ten new interfaces plus static registries, and by far the
+  largest single dependency: `cluster/metadata/IndexCatalog.java` + `IndexCatalogRegistry` (13 core
+  files), `IndexCreationStrategy` + registry (12), `ClaimedIndexLifecycle` + registry (5),
+  `indices/cluster/IndexResidencyPolicy` + registry (5),
+  `cluster/metadata/AbsentIndexDescriptorSuppliers.java` (**20 core files**),
+  `cluster/routing/AbsentIndexRoutingSuppliers.java` (**17**), `IndexDescriptor`, `LazyIndexMetadata`,
+  `IndexMetadataHolder`, `DescriptorPrefetch`, `DescriptorRepresentable`,
+  `DescriptorUnavailableException`, `GatedIndexRelease`, `indices/cluster/GatedIndexResidency.java`
+  (550 new lines).
+- Four new `ClusterPlugin` SPI methods (`getIndexCatalog`, `getIndexCreationStrategy`,
+  `getClaimedIndexLifecycle`, `getIndexResidencyPolicy`); a new
+  `IndexStorePlugin.getShardRecoveryStrategies()` and a
+  `DirectoryFactory.newDirectory(IndexSettings, ShardPath, ShardRouting)` overload;
+  `Plugin.nodeStats()` + `plugins/PluginNodeStats.java`.
+- **`common/blobstore/BlobRegister.java`** / `BlobRegisterCasResult.java` and three new
+  `BlobContainer` methods, plus real implementations in FS/S3/GCS/Azure and matching
+  conditional-write support added to all three cloud test fixtures.
+- Engine-native snapshot/restore: `Engine#attemptEngineNativeSnapshot`,
+  `index/engine/EngineNativeSnapshotPointer.java`, `EngineNativeSnapshotReleasers.java`,
+  `ShardRecoveryStrategy.EngineNativeSnapshots`, `Repository#snapshotEngineNative` +
+  `getEngineNativeShardSnapshotMetadata`, `BlobStoreRepository` +186,
+  `index/snapshots/blobstore/EngineNativeShardSnapshot.java`.
+- **In-place shard split/merge in core**:
+  `action/admin/indices/split/InPlace{Split,Merge}ShardAction.java` and their transports,
+  `MetadataInPlace{Split,Merge}ShardCommitService`, `SplitShardsMetadata` (+596).
+- Remote-cluster-state manifest sharding: `gateway/remote/IndexMetadataManifestSharder.java`,
+  `ManifestShardFunction`, `RemoteManifestShard`, plus four new `cluster.remote_store.state.*`
+  settings.
+- `Engine#onPrimaryTermBumped` (`Engine.java:1272`, fired from `IndexShard.java:5238`),
+  `cluster/ClusterStateMutationThreads.java` (7 core files).
+
+**The measured core footprint.** §2 goal 5 says this work is "delivered predominantly as a plugin
+... core changes stay minimal". Measured against `b99229e3f36`, the newest pure-upstream commit on
+the preserved pre-restructure branch (`main` is not a usable baseline here: commit `b3eafdd0f0a`
+absorbed ~332 upstream commits during a restructure, so a `main...HEAD` diff overstates `server/`
+by roughly 19k lines):
+
+| Area | Files | +Ins | −Del |
+|---|---|---|---|
+| `server/src/main` (production) | **222** | **18,325** | **1,733** |
+| `server/src/test` + `internalClusterTest` | 165 | 18,249 | 1,338 |
+| `plugins/repository-{s3,gcs,azure,hdfs}` | 12 | 1,204 | 17 |
+| `test/fixtures/{s3,gcs,azure}-fixture` | 3 | 124 | 30 |
+| `libs/`, `modules/` | 0 | 0 | 0 |
+| `plugins/serverless-storage` | 812 | 128,703 | 0 |
+
+**63 new production files** under `server/`. Largest single core edits:
+`MetadataCreateIndexService` +1021/−29, `SplitShardsMetadata` +596/−30,
+`IndicesClusterStateService` +581/−26, `Metadata` +465/−33, `RemoteManifestManager` +462/−6,
+`IndexShard` +250/−9, `StoreRecovery` +227/−15.
+
+**How to read that honestly.** The claim "core changes stay minimal" is not defensible over that
+whole number, and it should not be defended over it. The two halves are different in kind:
+
+- The **storage plane** -- engine dispatch, `ShardRecoveryStrategy`, `BlobRegister`, engine-native
+  snapshots -- is roughly a third of the footprint and is a genuinely minimal, generally useful seam
+  set. Each of those seams is small, has a default that preserves existing behaviour exactly, and is
+  the kind of thing another storage plugin would also want.
+- The **gated-metadata plane** is not, and calling it minimal is what makes the claim false. It is a
+  second RFC's worth of core surface in its own right (see `rfc-serverless-metadata-plane.md` and
+  `core-pluggability-refactor-plan.md`), it changes how core resolves index metadata and routing for
+  every caller, and 20 core files depend on `AbsentIndexDescriptorSuppliers` alone.
+
+Bundling both under one "minimal" claim is the error. Upstreaming the storage plane and the metadata
+plane are separate conversations with separate answers, and this section should say so rather than
+present a list of eight items that omits the interface half of them landed on.
 
 **Plugin/module code (the bulk):** writer/reader engines, bundle+manifest format, WAL service
 (with per-record envelope encryption, §12), compaction service (§7.4), block cache unification,
@@ -2371,7 +2542,32 @@ across repeated runs. `plugins/serverless-storage/build.gradle` gained two new
 `:test:fixtures:s3-fixture`) to support this -- test-scoped only, no production-jar impact.
 
 **Phase 2 — Writer engine (WAL format, translog adapter, commit publishing, head CAS wiring,
-durability-driven local-disk retention, and crash recovery via WAL replay all done).** WAL chunk
+durability-driven local-disk retention, and crash recovery via WAL replay all done).**
+
+> **Status note, and a correction to how this phase read until now.** Every component below has
+> existed and been integration-tested for some time, but the entire WAL half was *off in the default
+> configuration*: `serverless_storage.wal_mirroring.enabled` defaulted to `false`, and with it off
+> `ObjectStoreWriterEngine#createTranslogManager` falls back to core's ordinary `LocalTranslog`. The
+> shipped default was therefore the *pre-WAL* configuration, in which an opted-in index loses every
+> write acknowledged since its last published manifest on node kill -- silently, on a shard that by
+> design has no writer replica. That is the exact failure §2 goal 1 exists to remove, and this phase
+> was marked done while it was the default.
+>
+> **`wal_mirroring.enabled` and `wal_flush.batching.enabled` now both default to `true`**, together,
+> so the default configuration is the one this phase describes. They are paired deliberately:
+> mirroring without batching is roughly one object-store PUT per document, which inverts §6.4's own
+> cost argument for a node-level WAL. `serverless_storage.wal_mirroring.required` remains available
+> for deployments that want a shard with no WAL service to refuse to open rather than degrade.
+>
+> **`serverless_storage.wal_gc.interval` flipped with them**, from `-1` to one minute: WAL chunks are
+> reclaimed by nothing else, so enabling mirroring without its collector would have traded a data-loss
+> default for an unbounded-storage one. Its cadence is a cost choice rather than a safety one --
+> deletability here is fixed by published state (a shard replays strictly forward from what its own
+> last published manifest covers), so cadence changes only how much already-dead garbage accumulates.
+>
+> Note also that this phase's own text names `EngineFactory#recoverMissingLocalStore`, which does not
+> exist -- see §15 item 8 for the correction.
+ WAL chunk
 format (`WalChunkWriter`/`WalChunkReader`/`WalRecord`, &sect;6.4) is implemented and tested,
 including a multi-shard group-commit/per-shard-replay-filter test. The WAL-backed translog adapter
 (`WalMirroringTranslogFactory`/`WalMirroringTranslog`) is **not** wired through
@@ -2703,7 +2899,25 @@ where it didn't already exist, and each of those additions is a generally useful
 shared test infrastructure other plugins' tests benefit from too, not a special-cased double built
 only for this RFC's purposes.
 
-**Phase 4 — Topology (4–6 weeks), fully done.** Role-separated allocation (see &sect;10 and
+**Phase 4 — Topology (4–6 weeks), PARTIAL.**
+
+> **Status correction, two parts.** First, every mechanism this phase describes is real and
+> integration-tested, and every one of them is **off by default** (`scale_to_zero.eval_interval` and
+> `scale_up.eval_interval` are `-1`, `scale_to_zero.suspend_enabled` and `scale_up.enabled` are
+> `false`). "Fully done" describes the code, not any running cluster. Second, **the cold-start
+> p50/p95/p99 measurement this milestone rests on no longer exists in the tree**:
+> `ColdStartReaderEngineBenchmarkTests`, `BlobLatencyBenchmarkTests` and
+> `LazyDirectoryBootSetPrefetchBenchmarkTests` were deleted in `bb865e83a3b` ("a clock is not an
+> assertion"). Only `benchmark/LatencyInjectingBlobContainer.java` and `LatencyProfile.java` remain.
+>
+> The deletion rationale is sound -- wall-clock assertions on shared CI hardware measure the
+> hardware -- and that commit states the rule it applied: *a test asserting on elapsed time is
+> deleted, a test asserting on a count is kept.* Applying that rule rather than the deletion is the
+> fix: a cold-start test asserting **blob request counts** (1 PUT + N GETs -- exactly the 1+7 and
+> 1+304 figures this document quotes elsewhere) is stable, meaningful, and catches the regression
+> the benchmark existed to catch. Until such a test exists, this milestone is unmeasured, and the
+> paragraphs below that describe the harness describe classes that are not present.
+ Role-separated allocation (see &sect;10 and
 `ServerlessStorageExistingShardsAllocator`/`ReaderShardPlacementAllocationDecider`), suspended
 writers and readers and scale-to-zero for both (signal collection through the actual
 suspend/reactivate mechanism -- see below), and balancer hysteresis (see below, `ShardSuspensionCoordinator`'s
@@ -3571,7 +3785,24 @@ orchestrated split should still ensure the source is not receiving direct writes
 window, even though the tail end of the gap (indefinite post-cutover drift) is now enforced rather
 than merely documented.
 
-**Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
+**Phase 4.5 — Compaction service, fully done (with one wiring defect since fixed).**
+
+> **Status correction.** Everything below was true of the compaction machinery and false of the
+> running system, for a reason this phase never states: both `CompactionSchedulerTask` and
+> `GcSchedulerTask` were constructed only by the **reader** engine. A reader shard requires
+> `index.number_of_search_replicas > 0`, which requires `remote_store.enabled`, so the common
+> serverless index -- one writer shard, no search replicas -- had neither scheduler anywhere in the
+> cluster. Setting `serverless_storage.compaction.interval` or `serverless_storage.gc.interval` on
+> such a cluster was accepted, parsed, and did nothing: quiescent shards never compacted and
+> object-store storage grew without bound.
+>
+> The stated reason for the reader-only home -- a writer always holds its own lease, so a
+> writer-hosted scheduler would never fire -- had already expired when the lease gate was removed
+> from `maybeCompact`. Both schedulers are now started per shard by `ServerlessStoragePlugin`
+> itself, on the node holding that shard's writer primary, and cancelled when the shard closes or
+> relocates. The defaults are unchanged (both intervals still `-1`); what changed is that setting
+> them now has an effect.
+ Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
 lease acquisition/renewal, and busy-writer offload are all implemented and tested. Its hard dependency,
 shard-head CAS (metadata-plane RFC Phase 2.5), is done and generically `BlobContainer`-backed
@@ -4636,7 +4867,29 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
    slow no matter what. Mitigation: boot-set prefetch, honest documentation, and autoscaling on
    cache hit rate; consider tiered "pinned working set" for latency-critical indices.
 
-   **Boot-set prefetch is now implemented and, unlike most items in this section, actually measured
+
+   > **REOPENED. The evidence cited below no longer exists in the repository.** The four benchmark
+   > classes this section and §16 Phase 4 present as measured evidence --
+   > `ColdStartReaderEngineBenchmarkTests`, `BlobLatencyBenchmarkTests`,
+   > `LazyDirectoryBootSetPrefetchBenchmarkTests`, `VectorWorkloadColdQueryBenchmarkTests` and
+   > `GlobalOrdinalsColdBuildBenchmarkTests` -- were deleted in commit `bb865e83a3b` ("a clock is
+   > not an assertion"). Only `benchmark/LatencyInjectingBlobContainer.java` and `LatencyProfile.java`
+   > remain. The numbers below were real when they were taken; nothing in the tree reproduces them
+   > now, and nothing would catch a regression against them.
+   >
+   > Leaving "Status: measured" next to a deleted class is the single most misleading pattern in
+   > this document, which is why these three risks are marked reopened rather than quietly footnoted.
+   > The fix is the rule `bb865e83a3b` itself states -- *assert on counts, not clocks* -- applied
+   > rather than the deletion: a count-based equivalent (blob GET/PUT counts for a cold open, with
+   > and without prefetch) is stable on shared hardware and catches the same regressions. Until one
+   > exists, treat the following as a record of a measurement taken once, not as a live guarantee.
+
+   > Risk 2 also carries a second caveat independent of the benchmarks: boot-set prefetch only runs
+   > on the lazy-directory read path, and that path is off by default (`lazy_directory.cache_size`
+   > is `0` and `index.serverless_storage.lazy_directory.enabled` is `false` and `Final`). The
+   > default reader materializes every referenced file in full.
+
+   **Boot-set prefetch is now implemented and, when this was written, actually measured
    against a real benchmark before being trusted** -- this repo's own "no speculative machinery
    without verification" discipline applied literally. `LazyBundleDirectory#prefetchBootSet`
    fetches just the first block of every currently-known file, concurrently, on the shared
@@ -4854,8 +5107,29 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
    graph-aware boot sets; sizing rules differ enough from text search that kNN gets its own
    measurement gate in Phase 3 rather than an assumption of "it's just another file."
 
-   **Status: measured for the first time, with a real (if scale-limited) counter-signal to the
-   "nearly the worst case" framing above.** `VectorWorkloadColdQueryBenchmarkTests` builds a real
+
+   > **REOPENED. The evidence cited below no longer exists in the repository.** The four benchmark
+   > classes this section and §16 Phase 4 present as measured evidence --
+   > `ColdStartReaderEngineBenchmarkTests`, `BlobLatencyBenchmarkTests`,
+   > `LazyDirectoryBootSetPrefetchBenchmarkTests`, `VectorWorkloadColdQueryBenchmarkTests` and
+   > `GlobalOrdinalsColdBuildBenchmarkTests` -- were deleted in commit `bb865e83a3b` ("a clock is
+   > not an assertion"). Only `benchmark/LatencyInjectingBlobContainer.java` and `LatencyProfile.java`
+   > remain. The numbers below were real when they were taken; nothing in the tree reproduces them
+   > now, and nothing would catch a regression against them.
+   >
+   > Leaving "Status: measured" next to a deleted class is the single most misleading pattern in
+   > this document, which is why these three risks are marked reopened rather than quietly footnoted.
+   > The fix is the rule `bb865e83a3b` itself states -- *assert on counts, not clocks* -- applied
+   > rather than the deletion: a count-based equivalent (blob GET/PUT counts for a cold open, with
+   > and without prefetch) is stable on shared hardware and catches the same regressions. Until one
+   > exists, treat the following as a record of a measurement taken once, not as a live guarantee.
+
+   > Risks 8 and 9 are pure measurement risks with no shipped mitigation of their own, so deleting
+   > the measurement returns them to fully open: there is no kNN or global-ordinals signal anywhere
+   > in the tree today.
+
+   **Status when written: measured for the first time, with a real (if scale-limited) counter-signal
+   to the "nearly the worst case" framing above.** `VectorWorkloadColdQueryBenchmarkTests` builds a real
    Lucene-backed k-NN index (128-dim vectors, a real ~3 MB `.vec` file confirmed to span multiple
    real 1 MiB blocks, not a toy single-block case) and compares cold k-NN query latency against
    cold term-query latency through the exact same `LazyBundleDirectory`/`FileCache` setup under
@@ -4875,9 +5149,26 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
    cliff. Mitigation candidates: ordinal structures included in boot sets, or eager ordinal
    builds pinned behind the admission controller (§7.2). Needs Phase 3 measurement.
 
-   **Status: measured for the first time, confirming the "latency cliff" premise with real
-   evidence -- and finding the existing boot-set prefetch mechanism already closes nearly all of
-   it, unplanned.** `GlobalOrdinalsColdBuildBenchmarkTests` builds a real 8-segment, high-cardinality
+
+   > **REOPENED. The evidence cited below no longer exists in the repository.** The four benchmark
+   > classes this section and §16 Phase 4 present as measured evidence --
+   > `ColdStartReaderEngineBenchmarkTests`, `BlobLatencyBenchmarkTests`,
+   > `LazyDirectoryBootSetPrefetchBenchmarkTests`, `VectorWorkloadColdQueryBenchmarkTests` and
+   > `GlobalOrdinalsColdBuildBenchmarkTests` -- were deleted in commit `bb865e83a3b` ("a clock is
+   > not an assertion"). Only `benchmark/LatencyInjectingBlobContainer.java` and `LatencyProfile.java`
+   > remain. The numbers below were real when they were taken; nothing in the tree reproduces them
+   > now, and nothing would catch a regression against them.
+   >
+   > Leaving "Status: measured" next to a deleted class is the single most misleading pattern in
+   > this document, which is why these three risks are marked reopened rather than quietly footnoted.
+   > The fix is the rule `bb865e83a3b` itself states -- *assert on counts, not clocks* -- applied
+   > rather than the deletion: a count-based equivalent (blob GET/PUT counts for a cold open, with
+   > and without prefetch) is stable on shared hardware and catches the same regressions. Until one
+   > exists, treat the following as a record of a measurement taken once, not as a live guarantee.
+
+   **Status when written: measured for the first time, confirming the "latency cliff" premise with
+   real evidence -- and finding the existing boot-set prefetch mechanism already closes nearly all
+   of it, unplanned.** `GlobalOrdinalsColdBuildBenchmarkTests` builds a real 8-segment, high-cardinality
    `SortedSetDocValues` field (the Lucene primitive `OrdinalMap`/`MultiDocValues#getSortedSetValues`
    construction OpenSearch's own terms/cardinality aggregation framework builds directly on top of),
    publishes it through the real manifest/bundle path, and measures cold cross-segment ordinal-map

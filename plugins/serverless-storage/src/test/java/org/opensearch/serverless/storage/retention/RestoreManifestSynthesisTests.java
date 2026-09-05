@@ -163,6 +163,33 @@ public class RestoreManifestSynthesisTests extends OpenSearchTestCase {
         assertEquals("a shard with no manifests starts at zero", 0, RestoreManifestSynthesis.nextGeneration(List.of()));
     }
 
+    /**
+     * "Newest" has to mean one thing in this codebase, and it did not.
+     *
+     * <p>This method ordered by generation first and term second, and its javadoc claimed that matched
+     * {@code PitrRestoreResolution}'s tie-break. It did not: that class, {@code CommitManifest#isNewerThan}
+     * and therefore all of garbage collection order by term first. The disagreement is reachable, because a
+     * fenced writer computes its generation from the live head but stamps its own older term -- so a stale
+     * orphan at (term 1, generation 6) can sit alongside a real head at (term 2, generation 5). Under the old
+     * ordering a restore adopted the abandoned writer's WAL position as the floor it refuses to replay
+     * beneath.
+     */
+    public void testNewestOrdersByTermFirstLikeEverythingElseThatOrdersManifests() {
+        CommitManifest staleTermHigherGeneration = manifest(1, 6, new WalPosition("epoch-0", 10), "seg_6");
+        CommitManifest realHead = manifest(2, 5, new WalPosition("epoch-1", 400), "seg_5");
+
+        assertEquals(
+            "a higher generation under a superseded term is still older -- that is what fencing means",
+            realHead,
+            RestoreManifestSynthesis.newest(List.of(staleTermHigherGeneration, realHead))
+        );
+        assertEquals(
+            "and the answer must not depend on listing order",
+            realHead,
+            RestoreManifestSynthesis.newest(List.of(realHead, staleTermHigherGeneration))
+        );
+    }
+
     private static CommitManifest manifest(long primaryTerm, long generation, WalPosition walPosition, String segmentsFileName) {
         return new CommitManifest(
             INDEX_UUID,

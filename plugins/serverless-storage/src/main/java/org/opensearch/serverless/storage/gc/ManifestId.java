@@ -54,6 +54,28 @@ public final class ManifestId {
         return generation;
     }
 
+    /**
+     * Whether {@code this} is strictly newer than {@code other} under the total order (primaryTerm,
+     * generation) &mdash; the <em>same</em> order {@link CommitManifest#isNewerThan} uses, deliberately, so
+     * that "newer" means one thing everywhere GC reasons about it.
+     *
+     * <p>Term dominates generation: a fenced writer computes its generation from the live head but stamps
+     * its own (older) term, so a higher generation under a stale term is still older overall
+     * (rfc-serverless-opensearch.md &sect;6.3 fencing). Duplicating the comparison here rather than
+     * converting to a {@link CommitManifest} matters because the shard head is a {@code (term, generation)}
+     * pair with no manifest body behind it -- reading one just to compare would defeat the point of
+     * anchoring GC to the head in the first place.
+     *
+     * @param other the identity to compare against.
+     * @return {@code true} if {@code this} is strictly newer than {@code other}.
+     */
+    public boolean isNewerThan(ManifestId other) {
+        if (this.primaryTerm != other.primaryTerm) {
+            return this.primaryTerm > other.primaryTerm;
+        }
+        return this.generation > other.generation;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;

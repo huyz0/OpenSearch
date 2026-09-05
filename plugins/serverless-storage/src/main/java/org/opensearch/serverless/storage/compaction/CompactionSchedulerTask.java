@@ -34,7 +34,7 @@ import java.util.Optional;
  * all existed and were correct, but nothing decided *when* to invoke them, for either the
  * "quiescent shard with no active writer" case this service originally targeted, or (since the
  * publish protocol both a writer and this task use was proven safe under real concurrent,
- * continuous contention -- see {@link #maybeCompact(String, int, ShardStateStore, BlobContainerManifestStore,
+ * continuous contention -- see {@code maybeCompact(String, int, ShardStateStore, BlobContainerManifestStore,
  * ObjectStoreCommitMaterializer, ObjectStoreCommitPublisher, CompactionPolicy, CompactionRebaseExecutor)}'s own
  * javadoc) the "busy writer accepts an
  * offload handoff" case &sect;16 Phase 4.5 separately called out.
@@ -86,6 +86,7 @@ public final class CompactionSchedulerTask implements Closeable {
     private final ObjectStoreCommitMaterializer materializer;
     private final ObjectStoreCommitPublisher commitPublisher;
     private final RewriteAdmissionController admissionController;
+    private final java.nio.file.Path mergeWorkRoot;
     private final Scheduler.Cancellable task;
 
     /**
@@ -113,7 +114,8 @@ public final class CompactionSchedulerTask implements Closeable {
         ObjectStoreCommitMaterializer materializer,
         ObjectStoreCommitPublisher commitPublisher,
         CompactionPolicy policy,
-        CompactionRebaseExecutor rebaseExecutor
+        CompactionRebaseExecutor rebaseExecutor,
+        java.nio.file.Path mergeWorkRoot
     ) {
         this(
             threadPool,
@@ -126,7 +128,8 @@ public final class CompactionSchedulerTask implements Closeable {
             commitPublisher,
             policy,
             rebaseExecutor,
-            null
+            null,
+            mergeWorkRoot
         );
     }
 
@@ -156,7 +159,8 @@ public final class CompactionSchedulerTask implements Closeable {
         ObjectStoreCommitPublisher commitPublisher,
         CompactionPolicy policy,
         CompactionRebaseExecutor rebaseExecutor,
-        RewriteAdmissionController admissionController
+        RewriteAdmissionController admissionController,
+        java.nio.file.Path mergeWorkRoot
     ) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;
@@ -167,6 +171,7 @@ public final class CompactionSchedulerTask implements Closeable {
         this.policy = policy;
         this.rebaseExecutor = rebaseExecutor;
         this.admissionController = admissionController;
+        this.mergeWorkRoot = mergeWorkRoot;
         // Jittered once per instance (rfc-serverless-opensearch.md §13's own "recovery stampede"
         // requirement) -- see JitteredScheduling's own javadoc for why a one-time offset is what
         // actually prevents lockstep ticking after a coordinated outage recovery.
@@ -185,7 +190,17 @@ public final class CompactionSchedulerTask implements Closeable {
             return;
         }
         try {
-            maybeCompact(indexUuid, shardId, shardStateStore, manifestStore, materializer, commitPublisher, policy, rebaseExecutor);
+            maybeCompact(
+                indexUuid,
+                shardId,
+                shardStateStore,
+                manifestStore,
+                materializer,
+                commitPublisher,
+                policy,
+                rebaseExecutor,
+                mergeWorkRoot
+            );
         } catch (Exception e) {
             // See class javadoc: swallow and let the next scheduled tick reevaluate. Catches every
             // Exception, not just IOException, so an unchecked exception (e.g. SecurityException
@@ -226,7 +241,60 @@ public final class CompactionSchedulerTask implements Closeable {
         ObjectStoreCommitMaterializer materializer,
         ObjectStoreCommitPublisher commitPublisher,
         CompactionPolicy policy,
-        CompactionRebaseExecutor rebaseExecutor
+        CompactionRebaseExecutor rebaseExecutor,
+        java.nio.file.Path mergeWorkRoot
+    ) throws IOException {
+        // At most one compaction of any given shard runs on this node at a time.
+        //
+        // A compaction task is scheduled inside EVERY engine that touches the shard -- the writer
+        // engine and every reader engine -- and each tick materializes the whole shard and merges
+        // it. Redundancy was argued to be safe, and for correctness it is (the rebase protocol
+        // tolerates concurrent compactors), but the waste is not small: one candidate tick with a
+        // writer and reader copies co-located on a node meant that many independent full-shard
+        // downloads, full merges, and full-shard bundle uploads, all but one of which lose the CAS
+        // and leave an orphaned bundle behind -- reclaimed only if GC is enabled, which by default
+        // it is not. This guard removes the whole of the same-node multiplier for the cost of one
+        // map entry. It does NOT remove the cross-node multiplier; see this class's own javadoc note
+        // and the deferred item recorded with it.
+        String shardKey = indexUuid + "/" + shardId;
+        if (COMPACTIONS_IN_FLIGHT.add(shardKey) == false) {
+            logger.debug(
+                "compaction tick skipped for shard [{}][{}]: another compaction of it is already running on this node",
+                indexUuid,
+                shardId
+            );
+            return false;
+        }
+        try {
+            return maybeCompactExclusively(
+                indexUuid,
+                shardId,
+                shardStateStore,
+                manifestStore,
+                materializer,
+                commitPublisher,
+                policy,
+                rebaseExecutor,
+                mergeWorkRoot
+            );
+        } finally {
+            COMPACTIONS_IN_FLIGHT.remove(shardKey);
+        }
+    }
+
+    /** Shards currently being compacted by some caller on this node -- see {@link #maybeCompact}. */
+    private static final java.util.Set<String> COMPACTIONS_IN_FLIGHT = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static boolean maybeCompactExclusively(
+        String indexUuid,
+        int shardId,
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ObjectStoreCommitMaterializer materializer,
+        ObjectStoreCommitPublisher commitPublisher,
+        CompactionPolicy policy,
+        CompactionRebaseExecutor rebaseExecutor,
+        java.nio.file.Path mergeWorkRoot
     ) throws IOException {
         Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
         if (current.isEmpty()) {
@@ -265,15 +333,22 @@ public final class CompactionSchedulerTask implements Closeable {
             return false;
         }
 
-        LuceneMergeCompactionPublisher publisher = new LuceneMergeCompactionPublisher(
-            indexUuid,
-            shardId,
-            manifestStore,
-            materializer,
-            commitPublisher,
-            policy
-        );
-        rebaseExecutor.publish(indexUuid, shardId, publisher);
+        // try-with-resources: the publisher now merges into a real temporary filesystem directory
+        // rather than into heap (see its own javadoc for why), and that directory holds a whole
+        // shard's worth of segment files until it is closed.
+        try (
+            LuceneMergeCompactionPublisher publisher = new LuceneMergeCompactionPublisher(
+                indexUuid,
+                shardId,
+                manifestStore,
+                materializer,
+                commitPublisher,
+                policy,
+                mergeWorkRoot
+            )
+        ) {
+            rebaseExecutor.publish(indexUuid, shardId, publisher);
+        }
         return true;
     }
 

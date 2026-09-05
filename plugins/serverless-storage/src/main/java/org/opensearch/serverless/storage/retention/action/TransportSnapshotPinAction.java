@@ -133,6 +133,26 @@ public class TransportSnapshotPinAction extends HandledTransportAction<SnapshotP
     }
 
     /**
+     * Whether a head names a manifest that was actually written.
+     *
+     * <p>Generation 0 counts as "never published", not just an absent head, and the difference is not
+     * academic: {@code ObjectStoreCommitHeadPublisher#acquireOrRenewLease} can put-if-absent a lease-only
+     * head before the shard has ever committed anything, deliberately leaving term and generation untouched
+     * so the head stays a valid pointer. Pinning such a shard produced a {@code PinRecord} naming manifest
+     * (term, 0) -- a file that was never written. The request reported success and the failure surfaced at
+     * restore time as a {@code NoSuchFileException}, which is the worst possible moment to learn that a
+     * snapshot was never real.
+     *
+     * <p>Visible for testing: a pure predicate over a head, exercisable without a blob store.
+     *
+     * @param head the shard's current head, if any.
+     * @return {@code true} only if the shard has published at least one manifest.
+     */
+    static boolean hasPublishedManifest(Optional<VersionedShardHead> head) {
+        return head.isPresent() && head.get().head().latestManifestGeneration() > 0;
+    }
+
+    /**
      * @param task the task tracking this request, unused.
      * @param request names the shard and snapshot to pin.
      * @param listener notified with the result once the attempt (dispatched off-thread) completes.
@@ -155,7 +175,7 @@ public class TransportSnapshotPinAction extends HandledTransportAction<SnapshotP
                 BlobContainerDurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(container);
 
                 Optional<VersionedShardHead> head = shardStateStore.get(request.indexUuid(), request.shardId());
-                if (head.isEmpty()) {
+                if (hasPublishedManifest(head) == false) {
                     listener.onFailure(
                         new IllegalStateException(
                             "shard [" + request.indexUuid() + "/" + request.shardId() + "] has never published a manifest to snapshot"

@@ -22,6 +22,7 @@ import org.opensearch.serverless.storage.wal.WalRecord;
 
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ExecutionException;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
@@ -77,14 +78,39 @@ public class WalMirroringTranslog extends LocalTranslog {
     private final WalBatchingProcessor batchingProcessor;
 
     /**
-     * The batching path's per-op completion handle: {@link #add} stores the future for the record it
-     * just enqueued here, and {@link #ensureSynced} waits on it. Waiting on the <em>most recent</em>
-     * enqueued future is sufficient -- the shared processor drains the whole queue in FIFO order one
-     * batch at a time, so when this shard's latest record's batch completes, every earlier record it
-     * enqueued has necessarily been written too. {@code null} until the first {@link #add} on the
-     * batching path. Unused on the legacy path.
+     * The batching path's per-<em>location</em> completion handles: {@link #add} records, against
+     * the exact {@link Location} it is about to return, the future that completes when that record's
+     * group-commit upload lands; {@link #ensureSynced} waits on the entry covering the location it
+     * was actually asked about.
+     *
+     * <p><b>This replaces a single {@code latestPendingWalFuture} field, which was a real
+     * acknowledged-write-loss bug rather than a tidiness issue.</b> {@code Translog#add} is called
+     * concurrently by many indexing threads on one primary (it holds only a read lock), and the old
+     * code assigned that field <em>after</em> the enqueue, so two concurrent appends could interleave
+     * as: A enqueues (batch B1), B enqueues (batch B2, drains strictly after B1), B assigns F2, A
+     * assigns F1. The field then held the <em>older</em> future, and {@code ensureSynced} -- which
+     * ignored its {@code location} argument entirely -- returned as soon as B1 landed. Operation 2
+     * was acked to the client with its chunk not yet written; losing the node lost it, with no
+     * manifest and no WAL chunk ever covering it. Making the field's update monotone would have
+     * closed that particular interleaving but still leaves {@code ensureSynced} answering a question
+     * it was not asked ("is the newest record durable?" instead of "is <em>this</em> record
+     * durable?"), which is both stricter than needed under {@code ASYNC} and wrong for any caller
+     * syncing an older location.
+     *
+     * <p>A {@link java.util.concurrent.ConcurrentSkipListMap} keyed by {@link Location} (which is
+     * {@link Comparable}, ordered by translog generation then offset, i.e. exactly append order) is
+     * what makes the per-location lookup possible without a lock: {@link #ensureSynced} takes
+     * {@code floorEntry(location)} -- the newest record enqueued at or before the location it must
+     * make durable. If that location's own entry is still present, that is precisely its future. If
+     * it has already been removed, then it has already completed, and because the shared processor
+     * drains one batch at a time in FIFO order, every earlier entry has completed too -- so the
+     * older entry {@code floorEntry} returns instead is already done and waiting on it is a no-op.
+     * Entries are removed by the completion callback itself, so the map never holds more than the
+     * records currently in flight.
+     *
+     * <p>Empty until the first {@link #add} on the batching path; unused entirely on the legacy path.
      */
-    private volatile CompletableFuture<Void> latestPendingWalFuture;
+    private final ConcurrentSkipListMap<Location, CompletableFuture<Void>> pendingWalFuturesByLocation = new ConcurrentSkipListMap<>();
 
     /** The chunk sequence, under this WAL service's shared epoch, most recently confirmed durably written on the legacy path -- see {@link #lastFlushedWalChunkSequence()}. */
     private volatile long lastFlushedWalChunkSequence = -1;
@@ -158,14 +184,34 @@ public class WalMirroringTranslog extends LocalTranslog {
             // Durability is deferred to ensureSynced(); under index.translog.durability=REQUEST the
             // request thread calls that before acking, under ASYNC a background sync task does.
             CompletableFuture<Void> future = new CompletableFuture<>();
-            batchingProcessor.put(record, exception -> {
-                if (exception != null) {
-                    future.completeExceptionally(exception);
-                } else {
-                    future.complete(null);
-                }
-            });
-            latestPendingWalFuture = future;
+            // Registered BEFORE the enqueue, not after: the listener below can fire on the drain
+            // thread the instant put() returns (or even inside put(), if the bounded queue rejects
+            // or the calling thread is interrupted), and it removes this entry. Publishing the entry
+            // first means the removal can never race ahead of the insertion and leave a completed
+            // record's future stranded in the map forever. Inserting an already-registered,
+            // not-yet-enqueued future is safe in the other direction too: the only reader is
+            // ensureSynced, which is only ever called for a location this method has already
+            // returned, i.e. strictly after the put() below has happened.
+            pendingWalFuturesByLocation.put(location, future);
+            try {
+                batchingProcessor.put(record, exception -> {
+                    // Remove before completing, so a waiter released by the completion can never
+                    // observe a stale entry, and a failed batch leaks nothing.
+                    pendingWalFuturesByLocation.remove(location, future);
+                    if (exception != null) {
+                        future.completeExceptionally(exception);
+                    } else {
+                        future.complete(null);
+                    }
+                });
+            } catch (RuntimeException e) {
+                // put() itself failing (rather than notifying the listener) means this record will
+                // never be drained and its listener will never fire -- drop the entry we just
+                // published, or every later ensureSynced whose floorEntry lands on it would block
+                // forever on a future nothing will ever complete.
+                pendingWalFuturesByLocation.remove(location, future);
+                throw e;
+            }
             return location;
         }
         // Legacy path: flushing per-operation gives the same per-write durability guarantee a local
@@ -190,9 +236,11 @@ public class WalMirroringTranslog extends LocalTranslog {
     }
 
     /**
-     * On the batching path, blocks until this shard's most recently enqueued WAL record has been
-     * group-committed to the object store, after first ensuring the local translog is fsynced up to
-     * {@code location} exactly as {@link LocalTranslog} does. This is the method
+     * On the batching path, blocks until <em>the WAL record enqueued for {@code location}</em> has
+     * been group-committed to the object store, after first ensuring the local translog is fsynced up
+     * to {@code location} exactly as {@link LocalTranslog} does. The wait is per-location, not
+     * "whatever was enqueued most recently" -- see {@link #pendingWalFuturesByLocation}'s own javadoc
+     * for the acknowledged-write-loss race the latter had. This is the method
      * {@code index.translog.durability=REQUEST} drives on the client's own request thread (via
      * {@code IndexShard.sync()} -> {@code translogSyncProcessor} -> {@code
      * TranslogManager#ensureTranslogSynced} -> {@code Translog#ensureSynced(Stream)} -> here),
@@ -211,8 +259,13 @@ public class WalMirroringTranslog extends LocalTranslog {
         if (batchingProcessor == null) {
             return localResult;
         }
-        CompletableFuture<Void> pending = latestPendingWalFuture;
-        if (pending != null) {
+        // floorEntry, not get: see pendingWalFuturesByLocation's javadoc. The exact entry is what is
+        // normally found; an older one is only ever returned once this location's own record has
+        // already completed and been removed, and FIFO drain order makes that older entry already
+        // complete too, so waiting on it returns immediately.
+        java.util.Map.Entry<Location, CompletableFuture<Void>> entry = pendingWalFuturesByLocation.floorEntry(location);
+        if (entry != null) {
+            CompletableFuture<Void> pending = entry.getValue();
             try {
                 pending.get();
             } catch (InterruptedException e) {

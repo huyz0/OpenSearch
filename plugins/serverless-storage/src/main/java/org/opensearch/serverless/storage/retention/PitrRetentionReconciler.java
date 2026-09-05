@@ -93,12 +93,13 @@ public final class PitrRetentionReconciler {
         List<PinRecord> toAdd = PitrRetentionPolicy.pinsToAdd(required, currentPitrPins);
         List<PinRecord> toRemove = PitrRetentionPolicy.pinsToRemove(required, currentPitrPins);
 
-        for (PinRecord pin : toAdd) {
-            pinRegistry.addPin(indexUuid, shardId, pin);
-        }
-        for (PinRecord pin : toRemove) {
-            pinRegistry.removePin(indexUuid, shardId, pin);
-        }
+        // One mutation for the whole diff, not one per pin. The PITR window holds a pin per manifest inside
+        // it, so a sliding window's tick adds and removes tens of pins on a register that already holds
+        // thousands -- and every individual add/remove was a full read-modify-CAS of that entire register,
+        // multiplying both the object-store traffic and the chance of exhausting the CAS retry bound against
+        // a concurrent snapshot or clone. applyPinDiff keeps the add-before-remove ordering that makes an
+        // interrupted reconcile over-retain rather than under-retain.
+        pinRegistry.applyPinDiff(indexUuid, shardId, toAdd, toRemove);
         return new ReconcileResult(toAdd.size(), toRemove.size());
     }
 }

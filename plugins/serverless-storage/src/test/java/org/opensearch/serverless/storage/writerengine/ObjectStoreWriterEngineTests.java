@@ -748,16 +748,20 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             new BlobContainerManifestStore(blobContainer)
         );
 
-        // Another node already activated the shard at a higher term before this engine even
+        // Another node already activated the shard and holds a LIVE lease before this engine even
         // constructs -- lease acquisition (done synchronously during construction, see
         // ObjectStoreWriterEngine's own javadoc) now catches this immediately, rather than letting a
         // doomed writer accept writes it could never publish until its first flush discovers the
-        // fencing.
+        // fencing. The expiry must be in the future: refusal is "someone else holds a live lease",
+        // not "someone else's term is higher" -- a term comparison cannot tell two nodes apart when
+        // every gated shard's primary term is the same compile-time constant, which is why the check
+        // is on node identity now (see ShardHead#isLeaseHeldByAnotherNodeAt). A lapsed lease nobody
+        // has displaced is stale, not fenced, and is legitimately taken over.
         shardStateStore.compareAndSet(
             shardId.getIndex().getUUID(),
             shardId.getId(),
             Optional.empty(),
-            new ShardHead(primaryTerm.get() + 1, "other-node", 0L, 0L)
+            new ShardHead(primaryTerm.get() + 1, "other-node", System.currentTimeMillis() + 300_000L, 0L)
         );
 
         try {

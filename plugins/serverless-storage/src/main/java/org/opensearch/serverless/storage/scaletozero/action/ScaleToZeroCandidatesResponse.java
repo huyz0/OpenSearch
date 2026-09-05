@@ -80,13 +80,39 @@ public class ScaleToZeroCandidatesResponse extends BaseNodesResponse<NodeScaleTo
         long idleThresholdMillis,
         long lagThreshold
     ) {
-        Map<String, Long> worstIdleByShard = new LinkedHashMap<>();
+        // Idleness folds with Math::min across nodes; lag still folds with Math::max. The asymmetry
+        // is deliberate and is finding L-2.
+        //
+        // Idleness is a claim about the *shard*, and the shard is active if ANY copy of it is
+        // active. The most-recently-active report is therefore the authoritative one, and folding
+        // with max -- taking the *least* recently active report -- inverts that: it lets any single
+        // report of long idleness overrule direct evidence of ongoing writes.
+        //
+        // That inversion is not hypothetical. Neither ShardActivityRegistry nor
+        // ReaderShardActivityRegistry has an unregister method, so when a shard relocates from node
+        // A to node B, A's entry survives with its lastActivityMillis frozen at the last real write
+        // there -- held alive by a WeakReference that a quiet, scaling-to-zero cluster has little
+        // reason to clear. A keeps reporting an idle time that grows without bound while B writes
+        // continuously. Under max, A's stale report won, the live busy primary on B was marked
+        // suspended and force-cancelled, and -- because the stale entry never goes away -- the shard
+        // re-suspended every cooldown, forever. Under min, B's idle-0 report wins and the shard is
+        // correctly not a candidate.
+        //
+        // Min is also the strictly safe direction on its own terms: it can only ever *delay* a
+        // suspension (a shard idle everywhere still reports the same value from every node and is
+        // still suspended), never cause one that the evidence does not support. The registries
+        // should still learn to unregister -- that fixes the underlying leak, and is written up
+        // separately -- but this merge must not depend on their doing so.
+        //
+        // Lag keeps Math::max because it means the opposite thing: it gates whether readers have
+        // caught up, and a shard is only safe to suspend once the *worst* reader has.
+        Map<String, Long> idleByShard = new LinkedHashMap<>();
         Map<String, Long> worstLagByShard = new LinkedHashMap<>();
-        Map<String, Long> worstReaderIdleByShard = new LinkedHashMap<>();
+        Map<String, Long> readerIdleByShard = new LinkedHashMap<>();
         for (NodeScaleToZeroCandidatesResponse node : nodes) {
             for (IdleShardEntry entry : node.idleShards()) {
                 String key = key(entry.indexUuid(), entry.shardId());
-                worstIdleByShard.merge(key, entry.millisSinceLastActivity(), Math::max);
+                idleByShard.merge(key, entry.millisSinceLastActivity(), Math::min);
             }
             for (ShardLagEntry entry : node.laggingShards()) {
                 String key = key(entry.indexUuid(), entry.shardId());
@@ -94,21 +120,21 @@ public class ScaleToZeroCandidatesResponse extends BaseNodesResponse<NodeScaleTo
             }
             for (IdleShardEntry entry : node.readerIdleShards()) {
                 String key = key(entry.indexUuid(), entry.shardId());
-                worstReaderIdleByShard.merge(key, entry.millisSinceLastActivity(), Math::max);
+                readerIdleByShard.merge(key, entry.millisSinceLastActivity(), Math::min);
             }
         }
 
         Map<String, ScaleToZeroCandidateEntry> byShard = new LinkedHashMap<>();
-        for (Map.Entry<String, Long> idle : worstIdleByShard.entrySet()) {
+        for (Map.Entry<String, Long> idle : idleByShard.entrySet()) {
             byShard.put(
                 idle.getKey(),
-                buildEntry(idle.getKey(), idle.getValue(), worstLagByShard.get(idle.getKey()), worstReaderIdleByShard.get(idle.getKey()))
+                buildEntry(idle.getKey(), idle.getValue(), worstLagByShard.get(idle.getKey()), readerIdleByShard.get(idle.getKey()))
             );
         }
         for (Map.Entry<String, Long> lag : worstLagByShard.entrySet()) {
-            byShard.putIfAbsent(lag.getKey(), buildEntry(lag.getKey(), null, lag.getValue(), worstReaderIdleByShard.get(lag.getKey())));
+            byShard.putIfAbsent(lag.getKey(), buildEntry(lag.getKey(), null, lag.getValue(), readerIdleByShard.get(lag.getKey())));
         }
-        for (Map.Entry<String, Long> readerIdle : worstReaderIdleByShard.entrySet()) {
+        for (Map.Entry<String, Long> readerIdle : readerIdleByShard.entrySet()) {
             byShard.putIfAbsent(readerIdle.getKey(), buildEntry(readerIdle.getKey(), null, null, readerIdle.getValue()));
         }
 

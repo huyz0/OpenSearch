@@ -111,6 +111,16 @@ public final class PinLedgerSweepTask implements Closeable {
             if (result.ledgersCleared() > 0) {
                 logger.info("pin ledger sweep for index [{}] cleared [{}] released ledger(s)", indexUuid, result.ledgersCleared());
             }
+            if (result.ledgersWithinFanOutWindow() > 0) {
+                // Debug, not warn: this is the sweep working as designed, and the next pass will judge them.
+                // Logged at all because "the ledger is still there and the sweep ran" otherwise has no
+                // visible explanation.
+                logger.debug(
+                    "pin ledger sweep for index [{}] left [{}] ledger(s) alone: still inside the fan-out window",
+                    indexUuid,
+                    result.ledgersWithinFanOutWindow()
+                );
+            }
             if (result.abandonedPastTtl().isEmpty() == false) {
                 logger.warn(
                     "pin ledger sweep for index [{}] found [{}] ledger(s) still live past their abandoned-after window: {}",
@@ -123,7 +133,7 @@ public final class PinLedgerSweepTask implements Closeable {
             // Never lets one bad pass stop the schedule -- the next tick retries from scratch, the
             // same "best effort, self-healing" contract every other GC-adjacent task in this plugin
             // keeps.
-            logger.warn("pin ledger sweep for index [{}] failed; will retry next tick", indexUuid, e);
+            logger.warn("pin ledger sweep for index [" + indexUuid + "] failed; will retry next tick", e);
         }
     }
 

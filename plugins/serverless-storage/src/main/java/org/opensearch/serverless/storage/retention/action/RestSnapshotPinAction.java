@@ -75,6 +75,13 @@ public class RestSnapshotPinAction extends BaseRestHandler {
                 "request body must contain a string \"index_uuid\", a numeric \"shard_id\", and a string \"snapshot_id\""
             );
         }
+        // The deep-snapshot export's own per-shard pins live under a reserved prefix and are taken and
+        // released by that action itself; the shard-level request type deliberately accepts it, because that
+        // is the path the export uses. An operator reaching this endpoint by hand is not that path, and a
+        // hand-written pin or release inside that namespace could strip the pin holding a copy in progress.
+        if (((String) snapshotId).startsWith(SnapshotPinRequest.DEEP_SNAPSHOT_PIN_ID_PREFIX)) {
+            throw new IllegalArgumentException(SnapshotPinRequest.reservedSnapshotIdError(SnapshotPinRequest.DEEP_SNAPSHOT_PIN_ID_PREFIX));
+        }
         SnapshotPinRequest pinRequest = new SnapshotPinRequest((String) indexUuid, ((Number) shardId).intValue(), (String) snapshotId);
         return channel -> client.executeLocally(SnapshotPinAction.INSTANCE, pinRequest, new RestToXContentListener<>(channel));
     }

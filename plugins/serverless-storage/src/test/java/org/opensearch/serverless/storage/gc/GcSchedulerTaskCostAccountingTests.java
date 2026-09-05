@@ -89,6 +89,10 @@ public class GcSchedulerTaskCostAccountingTests extends OpenSearchTestCase {
             writeGeneration(setupBundleStore, setupManifestStore, generation, farInThePast);
         }
         writeGeneration(setupBundleStore, setupManifestStore, deletableGenerationCount + 1L, farInThePast);
+        // The sweep anchors "latest" to the head register, so the setup publishes one -- and it does so on
+        // the uncounted container, because what this test measures is the sweep's own request cost, not the
+        // cost of standing the fixture up.
+        TestShardHeads.publish(uncountedContainer, INDEX_UUID, SHARD_ID, PRIMARY_TERM, deletableGenerationCount + 1L);
 
         ObjectStoreRequestCounter counter = new ObjectStoreRequestCounter();
         RequestCountingBlobContainer countingContainer = new RequestCountingBlobContainer(uncountedContainer, counter);
@@ -102,7 +106,9 @@ public class GcSchedulerTaskCostAccountingTests extends OpenSearchTestCase {
             retentionWindowMillis,
             manifestStore,
             bundleStore,
-            pinRegistry
+            pinRegistry,
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(countingContainer),
+            new BlobContainerGcSweepStateStore(countingContainer, INDEX_UUID, SHARD_ID)
         );
         ThreadPool threadPool = new TestThreadPool(getTestName());
         try {

@@ -46,6 +46,35 @@ import java.util.List;
  * this kind of review (an initial delete-denied wrap broke a real {@code internalClusterTest}):
  * {@code PartitionRewritePublisher#rewrite} deletes the target's now-superseded partition descriptor
  * as a required last step of its own contract, so that action's target container is left unwrapped.
+ *
+ * <h2>Where the tier model is not applied at all: the shared WAL container</h2>
+ *
+ * <p>Written down here because it is the one hole in this model that nothing else records. The
+ * node-shared write-ahead-log container ({@code ServerlessStoragePlugin#resolveSharedWalChunkService},
+ * built through {@code resolveContainer} directly) is <b>not wrapped by this class</b>. Every writer
+ * shard on the node therefore holds full read, write <em>and delete</em> on the node-shared WAL
+ * prefix -- a prefix that, by construction, carries every other index's WAL records too. &sect;12's
+ * own tier model says deletion belongs to GC alone; for the WAL, it belongs to every writer.
+ *
+ * <p>The consequence is not hypothetical: a bug in any one shard's WAL path -- a mis-scoped chunk
+ * name, an off-by-one in a truncation, a retry that deletes the chunk it just wrote -- can destroy
+ * another index's unflushed operations, and it does so through a container that never says no. The
+ * per-record encryption WAL records carry is confidentiality, not integrity of the container, and it
+ * does not help here at all: deleting a chunk needs no key.
+ *
+ * <p><b>The fix, for whoever picks this up.</b> Exactly the split {@code getEngineFactory} already
+ * performs for {@code GcSchedulerConfig}: wrap the shared WAL container delete-denied for the writer
+ * shards that only append to it, and hand {@code WalGcSchedulerTask} its own separate, unrestricted
+ * instance of the same container. Not done here only because that container is built inside the WAL
+ * package's own lazy-initialization path, which this change did not own. It is a small change and it
+ * should be made.
+ *
+ * <p><b>And a limit worth stating about this class generally.</b> Everything above is an in-process
+ * assertion: it turns a bug into a {@link SecurityException} on the code path that has the wrapper.
+ * It is not a security boundary against a caller who can reach the object store by any other route,
+ * because the underlying credentials are unchanged -- the same node holds the same bucket
+ * permissions either way. Real per-tier scoping is IAM, and &sect;12 marks it out of scope for this
+ * repository.
  */
 public final class RestrictingBlobContainer extends RegisterDelegatingBlobContainer {
 

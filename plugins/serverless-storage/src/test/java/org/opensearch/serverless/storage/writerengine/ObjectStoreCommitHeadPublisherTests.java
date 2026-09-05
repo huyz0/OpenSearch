@@ -207,7 +207,12 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                 1,
                 afterAcquire.primaryTerm()
             );
-            assertEquals("leaseTerm must advance immediately on acquisition, ahead of any publish", 2, afterAcquire.leaseTerm());
+            // 3, not 2: this is a TAKEOVER (the head's lease holder was null, i.e. nobody's), and a
+            // takeover advances the fencing token strictly -- max(existing leaseTerm, acquiring term)
+            // + 1 -- rather than merely to the acquirer's own term. That strictness is what makes the
+            // token monotonic for a gated index, whose primary term is a compile-time constant and so
+            // can never advance on its own. See ShardHead#withTakenOverLease.
+            assertEquals("leaseTerm must advance immediately on acquisition, ahead of any publish", 3, afterAcquire.leaseTerm());
 
             // Node A, still unaware it has been superseded (e.g. partitioned from the cluster
             // manager), tries to publish under its own stale term 1. This must be rejected

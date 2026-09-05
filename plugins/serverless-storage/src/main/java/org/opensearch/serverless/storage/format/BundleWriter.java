@@ -49,10 +49,32 @@ public final class BundleWriter {
     /**
      * Packs the given files into a single immutable bundle blob.
      *
+     * <p>Now a thin wrapper over {@link #layout}: the returned {@link SegmentBundle} materializes
+     * its bytes lazily, only if someone actually asks for them, so this no longer allocates a second
+     * full copy of the whole commit merely because a caller wanted the entry map. Every existing
+     * caller is unaffected -- {@code bytes()} still returns exactly what it always did.
+     *
      * @param files the files to pack, in the order they should appear in the bundle.
      * @return the packed bundle, with its parsed file-entry map.
      */
     public static SegmentBundle write(List<BundleFileContent> files) {
+        return new SegmentBundle(layout(files));
+    }
+
+    /**
+     * Plans a bundle without materializing it: computes the header and every file's offset, length
+     * and checksum, leaving the body to be streamed on demand.
+     *
+     * <p>This is the shape the upload path wants and the shape that removes the format's 2&nbsp;GiB
+     * ceiling -- see {@link BundleLayout}'s own javadoc for why that ceiling was a shard-killing
+     * product limit rather than an inefficiency. Offsets are not stored in the header; they are the
+     * cumulative sum of preceding lengths, which is what makes the header computable from metadata
+     * alone and self-consistent by construction.
+     *
+     * @param files the files to pack, in the order they should appear in the bundle.
+     * @return the planned layout.
+     */
+    public static BundleLayout layout(List<BundleFileContent> files) {
         try {
             ByteArrayOutputStream headerBuf = new ByteArrayOutputStream();
             DataOutputStream header = new DataOutputStream(headerBuf);
@@ -78,22 +100,15 @@ public final class BundleWriter {
 
             byte[] headerBytes = headerBuf.toByteArray();
             long bodyLength = files.stream().mapToLong(f -> f.content().length).sum();
-            if (headerBytes.length + bodyLength > Integer.MAX_VALUE) {
-                throw new IllegalArgumentException("bundle too large: " + (headerBytes.length + bodyLength) + " bytes");
-            }
-
-            byte[] bundleBytes = new byte[(int) (headerBytes.length + bodyLength)];
-            System.arraycopy(headerBytes, 0, bundleBytes, 0, headerBytes.length);
 
             Map<String, BundleFileEntry> entries = new LinkedHashMap<>();
             long offset = headerBytes.length;
             for (BundleFileContent file : files) {
-                System.arraycopy(file.content(), 0, bundleBytes, (int) offset, file.content().length);
                 entries.put(file.name(), new BundleFileEntry(file.name(), offset, file.content().length, checksum(file.content())));
                 offset += file.content().length;
             }
 
-            return new SegmentBundle(bundleBytes, entries);
+            return new BundleLayout(headerBytes, entries, List.copyOf(files), headerBytes.length + bodyLength);
         } catch (IOException e) {
             // ByteArrayOutputStream/DataOutputStream never actually throw for in-memory buffers;
             // surfacing as unchecked keeps this a pure, exception-free-in-practice API.

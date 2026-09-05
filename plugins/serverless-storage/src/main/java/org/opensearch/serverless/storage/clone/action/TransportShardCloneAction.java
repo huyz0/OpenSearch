@@ -164,6 +164,17 @@ public class TransportShardCloneAction extends HandledTransportAction<ShardClone
                 ShardStateStore targetShardStateStore = new BlobContainerShardStateStore(targetContainer);
                 BlobContainerCloneLineageStore targetLineageStore = new BlobContainerCloneLineageStore(targetContainer);
 
+                // Cloning a clone is supported, and the bytes a clone reads live wherever the chain
+                // physically stores them -- not necessarily on the immediate source, which for a pure clone
+                // holds no bundles at all. Handing the cloner a resolver lets it pin every hop of the
+                // source's lineage, so deleting a middle index cannot unpin the shard that actually holds
+                // this clone's segments. Delete-denied, same as the two containers above: pinning is a
+                // register mutation, never a delete.
+                ShardCloner.ContainerResolver ancestorResolver = (indexUuid, shardId) -> new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(indexUuid, shardId),
+                    false
+                );
+
                 ShardCloner.clone(
                     request.sourceIndexUuid(),
                     request.sourceShardId(),
@@ -175,7 +186,10 @@ public class TransportShardCloneAction extends HandledTransportAction<ShardClone
                     targetManifestStore,
                     targetShardStateStore,
                     targetLineageStore,
-                    threadPool.absoluteTimeInMillis()
+                    threadPool.absoluteTimeInMillis(),
+                    null,
+                    null,
+                    ancestorResolver
                 );
                 listener.onResponse(new ShardCloneResponse(true));
             } catch (Exception e) {

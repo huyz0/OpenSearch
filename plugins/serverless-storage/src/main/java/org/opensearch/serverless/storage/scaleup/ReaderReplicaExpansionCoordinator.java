@@ -100,6 +100,36 @@ public final class ReaderReplicaExpansionCoordinator {
     private final IntSupplier headroomBudget;
 
     /**
+     * When {@link #expandCandidates} last counted an evaluation toward the hysteresis streak. See
+     * that method for why ticks are throttled to the query-rate window (finding S-2).
+     */
+    private volatile long lastCountedEvaluationMillis = 0L;
+
+    /**
+     * The width of the query-rate window the candidate signal is derived from -- the minimum spacing
+     * between two evaluations that can be treated as independent observations. Kept in step with
+     * {@code ScaleUpCandidatesResponse.QUERY_RATE_WINDOW_MILLIS} and {@code
+     * ObjectStoreReaderEngine.QUERY_RATE_WINDOW_MILLIS}.
+     */
+    static final long QUERY_RATE_WINDOW_MILLIS = 60_000L;
+
+    /**
+     * The spacing actually enforced. Defaults to {@link #QUERY_RATE_WINDOW_MILLIS}; a unit test that
+     * is exercising the streak arithmetic itself sets it to zero, because there the point is to feed
+     * N distinct observations, not to prove they were N distinct <em>measurements</em>.
+     */
+    private volatile long minimumEvaluationSpacingMillis = QUERY_RATE_WINDOW_MILLIS;
+
+    /**
+     * Disables or changes the minimum spacing between counted evaluations -- test-only visibility.
+     *
+     * @param millis the spacing to enforce; {@code 0} counts every call.
+     */
+    void setMinimumEvaluationSpacingMillisForTesting(long millis) {
+        this.minimumEvaluationSpacingMillis = millis;
+    }
+
+    /**
      * Creates a coordinator with no capacity-ceiling awareness -- {@link #expandCandidates} always
      * proceeds regardless of node-level fleet capacity, the original behavior before node
      * autoscaling existed. Equivalent to the other constructor with a supplier that always returns
@@ -207,6 +237,33 @@ public final class ReaderReplicaExpansionCoordinator {
      *                   the streak of a shard no longer reported at all.
      */
     public void expandCandidates(List<ScaleUpCandidateEntry> candidates) {
+        // Finding S-2. requiredConsecutiveTicks counts *ticks*, but the underlying query-rate signal
+        // is a fixed 60-second window, and nothing validates the eval interval against it. With
+        // scale_up.eval_interval at 10s -- a perfectly reasonable operator choice -- six consecutive
+        // ticks read the identical completedWindowQueryCount, so the default of 2 ticks was satisfied
+        // by a *single* 60-second observation; and because the streak is cleared after each expansion,
+        // an index ratcheted 1 -> 2 -> 3 -> 4 -> 5 in about 40 seconds on the strength of that one
+        // measurement. The setting's own javadoc claims it prevents "reacting to one noisy
+        // evaluation"; it did not.
+        //
+        // Enforcing a minimum spacing between counted evaluations is what makes the hysteresis
+        // count distinct measurements again, whatever the configured interval. Ticks that arrive too
+        // soon are skipped entirely rather than folded in: touching the tracker would either advance
+        // a streak on a repeated observation (the bug) or, via filterSustained's retainAll, disturb
+        // streaks it has no new information about.
+        long now = System.currentTimeMillis();
+        long previous = lastCountedEvaluationMillis;
+        if (previous != 0L && now - previous < minimumEvaluationSpacingMillis) {
+            logger.debug(
+                "skipping reader replica expansion this tick: only {} ms since the last counted evaluation, and the query-rate "
+                    + "signal has a {} ms window -- this tick would re-count the same measurement",
+                now - previous,
+                minimumEvaluationSpacingMillis
+            );
+            return;
+        }
+        lastCountedEvaluationMillis = now;
+
         if (readerCapacitySaturated.getAsBoolean()) {
             // Fleet is already at capacity for the reader role -- skip acting this tick, but still
             // run filterSustained below so every candidate's streak stays current (neither reset nor

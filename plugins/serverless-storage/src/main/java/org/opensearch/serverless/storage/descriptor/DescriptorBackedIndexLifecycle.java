@@ -334,6 +334,14 @@ public final class DescriptorBackedIndexLifecycle implements ClaimedIndexLifecyc
      * state, so every node learns of the change through the state it is applying at this very moment; the
      * change log exists for indices cluster state never mentions. Those are written by {@link #createIndex},
      * {@link #updateIndex}, the mapping compare-and-swap and {@link #removeIndices}, and all four record.
+     *
+     * <p><b>The descriptor write beside it was the same defect, and was left in place.</b> The paragraph
+     * above diagnoses "N nodes each writing the same entry" for the change-log append and removes the
+     * append; the {@code putAsync} it stood next to went on being made from every node, unfiltered, for
+     * every index in cluster state. Two guards now bound it: the index must be one this plugin owns, and
+     * the node must be the elected cluster manager. Both are stated at the call sites below with the
+     * measurements behind them; between them, a 200-node cluster's alias edit goes from up to 1,200
+     * object-store operations on one key to at most six, and an ordinary index's edit goes to none.
      */
     @Override
     public void recordChange(IndexMetadata indexMetadata) {
@@ -341,12 +349,39 @@ public final class DescriptorBackedIndexLifecycle implements ClaimedIndexLifecyc
         if (store == null) {
             return;
         }
+        // Indices this plugin does not own are not recorded at all, which is the larger of the two
+        // reductions below and the one that makes a cluster with the plugin installed and no serverless
+        // index do zero descriptor I/O.
+        //
+        // Nothing was ever going to read those descriptors. Descriptor resolution is consulted only for
+        // names *absent* from cluster state (AbsentIndexDescriptorSuppliers is the seam's own name), and an
+        // index reaching this method is by definition in it; the prefix half answers wildcards over gated
+        // names, which these are not. What writing them did buy was a descriptor blob per ordinary index in
+        // the cluster, rewritten on every settings, alias or mapping change, plus a uuid-to-name entry per
+        // ordinary index in a 50,000-entry LRU that gated indices have to share -- so a cluster with many
+        // ordinary indices evicted the entries the gated mapping path cannot work without, and the symptom
+        // of that is a mapping update failing sixteen times and reporting "sustained contention" for a
+        // missing lookup. See DescriptorBackedMappingStore's own map.
+        if (org.opensearch.serverless.storage.placement.ComputedPlacementGate.ownsIndex(indexMetadata) == false) {
+            return;
+        }
         IndexDescriptor descriptor = IndexDescriptor.from(indexMetadata);
         // Which name is being written and whether it is a tombstone. Descriptor writes are asynchronous,
         // so they are hard to attribute after the fact: a write that lands after a test has finished
         // shows up only as a descriptor reappearing, with nothing saying what wrote it.
         logger.debug("publishing descriptor for [{}], exists [{}]", descriptor.name(), descriptor.exists());
+        // Registered on every node, ahead of the manager guard below, because this half is node-local and
+        // free: it is the uuid-to-name entry the mapping store cannot answer anything without, and a
+        // follower needs it exactly as much as the manager does. Only the writes below are the manager's.
         DescriptorBackedMappingStore.registerDescriptor(descriptor);
+        // The write itself, on one node rather than all of them. See DescriptorGate#writesRecordedDescriptorsHere
+        // for the arithmetic: this method runs on the manager's state update thread and on every follower's
+        // applier thread, so without this guard one metadata change was N nodes issuing a read plus a
+        // compare-and-swap -- up to three times each -- against a single object-store key, all of them
+        // writing identical bytes derived from the state they had all just received.
+        if (DescriptorGate.writesRecordedDescriptorsHere() == false) {
+            return;
+        }
         if (descriptor.exists()) {
             store.putAsync(descriptor);
         } else {

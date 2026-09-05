@@ -15,8 +15,10 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.SlowCodecReaderWrapper;
+import org.apache.lucene.index.SoftDeletesDirectoryReaderWrapper;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
@@ -138,13 +140,39 @@ public final class PartitionRewritePublisher {
         try (Directory sourceDirectory = new ByteBuffersDirectory(); Directory rewrittenDirectory = new ByteBuffersDirectory()) {
             materializer.materialize(currentManifest, sourceDirectory);
 
-            try (DirectoryReader rawReader = DirectoryReader.open(sourceDirectory)) {
+            // Two soft-deletes concerns, both of which used to be unhandled here (finding R-9), and
+            // both already solved correctly a few files away in InPlaceSiblingMerger:
+            //
+            // (1) A plain DirectoryReader.open exposes soft-deleted documents (the superseded old
+            // version left behind by any _update, and the tombstone left behind by any DELETE)
+            // as still-live, so the partition filter below would start from a live-docs set that
+            // re-admits them and this "rewrite" would resurrect deleted data. The soft-deletes
+            // wrapper hard-excludes them first, exactly as the engine's own read path does.
+            // (2) IndexWriter.addIndexes runs every incoming FieldInfo through
+            // FieldInfos.verifySoftDeletedFieldName, which throws IllegalArgumentException
+            // ("this index has [__soft_deletes] as soft-deletes already but soft-deletes field
+            // is not configured in IWC") the moment a source carries that FieldInfo -- i.e. for
+            // any shard that has ever taken a single delete or update. With the scheduler
+            // enabled that failed on every tick, forever, after a full materialisation, with no
+            // backoff. No fixture in this package had ever indexed a delete, which is why it
+            // went unnoticed; the fixtures now do.
+            try (
+                DirectoryReader rawReader = new SoftDeletesDirectoryReaderWrapper(
+                    DirectoryReader.open(sourceDirectory),
+                    Lucene.SOFT_DELETES_FIELD
+                )
+            ) {
                 try (PartitionFilteringDirectoryReader filtered = new PartitionFilteringDirectoryReader(rawReader, descriptor)) {
                     List<CodecReader> codecReaders = new ArrayList<>(filtered.leaves().size());
                     for (LeafReaderContext leafContext : filtered.leaves()) {
                         codecReaders.add(SlowCodecReaderWrapper.wrap(leafContext.reader()));
                     }
-                    try (IndexWriter writer = new IndexWriter(rewrittenDirectory, new IndexWriterConfig())) {
+                    try (
+                        IndexWriter writer = new IndexWriter(
+                            rewrittenDirectory,
+                            new IndexWriterConfig().setSoftDeletesField(Lucene.SOFT_DELETES_FIELD)
+                        )
+                    ) {
                         if (codecReaders.isEmpty() == false) {
                             writer.addIndexes(codecReaders.toArray(new CodecReader[0]));
                         }

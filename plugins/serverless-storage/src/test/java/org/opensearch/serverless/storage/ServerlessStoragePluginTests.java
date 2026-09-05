@@ -28,6 +28,7 @@ import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
 import org.opensearch.serverless.storage.writerengine.WriterEngineFactory;
 import org.opensearch.test.IndexSettingsModule;
 import org.opensearch.test.OpenSearchTestCase;
+import org.junit.After;
 
 import java.nio.file.Path;
 import java.util.Base64;
@@ -39,6 +40,43 @@ import static org.mockito.Mockito.when;
 
 public class ServerlessStoragePluginTests extends OpenSearchTestCase {
 
+    /**
+     * A real thread pool for every plugin this fixture builds, torn down after each test.
+     *
+     * <p>These tests used to pass {@code null} here, and passed because the code path that needs a
+     * thread pool was never taken: WAL mirroring defaulted to off, so {@code
+     * resolveSharedWalChunkService} returned immediately and nothing ever asked for a
+     * {@code ThreadContext} or a scheduler. Mirroring now defaults to <em>on</em>, so the default
+     * path builds the shared WAL service for real -- and eight tests here started failing with an
+     * NPE several frames inside it.
+     *
+     * <p>Supplying one is the right fix rather than making production tolerate its absence, for the
+     * reason this file already recorded once for {@code clusterServiceFor}: the fixture was
+     * asserting against a shape a real node never has. A node always passes a thread pool to
+     * {@code createComponents}. The tolerant alternative is a plugin that comes up reporting WAL
+     * mirroring enabled and silently having no WAL, which is the exact failure this default flip
+     * exists to remove. {@code createComponents} now refuses that combination outright.
+     *
+     * <p>Created lazily so tests that never build a plugin do not pay for a thread pool, and so the
+     * teardown below is a no-op for them.
+     */
+    private org.opensearch.threadpool.ThreadPool fixtureThreadPool;
+
+    private org.opensearch.threadpool.ThreadPool testThreadPool() {
+        if (fixtureThreadPool == null) {
+            fixtureThreadPool = new org.opensearch.threadpool.TestThreadPool(getTestName());
+        }
+        return fixtureThreadPool;
+    }
+
+    @After
+    public void terminateFixtureThreadPool() {
+        if (fixtureThreadPool != null) {
+            org.opensearch.threadpool.ThreadPool.terminate(fixtureThreadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
+            fixtureThreadPool = null;
+        }
+    }
+
     private ServerlessStoragePlugin newPlugin(Path basePath) {
         ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         if (basePath != null) {
@@ -48,7 +86,19 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
                 .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
                 .build();
             Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-            plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+            plugin.createComponents(
+                null,
+                clusterServiceFor(plugin),
+                testThreadPool(),
+                null,
+                null,
+                null,
+                environment,
+                null,
+                null,
+                null,
+                null
+            );
         }
         return plugin;
     }
@@ -247,7 +297,33 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
                 new org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore(shard0Container);
             ledgerStore.write(new org.opensearch.serverless.storage.retention.PinLedger("pin-1", "test-index", indexUuid, 1, 0));
 
-            task.sweepNowForTesting(1000);
+            // Past the fan-out window: a ledger younger than it is deliberately not judged, since the pins
+            // it names may still be landing (see PinLedgerSweeper's own reasoning). Referencing the
+            // constant rather than a literal keeps this from drifting if the window changes.
+            org.opensearch.serverless.storage.retention.PinLedgerSweeper.SweepResult result = task.sweepNowForTesting(
+                org.opensearch.serverless.storage.retention.PinLedger.UNCONFIRMED_PIN_TTL_MILLIS + 1000
+            );
+
+            // Assert on the sweep's own report before asserting on the outcome. "The ledger is still
+            // there" has four different causes -- the sweep never saw it, the sweep declined to judge
+            // it as too young, a shard was unreadable so the fail-safe left it alone, or the delete
+            // itself was denied -- and the outcome assertion below cannot tell them apart. Each of
+            // these names one, so a failure says which branch was taken instead of leaving the next
+            // reader to work it out from the production code.
+            assertEquals("the sweep must actually see the ledger that was just written", 1, result.ledgersSeen());
+            assertEquals(
+                "past the fan-out TTL the sweep must judge the ledger, not defer it -- if this is 1, the "
+                    + "instant this test sweeps at is inside PinLedger.UNCONFIRMED_PIN_TTL_MILLIS again",
+                0,
+                result.ledgersWithinFanOutWindow()
+            );
+            assertEquals(
+                "nothing holds this pin, so the sweep must clear it -- if this is 0 while ledgersSeen is 1 "
+                    + "and ledgersWithinFanOutWindow is 0, a shard read threw and the fail-safe path in "
+                    + "PinLedgerSweeper#sweepOnce left the ledger in place",
+                1,
+                result.ledgersCleared()
+            );
 
             assertTrue(
                 "a ledger naming no live pins must actually be deleted by a real sweep pass, not merely attempted",
@@ -290,7 +366,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .setSecureSettings(secureSettings)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
 
         IndexSettings settings = indexSettings(true);
         ShardId shardId = new ShardId(settings.getIndex(), 0);
@@ -328,7 +404,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .setSecureSettings(secureSettings)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
 
         IndexSettings settings = indexSettings(true);
         ShardId shardId = new ShardId(settings.getIndex(), 0);
@@ -353,7 +429,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
 
         IndexSettings settings = indexSettings(true);
         ShardId shardId = new ShardId(settings.getIndex(), 0);
@@ -374,7 +450,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
         // sharedWalChunkService is no longer built eagerly by createComponents -- it's resolved
         // lazily on first real writer-shard use (see resolveSharedWalChunkService()'s own javadoc),
         // so a writer EngineFactory must actually be requested first to trigger construction.
@@ -394,7 +470,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING.getKey(), "512kb")
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
         triggerSharedWalChunkServiceResolution(plugin);
 
         assertEquals(512L * 1024, plugin.sharedWalChunkService().perShardBudgetBytesForTesting());
@@ -427,7 +503,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING.getKey(), "16mb")
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
 
         assertNotNull(
             "an explicit positive cache size must construct a real FileCache",
@@ -454,7 +530,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING.getKey(), 5)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
 
         assertNotNull(
             "an explicit positive max_concurrent_reader_shards must construct a real controller",
@@ -472,7 +548,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
 
         assertNull(
             "the WAL GC scheduler must stay off by default (non-positive interval), matching every "
@@ -527,7 +603,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
 
         assertNull(
             "the node self-warmup scheduler must stay off by default (non-positive interval), "
@@ -566,10 +642,15 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         }
     }
 
-    public void testWalMirroringDisabledByDefaultStillConstructsAWriterEngineFactory() {
-        // The default-off setting must never be a hard requirement: every existing deployment of
-        // this plugin (and every other test in this class) constructs a WriterEngineFactory with
-        // WAL mirroring untouched, and that must keep working unchanged.
+    /**
+     * Renamed from {@code testWalMirroringDisabledByDefaultStillConstructsAWriterEngineFactory},
+     * which asserted the right thing under a name that is now false: WAL mirroring defaults to
+     * <em>enabled</em>. The assertion is unchanged and still worth keeping -- constructing a writer
+     * engine factory on untouched settings must work -- but the name was the only place the old
+     * default was recorded, so leaving it would have made this file quietly claim the opposite of
+     * what the plugin does.
+     */
+    public void testWalMirroringOnByDefaultStillConstructsAWriterEngineFactory() {
         ServerlessStoragePlugin plugin = newPlugin(createTempDir());
         IndexSettings settings = indexSettings(true);
         ShardId shardId = new ShardId(settings.getIndex(), 0);
@@ -578,6 +659,57 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         Optional<EngineFactory> factory = plugin.getEngineFactory(settings, primaryRouting);
         assertTrue(factory.isPresent());
         assertTrue(factory.get() instanceof WriterEngineFactory);
+    }
+
+    /**
+     * The default itself, asserted directly rather than only implied by a test name.
+     *
+     * <p>The old name was the only record of it, which is how it went stale. A setting default that
+     * a durability guarantee depends on should be pinned by an assertion, so that changing it is a
+     * deliberate act with a failing test attached rather than a silent edit.
+     */
+    public void testWalMirroringAndFlushBatchingAreOnByDefaultAndWalGcIsScheduled() {
+        Environment environment = TestEnvironment.newEnvironment(buildEnvSettings(Settings.EMPTY));
+        assertTrue(
+            "WAL mirroring is what makes an acknowledged write durable in the object store; with it off "
+                + "everything acked since the last published manifest is lost on node kill",
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.get(environment.settings())
+        );
+        assertTrue(
+            "mirroring without batching is roughly one object-store PUT per document -- these two "
+                + "defaults are a pair and must not drift apart",
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING.get(environment.settings())
+        );
+        assertTrue(
+            "WAL chunks are reclaimed by nothing else, so mirroring on with WAL GC off trades a "
+                + "data-loss default for an unbounded-storage one",
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING.get(environment.settings()).millis() > 0
+        );
+    }
+
+    /**
+     * The production half of the fixture change above: a plugin built without a thread pool must say
+     * so, at construction, rather than throwing a {@link NullPointerException} several frames inside
+     * {@code resolveSharedWalChunkService} the first time a writer shard opens.
+     */
+    public void testCreateComponentsRefusesWalMirroringWithNoThreadPool() {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", createTempDir().toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), createTempDir().toString())
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+
+        IllegalStateException e = expectThrows(
+            IllegalStateException.class,
+            () -> plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null)
+        );
+        assertTrue(
+            "the message must name the setting an operator could change: " + e.getMessage(),
+            e.getMessage().contains("serverless_storage.wal_mirroring.enabled")
+        );
+        assertTrue("and say what was actually missing: " + e.getMessage(), e.getMessage().contains("no ThreadPool"));
     }
 
     public void testBundleCacheSizeSettingDefaultsToAPositiveFractionOfHeap() {
@@ -601,7 +733,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .build();
         Environment environment = TestEnvironment.newEnvironment(buildEnvSettings(nodeSettings));
         ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
-        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), testThreadPool(), null, null, null, environment, null, null, null, null);
 
         InMemoryPlaintextBundleCache sharedCache = plugin.sharedBundleCache();
         assertNotNull("createComponents must construct the shared cache", sharedCache);

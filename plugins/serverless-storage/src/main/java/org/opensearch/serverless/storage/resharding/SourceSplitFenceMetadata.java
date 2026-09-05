@@ -40,12 +40,17 @@ import java.util.Map;
  * What this closes is the much longer-lived, permanently-open window this fixes: from cutover onward,
  * for as long as the source index continues to exist before eventual retirement.
  *
- * <p><b>Deliberately no unfence primitive in this first increment.</b> Fencing only ever fires after
- * a successful cutover (real targets already serving real traffic through the alias), so there is no
- * safe rollback scenario this needs to support yet -- unlike write-routing's enable/disable pair,
- * which toggles a live, still-in-use routing behavior. If an operator later needs to reverse a split
- * outright, that is a new, separate undo mechanism, not a reason to make source fencing itself
- * togglable.
+ * <p><b>There is an unfence primitive, and there has to be.</b> The first increment of this class
+ * deliberately shipped without one, on the reasoning that fencing only ever fires after a successful
+ * cutover and so has no safe rollback scenario. That reasoning was wrong in a way that could not be
+ * recovered from: a fence is a <em>permanent, cluster-state-durable write block</em> on a real
+ * dataset, and an operator who ends up with one they did not intend -- because a later stage of the
+ * orchestration failed, because the superseding alias has no write index, or simply because they
+ * fenced the wrong index -- had exactly two options, deleting the index or hand-editing cluster
+ * state. A mechanism whose only escape hatch is data loss is not a safe mechanism, however narrow
+ * the window that produces it. {@link #withoutFence} and {@code UnfenceSplitSourceAction} exist for
+ * that reason; unfencing is an explicit operator action, never automatic, so the normal
+ * post-cutover fence still behaves exactly as before.
  */
 public final class SourceSplitFenceMetadata {
 
@@ -68,6 +73,22 @@ public final class SourceSplitFenceMetadata {
         Map<String, String> map = new HashMap<>();
         map.put(SUPERSEDING_ALIAS_MAP_KEY, supersedingAliasName);
         builder.putCustom(FENCE_CUSTOM_TYPE, map);
+        return builder.build();
+    }
+
+    /**
+     * Returns {@code indexMetadata} with any fence marker removed, restoring it as a writable index.
+     * Returns the argument unchanged (same reference) when it was not fenced, so a caller can use
+     * reference identity to decide whether a cluster-state update is needed at all.
+     *
+     * @param indexMetadata the source index to unfence.
+     */
+    public static IndexMetadata withoutFence(IndexMetadata indexMetadata) {
+        if (isFencedSource(indexMetadata) == false) {
+            return indexMetadata;
+        }
+        IndexMetadata.Builder builder = IndexMetadata.builder(indexMetadata);
+        builder.removeCustom(FENCE_CUSTOM_TYPE);
         return builder.build();
     }
 

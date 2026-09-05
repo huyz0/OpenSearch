@@ -52,6 +52,23 @@ import java.util.Objects;
 public record PinLedger(String pinId, String indexName, String indexUuid, int shardCount, long createdAtMillis) implements Writeable {
 
     /**
+     * How long an index-wide pin's fan-out is allowed to take before anything is entitled to conclude that
+     * the pins it names do not exist.
+     *
+     * <p>Lives here rather than on the transport action that stamps it because two independent parties need
+     * the same number: the action, which gives each provisional pin this expiry, and {@link
+     * PinLedgerSweeper}, which must not delete a ledger written moments ago by a fan-out that has not
+     * reached shard 0 yet. Without the second use, a sweep landing between "ledger written" and "first pin
+     * taken" saw no live pin anywhere, concluded the pin had been released, and deleted the only record of a
+     * 200-shard pin that then completed successfully -- leaving pins nothing could enumerate, which is
+     * precisely the condition this record exists to prevent.
+     *
+     * <p>Ten minutes: long enough that a slow but healthy fan-out finishes well inside it, short enough that
+     * an abandoned one does not hold storage meaningfully longer than the operation itself would have.
+     */
+    public static final long UNCONFIRMED_PIN_TTL_MILLIS = 10 * 60 * 1000L;
+
+    /**
      * Creates a ledger entry.
      *
      * @param pinId          the pin id every shard's {@link PinRecord} was written under.

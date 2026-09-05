@@ -94,11 +94,24 @@ public class GcBundleSafetyPropertyFuzzTests extends OpenSearchTestCase {
             retentionWindowMillis,
             manifestStore,
             bundleStore,
-            pinRegistry
+            pinRegistry,
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(container),
+            new BlobContainerGcSweepStateStore(container, INDEX_UUID, SHARD_ID)
         );
         ThreadPool threadPool = new TestThreadPool(getTestName());
         try {
-            GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
+            // Zero skew allowance: this fuzz publishes with the same clock it sweeps with, so the
+            // cross-node margin would simply push every generation out of reach of the sweep and the
+            // property would stop being exercised at all.
+            GcSchedulerTask task = new GcSchedulerTask(
+                threadPool,
+                config.interval(),
+                INDEX_UUID,
+                SHARD_ID,
+                config,
+                () -> clockMillis[0],
+                0L
+            );
             try {
                 long nextGeneration = 1;
                 List<PinRecord> activePins = new ArrayList<>();
@@ -106,13 +119,13 @@ public class GcBundleSafetyPropertyFuzzTests extends OpenSearchTestCase {
 
                 // Always start with at least one manifest -- an empty store has nothing for the
                 // invariant check to verify and every action below assumes at least one exists.
-                nextGeneration = publish(bundleStore, manifestStore, nextGeneration, clockMillis[0]);
+                nextGeneration = publish(bundleStore, manifestStore, container, nextGeneration, clockMillis[0]);
                 assertSafetyInvariant(manifestStore, bundleStore, pinRegistry);
 
                 for (int step = 0; step < steps; step++) {
                     int action = random.nextInt(5);
                     switch (action) {
-                        case 0 -> nextGeneration = publish(bundleStore, manifestStore, nextGeneration, clockMillis[0]);
+                        case 0 -> nextGeneration = publish(bundleStore, manifestStore, container, nextGeneration, clockMillis[0]);
                         case 1 -> task.sweepForTesting();
                         case 2 -> {
                             List<CommitManifest> current = manifestStore.listManifests();
@@ -150,6 +163,7 @@ public class GcBundleSafetyPropertyFuzzTests extends OpenSearchTestCase {
     private static long publish(
         BlobContainerBundleStore bundleStore,
         BlobContainerManifestStore manifestStore,
+        BlobContainer container,
         long generation,
         long createdAtMillis
     ) throws Exception {
@@ -172,6 +186,10 @@ public class GcBundleSafetyPropertyFuzzTests extends OpenSearchTestCase {
             createdAtMillis
         );
         manifestStore.writeManifest(manifest);
+        // A publication is the manifest write AND the head CAS. The sweep anchors on the head, so a fuzz
+        // step that wrote only the blob would be generating unpublished orphans rather than the commit
+        // history this property is about.
+        TestShardHeads.publish(container, INDEX_UUID, SHARD_ID, PRIMARY_TERM, generation);
         return generation + 1;
     }
 

@@ -100,6 +100,25 @@ public final class AffinityForwardingActionFilter implements ActionFilter {
     private static final String FORWARDED_MARKER_KEY = "serverless_storage_affinity_forwarded";
 
     /**
+     * The cross-node half of the loop guard.
+     *
+     * <p><b>Finding R-14.</b> {@link #FORWARDED_MARKER_KEY} is a {@code ThreadContext}
+     * <em>transient</em>, and {@code ThreadContext}'s wire serialisation writes {@code requestHeaders}
+     * only -- transients never travel. The receiving node also sees a deserialised <em>copy</em> of
+     * the request, so an {@code IdentityHashMap}-backed set could not have matched it even if the
+     * transient had crossed. Node B therefore started with an empty marker set and re-resolved the
+     * affinity target from its own cluster state; if A and B disagreed (a node joining or leaving, a
+     * lagging cluster-state apply), {@code CoordinatorAffinityRouting.getAffinityNode} could answer
+     * "A" on B, producing A -&gt; B -&gt; A and repeating on every state churn. This class's javadoc
+     * claimed the marker covered "a transient cluster-state disagreement between two nodes' reads",
+     * which is precisely the one case it could not cover.
+     *
+     * <p>A header does travel, so one hop is now genuinely one hop: a request that already carries
+     * this executes locally wherever it lands.
+     */
+    private static final String FORWARDED_HEADER_KEY = "_serverless_storage_affinity_forwarded";
+
+    /**
      * Counts real forward decisions -- incremented at the one place {@code apply} actually commits
      * to sending a request elsewhere, not merely considering it. Exists so a test can assert
      * forwarding genuinely happened rather than only that a request completed correctly, which it
@@ -206,7 +225,13 @@ public final class AffinityForwardingActionFilter implements ActionFilter {
             return;
         }
 
-        Set<Object> forwardedMarker = forwardedMarkerSet(currentThreadPool.getThreadContext());
+        ThreadContext threadContext = currentThreadPool.getThreadContext();
+        if (threadContext.getHeader(FORWARDED_HEADER_KEY) != null) {
+            // Already forwarded once, by some other node. Execute here (finding R-14).
+            chain.proceed(task, action, request, listener);
+            return;
+        }
+        Set<Object> forwardedMarker = forwardedMarkerSet(threadContext);
         if (forwardedMarker.contains(request)) {
             chain.proceed(task, action, request, listener);
             return;
@@ -239,39 +264,101 @@ public final class AffinityForwardingActionFilter implements ActionFilter {
             forwardedMarker.add(request);
             FORWARD_COUNT.incrementAndGet();
             boolean currentStrict = strict;
-            currentTransportService.sendRequest(affinityNode, action, request, new TransportResponseHandler<TransportResponse>() {
-                @Override
-                public TransportResponse read(StreamInput in) throws IOException {
-                    return reader.read(in);
-                }
+            // The header is written into a stored-and-restored context so it applies to this one
+            // outgoing request and does not leak into anything else this thread goes on to do
+            // (finding R-14).
+            try (ThreadContext.StoredContext ignored = threadContext.newStoredContext(true)) {
+                threadContext.putHeader(FORWARDED_HEADER_KEY, "true");
+                currentTransportService.sendRequest(affinityNode, action, request, new TransportResponseHandler<TransportResponse>() {
+                    @Override
+                    public TransportResponse read(StreamInput in) throws IOException {
+                        return reader.read(in);
+                    }
 
-                @Override
-                @SuppressWarnings("unchecked")
-                public void handleResponse(TransportResponse response) {
-                    listener.onResponse((Response) response);
-                }
+                    @Override
+                    @SuppressWarnings("unchecked")
+                    public void handleResponse(TransportResponse response) {
+                        listener.onResponse((Response) response);
+                    }
 
-                @Override
-                public void handleException(TransportException exp) {
-                    if (currentStrict) {
-                        listener.onFailure(exp);
-                    } else {
+                    @Override
+                    public void handleException(TransportException exp) {
+                        // Finding R-13. This used to fall back to local execution for any transport
+                        // failure whenever strict was off, which is data corruption for a mutating
+                        // action: handleException cannot distinguish "never dispatched" from "executed
+                        // remotely, response lost". A 1,000-document auto-id bulk forwarded to the
+                        // affinity node, applied there, then losing its connection yields a
+                        // NodeDisconnectedException -- and re-running the whole bulk locally writes 1,000
+                        // duplicate documents. With explicit ids it produces spurious version conflicts
+                        // instead. Neither is acceptable, and neither is visible to the caller.
+                        //
+                        // Two rules now. A mutating action never retries, whatever strict says: the
+                        // exception is surfaced and the client decides, which is what it would have to do
+                        // for any other partial-failure bulk anyway. A read-only action retries only for
+                        // exceptions raised *before* the request could have been executed remotely -- a
+                        // connection that was never established. Anything else (a disconnect mid-flight,
+                        // a timeout, a remote failure) is surfaced too, because it might have run.
+                        if (currentStrict || isMutating(action) || raisedBeforeDispatch(exp) == false) {
+                            listener.onFailure(exp);
+                            return;
+                        }
                         logger.debug(
-                            "forward to affinity node [{}] failed for [{}], falling back to local execution: {}",
+                            "forward to affinity node [{}] failed for read-only action [{}] before dispatch, falling back to local "
+                                + "execution: {}",
                             affinityNode.getId(),
                             action,
                             exp.toString()
                         );
-                        chain.proceed(task, action, request, listener);
+                        // Finding R-13, second half: this used to run on the transport worker thread,
+                        // because executor() below is SAME -- so a full search or bulk was executed on a
+                        // thread whose only job is moving bytes. The success path already hops to GENERIC.
+                        currentThreadPool.executor(ThreadPool.Names.GENERIC).execute(() -> chain.proceed(task, action, request, listener));
                     }
-                }
 
-                @Override
-                public String executor() {
-                    return ThreadPool.Names.SAME;
-                }
-            });
+                    @Override
+                    public String executor() {
+                        return ThreadPool.Names.SAME;
+                    }
+                });
+            }
         });
+    }
+
+    /**
+     * Whether {@code action} can change data, and therefore must never be retried after a transport
+     * failure whose outcome is unknown (finding R-13).
+     */
+    private static boolean isMutating(String action) {
+        return BulkAction.NAME.equals(action);
+    }
+
+    /**
+     * Whether {@code exp} was necessarily raised before the request could have reached the remote
+     * node, making a local retry safe even for a read.
+     *
+     * <p>Only connection-establishment failures qualify. A disconnect, a timeout, or a remote
+     * exception all leave open the possibility that the request ran, so they are surfaced rather
+     * than retried -- for a read that is merely a lost optimisation, and the alternative is guessing.
+     *
+     * <p>{@code NodeDisconnectedException} is checked <em>first</em> and rejected precisely because
+     * it extends {@code ConnectTransportException}: a connection lost while the request was in
+     * flight is the single most likely way an already-executed request looks like a failure, so
+     * accepting it via the superclass check would reintroduce the bug this method exists to prevent.
+     */
+    private static boolean raisedBeforeDispatch(TransportException exp) {
+        for (Throwable cause = exp; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.opensearch.transport.NodeDisconnectedException) {
+                return false;
+            }
+            if (cause instanceof org.opensearch.transport.NodeNotConnectedException
+                || cause instanceof org.opensearch.transport.ConnectTransportException) {
+                return true;
+            }
+            if (cause == cause.getCause()) {
+                break;
+            }
+        }
+        return false;
     }
 
     /** A {@link org.opensearch.core.common.io.stream.Writeable.Reader}, named so the cast above reads clearly. */

@@ -66,6 +66,15 @@ import java.util.Optional;
  * just-read generation, a sweep deletes it, and the pin that arrives moments later protects
  * bundles already gone) and whose {@code ...Fixed} property HOLDS exhaustively for this ordering.
  *
+ * <p><b>A chain is pinned at every hop, and deleting its middle hands the chain down rather than cutting
+ * it.</b> Cloning a clone is supported on the read path (see {@link #resolveLineageChain}) and used to be
+ * broken on the lifecycle path: C's files physically live in A's bundles, C pinned only B, and deleting B
+ * both removed A's only pin and deleted B's lineage record, so C lost its data and its way of finding it in
+ * the same operation. {@link #clone} now pins every ancestor when given a resolver, {@link #deleteClone}
+ * transfers a dependant's pin to the next hop before releasing its own, and neither deletes a lineage
+ * record. {@code formal/CloneGc.tla} models one hop only; the chain case is argued in those methods' own
+ * javadoc rather than model-checked.
+ *
  * <p>{@link #deleteClone} also now fires automatically: {@code
  * ServerlessStoragePlugin#onIndexModule} registers an {@code IndexEventListener} that calls it on
  * {@code afterIndexRemoved(..., IndexRemovalReason.DELETED)} -- see that method's own javadoc for
@@ -251,6 +260,78 @@ public final class ShardCloner {
         CheckedRunnable<IOException> beforeActivation,
         CheckedRunnable<IOException> rollbackBeforeActivation
     ) throws IOException {
+        clone(
+            sourceIndexUuid,
+            sourceShardId,
+            sourceManifestStore,
+            sourceShardStateStore,
+            sourcePinRegistry,
+            targetIndexUuid,
+            targetShardId,
+            targetManifestStore,
+            targetShardStateStore,
+            targetLineageStore,
+            nowMillis,
+            beforeActivation,
+            rollbackBeforeActivation,
+            null
+        );
+    }
+
+    /**
+     * Same as the thirteen-argument overload, with one addition: {@code ancestorResolver}, which lets this
+     * call pin <em>every</em> shard in the source's own clone lineage rather than only the source itself.
+     *
+     * <h4>Why the extra hops matter</h4>
+     *
+     * A pure clone writes no bundles of its own -- its manifest is a copy of its source's file map. So a
+     * clone of a clone (C from B from A) has a manifest naming files that physically live in A's bundles,
+     * while nothing pins A on C's behalf. Deleting the middle index B then removed the only pin A carried,
+     * A's own sweep found its generation superseded and unpinned, and deleted the manifest and the bundles
+     * C was still reading from. {@code formal/CloneGc.tla} models a single hop and so does not cover this;
+     * the chain case is what this parameter closes.
+     *
+     * <p>{@code null} means "pin only the immediate source", which is correct whenever the source is known
+     * to be an original and is what the shorter overloads pass. It is not silently unsafe for the others:
+     * {@link #deleteClone(String, int, BlobContainerCloneLineageStore, java.util.function.BiFunction,
+     * ContainerResolver)} transfers a still-live clone pin down to the next hop before releasing its own, so
+     * a chain built without a resolver is still not severed by deleting its middle. Supplying the resolver
+     * is nonetheless better: it closes the narrow race where the middle index is deleted at the same moment
+     * a new clone of it is being taken.
+     *
+     * @param sourceIndexUuid the index being cloned from; must already have a published manifest.
+     * @param sourceShardId the shard number within {@code sourceIndexUuid}.
+     * @param sourceManifestStore where the source shard's manifests live.
+     * @param sourceShardStateStore where the source shard's head lives.
+     * @param sourcePinRegistry the source shard's durable pin registry, protected via this call.
+     * @param targetIndexUuid the brand-new index the clone creates.
+     * @param targetShardId the shard number within {@code targetIndexUuid}.
+     * @param targetManifestStore where the target shard's new manifest is written.
+     * @param targetShardStateStore where the target shard's new head is published.
+     * @param targetLineageStore where the target shard's {@link CloneLineage} is recorded.
+     * @param nowMillis the target manifest's {@link CommitManifest#createdAtMillis()}.
+     * @param beforeActivation run after the manifest write, before the head CAS; {@code null} for none.
+     * @param rollbackBeforeActivation this attempt's own undo of {@code beforeActivation}; {@code null} for none.
+     * @param ancestorResolver resolves any shard's own container, so the source's lineage chain can be
+     *                         walked and pinned at every hop; {@code null} to pin only the immediate source.
+     * @throws IOException if the source has no published manifest, or the target already does.
+     */
+    public static void clone(
+        String sourceIndexUuid,
+        int sourceShardId,
+        BlobContainerManifestStore sourceManifestStore,
+        ShardStateStore sourceShardStateStore,
+        DurablePinRegistry sourcePinRegistry,
+        String targetIndexUuid,
+        int targetShardId,
+        BlobContainerManifestStore targetManifestStore,
+        ShardStateStore targetShardStateStore,
+        BlobContainerCloneLineageStore targetLineageStore,
+        long nowMillis,
+        CheckedRunnable<IOException> beforeActivation,
+        CheckedRunnable<IOException> rollbackBeforeActivation,
+        ContainerResolver ancestorResolver
+    ) throws IOException {
         // Fails with a specific, actionable message for a PRIOR, different-source clone attempt's
         // still-present lineage (e.g. one that pinned its source but then lost the head CAS below
         // and was never cleaned up -- see this method's own catch block below, which now handles
@@ -299,6 +380,15 @@ public final class ShardCloner {
         // ordering is shown to hold across the complete reachable state space for that model.
         PinRecord pin = new PinRecord(clonePinId(targetIndexUuid, targetShardId), head.primaryTerm(), head.latestManifestGeneration());
         sourcePinRegistry.addPin(sourceIndexUuid, sourceShardId, pin);
+
+        // The immediate source is not necessarily where the bytes are. Cloning a clone is supported (see
+        // resolveLineageChain), and a pure clone writes no bundles of its own: C's manifest is a copy of B's
+        // file map, which is a copy of A's, so C's segments physically live in A's bundles while C pins only
+        // B. Deleting B then released the only pin A had and A's own sweep deleted the bytes C was reading.
+        // Pinning every hop closes that -- and it is deliberately done here, before the manifest read below,
+        // for exactly the reason the immediate pin is: a pin that arrives after the read protects whatever
+        // is left, not what was read.
+        List<PinnedAncestor> pinnedAncestors = pinAncestors(sourceIndexUuid, sourceShardId, ancestorResolver, pin);
 
         // Every step from here through the head CAS is wrapped in one try/catch: a failure anywhere
         // in this range rolls back everything THIS call itself durably wrote, tracked explicitly per
@@ -400,6 +490,17 @@ public final class ShardCloner {
             } catch (IOException | RuntimeException rollbackFailure) {
                 e.addSuppressed(rollbackFailure);
             }
+            // Same exact-match reasoning as the immediate pin above, applied to each ancestor hop this
+            // attempt pinned. Only hops recorded as actually pinned are undone, so a failure partway
+            // through pinAncestors leaves the remaining ancestors untouched rather than removing a pin this
+            // attempt never placed.
+            for (PinnedAncestor ancestor : pinnedAncestors) {
+                try {
+                    ancestor.pinRegistry().removePin(ancestor.indexUuid(), ancestor.shardId(), ancestor.pin());
+                } catch (IOException | RuntimeException rollbackFailure) {
+                    e.addSuppressed(rollbackFailure);
+                }
+            }
             // Rolls back the manifest unconditionally once manifestWritten is true: since
             // writeManifest is write-once (same as writeLineage), this call succeeding at all means
             // no one else's content could be at that exact name, so nothing else could need
@@ -451,6 +552,79 @@ public final class ShardCloner {
         }
     }
 
+    /** One hop of the source's lineage that {@link #clone} pinned, kept so a failed attempt can undo exactly what it did. */
+    private record PinnedAncestor(String indexUuid, int shardId, DurablePinRegistry pinRegistry, PinRecord pin) {
+    }
+
+    /**
+     * Pins the clone's generation on every shard in the source's own lineage chain, beyond the immediate
+     * source, so the physical bundles the clone will read stay pinned wherever they actually live.
+     *
+     * <p>Each hop is pinned at <em>that hop's own head generation</em>, not the source's: a shard's manifest
+     * numbering is its own, and the generation of A that B's files came from is recorded in A's pin from B,
+     * not in B's head. Using each hop's current head is the conservative reading -- it can pin a generation
+     * newer than strictly required (A may have committed since B cloned it), which retains slightly more
+     * than necessary and never less.
+     *
+     * @param sourceIndexUuid the immediate source, whose lineage is walked.
+     * @param sourceShardId the shard number within it.
+     * @param ancestorResolver resolves each hop's container; {@code null} disables ancestor pinning entirely.
+     * @param pin the clone's pin, whose {@code pinId} is reused at every hop so {@link #deleteClone} can
+     *            remove them all by that one id.
+     * @return the hops actually pinned, in the order they were pinned.
+     */
+    private static List<PinnedAncestor> pinAncestors(
+        String sourceIndexUuid,
+        int sourceShardId,
+        ContainerResolver ancestorResolver,
+        PinRecord pin
+    ) throws IOException {
+        List<PinnedAncestor> pinned = new ArrayList<>();
+        if (ancestorResolver == null) {
+            return pinned;
+        }
+        String currentIndexUuid = sourceIndexUuid;
+        int currentShardId = sourceShardId;
+        for (int hop = 0; hop < MAX_LINEAGE_CHAIN_DEPTH; hop++) {
+            BlobContainer currentContainer = ancestorResolver.resolve(currentIndexUuid, currentShardId);
+            Optional<CloneLineage> lineage = new BlobContainerCloneLineageStore(currentContainer).readLineage();
+            if (lineage.isEmpty()) {
+                return pinned; // reached a genuine original -- nothing further back to protect
+            }
+            currentIndexUuid = lineage.get().sourceIndexUuid();
+            currentShardId = lineage.get().sourceShardId();
+            BlobContainer ancestorContainer = ancestorResolver.resolve(currentIndexUuid, currentShardId);
+            Optional<VersionedShardHead> ancestorHead = new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(
+                ancestorContainer
+            ).get(currentIndexUuid, currentShardId);
+            if (ancestorHead.isEmpty() || ancestorHead.get().head().latestManifestGeneration() == 0) {
+                // An ancestor with no published head has no generation to pin. That is not a reason to fail
+                // the clone -- there is nothing there for GC to delete either -- so record nothing and
+                // keep walking.
+                continue;
+            }
+            DurablePinRegistry ancestorPinRegistry = new org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry(
+                ancestorContainer
+            );
+            PinRecord ancestorPin = new PinRecord(
+                pin.pinId(),
+                ancestorHead.get().head().primaryTerm(),
+                ancestorHead.get().head().latestManifestGeneration()
+            );
+            ancestorPinRegistry.addPin(currentIndexUuid, currentShardId, ancestorPin);
+            pinned.add(new PinnedAncestor(currentIndexUuid, currentShardId, ancestorPinRegistry, ancestorPin));
+        }
+        throw new IOException(
+            "clone lineage chain starting at "
+                + sourceIndexUuid
+                + "/"
+                + sourceShardId
+                + " exceeded "
+                + MAX_LINEAGE_CHAIN_DEPTH
+                + " hops -- refusing to follow a likely-corrupted or cyclic lineage record"
+        );
+    }
+
     /**
      * The {@link PinRecord#pinId()} a clone of {@code (targetIndexUuid, targetShardId)} registers
      * on its source -- stable and derivable from the target's identity alone, so {@link
@@ -461,8 +635,15 @@ public final class ShardCloner {
      * @param targetShardId the shard number within {@code targetIndexUuid}.
      */
     public static String clonePinId(String targetIndexUuid, int targetShardId) {
-        return "clone:" + targetIndexUuid + ":" + targetShardId;
+        return CLONE_PIN_ID_PREFIX + targetIndexUuid + ":" + targetShardId;
     }
+
+    /**
+     * The prefix every clone pin id carries. Public so the snapshot-pin request validation can refuse it as
+     * a reserved namespace: a caller allowed to name a snapshot {@code clone:<uuid>:0} could remove a live
+     * clone's only protection through the ordinary release endpoint.
+     */
+    public static final String CLONE_PIN_ID_PREFIX = "clone:";
 
     /**
      * Releases exactly the pin {@link #clone} placed on the source shard for this clone, using
@@ -472,9 +653,11 @@ public final class ShardCloner {
      * previous call) -- idempotent, safe to call more than once or speculatively.
      *
      * <p>Does not touch the target's own manifest or head -- deleting <em>those</em> (the actual
-     * index deletion) is the caller's separate responsibility; this method only ever releases the
-     * source-side pin and the lineage record that pointed to it. Deliberately not wired to any
-     * automatic index-deletion hook yet -- see this class's own javadoc.
+     * index deletion) is the caller's separate responsibility; this method only ever releases pins. It
+     * deliberately leaves the {@link CloneLineage} record in place: a clone of this clone resolves its
+     * inherited files by walking through this shard, and deleting the record severed that walk at a shard
+     * that holds no bundles of its own, making every inherited read fail. Before releasing, it hands any
+     * such dependant's pin down to this shard's own source, so the chain is protected at every instant.
      *
      * @param targetIndexUuid the (possibly former) clone's index.
      * @param targetShardId the shard number within {@code targetIndexUuid}.
@@ -493,20 +676,129 @@ public final class ShardCloner {
         BlobContainerCloneLineageStore targetLineageStore,
         java.util.function.BiFunction<String, Integer, DurablePinRegistry> sourcePinRegistryResolver
     ) throws IOException {
+        deleteClone(targetIndexUuid, targetShardId, targetLineageStore, sourcePinRegistryResolver, null);
+    }
+
+    /**
+     * Same as the four-argument overload, plus the container resolver needed to walk the whole lineage
+     * chain rather than only its first hop -- which is what {@link #clone} pins when it is given one.
+     *
+     * @param targetIndexUuid the (possibly former) clone's index.
+     * @param targetShardId the shard number within {@code targetIndexUuid}.
+     * @param targetLineageStore where this shard's {@link CloneLineage} is recorded, if any.
+     * @param sourcePinRegistryResolver resolves any shard's own {@link DurablePinRegistry}.
+     * @param chainResolver resolves any shard's own container, so the lineage chain past the immediate
+     *                      source can be walked; {@code null} releases the immediate source's pin only,
+     *                      which is still correct because the transfer below runs either way.
+     */
+    public static void deleteClone(
+        String targetIndexUuid,
+        int targetShardId,
+        BlobContainerCloneLineageStore targetLineageStore,
+        java.util.function.BiFunction<String, Integer, DurablePinRegistry> sourcePinRegistryResolver,
+        ContainerResolver chainResolver
+    ) throws IOException {
         Optional<CloneLineage> lineage = targetLineageStore.readLineage();
         if (lineage.isEmpty()) {
             return;
         }
-        DurablePinRegistry sourcePinRegistry = sourcePinRegistryResolver.apply(
-            lineage.get().sourceIndexUuid(),
-            lineage.get().sourceShardId()
-        );
-        sourcePinRegistry.removePin(
-            lineage.get().sourceIndexUuid(),
-            lineage.get().sourceShardId(),
-            clonePinId(targetIndexUuid, targetShardId)
-        );
-        targetLineageStore.deleteLineage();
+        String sourceIndexUuid = lineage.get().sourceIndexUuid();
+        int sourceShardId = lineage.get().sourceShardId();
+        String pinId = clonePinId(targetIndexUuid, targetShardId);
+        DurablePinRegistry sourcePinRegistry = sourcePinRegistryResolver.apply(sourceIndexUuid, sourceShardId);
+
+        // BEFORE releasing anything: hand this shard's own dependants down to its source.
+        //
+        // A clone of this clone holds its files by pinning THIS shard, but a pure clone stores no bundles
+        // of its own -- the bytes live further back in the chain. Releasing this shard's pin without doing
+        // anything else therefore unpins, on the shard that actually holds the data, the last thing
+        // protecting a grandchild that is still very much alive. Transferring first means the chain is
+        // never, at any instant, unprotected: the source gains the grandchild's pin before it loses this
+        // one, so a sweep that runs in between over-retains rather than under-retains.
+        transferDependantPins(targetIndexUuid, targetShardId, sourceIndexUuid, sourceShardId, sourcePinRegistry, sourcePinRegistryResolver);
+
+        sourcePinRegistry.removePin(sourceIndexUuid, sourceShardId, pinId);
+
+        // The rest of the chain, for a clone taken with an ancestor resolver: clone() pinned every hop under
+        // this same pin id, so every hop has to be released under it too. Walking with the resolver rather
+        // than assuming a single hop is what keeps that symmetric.
+        if (chainResolver != null) {
+            String hopIndexUuid = sourceIndexUuid;
+            int hopShardId = sourceShardId;
+            for (int hop = 0; hop < MAX_LINEAGE_CHAIN_DEPTH; hop++) {
+                Optional<CloneLineage> hopLineage = new BlobContainerCloneLineageStore(chainResolver.resolve(hopIndexUuid, hopShardId))
+                    .readLineage();
+                if (hopLineage.isEmpty()) {
+                    break;
+                }
+                hopIndexUuid = hopLineage.get().sourceIndexUuid();
+                hopShardId = hopLineage.get().sourceShardId();
+                sourcePinRegistryResolver.apply(hopIndexUuid, hopShardId).removePin(hopIndexUuid, hopShardId, pinId);
+            }
+        }
+
+        // The lineage record is deliberately NOT deleted, and that is the other half of this fix.
+        //
+        // It is one tiny blob and it is the only thing that makes the chain walkable: a clone of this clone
+        // resolves its inherited files by walking grandchild -> this shard -> source, and deleting this
+        // record stopped that walk dead at a shard holding no bundles at all, so every inherited file read
+        // failed with NoSuchFileException on the next engine open. Deleting it bought nothing -- release is
+        // by pin id, which the record is not needed to compute -- and cost exactly that. Keeping it also
+        // makes repeated calls here harmlessly idempotent in the same way they already were: the pin
+        // removals below are all no-ops the second time.
+    }
+
+    /**
+     * Re-pins, on {@code sourceIndexUuid}/{@code sourceShardId}, every clone that currently pins
+     * {@code targetIndexUuid}/{@code targetShardId} -- so deleting the middle of a chain hands the
+     * grandchildren down rather than dropping them.
+     *
+     * <p>The generation each transferred pin names is the one this shard's own pin on the source names,
+     * because that is precisely the source generation this shard's files were copied from and therefore the
+     * one its own dependants are transitively reading. Read from the source's registry rather than from the
+     * source's head: the head has moved on since the clone was taken, and pinning today's head would protect
+     * the wrong generation.
+     */
+    private static void transferDependantPins(
+        String targetIndexUuid,
+        int targetShardId,
+        String sourceIndexUuid,
+        int sourceShardId,
+        DurablePinRegistry sourcePinRegistry,
+        java.util.function.BiFunction<String, Integer, DurablePinRegistry> sourcePinRegistryResolver
+    ) throws IOException {
+        DurablePinRegistry ownPinRegistry;
+        try {
+            ownPinRegistry = sourcePinRegistryResolver.apply(targetIndexUuid, targetShardId);
+        } catch (RuntimeException unresolvable) {
+            // A caller whose resolver only knows how to reach the source (older wiring) cannot answer this
+            // question. Failing the whole delete over it would leave the pin held forever, which is the
+            // worse of the two outcomes, so the transfer is skipped and the ordinary release proceeds.
+            return;
+        }
+        if (ownPinRegistry == null) {
+            return;
+        }
+        PinRecord ownPinOnSource = null;
+        String ownPinId = clonePinId(targetIndexUuid, targetShardId);
+        for (PinRecord pin : sourcePinRegistry.getPins(sourceIndexUuid, sourceShardId)) {
+            if (pin.pinId().equals(ownPinId)) {
+                ownPinOnSource = pin;
+                break;
+            }
+        }
+        if (ownPinOnSource == null) {
+            return; // nothing of this shard's own is held on the source, so there is nothing to hand down
+        }
+        for (PinRecord dependant : ownPinRegistry.getPins(targetIndexUuid, targetShardId)) {
+            if (dependant.pinId().startsWith(CLONE_PIN_ID_PREFIX) && dependant.pinId().equals(ownPinId) == false) {
+                sourcePinRegistry.addPin(
+                    sourceIndexUuid,
+                    sourceShardId,
+                    new PinRecord(dependant.pinId(), ownPinOnSource.primaryTerm(), ownPinOnSource.generation())
+                );
+            }
+        }
     }
 
     /** A defensive bound on how many hops {@link #resolveLineageChain} will follow, guarding against a corrupted/cyclic lineage record. */

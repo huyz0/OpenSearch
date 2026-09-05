@@ -81,6 +81,32 @@ public final class DrainCoordinator {
     public static Set<String> currentlyExcludedNames(ClusterState state) {
         String transientValue = state.metadata().transientSettings().get(EXCLUDE_NAME_SETTING_KEY);
         String value = transientValue != null ? transientValue : state.metadata().persistentSettings().get(EXCLUDE_NAME_SETTING_KEY);
+        return splitNames(value);
+    }
+
+    /**
+     * The excluded names written by this coordinator, i.e. the transient setting only.
+     *
+     * <p>Deliberately separate from {@link #currentlyExcludedNames}: that method answers "what is
+     * excluded right now", including an operator's persistent exclusions, which is what a reporting
+     * or sweeping caller wants. This one answers "what did we write", which is the only correct
+     * basis for a read-modify-write against a key we only ever write transiently -- see {@link
+     * #mutateExcludeNames} (finding N-7).
+     *
+     * @param state the cluster state to read from.
+     */
+    static Set<String> transientExcludedNames(ClusterState state) {
+        return splitNames(state.metadata().transientSettings().get(EXCLUDE_NAME_SETTING_KEY));
+    }
+
+    /**
+     * Splits a comma-joined node-name list.
+     *
+     * <p>Node names containing a comma are rejected on the write path rather than mangled here (see
+     * {@link #drain}, finding N-10): a name with a comma in it would otherwise split into two bogus
+     * names, each of which the hygiene sweep would then find "stale" and try to remove, every tick.
+     */
+    private static Set<String> splitNames(String value) {
         if (value == null || value.isEmpty()) {
             return Set.of();
         }
@@ -94,6 +120,24 @@ public final class DrainCoordinator {
      * @param listener completed once the mutation either applies or fails.
      */
     public void drain(String nodeName, ActionListener<Void> listener) {
+        // Finding N-10: the exclude list is a comma-joined string with no escaping, so a name
+        // containing a comma would be stored and then read back as two different, bogus names --
+        // neither of which matches a live node, so the hygiene sweep would try to remove them on
+        // every tick, forever, while the node the operator asked to drain was never actually
+        // excluded. Refusing the name up front is the only honest answer: there is no encoding that
+        // makes it work without changing the format core itself reads.
+        if (nodeName != null && nodeName.indexOf(',') >= 0) {
+            listener.onFailure(
+                new IllegalArgumentException(
+                    "cannot drain node ["
+                        + nodeName
+                        + "]: node names containing a comma cannot be represented in "
+                        + EXCLUDE_NAME_SETTING_KEY
+                        + ", which is a comma-separated list with no escaping"
+                )
+            );
+            return;
+        }
         // Already draining is not special-cased: the task still runs and still acks, so the caller
         // gets a real ack either way rather than a distinct "already draining" response shape it
         // would have to handle separately -- it just ends up a no-op state update.
@@ -132,9 +176,30 @@ public final class DrainCoordinator {
         clusterService.submitStateUpdateTask("serverless-storage-mutate-drain-exclude-names", new ClusterStateUpdateTask(Priority.NORMAL) {
             @Override
             public ClusterState execute(ClusterState currentState) {
-                Set<String> names = new LinkedHashSet<>(currentlyExcludedNames(currentState));
+                // Finding N-7. This used to read and compare against currentlyExcludedNames(), which
+                // falls back to the *persistent* setting when no transient one exists -- while the
+                // write below only ever touches the transient one. That asymmetry produced an
+                // infinite publication loop on a perfectly healthy cluster: with an operator's
+                // persistent exclude of a node that has since left, the hygiene sweep resolved
+                // {old-node} through the persistent fallback, found it stale, and called in here;
+                // the mutation produced {}, which did not equal {old-node}, so this proceeded;
+                // removing a transient key that was never present changed nothing, but returned a
+                // newly constructed ClusterState -- and MasterService publishes on reference
+                // inequality. One full cluster-state publication and one full reroute, every eval
+                // tick, forever. The next tick read the same unchanged persistent value.
+                //
+                // The same asymmetry had a second consequence: cancelling the last transient drain
+                // removed the key outright, silently resurrecting any persistent exclusions, while
+                // the API reported the drain cancelled.
+                //
+                // So the read-modify-write is now transient-only and self-consistent. The persistent
+                // fallback stays in currentlyExcludedNames(), which is the read-only reporting path
+                // where "what is actually excluded right now" is the correct answer.
+                Set<String> current = transientExcludedNames(currentState);
+                Set<String> names = new LinkedHashSet<>(current);
                 mutation.accept(names);
-                if (names.equals(currentlyExcludedNames(currentState))) {
+                if (names.equals(current)) {
+                    // The *same* reference, so MasterService does not publish a no-op state.
                     return currentState;
                 }
                 Settings.Builder transientSettings = Settings.builder().put(currentState.metadata().transientSettings());

@@ -27,9 +27,20 @@ public class StatsProjectingMappingStoreTests extends OpenSearchTestCase {
     /** Runs inline, so the assertions do not have to wait for a pool. */
     private static final Executor DIRECT = Runnable::run;
 
-    /** Records what it was asked to do, and can be told to refuse or to throw. */
+    /**
+     * Records what it was asked to do, and can be told to refuse or to throw.
+     *
+     * <p><b>The call list is synchronized, and that is not defensive tidying.</b> Two tests here submit
+     * projections to a real thread pool and then count what arrived: the four admitted projections in
+     * {@code testTheDrainDoesNotWaitForProjectionsThatWereNeverSubmitted} all resume together the instant
+     * the release latch drops, so they append to this list concurrently. A plain {@code ArrayList} loses an
+     * append under that -- two threads read the same size, write the same slot, and one element vanishes --
+     * which surfaced as "expected 4 but was 3" on a loaded machine and passes on an idle one. A test double
+     * that is only correct when the code under test is single-threaded cannot measure concurrency, and this
+     * one is measuring exactly that.
+     */
     private static final class RecordingStore implements MappingGenerationStore.Store {
-        private final List<String> calls = new ArrayList<>();
+        private final List<String> calls = java.util.Collections.synchronizedList(new ArrayList<>());
         private MappingGenerationStore.MappingGeneration readAnswer;
         private boolean swapAnswer = true;
         private RuntimeException failure;

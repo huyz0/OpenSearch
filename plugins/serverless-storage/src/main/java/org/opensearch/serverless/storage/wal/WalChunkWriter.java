@@ -26,7 +26,7 @@ import java.util.zip.CheckedOutputStream;
  * <p>Wire format (big-endian):
  * <pre>
  *   magic          4 bytes   = 'W','C','H','1'
- *   formatVersion  4 bytes   int, currently 2
+ *   formatVersion  4 bytes   int, currently 3
  *   recordCount    4 bytes   int
  *   record[0..n)             repeated recordCount times, in append order:
  *     indexUuidLen 2 bytes   unsigned short
@@ -39,11 +39,27 @@ import java.util.zip.CheckedOutputStream;
  *     payload      variable  raw bytes (opaque -- possibly per-record ciphertext)
  *   chunkChecksum  8 bytes   long, CRC32C of every byte written above
  * </pre>
+ *
+ * <p><b>Version history.</b> Version 2 added {@code primaryTerm} (see {@link WalRecord}'s own
+ * javadoc for why fencing needs it under a shared, node-level writer epoch). Version 3 changed
+ * nothing about the layout above but changed how an <em>encrypted</em> record's payload is produced:
+ * from version 3 the record's own identity ({@code indexUuid}, {@code shardId}, {@code primaryTerm},
+ * {@code seqNo}) is supplied to AES-GCM as associated data, so a ciphertext payload can no longer be
+ * relabelled into another shard or index and replayed -- see {@link WalRecordCrypto}. The bytes are
+ * therefore not interchangeable between 2 and 3 when encryption is on, which is exactly why the
+ * version is bumped and why {@link WalChunkReader} accepts both and reports which one it read: a
+ * silent break here would mean every record written before the upgrade fails to replay, i.e. data
+ * loss on the first crash after a rolling restart.
  */
 public final class WalChunkWriter {
 
     static final byte[] MAGIC = { 'W', 'C', 'H', '1' };
-    static final int FORMAT_VERSION = 2;
+
+    /** The version this writer produces. Readers accept anything in [{@link #MIN_SUPPORTED_FORMAT_VERSION}, this]. */
+    static final int FORMAT_VERSION = 3;
+
+    /** The oldest chunk version {@link WalChunkReader} still reads -- chunks already in the object store when a node upgrades. */
+    static final int MIN_SUPPORTED_FORMAT_VERSION = 2;
 
     private WalChunkWriter() {}
 

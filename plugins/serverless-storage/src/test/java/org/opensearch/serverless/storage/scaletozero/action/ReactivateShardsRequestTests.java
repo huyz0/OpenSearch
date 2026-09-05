@@ -34,6 +34,27 @@ public class ReactivateShardsRequestTests extends OpenSearchTestCase {
         assertEquals(original.reader(), deserialized.reader());
     }
 
+    /**
+     * Finding L-3: the shard set has to survive the wire, because the filter that narrows the scope
+     * runs on the coordinating node and the action that honours it runs on the cluster manager.
+     */
+    public void testShardIdsSurviveSerialization() throws Exception {
+        ReactivateShardsRequest original = new ReactivateShardsRequest("round-trip-index", false, java.util.Set.of(0, 7, 42));
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        original.writeTo(out);
+
+        ReactivateShardsRequest deserialized = new ReactivateShardsRequest(StreamInput.wrap(out.bytes().toBytesRef().bytes));
+        assertEquals(java.util.Set.of(0, 7, 42), deserialized.shardIds());
+    }
+
+    public void testTheDefaultScopeIsTheWholeIndex() {
+        // An empty set means "every suspended shard", which is what a search needs and what any
+        // caller that cannot resolve shards must fall back to.
+        assertTrue(new ReactivateShardsRequest("idx", false).shardIds().isEmpty());
+        assertTrue(new ReactivateShardsRequest("idx", false, null).shardIds().isEmpty());
+    }
+
     public void testSerializationRoundTripForWriterRequest() throws Exception {
         ReactivateShardsRequest original = new ReactivateShardsRequest("round-trip-index", false);
 

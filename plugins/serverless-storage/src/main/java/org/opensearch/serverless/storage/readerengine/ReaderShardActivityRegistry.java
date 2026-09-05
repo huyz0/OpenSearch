@@ -47,6 +47,34 @@ public final class ReaderShardActivityRegistry {
      */
     public void register(String indexUuid, int shardId, ObjectStoreReaderEngine engine) {
         engines.put(key(indexUuid, shardId), new WeakReference<>(engine));
+        // Hand the engine a way back here so it can remove itself the moment it stops being live,
+        // rather than lingering as a stale-but-strongly-reachable entry until the GC happens to
+        // clear the WeakReference. The window matters: between an engine failing and its
+        // WeakReference clearing, every lag/idle/query-rate lookup and every pollNow for this shard
+        // is answered by a dead engine, which is worse than answering "not on this node".
+        engine.attachActivityRegistry(this, indexUuid, shardId);
+    }
+
+    /**
+     * Removes {@code engine}'s entry for (indexUuid, shardId), but only if that is still the
+     * engine registered there.
+     *
+     * <p>Conditional, not an unconditional remove, for the same reason {@code
+     * ShardDirectory#dropIfMatches} is: a shard that relocated away and back, or was closed and
+     * reopened, has already registered a <em>newer</em> engine under this key by the time the old
+     * one gets around to cleaning up, and dropping that would blind every lookup for a shard that
+     * is perfectly healthy.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard number within {@code indexUuid}
+     * @param engine the engine that is no longer live
+     */
+    public void unregister(String indexUuid, int shardId, ObjectStoreReaderEngine engine) {
+        String mapKey = key(indexUuid, shardId);
+        WeakReference<ObjectStoreReaderEngine> current = engines.get(mapKey);
+        if (current != null && current.get() == engine) {
+            engines.remove(mapKey, current);
+        }
     }
 
     /**

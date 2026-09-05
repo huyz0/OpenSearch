@@ -24,12 +24,14 @@ import java.io.IOException;
  * ever returned via a successful listener callback for the stages that did complete, or omitted
  * entirely in favor of {@code onFailure} once a stage can't proceed.
  *
- * <p>Note there is no separate {@code sourceFenced} field: {@link
- * org.opensearch.serverless.storage.resharding.action.TransportOrchestrateShardSplitAction#fenceSourceStage}
- * runs unconditionally immediately after cutover succeeds and short-circuits to {@code onFailure} if
- * fencing itself fails, so {@link #cutover()} being {@code true} already implies the source was
- * fenced -- see {@link org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata}'s own
- * javadoc for what fencing does and does not close.
+ * <p>{@link #sourceFenced()} is reported separately because fencing is no longer unconditional. It
+ * is applied only after write routing has actually been enabled, so that the alias is a working
+ * write entry point before the source stops being one; a caller that leaves {@code
+ * enable_write_routing} at its default of {@code false} gets {@code write_routing_enabled: false}
+ * and {@code source_fenced: false}, and the source index stays writable. See finding R-7 in {@link
+ * TransportOrchestrateShardSplitAction#writeRoutingStage} for the failure this replaced, and {@link
+ * org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata}'s own javadoc for what
+ * fencing does and does not close.
  */
 public class OrchestrateShardSplitResponse extends ActionResponse implements ToXContentObject {
 
@@ -37,27 +39,32 @@ public class OrchestrateShardSplitResponse extends ActionResponse implements ToX
     private final boolean allTargetsSplit;
     private final boolean cutover;
     private final boolean writeRoutingEnabled;
+    private final boolean sourceFenced;
 
     /**
      * Creates a response.
      *
      * @param targetsProvisioned whether every named target index now exists.
      * @param allTargetsSplit whether every named target has a published split head.
-     * @param cutover whether the search-only alias cutover (and the source fencing that unconditionally
-     *                follows it) completed.
+     * @param cutover whether the search-only alias cutover completed and was acknowledged.
      * @param writeRoutingEnabled whether write-partition-routing was also assigned (always {@code false}
      *                            if the request didn't ask for it).
+     * @param sourceFenced whether the source index was fenced against direct writes (only ever
+     *                     {@code true} when {@code writeRoutingEnabled} is, so the dataset always
+     *                     retains a writable entry point).
      */
     public OrchestrateShardSplitResponse(
         boolean targetsProvisioned,
         boolean allTargetsSplit,
         boolean cutover,
-        boolean writeRoutingEnabled
+        boolean writeRoutingEnabled,
+        boolean sourceFenced
     ) {
         this.targetsProvisioned = targetsProvisioned;
         this.allTargetsSplit = allTargetsSplit;
         this.cutover = cutover;
         this.writeRoutingEnabled = writeRoutingEnabled;
+        this.sourceFenced = sourceFenced;
     }
 
     /**
@@ -71,6 +78,7 @@ public class OrchestrateShardSplitResponse extends ActionResponse implements ToX
         this.allTargetsSplit = in.readBoolean();
         this.cutover = in.readBoolean();
         this.writeRoutingEnabled = in.readBoolean();
+        this.sourceFenced = in.readBoolean();
     }
 
     /** @param out stream to write this response's fields to. */
@@ -80,6 +88,7 @@ public class OrchestrateShardSplitResponse extends ActionResponse implements ToX
         out.writeBoolean(allTargetsSplit);
         out.writeBoolean(cutover);
         out.writeBoolean(writeRoutingEnabled);
+        out.writeBoolean(sourceFenced);
     }
 
     /** Whether every named target index now exists. */
@@ -102,6 +111,11 @@ public class OrchestrateShardSplitResponse extends ActionResponse implements ToX
         return writeRoutingEnabled;
     }
 
+    /** Whether the source index was fenced against direct writes. */
+    public boolean sourceFenced() {
+        return sourceFenced;
+    }
+
     /**
      * @param builder the builder to append this response's fields to.
      * @param params unused.
@@ -113,6 +127,7 @@ public class OrchestrateShardSplitResponse extends ActionResponse implements ToX
             .field("all_targets_split", allTargetsSplit)
             .field("cutover", cutover)
             .field("write_routing_enabled", writeRoutingEnabled)
+            .field("source_fenced", sourceFenced)
             .endObject();
     }
 }

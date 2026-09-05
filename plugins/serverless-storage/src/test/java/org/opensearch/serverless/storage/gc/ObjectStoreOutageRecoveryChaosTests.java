@@ -94,6 +94,9 @@ public class ObjectStoreOutageRecoveryChaosTests extends OpenSearchTestCase {
         long farInThePast = now - TimeValue.timeValueDays(1).millis();
         writeGeneration(setupBundleStore, setupManifestStore, 1, farInThePast);
         CommitManifest survivor = writeGeneration(setupBundleStore, setupManifestStore, 2, now);
+        // The sweep will not act on manifests it cannot see a head for -- writing the blob is not publishing
+        // it. Published on the raw container so the outage injected below is the only fault in play.
+        TestShardHeads.publish(rawContainer, INDEX_UUID, SHARD_ID, 1L, survivor.generation());
 
         AtomicBoolean outage = new AtomicBoolean(false);
         BlobContainer outageContainer = new OutageInjectingBlobContainer(rawContainer, outage);
@@ -106,7 +109,9 @@ public class ObjectStoreOutageRecoveryChaosTests extends OpenSearchTestCase {
             retentionWindowMillis,
             manifestStore,
             bundleStore,
-            pinRegistry
+            pinRegistry,
+            new BlobContainerShardStateStore(outageContainer),
+            new BlobContainerGcSweepStateStore(outageContainer, INDEX_UUID, SHARD_ID)
         );
 
         ThreadPool threadPool = new TestThreadPool(getTestName());

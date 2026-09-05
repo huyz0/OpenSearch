@@ -40,6 +40,8 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.Collections;
+import java.util.Set;
 
 /**
  * The actual work behind {@link ReactivateShardsAction}: clears every suspended-shard marker on one
@@ -115,7 +117,7 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
             listener.onResponse(new AcknowledgedResponse(true));
             return;
         }
-        ReactivateTask task = new ReactivateTask(indexName, reader, listener);
+        ReactivateTask task = new ReactivateTask(indexName, reader, request.shardIds(), listener);
         clusterService.submitStateUpdateTask(
             "serverless-storage-reactivate-shards",
             task,
@@ -187,12 +189,14 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
     private final class ReactivateTask implements ClusterStateTaskListener {
         private final String indexName;
         private final boolean reader;
+        private final Set<Integer> shardIds;
         private final ActionListener<AcknowledgedResponse> listener;
         private volatile boolean reactivated;
 
-        ReactivateTask(String indexName, boolean reader, ActionListener<AcknowledgedResponse> listener) {
+        ReactivateTask(String indexName, boolean reader, Set<Integer> shardIds, ActionListener<AcknowledgedResponse> listener) {
             this.indexName = indexName;
             this.reader = reader;
+            this.shardIds = shardIds;
             this.listener = listener;
         }
 
@@ -240,7 +244,7 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
         ClusterState state = currentState;
         for (ReactivateTask task : tasks) {
             try {
-                ClusterState next = reactivate(state, task.indexName, task.reader, threadPool.absoluteTimeInMillis());
+                ClusterState next = reactivate(state, task.indexName, task.reader, task.shardIds, threadPool.absoluteTimeInMillis());
                 task.reactivated = next != state;
                 state = next;
                 builder.success(task);
@@ -260,13 +264,54 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
      * transport action; {@link #clusterManagerOperation} is the only production caller.
      */
     static ClusterState reactivate(ClusterState currentState, String indexName, boolean reader, long nowMillis) {
+        return reactivate(currentState, indexName, reader, Collections.emptySet(), nowMillis);
+    }
+
+    /**
+     * As {@link #reactivate(ClusterState, String, boolean, long)}, but clearing only {@code shardIds}
+     * when that set is non-empty.
+     *
+     * <p><b>Finding L-3.</b> An empty set keeps the original whole-index behaviour, which is what a
+     * search needs and what any caller that cannot resolve shards must fall back to. A non-empty set
+     * is the narrowing that stops one hot shard perpetually waking its cold siblings -- see {@link
+     * ReactivateShardsRequest}'s three-argument constructor for the full failure it prevents.
+     *
+     * <p>Implemented as "clear everything, then re-suspend what should have stayed suspended" rather
+     * than as a per-shard clear, deliberately: {@code SuspendedShardsMetadata} exposes whole-index
+     * clearing and per-shard suspending, and composing those two is exactly equivalent to a per-shard
+     * clear while adding no new metadata surface for the two to drift apart on. The only visible
+     * difference is that a shard that stays suspended also gets its {@code lastReactivated} stamp
+     * refreshed, which is inert: the cooldown that stamp feeds is only ever consulted before
+     * suspending a shard that is currently active, and these shards are not.
+     */
+    static ClusterState reactivate(ClusterState currentState, String indexName, boolean reader, Set<Integer> shardIds, long nowMillis) {
         IndexMetadata indexMetadata = currentState.metadata().index(indexName);
         if (indexMetadata == null) {
             return currentState;
         }
+        Set<Integer> suspendedBefore = reader
+            ? SuspendedShardsMetadata.suspendedReaderShardIds(indexMetadata)
+            : SuspendedShardsMetadata.suspendedShardIds(indexMetadata);
+        if (shardIds.isEmpty() == false && Collections.disjoint(suspendedBefore, shardIds)) {
+            // None of the shards this caller actually needs is suspended. Returning the same
+            // ClusterState reference here (rather than falling through to the clear-then-re-suspend
+            // dance, which would build an equal-but-not-identical IndexMetadata) is what keeps
+            // MasterService -- which publishes on reference inequality -- from publishing a state
+            // that changed nothing. The routing-entry check below still runs for a cold index.
+            return maybeRestoreRoutingEntry(currentState, indexMetadata, indexName);
+        }
         IndexMetadata updated = reader
             ? SuspendedShardsMetadata.withAllReaderShardsReactivated(indexMetadata, nowMillis)
             : SuspendedShardsMetadata.withAllShardsReactivated(indexMetadata, nowMillis);
+        if (shardIds.isEmpty() == false) {
+            for (Integer suspendedShardId : suspendedBefore) {
+                if (shardIds.contains(suspendedShardId) == false) {
+                    updated = reader
+                        ? SuspendedShardsMetadata.withReaderShardSuspended(updated, suspendedShardId)
+                        : SuspendedShardsMetadata.withShardSuspended(updated, suspendedShardId);
+                }
+            }
+        }
 
         // ShardSuspensionCoordinator removes a fully cold index's routing entry, so
         // reactivating one has to put it back -- and in this same update, not a later one.
@@ -294,6 +339,21 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
             builder.routingTable(RoutingTable.builder(currentState.routingTable()).add(coldIndexRoutingTable(updated)).build());
         }
         return builder.build();
+    }
+
+    /**
+     * The routing-entry half of {@link #reactivate}, for the shard-scoped path that decided it had no
+     * markers to clear. A fully cold index has had its routing entry pruned, and it still has to come
+     * back even when this particular request's shards were not among the suspended ones -- otherwise a
+     * narrowed reactivation of a pruned index would leave it with no routing table at all.
+     */
+    private static ClusterState maybeRestoreRoutingEntry(ClusterState currentState, IndexMetadata indexMetadata, String indexName) {
+        if (currentState.routingTable().hasIndex(indexName)) {
+            return currentState;
+        }
+        return ClusterState.builder(currentState)
+            .routingTable(RoutingTable.builder(currentState.routingTable()).add(coldIndexRoutingTable(indexMetadata)).build())
+            .build();
     }
 
     /**

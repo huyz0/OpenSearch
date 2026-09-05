@@ -22,6 +22,10 @@ import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.DurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PinRecord;
+import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
+import org.opensearch.serverless.storage.shardstate.ShardHead;
+import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
@@ -41,6 +45,8 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
     private BlobContainerBundleStore bundleStore;
     private BlobContainerManifestStore manifestStore;
     private DurablePinRegistry pinRegistry;
+    private ShardStateStore shardStateStore;
+    private GcSweepStateStore sweepStateStore;
     private ThreadPool threadPool;
 
     @Override
@@ -51,6 +57,8 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
         bundleStore = new BlobContainerBundleStore(blobContainer);
         manifestStore = new BlobContainerManifestStore(blobContainer);
         pinRegistry = new BlobContainerDurablePinRegistry(blobContainer);
+        shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        sweepStateStore = new BlobContainerGcSweepStateStore(blobContainer, INDEX_UUID, SHARD_ID);
         threadPool = new TestThreadPool(getTestName());
     }
 
@@ -81,7 +89,32 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             createdAtMillis
         );
         manifestStore.writeManifest(manifest);
+        publishHead(generation);
         return manifest;
+    }
+
+    /**
+     * Moves the shard head to {@code generation}, which is what actually publishes a manifest -- the sweep
+     * anchors "latest" to the head and will not treat a manifest blob alone as published, precisely so a
+     * writer killed between the two cannot make the live head look superseded.
+     */
+    private void publishHead(long generation) throws Exception {
+        java.util.Optional<VersionedShardHead> current = shardStateStore.get(INDEX_UUID, SHARD_ID);
+        if (current.isEmpty()) {
+            shardStateStore.compareAndSet(
+                INDEX_UUID,
+                SHARD_ID,
+                java.util.Optional.empty(),
+                new ShardHead(PRIMARY_TERM, null, 0L, generation)
+            );
+        } else if (current.get().head().latestManifestGeneration() < generation) {
+            shardStateStore.compareAndSet(
+                INDEX_UUID,
+                SHARD_ID,
+                java.util.Optional.of(current.get().version()),
+                current.get().head().withPublishedGeneration(generation)
+            );
+        }
     }
 
     public void testSweepDeletesOnlySupersededUnpinnedManifestsPastTheRetentionWindowAndTheirOrphanedBundles() throws Exception {
@@ -102,7 +135,9 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             retentionWindowMillis,
             manifestStore,
             bundleStore,
-            pinRegistry
+            pinRegistry,
+            shardStateStore,
+            sweepStateStore
         );
         // A bundle only becomes deletable once it has been continuously observed as unreferenced
         // for a full retentionWindowMillis (see GcSchedulerTask's own javadoc for why) -- so this
@@ -159,7 +194,9 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             1L, // minimal retention window: every unpinned superseded generation is immediately GC-eligible
             manifestStore,
             bundleStore,
-            pinRegistry
+            pinRegistry,
+            shardStateStore,
+            sweepStateStore
         );
         GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config);
 
@@ -293,7 +330,9 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             retentionWindowMillis,
             new BlobContainerManifestStore(faultyContainer),
             new BlobContainerBundleStore(faultyContainer),
-            pinRegistry
+            pinRegistry,
+            shardStateStore,
+            sweepStateStore
         );
         long[] clockMillis = { System.currentTimeMillis() };
         GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
@@ -337,6 +376,62 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A configured window of "effectively none" must still mean effectively none, with the real
+     * production clock-skew allowance in play.
+     *
+     * <p>The allowance exists because a manifest's {@code createdAtMillis} is stamped by the writing node
+     * and a sweeping node whose clock runs fast would otherwise judge it past retention too early. But
+     * applied as a flat addition it silently overrode the setting it was protecting: a window of 1 ms became
+     * a window of five minutes, so a caller that deliberately took the window out of play -- an aggressive
+     * deployment, or an engine test asserting that an external sweep reclaims a superseded generation --
+     * found nothing was ever reclaimed, with no log line to say why. The allowance is therefore capped at
+     * the configured window: the default thirty-minute window keeps the full five minutes, and a window of
+     * 1 ms gets 1 ms.
+     *
+     * <p>Constructed with the ordinary clock-only test constructor, so the allowance under test is the real
+     * {@link GcSchedulerTask#MAX_CLOCK_SKEW_ALLOWANCE_MILLIS} rather than a zero a test chose.
+     */
+    public void testAMinimalRetentionWindowIsNotSilentlyWidenedByTheClockSkewAllowance() throws Exception {
+        long now = System.currentTimeMillis();
+        CommitManifest gen1 = writeGeneration(1, now);
+        CommitManifest gen2 = writeGeneration(2, now);
+
+        GcSchedulerConfig config = new GcSchedulerConfig(
+            TimeValue.timeValueMinutes(5),
+            1L, // deliberately no retention delay: every superseded, unpinned generation is eligible at once
+            manifestStore,
+            bundleStore,
+            pinRegistry,
+            shardStateStore,
+            sweepStateStore
+        );
+        long[] clockMillis = { now + 1000 };
+        GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
+        try {
+            task.sweepForTesting();
+            assertFalse(
+                "a superseded, unpinned generation past a 1 ms window must be reclaimed -- the skew allowance "
+                    + "is a maximum, not five minutes added to whatever was configured",
+                manifestStore.listManifests().stream().anyMatch(m -> m.generation() == gen1.generation())
+            );
+            assertTrue(
+                "and the head's own generation must survive, as always",
+                manifestStore.listManifests().stream().anyMatch(m -> m.generation() == gen2.generation())
+            );
+
+            clockMillis[0] += 1000;
+            task.sweepForTesting();
+            assertFalse(
+                "its exclusively-referenced bundle goes on the following tick, once the sustained-orphan "
+                    + "window (also 1 ms here) has elapsed",
+                bundleStore.listBundleNames().contains(gen1.referencedBundles().iterator().next())
+            );
+        } finally {
+            task.close();
+        }
+    }
+
     public void testSweepRetainsEverythingWithinTheRetentionWindowEvenIfSupersededAndUnpinned() throws Exception {
         long now = System.currentTimeMillis();
 
@@ -352,7 +447,9 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             TimeValue.timeValueMinutes(30).millis(),
             manifestStore,
             bundleStore,
-            pinRegistry
+            pinRegistry,
+            shardStateStore,
+            sweepStateStore
         );
         GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config);
         try {
@@ -392,7 +489,9 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             retentionWindowMillis,
             manifestStore,
             bundleStore,
-            pinRegistry
+            pinRegistry,
+            shardStateStore,
+            sweepStateStore
         );
         long[] clockMillis = { now };
         GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
@@ -425,6 +524,7 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
                 now
             );
             manifestStore.writeManifest(gen3ReferencingGen1Bundle);
+            publishHead(3); // a manifest blob alone is not published -- the sweep anchors on the head
 
             // Tick 2: even though the window has now elapsed since gen 1's bundle was first observed
             // as an orphan candidate, it is live again (referenced by gen 3) -- it must survive, not
@@ -511,7 +611,9 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             retentionWindowMillis,
             manifestStore,
             bundleStore,
-            racingPinRegistry
+            racingPinRegistry,
+            shardStateStore,
+            sweepStateStore
         );
         long[] clockMillis = { now };
         GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);

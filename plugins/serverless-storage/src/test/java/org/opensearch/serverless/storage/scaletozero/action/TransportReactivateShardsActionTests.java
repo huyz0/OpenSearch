@@ -95,6 +95,62 @@ public class TransportReactivateShardsActionTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * Finding L-3. Reactivation used to be unavoidably index-wide, so on a 100-shard index with one
+     * continuously hot shard and 99 cold ones, the very next request to the hot shard woke all 99 --
+     * which then went idle, were suspended and evicted, and were woken again on the next request.
+     * Forever, roughly every {@code idle_threshold + cooldown}. The index could never scale to zero
+     * and paid continuous recover/evict churn for nothing.
+     */
+    public void testAShardScopedReactivationLeavesTheOtherShardsSuspended() {
+        ClusterState cold = multiShardColdState(4);
+        ClusterState reactivated = TransportReactivateShardsAction.reactivate(cold, MULTI_INDEX, false, java.util.Set.of(2), 1_000L);
+
+        java.util.Set<Integer> stillSuspended = SuspendedShardsMetadata.suspendedShardIds(reactivated.metadata().index(MULTI_INDEX));
+        assertEquals(
+            "only the shard the caller actually needs may be woken; the rest must stay asleep",
+            java.util.Set.of(0, 1, 3),
+            stillSuspended
+        );
+        assertFalse("...and the requested shard must genuinely be awake", stillSuspended.contains(2));
+    }
+
+    public void testAnEmptyShardSetStillMeansTheWholeIndex() {
+        ClusterState cold = multiShardColdState(4);
+        ClusterState reactivated = TransportReactivateShardsAction.reactivate(cold, MULTI_INDEX, false, java.util.Set.of(), 1_000L);
+        assertTrue(
+            "a search genuinely needs every shard, so the whole-index scope must still exist and still work",
+            SuspendedShardsMetadata.suspendedShardIds(reactivated.metadata().index(MULTI_INDEX)).isEmpty()
+        );
+    }
+
+    public void testAShardScopedReactivationOfAnAlreadyAwakeShardPublishesNothing() {
+        // The routing entry exists and shard 2 is not suspended, so there is nothing to do. Returning
+        // the same reference is what stops MasterService publishing a no-op cluster state -- and this
+        // path runs on every write to a hot shard of a partly-cold index, so it is not a rare one.
+        ClusterState cold = multiShardColdState(4);
+        ClusterState withRouting = TransportReactivateShardsAction.reactivate(cold, MULTI_INDEX, false, java.util.Set.of(), 1_000L);
+        assertSame(withRouting, TransportReactivateShardsAction.reactivate(withRouting, MULTI_INDEX, false, java.util.Set.of(2), 2_000L));
+    }
+
+    private static final String MULTI_INDEX = "partly-cold-idx";
+
+    /** An index of {@code shardCount} shards, every one suspended, with a routing table present. */
+    private static ClusterState multiShardColdState(int shardCount) {
+        IndexMetadata indexMetadata = IndexMetadata.builder(MULTI_INDEX)
+            .settings(Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT))
+            .numberOfShards(shardCount)
+            .numberOfReplicas(0)
+            .build();
+        for (int shardId = 0; shardId < shardCount; shardId++) {
+            indexMetadata = SuspendedShardsMetadata.withShardSuspended(indexMetadata, shardId);
+        }
+        return ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(indexMetadata, false).build())
+            .routingTable(RoutingTable.builder().build())
+            .build();
+    }
+
     /** Present in metadata with a suspended shard, absent from routing. */
     private static ClusterState coldState() {
         IndexMetadata indexMetadata = IndexMetadata.builder(INDEX)

@@ -19,6 +19,14 @@ import java.util.Optional;
  * and reported to one shard at a time, and at target scale (100M shards, ~2% active) only holds
  * entries for the active set, not every shard that has ever existed.
  *
+ * <p><b>Status, stated up front because the rest of this javadoc describes a design rather than a
+ * deployment.</b> One implementation is constructed in production ({@link InMemoryShardDirectory}, one
+ * per node, in process) and it is written to but never read from -- see {@link #lookup}. The multi-node
+ * fan-out this interface was shaped for is not built: a partitioned implementation and its consistent-hash
+ * ring existed with no caller at all and were deleted on 2026-09-05 rather than left looking wired, and
+ * {@link DirectoryRebuildService} remains, with its own javadoc saying the same thing about itself. What
+ * routes a request today is {@code ComputedRoutingTable}.
+ *
  * <p>Never a source of truth: {@link org.opensearch.serverless.storage.shardstate.ShardHead}
  * (the CAS-arbitrated object-store record) is truth; a directory entry is only ever a hint a
  * caller should be prepared to have be wrong. Implementations are free to lose entries, serve
@@ -30,6 +38,23 @@ public interface ShardDirectory {
 
     /**
      * The current best-known hint for where shard {@code (indexUuid, shardId)} is open, if any.
+     *
+     * <p><b>Nothing in production calls this, and the tier is therefore write-only today.</b> The engines
+     * report and refresh entries ({@code ObjectStoreWriterEngine}, {@code ObjectStoreReaderEngine}) into
+     * the one production instance, which is a per-node, in-process, unreplicated {@link
+     * InMemoryShardDirectory}; no coordinator, allocator or routing path reads them back. Routing for
+     * gated indices is instead <em>computed</em> -- rendezvous hashing over a membership set published
+     * through the cluster manager, see {@code ComputedRoutingTable} -- which is a different design from the
+     * hint-and-verify one this interface describes, and the one that is actually in force.
+     *
+     * <p>That means the refresh schedules the engines run against this tier's TTL cost a map write and buy
+     * nothing: the "constant-load caching" property they are documented as providing cannot exist without a
+     * remote tier to cache against. Wiring {@code lookup} into the coordinator ahead of the computed answer
+     * is a real option, and it is deliberately <em>not</em> the first one: a hint is only safe when the
+     * shard head's compare-and-swap fences a writer that acts on a stale one, and that fencing has only
+     * just been given a token to work with (see {@code ShardHead#withTakenOverLease}). Routing on hints
+     * before both halves of that are enforced end to end converts a latency question into a correctness
+     * one.
      *
      * @param indexUuid the index the shard belongs to
      * @param shardId the shard id within the index

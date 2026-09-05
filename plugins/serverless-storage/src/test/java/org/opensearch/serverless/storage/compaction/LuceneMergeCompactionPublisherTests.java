@@ -105,7 +105,8 @@ public class LuceneMergeCompactionPublisherTests extends OpenSearchTestCase {
                 manifestStore,
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
-                CompactionPolicy.withDefaults()
+                CompactionPolicy.withDefaults(),
+                createTempDir()
             );
             CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
 
@@ -178,7 +179,8 @@ public class LuceneMergeCompactionPublisherTests extends OpenSearchTestCase {
                 manifestStore,
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
-                tightPolicy
+                tightPolicy,
+                createTempDir()
             );
             CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
 
@@ -261,7 +263,8 @@ public class LuceneMergeCompactionPublisherTests extends OpenSearchTestCase {
                 manifestStore,
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
-                CompactionPolicy.withDefaults()
+                CompactionPolicy.withDefaults(),
+                createTempDir()
             );
             CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
 
@@ -336,7 +339,8 @@ public class LuceneMergeCompactionPublisherTests extends OpenSearchTestCase {
                 manifestStore,
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                 commitPublisher,
-                CompactionPolicy.withDefaults()
+                CompactionPolicy.withDefaults(),
+                createTempDir()
             );
             CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
 

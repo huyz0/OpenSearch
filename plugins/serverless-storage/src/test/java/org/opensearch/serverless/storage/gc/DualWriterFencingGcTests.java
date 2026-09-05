@@ -218,8 +218,28 @@ public class DualWriterFencingGcTests extends OpenSearchTestCase {
         // (rather than a hand-constructed past timestamp) keeps this exercising the actual
         // publish-time System.currentTimeMillis() path, not a synthetic one.
         Thread.sleep(50);
-        GcSchedulerConfig gcConfig = new GcSchedulerConfig(TimeValue.timeValueMinutes(5), 1L, manifestStore, bundleStore, pinRegistry);
-        GcSchedulerTask gcTask = new GcSchedulerTask(threadPool, gcConfig.interval(), INDEX_UUID, SHARD_ID, gcConfig);
+        GcSchedulerConfig gcConfig = new GcSchedulerConfig(
+            TimeValue.timeValueMinutes(5),
+            1L,
+            manifestStore,
+            bundleStore,
+            pinRegistry,
+            shardStateStore,
+            new BlobContainerGcSweepStateStore(blobContainer, INDEX_UUID, SHARD_ID)
+        );
+        // Zero clock-skew allowance: this test is about term ordering, and it deliberately uses a
+        // one-millisecond retention window against manifests stamped with the real publish-time clock. The
+        // production allowance would add five minutes to that window and turn the assertion below into a
+        // statement about the margin rather than about fencing.
+        GcSchedulerTask gcTask = new GcSchedulerTask(
+            threadPool,
+            gcConfig.interval(),
+            INDEX_UUID,
+            SHARD_ID,
+            gcConfig,
+            System::currentTimeMillis,
+            0L
+        );
         try {
             gcTask.sweepForTesting();
         } finally {

@@ -134,6 +134,60 @@ public class NodeSelfWarmupSchedulerTaskTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * Finding N-2. The {@code client.execute} that marks the node warming used to sit outside any
+     * try/catch, with {@code markAttemptInFlight} cleared only inside the listener callbacks. A
+     * <em>synchronous</em> throw -- a {@code NodeClosedException} during shutdown, or an
+     * {@code IllegalStateException} from the action registry on a still-starting node, which is
+     * precisely the window this task's own {@code Throwable} catch exists for -- escaped to that
+     * catch, was logged once, and left the flag set for the process lifetime. The node then never
+     * marked itself warming, never logged why again, and silently received reader shards while
+     * genuinely cold: the exact inverse of the failure this task exists to prevent.
+     */
+    public void testASynchronousDispatchFailureDoesNotPinTheInFlightFlagForever() {
+        DiscoveryNode local = node("reader-1", true);
+        when(clusterService.state()).thenReturn(stateWithLocalNode(local, null));
+
+        java.util.concurrent.atomic.AtomicBoolean throwSynchronously = new java.util.concurrent.atomic.AtomicBoolean(true);
+        NoOpClient throwingClient = new NoOpClient(threadPool) {
+            @Override
+            protected <Request extends ActionRequest, Response extends ActionResponse> void doExecute(
+                ActionType<Response> action,
+                Request request,
+                ActionListener<Response> listener
+            ) {
+                requestCount.incrementAndGet();
+                if (throwSynchronously.get()) {
+                    throw new IllegalStateException("simulated: action not registered yet on a still-starting node");
+                }
+                @SuppressWarnings("unchecked")
+                ActionListener<AcknowledgedResponse> typed = (ActionListener<AcknowledgedResponse>) listener;
+                typed.onResponse(new AcknowledgedResponse(true));
+            }
+        };
+
+        NodeSelfWarmupSchedulerTask task = new NodeSelfWarmupSchedulerTask(
+            threadPool,
+            TimeValue.timeValueDays(1),
+            clusterService,
+            throwingClient,
+            TimeValue.ZERO
+        );
+        try {
+            expectThrows(IllegalStateException.class, task::evaluateForTesting);
+            assertFalse("the failed attempt must not count as having marked the node", task.isSelfMarkedForTesting());
+
+            // The next tick must be able to try again. Before the fix, markAttemptInFlight was still
+            // true here and evaluate() returned immediately -- forever.
+            throwSynchronously.set(false);
+            task.evaluateForTesting();
+            assertTrue("a later tick must be able to complete the self-mark", task.isSelfMarkedForTesting());
+            assertEquals("both attempts must actually have reached the client", 2, requestCount.get());
+        } finally {
+            task.close();
+        }
+    }
+
     public void testDoesNotSelfMarkANonReaderNode() {
         DiscoveryNode local = node("writer-1", false);
         when(clusterService.state()).thenReturn(stateWithLocalNode(local, null));

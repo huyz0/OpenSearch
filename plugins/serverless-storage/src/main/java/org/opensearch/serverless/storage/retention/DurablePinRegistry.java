@@ -141,4 +141,40 @@ public interface DurablePinRegistry {
      * @param newPin    the pin that should become the sole pin under its {@code pinId}.
      */
     void replacePin(String indexUuid, int shardId, PinRecord newPin) throws IOException;
+
+    /**
+     * Applies a whole set of additions and removals as one mutation.
+     *
+     * <p>What PITR reconciliation needs, and the reason it exists: the window holds one pin per manifest, so
+     * a 24-hour window at a 30-second publication cadence is a few thousand records in one register, and a
+     * reconcile tick that adds sixty and removes sixty as the window slides did a hundred and twenty
+     * separate read-modify-CAS cycles over the whole thing -- each one re-reading and re-writing every pin
+     * on the shard, and each one another chance to lose a CAS race against a concurrent snapshot or clone
+     * and burn into the retry bound. Applied together, the same tick is a single cycle.
+     *
+     * <p>Additions are applied before removals, deliberately: a reconcile interrupted partway then leaves
+     * <em>more</em> pinned than required, never less, which is the direction a mechanism whose only job is
+     * to prevent deletion has to fail in.
+     *
+     * <p>The default implementation preserves that ordering while doing one call per pin, so an
+     * implementation that cannot batch is still correct -- only slower.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId   the shard to apply the diff to.
+     * @param toAdd     pins to add; already-present pins are no-ops, as with {@link #addPin}.
+     * @param toRemove  exact pins to remove, matched on pin id, term and generation together.
+     */
+    default void applyPinDiff(
+        String indexUuid,
+        int shardId,
+        java.util.Collection<PinRecord> toAdd,
+        java.util.Collection<PinRecord> toRemove
+    ) throws IOException {
+        for (PinRecord pin : toAdd) {
+            addPin(indexUuid, shardId, pin);
+        }
+        for (PinRecord pin : toRemove) {
+            removePin(indexUuid, shardId, pin);
+        }
+    }
 }

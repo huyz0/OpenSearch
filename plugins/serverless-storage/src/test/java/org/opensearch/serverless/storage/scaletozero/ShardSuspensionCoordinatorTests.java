@@ -345,6 +345,65 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
         return state.metadata().index(INDEX_NAME).getIndexUUID();
     }
 
+    /**
+     * Finding L-4. {@code IndexRoutingTable#shard(int)} is a plain map lookup and returns null for a
+     * shard id the routing table does not contain. {@code evict} null-checked the <em>index</em>
+     * routing table and then dereferenced the <em>shard</em> one, so a shard id present in
+     * {@code IndexMetadata} but absent from routing threw NPE -- which is exactly what a retired
+     * in-place-split parent is, since {@code MetadataInPlaceSplitShardCommitService} removes the
+     * parent's routing entry at commit while {@code numberOfShards} deliberately stays put.
+     *
+     * <p>The NPE mattered more than an NPE usually does: {@code evict} is driven from the
+     * scale-to-zero scheduler's {@code client.execute} response listener, outside that task's own
+     * try block, so it aborted the loop and silently skipped every remaining candidate in the tick --
+     * deterministically, on every subsequent tick too.
+     */
+    public void testEvictIsANoOpForAShardIdMissingFromTheRoutingTable() {
+        ClusterState state = buildClusterState(0);
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(mock(ClusterService.class), client);
+
+        // Shard 7 does not exist in the routing table. This must not throw.
+        coordinator.evictForTesting(state, indexUuid(state), 7, false);
+
+        verify(clusterAdminClient, never()).reroute(any(ClusterRerouteRequest.class), any());
+    }
+
+    /**
+     * The containment half of finding L-4: one bad candidate must not take the rest of the tick's
+     * candidate list with it.
+     */
+    public void testOneFailingCandidateDoesNotAbortTheRestOfTheBatch() {
+        ClusterState state = buildClusterState(0);
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.state()).thenThrow(new IllegalStateException("simulated: cluster state not available for this candidate"));
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(clusterService, client);
+
+        List<org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidateEntry> candidates = List.of(
+            new org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidateEntry(
+                indexUuid(state),
+                0,
+                60_000L,
+                0L,
+                true,
+                0L,
+                false
+            ),
+            new org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidateEntry(
+                indexUuid(state),
+                1,
+                60_000L,
+                0L,
+                true,
+                0L,
+                false
+            )
+        );
+
+        // Before the fix this propagated out of the loop on the first candidate and the second was
+        // never even attempted. It must now complete, having logged each failure.
+        coordinator.suspendCandidates(candidates);
+    }
+
     /** Builds a cluster state with a started primary (and, if {@code numberOfReplicas > 0}, one started ordinary replica) for shard 0. */
     private static ClusterState buildClusterState(int numberOfReplicas) {
         Settings settings = Settings.builder()

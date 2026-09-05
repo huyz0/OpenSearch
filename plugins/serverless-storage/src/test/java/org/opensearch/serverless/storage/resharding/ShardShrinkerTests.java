@@ -10,17 +10,22 @@ package org.opensearch.serverless.storage.resharding;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
+import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.index.SoftDeletesDirectoryReaderWrapper;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.index.mapper.IdFieldMapper;
+import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
@@ -63,6 +68,14 @@ public class ShardShrinkerTests extends OpenSearchTestCase {
         targetCommitPublisher = new ObjectStoreCommitPublisher(new BlobContainerBundleStore(targetContainer), targetManifestStore);
     }
 
+    /** One document, shaped the way an OpenSearch writer shapes a root document. */
+    private static Document document(String id) {
+        Document doc = new Document();
+        doc.add(new Field(IdFieldMapper.NAME, Uid.encodeId(id), IdFieldMapper.Defaults.FIELD_TYPE));
+        doc.add(new NumericDocValuesField(SeqNoFieldMapper.PRIMARY_TERM_NAME, 1L));
+        return doc;
+    }
+
     private ShrinkSource publishSource(String indexUuid, int startId, int count, long maxSeqNo, long mappingVersion) throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer container = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
@@ -72,14 +85,28 @@ public class ShardShrinkerTests extends OpenSearchTestCase {
 
         CommitManifest manifest;
         try (Directory writerDirectory = new ByteBuffersDirectory()) {
-            try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+            // Finding R-9: every source in this package used to be built with a bare
+            // IndexWriterConfig and never took a delete or an update, so no __soft_deletes FieldInfo
+            // ever existed and IndexWriter.addIndexes' FieldInfos.verifySoftDeletedFieldName check
+            // never fired. Any real shard that has taken a single DELETE or _update carries that
+            // FieldInfo, so ShardShrinker threw IllegalArgumentException on it -- via an
+            // always-reachable REST action. One softUpdateDocument here reproduces it.
+            try (
+                IndexWriter writer = new IndexWriter(
+                    writerDirectory,
+                    new IndexWriterConfig().setSoftDeletesField(Lucene.SOFT_DELETES_FIELD)
+                )
+            ) {
                 for (int i = 0; i < count; i++) {
-                    Document doc = new Document();
-                    doc.add(
-                        new Field(IdFieldMapper.NAME, Uid.encodeId(indexUuid + "-doc-" + (startId + i)), IdFieldMapper.Defaults.FIELD_TYPE)
-                    );
-                    writer.addDocument(doc);
+                    writer.addDocument(document(indexUuid + "-doc-" + (startId + i)));
                 }
+                // A real update of the first document, leaving its previous version soft-deleted.
+                String updatedId = indexUuid + "-doc-" + startId;
+                writer.softUpdateDocument(
+                    new Term(IdFieldMapper.NAME, Uid.encodeId(updatedId)),
+                    document(updatedId),
+                    new NumericDocValuesField(Lucene.SOFT_DELETES_FIELD, 1)
+                );
                 writer.commit();
             }
             SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
@@ -138,10 +165,20 @@ public class ShardShrinkerTests extends OpenSearchTestCase {
 
         Directory targetDirectory = new ByteBuffersDirectory();
         new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(targetContainer)).materialize(targetManifest, targetDirectory);
-        try (DirectoryReader reader = DirectoryReader.open(targetDirectory)) {
-            assertEquals("the target must contain every document from every source, no more, no fewer", 15, reader.numDocs());
+        // Read through the soft-deletes wrapper, the way the engine's own read path does: each
+        // source contributed one soft-deleted previous version (see publishSource), and a shrink is
+        // required to carry that history across rather than drop it, so the physical segments hold
+        // more documents than are live.
+        try (
+            DirectoryReader reader = new SoftDeletesDirectoryReaderWrapper(DirectoryReader.open(targetDirectory), Lucene.SOFT_DELETES_FIELD)
+        ) {
+            assertEquals("the target must contain every live document from every source, no more, no fewer", 15, reader.numDocs());
             Set<String> ids = new HashSet<>();
+            org.apache.lucene.util.Bits liveDocs = org.apache.lucene.index.MultiBits.getLiveDocs(reader);
             for (int i = 0; i < reader.maxDoc(); i++) {
+                if (liveDocs != null && liveDocs.get(i) == false) {
+                    continue;
+                }
                 byte[] idBytes = reader.storedFields().document(i).getField(IdFieldMapper.NAME).binaryValue().bytes;
                 ids.add(Uid.decodeId(idBytes));
             }

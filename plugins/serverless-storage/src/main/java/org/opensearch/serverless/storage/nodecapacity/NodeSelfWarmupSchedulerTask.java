@@ -19,6 +19,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.allocation.ReaderShardPlacementAllocationDecider;
 import org.opensearch.serverless.storage.nodecapacity.action.NodeWarmupAction;
 import org.opensearch.serverless.storage.nodecapacity.action.NodeWarmupRequest;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -67,6 +68,28 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
     private volatile boolean selfMarked = false;
 
     /**
+     * When this task marked the local node warming, or {@code 0} if it has not. Only set on the path
+     * where <em>this task</em> did the marking and no auto-clear is configured -- see {@link
+     * #warnIfWarmingForever} (finding N-1).
+     */
+    private volatile long selfMarkedAtMillis = 0L;
+
+    /** When the stuck-warming warning was last emitted, so it repeats at a useful cadence rather than every tick. */
+    private volatile long lastStuckWarningAtMillis = 0L;
+
+    /** How often to repeat the stuck-warming warning. Five minutes: loud enough to notice, quiet enough not to be noise. */
+    private static final long STUCK_WARNING_INTERVAL_MILLIS = 300_000L;
+
+    /**
+     * How many times, and how far apart, a failed auto-clear is retried -- see {@link #autoClear}
+     * (finding N-2). Geometric from the first delay: 5s, 10s, 20s, 40s, 80s, 160s. Six attempts is
+     * comfortably longer than a cluster-manager election or a transient transport disconnect, and
+     * every attempt is a single tiny cluster-state request.
+     */
+    private static final int AUTO_CLEAR_MAX_ATTEMPTS = 6;
+    private static final long AUTO_CLEAR_FIRST_RETRY_MILLIS = 5_000L;
+
+    /**
      * Starts the scheduled self-warmup check.
      *
      * @param threadPool schedules the periodic check, and (if {@code autoClearDelay} is positive)
@@ -95,7 +118,14 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
         this.clusterService = clusterService;
         this.client = client;
         this.autoClearDelay = autoClearDelay;
-        this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, interval, ThreadPool.Names.GENERIC);
+        // Jittered rather than started on the exact configured interval (finding L-10). Every node
+        // constructs this task at roughly the same moment after a cluster restart or a rolling
+        // upgrade, and scheduleWithFixedDelay never recomputes the delay, so an un-jittered start
+        // leaves every node's copy of this loop ticking in lockstep for the lifetime of the process
+        // -- a synchronised burst of cluster-manager work and object-store requests every interval,
+        // forever, which is exactly the recovery-stampede shape RFC section 13 asks the reconcilers
+        // to avoid. JitteredScheduling only ever extends the first interval, never shortens it.
+        this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
     private void evaluateSafely() {
@@ -111,7 +141,10 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
 
     void evaluate() {
         if (selfMarked) {
-            return; // already marked (or attempted and given up retrying isn't useful) -- nothing left to do.
+            // Not simply "nothing left to do" any more: if this task marked the node and nothing is
+            // ever going to clear that mark, someone needs to be told (finding N-1).
+            warnIfWarmingForever();
+            return;
         }
         ClusterState state = clusterService.state();
         DiscoveryNode localNode = state.nodes().getLocalNode();
@@ -133,34 +166,151 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
             return; // a previous tick's mark call hasn't completed yet.
         }
         String nodeName = localNode.getName();
-        client.execute(NodeWarmupAction.INSTANCE, new NodeWarmupRequest(localNode.getId(), true), new ActionListener<>() {
-            @Override
-            public void onResponse(AcknowledgedResponse response) {
-                markAttemptInFlight.set(false);
-                selfMarked = true;
-                logger.info("self-marked this node [{}] as warming before it enters reader shard rotation", nodeName);
-                if (autoClearDelay.millis() > 0) {
-                    threadPool.schedule(() -> autoClear(localNode.getId(), nodeName), autoClearDelay, ThreadPool.Names.GENERIC);
+        // Finding N-2. This client.execute used to sit outside any try/catch, with
+        // markAttemptInFlight cleared only inside the two listener callbacks. A *synchronous* throw
+        // -- a NodeClosedException during shutdown, or an IllegalStateException from the action
+        // registry on a still-starting node, which is precisely the window the Throwable catch in
+        // evaluateSafely exists for -- escaped to that catch, was logged once, and left the flag set
+        // for the process lifetime. The node then never marked itself warming, never logged why
+        // again, and silently received reader shards while genuinely cold: the exact inverse of the
+        // failure this task exists to prevent, reached by the task's own error handling.
+        try {
+            client.execute(NodeWarmupAction.INSTANCE, new NodeWarmupRequest(localNode.getId(), true), new ActionListener<>() {
+                @Override
+                public void onResponse(AcknowledgedResponse response) {
+                    markAttemptInFlight.set(false);
+                    selfMarked = true;
+                    logger.info("self-marked this node [{}] as warming before it enters reader shard rotation", nodeName);
+                    if (autoClearDelay.millis() > 0) {
+                        threadPool.schedule(() -> autoClear(localNode.getId(), nodeName, 1), autoClearDelay, ThreadPool.Names.GENERIC);
+                    } else {
+                        selfMarkedAtMillis = System.currentTimeMillis();
+                    }
                 }
-            }
 
-            @Override
-            public void onFailure(Exception e) {
-                markAttemptInFlight.set(false); // retry on the next tick.
-                logger.warn("failed to self-mark this node [" + nodeName + "] as warming, will retry next tick", e);
-            }
-        });
+                @Override
+                public void onFailure(Exception e) {
+                    markAttemptInFlight.set(false); // retry on the next tick.
+                    logger.warn("failed to self-mark this node [" + nodeName + "] as warming, will retry next tick", e);
+                }
+            });
+        } catch (RuntimeException e) {
+            markAttemptInFlight.set(false);
+            throw e;
+        }
     }
 
-    private void autoClear(String nodeId, String nodeName) {
-        client.execute(
-            NodeWarmupAction.INSTANCE,
-            new NodeWarmupRequest(nodeId, false),
-            ActionListener.wrap(
-                response -> logger.info("auto-cleared this node [{}]'s warming status after the configured delay", nodeName),
-                e -> logger.warn("failed to auto-clear this node [" + nodeName + "]'s warming status", e)
-            )
+    /**
+     * Warns, repeatedly, that this node is warming and nothing will ever clear it.
+     *
+     * <p><b>Finding N-1.</b> {@code serverless_storage.node_warmup.self_mark_auto_clear_delay}
+     * defaults to zero, meaning "never auto-clear", and {@code NodeWarmupAllocationDecider} answers
+     * {@code NO} for every reader shard of every serverless-storage index on a warming node. So an
+     * operator who turns on {@code self_mark_eval_interval} -- a plausible "enable pre-warm" action
+     * -- without also deploying a control plane that issues the clearing call ends up with every
+     * reader node permanently warming, every reader shard permanently {@code UNASSIGNED}, and every
+     * search-replica query permanently failing. That contract is documented on the setting, so this
+     * is a configuration mistake rather than a code defect; what made it a HIGH-severity one is that
+     * its entire signal was a single INFO line at startup, after which a total loss of
+     * search-replica serving looked like nothing at all.
+     *
+     * <p>Deliberately a warning and not an automatic clear: clearing a mark this node was told to
+     * hold would break the documented contract for the deployments that use it correctly. Making the
+     * state loud is the fix that helps the misconfigured deployment without harming the correct one.
+     */
+    private void warnIfWarmingForever() {
+        long markedAt = selfMarkedAtMillis;
+        if (markedAt == 0L) {
+            return; // either this task did not do the marking, or an auto-clear is scheduled.
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastStuckWarningAtMillis < STUCK_WARNING_INTERVAL_MILLIS) {
+            return;
+        }
+        ClusterState state = clusterService.state();
+        DiscoveryNode localNode = state.nodes().getLocalNode();
+        if (localNode == null || NodeWarmupCoordinator.currentlyWarmingNames(state).contains(localNode.getName()) == false) {
+            selfMarkedAtMillis = 0L; // something cleared it: exactly what is supposed to happen.
+            return;
+        }
+        lastStuckWarningAtMillis = now;
+        logger.warn(
+            "this node [{}] has been marked warming for {} ms and no auto-clear is configured "
+                + "(serverless_storage.node_warmup.self_mark_auto_clear_delay is 0). While it is warming, "
+                + "NodeWarmupAllocationDecider refuses every serverless-storage reader shard on this node, so "
+                + "search-replica queries against those indices cannot be served here. Either have the control plane "
+                + "issue DELETE /_plugins/_serverless/storage/nodes/{}/warming when the node is ready, or set a "
+                + "positive auto-clear delay.",
+            localNode.getName(),
+            now - markedAt,
+            localNode.getId()
         );
+    }
+
+    /**
+     * Clears this node's warming mark, retrying on failure.
+     *
+     * <p><b>Finding N-2.</b> This used to be a single {@code client.execute} that logged a WARN and
+     * gave up. One transient failure -- a {@code NotClusterManagerException} during an election, a
+     * momentary transport disconnect -- therefore left the node warming for its entire process
+     * lifetime, because {@code selfMarked} was already true and {@code evaluate()} never ran the
+     * marking path again. A single dropped packet turning into a permanently unserviceable reader
+     * node is not an acceptable failure mode for a best-effort convenience.
+     *
+     * @param attempt 1-based attempt number; retries stop at {@link #AUTO_CLEAR_MAX_ATTEMPTS}.
+     */
+    private void autoClear(String nodeId, String nodeName, int attempt) {
+        try {
+            client.execute(
+                NodeWarmupAction.INSTANCE,
+                new NodeWarmupRequest(nodeId, false),
+                ActionListener.wrap(
+                    response -> logger.info("auto-cleared this node [{}]'s warming status after the configured delay", nodeName),
+                    e -> scheduleAutoClearRetry(nodeId, nodeName, attempt, e)
+                )
+            );
+        } catch (RuntimeException e) {
+            scheduleAutoClearRetry(nodeId, nodeName, attempt, e);
+        }
+    }
+
+    private void scheduleAutoClearRetry(String nodeId, String nodeName, int attempt, Exception failure) {
+        if (attempt >= AUTO_CLEAR_MAX_ATTEMPTS) {
+            // Out of retries. Record the mark time so the stuck-warming watchdog above starts
+            // shouting about it, rather than letting the node go quiet while unable to serve.
+            selfMarkedAtMillis = System.currentTimeMillis();
+            logger.error(
+                "gave up after "
+                    + attempt
+                    + " attempts to auto-clear this node ["
+                    + nodeName
+                    + "]'s warming status; it will keep refusing serverless-storage reader shards until "
+                    + "something clears it explicitly",
+                failure
+            );
+            return;
+        }
+        long delayMillis = AUTO_CLEAR_FIRST_RETRY_MILLIS << (attempt - 1);
+        logger.warn(
+            "failed to auto-clear this node ["
+                + nodeName
+                + "]'s warming status (attempt "
+                + attempt
+                + "), retrying in "
+                + delayMillis
+                + " ms",
+            failure
+        );
+        try {
+            threadPool.schedule(
+                () -> autoClear(nodeId, nodeName, attempt + 1),
+                TimeValue.timeValueMillis(delayMillis),
+                ThreadPool.Names.GENERIC
+            );
+        } catch (RuntimeException e) {
+            // The thread pool is shutting down; there is no later tick to fall back on.
+            logger.warn("could not schedule a warming auto-clear retry for node [" + nodeName + "]", e);
+        }
     }
 
     /** Invokes {@link #evaluate()} synchronously -- test-only visibility. */

@@ -12,6 +12,7 @@ import org.opensearch.serverless.storage.security.AesGcmCipher;
 import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -40,40 +41,101 @@ public final class WalRecordCrypto {
     private WalRecordCrypto() {}
 
     /**
-     * Returns a copy of {@code record} with its payload replaced by ciphertext.
+     * The first {@link WalChunkWriter#FORMAT_VERSION} whose records are encrypted with their
+     * identity as AES-GCM associated data. Chunks written at an earlier version have no associated
+     * data and must be decrypted without it, or every record written before the upgrade fails to
+     * replay -- which is data loss on the first crash after a rolling restart, not a compatibility
+     * inconvenience. See {@link #associatedDataFor} for what the binding buys and
+     * {@link #decryptAll(List, EncryptionKeyProvider, int)} for how the version reaches this class.
+     */
+    public static final int FIRST_IDENTITY_BOUND_FORMAT_VERSION = 3;
+
+    /**
+     * Binds this record's ciphertext to the identity that travels beside it in the clear. Without it,
+     * the envelope is portable: under the single node-wide key that is the only key any deployable
+     * configuration has, index A's payload can be relabelled as index B's and replayed. AES-GCM
+     * authenticates the payload; only associated data authenticates the label.
+     *
+     * <p>All four identity fields, not just the index: a chunk is a node-level group commit mixing
+     * many shards, so relabelling within one index (shard 3's record presented as shard 0's) is just
+     * as reachable as relabelling across indices, and {@code primaryTerm}/{@code seqNo} are what
+     * replay's own fencing filter and the local checkpoint bookkeeping key off.
+     */
+    private static byte[] associatedDataFor(WalRecord record) {
+        return ("WALv1|" + record.indexUuid() + "|" + record.shardId() + "|" + record.primaryTerm() + "|" + record.seqNo()).getBytes(
+            StandardCharsets.UTF_8
+        );
+    }
+
+    /**
+     * Returns a copy of {@code record} with its payload replaced by ciphertext, bound to the
+     * record's own identity as associated data.
      *
      * @param record the record whose plaintext payload should be encrypted
      * @param keyProvider supplies the key used to encrypt the payload
      * @return a copy of {@code record} with its payload replaced by ciphertext
      */
     public static WalRecord encrypt(WalRecord record, EncryptionKeyProvider keyProvider) throws IOException {
-        byte[] ciphertext = AesGcmCipher.encrypt(record.payload(), keyProvider.currentKey(record.indexUuid()));
+        byte[] ciphertext = AesGcmCipher.encrypt(record.payload(), keyProvider.currentKey(record.indexUuid()), associatedDataFor(record));
         return new WalRecord(record.indexUuid(), record.shardId(), record.primaryTerm(), record.seqNo(), ciphertext);
     }
 
     /**
-     * Returns a copy of {@code record} with its payload replaced by the decrypted plaintext.
+     * Returns a copy of {@code record} with its payload replaced by the decrypted plaintext, checking
+     * the identity binding {@link #encrypt} applied.
      *
      * @param record the record whose ciphertext payload should be decrypted
      * @param keyProvider supplies the key used to decrypt the payload
      * @return a copy of {@code record} with its payload replaced by plaintext
      */
     public static WalRecord decrypt(WalRecord record, EncryptionKeyProvider keyProvider) throws IOException {
-        byte[] plaintext = AesGcmCipher.decrypt(record.payload(), keyProvider.currentKey(record.indexUuid()));
+        return decrypt(record, keyProvider, WalChunkWriter.FORMAT_VERSION);
+    }
+
+    /**
+     * As {@link #decrypt(WalRecord, EncryptionKeyProvider)}, but for a record read out of a chunk
+     * written at {@code chunkFormatVersion}: identity is only supplied as associated data when that
+     * version actually wrote it that way (see {@link #FIRST_IDENTITY_BOUND_FORMAT_VERSION}).
+     *
+     * @param record the record whose ciphertext payload should be decrypted
+     * @param keyProvider supplies the key used to decrypt the payload
+     * @param chunkFormatVersion the {@code formatVersion} of the chunk this record was read from
+     * @return a copy of {@code record} with its payload replaced by plaintext
+     */
+    public static WalRecord decrypt(WalRecord record, EncryptionKeyProvider keyProvider, int chunkFormatVersion) throws IOException {
+        byte[] plaintext = chunkFormatVersion >= FIRST_IDENTITY_BOUND_FORMAT_VERSION
+            ? AesGcmCipher.decrypt(record.payload(), keyProvider.currentKey(record.indexUuid()), associatedDataFor(record))
+            : AesGcmCipher.decrypt(record.payload(), keyProvider.currentKey(record.indexUuid()));
         return new WalRecord(record.indexUuid(), record.shardId(), record.primaryTerm(), record.seqNo(), plaintext);
     }
 
     /**
-     * {@link #decrypt} applied to every record in {@code records}, in order.
+     * {@link #decrypt} applied to every record in {@code records}, in order, assuming they came from
+     * a chunk written at the current {@link WalChunkWriter#FORMAT_VERSION}.
      *
      * @param records the records whose ciphertext payloads should be decrypted
      * @param keyProvider supplies the key used to decrypt each payload
      * @return the decrypted records, in the same order as {@code records}
      */
     public static List<WalRecord> decryptAll(List<WalRecord> records, EncryptionKeyProvider keyProvider) throws IOException {
+        return decryptAll(records, keyProvider, WalChunkWriter.FORMAT_VERSION);
+    }
+
+    /**
+     * {@link #decrypt(WalRecord, EncryptionKeyProvider, int)} applied to every record in {@code
+     * records}, in order. This is the overload replay uses, since only the chunk parser knows which
+     * format version the bytes on disk were written at.
+     *
+     * @param records the records whose ciphertext payloads should be decrypted
+     * @param keyProvider supplies the key used to decrypt each payload
+     * @param chunkFormatVersion the {@code formatVersion} of the chunk these records were read from
+     * @return the decrypted records, in the same order as {@code records}
+     */
+    public static List<WalRecord> decryptAll(List<WalRecord> records, EncryptionKeyProvider keyProvider, int chunkFormatVersion)
+        throws IOException {
         List<WalRecord> decrypted = new ArrayList<>(records.size());
         for (WalRecord record : records) {
-            decrypted.add(decrypt(record, keyProvider));
+            decrypted.add(decrypt(record, keyProvider, chunkFormatVersion));
         }
         return decrypted;
     }

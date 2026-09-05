@@ -13,6 +13,8 @@ import org.opensearch.action.support.nodes.BaseNodesResponse;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.ShardRange;
+import org.opensearch.cluster.metadata.SplitShardsMetadata;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.ToXContentObject;
@@ -113,8 +115,12 @@ public class ShardSplitCandidatesResponse extends BaseNodesResponse<NodeShardSpl
                 continue;
             }
             String indexName = indexMetadata.getIndex().getName();
+            long ownedSizeInBytes = ownedSize(shardSizeInBytes, indexMetadata, shardId);
             boolean writeRateCandidate = writesPerMinute > writesPerMinuteThreshold;
-            boolean sizeCandidate = shardSizeInBytes > sizeThresholdBytes;
+            // Deliberately the *owned* size, not the reported one: see
+            // ShardSplitCandidateEntry#ownedSizeInBytes (finding R-3) for why comparing the reported
+            // size against the threshold made automatic split-for-size a non-terminating loop.
+            boolean sizeCandidate = ownedSizeInBytes > sizeThresholdBytes;
             result.add(
                 new ShardSplitCandidateEntry(
                     indexUuid,
@@ -122,6 +128,7 @@ public class ShardSplitCandidatesResponse extends BaseNodesResponse<NodeShardSpl
                     indexName,
                     writesPerMinute,
                     shardSizeInBytes,
+                    ownedSizeInBytes,
                     writeRateCandidate,
                     sizeCandidate
                 )
@@ -129,6 +136,45 @@ public class ShardSplitCandidatesResponse extends BaseNodesResponse<NodeShardSpl
         }
         return result;
     }
+
+    /**
+     * The share of {@code reportedSizeInBytes} that shard {@code shardId} actually owns, given its
+     * {@link ShardRange}'s fraction of the 2^32 hash space. Returns the reported size unchanged for
+     * a shard with no split lineage (whose range is the whole space), for {@link
+     * ShardSplitCandidateEntry#UNKNOWN}, and for any shard whose range cannot be resolved -- an
+     * unresolvable range must not silently shrink a real size signal to zero.
+     */
+    private static long ownedSize(long reportedSizeInBytes, IndexMetadata indexMetadata, int shardId) {
+        if (reportedSizeInBytes == ShardSplitCandidateEntry.UNKNOWN || reportedSizeInBytes <= 0) {
+            return reportedSizeInBytes;
+        }
+        SplitShardsMetadata splitShardsMetadata = indexMetadata.getSplitShardsMetadata();
+        if (splitShardsMetadata == null) {
+            return reportedSizeInBytes;
+        }
+        ShardRange range;
+        try {
+            range = splitShardsMetadata.getRangeOfShard(shardId);
+        } catch (RuntimeException e) {
+            // A shard id this index's split metadata does not know about (a retired parent, a
+            // node's snapshot racing ahead of this coordinator's cluster state). Fail open: report
+            // the raw size rather than fabricating a fraction.
+            return reportedSizeInBytes;
+        }
+        if (range == null) {
+            return reportedSizeInBytes;
+        }
+        // Widened to long deliberately: end - start overflows int for a full-space range, which is
+        // exactly the common case. +1 because both bounds are inclusive.
+        long span = (long) range.end() - (long) range.start() + 1L;
+        if (span <= 0 || span >= FULL_HASH_SPACE) {
+            return reportedSizeInBytes;
+        }
+        return (long) (reportedSizeInBytes * ((double) span / (double) FULL_HASH_SPACE));
+    }
+
+    /** The number of distinct values a 32-bit routing hash can take -- the span of a never-split shard's range. */
+    private static final long FULL_HASH_SPACE = 1L << 32;
 
     private static String key(String indexUuid, int shardId) {
         return indexUuid + "/" + shardId;

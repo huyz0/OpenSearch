@@ -29,6 +29,7 @@ public final class RoleCapacitySignal implements Writeable, ToXContentObject {
 
     private final List<NodeCapacityEntry> nodes;
     private final int unassignedShardCount;
+    private final int blockedUnassignedShardCount;
     private final List<String> drainCandidates;
     private final int sustainedPressureTicks;
     private final Map<String, Integer> unassignedByIndex;
@@ -57,8 +58,33 @@ public final class RoleCapacitySignal implements Writeable, ToXContentObject {
         int sustainedPressureTicks,
         Map<String, Integer> unassignedByIndex
     ) {
+        this(nodes, unassignedShardCount, 0, drainCandidates, sustainedPressureTicks, unassignedByIndex);
+    }
+
+    /**
+     * Creates a signal that separates unassigned shards allocation could place given more capacity
+     * from unassigned shards no amount of capacity would help.
+     *
+     * @param nodes every node in this role's pool, including those holding no shards.
+     * @param unassignedShardCount shard copies of this role that allocation wants to place and that
+     *                             adding capacity could plausibly satisfy -- the scale-up trigger.
+     * @param blockedUnassignedShardCount shard copies that are unassigned for a reason no new node
+     *                                    would fix; see {@link #blockedUnassignedShardCount()}.
+     * @param drainCandidates node ids that have passed this signal's own sustained-idleness hysteresis.
+     * @param sustainedPressureTicks how many consecutive ticks {@code unassignedShardCount} has been nonzero.
+     * @param unassignedByIndex per-index breakdown of {@code unassignedShardCount}.
+     */
+    public RoleCapacitySignal(
+        List<NodeCapacityEntry> nodes,
+        int unassignedShardCount,
+        int blockedUnassignedShardCount,
+        List<String> drainCandidates,
+        int sustainedPressureTicks,
+        Map<String, Integer> unassignedByIndex
+    ) {
         this.nodes = nodes;
         this.unassignedShardCount = unassignedShardCount;
+        this.blockedUnassignedShardCount = blockedUnassignedShardCount;
         this.drainCandidates = drainCandidates;
         this.sustainedPressureTicks = sustainedPressureTicks;
         this.unassignedByIndex = unassignedByIndex;
@@ -72,6 +98,7 @@ public final class RoleCapacitySignal implements Writeable, ToXContentObject {
     public RoleCapacitySignal(StreamInput in) throws IOException {
         this.nodes = in.readList(NodeCapacityEntry::new);
         this.unassignedShardCount = in.readVInt();
+        this.blockedUnassignedShardCount = in.readVInt();
         this.drainCandidates = in.readStringList();
         this.sustainedPressureTicks = in.readVInt();
         this.unassignedByIndex = in.readMap(StreamInput::readString, StreamInput::readVInt);
@@ -82,19 +109,56 @@ public final class RoleCapacitySignal implements Writeable, ToXContentObject {
     public void writeTo(StreamOutput out) throws IOException {
         out.writeList(nodes);
         out.writeVInt(unassignedShardCount);
+        out.writeVInt(blockedUnassignedShardCount);
         out.writeStringCollection(drainCandidates);
         out.writeVInt(sustainedPressureTicks);
         out.writeMap(unassignedByIndex, StreamOutput::writeString, StreamOutput::writeVInt);
     }
 
-    /** Every node currently holding at least one shard copy of this role. */
+    /**
+     * Every node in this role's pool.
+     *
+     * <p><b>Finding N-6.</b> This used to mean "every node currently holding at least one shard copy
+     * of this role", because the accumulator behind it was only ever populated from inside the loop
+     * over <em>assigned</em> shard routings. A completely empty node -- the ideal drain target, and
+     * the whole of the available headroom on a fresh cluster -- was therefore invisible. Three things
+     * broke on that: a control plane could not see idle capacity at all; an empty node could never be
+     * a drain candidate, because drain candidates are drawn from these same entries; and the reader
+     * scale-up headroom formula {@code nodeCount() * maxShardsPerReaderNode - totalAssignedShardCount()}
+     * evaluated to zero on a fresh cluster, so expansion returned without expanding and stayed dead
+     * until something else happened to assign a reader shard. Nodes are now seeded from the cluster's
+     * membership, so a zero-shard node appears with {@code assignedShardCount == 0}.
+     */
     public List<NodeCapacityEntry> nodes() {
         return nodes;
     }
 
-    /** How many nodes currently hold at least one shard copy of this role. */
+    /** How many nodes are in this role's pool, whether or not they currently hold a shard. */
     public int nodeCount() {
         return nodes.size();
+    }
+
+    /**
+     * Unassigned shard copies of this role that no amount of new capacity would place.
+     *
+     * <p><b>Finding N-3.</b> {@link #unassignedShardCount()} is documented as the primary scale-up
+     * trigger, and it used to count <em>every</em> unassigned copy -- including ones held unassigned
+     * on purpose by this plugin's own deciders (a scale-to-zero-suspended shard is by design pinned
+     * {@code UNASSIGNED}) and ones that have exhausted {@code index.allocation.max_retries}. A
+     * control plane following the documented contract would provision nodes forever against a shard
+     * no node can accept, and {@code sustainedPressureTicks} made it look like escalating demand
+     * because a permanently blocked shard produces a monotonically rising counter.
+     *
+     * <p>Worse, the same value gates reader scale-up: one stuck-warming reader node kept
+     * {@code unassignedShardCount() > 0} true forever, which kept {@code readerCapacitySaturated}
+     * true forever, which made reader replica expansion return immediately for every index in the
+     * cluster. One misconfigured node silently disabled reader scale-up everywhere.
+     *
+     * <p>These shards are still reported, because they are a real and important condition -- they
+     * are simply not a capacity signal, and separating them is what stops them being read as one.
+     */
+    public int blockedUnassignedShardCount() {
+        return blockedUnassignedShardCount;
     }
 
     /**
@@ -139,6 +203,7 @@ public final class RoleCapacitySignal implements Writeable, ToXContentObject {
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject();
         builder.field("node_count", nodeCount());
+        builder.field("blocked_unassigned_shard_count", blockedUnassignedShardCount);
         builder.field("unassigned_shard_count", unassignedShardCount);
         builder.startArray("nodes");
         for (NodeCapacityEntry entry : nodes) {
@@ -165,6 +230,7 @@ public final class RoleCapacitySignal implements Writeable, ToXContentObject {
         }
         RoleCapacitySignal that = (RoleCapacitySignal) o;
         return unassignedShardCount == that.unassignedShardCount
+            && blockedUnassignedShardCount == that.blockedUnassignedShardCount
             && sustainedPressureTicks == that.sustainedPressureTicks
             && Objects.equals(nodes, that.nodes)
             && Objects.equals(drainCandidates, that.drainCandidates)
@@ -173,6 +239,13 @@ public final class RoleCapacitySignal implements Writeable, ToXContentObject {
 
     @Override
     public int hashCode() {
-        return Objects.hash(nodes, unassignedShardCount, drainCandidates, sustainedPressureTicks, unassignedByIndex);
+        return Objects.hash(
+            nodes,
+            unassignedShardCount,
+            blockedUnassignedShardCount,
+            drainCandidates,
+            sustainedPressureTicks,
+            unassignedByIndex
+        );
     }
 }

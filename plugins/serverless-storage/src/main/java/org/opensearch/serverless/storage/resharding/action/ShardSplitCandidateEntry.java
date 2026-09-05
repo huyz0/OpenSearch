@@ -42,6 +42,7 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
     private final String indexName;
     private final long writesPerMinute;
     private final long shardSizeInBytes;
+    private final long ownedSizeInBytes;
     private final boolean writeRateCandidate;
     private final boolean sizeCandidate;
 
@@ -70,11 +71,41 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
         boolean writeRateCandidate,
         boolean sizeCandidate
     ) {
+        // A shard with no split lineage owns everything it reports, so the two sizes coincide.
+        this(indexUuid, shardId, indexName, writesPerMinute, shardSizeInBytes, shardSizeInBytes, writeRateCandidate, sizeCandidate);
+    }
+
+    /**
+     * Creates an entry that distinguishes the shard's reported size from the share of it the shard
+     * actually owns.
+     *
+     * @param indexUuid UUID of the index the shard belongs to.
+     * @param shardId the shard number within {@code indexUuid}.
+     * @param indexName the index's current name.
+     * @param writesPerMinute the highest writes-per-minute estimate any writer copy reported.
+     * @param shardSizeInBytes the highest raw size-in-bytes estimate any writer copy reported.
+     * @param ownedSizeInBytes that raw size scaled down to the fraction of the hash space this
+     *                         shard's {@link org.opensearch.cluster.metadata.ShardRange} actually
+     *                         covers -- see {@link #ownedSizeInBytes()}.
+     * @param writeRateCandidate whether the write-rate signal flags this shard.
+     * @param sizeCandidate whether the size signal flags this shard.
+     */
+    public ShardSplitCandidateEntry(
+        String indexUuid,
+        int shardId,
+        String indexName,
+        long writesPerMinute,
+        long shardSizeInBytes,
+        long ownedSizeInBytes,
+        boolean writeRateCandidate,
+        boolean sizeCandidate
+    ) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;
         this.indexName = indexName;
         this.writesPerMinute = writesPerMinute;
         this.shardSizeInBytes = shardSizeInBytes;
+        this.ownedSizeInBytes = ownedSizeInBytes;
         this.writeRateCandidate = writeRateCandidate;
         this.sizeCandidate = sizeCandidate;
     }
@@ -90,6 +121,7 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
         this.indexName = in.readString();
         this.writesPerMinute = in.readZLong();
         this.shardSizeInBytes = in.readZLong();
+        this.ownedSizeInBytes = in.readZLong();
         this.writeRateCandidate = in.readBoolean();
         this.sizeCandidate = in.readBoolean();
     }
@@ -102,6 +134,7 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
         out.writeString(indexName);
         out.writeZLong(writesPerMinute);
         out.writeZLong(shardSizeInBytes);
+        out.writeZLong(ownedSizeInBytes);
         out.writeBoolean(writeRateCandidate);
         out.writeBoolean(sizeCandidate);
     }
@@ -131,6 +164,29 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
         return shardSizeInBytes;
     }
 
+    /**
+     * The share of {@link #shardSizeInBytes()} this shard actually owns, and the number {@link
+     * #sizeCandidate()} is evaluated against.
+     *
+     * <p><b>Finding R-3, and why this field has to exist.</b> {@code
+     * ObjectStoreWriterEngine#shardSizeInBytes()} sums every file in the shard's latest manifest.
+     * An in-place split child's manifest is a <em>clone</em> of its parent's and references exactly
+     * the same file set, so both children report the parent's full size -- and, because nothing ever
+     * physically rewrites an in-place child's bundles, that reported size never falls. With
+     * split-for-size enabled that made the trigger self-perpetuating: split a 10 GiB shard, get two
+     * children each reporting 10 GiB, each immediately a size candidate again, 2 -&gt; 4 -&gt; 8,
+     * bounded only by core's minimum range length. The loop had no terminating condition at all.
+     *
+     * <p>The scaling here is exact enough for a threshold and needs no extra I/O: a child's {@link
+     * org.opensearch.cluster.metadata.ShardRange} covers a known fraction of the 2^32 hash space,
+     * and documents are distributed across that space by a hash, so the child owns approximately
+     * that fraction of the shared bytes. A never-split shard covers the whole space and this equals
+     * {@link #shardSizeInBytes()}.
+     */
+    public long ownedSizeInBytes() {
+        return ownedSizeInBytes;
+    }
+
     /** Whether this plugin's policy considers this shard's write rate a split-for-heat candidate. */
     public boolean writeRateCandidate() {
         return writeRateCandidate;
@@ -158,6 +214,7 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
             .field("index_name", indexName)
             .field("writes_per_minute", writesPerMinute)
             .field("shard_size_in_bytes", shardSizeInBytes)
+            .field("owned_size_in_bytes", ownedSizeInBytes)
             .field("write_rate_candidate", writeRateCandidate)
             .field("size_candidate", sizeCandidate)
             .field("candidate", candidate())
@@ -177,6 +234,7 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
             && writesPerMinute == that.writesPerMinute
             && shardSizeInBytes == that.shardSizeInBytes
             && writeRateCandidate == that.writeRateCandidate
+            && ownedSizeInBytes == that.ownedSizeInBytes
             && sizeCandidate == that.sizeCandidate
             && Objects.equals(indexUuid, that.indexUuid)
             && Objects.equals(indexName, that.indexName);
@@ -184,6 +242,15 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
 
     @Override
     public int hashCode() {
-        return Objects.hash(indexUuid, shardId, indexName, writesPerMinute, shardSizeInBytes, writeRateCandidate, sizeCandidate);
+        return Objects.hash(
+            indexUuid,
+            shardId,
+            indexName,
+            writesPerMinute,
+            shardSizeInBytes,
+            ownedSizeInBytes,
+            writeRateCandidate,
+            sizeCandidate
+        );
     }
 }

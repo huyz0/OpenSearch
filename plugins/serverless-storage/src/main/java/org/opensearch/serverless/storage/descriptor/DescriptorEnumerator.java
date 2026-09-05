@@ -152,12 +152,30 @@ public final class DescriptorEnumerator implements DescriptorPrefixBackend {
      * itself; both are now constants for a gated index rather than unknowns:
      *
      * <ul>
-     *   <li><b>open</b> is always true, because {@code MetadataIndexStateService} refuses to close a gated
-     *       index at all. There is no other state a live descriptor can be in.</li>
      *   <li><b>hidden</b> is always false, because {@code DescriptorRepresentable} refuses to gate a hidden
      *       index. That refusal exists precisely so this can come from a listing rather than from a GET per
      *       match, or from a second keyspace written on every create.</li>
+     *   <li><b>open</b> <em>was</em> always true, and is not any more. This paragraph used to say that
+     *       {@code MetadataIndexStateService} refuses to close a gated index at all, and concluded from the
+     *       two invariants together that a key alone answers a whole match. Close was subsequently
+     *       implemented for gated indices -- the gated path writes {@code descriptor.withState(CLOSE)} and
+     *       {@code IndexDescriptor.toIndexMetadata} synthesises {@code State.CLOSE} from it, which it
+     *       records having had to fix once already because dropping the state made close a label rather
+     *       than an operation. So the state has to be read from the descriptor, and the loop below reads
+     *       it.</li>
      * </ul>
+     *
+     * <h4>What that costs, stated rather than implied</h4>
+     *
+     * One descriptor resolution per returned key: a cold hundred-match wildcard is up to a hundred point
+     * reads (two hundred GETs for any name that is absent or tombstoned), on top of the one listing. They
+     * go through {@code AbsentIndexDescriptorSuppliers} and therefore through the descriptor cache, so a
+     * warm node pays nothing and a node that has just started pays all of it. This is the cost the two
+     * invariants were meant to remove and one of them no longer holds; removing it again means either
+     * carrying the state in the key (a second keyspace, rewritten on every close) or accepting that a
+     * closed gated index may be reported open by a wildcard for one freshness window. Neither is obviously
+     * right, so the cost is paid and named here instead of being quietly reintroduced under a comment
+     * saying it was designed out.
      *
      * <p>Deleted names are absent for free, for the reason the class javadoc already gives: tombstones live
      * under their own prefix, so this listing is exactly the set of live names.

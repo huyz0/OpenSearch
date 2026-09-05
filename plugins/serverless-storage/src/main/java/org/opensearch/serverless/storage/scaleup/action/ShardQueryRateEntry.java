@@ -28,6 +28,7 @@ public final class ShardQueryRateEntry implements Writeable, ToXContentObject {
     private final String indexUuid;
     private final int shardId;
     private final long queriesPerMinute;
+    private final long millisSinceLastQuery;
 
     /**
      * Creates an entry.
@@ -38,9 +39,26 @@ public final class ShardQueryRateEntry implements Writeable, ToXContentObject {
      *                         on the node that reported this entry.
      */
     public ShardQueryRateEntry(String indexUuid, int shardId, long queriesPerMinute) {
+        this(indexUuid, shardId, queriesPerMinute, UNKNOWN_IDLE);
+    }
+
+    /** Sentinel for {@link #millisSinceLastQuery()} when the reporting node had no idleness reading for this shard. */
+    public static final long UNKNOWN_IDLE = -1L;
+
+    /**
+     * Creates an entry carrying both signals.
+     *
+     * @param indexUuid UUID of the index the shard belongs to.
+     * @param shardId the shard number within {@code indexUuid}.
+     * @param queriesPerMinute this shard's reader engine's own {@code queriesPerMinute()} estimate.
+     * @param millisSinceLastQuery how long ago that reader copy last served a query, or {@link
+     *                             #UNKNOWN_IDLE} -- see {@link #millisSinceLastQuery()}.
+     */
+    public ShardQueryRateEntry(String indexUuid, int shardId, long queriesPerMinute, long millisSinceLastQuery) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;
         this.queriesPerMinute = queriesPerMinute;
+        this.millisSinceLastQuery = millisSinceLastQuery;
     }
 
     /**
@@ -52,6 +70,7 @@ public final class ShardQueryRateEntry implements Writeable, ToXContentObject {
         this.indexUuid = in.readString();
         this.shardId = in.readVInt();
         this.queriesPerMinute = in.readZLong();
+        this.millisSinceLastQuery = in.readZLong();
     }
 
     /** @param out stream to write this entry's fields to. */
@@ -60,6 +79,7 @@ public final class ShardQueryRateEntry implements Writeable, ToXContentObject {
         out.writeString(indexUuid);
         out.writeVInt(shardId);
         out.writeZLong(queriesPerMinute);
+        out.writeZLong(millisSinceLastQuery);
     }
 
     /** UUID of the index the shard belongs to. */
@@ -78,6 +98,31 @@ public final class ShardQueryRateEntry implements Writeable, ToXContentObject {
     }
 
     /**
+     * How long ago this reader copy last served a query, in millis, or {@link #UNKNOWN_IDLE}.
+     *
+     * <p><b>Finding S-1: why the rate alone is not a usable signal.</b> {@code
+     * ObjectStoreReaderEngine#recordQueryForRateCounter} rolls its 60-second window over only on the
+     * <em>next</em> query. When traffic stops there is no next query, so the completed window's count
+     * freezes and {@code queriesPerMinute()} reports the last busy value indefinitely. The engine's
+     * javadoc acknowledges this and excuses it with "an idle shard has nothing to scale up for
+     * regardless" -- which is false for this signal's actual consumer, whose candidate predicate
+     * tested only the rate. A shard that sustained 5,000 qpm for an hour and then went to zero was
+     * flagged a candidate on every subsequent tick, ratcheted one step per hysteresis window all the
+     * way to {@code max_search_replicas}, and stayed there: nothing in this repository ever reduces
+     * {@code index.number_of_search_replicas}. The cluster permanently carried five idle reader
+     * copies -- each of which must be materialised from the object store -- of a shard receiving no
+     * traffic at all.
+     *
+     * <p>Carrying idleness alongside the rate lets the predicate cross-check them, which also
+     * resolves finding S-3: scale-up and scale-to-zero were reading two signals that disagree once
+     * traffic stops, with no arbiter, so the same shard could be expanded for load and suspended for
+     * idleness concurrently, on independent schedules.
+     */
+    public long millisSinceLastQuery() {
+        return millisSinceLastQuery;
+    }
+
+    /**
      * @param builder the builder to append this entry's fields to.
      * @param params unused.
      */
@@ -87,6 +132,7 @@ public final class ShardQueryRateEntry implements Writeable, ToXContentObject {
             .field("index_uuid", indexUuid)
             .field("shard_id", shardId)
             .field("queries_per_minute", queriesPerMinute)
+            .field("millis_since_last_query", millisSinceLastQuery)
             .endObject();
     }
 
@@ -99,11 +145,14 @@ public final class ShardQueryRateEntry implements Writeable, ToXContentObject {
             return false;
         }
         ShardQueryRateEntry that = (ShardQueryRateEntry) o;
-        return shardId == that.shardId && queriesPerMinute == that.queriesPerMinute && Objects.equals(indexUuid, that.indexUuid);
+        return shardId == that.shardId
+            && queriesPerMinute == that.queriesPerMinute
+            && millisSinceLastQuery == that.millisSinceLastQuery
+            && Objects.equals(indexUuid, that.indexUuid);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(indexUuid, shardId, queriesPerMinute);
+        return Objects.hash(indexUuid, shardId, queriesPerMinute, millisSinceLastQuery);
     }
 }

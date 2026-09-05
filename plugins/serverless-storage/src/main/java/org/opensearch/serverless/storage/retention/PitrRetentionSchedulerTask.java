@@ -99,7 +99,15 @@ public final class PitrRetentionSchedulerTask implements Closeable {
         this.manifestStore = manifestStore;
         this.reconciler = new PitrRetentionReconciler(pinRegistry);
         this.windowMillis = windowMillis;
-        this.task = threadPool.scheduleWithFixedDelay(this::reconcileSafely, interval, ThreadPool.Names.GENERIC);
+        // Jittered, like GcSchedulerTask's and PinLedgerSweepTask's own scheduling and for the same reason:
+        // after a coordinated restart every shard on the node would otherwise reconcile in lockstep forever,
+        // and a reconcile tick reads the shard's whole manifest listing. The two sibling tasks already do
+        // this; this one was simply missed.
+        this.task = threadPool.scheduleWithFixedDelay(
+            this::reconcileSafely,
+            org.opensearch.serverless.storage.scheduling.JitteredScheduling.jitter(interval),
+            ThreadPool.Names.GENERIC
+        );
     }
 
     private void reconcileSafely() {

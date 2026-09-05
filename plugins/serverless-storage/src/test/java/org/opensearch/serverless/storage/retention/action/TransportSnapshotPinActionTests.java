@@ -84,6 +84,42 @@ public class TransportSnapshotPinActionTests extends OpenSearchTestCase {
         assertTrue("the error must name the index it actually resolved to", e.getMessage().contains("other-idx"));
     }
 
+    /**
+     * A lease-only head, at generation 0, is not a shard you can snapshot.
+     *
+     * <p>The guard used to refuse only an <em>absent</em> head. But a writer acquiring the lease can
+     * put-if-absent a head before it has ever committed anything -- {@code acquireOrRenewLease} deliberately
+     * leaves the term and generation untouched so the head stays a valid pointer to the last real manifest.
+     * Pinning such a shard produced a pin naming manifest (term, 0), a file that was never written: the
+     * request reported success and the failure surfaced at restore time, as a missing file, which is the
+     * worst possible moment to learn a snapshot was never real.
+     */
+    public void testAHeadThatHasNeverPublishedAManifestIsNotSnapshottable() {
+        assertFalse("no head at all", TransportSnapshotPinAction.hasPublishedManifest(java.util.Optional.empty()));
+        assertFalse(
+            "a lease-only head sits at generation 0 and names no manifest",
+            TransportSnapshotPinAction.hasPublishedManifest(
+                java.util.Optional.of(
+                    new org.opensearch.serverless.storage.shardstate.VersionedShardHead(
+                        new org.opensearch.serverless.storage.shardstate.ShardHead(3, "node-1", 10_000L, 0),
+                        1
+                    )
+                )
+            )
+        );
+        assertTrue(
+            "a head that has published is snapshottable, lease or no lease",
+            TransportSnapshotPinAction.hasPublishedManifest(
+                java.util.Optional.of(
+                    new org.opensearch.serverless.storage.shardstate.VersionedShardHead(
+                        new org.opensearch.serverless.storage.shardstate.ShardHead(3, null, 0L, 7),
+                        1
+                    )
+                )
+            )
+        );
+    }
+
     /** An index name is not an index uuid, however real the name is. */
     public void testAnIndexNameIsNotAcceptedInPlaceOfItsUuid() {
         IllegalArgumentException e = expectThrows(

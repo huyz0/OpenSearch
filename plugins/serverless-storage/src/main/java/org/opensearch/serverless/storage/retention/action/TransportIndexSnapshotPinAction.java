@@ -125,13 +125,11 @@ public class TransportIndexSnapshotPinAction extends HandledTransportAction<Inde
     /**
      * How long an unconfirmed pin holds its generation.
      *
-     * <p>Long enough that a slow but healthy fan-out across many shards finishes well inside it, short
-     * enough that an abandoned one does not hold storage for meaningfully longer than the operation would
-     * have. Ten minutes is a judgment rather than a measurement: the fan-out is one register mutation per
-     * shard against the object store, so a thousand-shard index at even ten per second is under two
-     * minutes, and the cost of being wrong on the high side is bounded storage rather than a lost pin.
+     * <p>Defined on {@link PinLedger} rather than here because {@code PinLedgerSweeper} needs the same
+     * number to know how long a just-written ledger's pins may legitimately not exist yet -- see that
+     * constant's own javadoc.
      */
-    static final long UNCONFIRMED_PIN_TTL_MILLIS = 10 * 60 * 1000L;
+    static final long UNCONFIRMED_PIN_TTL_MILLIS = PinLedger.UNCONFIRMED_PIN_TTL_MILLIS;
 
     private void pinShard(
         String indexUuid,
@@ -163,23 +161,34 @@ public class TransportIndexSnapshotPinAction extends HandledTransportAction<Inde
      * committed new data between the two phases would otherwise be re-pinned at a later generation, quietly
      * turning one point in time into two.
      *
-     * <p>A failure here fails the request with the pins still provisional, which is the safe direction --
-     * they lapse, and the caller is told the pin did not take rather than being handed one that will
-     * disappear later without explanation.
+     * <p><b>A failure here is not the safe direction, and used to be described as one.</b> This loop
+     * re-stamps each shard's pin to {@code NEVER_EXPIRES} one shard at a time. If the object store fails at
+     * shard 120 of 200, shards 0..119 are already permanent: they will not lapse, nothing will ever release
+     * them, and garbage collection on those 120 shards is blocked at whatever generation was current --
+     * while the caller has been told the pin did not take and therefore has no reason to release anything.
+     * The pins that lapse (120..199) and the pins that do not (0..119) make the "snapshot" neither taken nor
+     * absent. So a failure here runs the same compensating release the fan-out's own failure path runs.
+     * Release is idempotent and by pin id, so it is correct over the confirmed and still-provisional shards
+     * alike, and the caller still sees the original failure rather than the compensation's.
      */
-    private void confirmPins(String indexUuid, int numberOfShards, String snapshotId, ActionListener<IndexSnapshotPinResponse> listener) {
-        try {
-            for (int shardId = 0; shardId < numberOfShards; shardId++) {
-                new BlobContainerDurablePinRegistry(plugin.blobContainerForDirectoryFactory(indexUuid, shardId)).confirmPin(
-                    indexUuid,
-                    shardId,
-                    snapshotId,
-                    PinRecord.NEVER_EXPIRES
-                );
+    // Package-private rather than private so a test can drive the confirm phase directly: the failure this
+    // guards against is the object store rejecting the 121st of 200 shards, which no amount of real wiring
+    // produces on demand.
+    void confirmPins(String indexUuid, int numberOfShards, String snapshotId, ActionListener<IndexSnapshotPinResponse> listener) {
+        for (int shardId = 0; shardId < numberOfShards; shardId++) {
+            try {
+                confirmShardPin(indexUuid, shardId, snapshotId);
+            } catch (Exception e) {
+                // Every shard, not just the ones already confirmed: the unconfirmed ones would lapse on
+                // their own, but releasing them now is a no-op-shaped extra call that removes any window in
+                // which a retry of this whole request could see a stale provisional pin.
+                List<Integer> everyShard = new ArrayList<>(numberOfShards);
+                for (int i = 0; i < numberOfShards; i++) {
+                    everyShard.add(i);
+                }
+                rollBackAndFail(indexUuid, snapshotId, everyShard, e, listener);
+                return;
             }
-        } catch (Exception e) {
-            listener.onFailure(e);
-            return;
         }
         listener.onResponse(new IndexSnapshotPinResponse(numberOfShards));
     }
@@ -192,28 +201,62 @@ public class TransportIndexSnapshotPinAction extends HandledTransportAction<Inde
         ActionListener<IndexSnapshotPinResponse> listener
     ) {
         if (pinnedSoFar.isEmpty()) {
+            deleteLedgerBestEffort(indexUuid, snapshotId);
             listener.onFailure(failure);
             return;
         }
         AtomicInteger remaining = new AtomicInteger(pinnedSoFar.size());
         for (int shardId : pinnedSoFar) {
-            client.execute(
-                SnapshotReleaseAction.INSTANCE,
-                new SnapshotReleaseRequest(indexUuid, shardId, snapshotId),
-                ActionListener.wrap(ignored -> {
-                    if (remaining.decrementAndGet() == 0) {
-                        listener.onFailure(failure);
-                    }
-                }, releaseFailure -> {
-                    // The compensating release itself failed -- SnapshotReleaseAction is
-                    // idempotent, so a caller retrying the pin (or a manual release) will clean
-                    // this up; still surface the original pin failure, not this secondary one, so
-                    // the caller understands why the overall operation failed.
-                    if (remaining.decrementAndGet() == 0) {
-                        listener.onFailure(failure);
-                    }
-                })
-            );
+            releaseShardPin(indexUuid, shardId, snapshotId, ActionListener.wrap(ignored -> {
+                if (remaining.decrementAndGet() == 0) {
+                    deleteLedgerBestEffort(indexUuid, snapshotId);
+                    listener.onFailure(failure);
+                }
+            }, releaseFailure -> {
+                // The compensating release itself failed -- SnapshotReleaseAction is
+                // idempotent, so a caller retrying the pin (or a manual release) will clean
+                // this up; still surface the original pin failure, not this secondary one, so
+                // the caller understands why the overall operation failed.
+                if (remaining.decrementAndGet() == 0) {
+                    deleteLedgerBestEffort(indexUuid, snapshotId);
+                    listener.onFailure(failure);
+                }
+            }));
+        }
+    }
+
+    /** One shard's confirm, as its own method so a test can make exactly one of them fail. */
+    void confirmShardPin(String indexUuid, int shardId, String snapshotId) throws Exception {
+        new BlobContainerDurablePinRegistry(plugin.blobContainerForDirectoryFactory(indexUuid, shardId)).confirmPin(
+            indexUuid,
+            shardId,
+            snapshotId,
+            PinRecord.NEVER_EXPIRES
+        );
+    }
+
+    /** One shard's compensating release, as its own method so a test can observe which shards it covers. */
+    void releaseShardPin(String indexUuid, int shardId, String snapshotId, ActionListener<SnapshotReleaseResponse> listener) {
+        client.execute(SnapshotReleaseAction.INSTANCE, new SnapshotReleaseRequest(indexUuid, shardId, snapshotId), listener);
+    }
+
+    /**
+     * Removes the ledger this request wrote before it started pinning, once the compensating release has
+     * finished.
+     *
+     * <p>The ledger records intent, so leaving it behind after a rolled-back attempt leaves a permanent
+     * record of a pin that does not exist -- and the sweeper that would otherwise clear it releases nothing
+     * and is off by default, so "it will be tidied later" was not true. Deleted only after the releases
+     * above, never before: the whole reason the ledger is written first is that it must outlive a failed
+     * release, and deleting it while a release is still outstanding would recreate exactly the invisible
+     * leak it exists to prevent. Failure here is swallowed -- the caller is being told about the original
+     * failure, and a stale ledger is a bookkeeping cost, not a correctness one.
+     */
+    private void deleteLedgerBestEffort(String indexUuid, String snapshotId) {
+        try {
+            new BlobContainerPinLedgerStore(plugin.blobContainerForDirectoryFactory(indexUuid, 0)).delete(snapshotId);
+        } catch (Exception ignored) {
+            // See this method's own javadoc.
         }
     }
 }

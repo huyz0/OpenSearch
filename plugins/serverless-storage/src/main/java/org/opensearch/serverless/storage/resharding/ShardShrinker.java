@@ -13,6 +13,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
@@ -159,7 +160,22 @@ public final class ShardShrinker {
             }
 
             try (Directory targetDirectory = new ByteBuffersDirectory()) {
-                try (IndexWriter writer = new IndexWriter(targetDirectory, new IndexWriterConfig())) {
+                // setSoftDeletesField is not optional here (finding R-9): addIndexes runs every
+                // incoming FieldInfo through FieldInfos.verifySoftDeletedFieldName, which throws
+                // IllegalArgumentException ("this index has [__soft_deletes] as soft-deletes
+                // already but soft-deletes field is not configured in IWC") as soon as any source
+                // carries that FieldInfo -- which is every shard that has ever taken a single
+                // DELETE or _update. Without it, shrink worked only on indices that had never had
+                // a document removed, and every fixture in this package happened to be one.
+                // Unlike PartitionRewritePublisher's rewrite, a shrink must *keep* the soft-deleted
+                // documents rather than filter them out: they are the shard's operation history,
+                // and the shrink target inherits the source's sequence numbers, so dropping them
+                // would silently truncate the history a later peer recovery or CCR read expects.
+                // The Directory-level addIndexes below copies segments wholesale and preserves them
+                // exactly; naming the field is all that is needed for the writer to understand what
+                // it is copying.
+                IndexWriterConfig config = new IndexWriterConfig().setSoftDeletesField(Lucene.SOFT_DELETES_FIELD);
+                try (IndexWriter writer = new IndexWriter(targetDirectory, config)) {
                     writer.addIndexes(sourceDirectories.toArray(new Directory[0]));
                     writer.commit();
                 }

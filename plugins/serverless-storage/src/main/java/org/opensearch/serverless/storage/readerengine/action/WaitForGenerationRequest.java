@@ -79,9 +79,27 @@ public class WaitForGenerationRequest extends ActionRequest {
         }
         if (timeout == null || timeout.millis() < 0) {
             validationException = addValidationError("timeout must be >= 0", validationException);
+        } else if (timeout.millis() > MAX_TIMEOUT_MILLIS) {
+            // Any non-negative timeout used to be accepted, so a one-hour wait was a legal request.
+            // A read-after-write wait is a latency mechanism, not a subscription: the receiving
+            // engine holds a pending waiter and a share of that shard's poll cadence for the whole
+            // duration, so an unbounded timeout is a denial-of-service surface rather than a
+            // feature. Rejected here, at the edge, rather than silently clamped on the far side,
+            // because a caller that asked for an hour should be told it cannot have one.
+            validationException = addValidationError(
+                "timeout must be <= " + MAX_TIMEOUT_MILLIS + "ms, got " + timeout.millis() + "ms",
+                validationException
+            );
         }
         return validationException;
     }
+
+    /**
+     * The longest read-after-write wait this action accepts -- see {@link #validate()}. Matches
+     * {@code ObjectStoreReaderEngine}'s own ceiling, so the two cannot drift into a request that
+     * validates here and is silently truncated there.
+     */
+    public static final long MAX_TIMEOUT_MILLIS = 60_000L;
 
     /** UUID of the index the shard belongs to. */
     public String indexUuid() {

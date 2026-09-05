@@ -91,10 +91,15 @@ public final class ObjectStoreCommitHeadPublisher {
      * publish attempt by this same writer winning first), the generation is recomputed from the
      * freshly re-read head and the commit is packaged again at the new generation -- so more than
      * one manifest/bundle pair may be written to object storage for a single call under contention.
-     * Every manifest not referenced by the head that ultimately wins the CAS is simply unreferenced
-     * garbage, eligible for the same GC path as any other orphaned bundle (see {@link
-     * ObjectStoreCommitPublisher}'s own class javadoc) -- never a correctness issue, since bundles
-     * and manifests are addressed only through a successfully published head.
+     * A manifest this call wrote and then failed to install is removed on the next iteration, once
+     * the freshly re-read head proves it did not become the head (best-effort -- some containers
+     * deny deletes, and GC collects it either way); its bundle remains unreferenced garbage for the
+     * same GC path as any other orphan (see {@link ObjectStoreCommitPublisher}'s own class javadoc).
+     * Bundles and manifests are addressed only through a successfully published head, so nothing
+     * about correctness depended on that cleanup -- but rfc-serverless-opensearch.md &sect;6.3 also
+     * keeps "list manifest names, highest term then generation" as a bootstrap/fallback discovery
+     * path, and a plain listing cannot tell a CAS loser from the winner, so leaving losers behind
+     * made that fallback's correctness a matter of convention rather than construction.
      *
      * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
      * @param segmentInfos the local Lucene commit to package and attempt to publish
@@ -122,7 +127,100 @@ public final class ObjectStoreCommitHeadPublisher {
         long mappingVersion,
         PruningStats pruningStats
     ) throws IOException {
-        for (;;) {
+        return publishCommitAsHeadReturningManifest(
+            directory,
+            segmentInfos,
+            indexUuid,
+            shardId,
+            primaryTerm,
+            maxSeqNo,
+            localCheckpoint,
+            walPosition,
+            mappingVersion,
+            pruningStats,
+            null,
+            null,
+            -1L
+        ).isPresent();
+    }
+
+    /**
+     * How many times the CAS/collision loop below may re-attempt before giving up. It used to be an
+     * unbounded {@code for(;;)}, which under sustained contention meant unbounded re-publication --
+     * and, since a bundle name embeds the target generation, unbounded full-shard bundle uploads,
+     * each one immediately orphaned. A bounded budget turns "spin and upload forever" into a
+     * transient failure the caller's own retry-with-backoff handles. Sixteen, matching {@link
+     * #MAX_LEASE_ACQUISITION_ATTEMPTS} and the same bound {@code DescriptorGate#applyToDescriptor}
+     * and {@code MappingGenerationStore} already use.
+     *
+     * <p>Exhaustion throws rather than failing the engine. That is a deliberate divergence from the
+     * "fail the engine on exhaustion" suggestion: losing sixteen compare-and-swaps in a row is
+     * contention or a struggling store, not a fencing verdict, and only a fencing verdict may destroy
+     * a shard whose commit is already durable locally -- see {@code
+     * ObjectStoreWriterEngine#publishWithRetry}. Genuine fencing returns empty from this method
+     * instead, and the engine does fail on that.
+     */
+    static final int MAX_PUBLISH_ATTEMPTS = 16;
+
+    /**
+     * Same as {@link #publishCommitAsHead}, returning the manifest that actually became the head
+     * (empty means fenced out), and accepting a delta base for incremental bundling.
+     *
+     * <p><b>Lost generation races are now retried, not fatal.</b> Both this class and the compactor
+     * target {@code currentHead.latestManifestGeneration() + 1} under the current term, i.e. the
+     * identical {@code manifest-<term>-<gen>} name, so a writer flush racing a compaction publish is
+     * an entirely expected event. The loop below always handled a lost <em>CAS</em>; what it did not
+     * handle was the collision being discovered <em>earlier</em>, while packaging, where it surfaced
+     * as a bare {@code IOException} that escaped this loop and reached {@code
+     * ObjectStoreWriterEngine#commitIndexWriter}'s catch-all -- which failed the primary over a
+     * benign race. {@link ManifestGenerationCollisionException} now names that condition, and this
+     * loop treats it exactly like a lost CAS: re-read the head, recompute the target generation, try
+     * again.
+     *
+     * <p>One extra subtlety the naive "just re-read the head" retry misses: if the colliding writer
+     * has published its manifest but has <em>not yet won the head CAS</em>, the head has not moved,
+     * so the recomputed target generation is the same colliding one and the retry spins. {@code
+     * minimumTargetGeneration} therefore ratchets past every generation already observed to be
+     * occupied. {@code ShardHead#withPublishedGeneration} only requires the new generation to be
+     * strictly greater than the current one, not exactly one greater, so skipping a slot is
+     * perfectly legal.
+     *
+     * @param deltaBase a manifest the caller itself published from its own live local index, whose
+     *                  file references may be carried forward instead of re-uploading the whole
+     *                  commit; {@code null} to package the full commit. Used only while the live head
+     *                  still points at exactly that manifest -- if a compaction (or anyone else) has
+     *                  advanced the head since, the base describes a different Lucene index for this
+     *                  shard and is dropped, because a file name shared between two different indexes
+     *                  is not a guarantee of shared bytes. See {@code
+     *                  ObjectStoreCommitPublisher#publishCommit}'s delta-bundling javadoc.
+     * @param myNodeId the publishing node's own id, or {@code null} to fall back to the legacy
+     *                 term-only fencing comparison (which, for a gated index whose primary term is a
+     *                 compile-time constant, can never tell two nodes apart -- see {@link
+     *                 #acquireOrRenewLease(String, int, long, String, long, long)}). A writer engine
+     *                 must always supply it.
+     * @param acquiredLeaseTerm the fencing token this node's own lease acquisition returned; ignored
+     *                          when {@code myNodeId} is {@code null}.
+     * @return the manifest that became this shard's head, or empty if this writer has been fenced out
+     *         (its tenancy is no longer the one this shard's head recognises).
+     */
+    public Optional<CommitManifest> publishCommitAsHeadReturningManifest(
+        Directory directory,
+        SegmentInfos segmentInfos,
+        String indexUuid,
+        int shardId,
+        long primaryTerm,
+        long maxSeqNo,
+        long localCheckpoint,
+        WalPosition walPosition,
+        long mappingVersion,
+        PruningStats pruningStats,
+        CommitManifest deltaBase,
+        String myNodeId,
+        long acquiredLeaseTerm
+    ) throws IOException {
+        long minimumTargetGeneration = 0L;
+        CommitManifest losingManifest = null;
+        for (int attempt = 1; attempt <= MAX_PUBLISH_ATTEMPTS; attempt++) {
             Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
 
             long currentGeneration;
@@ -135,44 +233,107 @@ public final class ObjectStoreCommitHeadPublisher {
             } else {
                 VersionedShardHead versioned = current.get();
                 currentHead = versioned.head();
-                if (currentHead.leaseTerm() > primaryTerm) {
-                    // A newer term has already acquired or renewed the lease -- possibly without
-                    // having published anything yet, which is exactly why this compares against
-                    // leaseTerm and not primaryTerm (see ShardHead#leaseTerm's own javadoc): a
-                    // primaryTerm-only comparison would let this writer, if it had been fenced out
-                    // by a takeover it never learned about (e.g. partitioned from the cluster
-                    // manager), keep publishing under its own stale term until the new writer's
-                    // first commit happened to land.
-                    return false;
+                if (myNodeId != null) {
+                    // Token fencing (the real check): this publish is allowed only while the head
+                    // still records THIS node holding THIS tenancy. Node id alone would let a writer
+                    // that lost the lease, had it taken over, and then re-acquired it publish a commit
+                    // packaged under its FIRST tenancy, whose segment set predates whatever the
+                    // intervening writer published; lease term alone would let a writer publish under
+                    // a term another node acquired. See ShardHead#isStillHeldBy.
+                    if (currentHead.isStillHeldBy(myNodeId, acquiredLeaseTerm) == false) {
+                        // Fenced. Not a retry: a lost lease is not transient, and republishing the
+                        // whole commit against a head somebody else owns is how two lineages get
+                        // interleaved.
+                        return Optional.empty();
+                    }
+                } else if (currentHead.leaseTerm() > primaryTerm) {
+                    // Legacy term-only fencing, for callers that hold no token (the ten-argument
+                    // overload, and tests that predate the token). Necessary but, on its own, not
+                    // sufficient: for a gated index every writer's primary term is the compile-time
+                    // constant IndexDescriptor.FIRST_PRIMARY_TERM, so this comparison is 1 > 1 and can
+                    // never tell two nodes apart. A writer engine must use the token-carrying overload.
+                    return Optional.empty();
                 }
-                // currentHead.leaseTerm() <= primaryTerm: either this writer is continuing under
-                // the term already on the head, or it is the first commit of a newly-activated
-                // writer under a term nothing has published under yet -- either way this publish is
-                // what legitimately moves the head's term forward to primaryTerm, via
-                // withPublishedGeneration(primaryTerm, ...) below.
+                // Not fenced: either this writer's own tenancy is still the one the head records
+                // (token path), or -- on the legacy path -- no newer term has taken the lease. Either
+                // way this publish is what legitimately moves the head's term forward to primaryTerm,
+                // via withPublishedGeneration(primaryTerm, ...) below, which leaves the lease holder
+                // and lease term untouched so this writer's token survives its own publish.
                 currentGeneration = currentHead.latestManifestGeneration();
                 currentVersion = Optional.of(versioned.version());
+            }
+
+            // A manifest this call wrote on a previous iteration and then failed to install is
+            // unreferenced garbage that a listing-based "latest" resolution could still select (see
+            // this class's own javadoc, and the report's P3). Now that the live head has been
+            // re-read, we know precisely whether it is the head -- it is not, if the head names a
+            // different (term, generation) -- so remove it. Best-effort: some containers deliberately
+            // deny deletes (rfc-serverless-opensearch.md §15), and GC would eventually collect it
+            // anyway; failing the publish over cleanup would be strictly worse.
+            if (losingManifest != null) {
+                // The condition is "the head has moved strictly PAST this generation," not merely
+                // "the head is not this manifest right now." That is the difference between a
+                // point-in-time observation and a proof: ShardHead#withPublishedGeneration refuses
+                // any generation not strictly greater than the current one, so once the head sits
+                // above this manifest's generation, no future CAS by anyone can ever install it.
+                // The weaker check would leave a window in which a compactor -- which adopts an
+                // existing manifest at its target generation by identity (its publishCommit call
+                // passes verifyIdempotentContent=false) -- could install this very manifest as the
+                // head between our read and our delete, and we would then be deleting the live head.
+                if (currentHead != null && currentHead.latestManifestGeneration() > losingManifest.generation()) {
+                    try {
+                        commitPublisher.deleteUnreferencedManifest(losingManifest);
+                    } catch (IOException ignored) {
+                        // Deliberately swallowed -- see the comment above.
+                    }
+                }
+                losingManifest = null;
             }
 
             // Always the next slot after the *live* head, exactly like the compactor -- never
             // derived from this writer's own local Lucene generation counter, which is what let a
             // stale writer either get wrongly fenced out or (narrower risk) collide with a different
-            // actor's generation number under the old design. See this class's own javadoc.
-            long targetGeneration = currentGeneration + 1;
+            // actor's generation number under the old design. See this class's own javadoc. The
+            // max() is the collision ratchet described in this method's javadoc.
+            long targetGeneration = Math.max(currentGeneration + 1, minimumTargetGeneration);
 
-            CommitManifest manifest = commitPublisher.publishCommit(
-                directory,
-                segmentInfos,
-                indexUuid,
-                shardId,
-                primaryTerm,
-                targetGeneration,
-                maxSeqNo,
-                localCheckpoint,
-                walPosition,
-                mappingVersion,
-                pruningStats
-            );
+            // Only usable while the head still names exactly this manifest -- see the deltaBase
+            // parameter's own javadoc for why anything else is unsound rather than merely stale.
+            CommitManifest usableDeltaBase = null;
+            if (deltaBase != null
+                && currentHead != null
+                && currentHead.primaryTerm() == deltaBase.primaryTerm()
+                && currentHead.latestManifestGeneration() == deltaBase.generation()) {
+                usableDeltaBase = deltaBase;
+            }
+
+            CommitManifest manifest;
+            try {
+                manifest = commitPublisher.publishCommit(
+                    directory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    primaryTerm,
+                    targetGeneration,
+                    maxSeqNo,
+                    localCheckpoint,
+                    walPosition,
+                    mappingVersion,
+                    pruningStats,
+                    "",
+                    true,
+                    usableDeltaBase
+                );
+            } catch (ManifestGenerationCollisionException e) {
+                // A lost race, not a failure: something else already owns this generation slot.
+                // Ratchet past it and go round again.
+                minimumTargetGeneration = targetGeneration + 1;
+                if (attempt == MAX_PUBLISH_ATTEMPTS) {
+                    throw e;
+                }
+                continue;
+            }
 
             ShardHead newHead = currentHead == null
                 ? new ShardHead(primaryTerm, null, 0L, manifest.generation())
@@ -203,11 +364,24 @@ public final class ObjectStoreCommitHeadPublisher {
                         )
                     );
                 }
-                return true;
+                return Optional.of(manifest);
             }
             // Lost the race (another compaction or another publish attempt winning first) -- reread
-            // the live head and retry with a freshly computed generation.
+            // the live head and retry with a freshly computed generation. Remember the manifest we
+            // just wrote and could not install, so the top of the next iteration can remove it once
+            // the fresh head read proves it did not become the head (see there).
+            losingManifest = manifest;
+            minimumTargetGeneration = Math.max(minimumTargetGeneration, manifest.generation() + 1);
         }
+        throw new IOException(
+            "failed to publish a commit as the head of shard ["
+                + indexUuid
+                + "]["
+                + shardId
+                + "] after "
+                + MAX_PUBLISH_ATTEMPTS
+                + " attempts under sustained contention"
+        );
     }
 
     /**
@@ -230,36 +404,105 @@ public final class ObjectStoreCommitHeadPublisher {
      * first commit. See {@link ShardHead#leaseTerm}'s own javadoc.
      *
      * <p>Retries on a lost CAS race by rereading the live head and retrying, same shape as {@link
-     * #publishCommitAsHead}. Returns {@code false} (never retries past this) only when the live head
-     * already reflects a lease term newer than {@code primaryTerm} -- real evidence that a different
-     * node already holds a newer term's lease, and this node must not go on renewing as this shard's
-     * writer.
+     * #publishCommitAsHead}, bounded at {@link #MAX_LEASE_ACQUISITION_ATTEMPTS}.
      *
      * @param indexUuid the index this shard belongs to
      * @param shardId the shard whose lease is being acquired or renewed
      * @param primaryTerm the primary term this writer believes it is currently active under
      * @param nodeId the id of the node acquiring or renewing the lease
      * @param leaseExpiryMillis the epoch millis at which this lease expires unless renewed again
-     * @return {@code true} if the lease was successfully acquired or renewed; {@code false} if the
-     *         live head already reflects a newer lease term, meaning this writer has been superseded
+     * @return {@code true} if the lease was successfully acquired or renewed; {@code false} if a live
+     *         lease is held by another node, meaning this writer has been superseded. Kept for callers
+     *         (and tests) that do not need the fencing token itself; the token-returning overload
+     *         below is what a writer engine must use.
      */
     public boolean acquireOrRenewLease(String indexUuid, int shardId, long primaryTerm, String nodeId, long leaseExpiryMillis)
         throws IOException {
-        for (;;) {
+        return acquireOrRenewLease(indexUuid, shardId, primaryTerm, nodeId, leaseExpiryMillis, System.currentTimeMillis()).isPresent();
+    }
+
+    /**
+     * The bound on both CAS loops in this class. It used to be {@code for (;;)} in both places, which
+     * under sustained contention meant spinning silently rather than failing loudly -- and, on the
+     * publish path, re-packaging a whole bundle+manifest on every turn, each one immediately orphaned.
+     * Sixteen matches the bound {@code DescriptorGate#applyToDescriptor} and {@code
+     * MappingGenerationStore} already use for the same reason.
+     */
+    static final int MAX_LEASE_ACQUISITION_ATTEMPTS = 16;
+
+    /**
+     * Acquires or renews this shard's writer lease and returns the <b>fencing token</b> -- the {@link
+     * ShardHead#leaseTerm()} this acquisition installed -- which the caller must hold and present on
+     * every subsequent publish. Empty means refused: a live lease is held by a different node.
+     *
+     * <p><b>Refusal is on node identity, not on a term comparison, and that is the whole point.</b>
+     * Fencing here used to be written entirely as {@code currentHead.leaseTerm() > primaryTerm}. For a
+     * gated index every shard's primary term is {@code IndexDescriptor.FIRST_PRIMARY_TERM = 1} and
+     * nothing advances it -- there is no cluster-manager step to bump it -- and {@link
+     * ShardHead#withRenewedLease} computes {@code max(leaseTerm, acquiringTerm)}, so against a constant
+     * term it is the identity function and {@code leaseTerm} stayed pinned at 1 forever. The comparison
+     * was {@code 1 > 1}: false, always. The refusal branch was dead code, {@code leaseHolderNodeId} was
+     * simply overwritten by whoever asked last and never compared against the asker, and two nodes could
+     * both be told "acquired" and both go on publishing full manifests derived from two different local
+     * Lucene commits -- the head alternating between two lineages, each generation internally complete
+     * and each missing the other's acknowledged documents, with the CAS reporting success to both
+     * because a compare-and-swap on a counter serialises writes without saying anything about who is
+     * entitled to make them.
+     *
+     * <p>A node id is the one thing about a writer that is always distinct and always known at both
+     * ends, and needs no cluster-manager step to advance -- so acquisition refuses on {@link
+     * ShardHead#isLeaseHeldByAnotherNodeAt}, and the monotonic token comes from {@link
+     * ShardHead#withTakenOverLease}, which advances {@code leaseTerm} strictly on a takeover and never
+     * on the holder's own heartbeat (bumping on every heartbeat would fence the only legitimate writer
+     * out against the token it is holding, one renewal interval after activating).
+     *
+     * @param indexUuid the index this shard belongs to
+     * @param shardId the shard whose lease is being acquired or renewed
+     * @param primaryTerm the primary term this writer believes it is currently active under
+     * @param nodeId the id of the node acquiring or renewing the lease
+     * @param leaseExpiryMillis the epoch millis at which this lease expires unless renewed again
+     * @param nowMillis the current epoch millis, used only to decide whether an existing lease is still live
+     * @return the installed lease term (this writer's fencing token), or empty if another node holds a live lease
+     */
+    public java.util.OptionalLong acquireOrRenewLease(
+        String indexUuid,
+        int shardId,
+        long primaryTerm,
+        String nodeId,
+        long leaseExpiryMillis,
+        long nowMillis
+    ) throws IOException {
+        for (int attempt = 0; attempt < MAX_LEASE_ACQUISITION_ATTEMPTS; attempt++) {
             Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
             ShardHead currentHead = current.map(VersionedShardHead::head).orElse(null);
-            if (currentHead != null && currentHead.leaseTerm() > primaryTerm) {
-                return false;
+            if (currentHead != null && currentHead.isLeaseHeldByAnotherNodeAt(nodeId, nowMillis)) {
+                // Refused on identity, not on term. For a gated index every writer's term is 1, so a
+                // term comparison can never tell two nodes apart; an unexpired lease held by someone
+                // else is an observation that does not depend on terms at all.
+                return java.util.OptionalLong.empty();
             }
-            ShardHead newHead = currentHead == null
-                ? new ShardHead(primaryTerm, nodeId, leaseExpiryMillis, 0)
-                : currentHead.withRenewedLease(nodeId, leaseExpiryMillis, primaryTerm);
+            ShardHead newHead;
+            if (currentHead == null) {
+                newHead = new ShardHead(primaryTerm, nodeId, leaseExpiryMillis, 0L);
+            } else if (nodeId.equals(currentHead.leaseHolderNodeId())) {
+                // A heartbeat by the holder. Must not advance the lease term, or a writer fences
+                // itself out against the token it is holding, ten seconds after activating.
+                newHead = currentHead.withRenewedLease(nodeId, leaseExpiryMillis, primaryTerm);
+            } else {
+                // A takeover of a free or lapsed lease -- the only thing that advances the token, and
+                // it advances it strictly, so the displaced writer is fenced from this instant rather
+                // than from whenever the new writer's first commit happens to land.
+                newHead = currentHead.withTakenOverLease(nodeId, leaseExpiryMillis, primaryTerm);
+            }
             Optional<Long> expectedVersion = current.map(VersionedShardHead::version);
             if (shardStateStore.compareAndSet(indexUuid, shardId, expectedVersion, newHead) == CasResult.SUCCESS) {
-                return true;
+                return java.util.OptionalLong.of(newHead.leaseTerm());
             }
-            // Lost the race -- reread the live head and retry.
+            // Lost the CAS -- reread and retry. Bounded, unlike the previous for(;;): a lease
+            // acquisition that loses sixteen times running is a shard with more contenders than it
+            // should have, and a silent infinite loop hides that.
         }
+        return java.util.OptionalLong.empty();
     }
 
     /**

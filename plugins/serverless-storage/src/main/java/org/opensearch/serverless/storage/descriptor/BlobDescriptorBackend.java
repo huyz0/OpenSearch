@@ -278,12 +278,19 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
                     logger.warn("could not read descriptor for [{}] after {} attempts; reporting unavailable: {}", name, attempt, e);
                     throw new DescriptorUnavailableException(name, e);
                 }
-                try {
-                    Thread.sleep(attempt * 10L);
-                } catch (InterruptedException interruptedException) {
-                    Thread.currentThread().interrupt();
-                    throw new DescriptorUnavailableException(name, e);
-                }
+                // Retried immediately, with no backoff sleep, because of where this runs.
+                //
+                // This is reached through DescriptorGate.supply -> AbsentIndexDescriptorSuppliers, which
+                // IndexNameExpressionResolver calls synchronously on transport worker threads -- the gate's
+                // own javadoc records the applier-thread assertion failure that came from exactly this
+                // shape. A backoff put up to thirty milliseconds of Thread.sleep on a worker thread, per
+                // resolution, on top of the round trips: the sleep was longer than the reads it was
+                // spacing out.
+                //
+                // Nothing is lost by dropping it. Backoff exists to stop a herd of retriers from
+                // amplifying a failing dependency, and the herd is already bounded one level up: the cache
+                // collapses concurrent readers of a name to one, so at most one thread per name is here.
+                logger.debug("descriptor read for [{}] failed on attempt {}; retrying: {}", name, attempt, e);
             }
         }
         return null;
@@ -420,6 +427,15 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      * both read generation N, both "succeeded", and one field's mapping was erased while documents carrying
      * it were being indexed. That caller now uses the conditional pair, and this one re-reads instead of
      * assuming, so each attempt is made against something actually observed.
+     *
+     * <p><b>Unconditional does not mean unguarded.</b> One thing this must never do, and did: write the
+     * descriptor of an incarnation whose tombstone is already durable -- either creating the key from
+     * scratch, which resurrects a deleted index permanently, or writing over the key a later incarnation of
+     * the same name now holds. That is the whole of the refusal: a differing uuid with no tombstone behind
+     * it is still an ordinary overwrite, because it is far more likely to be this caller repairing a stale
+     * record than a stale caller damaging a live one. See {@link
+     * #writingWouldResurrectADeletedIncarnation}, which is consulted on every attempt and answers from what
+     * that attempt actually read.
      */
     @Override
     public void put(IndexDescriptor descriptor) {
@@ -427,7 +443,11 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
         int maxAttempts = 3;
         try {
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-                long generation = blobContainer.readRegister(key).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                Optional<BlobRegister> live = blobContainer.readRegister(key);
+                if (writingWouldResurrectADeletedIncarnation(descriptor, live)) {
+                    return;
+                }
+                long generation = live.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
                 BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(key, generation, encode(descriptor));
                 if (result.applied()) {
                     // Invalidated after the write, never before. Dropping the entry first would leave a
@@ -447,6 +467,110 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
             );
         } catch (IOException e) {
             throw new DescriptorUnavailableException(descriptor.name(), e);
+        }
+    }
+
+    /**
+     * Whether this {@link #put} would bring a deleted index back, or write one incarnation's descriptor
+     * over another's, in which case it must write nothing at all.
+     *
+     * <p><b>The resurrection.</b> {@link #put} defaults an absent register to {@code ABSENT_GENERATION} and
+     * compare-and-swaps at it, and against an absent key that is a <em>create</em>. It never consulted the
+     * tombstone prefix, so this interleaving left a deleted index permanently live:
+     *
+     * <pre>
+     * t0  a cluster state change for "orders" queues recordChange -&gt; putAsync on GENERIC; GENERIC is busy
+     * t1  the client deletes "orders": tombstone durable, live key deleted, change logged, client answered
+     * t2  the t0 task finally runs: readRegister -&gt; absent -&gt; ABSENT_GENERATION -&gt; CAS creates the key
+     * t3  every subsequent read finds the live key first and answers OPEN; the tombstone is never consulted
+     * </pre>
+     *
+     * Nothing repairs that afterwards. The tombstone scrubber reclaims tombstones and the change log only
+     * invalidates caches, so the name stays live for the life of the cluster -- and the tombstone now
+     * actively lies, since a partitioned node that consults it will drop shard data for an index the store
+     * says is live. {@code createIndex} in {@code DescriptorBackedIndexLifecycle} documents and fixes this
+     * exact hazard for the prefix half ("the tombstone then lands first and the creation write overwrites
+     * it... Observed as exactly that"); this is the same hazard on the point half.
+     *
+     * <p><b>The cross-incarnation write.</b> The mirror image, when the live key <em>is</em> present: a put
+     * queued for uuid A that runs after the name has been deleted and recreated as uuid B would overwrite
+     * B's descriptor with A's, silently changing the live index's shard count, aliases and mapping
+     * generation to a dead index's.
+     *
+     * <h4>The rule, and what it is deliberately not</h4>
+     *
+     * A write is refused <b>if and only if a durable tombstone names this write's own uuid</b>. Not "the
+     * stored uuid differs from this one", which is what the first version of this guard said and which is
+     * too broad in a way worth recording, because it looks right:
+     *
+     * <ul>
+     *   <li>A differing uuid does not say which side is stale. The only production caller of {@link #put}
+     *       is {@code DescriptorBackedIndexLifecycle.recordChange}, which runs on the elected cluster
+     *       manager and writes a descriptor derived from an index that is <em>in</em> the cluster state it
+     *       is applying. If the store holds some other uuid under that name, the ordinary reading is that
+     *       the <em>store</em> is stale and this write is the repair -- and refusing it leaves a live
+     *       index's descriptor permanently wrong, with nothing else that ever rewrites it.</li>
+     *   <li>The tombstone is the only durable evidence that distinguishes the two, because it is written by
+     *       the deletion itself. A tombstone naming this write's uuid says this write's incarnation is
+     *       gone, whoever else holds the name now.</li>
+     *   <li>It also keeps {@link #put} unconditional in the sense its own javadoc promises -- "write it, I
+     *       know what I am doing" -- for every case where nothing says otherwise, which is what
+     *       {@code BlobDescriptorBackendTests.testPutOverwritesWhereCreateWouldHaveLost} pins.</li>
+     * </ul>
+     *
+     * <p>The residual hole, stated rather than hidden: two delete-and-recreate cycles inside one queued
+     * write's lifetime leave the tombstone naming the <em>second</em> dead incarnation, so a write from the
+     * first would no longer be refused. Closing that needs a monotonic write sequence stamped on the
+     * descriptor and compared against the tombstone's {@code deletedAtMillis}, which is a stored-format
+     * change. The behaviour before this guard existed was to overwrite in every one of these cases.
+     *
+     * <p><b>Cost.</b> The tombstone is read only when the live key is absent or holds a different
+     * incarnation, both of which are rare; an ordinary in-place update pays nothing extra.
+     *
+     * <p>Refusing on an unreadable tombstone is deliberate: this method cannot then tell a legitimate write
+     * from a resurrection, and a descriptor that fails to be recorded is repaired by the next change to the
+     * same index, whereas a resurrection is repaired by nothing.
+     */
+    private boolean writingWouldResurrectADeletedIncarnation(IndexDescriptor descriptor, Optional<BlobRegister> live) {
+        String name = descriptor.name();
+        if (live.isPresent()) {
+            IndexDescriptor stored;
+            try {
+                stored = decode(live.get().value());
+            } catch (IOException | RuntimeException e) {
+                // Unreadable bytes under the live key are not evidence of anything, and refusing here would
+                // make an undecodable descriptor unrepairable by the ordinary write path.
+                logger.debug("could not decode the stored descriptor for [{}] before writing over it: {}", name, e);
+                return false;
+            }
+            if (stored.exists() && stored.uuid().equals(descriptor.uuid())) {
+                // The ordinary case by far: this is an update in place of the incarnation already recorded.
+                // Nothing can make that a resurrection, so the tombstone is not read at all.
+                return false;
+            }
+        }
+        try {
+            Optional<BlobRegister> tombstone = blobContainer.readRegister(tombstoneKeyFor(name));
+            if (tombstone.isEmpty()) {
+                return false;
+            }
+            IndexDescriptor deleted = decode(tombstone.get().value());
+            // A tombstone for a *different* uuid is not this descriptor's tombstone: the name was deleted
+            // and something else has since taken it. Only a tombstone naming this very uuid says the index
+            // this write describes is gone.
+            if (deleted.uuid().equals(descriptor.uuid()) == false) {
+                return false;
+            }
+            logger.debug(
+                "not writing the descriptor for [{}] uuid [{}]: its tombstone is durable, so this write would resurrect a deleted "
+                    + "incarnation",
+                name,
+                descriptor.uuid()
+            );
+            return true;
+        } catch (IOException | RuntimeException e) {
+            logger.warn("could not read the tombstone for [{}] before writing its descriptor; not writing it: {}", name, e);
+            return true;
         }
     }
 

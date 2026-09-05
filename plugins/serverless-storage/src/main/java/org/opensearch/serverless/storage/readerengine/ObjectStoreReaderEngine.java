@@ -43,8 +43,14 @@ import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 /**
@@ -106,11 +112,48 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private static final TimeValue DIRECTORY_REFRESH_INTERVAL = TimeValue.timeValueMillis(DIRECTORY_ENTRY_TTL_MILLIS / 3);
 
     /**
-     * Aimed well under this phase's own p99 freshness-lag milestone (15 s) -- a poll finding
-     * nothing newer is cheap (one {@link ShardStateStore#get} read), so there is no real cost to
-     * polling faster than the milestone strictly requires.
+     * The floor of the manifest poll's adaptive interval, and the interval a shard with any recent
+     * query traffic actually polls at. Aimed well under this phase's own p99 freshness-lag
+     * milestone (15 s).
      */
     private static final TimeValue MANIFEST_POLL_INTERVAL = TimeValue.timeValueSeconds(5);
+
+    /**
+     * The ceiling of the adaptive interval, used by a shard that is both idle and finding nothing
+     * new.
+     *
+     * <p>A fixed 5&nbsp;s poll is priced per shard ("a poll finding nothing newer is cheap -- one
+     * {@link ShardStateStore#get} read"), and per shard it is. Per <em>node</em> it is not: at the
+     * density this design targets -- thousands of hot reader shards per node -- a fixed 5&nbsp;s
+     * poll is hundreds of object-store requests per second per node of pure polling, before any
+     * query traffic, and it dominates every other request the read path makes. It is also no longer
+     * the primary freshness mechanism: {@link #pollNow()} exists precisely so a publication
+     * notification can pull a reader forward immediately, which makes the schedule a safety net.
+     * A safety net does not need to run at 5&nbsp;s on a shard nobody is querying and whose head
+     * has not moved in minutes.
+     */
+    private static final TimeValue MAX_MANIFEST_POLL_INTERVAL = TimeValue.timeValueSeconds(60);
+
+    /**
+     * How long a shard must have gone without a real client query before its poll is allowed to
+     * back off at all. A shard being queried keeps polling at the floor no matter how quiet its
+     * writer is, because that is exactly the shard whose freshness a user can observe.
+     */
+    private static final long POLL_BACKOFF_IDLE_THRESHOLD_MILLIS = 60_000L;
+
+    /**
+     * After this many consecutive over-budget skips, the next tick advances anyway.
+     *
+     * <p>The budget check is a defence against pulling more bytes onto an already-pressured node,
+     * and deferring one refresh is the right answer to that. Deferring <em>every</em> refresh
+     * forever is not: an unbounded deferral means a reader's generation lag grows without limit,
+     * which violates the consistency model outright ("lag is bounded by publication frequency plus
+     * notification delivery"), inflates the very autoscaling signal that would add more reader nodes
+     * to fix it, and -- worst -- lets the frozen generation age past the GC retention window and be
+     * deleted out from under the reader. Bounding the number of consecutive skips keeps staleness
+     * finite no matter what the pressure signal says.
+     */
+    private static final int MAX_CONSECUTIVE_OVER_BUDGET_SKIPS = 12;
 
     private final String indexUuid;
     private final int shardId;
@@ -126,8 +169,62 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         new java.util.concurrent.atomic.AtomicReference<>();
     private final String localNodeId;
     private final Scheduler.Cancellable directoryRefreshTask;
-    private final Scheduler.Cancellable manifestPollTask;
+    private volatile Scheduler.Cancellable manifestPollTask;
     private final ReaderShardAdmissionController admissionController;
+    /**
+     * Guards every piece of teardown this engine owns, so it runs exactly once no matter which of
+     * the two close paths gets there first -- see {@link #cleanupOnce()}.
+     */
+    private final AtomicBoolean cleanedUp = new AtomicBoolean(false);
+    /**
+     * The registry to remove this engine from when it stops being live, and the exact key it was
+     * registered under -- {@code null} until something registers it.
+     *
+     * <p>The key is remembered rather than re-derived from this engine's own {@code indexUuid}/
+     * {@code shardId}: a caller registers under whatever key it chooses, and a test (or any caller
+     * holding an index UUID from somewhere other than the engine config) legitimately uses a
+     * different one. Unregistering under a key nobody registered would silently leak the entry,
+     * which is the whole failure this was added to prevent.
+     */
+    private volatile RegistryRegistration activityRegistration;
+
+    /** Where this engine was registered, so it can remove exactly that entry. */
+    private record RegistryRegistration(ReaderShardActivityRegistry registry, String indexUuid, int shardId) {
+    }
+
+    /**
+     * The durable pin this engine holds on the generation it currently serves, or {@code null} when
+     * no pin registry is available -- see {@link #takeOrMoveReaderPin}.
+     */
+    private final org.opensearch.serverless.storage.retention.DurablePinRegistry pinRegistry;
+    private final AtomicReference<org.opensearch.serverless.storage.retention.PinRecord> currentReaderPin = new AtomicReference<>();
+    /** Consecutive poll ticks skipped because the node was over its refresh budget -- see {@link #MAX_CONSECUTIVE_OVER_BUDGET_SKIPS}. */
+    private final AtomicInteger consecutiveOverBudgetSkips = new AtomicInteger();
+    /** The current adaptive poll interval, in millis -- see {@link #MAX_MANIFEST_POLL_INTERVAL}. */
+    private final AtomicLong currentPollIntervalMillis = new AtomicLong(MANIFEST_POLL_INTERVAL.millis());
+    /** Wall-clock time the next real poll is allowed to run; ticks before it cost nothing at all. */
+    private final AtomicLong nextPollDueAtMillis = new AtomicLong(0L);
+    /**
+     * The manifest this engine currently serves, and the one before it. Both are retained so
+     * {@link ObjectStoreCommitMaterializer#pruneUnreferencedFiles} can delete everything else
+     * without ever touching a file a searcher acquired just before the last advance still needs.
+     */
+    private final AtomicReference<CommitManifest> currentManifest = new AtomicReference<>();
+    private final AtomicReference<CommitManifest> previousManifest = new AtomicReference<>();
+    /**
+     * Sequence-number statistics for the generation currently open, rebuilt on every advance.
+     *
+     * <p>{@link ReadOnlyEngine} takes its {@code SeqNoStats} once in its constructor and caches it
+     * forever, which is right for a genuinely read-only engine over a fixed commit and wrong for
+     * this one: this engine materializes newer generations for its whole life. Without this, a
+     * reader shard's reported {@code maxSeqNo} and {@code localCheckpoint} are permanently those of
+     * whatever generation it happened to open on, however many it later advanced through -- and
+     * they look perfectly valid to {@code _stats}, {@code _cat/shards}, and any seq-no-based
+     * consistency check reading them.
+     */
+    private volatile SeqNoStats currentSeqNoStats;
+    /** Pending read-after-write waiters, resolved by one shared poll rather than one poll each -- see {@link #waitForGeneration}. */
+    private final java.util.Queue<GenerationWaiter> generationWaiters = new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final CompactionSchedulerTask compactionSchedulerTask;
     private final GcSchedulerTask gcSchedulerTask;
     private final PartitionRewriteSchedulerTask partitionRewriteSchedulerTask;
@@ -174,6 +271,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private ObjectStoreReaderEngine(
         EngineConfig config,
         SeqNoStats seqNoStats,
+        CommitManifest openedManifest,
         long primaryTerm,
         long manifestGeneration,
         ShardStateStore shardStateStore,
@@ -200,6 +298,21 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
         this.admissionController = admissionController;
+        this.currentSeqNoStats = seqNoStats;
+        this.currentManifest.set(openedManifest);
+        this.previousManifest.set(openedManifest);
+        // Either scheduler's registry will do -- they are the same CAS-backed, cluster-wide
+        // registry, and a deployment that has neither has no pin mechanism to use at all. Read out
+        // of the configs this engine is already given rather than threaded through as yet another
+        // constructor parameter, because there is nothing to decide: if a pin registry exists for
+        // this shard, a reader on this shard should be pinning with it.
+        this.pinRegistry = gcConfig != null
+            ? gcConfig.pinRegistry()
+            : (pitrRetentionConfig != null ? pitrRetentionConfig.pinRegistry() : null);
+        // Taken BEFORE any scheduler starts, and before this constructor can return an engine that
+        // is serving queries: the generation this engine opened on must be protected from GC from
+        // the first instant it is in use, not from the first poll tick. See takeOrMoveReaderPin.
+        takeOrMoveReaderPin(primaryTerm, manifestGeneration);
         // Report once synchronously so the shard is discoverable immediately on activation, rather
         // than waiting out the first refresh interval; scheduleWithFixedDelay's first execution
         // only happens after the interval elapses, not on registration.
@@ -207,7 +320,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         this.directoryRefreshTask = config.getThreadPool()
             .scheduleWithFixedDelay(this::refreshDirectoryEntry, DIRECTORY_REFRESH_INTERVAL, ThreadPool.Names.GENERIC);
         this.manifestPollTask = config.getThreadPool()
-            .scheduleWithFixedDelay(this::pollForNewerManifest, MANIFEST_POLL_INTERVAL, ThreadPool.Names.GENERIC);
+            .scheduleWithFixedDelay(this::pollTick, MANIFEST_POLL_INTERVAL, ThreadPool.Names.GENERIC);
         // A reader shard is a natural home for this: it exists for as long as the shard is
         // searchable at all, including the "writer scaled to zero" case a writer-only scheduler
         // instance would miss entirely (rfc-serverless-opensearch.md &sect;16 Phase 4.5). Running
@@ -227,7 +340,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 compactionConfig.commitPublisher(),
                 compactionConfig.policy(),
                 compactionConfig.rebaseExecutor(),
-                compactionConfig.admissionController()
+                compactionConfig.admissionController(),
+                compactionConfig.mergeWorkRoot()
             );
         // Same reasoning and same redundancy-is-safe argument as compactionSchedulerTask above --
         // see GcSchedulerTask's own javadoc for its own, separate safety design (retention window +
@@ -334,6 +448,10 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         );
         shardDirectory.report(indexUuid, shardId, entry);
         lastReportedEntry.set(entry);
+        // Piggy-backed on a tick that already runs every 20 s: a reader that sits on one generation
+        // for hours (an idle shard, a brownout, a long-lived searcher) must not have that generation
+        // collected out from under it just because it had nothing new to advance to.
+        renewReaderPin();
     }
 
     /**
@@ -364,6 +482,9 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      */
     private synchronized void pollForNewerManifest() {
         try {
+            // Every exit from this method updates the adaptive interval, so a tick that finds
+            // nothing on an idle shard genuinely stops costing a request every 5 seconds.
+            lastPollAdvanced = false;
             // The head read (and the lastObservedLatestGeneration update below) deliberately runs
             // BEFORE the admission-budget check, not after: an over-budget tick still needs to know
             // how far behind it now is for manifestGenerationLag() to mean anything. Getting this
@@ -383,21 +504,194 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
             if (shardHead.latestManifestGeneration() <= currentManifestGeneration.get()) {
                 return;
             }
-            if (admissionController != null && admissionController.isOverBudgetForRefresh()) {
-                logger.debug(
-                    "skipping manifest poll: node's reader-shard admission budget is currently exceeded, staying on generation {}",
+            if (isRefreshDeferredByBudget()) {
+                return;
+            }
+            CommitManifest manifest = manifestStore.readManifest(shardHead.primaryTerm(), shardHead.latestManifestGeneration());
+            // The pin moves BEFORE the advance, not after: the generation about to be opened is the
+            // one that must not be collected, and taking the pin first means there is no instant
+            // where this engine is serving a generation nothing is holding. If the pin cannot be
+            // taken, the advance does not happen -- staying one generation behind is a freshness
+            // cost; advancing onto a generation GC is free to delete is a correctness one.
+            if (takeOrMoveReaderPin(shardHead.primaryTerm(), manifest.generation()) == false) {
+                logger.warn(
+                    "not advancing shard [{}][{}] to generation {}: could not take a reader pin on it",
+                    indexUuid,
+                    shardId,
+                    manifest.generation()
+                );
+                return;
+            }
+            applyManifestToDirectory(engineConfig.getStore().directory(), manifest, materializer);
+            maybeRefresh("manifest-generation-advance");
+            if (servesCommitNamedBy(manifest) == false) {
+                // The materialization succeeded and the reopen ran, but the reader is not actually
+                // on this manifest's commit. Advancing the tracked generation here is exactly the
+                // failure that made compaction invisible: manifestGenerationLag(), the shard's
+                // directory entry, and every read-after-write waiter would all report this shard as
+                // caught up while it served older data. Reporting honestly and retrying next tick is
+                // the only safe answer.
+                logger.error(
+                    "shard [{}][{}] materialized manifest generation {} but is not serving its commit [{}]; staying on generation {}",
+                    indexUuid,
+                    shardId,
+                    manifest.generation(),
+                    manifest.segmentsFileName(),
                     currentManifestGeneration.get()
                 );
                 return;
             }
-            CommitManifest manifest = manifestStore.readManifest(shardHead.primaryTerm(), shardHead.latestManifestGeneration());
-            applyManifestToDirectory(engineConfig.getStore().directory(), manifest, materializer);
-            maybeRefresh("manifest-generation-advance");
+            previousManifest.set(currentManifest.get());
+            currentManifest.set(manifest);
             currentManifestGeneration.set(manifest.generation());
             currentPrimaryTerm.set(shardHead.primaryTerm());
+            // Rebuilt on every advance, not taken once at open -- see currentSeqNoStats' own comment
+            // for what a frozen value silently misreports.
+            currentSeqNoStats = new SeqNoStats(
+                manifest.maxSeqNo(),
+                manifest.localCheckpoint(),
+                engineConfig.getGlobalCheckpointSupplier().getAsLong()
+            );
+            lastPollAdvanced = true;
+            pruneSupersededFiles();
+            resolveGenerationWaiters();
         } catch (Exception e) {
             logger.warn("failed to poll/refresh to a newer manifest generation, will retry next tick", e);
+        } finally {
+            updatePollInterval(lastPollAdvanced);
         }
+    }
+
+    /**
+     * Whether the poll currently running advanced a generation. A field rather than a local purely
+     * so the {@code finally} above can read it; only ever touched under this class's own monitor,
+     * which {@link #pollForNewerManifest} holds for its whole body.
+     */
+    private boolean lastPollAdvanced;
+
+    /**
+     * Whether this tick should defer because the node is over its refresh budget -- and, crucially,
+     * whether it has deferred too many times in a row to keep doing so.
+     *
+     * <p>Deferring at all is right: pulling another generation's bytes onto a node whose block
+     * cache is already at its admission budget is what the deferral exists to prevent. Deferring
+     * without limit is not, for the three reasons {@link #MAX_CONSECUTIVE_OVER_BUDGET_SKIPS}
+     * describes. A prune-and-recheck runs first, because the budget signal is measured against a
+     * cache that evicts on demand: what looks like "no headroom" is very often "no headroom until
+     * something asks for some".
+     */
+    private boolean isRefreshDeferredByBudget() {
+        if (admissionController == null || admissionController.isOverBudgetForRefresh() == false) {
+            consecutiveOverBudgetSkips.set(0);
+            return false;
+        }
+        if (admissionController.pruneAndRecheckOverBudgetForRefresh() == false) {
+            consecutiveOverBudgetSkips.set(0);
+            return false;
+        }
+        int skips = consecutiveOverBudgetSkips.incrementAndGet();
+        if (skips > MAX_CONSECUTIVE_OVER_BUDGET_SKIPS) {
+            logger.warn(
+                "shard [{}][{}] has skipped {} consecutive refreshes for cache budget; advancing anyway to keep staleness bounded",
+                indexUuid,
+                shardId,
+                skips - 1
+            );
+            consecutiveOverBudgetSkips.set(0);
+            return false;
+        }
+        logger.debug(
+            "skipping manifest poll: node's reader-shard admission budget is currently exceeded, staying on generation {}",
+            currentManifestGeneration.get()
+        );
+        return true;
+    }
+
+    /**
+     * Whether the Lucene commit this engine currently has open is the one {@code manifest} names.
+     *
+     * <p>Nothing else checks this, and everything downstream assumes it. Lucene resolves "the
+     * commit" in a directory as the highest-generation {@code segments_N} present, which is not the
+     * same question as "which commit did the manifest I just applied name" whenever the two can
+     * disagree -- and they can: a compaction's merged commit and a writer's own next commit are two
+     * different byte-sequences that can carry the same generation number. {@code
+     * ObjectStoreCommitMaterializer} removes superseded commit pointers precisely so they cannot,
+     * and this is the assertion that the removal actually worked, checked where it matters rather
+     * than trusted.
+     */
+    private boolean servesCommitNamedBy(CommitManifest manifest) {
+        try {
+            String open = org.apache.lucene.index.SegmentInfos.getLastCommitSegmentsFileName(engineConfig.getStore().directory());
+            return manifest.segmentsFileName().equals(open);
+        } catch (IOException e) {
+            logger.warn("could not determine which commit shard [" + indexUuid + "][" + shardId + "] currently has open", e);
+            return false;
+        }
+    }
+
+    /**
+     * Deletes everything in the store directory that neither the current nor the immediately
+     * previous generation references -- see {@link
+     * ObjectStoreCommitMaterializer#pruneUnreferencedFiles} for why one generation of slack is kept
+     * and why a failure here is logged rather than propagated. Only meaningful on the eager path;
+     * the lazy directory prunes its own file map inside {@code advanceToManifest}.
+     */
+    private void pruneSupersededFiles() {
+        org.apache.lucene.store.Directory directory = engineConfig.getStore().directory();
+        if (org.apache.lucene.store.FilterDirectory.unwrap(
+            directory
+        ) instanceof org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory) {
+            return;
+        }
+        CommitManifest current = currentManifest.get();
+        CommitManifest previous = previousManifest.get();
+        if (current == null) {
+            return;
+        }
+        try {
+            List<CommitManifest> retained = new ArrayList<>(2);
+            retained.add(current);
+            if (previous != null) {
+                retained.add(previous);
+            }
+            materializer.pruneUnreferencedFiles(directory, retained);
+        } catch (Exception e) {
+            logger.debug("failed to prune superseded reader files, will retry after a later advance", e);
+        }
+    }
+
+    /**
+     * Moves the adaptive poll interval, and schedules when the next real poll may run.
+     *
+     * <p>Back off only when both halves are true: nothing new was found <em>and</em> nobody has
+     * queried this shard recently. A queried shard polls at the floor regardless of how quiet its
+     * writer is, because that is the shard whose staleness someone can actually observe. Any
+     * advance, any query, and any {@link #pollNow()} resets to the floor immediately.
+     */
+    private void updatePollInterval(boolean advanced) {
+        long now = System.currentTimeMillis();
+        long floor = MANIFEST_POLL_INTERVAL.millis();
+        long next;
+        if (advanced || millisSinceLastQuery() < POLL_BACKOFF_IDLE_THRESHOLD_MILLIS) {
+            next = floor;
+        } else {
+            next = Math.min(MAX_MANIFEST_POLL_INTERVAL.millis(), currentPollIntervalMillis.get() * 2);
+        }
+        currentPollIntervalMillis.set(next);
+        nextPollDueAtMillis.set(now + next);
+    }
+
+    /**
+     * The scheduled entry point, which is deliberately not {@link #pollForNewerManifest} itself:
+     * the schedule fires at the floor interval and this decides whether the current adaptive
+     * interval has actually elapsed. A tick that has not is free -- no lock, no object-store
+     * request -- which is the whole point of backing off.
+     */
+    private void pollTick() {
+        if (System.currentTimeMillis() < nextPollDueAtMillis.get()) {
+            return;
+        }
+        pollForNewerManifest();
     }
 
     /**
@@ -411,7 +705,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      * @param source a description of why the refresh was triggered, for logging/diagnostics
      */
     @Override
-    public void refresh(String source) throws EngineException {
+    public synchronized void refresh(String source) throws EngineException {
         try {
             getReferenceManager(SearcherScope.EXTERNAL).maybeRefreshBlocking();
         } catch (IOException e) {
@@ -419,13 +713,47 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         }
     }
 
+    /**
+     * {@code synchronized} on the same monitor {@link #pollForNewerManifest} holds, and that is the
+     * point of the keyword here rather than a nicety.
+     *
+     * <p>These two entry points are public and are called by core independently of this engine's own
+     * poll: {@code IndexService}'s async refresh task reaches {@code Engine#maybeRefresh} on the
+     * default one-second {@code index.refresh_interval}, and {@code _refresh} reaches the same path.
+     * The poll was already {@code synchronized}; these were not, so they were not mutually excluded
+     * from it. That left a real window: the poll begins materializing a generation -- which can mean
+     * a multi-hundred-megabyte object-store read -- and a scheduled refresh fires inside it,
+     * {@code openIfChanged} reads a segments file whose segment data has not landed yet, and the
+     * refresh fails with {@code NoSuchFileException} (or, worse, opens a partially-written file).
+     * Writing the segments file last closes most of that window; sharing the monitor closes the rest,
+     * and costs nothing, because a refresh that would have raced is one that had nothing new to see.
+     *
+     * @param source a description of why the refresh was triggered, for logging/diagnostics
+     * @return whether a reopen actually happened
+     */
     @Override
-    public boolean maybeRefresh(String source) throws EngineException {
+    public synchronized boolean maybeRefresh(String source) throws EngineException {
         try {
             return getReferenceManager(SearcherScope.EXTERNAL).maybeRefresh();
         } catch (IOException e) {
             throw new EngineException(engineConfig.getShardId(), "failed to refresh reader engine", e);
         }
+    }
+
+    /**
+     * The sequence-number statistics of the generation this engine currently serves, not of the one
+     * it happened to open on -- see {@link #currentSeqNoStats}.
+     *
+     * @param globalCheckpoint the global checkpoint to report alongside this engine's own values
+     * @return stats for the currently-open generation
+     */
+    @Override
+    public SeqNoStats getSeqNoStats(long globalCheckpoint) {
+        SeqNoStats current = currentSeqNoStats;
+        if (current == null) {
+            return super.getSeqNoStats(globalCheckpoint);
+        }
+        return new SeqNoStats(current.getMaxSeqNo(), current.getLocalCheckpoint(), globalCheckpoint);
     }
 
     /**
@@ -495,34 +823,99 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      *                  #pollForNewerManifest} already tolerates its own errors internally.
      */
     public void waitForGeneration(long minGeneration, TimeValue timeout, org.opensearch.core.action.ActionListener<Boolean> listener) {
-        scheduleWaitForGenerationCheck(minGeneration, System.currentTimeMillis() + timeout.millis(), listener);
+        if (currentManifestGeneration.get() >= minGeneration) {
+            listener.onResponse(true);
+            return;
+        }
+        long deadlineMillis = System.currentTimeMillis() + Math.min(timeout.millis(), MAX_WAIT_FOR_GENERATION_MILLIS);
+        generationWaiters.add(new GenerationWaiter(minGeneration, deadlineMillis, listener));
+        // One shared poll serves every waiter, so N concurrent read-after-write callers on one shard
+        // cost one object-store round trip per interval, not N. Kick it once here so the first
+        // waiter does not have to sit out an interval it could have skipped.
+        scheduleWaiterSweep(0L);
     }
 
-    private void scheduleWaitForGenerationCheck(
-        long minGeneration,
-        long deadlineMillis,
-        org.opensearch.core.action.ActionListener<Boolean> listener
-    ) {
-        if (currentManifestGeneration.get() >= minGeneration) {
-            listener.onResponse(true);
-            return;
-        }
-        long remainingMillis = deadlineMillis - System.currentTimeMillis();
-        if (remainingMillis <= 0) {
-            listener.onResponse(false);
-            return;
-        }
-        pollForNewerManifest();
-        if (currentManifestGeneration.get() >= minGeneration) {
-            listener.onResponse(true);
-            return;
-        }
+    /**
+     * Runs one poll on behalf of every pending waiter and resolves whichever of them that satisfied,
+     * then reschedules itself for as long as any remain.
+     *
+     * <p>The shape this replaces did one {@code pollForNewerManifest} <em>per waiter</em> every
+     * 100&nbsp;ms, and that method is {@code synchronized} and does a real shard-head read: one
+     * waiter was ten object-store GETs a second for the whole timeout, N waiters were 10N GETs a
+     * second plus N threads queued on this engine's monitor each holding it across a network round
+     * trip -- and the shard's own background poll queued behind all of them, delaying the very
+     * mechanism read-after-write depends on. Coalescing removes the multiplier entirely, and the
+     * interval widening after the first couple of attempts removes most of what is left: a
+     * generation that has not published within 200&nbsp;ms is not going to publish sooner because
+     * this shard asked ten more times.
+     */
+    private void scheduleWaiterSweep(long delayMillis) {
         engineConfig.getThreadPool()
-            .schedule(
-                () -> scheduleWaitForGenerationCheck(minGeneration, deadlineMillis, listener),
-                TimeValue.timeValueMillis(Math.min(WAIT_FOR_GENERATION_POLL_INTERVAL_MILLIS, remainingMillis)),
-                ThreadPool.Names.GENERIC
-            );
+            .schedule(this::sweepGenerationWaiters, TimeValue.timeValueMillis(delayMillis), ThreadPool.Names.GENERIC);
+    }
+
+    private void sweepGenerationWaiters() {
+        if (generationWaiters.isEmpty()) {
+            return;
+        }
+        int attempt = waiterSweepAttempts.incrementAndGet();
+        pollForNewerManifest();
+        resolveGenerationWaiters();
+        if (generationWaiters.isEmpty()) {
+            waiterSweepAttempts.set(0);
+            return;
+        }
+        // The first couple of sweeps run at the responsive 100 ms cadence read-after-write actually
+        // needs; after that, fall back to the background poll interval rather than keeping up a
+        // 10-per-second head-read rate for the rest of what may be a minute-long wait.
+        long delay = attempt <= 2 ? WAIT_FOR_GENERATION_POLL_INTERVAL_MILLIS : MANIFEST_POLL_INTERVAL.millis();
+        scheduleWaiterSweep(delay);
+    }
+
+    /** Resolves every waiter whose generation has arrived or whose deadline has passed. */
+    private void resolveGenerationWaiters() {
+        if (generationWaiters.isEmpty()) {
+            return;
+        }
+        long generation = currentManifestGeneration.get();
+        long now = System.currentTimeMillis();
+        List<GenerationWaiter> stillWaiting = new ArrayList<>();
+        for (GenerationWaiter waiter = generationWaiters.poll(); waiter != null; waiter = generationWaiters.poll()) {
+            if (generation >= waiter.minGeneration) {
+                waiter.listener.onResponse(true);
+            } else if (now >= waiter.deadlineMillis) {
+                waiter.listener.onResponse(false);
+            } else {
+                stillWaiting.add(waiter);
+            }
+        }
+        generationWaiters.addAll(stillWaiting);
+    }
+
+    /** How many consecutive sweeps the current batch of waiters has already cost -- see {@link #sweepGenerationWaiters}. */
+    private final AtomicInteger waiterSweepAttempts = new AtomicInteger();
+
+    /**
+     * The longest this engine will wait for a generation, whatever a caller asks for.
+     *
+     * <p>{@code WaitForGenerationRequest} accepts any non-negative timeout, so an hour-long wait was
+     * a legal request. A read-after-write wait is a latency mechanism, not a subscription: past a
+     * minute the honest answer is "not yet", and letting a caller hold a waiter (and its share of
+     * the poll cadence) open indefinitely is a denial-of-service surface, not a feature.
+     */
+    static final long MAX_WAIT_FOR_GENERATION_MILLIS = 60_000L;
+
+    /** One pending read-after-write waiter. */
+    private static final class GenerationWaiter {
+        private final long minGeneration;
+        private final long deadlineMillis;
+        private final org.opensearch.core.action.ActionListener<Boolean> listener;
+
+        private GenerationWaiter(long minGeneration, long deadlineMillis, org.opensearch.core.action.ActionListener<Boolean> listener) {
+            this.minGeneration = minGeneration;
+            this.deadlineMillis = deadlineMillis;
+            this.listener = listener;
+        }
     }
 
     /**
@@ -640,13 +1033,173 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      * background poll schedule both already converge correctly with nobody ever calling this.
      */
     public void pollNow() {
+        // An explicit notification is exactly the signal the adaptive backoff exists to defer to:
+        // reset to the floor first, so a shard that had backed off to 60 s does not merely catch up
+        // once and then go straight back to sleep while more publications are landing.
+        nextPollDueAtMillis.set(0L);
+        currentPollIntervalMillis.set(MANIFEST_POLL_INTERVAL.millis());
         pollForNewerManifest();
+        resolveGenerationWaiters();
     }
 
-    @Override
-    public void close() throws IOException {
-        manifestPollTask.cancel();
+    /**
+     * Takes, or moves forward, this engine's durable pin on the generation it is about to serve.
+     *
+     * <p>The design promises "open searchers pin their manifest generation ... so GC never yanks a
+     * bundle out from under an in-flight query", and no reader pinned anything: the GC sweep is
+     * always handed an <em>empty</em> lease-pin set, and the only protection was a retention window
+     * justified as "comfortably longer than any legitimate reader's own manifest-generation lag,
+     * bounded by the 5&nbsp;s poll interval". A reader's lag is not bounded by 5&nbsp;s in at least
+     * four reachable states: a refresh deferred for cache budget (unbounded before this class
+     * started counting consecutive skips), an object-store brownout in which every poll throws and
+     * is swallowed, a shard suspended by scale-to-zero, and -- the case the promise was written
+     * about -- a long-lived {@code Searcher}, which pins the Lucene reader but never the manifest
+     * generation its files came from. On the eager path a deleted bundle is survivable because the
+     * files are already local; on the lazy path it is fatal mid-query. And because a reader engine
+     * hosts the GC scheduler itself, a reader stuck at generation G is the very process deleting G.
+     *
+     * <p>{@code DurablePinRegistry} is used rather than the {@code ShardDirectory} tier because it
+     * is CAS-backed and correct cluster-wide (it is what point-in-time recovery already relies on),
+     * while the directory tier is explicitly node-local in-memory hints. The pin carries a bounded
+     * expiry so a crashed reader's pin ages out on its own instead of leaking a generation forever;
+     * it is re-stamped on every advance, and the reader engine also refreshes it on every directory
+     * tick, so a healthy reader's pin never lapses under it.
+     *
+     * @return whether the generation is now pinned (and therefore safe to advance onto).
+     */
+    private boolean takeOrMoveReaderPin(long primaryTerm, long generation) {
+        if (pinRegistry == null) {
+            // No registry configured for this shard: nothing to pin with, and refusing to open the
+            // shard over it would be a far larger regression than the exposure it removes. The
+            // retention window remains the only protection, exactly as before.
+            return true;
+        }
+        org.opensearch.serverless.storage.retention.PinRecord pin = new org.opensearch.serverless.storage.retention.PinRecord(
+            readerPinId(),
+            primaryTerm,
+            generation,
+            localNodeId,
+            System.currentTimeMillis() + READER_PIN_TTL_MILLIS
+        );
+        try {
+            // replacePin, not addPin: this reason pins exactly one generation at a time, and
+            // replacing atomically is what stops a reader that has advanced a thousand generations
+            // from having pinned all thousand of them.
+            pinRegistry.replacePin(indexUuid, shardId, pin);
+            currentReaderPin.set(pin);
+            return true;
+        } catch (Exception e) {
+            logger.warn("failed to pin generation " + generation + " for reader shard [" + indexUuid + "][" + shardId + "]", e);
+            return false;
+        }
+    }
+
+    /**
+     * Re-stamps the current pin's expiry so a long-lived reader that has not advanced in a while
+     * does not have its own generation collected out from under it. Called from the directory-entry
+     * refresh tick, which already runs well inside {@link #READER_PIN_TTL_MILLIS}.
+     */
+    private void renewReaderPin() {
+        org.opensearch.serverless.storage.retention.PinRecord pin = currentReaderPin.get();
+        if (pinRegistry == null || pin == null) {
+            return;
+        }
+        try {
+            pinRegistry.confirmPin(indexUuid, shardId, pin.pinId(), System.currentTimeMillis() + READER_PIN_TTL_MILLIS);
+        } catch (UnsupportedOperationException notSupported) {
+            // Some registries cannot re-stamp; fall back to rewriting the pin outright, which is
+            // idempotent for this reason since it only ever holds one generation.
+            takeOrMoveReaderPin(pin.primaryTerm(), pin.generation());
+        } catch (Exception e) {
+            logger.debug("failed to renew the reader pin for [" + indexUuid + "][" + shardId + "]", e);
+        }
+    }
+
+    private void releaseReaderPin() {
+        org.opensearch.serverless.storage.retention.PinRecord pin = currentReaderPin.getAndSet(null);
+        if (pinRegistry == null || pin == null) {
+            return;
+        }
+        try {
+            pinRegistry.removePin(indexUuid, shardId, pin);
+        } catch (Exception e) {
+            // Bounded leak, not a correctness problem: the pin carries an expiry precisely so a
+            // reader that cannot clean up after itself does not hold a generation forever.
+            logger.warn("failed to release the reader pin for [" + indexUuid + "][" + shardId + "]; it will expire on its own", e);
+        }
+    }
+
+    /**
+     * One pin id per (node, shard), so two reader copies of the same shard on different nodes pin
+     * independently and neither can release the other's.
+     */
+    private String readerPinId() {
+        return "reader:" + localNodeId + ":" + indexUuid + ":" + shardId;
+    }
+
+    /**
+     * How long a reader's pin survives without being renewed. Long enough to ride out a brownout in
+     * which every poll and every directory tick fails, short enough that a node that died holding a
+     * pin stops blocking collection within a sweep or two.
+     */
+    static final long READER_PIN_TTL_MILLIS = 30 * 60_000L;
+
+    /**
+     * Lets {@link ReaderShardActivityRegistry} tell this engine where to remove itself from when it
+     * stops being live -- see that class's {@code register}.
+     *
+     * @param registry the registry this engine was registered in
+     * @param registeredIndexUuid the index UUID it was registered under
+     * @param registeredShardId the shard id it was registered under
+     */
+    void attachActivityRegistry(ReaderShardActivityRegistry registry, String registeredIndexUuid, int registeredShardId) {
+        RegistryRegistration registration = new RegistryRegistration(registry, registeredIndexUuid, registeredShardId);
+        this.activityRegistration = registration;
+        if (cleanedUp.get()) {
+            // Lost a race with our own teardown -- remove immediately rather than leaving a dead
+            // engine registered because it closed a moment before it was registered.
+            registry.unregister(registeredIndexUuid, registeredShardId, this);
+        }
+    }
+
+    /**
+     * Every piece of teardown this engine owns, run exactly once.
+     *
+     * <p>It used to live directly in {@link #close()}, which is only one of the two ways this engine
+     * stops being live. {@code Engine#failEngine} calls {@code closeNoLock} <em>directly</em> and
+     * never goes through {@code close()} -- so on any engine failure (a corrupt read, an
+     * {@code IOException} out of the reader manager: precisely the conditions the reader-side
+     * correctness bugs produced) none of this ran. The consequences per failed reader shard were
+     * concrete: the admission permit was never released, so the node's effective cap shrank toward
+     * zero and eventually no reader shard could be allocated to it at all; the manifest poll kept
+     * ticking every five seconds forever against a closed store; and the compaction and GC
+     * schedulers kept running, so a <em>dead</em> shard went on merging and deleting in the object
+     * store.
+     *
+     * <p>The guard matters in the other direction too. {@code Engine#close()} is itself idempotent,
+     * but this override ran its body before delegating, unguarded -- so a second {@code close()}
+     * called {@code Semaphore#release()} a second time, and a {@code Semaphore} has no ownership
+     * check, silently <em>raising</em> the node's admission cap. One {@code compareAndSet} fixes
+     * both directions.
+     */
+    private void cleanupOnce() {
+        if (cleanedUp.compareAndSet(false, true) == false) {
+            return;
+        }
+        Scheduler.Cancellable poll = manifestPollTask;
+        if (poll != null) {
+            poll.cancel();
+        }
         directoryRefreshTask.cancel();
+        // Resolve rather than abandon: a read-after-write caller waiting on a shard that just went
+        // away should get a prompt "no", not a timeout.
+        for (GenerationWaiter waiter = generationWaiters.poll(); waiter != null; waiter = generationWaiters.poll()) {
+            waiter.listener.onResponse(false);
+        }
+        RegistryRegistration registration = activityRegistration;
+        if (registration != null) {
+            registration.registry().unregister(registration.indexUuid(), registration.shardId(), this);
+        }
         // Cleans up this engine's own directory entry rather than leaving it to linger until its
         // TTL lapses (InMemoryShardDirectory has no active eviction, only lazy removal on a later
         // lookup -- see its own javadoc). Conditional, not a plain drop(): an unconditional removal
@@ -657,22 +1210,47 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         if (ownEntry != null) {
             shardDirectory.dropIfMatches(indexUuid, shardId, ownEntry);
         }
-        if (compactionSchedulerTask != null) {
-            compactionSchedulerTask.close();
-        }
-        if (gcSchedulerTask != null) {
-            gcSchedulerTask.close();
-        }
-        if (partitionRewriteSchedulerTask != null) {
-            partitionRewriteSchedulerTask.close();
-        }
-        if (pitrRetentionTask != null) {
-            pitrRetentionTask.close();
-        }
+        closeQuietly(compactionSchedulerTask);
+        closeQuietly(gcSchedulerTask);
+        closeQuietly(partitionRewriteSchedulerTask);
+        closeQuietly(pitrRetentionTask);
+        releaseReaderPin();
         if (admissionController != null) {
             admissionController.release();
         }
+    }
+
+    /** A scheduler failing to stop must never prevent the rest of teardown -- especially not the admission permit. */
+    private void closeQuietly(java.io.Closeable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (Exception e) {
+            logger.warn("failed to close a background scheduler for reader shard [" + indexUuid + "][" + shardId + "]", e);
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        cleanupOnce();
         super.close();
+    }
+
+    /**
+     * The other way this engine stops being live: {@code Engine#failEngine} calls this directly,
+     * bypassing {@link #close()} entirely. Overriding it is what makes teardown actually happen on
+     * a failure rather than only on an orderly close -- see {@link #cleanupOnce()} for what was
+     * being leaked.
+     *
+     * @param reason why the engine is being closed
+     * @param closedLatch counted down by the superclass once the close completes
+     */
+    @Override
+    protected void closeNoLock(String reason, CountDownLatch closedLatch) {
+        cleanupOnce();
+        super.closeNoLock(reason, closedLatch);
     }
 
     /**
@@ -950,6 +1528,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
             return new ObjectStoreReaderEngine(
                 config,
                 seqNoStats,
+                manifest,
                 primaryTerm,
                 manifest.generation(),
                 shardStateStore,

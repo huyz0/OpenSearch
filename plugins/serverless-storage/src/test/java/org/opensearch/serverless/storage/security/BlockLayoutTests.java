@@ -94,4 +94,60 @@ public class BlockLayoutTests extends OpenSearchTestCase {
         assertEquals(offset0 + stride, offset1);
         assertEquals(offset1 + stride, offset2);
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Format version 2 and the header bound. Both are F-5/F-6: the header is the one part of the
+    // blob a reader must trust before it has authenticated anything, so what it is allowed to say
+    // is a security question, not a parsing one.
+    // ------------------------------------------------------------------------------------------
+
+    /** Everything written now is version 2, whether or not the caller mentioned a version. */
+    public void testHeadersAreWrittenAtTheCurrentFormatVersion() throws Exception {
+        BlockLayout.Header header = new BlockLayout.Header(1024, 5000);
+        assertEquals(BlockLayout.FORMAT_VERSION, header.formatVersion());
+        assertTrue(header.authenticatesAssociatedData());
+        assertEquals(BlockLayout.FORMAT_VERSION, BlockLayout.decodeHeader(BlockLayout.encodeHeader(header)).formatVersion());
+    }
+
+    /**
+     * Version 1 still decodes, and reports that its blocks carry no associated data -- which is what
+     * {@code EncryptingBlobContainer} keys the legacy read path off. Refusing it outright would turn
+     * every upgrade into a data-loss event; accepting it without <em>knowing</em> it is version 1
+     * would silently read a v1 blob with v2 rules and fail every tag.
+     */
+    public void testLegacyVersionOneHeadersStillDecodeAndSayTheyAreUnauthenticated() throws Exception {
+        BlockLayout.Header legacy = new BlockLayout.Header(BlockLayout.FORMAT_VERSION_LEGACY_NO_AAD, 1024, 5000);
+        BlockLayout.Header decoded = BlockLayout.decodeHeader(BlockLayout.encodeHeader(legacy));
+        assertEquals(BlockLayout.FORMAT_VERSION_LEGACY_NO_AAD, decoded.formatVersion());
+        assertFalse("a version 1 block was written with no associated data", decoded.authenticatesAssociatedData());
+    }
+
+    /** A version from the future is still refused: only 1 and 2 have defined read rules. */
+    public void testDecodeRejectsAnUnknownFormatVersion() throws Exception {
+        byte[] encoded = BlockLayout.encodeHeader(new BlockLayout.Header(1024, 5000));
+        java.nio.ByteBuffer.wrap(encoded).putInt(4, 99);
+        IOException e = expectThrows(IOException.class, () -> BlockLayout.decodeHeader(encoded));
+        assertTrue(e.getMessage().contains("unsupported block-encrypted format version 99"));
+    }
+
+    /**
+     * F-6: the header sizes the reader's buffers before any tag has been checked, so a forged
+     * {@code blockSizeBytes} was an allocation primitive. The record's own constructor only rejected
+     * values {@code <= 0}, which let {@code Integer.MAX_VALUE} through as a 2 GB allocation driven
+     * entirely by attacker-controlled bytes.
+     */
+    public void testDecodeRejectsAnAbsurdBlockSize() throws Exception {
+        byte[] encoded = BlockLayout.encodeHeader(new BlockLayout.Header(1024, 5000));
+        java.nio.ByteBuffer.wrap(encoded).putInt(8, Integer.MAX_VALUE);
+        IOException e = expectThrows(IOException.class, () -> BlockLayout.decodeHeader(encoded));
+        assertTrue("the message must name the bound: " + e.getMessage(), e.getMessage().contains("above the maximum"));
+    }
+
+    /** The bound is two orders of magnitude above the 64 KiB actually written, so it constrains nothing real. */
+    public void testTheBlockSizeBoundStillAllowsEveryRealisticBlockSize() throws Exception {
+        for (int blockSize : new int[] { 1, 64 * 1024, BlockLayout.MAX_BLOCK_SIZE_BYTES }) {
+            byte[] encoded = BlockLayout.encodeHeader(new BlockLayout.Header(blockSize, 5000));
+            assertEquals(blockSize, BlockLayout.decodeHeader(encoded).blockSizeBytes());
+        }
+    }
 }

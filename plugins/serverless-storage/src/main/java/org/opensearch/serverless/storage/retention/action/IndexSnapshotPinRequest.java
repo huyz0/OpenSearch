@@ -63,6 +63,20 @@ public class IndexSnapshotPinRequest extends ActionRequest {
         }
         if (snapshotId == null || snapshotId.isEmpty()) {
             validationException = addValidationError("snapshotId is required", validationException);
+        } else if (SnapshotPinRequest.isWellFormedSnapshotId(snapshotId) == false) {
+            // See SnapshotPinRequest#isWellFormedSnapshotId: this string becomes a pin id and a blob-name
+            // suffix, so an unrestricted alphabet is a path and a namespace the caller picks.
+            validationException = addValidationError(SnapshotPinRequest.SNAPSHOT_ID_CHARSET_ERROR, validationException);
+        } else if (snapshotId.startsWith(SnapshotPinRequest.DEEP_SNAPSHOT_PIN_ID_PREFIX)) {
+            // The deep-snapshot export mints its own per-shard pins under this prefix and releases them in
+            // a finally block. A caller allowed to name a snapshot into that namespace could remove the pin
+            // holding a copy in progress, or leave one behind that the export will never release. The
+            // per-shard action deliberately does NOT reject this prefix -- that is the path the export
+            // itself uses -- so the refusal belongs on the operator-facing entry points.
+            validationException = addValidationError(
+                SnapshotPinRequest.reservedSnapshotIdError(SnapshotPinRequest.DEEP_SNAPSHOT_PIN_ID_PREFIX),
+                validationException
+            );
         } else if (snapshotId.equals(PitrRetentionPolicy.PITR_PIN_ID)) {
             // See SnapshotPinRequest's own validate() for why this exact name is reserved.
             validationException = addValidationError(

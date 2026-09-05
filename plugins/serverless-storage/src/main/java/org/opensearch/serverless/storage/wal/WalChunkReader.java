@@ -32,14 +32,44 @@ public final class WalChunkReader {
     private WalChunkReader() {}
 
     /**
+     * A parsed chunk: its records, plus the {@code formatVersion} they were written at.
+     *
+     * <p>The version is part of the result rather than swallowed by the parser because it is not
+     * only a compatibility detail -- from {@link WalRecordCrypto#FIRST_IDENTITY_BOUND_FORMAT_VERSION}
+     * onward an encrypted record's payload is bound to its own identity as AES-GCM associated data,
+     * so decrypting a chunk correctly requires knowing which version wrote it. Nothing but this
+     * parser can know that.
+     *
+     * @param formatVersion the {@code formatVersion} field read from the chunk header
+     * @param records the chunk's records, in original append order
+     */
+    public record ParsedChunk(int formatVersion, List<WalRecord> records) {
+    }
+
+    /**
      * Parses a chunk's raw bytes back into its ordered list of records, validating the magic
-     * header, format version, and trailing checksum.
+     * header, format version, and trailing checksum. Equivalent to {@link #readChunk} when the
+     * caller does not need to know which format version wrote the bytes -- which, once encryption is
+     * in play, it does; see {@link ParsedChunk}.
      *
      * @param chunkBytes the raw bytes of a chunk previously produced by {@link WalChunkWriter#write}
      * @return the chunk's records, in original append order
      * @throws WalFormatException if the chunk is malformed, truncated, or fails checksum verification
      */
     public static List<WalRecord> readRecords(byte[] chunkBytes) throws WalFormatException {
+        return readChunk(chunkBytes).records();
+    }
+
+    /**
+     * Parses a chunk's raw bytes into its records <em>and</em> the format version that produced
+     * them, validating the magic header, the version range, and the trailing checksum.
+     *
+     * @param chunkBytes the raw bytes of a chunk previously produced by {@link WalChunkWriter#write}
+     * @return the parsed chunk
+     * @throws WalFormatException if the chunk is malformed, truncated, written at an unsupported
+     *                            version, or fails checksum verification
+     */
+    public static ParsedChunk readChunk(byte[] chunkBytes) throws WalFormatException {
         try {
             ByteArrayInputStream rawIn = new ByteArrayInputStream(chunkBytes);
             DataInputStream in = new DataInputStream(rawIn);
@@ -52,8 +82,13 @@ public final class WalChunkReader {
                 }
             }
 
+            // A RANGE, not an equality check: chunks written before a node upgraded are still in the
+            // shared container and are exactly the ones a crash right after that upgrade needs to
+            // replay. Rejecting them because the writer has moved on is data loss dressed up as
+            // strictness. The upper bound stays strict -- a version this build has never heard of
+            // cannot be parsed by guessing.
             int version = in.readInt();
-            if (version != WalChunkWriter.FORMAT_VERSION) {
+            if (version < WalChunkWriter.MIN_SUPPORTED_FORMAT_VERSION || version > WalChunkWriter.FORMAT_VERSION) {
                 throw new WalFormatException("unsupported WAL chunk format version " + version);
             }
 
@@ -104,7 +139,7 @@ public final class WalChunkReader {
                 throw new WalFormatException("WAL chunk checksum mismatch: corrupt or truncated chunk");
             }
 
-            return records;
+            return new ParsedChunk(version, records);
         } catch (EOFException e) {
             throw new WalFormatException("truncated WAL chunk", e);
         } catch (WalFormatException e) {

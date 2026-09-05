@@ -11,8 +11,13 @@ package org.opensearch.serverless.storage.scaletozero;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
+import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.IndicesRequest;
+import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.fieldcaps.FieldCapabilitiesAction;
+import org.opensearch.action.search.MultiSearchAction;
 import org.opensearch.action.search.SearchAction;
+import org.opensearch.action.search.SearchScrollAction;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.ActionRequestMetadata;
@@ -32,7 +37,12 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The "cold-start reactivation on next write or query" half of scale-to-zero (rfc-serverless-opensearch.md
@@ -169,7 +179,7 @@ public final class ShardReactivationActionFilter implements ActionFilter {
             return;
         }
 
-        boolean isSearch = SearchAction.NAME.equals(action);
+        boolean isSearch = isSearchFamily(action);
         ClusterState state = currentClusterService.state();
         GatedShardSuspensionRegistry gatedSuspensions = GatedShardSuspensionRegistry.installed();
         // Whether this node holds any gated suspension at all. A plain size read, and it is the gate that
@@ -188,11 +198,15 @@ public final class ShardReactivationActionFilter implements ActionFilter {
             String realIndexName = indexMetadata.getIndex().getName();
             boolean writerSuspended = SuspendedShardsMetadata.suspendedShardIds(indexMetadata).isEmpty() == false;
             boolean readerSuspended = SuspendedShardsMetadata.suspendedReaderShardIds(indexMetadata).isEmpty() == false;
+            // A search needs every shard, so it keeps the whole-index scope (an empty set). A write
+            // touches exactly the shards its documents hash to, and waking the other 99 of a
+            // 100-shard index because one of them happens to be hot is finding L-3's churn loop.
+            Set<Integer> writerScope = isSearch ? Collections.emptySet() : targetShardIds(indexMetadata, request);
             if (writerSuspended) {
-                triggerReactivation(currentClient, realIndexName, false);
+                triggerReactivation(currentClient, realIndexName, false, writerScope);
             }
             if (readerSuspended) {
-                triggerReactivation(currentClient, realIndexName, true);
+                triggerReactivation(currentClient, realIndexName, true, Collections.emptySet());
             }
             if (isSearch) {
                 // Deciding whether to wait off the suspended marker alone leaves a real race:
@@ -298,7 +312,7 @@ public final class ShardReactivationActionFilter implements ActionFilter {
      * practice only the elected cluster manager records gated suspensions, so a node that finds one locally
      * and is not the manager forwards, and the manager itself does not need to talk to anyone.
      */
-    private static void wakeGatedIndex(ClusterState state, GatedShardSuspensionRegistry gatedSuspensions, Client client, String indexName) {
+    private void wakeGatedIndex(ClusterState state, GatedShardSuspensionRegistry gatedSuspensions, Client client, String indexName) {
         IndexMetadata gated = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
             state.metadata(),
             indexName
@@ -314,8 +328,10 @@ public final class ShardReactivationActionFilter implements ActionFilter {
         }
         logger.info("woke gated index [{}] on this node for an incoming request", indexName);
         if (state.nodes().isLocalNodeElectedClusterManager() == false) {
-            triggerReactivation(client, indexName, false);
-            triggerReactivation(client, indexName, true);
+            // The whole gated index is being woken, so every suspended shard of it is in scope; the
+            // request spells that as an empty set (see ReactivateShardsRequest's own javadoc).
+            triggerReactivation(client, indexName, false, java.util.Set.of());
+            triggerReactivation(client, indexName, true, java.util.Set.of());
         }
     }
 
@@ -352,6 +368,23 @@ public final class ShardReactivationActionFilter implements ActionFilter {
             return false;
         }
         String indexName = indexMetadata.getIndex().getName();
+        if (readerCopyIsHopeless(state, indexMetadata)) {
+            // Finding L-5. This method used to answer "true" for any reader copy that was not
+            // STARTED, with no distinction between "mid-reactivation" and "will never allocate" --
+            // so an index configured with search-only replicas on a cluster with no reader node, or
+            // whose reader copy has exhausted its allocation retries, added the full 30-second
+            // search_reactivation_wait to *every single search* before failing anyway. RFC section 13
+            // is explicit that an unavailable cold activation must "fail fast with a distinct error
+            // rather than queueing indefinitely"; a 30-second queue followed by a generic error is
+            // the opposite of that. Proceeding immediately hands the request to core, which fails it
+            // with its own NoShardAvailableActionException at once.
+            logger.debug(
+                "not waiting for reader reactivation of index [{}]: its search-only copies have exhausted their allocation "
+                    + "retries and will not start without operator intervention",
+                indexName
+            );
+            return false;
+        }
         if (state.routingTable().hasIndex(indexName) == false) {
             // The caller already established the index is in metadata, so no routing entry means
             // cold, not gone. A cold index has no reader copy anywhere, which is the strongest form
@@ -370,15 +403,190 @@ public final class ShardReactivationActionFilter implements ActionFilter {
         return false;
     }
 
-    private static void triggerReactivation(Client client, String indexName, boolean reader) {
+    /**
+     * Whether every search-only copy of some shard of this index is unassigned <em>and</em> has
+     * exhausted {@code index.allocation.max_retries}, i.e. no reroute will ever start it again
+     * without an operator resetting the failures. Waiting on such a copy can only ever burn the full
+     * reactivation timeout (finding L-5).
+     *
+     * <p>Deliberately conservative in the other direction too: a copy that is merely unassigned with
+     * no failures yet is <em>not</em> hopeless -- that is exactly what a reactivation in flight looks
+     * like -- so the wait is still taken for it.
+     */
+    private static boolean readerCopyIsHopeless(ClusterState state, IndexMetadata indexMetadata) {
+        String indexName = indexMetadata.getIndex().getName();
+        if (state.routingTable().hasIndex(indexName) == false) {
+            return false;
+        }
+        int maxRetries = org.opensearch.cluster.routing.allocation.decider.MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(
+            indexMetadata.getSettings()
+        );
+        for (org.opensearch.cluster.routing.IndexShardRoutingTable shardRoutingTable : state.routingTable().index(indexName)) {
+            List<org.opensearch.cluster.routing.ShardRouting> searchReplicas = shardRoutingTable.searchOnlyReplicas();
+            if (searchReplicas.isEmpty()) {
+                continue;
+            }
+            boolean everyCopyExhausted = true;
+            for (org.opensearch.cluster.routing.ShardRouting replica : searchReplicas) {
+                if (replica.state() == org.opensearch.cluster.routing.ShardRoutingState.STARTED) {
+                    everyCopyExhausted = false;
+                    break;
+                }
+                org.opensearch.cluster.routing.UnassignedInfo unassignedInfo = replica.unassignedInfo();
+                if (unassignedInfo == null || unassignedInfo.getNumFailedAllocations() < maxRetries) {
+                    everyCopyExhausted = false;
+                    break;
+                }
+            }
+            if (everyCopyExhausted) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Recently-dispatched reactivations, keyed by what was dispatched, valued by the wall-clock time
+     * it was dispatched at. See {@link #triggerReactivation} for why this exists (finding L-7).
+     */
+    private final Map<String, Long> recentlyDispatched = new ConcurrentHashMap<>();
+
+    /**
+     * How long a dispatched reactivation suppresses an identical one. Short on purpose: long enough
+     * to fold a burst of concurrent requests against the same cold index into one dispatch, short
+     * enough that a reactivation which failed outright is retried almost immediately by the next
+     * request rather than leaving the index cold for a noticeable interval.
+     */
+    private static final long DISPATCH_DEDUP_MILLIS = 2_000L;
+
+    /**
+     * Fires one reactivation, unless an identical one was fired within the last {@link
+     * #DISPATCH_DEDUP_MILLIS}.
+     *
+     * <p><b>Finding L-7: why the dedup is not optional.</b> {@link #apply} runs per request and
+     * loops over every resolved index name, so a single {@code GET logs-*&#47;_search} resolving to 500
+     * cold indices used to dispatch up to 1,000 cluster-manager-node actions, and a client retry
+     * storm during a cold start multiplied that by the concurrency. The transport action does batch
+     * the cluster-state <em>tasks</em>, so the publications fold -- but the transport fan-in to the
+     * elected cluster manager does not, and neither does the per-changed-task reroute. This is a
+     * self-inflicted herd against the one node least able to absorb it.
+     */
+    private void triggerReactivation(Client client, String indexName, boolean reader, Set<Integer> shardIds) {
+        String key = indexName + '|' + reader + '|' + shardIds;
+        long now = System.currentTimeMillis();
+        Long previous = recentlyDispatched.get(key);
+        if (previous != null && now - previous < DISPATCH_DEDUP_MILLIS) {
+            return;
+        }
+        // putIfAbsent-then-replace rather than a plain put, so two threads racing here dispatch once.
+        Long raced = recentlyDispatched.putIfAbsent(key, now);
+        if (raced != null) {
+            if (now - raced < DISPATCH_DEDUP_MILLIS) {
+                return;
+            }
+            if (recentlyDispatched.replace(key, raced, now) == false) {
+                return; // another thread just refreshed it and is dispatching.
+            }
+        }
+        pruneDispatchCache(now);
         client.execute(
             ReactivateShardsAction.INSTANCE,
-            new ReactivateShardsRequest(indexName, reader),
-            ActionListener.wrap(
-                response -> {},
-                e -> logger.warn("failed to trigger reactivation of index [" + indexName + "] (reader=" + reader + ")", e)
-            )
+            new ReactivateShardsRequest(indexName, reader, shardIds),
+            ActionListener.wrap(response -> {}, e -> {
+                // A failed dispatch must not be suppressed for the full window: the next request
+                // should be free to try again immediately.
+                recentlyDispatched.remove(key);
+                logger.warn("failed to trigger reactivation of index [" + indexName + "] (reader=" + reader + ")", e);
+            })
         );
+    }
+
+    /**
+     * Drops entries older than the dedup window. Bounded work: this map only ever holds indices
+     * reactivated in the last couple of seconds, and the sweep runs only on a dispatch, not on every
+     * request.
+     */
+    private void pruneDispatchCache(long now) {
+        if (recentlyDispatched.size() < 64) {
+            return;
+        }
+        recentlyDispatched.entrySet().removeIf(entry -> now - entry.getValue() >= DISPATCH_DEDUP_MILLIS);
+    }
+
+    /**
+     * Which shards of {@code indexMetadata} a write request will actually touch, or an empty set
+     * meaning "cannot tell, use the whole index".
+     *
+     * <p>Deliberately conservative, because a wrong answer here is a shard that stays asleep while a
+     * write waits on it. Anything that cannot be resolved exactly -- an auto-id document whose id is
+     * assigned later in the pipeline, a bulk item naming a different index, a routing-partitioned or
+     * in-place-split index whose hash-to-shard mapping is not this simple function -- falls back to
+     * the whole index, which is exactly the behaviour that existed before shard scoping.
+     */
+    private static Set<Integer> targetShardIds(IndexMetadata indexMetadata, Object request) {
+        if (indexMetadata.getSplitShardsMetadata() != null
+            && (indexMetadata.getSplitShardsMetadata().getSplitParentShardIds().isEmpty() == false
+                || indexMetadata.getSplitShardsMetadata().getInProgressSplitShardIds().isEmpty() == false)) {
+            // An in-place-split index resolves a document to a shard through its hash ranges, not
+            // through OperationRouting#generateShardId's modulo. Not reproduced here.
+            return Collections.emptySet();
+        }
+        List<DocWriteRequest<?>> docRequests;
+        if (request instanceof BulkRequest) {
+            docRequests = ((BulkRequest) request).requests();
+        } else if (request instanceof DocWriteRequest) {
+            docRequests = List.of((DocWriteRequest<?>) request);
+        } else {
+            return Collections.emptySet();
+        }
+        if (docRequests.isEmpty()) {
+            return Collections.emptySet();
+        }
+        String concreteName = indexMetadata.getIndex().getName();
+        Set<Integer> shardIds = new LinkedHashSet<>();
+        for (DocWriteRequest<?> docRequest : docRequests) {
+            if (concreteName.equals(docRequest.index()) == false) {
+                // Either a bulk item for a different index (whose own metadata drives its own
+                // iteration of the caller's loop) or a name we have not resolved -- either way this
+                // request's full shard set is not knowable from here.
+                return Collections.emptySet();
+            }
+            if (docRequest.id() == null && docRequest.routing() == null) {
+                return Collections.emptySet(); // auto-id: the id does not exist yet.
+            }
+            try {
+                shardIds.add(
+                    org.opensearch.cluster.routing.OperationRouting.generateShardId(indexMetadata, docRequest.id(), docRequest.routing())
+                );
+            } catch (RuntimeException e) {
+                return Collections.emptySet();
+            }
+        }
+        return shardIds;
+    }
+
+    /**
+     * Whether {@code action} is one of the read paths that has no retry of its own and therefore
+     * needs this filter to hold the request until the reader copy is actually serving.
+     *
+     * <p><b>Finding L-8.</b> This used to be {@code SearchAction.NAME.equals(action)} alone.
+     * {@code _msearch} inherits the behaviour because it reaches {@code SearchAction} through the
+     * node client, but field-caps does not go through {@code SearchAction} and has no equivalent
+     * retry, so it failed immediately against a fully reader-suspended index instead of waiting for
+     * it to wake -- the client-visible failure this whole filter exists to prevent, reached by a
+     * slightly different door.
+     *
+     * <p>{@code SearchScrollAction} is named here for completeness but is not actually reachable
+     * from this filter: {@code SearchScrollRequest} is not an {@code IndicesRequest}, so {@link
+     * #apply} returns early for it before this method is consulted. Covering scroll and
+     * point-in-time creation needs the index names to come from the reader context rather than the
+     * request, which is a different mechanism; it is recorded as deferred rather than pretended at.
+     */
+    private static boolean isSearchFamily(String action) {
+        return SearchAction.NAME.equals(action)
+            || MultiSearchAction.NAME.equals(action)
+            || SearchScrollAction.NAME.equals(action)
+            || FieldCapabilitiesAction.NAME.equals(action);
     }
 
     private <Request extends ActionRequest, Response extends ActionResponse> void waitForReactivationThenProceed(

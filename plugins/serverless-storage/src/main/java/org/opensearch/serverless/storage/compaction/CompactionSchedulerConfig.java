@@ -24,7 +24,7 @@ import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher
  */
 public record CompactionSchedulerConfig(TimeValue interval, BlobContainerManifestStore manifestStore,
     ObjectStoreCommitMaterializer materializer, ObjectStoreCommitPublisher commitPublisher, CompactionPolicy policy,
-    CompactionRebaseExecutor rebaseExecutor, RewriteAdmissionController admissionController) {
+    CompactionRebaseExecutor rebaseExecutor, RewriteAdmissionController admissionController, java.nio.file.Path mergeWorkRoot) {
 
     /**
      * Creates a config bundling everything needed to schedule background compaction for one shard.

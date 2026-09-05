@@ -157,15 +157,28 @@ public final class WalChunkService implements WalAppendTarget {
      * blip: {@link #writeChunkWithRetry} retries this many times with a short linear backoff before
      * giving up and propagating the failure. This is the retry policy that used to live in {@code
      * WalMirroringTranslog#flushWithRetry} on the caller side, hoisted down to this layer so both the
-     * legacy per-operation {@link #flush}/{@link #overflowShardToDedicatedChunk} paths and the new
+     * legacy per-operation {@link #flush}/{@link #append} overflow paths and the new
      * group-commit batching path ({@code WalBatchingProcessor}) share exactly one retry
-     * implementation rather than each reimplementing it (or, as {@code overflowShardToDedicatedChunk}
-     * did before this, silently having none at all).
+     * implementation rather than each reimplementing it (or, as the overflow path did before this,
+     * silently having none at all).
      */
     public static final int MAX_WRITE_ATTEMPTS = 3;
 
     /** The linear backoff base between {@link #writeChunkWithRetry} attempts -- attempt <em>n</em> waits {@code RETRY_BASE_DELAY_MILLIS * n}. */
     static final long RETRY_BASE_DELAY_MILLIS = 10;
+
+    /** Sentinel for {@link #cachedRegisterGeneration} meaning "we have no idea, read the register". */
+    private static final long UNKNOWN_REGISTER_GENERATION = Long.MIN_VALUE;
+
+    /**
+     * The last generation {@link #SEQUENCE_REGISTER_NAME} was observed at by this instance -- a pure
+     * cost optimisation, never a correctness input; see {@link #claimNextChunkSequence}'s own inline
+     * comment for why a stale value here can only ever cost one extra CAS round trip. Volatile
+     * rather than atomic because a lost update between two concurrent claimers is harmless (both
+     * values are equally valid hints, and whichever loses simply re-learns the truth from its own
+     * failed CAS).
+     */
+    private volatile long cachedRegisterGeneration = UNKNOWN_REGISTER_GENERATION;
 
     /**
      * Atomically claims the next chunk sequence number, safe under any number of concurrent {@link
@@ -181,9 +194,23 @@ public final class WalChunkService implements WalAppendTarget {
      * so every retry after the first can use that directly instead of paying for another read.
      */
     private long claimNextChunkSequence() throws IOException {
-        long expectedGeneration = blobContainer.readRegister(SEQUENCE_REGISTER_NAME)
-            .map(BlobRegister::generation)
-            .orElse(BlobRegister.ABSENT_GENERATION);
+        // rfc-serverless-opensearch.md &sect;6.4's cost budget (see this field's own javadoc):
+        // skipping the readRegister when a previous successful CAS on this instance already told us
+        // exactly what the register's generation is takes the steady-state claim from two
+        // object-store requests (READ + CAS) down to one (CAS alone) -- a third off the whole legacy
+        // per-operation write path, and a third off every group-commit chunk on the batching path.
+        // This is safe under any number of concurrent writers for the same reason the retry loop
+        // below already is: a wrong expectation does not corrupt anything, it merely loses the CAS,
+        // and a lost CAS reports the register's real current generation, which the loop then uses.
+        // The cache is therefore a hint that costs one extra CAS round trip when wrong, never a
+        // correctness assumption -- unlike the locally-incremented AtomicLong this class used to
+        // have (see the class javadoc), which never consulted the register at all.
+        long expectedGeneration = cachedRegisterGeneration;
+        if (expectedGeneration == UNKNOWN_REGISTER_GENERATION) {
+            expectedGeneration = blobContainer.readRegister(SEQUENCE_REGISTER_NAME)
+                .map(BlobRegister::generation)
+                .orElse(BlobRegister.ABSENT_GENERATION);
+        }
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(
                 SEQUENCE_REGISTER_NAME,
@@ -193,26 +220,103 @@ public final class WalChunkService implements WalAppendTarget {
             if (result.applied()) {
                 // Generation 1 is the first successful write (ABSENT_GENERATION is 0), so the
                 // 0-based chunk sequence it corresponds to is one less.
+                cachedRegisterGeneration = result.currentGeneration();
                 return result.currentGeneration() - 1;
             }
             // Lost the race -- another instance (this node or another) claimed a sequence between
             // our read and our CAS attempt. The conflict result already reports what the register
             // actually is now; retry against that directly rather than re-reading.
             expectedGeneration = result.currentGeneration();
+            cachedRegisterGeneration = expectedGeneration;
         }
+        // Give up on the cache too: MAX_CAS_ATTEMPTS consecutive losses means our idea of the
+        // register is being invalidated faster than we can act on it, so the next call should pay
+        // for a fresh read rather than starting from a value already proven unhelpful.
+        cachedRegisterGeneration = UNKNOWN_REGISTER_GENERATION;
         throw new IOException(
             "failed to claim a WAL chunk sequence under writer epoch " + writerEpoch + " after " + MAX_CAS_ATTEMPTS + " CAS attempts"
         );
     }
 
+    /**
+     * Buffers {@code record} and, if that pushes its shard over {@link #perShardBudgetBytes},
+     * siphons that shard's buffered records into their own dedicated chunk.
+     *
+     * <p><b>Deliberately not {@code synchronized} as a whole any more.</b> It used to be, and the
+     * overflow write ran inside that monitor -- meaning one shard crossing its fairness budget
+     * blocked <em>every</em> shard's {@code append} on this node for the duration of an object-store
+     * PUT plus its retry backoffs, which is precisely the node-wide bottleneck {@link #flush}'s own
+     * javadoc explains it goes out of its way to avoid. The buffer mutation (cheap, in-memory) stays
+     * under the monitor; the write happens outside it, exactly as {@link #flush} already does.
+     *
+     * <p><b>And a failed overflow write no longer destroys records.</b> The old overflow step
+     * removed the shard's records from the buffer and then wrote them; if the write ultimately
+     * threw, those records -- including any this shard had buffered from <em>earlier</em> appends,
+     * which no caller was even waiting on -- were simply
+     * gone, silently violating the "a flush failure never loses or duplicates records, a later flush
+     * retries them" contract {@link #flush} maintains and {@code
+     * WalMirroringTranslog#flushWithRetry} depends on. They are now restored to the front of the
+     * buffer (with their byte counters) before the failure is rethrown, so the very next flush
+     * retries them.
+     *
+     * @param record the operation to buffer.
+     */
     @Override
-    public synchronized void append(WalRecord record) throws IOException {
-        buffered.add(record);
+    public void append(WalRecord record) throws IOException {
+        List<WalRecord> overflow = null;
+        synchronized (this) {
+            buffered.add(record);
+            if (perShardBudgetBytes > 0) {
+                ShardKey key = new ShardKey(record.indexUuid(), record.shardId());
+                long newTotal = bufferedBytesByShard.merge(key, (long) record.payload().length, Long::sum);
+                if (newTotal >= perShardBudgetBytes) {
+                    overflow = takeShardRecords(key);
+                }
+            }
+        }
+        if (overflow == null || overflow.isEmpty()) {
+            return;
+        }
+        try {
+            writeChunkWithRetry(overflow);
+        } catch (IOException e) {
+            restoreToBufferFront(overflow);
+            throw e;
+        }
+    }
+
+    /**
+     * Removes every currently-buffered record belonging to {@code key} from the shared buffer and
+     * returns them, clearing that shard's byte counter and leaving every other shard's records and
+     * counters untouched. Must be called with this service's monitor held.
+     */
+    private List<WalRecord> takeShardRecords(ShardKey key) {
+        assert Thread.holdsLock(this);
+        List<WalRecord> shardRecords = new ArrayList<>();
+        Iterator<WalRecord> iterator = buffered.iterator();
+        while (iterator.hasNext()) {
+            WalRecord record = iterator.next();
+            if (key.matches(record)) {
+                shardRecords.add(record);
+                iterator.remove();
+            }
+        }
+        bufferedBytesByShard.remove(key);
+        return shardRecords;
+    }
+
+    /**
+     * Puts {@code records} back at the front of the buffer and re-adds their per-shard byte counts,
+     * after a write attempt for them failed -- the same restore {@link #flush} performs, so a
+     * failed write never loses records regardless of which path attempted it. Front, not back:
+     * these records were appended before anything still in the buffer, and one shard's own records
+     * must never replay out of their original append order.
+     */
+    private synchronized void restoreToBufferFront(List<WalRecord> records) {
+        buffered.addAll(0, records);
         if (perShardBudgetBytes > 0) {
-            ShardKey key = new ShardKey(record.indexUuid(), record.shardId());
-            long newTotal = bufferedBytesByShard.merge(key, (long) record.payload().length, Long::sum);
-            if (newTotal >= perShardBudgetBytes) {
-                overflowShardToDedicatedChunk(key);
+            for (WalRecord record : records) {
+                bufferedBytesByShard.merge(new ShardKey(record.indexUuid(), record.shardId()), (long) record.payload().length, Long::sum);
             }
         }
     }
@@ -224,8 +328,8 @@ public final class WalChunkService implements WalAppendTarget {
      * <p>Deliberately does not hold this service's monitor across the actual write: only the
      * cheap in-memory swap (snapshot the buffer, clear it) is synchronized, and {@link
      * #writeChunkWithRetry} -- the network I/O, including its own bounded retry-with-backoff --
-     * runs with no lock held, exactly as its own javadoc says is safe ("writing a chunk needs no
-     * lock of its own since every attempt claims a fresh, globally-unique chunk sequence"). This
+     * runs with no lock held, exactly as its own javadoc says is safe (writing a chunk needs no
+     * lock of its own since each call claims its own globally-unique chunk sequence). This
      * service is shared by every writer shard on the node (see the class javadoc's "Per-shard
      * fairness" section), and on the legacy synchronous path {@link
      * org.opensearch.serverless.storage.translog.WalMirroringTranslog#add} calls {@link #append}
@@ -275,15 +379,7 @@ public final class WalChunkService implements WalAppendTarget {
         try {
             return writeChunkWithRetry(toWrite);
         } catch (IOException e) {
-            synchronized (this) {
-                buffered.addAll(0, toWrite);
-                if (perShardBudgetBytes > 0) {
-                    for (WalRecord record : toWrite) {
-                        ShardKey key = new ShardKey(record.indexUuid(), record.shardId());
-                        bufferedBytesByShard.merge(key, (long) record.payload().length, Long::sum);
-                    }
-                }
-            }
+            restoreToBufferFront(toWrite);
             throw e;
         }
     }
@@ -320,7 +416,7 @@ public final class WalChunkService implements WalAppendTarget {
      * org.opensearch.serverless.storage.wal.WalReplayRecovery} reads chunks back from during
      * activation replay. Note this container is not itself scoped per-epoch on disk (see {@link
      * WalChunkNaming}'s javadoc: {@code blobName} does not actually incorporate the epoch, only
-     * {@code blobPath} does, and only {@code blobName} is what {@link #writeChunk} uses) -- chunk
+     * {@code blobPath} does, and only {@code blobName} is what {@link #writeChunkWithRetry} uses) -- chunk
      * sequence numbers are the real, globally-continuous ordering key this service and {@code
      * WalReplayRecovery} both rely on, not the epoch string.
      */
@@ -349,35 +445,14 @@ public final class WalChunkService implements WalAppendTarget {
     }
 
     /**
-     * Pulls every currently-buffered record belonging to {@code key} out of the shared buffer and
-     * writes them into their own dedicated chunk immediately, leaving every other shard's buffered
-     * records (and their own per-shard byte counters) untouched.
-     */
-    private void overflowShardToDedicatedChunk(ShardKey key) throws IOException {
-        List<WalRecord> shardRecords = new ArrayList<>();
-        Iterator<WalRecord> iterator = buffered.iterator();
-        while (iterator.hasNext()) {
-            WalRecord record = iterator.next();
-            if (key.matches(record)) {
-                shardRecords.add(record);
-                iterator.remove();
-            }
-        }
-        bufferedBytesByShard.remove(key);
-        if (shardRecords.isEmpty() == false) {
-            writeChunkWithRetry(shardRecords);
-        }
-    }
-
-    /**
      * Writes {@code records} into one new chunk blob, retrying a bounded number of times with a
      * short linear backoff (see {@link #MAX_WRITE_ATTEMPTS}) on a transient {@link IOException}
      * before giving up and rethrowing -- never silently swallowed. Shared by the legacy
-     * per-operation {@link #flush}/{@link #overflowShardToDedicatedChunk} paths (which pass the
-     * shared buffer, under this service's own monitor) and the group-commit batching path
-     * ({@code WalBatchingProcessor#write}, which passes its own drained batch, off this monitor):
-     * writing a chunk needs no lock of its own since every attempt claims a fresh, globally-unique
-     * chunk sequence (see {@link #claimNextChunkSequence}) and writes a uniquely-named blob, so two
+     * per-operation {@link #flush}/{@link #append} overflow paths (which pass the
+     * shared buffer, snapshotted out from under this service's own monitor) and the group-commit
+     * batching path ({@code WalBatchingProcessor#write}, which passes its own drained batch):
+     * writing a chunk needs no lock of its own since each call claims one globally-unique chunk
+     * sequence (see {@link #claimNextChunkSequence}) and writes a uniquely-named blob, so two
      * concurrent writers never collide regardless of which path they came in on.
      *
      * @param records the records to group-commit into one chunk; a no-op returning {@code -1} if empty.
@@ -387,9 +462,31 @@ public final class WalChunkService implements WalAppendTarget {
         if (records.isEmpty()) {
             return -1;
         }
+        // The sequence is claimed ONCE, ahead of the retry loop, and every attempt reuses it.
+        //
+        // It used to be claimed inside writeChunk, i.e. freshly on every attempt, which had two
+        // consequences, one merely wasteful and one a real (if narrow) acked-and-lost bug:
+        // * Each failed attempt advanced the shared register without writing anything, burning a
+        // sequence and leaving a permanent hole in the chunk-sequence space (tolerated by
+        // WalReplayRecovery#listChunkSequencesInRange's per-candidate blobExists probe, but at
+        // the cost of a wasted probe per hole forever after, and -- see WalReplayRecovery's own
+        // corrupt-tail branch -- a hole can make a mid-stream chunk look like the last one).
+        // * More seriously, the retry's record landed at a strictly *higher* sequence than the
+        // first attempt claimed. If a new writer snapshotted its activationWalPosition in that
+        // window, the successfully-written (and then acked) records fell *above* that fencing
+        // cutoff and were silently excluded from replay -- the same acked-and-lost failure mode
+        // as D1/D3, reached by a different route.
+        // Rewriting the same blob name on a retry is safe: writeBlob is called with
+        // failIfAlreadyExists=false, and every attempt writes byte-identical content (the records
+        // are serialized once, below, outside the loop), so an attempt that actually succeeded
+        // server-side but reported failure to us is simply overwritten with itself.
+        long chunkSequence = claimNextChunkSequence();
+        byte[] chunkBytes = WalChunkWriter.write(records);
+        String blobName = WalChunkNaming.blobName(writerEpoch, chunkSequence);
         for (int attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt++) {
             try {
-                return writeChunk(records);
+                blobContainer.writeBlob(blobName, new BytesArray(chunkBytes).streamInput(), chunkBytes.length, false);
+                return chunkSequence;
             } catch (IOException e) {
                 if (attempt == MAX_WRITE_ATTEMPTS) {
                     throw e;
@@ -403,14 +500,6 @@ public final class WalChunkService implements WalAppendTarget {
             }
         }
         throw new AssertionError("writeChunkWithRetry loop exited without returning or throwing");
-    }
-
-    private long writeChunk(List<WalRecord> records) throws IOException {
-        long chunkSequence = claimNextChunkSequence();
-        byte[] chunkBytes = WalChunkWriter.write(records);
-        String blobName = WalChunkNaming.blobName(writerEpoch, chunkSequence);
-        blobContainer.writeBlob(blobName, new BytesArray(chunkBytes).streamInput(), chunkBytes.length, false);
-        return chunkSequence;
     }
 
     private static final class ShardKey {

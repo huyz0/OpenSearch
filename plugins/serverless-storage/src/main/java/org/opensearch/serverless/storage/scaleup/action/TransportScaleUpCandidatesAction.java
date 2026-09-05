@@ -122,12 +122,18 @@ public class TransportScaleUpCandidatesAction extends TransportNodesAction<
     @Override
     protected NodeScaleUpCandidatesResponse nodeOperation(NodeRequest request) {
         Map<String, Long> qpmSnapshot = plugin.readerShardActivityRegistry().snapshotQueriesPerMinute();
+        // Finding S-1/S-3: report idleness alongside the rate. The registry already collects it for
+        // the scale-to-zero fan-out, so this costs one extra map read and nothing else -- and it is
+        // the only thing that lets the candidate predicate tell "busy" from "was busy an hour ago",
+        // since queriesPerMinute() freezes at the last busy window when traffic stops.
+        Map<String, Long> idleSnapshot = plugin.readerShardActivityRegistry().snapshotQueryIdleMillis();
         List<ShardQueryRateEntry> entries = new ArrayList<>(qpmSnapshot.size());
         for (Map.Entry<String, Long> entry : qpmSnapshot.entrySet()) {
             int separator = entry.getKey().lastIndexOf('/');
             String indexUuid = entry.getKey().substring(0, separator);
             int shardId = Integer.parseInt(entry.getKey().substring(separator + 1));
-            entries.add(new ShardQueryRateEntry(indexUuid, shardId, entry.getValue()));
+            long idleMillis = idleSnapshot.getOrDefault(entry.getKey(), ShardQueryRateEntry.UNKNOWN_IDLE);
+            entries.add(new ShardQueryRateEntry(indexUuid, shardId, entry.getValue(), idleMillis));
         }
         return new NodeScaleUpCandidatesResponse(clusterService.localNode(), entries);
     }

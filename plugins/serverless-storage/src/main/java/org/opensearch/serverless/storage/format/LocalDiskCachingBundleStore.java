@@ -24,8 +24,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.CRC32C;
@@ -90,9 +88,34 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     private final BundleFileReader delegate;
     private final Path cacheDirectory;
     private final EncryptionKeyProvider encryptionKeyProvider;
-    // Guards the read-check-write-then-rename sequence for one cache key so concurrent readers of
-    // the same file don't race to write the same temp file; different keys never contend.
-    private final ConcurrentMap<String, Object> locksByKey = new ConcurrentHashMap<>();
+    /**
+     * Guards the read-check-write-then-rename sequence for one cache key so concurrent readers of
+     * the same file don't race to write the same temp file.
+     *
+     * <p><b>A fixed stripe array, not a {@code ConcurrentHashMap} of one lock object per path.</b>
+     * The map form had a real defect: {@code evictIfOverBudget} removed a path's lock object from
+     * the map while holding it, so a thread that had already resolved the <em>old</em> object but
+     * had not yet entered its {@code synchronized} block ended up on a different monitor from a
+     * thread that minted a fresh one afterwards -- two monitors for one path. That never produced
+     * wrong bytes (the key is content-addressed, the write is an atomic rename, and every hit
+     * re-verifies length and CRC32C against the manifest), but it did quietly break the headline
+     * property this class advertises and tests: "N concurrent readers of the same entry cause one
+     * fetch". Under eviction pressure they could become N fetches. The map only ever existed so it
+     * could be pruned; striping removes the need to prune at all, and with it the defect, at the
+     * cost of unrelated paths occasionally sharing a monitor -- which is merely a little contention,
+     * never a correctness or single-flight problem.
+     */
+    private static final int LOCK_STRIPES = 64;
+    private final Object[] lockStripes = newLockStripes();
+
+    private static Object[] newLockStripes() {
+        Object[] stripes = new Object[LOCK_STRIPES];
+        for (int i = 0; i < LOCK_STRIPES; i++) {
+            stripes[i] = new Object();
+        }
+        return stripes;
+    }
+
     private final AtomicLong hitCount = new AtomicLong();
     private final AtomicLong missCount = new AtomicLong();
     // Total wall-clock nanos spent in the delegate.readFile call below, across every miss --
@@ -219,12 +242,14 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     @Override
     public byte[] readFile(String bundleName, BundleFileEntry entry) throws IOException {
         Path cachedPath = cachePathFor(bundleName, entry);
+        byte[] result;
+        long netBytesLanded;
         synchronized (lockFor(cachedPath)) {
             boolean existedBefore = Files.exists(cachedPath);
             if (existedBefore) {
                 byte[] cached = null;
                 try {
-                    cached = decryptIfNeeded(Files.readAllBytes(cachedPath));
+                    cached = decryptCacheEntry(Files.readAllBytes(cachedPath), bundleName, entry);
                 } catch (IOException e) {
                     // A cache entry that fails to decrypt (corrupted/truncated on disk, or a
                     // leftover plaintext file from before encryption was enabled) is exactly as
@@ -256,7 +281,7 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
             long start = System.nanoTime();
             byte[] fresh = delegate.readFile(bundleName, entry);
             coldReadNanos.addAndGet(System.nanoTime() - start);
-            byte[] onDisk = encryptIfNeeded(fresh);
+            byte[] onDisk = encryptIfNeeded(fresh, associatedDataFor(bundleName, entry));
             // existedBefore here means this write is REPLACING a corrupted/checksum-mismatched
             // entry (see the fall-through just above), not creating a brand-new one -- net out the
             // old on-disk size so neither counter double-counts the same path's bytes. Measured
@@ -269,14 +294,44 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
             }
             writeAtomically(cachedPath, onDisk);
             maybeEvict();
-            if (spaceGovernor != null) {
-                // Reported after this shard's own eviction has had its turn, so a write that both
-                // shards can absorb locally never provokes a node-wide walk: whatever the local
-                // sweep just reclaimed has already been subtracted via recordBytesRemoved below.
-                spaceGovernor.recordBytesAdded(onDisk.length - oldSizeOnDisk);
-            }
-            return fresh;
+            netBytesLanded = onDisk.length - oldSizeOnDisk;
+            result = fresh;
         }
+        if (spaceGovernor != null) {
+            // Reported after this shard's own eviction has had its turn, so a write that both
+            // shards can absorb locally never provokes a node-wide walk: whatever the local
+            // sweep just reclaimed has already been subtracted via recordBytesRemoved.
+            //
+            // Deliberately OUTSIDE the per-key monitor above. recordBytesAdded can decide the
+            // node-wide tree is over budget and, before this change, would then run its whole
+            // Files.walk-plus-stat-per-file sweep synchronously while this thread still held this
+            // cache key's lock -- so every other reader of this same file blocked behind a walk of
+            // a cache that can hold a million entries. The governor now hands that sweep to its own
+            // executor (see DiskCacheSpaceGovernor), and this call site no longer holds a lock
+            // across it either; the two fixes are independent and both are needed.
+            spaceGovernor.recordBytesAdded(netBytesLanded);
+        }
+        return result;
+    }
+
+    /**
+     * Streams straight past this disk cache to the delegate, caching nothing.
+     *
+     * <p>This method exists for files that cannot be held in a {@code byte[]} at all (see {@link
+     * BundleFileReader#openFile}) -- and every path in this class, from {@code Files.readAllBytes}
+     * through {@code encryptIfNeeded} to {@code writeAtomically}, is {@code byte[]}-typed. Trying
+     * to cache such a file here would fail with the very {@code Integer.MAX_VALUE} ceiling the
+     * streaming path was added to escape, so the honest behaviour is to not try. The files this
+     * concerns are single Lucene files above 2&nbsp;GiB, which are by construction the least
+     * cache-worthy things a shard has: one of them alone would evict an entire shard's working set.
+     *
+     * @param bundleName the name of the bundle blob containing the file.
+     * @param entry the file's location and length within that bundle.
+     * @return a stream over exactly this file's bytes; the caller closes it.
+     */
+    @Override
+    public java.io.InputStream openFile(String bundleName, BundleFileEntry entry) throws IOException {
+        return delegate.openFile(bundleName, entry);
     }
 
     /** {@code 0} if {@code path} vanished between the caller observing it and this call -- nothing to net out either way. */
@@ -371,7 +426,10 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                     // directory genuinely still needs.
                     actualSizeBeingDeleted = Files.exists(entry.path) ? Files.size(entry.path) : 0L;
                     Files.deleteIfExists(entry.path);
-                    locksByKey.remove(entry.path.toString());
+                    // Nothing to unregister any more: the stripe array is fixed for this store's
+                    // lifetime, so there is no per-path lock object to prune -- which is exactly
+                    // what removes the two-monitors-for-one-path window the map form had. See
+                    // lockStripes' own comment.
                 }
                 totalBytes -= entry.sizeBytes;
                 currentTotalBytes.addAndGet(-actualSizeBeingDeleted);
@@ -431,12 +489,59 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     private record CacheEntry(Path path, long sizeBytes, FileTime lastModifiedTime) {
     }
 
-    private byte[] encryptIfNeeded(byte[] plaintext) throws IOException {
-        return encryptionKeyProvider == null ? plaintext : AesGcmCipher.encrypt(plaintext, encryptionKeyProvider.currentKey());
+    /**
+     * The identity a cache entry's ciphertext is cryptographically bound to.
+     *
+     * <p>Without this, an encrypted cache file is <em>substitutable</em>: the AES-GCM tag proves the
+     * bytes were produced by this node's key and have not been altered, but says nothing about
+     * <em>which file</em> they are. Anyone able to move or rename a file inside the cache directory
+     * -- the same local-disk access the cache already assumes -- could serve one file's contents
+     * under another file's key, and every layer above would accept it, because the only other check
+     * is the CRC32C that is read out of the same substituted bytes. Passing the file's identity as
+     * AES-GCM associated data makes the decryption itself fail on a substitution, which is the point
+     * at which it can still be turned into a clean re-fetch.
+     *
+     * <p>The three fields are exactly the ones {@link #cachePathFor} already uses to name the entry,
+     * minus the checksum, which the caller re-verifies separately. The {@code LDCv1} prefix is a
+     * format marker: if this binding ever has to change, bumping it makes every existing entry fail
+     * to decrypt and therefore silently re-fetch, which is the correct and cheapest upgrade path for
+     * a cache -- there is nothing here that is not reconstructible from the object store.
+     */
+    private static byte[] associatedDataFor(String bundleName, BundleFileEntry entry) {
+        return ("LDCv1|" + bundleName + "|" + entry.offset() + "|" + entry.length()).getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }
 
-    private byte[] decryptIfNeeded(byte[] bytes) throws IOException {
-        return encryptionKeyProvider == null ? bytes : AesGcmCipher.decrypt(bytes, encryptionKeyProvider.currentKey());
+    private byte[] encryptIfNeeded(byte[] plaintext, byte[] associatedData) throws IOException {
+        return encryptionKeyProvider == null
+            ? plaintext
+            : AesGcmCipher.encrypt(plaintext, encryptionKeyProvider.currentKey(), associatedData);
+    }
+
+    /**
+     * Decrypts a cache entry, accepting both the bound form this class now writes and the unbound
+     * form written before the binding existed.
+     *
+     * <p>The fallback is deliberate and is why this change needs no migration step. An entry written
+     * by an earlier build carries no associated data, so the bound decrypt fails its tag check on
+     * it; retrying without associated data keeps every already-warm cache directory usable across an
+     * upgrade instead of forcing a node to re-fetch its entire working set on first start. The
+     * fallback is not a weakening of the new guarantee: an unbound entry is exactly as trustworthy as
+     * it was before this change, and every entry this build writes -- including the re-write of any
+     * entry that fails its checksum -- is bound. A deployment that wants the property to hold
+     * unconditionally can delete the cache directory, which costs only re-fetches.
+     */
+    private byte[] decryptCacheEntry(byte[] bytes, String bundleName, BundleFileEntry entry) throws IOException {
+        if (encryptionKeyProvider == null) {
+            return bytes;
+        }
+        try {
+            return AesGcmCipher.decrypt(bytes, encryptionKeyProvider.currentKey(), associatedDataFor(bundleName, entry));
+        } catch (IOException notBoundOrNotOurs) {
+            // Pre-binding entry, or a genuine substitution/corruption. Either way the unbound decrypt
+            // decides: it succeeds for the former and fails for the latter, and a failure here is
+            // caught by readFile and turned into a clean re-fetch.
+            return AesGcmCipher.decrypt(bytes, encryptionKeyProvider.currentKey());
+        }
     }
 
     /** Number of reads served from the local disk cache. */
@@ -470,7 +575,12 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     }
 
     private Object lockFor(Path cachedPath) {
-        return locksByKey.computeIfAbsent(cachedPath.toString(), p -> new Object());
+        // Same spreading trick HashMap/ConcurrentHashMap use on hashCode(): cache path names differ
+        // only in a long, mostly-common prefix, so without it their low bits alias onto the same
+        // stripe far more often than chance would predict.
+        int h = cachedPath.toString().hashCode();
+        h ^= (h >>> 16);
+        return lockStripes[(h & 0x7fffffff) % LOCK_STRIPES];
     }
 
     private void writeAtomically(Path cachedPath, byte[] bytes) throws IOException {

@@ -60,6 +60,30 @@ public final class CompactionRebaseExecutor {
      * @throws IOException if reading the shard's live head or manifest fails
      */
     public RebaseResult publish(String indexUuid, int shardId, CompactionPublisher publisher) throws IOException {
+        try {
+            return publishAndRetry(indexUuid, shardId, publisher);
+        } finally {
+            // A publisher that holds resources across the retry loop -- LuceneMergeCompactionPublisher
+            // keeps a temporary filesystem directory holding a whole shard's merged segments, so it
+            // can reuse the merge when a retry's source manifest turns out to be unchanged -- is
+            // released here rather than by each of this method's callers. Closing it is meaningless
+            // before the loop ends (that is precisely the window the cache exists for) and every
+            // caller would otherwise have to remember to do it; one of them not remembering leaves a
+            // shard-sized directory on disk. Idempotent, so a caller that also closes is fine.
+            if (publisher instanceof AutoCloseable) {
+                try {
+                    ((AutoCloseable) publisher).close();
+                } catch (Exception closeFailure) {
+                    throw new IOException(
+                        "failed to release compaction publisher resources for " + indexUuid + "/" + shardId,
+                        closeFailure
+                    );
+                }
+            }
+        }
+    }
+
+    private RebaseResult publishAndRetry(String indexUuid, int shardId, CompactionPublisher publisher) throws IOException {
         int attempts = 0;
         while (attempts < maxAttempts) {
             attempts++;

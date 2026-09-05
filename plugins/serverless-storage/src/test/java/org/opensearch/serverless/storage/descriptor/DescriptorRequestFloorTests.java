@@ -116,8 +116,23 @@ public class DescriptorRequestFloorTests extends OpenSearchTestCase {
 
         logger.info("reads over 10s of traffic across {} tenants: {} at a 1s window, {} at 5s", TENANTS, atOneSecond, atFiveSeconds);
 
-        assertEquals("ten one-second windows, one read per tenant per window", 10L * TENANTS, atOneSecond);
-        assertEquals("two five-second windows", 2L * TENANTS, atFiveSeconds);
+        // Bounded rather than exact, and the reason is a deliberate change rather than flakiness.
+        //
+        // The freshness window is jittered per name, by up to ten percent and only downwards, so that a
+        // node which warmed T tenants in one burst does not re-read all T of them in the same tick a window
+        // later. That mitigation existed and was applied only to the non-blocking peek -- not to this path,
+        // which is the one that issues the read -- so it mitigated nothing; applying it here is the fix.
+        //
+        // The consequence for this test is that "one read per tenant per window" is now "one read per
+        // tenant per 0.9-to-1.0 windows", so the exact equalities it used to assert are no longer the
+        // property. The property is unchanged in what it is defending: reads fall in proportion to the
+        // window, and the count is set by the window and the population rather than by the traffic.
+        assertTrue(
+            "about ten one-second windows, one read per tenant per window: " + atOneSecond,
+            atOneSecond >= 10L * TENANTS && atOneSecond <= 12L * TENANTS
+        );
+        assertTrue("about two five-second windows: " + atFiveSeconds, atFiveSeconds >= 2L * TENANTS && atFiveSeconds <= 3L * TENANTS);
+        assertTrue("a five second window must cost far fewer reads than a one second one", atFiveSeconds * 3 < atOneSecond);
     }
 
     /**
@@ -133,7 +148,18 @@ public class DescriptorRequestFloorTests extends OpenSearchTestCase {
         long atLowRate = loadsOverSpan(window, tenSeconds, TimeUnit.SECONDS.toNanos(1));
         long atHighRate = loadsOverSpan(window, tenSeconds, TimeUnit.MILLISECONDS.toNanos(100));
 
-        assertEquals("ten times the requests, identical store reads", atLowRate, atHighRate);
+        logger.info("reads over 10s: {} at one request per second, {} at ten", atLowRate, atHighRate);
+
+        // Ten times the requests, within a tenth of the store reads -- not identical, since the window is
+        // now jittered down by up to ten percent per name and a coarse request rate cannot observe a window
+        // shorter than its own interval. The claim being defended is unchanged: the cost is set by the
+        // window and the population, and an order of magnitude more traffic does not move it by an order of
+        // magnitude, or by anything close to one. See testTheWindowIsTheLever for why the jitter is there.
+        assertTrue("more traffic must not cost fewer reads: " + atLowRate + " vs " + atHighRate, atHighRate >= atLowRate);
+        assertTrue(
+            "ten times the requests must stay within a tenth of the reads: " + atLowRate + " vs " + atHighRate,
+            atHighRate * 10 <= atLowRate * 12
+        );
     }
 
     /** The shipped default is a minute, not the cache's own one second. */

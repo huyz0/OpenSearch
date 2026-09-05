@@ -84,10 +84,17 @@ public class ScaleUpCandidatesResponse extends BaseNodesResponse<NodeScaleUpCand
         Metadata metadata
     ) {
         Map<String, Long> highestQpmByShard = new LinkedHashMap<>();
+        // Idleness folds with min for the same reason it does in the scale-to-zero merge: a shard is
+        // being queried if ANY copy of it is being queried, so the most-recently-queried report is
+        // the authoritative one.
+        Map<String, Long> lowestIdleByShard = new LinkedHashMap<>();
         for (NodeScaleUpCandidatesResponse node : nodes) {
             for (ShardQueryRateEntry entry : node.queryRates()) {
                 String key = key(entry.indexUuid(), entry.shardId());
                 highestQpmByShard.merge(key, entry.queriesPerMinute(), Math::max);
+                if (entry.millisSinceLastQuery() != ShardQueryRateEntry.UNKNOWN_IDLE) {
+                    lowestIdleByShard.merge(key, entry.millisSinceLastQuery(), Math::min);
+                }
             }
         }
 
@@ -112,14 +119,49 @@ public class ScaleUpCandidatesResponse extends BaseNodesResponse<NodeScaleUpCand
             }
             String indexName = indexMetadata.getIndex().getName();
             int currentSearchReplicaCount = indexMetadata.getNumberOfSearchOnlyReplicas();
-            boolean candidate = queriesPerMinute > qpmThreshold && currentSearchReplicaCount < maxSearchReplicas;
+            // Findings S-1 and S-3. The predicate used to be `rate > threshold && replicas < max`
+            // and nothing else, which meant a shard whose traffic had stopped an hour ago was still
+            // a candidate on every tick -- because queriesPerMinute() freezes at the last busy
+            // window's value when there is no next query to roll the window over. The result was a
+            // ratchet to max_search_replicas *after* the load ended, with no path back down, and a
+            // shard that scale-to-zero was concurrently suspending for idleness.
+            //
+            // Requiring the shard to have been queried within the rate window makes the two loops
+            // agree: past the window, the rate is stale by construction and is not evidence of
+            // anything. UNKNOWN_IDLE (no node reported idleness) keeps the old rate-only behaviour,
+            // so a node that cannot supply the signal degrades to the previous semantics rather than
+            // silently disabling scale-up.
+            Long idleMillis = lowestIdleByShard.get(entry.getKey());
+            boolean recentlyQueried = idleMillis == null || idleMillis < QUERY_RATE_WINDOW_MILLIS;
+            boolean candidate = queriesPerMinute > qpmThreshold && recentlyQueried && currentSearchReplicaCount < maxSearchReplicas;
             result.add(new ScaleUpCandidateEntry(indexUuid, shardId, indexName, queriesPerMinute, currentSearchReplicaCount, candidate));
         }
         return result;
     }
 
+    /**
+     * The width of {@code ObjectStoreReaderEngine}'s query-rate window. Duplicated here as a constant
+     * rather than read from the engine because this merge runs on the cluster-manager, which has no
+     * engine to ask; it must stay in step with {@code ObjectStoreReaderEngine.QUERY_RATE_WINDOW_MILLIS}.
+     */
+    static final long QUERY_RATE_WINDOW_MILLIS = 60_000L;
+
     private static String key(String indexUuid, int shardId) {
         return indexUuid + "/" + shardId;
+    }
+
+    /**
+     * Whether any node failed to answer this fan-out.
+     *
+     * <p><b>Finding S-5.</b> {@code merge} never read the {@code failures} list, so if the node
+     * hosting the busiest reader copy failed to answer, the merged view simply reported whatever the
+     * survivors said -- and the REST endpoint showed that partial picture with no indication it was
+     * partial. Safe in the expansion direction (a missing node can only lower the observed rate), but
+     * an operator, and the expansion coordinator, both need to be able to tell "quiet" from "we did
+     * not hear from the node that was busy".
+     */
+    public boolean hasNodeFailures() {
+        return failures().isEmpty() == false;
     }
 
     /** Every reader shard observed anywhere in the cluster, merged and evaluated against this plugin's thresholds. */
@@ -150,7 +192,14 @@ public class ScaleUpCandidatesResponse extends BaseNodesResponse<NodeScaleUpCand
      */
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-        builder.startObject().startArray("shards");
+        builder.startObject();
+        builder.field("partial", hasNodeFailures());
+        builder.startArray("failed_nodes");
+        for (FailedNodeException failure : failures()) {
+            builder.startObject().field("node_id", failure.nodeId()).field("reason", failure.getMessage()).endObject();
+        }
+        builder.endArray();
+        builder.startArray("shards");
         for (ScaleUpCandidateEntry entry : candidates) {
             entry.toXContent(builder, params);
         }

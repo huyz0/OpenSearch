@@ -27,9 +27,11 @@ import java.util.Map;
  * request-cost profiles remain ungated" gap, the PITR half: pins down {@link PitrRetentionReconciler#reconcile}'s
  * real request cost as a function of how many pins actually change, not of how many manifests it
  * was handed -- the same "regardless of N" shape {@code CostAccountingRegressionTests} already
- * established for compaction's PUT cost, adapted to this class's own GET+PUT-per-pin-change shape
- * ({@link BlobContainerDurablePinRegistry#addPin}/{@link BlobContainerDurablePinRegistry#removePin}
- * are each an independent read-modify-CAS cycle, not batched into one register write).
+ * established for compaction's PUT cost, adapted to this class's own shape: the whole diff is applied as a
+ * single read-modify-CAS ({@link org.opensearch.serverless.storage.retention.DurablePinRegistry#applyPinDiff}),
+ * so the cost is one read and one write per reconcile rather than one of each per pin changed. It used to be
+ * per pin, which at a realistic window size meant re-reading and re-writing a register holding thousands of
+ * records a hundred times a tick, per shard.
  */
 public class PitrRetentionReconcilerCostAccountingTests extends OpenSearchTestCase {
 
@@ -53,7 +55,7 @@ public class PitrRetentionReconcilerCostAccountingTests extends OpenSearchTestCa
         );
     }
 
-    public void testFirstReconcileOverManyManifestsCostsExactlyOneGetPlusOneGetPutPairPerPinAdded() throws Exception {
+    public void testFirstReconcileOverManyManifestsCostsOneReadAndOneWriteNoMatterHowManyPinsItAdds() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer uncountedContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
         ObjectStoreRequestCounter counter = new ObjectStoreRequestCounter();
@@ -74,24 +76,21 @@ public class PitrRetentionReconcilerCostAccountingTests extends OpenSearchTestCa
 
         assertEquals(manifestCount, result.added());
         assertEquals(0, result.removed());
-        // 1 initial getPins() read, plus one more GET per pin added (BlobContainerDurablePinRegistry#addPin's
-        // own read-before-CAS) -- see this class's own javadoc for why each addition isn't batched.
+        // The whole diff is one read-modify-CAS now, not one per pin. That matters at the size this actually
+        // reaches: a 24-hour window at a 30-second publication cadence is thousands of records in a single
+        // register, and the sliding window adds and removes dozens per tick -- each of which used to re-read
+        // and re-write every pin on the shard, and each of which was another chance to lose the CAS race
+        // against a concurrent snapshot or clone and exhaust the 50-attempt bound.
         assertEquals(
             "reconciling "
                 + manifestCount
-                + " new pins must cost exactly 1 (initial read) + "
-                + manifestCount
-                + " (one read per addPin) GETs -- got "
-                + counter.getCount()
-                + ", a change likely altered how many reads each pin change costs",
-            1L + manifestCount,
+                + " new pins must cost 1 (initial read) + 1 (the batched mutate's own read) GETs regardless of "
+                + "how many pins the diff contains -- got "
+                + counter.getCount(),
+            2L,
             counter.getCount()
         );
-        assertEquals(
-            "reconciling " + manifestCount + " new pins must cost exactly " + manifestCount + " PUTs (one CAS per addPin)",
-            (long) manifestCount,
-            counter.putCount()
-        );
+        assertEquals("and exactly one CAS write for the whole diff", 1L, counter.putCount());
     }
 
     public void testReconcilingWithNoChangeCostsOnlyTheInitialRead() throws Exception {

@@ -65,6 +65,20 @@ public final class MappingIndexWatcher implements ClusterStateListener, BooleanS
 
     @Override
     public void clusterChanged(ClusterChangedEvent event) {
+        // A second observation, taken here rather than from a listener of its own.
+        //
+        // DescriptorBackedIndexLifecycle.recordChange runs on every node applying a cluster state diff, and
+        // until it could tell a manager from a follower it wrote the same descriptor blob from all of them
+        // -- N nodes compare-and-swapping one key for one metadata change. Deciding that needs one boolean
+        // off a cluster state, and this listener is already registered on precisely the same condition the
+        // descriptor plane is (see ServerlessStoragePlugin's install block, where the two are adjacent), so
+        // it is the observation point that costs nothing to keep in step. A dedicated listener would be a
+        // second registration, a second lifetime, and a second thing to forget to add.
+        //
+        // Deliberately unconditional and first: the mapping-index question below returns early in the
+        // common case, and a flag that stopped being updated whenever the mapping index was absent would be
+        // stale in exactly the cluster that has no gated mappings yet.
+        DescriptorGate.observeElectedClusterManager(event.state().nodes().isLocalNodeElectedClusterManager());
         var metadata = event.state().metadata().index(IndexBackedMappingStore.MAPPING_INDEX);
         if (metadata == null) {
             if (seenUuid.get() != null) {

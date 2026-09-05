@@ -276,7 +276,8 @@ public class CostAccountingRegressionTests extends OpenSearchTestCase {
             manifestStore,
             new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(countingContainer)),
             commitPublisher,
-            CompactionPolicy.withDefaults()
+            CompactionPolicy.withDefaults(),
+            createTempDir()
         );
         CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
 
