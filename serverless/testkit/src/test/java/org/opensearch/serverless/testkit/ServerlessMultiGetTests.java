@@ -1,0 +1,295 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.serverless.testkit;
+
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.test.OpenSearchTestCase;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * {@code _mget} — many documents, one request.
+ *
+ * <p>A multi-get is worth having over a loop the caller writes for two reasons, and the tests are built
+ * around both. The documents go out concurrently, so the cost is the slowest of them rather than the sum;
+ * and each item answers for itself, so a document that does not exist is {@code "found": false} beside the
+ * ones that do rather than an error that loses them.
+ *
+ * <p>What must not happen is an item quietly disappearing, so every fixture here asks for more documents
+ * than exist and asserts the answer has one entry per request, in order.
+ *
+ * <p><b>D5:</b> {@code FsBlobContainer} only.
+ */
+public class ServerlessMultiGetTests extends OpenSearchTestCase {
+
+    private static final long TTL = 30_000L;
+    private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
+    private static final String WIDE_MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},"
+        + "\"tag\":{\"type\":\"keyword\"},\"big\":{\"type\":\"keyword\"}}}";
+
+    private Settings nodeSettings(String name) {
+        return Settings.builder()
+            .put("node.name", name)
+            .put("cluster.name", "serverless-mget")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", "ingest")
+            .build();
+    }
+
+    /** Documents from several shards, and one that is not there, all in one answer. */
+    public void testAMultiGetAnswersForEveryDocumentAsked() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 3, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-basic"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 3, "alpha");
+
+            for (int i = 1; i <= 5; i++) {
+                assertEquals(201, send(node, "PUT", "/alpha/_doc/d" + i + "?refresh=true", "{\"msg\":\"doc" + i + "\"}").status());
+            }
+            assertTrue("the documents must actually spread across shards", node.reconciler().openShards().size() > 1);
+
+            final Response got = send(node, "POST", "/alpha/_mget", "{\"ids\":[\"d1\",\"missing\",\"d5\",\"d3\"]}");
+            assertEquals(got.body(), 200, got.status());
+
+            // One entry per request, in the order asked. An item that vanished would be the failure this
+            // whole shape exists to prevent.
+            assertEquals("four asked for, four answered: " + got.body(), List.of("d1", "missing", "d5", "d3"), idsIn(got.body()));
+            assertEquals("and found where they exist: " + got.body(), List.of(true, false, true, true), foundIn(got.body()));
+            assertTrue("with their sources: " + got.body(), got.body().contains("\"msg\":\"doc5\""));
+            assertFalse("and nothing invented for the one that is absent", got.body().contains("\"msg\":\"missing\""));
+        }
+    }
+
+    /** Documents from different indices in one request, each naming its own. */
+    public void testAMultiGetSpansIndices() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("left", "uuid-left-0000000000", 1, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("right", "uuid-right-000000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-indices"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "left", "right");
+
+            assertEquals(201, send(node, "PUT", "/left/_doc/1?refresh=true", "{\"msg\":\"on the left\"}").status());
+            assertEquals(201, send(node, "PUT", "/right/_doc/1?refresh=true", "{\"msg\":\"on the right\"}").status());
+
+            final Response got = send(
+                node,
+                "POST",
+                "/_mget",
+                "{\"docs\":[{\"_index\":\"left\",\"_id\":\"1\"},{\"_index\":\"right\",\"_id\":\"1\"}]}"
+            );
+            assertEquals(got.body(), 200, got.status());
+            assertTrue("both documents, from their own indices: " + got.body(), got.body().contains("on the left"));
+            assertTrue(got.body().contains("on the right"));
+            assertEquals(List.of("left", "right"), indicesIn(got.body()));
+        }
+    }
+
+    /**
+     * An item naming an index that does not exist fails as an item, not as the request.
+     *
+     * <p>The distinction a multi-get exists for: one bad entry must not lose the answers to the good ones.
+     */
+    public void testABadItemDoesNotLoseTheGoodOnes() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-partial"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "alpha");
+            assertEquals(201, send(node, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"survivor\"}").status());
+
+            final Response got = send(
+                node,
+                "POST",
+                "/_mget",
+                "{\"docs\":[{\"_index\":\"alpha\",\"_id\":\"1\"},{\"_index\":\"nowhere\",\"_id\":\"1\"}]}"
+            );
+            assertEquals("the request itself succeeds: " + got.body(), 200, got.status());
+            assertTrue("the good document comes back: " + got.body(), got.body().contains("survivor"));
+            assertTrue("and the bad one says why: " + got.body(), got.body().contains("index_not_found"));
+            // Not "found: false" -- an index that does not exist is a different answer from a document
+            // that is not in one, and collapsing them would tell a caller their data was deleted.
+            assertEquals("two asked for, two answered", 2, idsIn(got.body()).size());
+        }
+    }
+
+    /** A body that names nothing is refused rather than answered emptily. */
+    public void testAnEmptyOrMalformedRequestIsRefused() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-refuse"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "alpha");
+
+            assertEquals("no body at all", 400, send(node, "POST", "/alpha/_mget", null).status());
+            assertEquals("a body naming nothing", 400, send(node, "POST", "/alpha/_mget", "{\"docs\":[]}").status());
+            assertEquals("neither docs nor ids", 400, send(node, "POST", "/alpha/_mget", "{\"documents\":[]}").status());
+            // A bare id list needs somewhere to look, and the path is the only place that can say.
+            final Response noIndex = send(node, "POST", "/_mget", "{\"ids\":[\"1\"]}");
+            assertEquals(400, noIndex.status());
+            assertTrue("and says what is missing: " + noIndex.body(), noIndex.body().contains("index in the request path"));
+        }
+    }
+
+    private MetadataPlane plane(AtomicLong clock) throws java.io.IOException {
+        return new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+    }
+
+    private void hold(ServerlessNode node, MetadataPlane plane, AtomicLong clock, int shards, String... indices) throws Exception {
+        final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+        for (String index : indices) {
+            for (int shard = 0; shard < shards; shard++) {
+                loop.want(index, shard);
+            }
+        }
+        loop.tick(clock.get());
+    }
+
+    private static final Pattern ID = Pattern.compile("\"_id\":\"([^\"]+)\"");
+    private static final Pattern INDEX = Pattern.compile("\"_index\":\"([^\"]+)\"");
+    private static final Pattern FOUND = Pattern.compile("\"found\":(true|false)");
+
+    private static List<String> idsIn(String body) {
+        return all(ID, body);
+    }
+
+    private static List<String> indicesIn(String body) {
+        return all(INDEX, body);
+    }
+
+    private static List<Boolean> foundIn(String body) {
+        final List<Boolean> found = new ArrayList<>();
+        for (String value : all(FOUND, body)) {
+            found.add(Boolean.parseBoolean(value));
+        }
+        return found;
+    }
+
+    private static List<String> all(Pattern pattern, String body) {
+        final List<String> values = new ArrayList<>();
+        final Matcher matcher = pattern.matcher(body);
+        while (matcher.find()) {
+            values.add(matcher.group(1));
+        }
+        return values;
+    }
+
+    /**
+     * A get and a multi-get return only the fields asked for.
+     *
+     * <p><b>It shapes the response and does not make the read cheaper</b>, which is worth asserting
+     * alongside because the two are easy to conflate. The document is fetched whole either way — a get is
+     * answered by the shard's owner and, when forwarded, the whole source has already crossed the internal
+     * network before any of this runs. What the caller stops paying for is the bytes back to them.
+     *
+     * <p>A search is the other way round: filtering there happens inside the shard's fetch phase, before a
+     * hit is ever returned, so it saves the transfer too.
+     */
+    public void testSourceFilteringOnAGetAndAMultiGet() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("shaped", "uuid-shaped-0000000", 1, WIDE_MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-source"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, 1, "shaped");
+            assertEquals(
+                201,
+                send(node, "PUT", "/shaped/_doc/1?refresh=true", "{\"msg\":\"body\",\"tag\":\"t\",\"big\":\"padding\"}").status()
+            );
+
+            final Response whole = send(node, "GET", "/shaped/_doc/1", null);
+            assertTrue("everything by default: " + whole.body(), whole.body().contains("\"big\""));
+
+            final Response none = send(node, "GET", "/shaped/_doc/1?_source=false", null);
+            assertTrue("the document is still found: " + none.body(), none.body().contains("\"found\":true"));
+            assertFalse("and carries no source at all: " + none.body(), none.body().contains("_source"));
+
+            final Response some = send(node, "GET", "/shaped/_doc/1?_source=msg", null);
+            assertTrue("the field asked for: " + some.body(), some.body().contains("\"msg\":\"body\""));
+            assertFalse("and not the others: " + some.body(), some.body().contains("\"big\""));
+
+            final Response excluded = send(node, "GET", "/shaped/_doc/1?_source_excludes=big", null);
+            assertTrue("what was not excluded stays: " + excluded.body(), excluded.body().contains("\"tag\""));
+            assertFalse("and what was excluded goes: " + excluded.body(), excluded.body().contains("\"big\""));
+
+            // Per document, which is the reason a multi-get takes objects rather than ids: one request can
+            // want the body of one document and only a field of another.
+            assertEquals(
+                201,
+                send(node, "PUT", "/shaped/_doc/2?refresh=true", "{\"msg\":\"other\",\"tag\":\"u\",\"big\":\"padding\"}").status()
+            );
+            final Response mixed = send(
+                node,
+                "POST",
+                "/_mget",
+                "{\"docs\":[{\"_index\":\"shaped\",\"_id\":\"1\",\"_source\":[\"msg\"]},"
+                    + "{\"_index\":\"shaped\",\"_id\":\"2\",\"_source\":false}]}"
+            );
+            assertEquals(mixed.body(), 200, mixed.status());
+            assertTrue("the first document's chosen field: " + mixed.body(), mixed.body().contains("\"msg\":\"body\""));
+            assertFalse("and not its other fields: " + mixed.body(), mixed.body().contains("padding"));
+            assertFalse("and nothing at all from the second: " + mixed.body(), mixed.body().contains("\"msg\":\"other\""));
+            assertEquals("both still answered for", 2, idsIn(mixed.body()).size());
+        }
+    }
+
+    private record Response(int status, String body) {
+    }
+
+    private static Response send(ServerlessNode node, String method, String path, String body) throws Exception {
+        final var address = node.boundHttpAddress().publishAddress();
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
+            final HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + path))
+                .timeout(Duration.ofSeconds(60))
+                .header("Content-Type", "application/json")
+                .method(
+                    method,
+                    body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)
+                )
+                .build();
+            final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            return new Response(response.statusCode(), response.body());
+        }
+    }
+}

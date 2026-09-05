@@ -117,6 +117,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -127,6 +128,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
 import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
@@ -986,6 +988,25 @@ public abstract class Engine implements LifecycleAware, Closeable {
         return null;
     }
 
+    /**
+     * Additional operations, beyond local translog, this engine needs replayed to reconstruct its
+     * state -- called by {@code IndexShard#openEngineAndRecoverFromTranslog()} once local translog
+     * recovery has completed, through the same {@code applyTranslogOperation} path (so mapping
+     * updates and version/seqno bookkeeping are handled identically to local translog recovery),
+     * before the shard proceeds toward being started. Empty by default: an engine whose durability
+     * is entirely local translog (every {@code InternalEngine} today) has nothing extra to supply.
+     * An engine backed by a durability mechanism beyond local disk (e.g. a write-ahead log mirrored
+     * to remote storage) overrides this to return whatever operations were durably written but not
+     * yet reflected in this shard's local state. A real override carries a subtle correctness
+     * obligation: replayed operations must be fenced against a competing writer that has taken over
+     * the shard since the operations were written, or a naive implementation reintroduces a
+     * lost-write bug. The plugin supplying such an engine keeps a formal model of that fencing
+     * argument alongside its implementation.
+     */
+    public List<Translog.Operation> engineRecoveryOperations() {
+        return List.of();
+    }
+
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
         TranslogDeletionPolicy customTranslogDeletionPolicy = null;
         if (engineConfig.getCustomTranslogDeletionPolicyFactory() != null) {
@@ -1000,6 +1021,26 @@ public abstract class Engine implements LifecycleAware, Closeable {
                 engineConfig.getIndexSettings().getTranslogRetentionTotalFiles()
             )
         );
+    }
+
+    /**
+     * The floor {@link CombinedDeletionPolicy} uses to decide which local Lucene commits are safe
+     * to delete: a commit whose max seq-no is at or below this value is eligible for deletion.
+     * Defaults to the translog's own last-synced global checkpoint -- unchanged from every
+     * engine's behavior before this method existed, since that is exactly what {@link
+     * InternalEngine} always passed directly before this hook was introduced.
+     *
+     * <p>Overriding this is for an engine whose durability model does not depend on the classic
+     * global-checkpoint/retention-lease chain (for example, one that treats an independent,
+     * already-durable remote store as authoritative and can safely retain less locally than a
+     * replica-recovery-oriented global checkpoint alone would justify). Widening the returned
+     * value only ever permits deleting <em>more</em> than the default would -- it can never keep a
+     * commit that core's own logic would otherwise have deleted, since {@link
+     * CombinedDeletionPolicy} always uses this value as a pure "safe to delete at or below"
+     * threshold, never as a floor that suppresses deletion.
+     */
+    protected LongSupplier globalCheckpointSupplierForCombinedDeletionPolicy(TranslogManager translogManagerRef) {
+        return translogManagerRef::getLastSyncedGlobalCheckpoint;
     }
 
     protected void fillSegmentStats(SegmentReader segmentReader, boolean includeSegmentFileSizes, SegmentsStats stats) {

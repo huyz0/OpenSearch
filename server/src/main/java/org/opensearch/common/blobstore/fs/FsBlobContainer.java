@@ -38,6 +38,8 @@ import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobVersionConflictException;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.VersionedBlob;
@@ -45,12 +47,17 @@ import org.opensearch.common.blobstore.support.AbstractBlobContainer;
 import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.common.io.Streams;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
@@ -67,8 +74,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static java.util.Collections.unmodifiableMap;
 
@@ -88,6 +97,34 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     protected final FsBlobStore blobStore;
     protected final Path path;
+
+    // Guards readRegister/compareAndSwapRegister: FileChannel#lock() is documented as
+    // inter-process only, and a second overlapping lock() from a different FileChannel in the
+    // *same* JVM throws OverlappingFileLockException rather than blocking, so real intra-process
+    // mutual exclusion has to come from here, not from the filesystem.
+    //
+    // Static, and keyed by the resolved register path rather than by blob name, because the unit of
+    // exclusion is the file and not the container that reached it. As a per-instance field keyed by
+    // name this arbitrated nothing between two containers over the same directory: both read the
+    // same generation, both passed the equality check, both wrote, and the second silently won.
+    // Internal cluster tests give every node its own container, so that is the normal case rather
+    // than an exotic one, and a test asserting one winner among concurrent CAS callers would have
+    // been asserting nothing.
+    //
+    // A fixed stripe table rather than a per-path map: a map entry per register path lives for the
+    // JVM's lifetime, which is an unbounded leak on a workload with many registers. Striping is
+    // bounded by construction and still correct, because a given path always hashes to the same
+    // stripe -- two callers on the same file always contend on the same lock. The only cost is
+    // over-exclusion: two different files that share a stripe serialize needlessly, which affects
+    // throughput, never correctness, and each register operation holds exactly one stripe at a time
+    // so no lock-ordering deadlock is possible.
+    private static final int REGISTER_LOCK_STRIPE_COUNT = 64;
+    private static final ReentrantLock[] REGISTER_LOCK_STRIPES = new ReentrantLock[REGISTER_LOCK_STRIPE_COUNT];
+    static {
+        for (int i = 0; i < REGISTER_LOCK_STRIPE_COUNT; i++) {
+            REGISTER_LOCK_STRIPES[i] = new ReentrantLock();
+        }
+    }
 
     public FsBlobContainer(FsBlobStore blobStore, BlobPath blobPath, Path path) {
         super(blobPath);
@@ -420,5 +457,104 @@ public class FsBlobContainer extends AbstractBlobContainer {
      */
     public static boolean isTempBlobName(final String blobName) {
         return blobName.startsWith(TEMP_FILE_PREFIX);
+    }
+
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        Path registerPath = path.resolve(blobName);
+        if (Files.exists(registerPath) == false) {
+            return Optional.empty();
+        }
+        ReentrantLock lock = registerLockFor(registerPath);
+        lock.lock();
+        try (FileChannel channel = FileChannel.open(registerPath, StandardOpenOption.READ)) {
+            // Shared, because the channel is read-only and an exclusive lock on it would throw. Enough
+            // to exclude a writer in another process, which is all this adds over the lock above.
+            try (FileLock fileLock = channel.lock(0L, Long.MAX_VALUE, true)) {
+                assert fileLock != null;
+                return readRegisterUnderLock(channel);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        Path registerPath = path.resolve(blobName);
+        // The register's own parent, not the container root. A blob name carrying a path segment, which is
+        // how a store namespaces its keys, resolves below the container, and creating only the root left
+        // the open() below throwing NoSuchFileException. S3 has no equivalent failure because its keys are
+        // flat strings, so this was a third way for the two implementations to disagree about a call that
+        // works against one of them.
+        Files.createDirectories(registerPath.getParent());
+
+        ReentrantLock lock = registerLockFor(registerPath);
+        lock.lock();
+        try (
+            FileChannel channel = FileChannel.open(
+                registerPath,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE
+            )
+        ) {
+            // Held across the read and the write, so the compare and the swap are one step. Taken only
+            // after the intra-process lock above, which is what keeps this from throwing
+            // OverlappingFileLockException when two containers in one JVM reach the same file.
+            try (FileLock fileLock = channel.lock()) {
+                assert fileLock != null;
+                Optional<BlobRegister> current = readRegisterUnderLock(channel);
+                long currentGeneration = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                if (currentGeneration != expectedGeneration) {
+                    return BlobRegisterCasResult.conflict(currentGeneration);
+                }
+
+                long newGeneration = currentGeneration + 1;
+                writeRegisterUnderLock(channel, newGeneration, newValue);
+                return BlobRegisterCasResult.applied(newGeneration);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * The intra-process lock stripe for one register file.
+     *
+     * <p>Keyed by the absolute normalised path so two containers that reach the same file through
+     * different {@link BlobPath}s always land on the same stripe -- mutual exclusion per file is
+     * preserved. Distinct files may share a stripe (bounded striping, see the field comment), which
+     * only serializes them, never lets two writers to the same file interleave.
+     */
+    private static ReentrantLock registerLockFor(Path registerPath) {
+        final int hash = registerPath.toAbsolutePath().normalize().toString().hashCode();
+        return REGISTER_LOCK_STRIPES[Math.floorMod(hash, REGISTER_LOCK_STRIPE_COUNT)];
+    }
+
+    private Optional<BlobRegister> readRegisterUnderLock(FileChannel channel) throws IOException {
+        long size = channel.size();
+        if (size == 0) {
+            return Optional.empty();
+        }
+        byte[] bytes = org.opensearch.common.io.Channels.readFromFileChannel(channel, 0, (int) size);
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        long generation = buffer.getLong();
+        byte[] value = new byte[buffer.remaining()];
+        buffer.get(value);
+        return Optional.of(new BlobRegister(generation, new BytesArray(value)));
+    }
+
+    private void writeRegisterUnderLock(FileChannel channel, long newGeneration, BytesReference newValue) throws IOException {
+        byte[] valueBytes = BytesReference.toBytes(newValue);
+        ByteBuffer buffer = ByteBuffer.allocate(8 + valueBytes.length);
+        buffer.putLong(newGeneration);
+        buffer.put(valueBytes);
+        buffer.flip();
+
+        channel.truncate(0);
+        org.opensearch.common.io.Channels.writeToChannel(buffer.array(), channel, 0);
+        channel.force(true);
     }
 }
