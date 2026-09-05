@@ -1002,7 +1002,11 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
             return null;
         }
         if (indexRoutingTable.shards().size() == 1) {
-            return indexRoutingTable.shards().get(0).shardId();
+            // The single shard's primary, not the shard table itself: an index with one shard and no
+            // primary yet has nothing to select, and returning its shard id anyway sent the write to a
+            // shard that could not accept it.
+            ShardRouting primary = indexRoutingTable.iterator().next().primaryShard();
+            return primary != null ? primary.shardId() : null;
         }
 
         // Two-stage selection: first rank nodes by metrics, then randomly pick a shard on the best node
@@ -1031,7 +1035,9 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
         Map<String, List<ShardRouting>> node2Shards = new HashMap<>();
         for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable.shards().values()) {
             ShardRouting primary = shardRoutingTable.primaryShard();
-            if (primary.active()) {
+            // A shard with no primary at all, not merely an inactive one -- primaryShard() is null
+            // while the shard is unassigned, and this loop used to dereference it.
+            if (primary != null && primary.active()) {
                 node2Shards.compute(primary.currentNodeId(), (nodeId, shardList) -> {
                     if (shardList == null) {
                         shardList = new ArrayList<>();

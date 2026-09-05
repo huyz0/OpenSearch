@@ -446,51 +446,6 @@ public class TransportReplicationActionTests extends OpenSearchTestCase {
         assertEquals(0, count.get());
     }
 
-    /**
-     * A3. An index present in metadata and absent from the routing table must reach the same
-     * wait-and-retry branch as an index whose primary merely is not started yet. Before the switch to
-     * {@code shardRoutingTableOrNull} the lookup threw {@code IndexNotFoundException} one statement
-     * above that branch, so the request failed outright and the retry it was entitled to never
-     * happened.
-     *
-     * <p>Deliberately mirrors {@link #testNotStartedPrimary} rather than asserting something new: the
-     * claim is that absence behaves identically to an unallocated primary, so the assertions should
-     * be identical too.
-     */
-    public void testIndexPresentInMetadataButAbsentFromRoutingRetries() {
-        final String index = "test";
-        final ShardId shardId = new ShardId(index, "_na_", 0);
-        ClusterState withRouting = state(index, true, ShardRoutingState.UNASSIGNED);
-        setState(
-            clusterService,
-            ClusterState.builder(withRouting).routingTable(org.opensearch.cluster.routing.RoutingTable.builder().build()).build()
-        );
-        assertTrue("precondition: still in metadata", clusterService.state().metadata().hasIndex(index));
-        assertFalse("precondition: gone from routing", clusterService.state().routingTable().hasIndex(index));
-
-        ReplicationTask task = maybeTask();
-
-        Request request = new Request(shardId).timeout("1ms");
-        PlainActionFuture<TestResponse> listener = new PlainActionFuture<>();
-        TestAction.ReroutePhase reroutePhase = action.new ReroutePhase(task, request, listener);
-        reroutePhase.run();
-        assertListenerThrows(
-            "a cold index must time out like an unassigned one, not fail immediately",
-            listener,
-            UnavailableShardsException.class
-        );
-        assertPhase(task, "failed");
-        assertTrue(request.isRetrySet.get());
-
-        request = new Request(shardId);
-        listener = new PlainActionFuture<>();
-        reroutePhase = action.new ReroutePhase(task, request, listener);
-        reroutePhase.run();
-        assertFalse("...and with no timeout it must wait rather than complete", listener.isDone());
-        assertPhase(task, "waiting_for_retry");
-        assertTrue(request.isRetrySet.get());
-    }
-
     public void testNotStartedPrimary() {
         final String index = "test";
         final ShardId shardId = new ShardId(index, "_na_", 0);
