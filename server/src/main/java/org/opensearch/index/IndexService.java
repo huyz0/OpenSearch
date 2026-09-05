@@ -95,12 +95,10 @@ import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardClosedException;
 import org.opensearch.index.shard.IndexingOperationListener;
-import org.opensearch.index.shard.LocalLuceneShardRecoveryStrategy;
 import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.index.shard.ShardNotFoundException;
 import org.opensearch.index.shard.ShardNotInPrimaryModeException;
 import org.opensearch.index.shard.ShardPath;
-import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.similarity.SimilarityService;
 import org.opensearch.index.store.DataFormatAwareStoreDirectory;
 import org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory;
@@ -184,11 +182,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private final NamedWriteableRegistry namedWriteableRegistry;
     private final SimilarityService similarityService;
     private final IndexerFactory indexerFactory;
-    // Resolves the IndexerFactory (and, transitively, the EngineFactory) for a specific shard copy, given its
-    // ShardRouting. Lets an EnginePlugin pick a different engine for e.g. a search-only replica than for a
-    // promotable one, which the index-wide `indexerFactory` above cannot express since it is fixed at index-service
-    // creation time, before any shard (or its role) exists.
-    private final BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider;
     private final EngineConfigFactory engineConfigFactory;
     private final IndexWarmer warmer;
     private volatile Map<Integer, IndexShard> shards = emptyMap();
@@ -231,12 +224,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private volatile TimeValue refreshInterval;
     private volatile boolean shardLevelRefreshEnabled;
     private final IndexStorePlugin.StoreFactory storeFactory;
-    /**
-     * This index's resolved {@link ShardRecoveryStrategy} (see {@link IndexModule#INDEX_RECOVERY_STRATEGY_SETTING}),
-     * handed to every shard this service creates. Resolved once per index rather than per shard: it is an index-level
-     * property, exactly like {@link #storeFactory} and {@link #recoveryStateFactory} beside it.
-     */
-    private final ShardRecoveryStrategy shardRecoveryStrategy;
     private final DataFormatRegistry dataFormatRegistry;
 
     @InternalApi
@@ -249,7 +236,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         ShardStoreDeleter shardStoreDeleter,
         IndexAnalyzers indexAnalyzers,
         IndexerFactory indexerFactory,
-        @Nullable BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider,
         EngineConfigFactory engineConfigFactory,
         CircuitBreakerService circuitBreakerService,
         BigArrays bigArrays,
@@ -262,7 +248,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         IndexStorePlugin.CompositeDirectoryFactory compositeDirectoryFactory,
         IndexStorePlugin.DirectoryFactory remoteDirectoryFactory,
         IndexStorePlugin.StoreFactory storeFactory,
-        ShardRecoveryStrategy shardRecoveryStrategy,
         IndexEventListener eventListener,
         Function<IndexService, CheckedFunction<DirectoryReader, DirectoryReader, IOException>> wrapperFactory,
         MapperRegistry mapperRegistry,
@@ -293,7 +278,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     ) {
         super(indexSettings);
         this.storeFactory = storeFactory;
-        this.shardRecoveryStrategy = Objects.requireNonNull(shardRecoveryStrategy);
         this.allowExpensiveQueries = allowExpensiveQueries;
         this.indexSettings = indexSettings;
         this.xContentRegistry = xContentRegistry;
@@ -372,7 +356,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         this.remoteDirectoryFactory = remoteDirectoryFactory;
         this.recoveryStateFactory = recoveryStateFactory;
         this.indexerFactory = Objects.requireNonNull(indexerFactory);
-        this.indexerFactoryProvider = indexerFactoryProvider != null ? indexerFactoryProvider : (settings, routing) -> this.indexerFactory;
         this.engineConfigFactory = Objects.requireNonNull(engineConfigFactory);
         // initialize this last -- otherwise if the wrapper requires any other member to be non-null we fail with an NPE
         this.readerWrapper = wrapperFactory.apply(this);
@@ -468,7 +451,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             shardStoreDeleter,
             indexAnalyzers,
             indexerFactory,
-            null,
             engineConfigFactory,
             circuitBreakerService,
             bigArrays,
@@ -481,7 +463,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             null,
             remoteDirectoryFactory,
             storeFactory,
-            LocalLuceneShardRecoveryStrategy.INSTANCE,
             eventListener,
             wrapperFactory,
             mapperRegistry,
@@ -856,7 +837,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                         threadPool
                     );
                 } else if (this.indexSettings.isPluggableDataFormatEnabled() == false) {
-                    directory = directoryFactory.newDirectory(this.indexSettings, path, routing);
+                    directory = directoryFactory.newDirectory(this.indexSettings, path);
                 } else {
                     // Will be enabled in case of formatAware indices.
                     directory = createDataFormatAwareStoreDirectory(shardId, path, checksumStrategies);
@@ -881,7 +862,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 indexCache,
                 mapperService,
                 similarityService,
-                indexerFactoryProvider.apply(this.indexSettings, routing),
+                indexerFactory,
                 engineConfigFactory,
                 eventListener,
                 readerWrapper,
@@ -912,8 +893,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 this.indexSettings.isSegRepEnabledOrRemoteNode() ? mergedSegmentPublisher : null,
                 this.indexSettings.isSegRepEnabledOrRemoteNode() ? referencedSegmentsPublisher : null,
                 checksumStrategies,
-                dataFormatRegistry,
-                shardRecoveryStrategy
+                dataFormatRegistry
             );
             eventListener.indexShardStateChanged(indexShard, null, indexShard.state(), "shard created");
             eventListener.afterIndexShardCreated(indexShard);

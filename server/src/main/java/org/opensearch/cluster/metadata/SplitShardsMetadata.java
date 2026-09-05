@@ -8,7 +8,6 @@
 
 package org.opensearch.cluster.metadata;
 
-import org.opensearch.Version;
 import org.opensearch.cluster.AbstractDiffable;
 import org.opensearch.cluster.Diff;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -41,39 +40,12 @@ import java.util.TreeSet;
 public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> implements ToXContentFragment {
     private static final int MINIMUM_RANGE_LENGTH_THRESHOLD = 1000;
 
-    /**
-     * Hard ceiling on the {@code num_of_root_shards} an XContent blob may claim, checked before an
-     * array that large is allocated. The stream path gets this for free -- {@code
-     * StreamInput#readArray}'s guarded length read bounds the count by the bytes actually left in
-     * the stream -- but an XContent blob carries no such length, so ~20 characters of digits could
-     * otherwise demand a multi-gigabyte array.
-     *
-     * <p>Deliberately far above any real index's shard count (core's own default ceiling is 1024,
-     * see {@code opensearch.index.max_number_of_shards}) rather than exactly at it: the job here is
-     * to stop a corrupt or hostile count from turning a tiny blob into an OOM, not to re-litigate
-     * core's shard-count policy on a read path where a false rejection would make an otherwise
-     * healthy index's metadata unreadable. At this bound the pre-allocation costs single-digit
-     * megabytes, which fails cleanly on the real per-root validation right after.
-     */
-    private static final int MAX_ROOT_SHARDS = 1 << 20;
-
-    /**
-     * Sentinel returned by {@link #getSplitCommitTimestamp(int)} when no split-commit timestamp is recorded
-     * for a shard id -- because it isn't a committed split parent at all, or because the split committed on a
-     * node/cluster-state old enough to predate the {@code splitCommitTimestamps} field (see wire-format gating
-     * on {@link Version#V_3_8_0}). A caller gating on elapsed-time-since-commit must treat this as "no floor"
-     * (fail open), never as "committed at epoch 0".
-     */
-    public static final long NO_SPLIT_COMMIT_TIMESTAMP = -1L;
-
     private static final String KEY_ROOT_SHARDS_TO_ALL_CHILDREN = "root_shards_to_all_children";
     private static final String KEY_NUMBER_OF_ROOT_SHARDS = "num_of_root_shards";
     private static final String KEY_PARENT_TO_CHILD_SHARDS = "parent_to_child_shards";
     private static final String KEY_MAX_SHARD_ID = "max_shard_id";
     private static final String KEY_IN_PROGRESS_SPLIT_SHARD_IDS = "in_progress_split_shard_id";
     private static final String KEY_ACTIVE_SHARD_IDS = "active_shard_ids";
-    private static final String KEY_SPLIT_COMMIT_TIMESTAMPS = "split_commit_timestamps";
-    private static final String KEY_IN_PROGRESS_MERGE_PARENT_SHARD_IDS = "in_progress_merge_parent_shard_id";
 
     // Following fields are upadated only after split completion and are used to service active shards request.
     // Root shard id to flat list of all child shards under root.
@@ -87,25 +59,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
     private final Map<Integer, ShardRange[]> parentToChildShards;
     private final Set<Integer> inProgressSplitShardIds;
 
-    // Parent shard id -> epoch millis at which that shard's split committed (all children reached STARTED and
-    // were promoted to active). Recorded by MetadataInPlaceSplitShardCommitService at commit time so a merge
-    // trigger can enforce a minimum cool-down since the split before considering the pair for re-merge.
-    // Keyed by parent shard id, consistent with parentToChildShards, and dropped when the parent is merged
-    // back (Builder#mergeChildrenBackToParent).
-    private final Map<Integer, Long> splitCommitTimestamps;
-
-    // Parent shard ids whose in-place merge (children -> parent) is pending, i.e. the parent has been
-    // revived as an UNASSIGNED primary recovering via InPlaceMergeShardRecoverySource but its children
-    // are still live, routed, and serving traffic by hash. Symmetric to inProgressSplitShardIds. While a
-    // parent sits here nothing has been destroyed: its children are still recorded in parentToChildShards/
-    // rootShardsToAllChildren/activeShardIds and still own their hash ranges. The merge is only finalized
-    // (children actually removed via Builder#mergeChildrenBackToParent) once the revived parent reaches
-    // STARTED; if the revival fails instead, Builder#cancelMerge drops just this marker and the caller
-    // removes the parent's revived routing entry, leaving the children fully intact -- so rollback is
-    // trivial because nothing was ever torn down. Driven by MetadataInPlaceMergeShardCommitService, the
-    // exact mirror of split's MetadataInPlaceSplitShardCommitService commit/cancel driver.
-    private final Set<Integer> inProgressMergeParentShardIds;
-
     SplitShardsMetadata(
         ShardRange[][] rootShardsToAllChildren,
         Map<Integer, ShardRange[]> parentToChildShards,
@@ -113,80 +66,26 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         Set<Integer> activeShardIds,
         int maxShardId
     ) {
-        this(rootShardsToAllChildren, parentToChildShards, inProgressSplitShardIds, activeShardIds, maxShardId, Collections.emptyMap());
-    }
-
-    SplitShardsMetadata(
-        ShardRange[][] rootShardsToAllChildren,
-        Map<Integer, ShardRange[]> parentToChildShards,
-        Set<Integer> inProgressSplitShardIds,
-        Set<Integer> activeShardIds,
-        int maxShardId,
-        Map<Integer, Long> splitCommitTimestamps
-    ) {
-        this(
-            rootShardsToAllChildren,
-            parentToChildShards,
-            inProgressSplitShardIds,
-            activeShardIds,
-            maxShardId,
-            splitCommitTimestamps,
-            Collections.emptySet()
-        );
-    }
-
-    SplitShardsMetadata(
-        ShardRange[][] rootShardsToAllChildren,
-        Map<Integer, ShardRange[]> parentToChildShards,
-        Set<Integer> inProgressSplitShardIds,
-        Set<Integer> activeShardIds,
-        int maxShardId,
-        Map<Integer, Long> splitCommitTimestamps,
-        Set<Integer> inProgressMergeParentShardIds
-    ) {
 
         this.rootShardsToAllChildren = rootShardsToAllChildren;
         this.parentToChildShards = Collections.unmodifiableMap(parentToChildShards);
         this.maxShardId = maxShardId;
         this.inProgressSplitShardIds = Collections.unmodifiableSet(inProgressSplitShardIds);
         this.activeShardIds = activeShardIds;
-        this.splitCommitTimestamps = Collections.unmodifiableMap(splitCommitTimestamps);
-        this.inProgressMergeParentShardIds = Collections.unmodifiableSet(inProgressMergeParentShardIds);
     }
 
     public SplitShardsMetadata(StreamInput in) throws IOException {
-        // readArray, not a raw readVInt() followed by `new ShardRange[n][]`: the byte layout is
-        // identical (writeTo still writes a vint length then each element), but readArray's own
-        // length read is the guarded one -- it rejects a negative size, caps at
-        // ArrayUtil.MAX_ARRAY_LENGTH, and calls ensureCanReadBytes so a count larger than the bytes
-        // that could possibly back it fails before anything is allocated. The unguarded shape this
-        // replaces let ~5 bytes of vint demand a multi-gigabyte array up front, ahead of reading a
-        // single element.
-        this.rootShardsToAllChildren = in.readArray(i -> i.readOptionalArray(ShardRange::new, ShardRange[]::new), ShardRange[][]::new);
+        int numberOfRootShards = in.readVInt();
+        this.rootShardsToAllChildren = new ShardRange[numberOfRootShards][];
+        for (int i = 0; i < numberOfRootShards; i++) {
+            this.rootShardsToAllChildren[i] = in.readOptionalArray(ShardRange::new, ShardRange[]::new);
+        }
         this.maxShardId = in.readVInt();
         this.inProgressSplitShardIds = Collections.unmodifiableSet(in.readSet(StreamInput::readInt));
         this.activeShardIds = Collections.unmodifiableSet(in.readSet(StreamInput::readInt));
         this.parentToChildShards = Collections.unmodifiableMap(
             in.readMap(StreamInput::readInt, i -> i.readArray(ShardRange::new, ShardRange[]::new))
         );
-        // splitCommitTimestamps is a V_3_8_0+ addition. Reading from an older node's stream (which never
-        // wrote this map) must leave it empty rather than attempting a read that would corrupt the stream.
-        // The whole SplitShardsMetadata blob is itself only ever serialized between V_3_6_0+ nodes (gated in
-        // IndexMetadata), so this inner gate is what keeps a mixed V_3_6_0/V_3_7_x <-> V_3_8_0 cluster safe.
-        if (in.getVersion().onOrAfter(Version.V_3_8_0)) {
-            this.splitCommitTimestamps = Collections.unmodifiableMap(in.readMap(StreamInput::readInt, StreamInput::readLong));
-            // inProgressMergeParentShardIds is the same V_3_8_0+ addition: appended after
-            // splitCommitTimestamps in the stream, read only from a peer new enough to have written it. A
-            // pending merge only ever exists in a uniform-version cluster (MetadataInPlaceMergeShardService
-            // rejects a merge unless every node is on the same version), so a mixed-version cluster never
-            // carries this state during a rolling upgrade -- and were an older peer to somehow receive this
-            // blob, dropping the marker (empty set) is the safe read: the merge simply isn't tracked there.
-            this.inProgressMergeParentShardIds = Collections.unmodifiableSet(in.readSet(StreamInput::readInt));
-        } else {
-            this.splitCommitTimestamps = Collections.emptyMap();
-            this.inProgressMergeParentShardIds = Collections.emptySet();
-        }
-        validateRootShardRanges(this.rootShardsToAllChildren);
     }
 
     public void writeTo(StreamOutput out) throws IOException {
@@ -198,31 +97,27 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         out.writeCollection(this.inProgressSplitShardIds, StreamOutput::writeInt);
         out.writeCollection(this.activeShardIds, StreamOutput::writeInt);
         out.writeMap(this.parentToChildShards, StreamOutput::writeInt, StreamOutput::writeArray);
-        // See the constructor's note: only write the new field to V_3_8_0+ peers.
-        if (out.getVersion().onOrAfter(Version.V_3_8_0)) {
-            out.writeMap(this.splitCommitTimestamps, StreamOutput::writeInt, StreamOutput::writeLong);
-            out.writeCollection(this.inProgressMergeParentShardIds, StreamOutput::writeInt);
-        }
     }
 
-    public int getShardIdOfHash(int rootShardId, int hash) {
+    public int getShardIdOfHash(int rootShardId, int hash, boolean includeInProgressChildren) {
         // First check if we have child shards against this root shard.
         if (rootShardsToAllChildren[rootShardId] == null) {
+            if (includeInProgressChildren && parentToChildShards.containsKey(rootShardId)) {
+                ShardRange shardRange = binarySearchShards(parentToChildShards.get(rootShardId), hash);
+                assert shardRange != null;
+                return shardRange.shardId();
+            }
             return rootShardId;
         }
 
         ShardRange[] existingChildShards = rootShardsToAllChildren[rootShardId];
         ShardRange shardRange = binarySearchShards(existingChildShards, hash);
-        if (shardRange == null) {
-            // Unreachable given validateRootShardRanges (every root's children are a gapless,
-            // sorted partition of the whole hash space, so a binary search always lands somewhere).
-            // A real check rather than the bare `assert` this replaces, which is disabled in
-            // production: this is the document-routing hot path, and dereferencing null here would
-            // turn "one index carries bad metadata" into an NPE on every node that applied it.
-            throw new IllegalStateException(
-                "no child shard of root shard " + rootShardId + " owns hash " + hash + "; split metadata is inconsistent"
-            );
+        assert shardRange != null;
+
+        if (includeInProgressChildren && parentToChildShards.containsKey(shardRange.shardId())) {
+            shardRange = binarySearchShards(parentToChildShards.get(shardRange.shardId()), hash);
         }
+        assert shardRange != null;
 
         return shardRange.shardId();
     }
@@ -262,10 +157,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             + parentToChildMap
             + ", inProgressSplitShardIds="
             + inProgressSplitShardIds
-            + ", splitCommitTimestamps="
-            + splitCommitTimestamps
-            + ", inProgressMergeParentShardIds="
-            + inProgressMergeParentShardIds
             + '}';
     }
 
@@ -298,59 +189,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         return childShards;
     }
 
-    /**
-     * The hash range of {@code shardId}, if it is a split child -- in progress or already committed --
-     * or {@code null} if it is not a split child at all (an ordinary, never-split shard). Unlike
-     * {@link #getParentAndRangeOfChild(int)} (deliberately scoped to only the in-progress window, for
-     * recovery), this covers a child's entire lifetime: the read path needs a committed child's own
-     * range for as long as its bundles remain logically-filtered rather than physically rewritten
-     * (a plugin's filtering reader hides documents not owned by the child shard), which is
-     * indefinitely in this increment, not just until commit.
-     */
-    public ShardRange getRangeOfShard(int shardId) {
-        for (ShardRange[] childRanges : parentToChildShards.values()) {
-            for (ShardRange childRange : childRanges) {
-                if (childRange.shardId() == shardId) {
-                    return childRange;
-                }
-            }
-        }
-        for (ShardRange[] childRanges : rootShardsToAllChildren) {
-            if (childRanges == null) {
-                continue;
-            }
-            for (ShardRange childRange : childRanges) {
-                if (childRange.shardId() == shardId) {
-                    return childRange;
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Reverse of {@link #getChildShardsOfParent(int)}: given a shard ID that is currently a
-     * not-yet-committed child of an in-progress split, returns its parent's shard ID and its own
-     * {@link ShardRange}. Returns {@code null} if {@code childShardId} isn't a child of any
-     * currently in-progress split -- in particular, this does <em>not</em> resolve parentage for a
-     * child whose split has already committed (use {@link #getRootShards()}/the {@code
-     * rootShardsToAllChildren} lineage for that case instead; this method only serves the recovery
-     * window between a child's {@link ShardRange} being reserved and the split being committed).
-     */
-    public Tuple<Integer, ShardRange> getParentAndRangeOfChild(int childShardId) {
-        for (Map.Entry<Integer, ShardRange[]> entry : parentToChildShards.entrySet()) {
-            if (inProgressSplitShardIds.contains(entry.getKey()) == false) {
-                continue;
-            }
-            for (ShardRange childRange : entry.getValue()) {
-                if (childRange.shardId() == childShardId) {
-                    return new Tuple<>(entry.getKey(), childRange);
-                }
-            }
-        }
-        return null;
-    }
-
     public Set<Integer> getChildShardIdsOfParent(int shardId) {
         Set<Integer> childShardIds = new HashSet<>();
         if (parentToChildShards.containsKey(shardId) == false) {
@@ -373,41 +211,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
     public Iterator<Integer> getActiveShardIterator() {
         return new HashSet<>(activeShardIds).iterator();
-    }
-
-    /**
-     * Re-runs {@link #validateShardRanges} over every root shard's committed child list, which is
-     * what {@link Builder#splitShard} and {@link Builder#updateSplitMetadataForChildShards} already
-     * do on every mutation -- but which neither deserialization path used to do at all.
-     *
-     * <p>That gap mattered because both deserialization paths bypass {@link Builder} entirely, so a
-     * corrupt or tampered custom (transport bytes, or an XContent blob read back from a remote-store
-     * manifest) could install child ranges with gaps, overlaps, or in the wrong order, none of which
-     * {@link Builder} would ever produce. {@link #getShardIdOfHash} then binary-searches that list on
-     * the document-routing hot path and its only defence was a bare {@code assert}, disabled in
-     * production -- so a hash falling in a gap dereferenced null and crashed routing on every node
-     * that applied the metadata. Failing the deserialization instead keeps the invalid state out.
-     *
-     * <p>Only the {@code rootShardsToAllChildren} lists are checked, deliberately, and not
-     * {@code parentToChildShards}: a root's list is the complete partition of the whole hash space
-     * (which is exactly what {@link #validateShardRanges} verifies, and exactly what the binary
-     * search needs), whereas a nested split's parent-to-children entry covers only that parent's own
-     * sub-range and legitimately does not span {@code [MIN_VALUE, MAX_VALUE]}. Per-element sanity
-     * for those is {@link ShardRange}'s own read-path validation.
-     *
-     * @param rootShardsToAllChildren the just-deserialized root-to-children table; {@code null}
-     *                                entries (a never-split root) are skipped.
-     * @throws IllegalArgumentException if any root's child ranges are not a gapless, ordered,
-     *                                  full-width partition.
-     */
-    private static void validateRootShardRanges(ShardRange[][] rootShardsToAllChildren) {
-        for (int rootShardId = 0; rootShardId < rootShardsToAllChildren.length; rootShardId++) {
-            ShardRange[] childShards = rootShardsToAllChildren[rootShardId];
-            if (childShards == null) {
-                continue;
-            }
-            validateShardRanges(rootShardId, childShards);
-        }
     }
 
     // Visible for testing
@@ -477,8 +280,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         private int maxShardId;
         private final Set<Integer> inProgressSplitShardIds;
         private final Set<Integer> activeShardIds;
-        private final Map<Integer, Long> splitCommitTimestamps;
-        private final Set<Integer> inProgressMergeParentShardIds;
 
         public Builder(int numberOfShards) {
             maxShardId = numberOfShards - 1;
@@ -486,8 +287,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             parentToChildShards = new HashMap<>();
             inProgressSplitShardIds = new HashSet<>();
             activeShardIds = new HashSet<>();
-            splitCommitTimestamps = new HashMap<>();
-            inProgressMergeParentShardIds = new HashSet<>();
             for (int i = 0; i < numberOfShards; i++) {
                 activeShardIds.add(i);
             }
@@ -495,7 +294,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
         public Builder(SplitShardsMetadata splitShardsMetadata) {
             this.maxShardId = splitShardsMetadata.maxShardId;
-            this.splitCommitTimestamps = new HashMap<>(splitShardsMetadata.splitCommitTimestamps);
 
             this.rootShardsToAllChildren = new ShardRange[splitShardsMetadata.rootShardsToAllChildren.length][];
             Set<Integer> activeShardIds = new HashSet<>();
@@ -521,7 +319,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
             inProgressSplitShardIds = new HashSet<>(splitShardsMetadata.inProgressSplitShardIds);
             this.activeShardIds = activeShardIds;
-            this.inProgressMergeParentShardIds = new HashSet<>(splitShardsMetadata.inProgressMergeParentShardIds);
         }
 
         /**
@@ -530,9 +327,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
          * @param numberOfChildren Number of child shards this shard is going to have.
          */
         public List<ShardRange> splitShard(int splitShardId, int numberOfChildren) {
-            if (numberOfChildren < 2) {
-                throw new IllegalArgumentException("Cannot split shard [" + splitShardId + "] into fewer than 2 children.");
-            }
             if (inProgressSplitShardIds.contains(splitShardId) || parentToChildShards.containsKey(splitShardId)) {
                 throw new IllegalArgumentException("Split of shard [" + splitShardId + "] is already in progress or completed.");
             }
@@ -632,17 +426,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         }
 
         public void updateSplitMetadataForChildShards(int sourceShardId, Set<Integer> newChildShardIds) {
-            updateSplitMetadataForChildShards(sourceShardId, newChildShardIds, NO_SPLIT_COMMIT_TIMESTAMP);
-        }
-
-        /**
-         * Commits a split and records the epoch-millis instant at which it committed, keyed by the parent
-         * shard id. The production commit path ({@code MetadataInPlaceSplitShardCommitService}) passes a real
-         * timestamp here; the no-timestamp overload above (used by tests and any caller that doesn't care)
-         * records {@link #NO_SPLIT_COMMIT_TIMESTAMP}, i.e. no cool-down floor. Passing
-         * {@link #NO_SPLIT_COMMIT_TIMESTAMP} explicitly clears any prior recorded timestamp for the parent.
-         */
-        public void updateSplitMetadataForChildShards(int sourceShardId, Set<Integer> newChildShardIds, long commitTimestamp) {
             Tuple<Integer, ShardRange> shardRangeTuple = findRootAndShard(sourceShardId, rootShardsToAllChildren);
 
             assert inProgressSplitShardIds.contains(sourceShardId);
@@ -671,11 +454,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             maxShardId = currentMaxShardId;
             rootShardsToAllChildren[shardRangeTuple.v1()] = newShardsUnderRoot;
             inProgressSplitShardIds.remove(sourceShardId);
-            if (commitTimestamp == NO_SPLIT_COMMIT_TIMESTAMP) {
-                splitCommitTimestamps.remove(sourceShardId);
-            } else {
-                splitCommitTimestamps.put(sourceShardId, commitTimestamp);
-            }
         }
 
         private Set<Integer> getInProgressChildShardIds() {
@@ -694,112 +472,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             assert inProgressSplitShardIds.contains(sourceShardId);
             inProgressSplitShardIds.remove(sourceShardId);
             parentToChildShards.remove(sourceShardId);
-            // An in-progress split never recorded a commit timestamp, but clear defensively so a re-used
-            // parent id can't inherit a stale one.
-            splitCommitTimestamps.remove(sourceShardId);
-        }
-
-        /**
-         * Reverses an already-committed split, merging every one of {@code parentShardId}'s children
-         * back into a single active shard again -- the
-         * "undo my own split" in-place merge, deliberately scoped to exactly the flat, non-nested case
-         * a first increment can support: {@code parentShardId} must itself be an original root shard
-         * (not itself a child produced by an earlier split), and every one of its children must still
-         * be active and unsplit -- if any child has itself been split further, this shard's children no
-         * longer form a simple contiguous partition of the parent's own original range, and reversing
-         * that would require the harder, not-yet-designed nested-merge case, which is explicitly out of
-         * scope here. Unlike {@link #cancelSplit}, which only ever undoes a still-*in-progress* split
-         * (this plugin's own allocation-failure rollback path), this undoes a split that has already
-         * committed and been serving traffic.
-         *
-         * @param parentShardId the root shard whose full, unsplit-further child set should be merged
-         *                      back into it.
-         * @throws IllegalArgumentException if {@code parentShardId} isn't a root shard, isn't currently
-         *                                  split, is still mid-split, or has a child that's itself been
-         *                                  split further.
-         */
-        public void mergeChildrenBackToParent(int parentShardId) {
-            ShardRange[] children = validateMergeable(parentShardId);
-            for (ShardRange child : children) {
-                activeShardIds.remove(child.shardId());
-            }
-            activeShardIds.add(parentShardId);
-            rootShardsToAllChildren[parentShardId] = null;
-            parentToChildShards.remove(parentShardId);
-            // The split that produced these children is being undone; its commit timestamp is no longer
-            // meaningful (and the parent id is active-and-unsplit again).
-            splitCommitTimestamps.remove(parentShardId);
-            // A pending merge (if this is the commit half of the two-phase flow) is now finalized.
-            inProgressMergeParentShardIds.remove(parentShardId);
-        }
-
-        /**
-         * Runs exactly the split-level preconditions {@link #mergeChildrenBackToParent(int)} enforces --
-         * {@code parentShardId} is an original root shard, is currently split, is not still mid-split, and
-         * none of its direct children have themselves been split further -- throwing the same descriptive
-         * {@link IllegalArgumentException}s, and returns the parent's direct children on success.
-         */
-        private ShardRange[] validateMergeable(int parentShardId) {
-            if (parentShardId < 0 || parentShardId >= rootShardsToAllChildren.length) {
-                throw new IllegalArgumentException(
-                    "Shard [" + parentShardId + "] is not an original root shard; nested in-place merge is not supported"
-                );
-            }
-            if (inProgressSplitShardIds.contains(parentShardId)) {
-                throw new IllegalArgumentException("Split of shard [" + parentShardId + "] is still in progress");
-            }
-            // parentToChildShards records exactly the *direct* children this shard's own split
-            // produced, unaffected by any later split of one of those children -- rootShardsToAllChildren
-            // is the wrong list to validate/remove against here, since a nested split of one direct
-            // child grows *this* root's entry with that child's own grandchildren too.
-            ShardRange[] children = parentToChildShards.get(parentShardId);
-            if (children == null || children.length == 0) {
-                throw new IllegalArgumentException("Shard [" + parentShardId + "] has not been split");
-            }
-            for (ShardRange child : children) {
-                if (activeShardIds.contains(child.shardId()) == false || inProgressSplitShardIds.contains(child.shardId())) {
-                    throw new IllegalArgumentException(
-                        "Child shard ["
-                            + child.shardId()
-                            + "] of ["
-                            + parentShardId
-                            + "] has itself been split further (or is "
-                            + "mid-split); nested in-place merge is not supported"
-                    );
-                }
-            }
-            return children;
-        }
-
-        /**
-         * Phase 1 of the two-phase in-place merge: marks {@code parentShardId}'s merge as <em>pending</em>
-         * without destroying anything. Validates the exact same split-level preconditions
-         * {@link #mergeChildrenBackToParent(int)} does (throwing the identical {@link IllegalArgumentException}s
-         * for a bad request), then records the parent in {@code inProgressMergeParentShardIds}. The children
-         * stay recorded in {@code parentToChildShards}/{@code rootShardsToAllChildren}/{@code activeShardIds}
-         * and keep owning their hash ranges, so they continue to serve reads and (barring the write guard)
-         * writes; they are only removed once the revived parent reaches STARTED and
-         * {@link #mergeChildrenBackToParent(int)} finalizes the merge. If the revival fails instead,
-         * {@link #cancelMerge(int)} drops just this marker and the children are already fully intact.
-         */
-        public void startMergeChildrenToParent(int parentShardId) {
-            if (inProgressMergeParentShardIds.contains(parentShardId)) {
-                throw new IllegalArgumentException("In-place merge of shard [" + parentShardId + "] is already in progress");
-            }
-            validateMergeable(parentShardId);
-            inProgressMergeParentShardIds.add(parentShardId);
-        }
-
-        /**
-         * Phase 2 (rollback) of the two-phase in-place merge: abandons a pending merge whose revived parent
-         * never recovered. Only the {@code inProgressMergeParentShardIds} marker is dropped; because
-         * {@link #startMergeChildrenToParent(int)} never removed the children, they remain active, routed,
-         * and range-owning exactly as before the merge was attempted -- so this is a complete, lossless
-         * rollback. The counterpart of split's {@link #cancelSplit(int)}.
-         */
-        public void cancelMerge(int parentShardId) {
-            assert inProgressMergeParentShardIds.contains(parentShardId);
-            inProgressMergeParentShardIds.remove(parentShardId);
         }
 
         public SplitShardsMetadata build() {
@@ -808,9 +480,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                 this.parentToChildShards,
                 this.inProgressSplitShardIds,
                 this.activeShardIds,
-                this.maxShardId,
-                this.splitCommitTimestamps,
-                this.inProgressMergeParentShardIds
+                this.maxShardId
             );
         }
     }
@@ -840,109 +510,12 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         return inProgressSplitShardIds;
     }
 
-    /**
-     * Epoch-millis timestamp at which {@code parentShardId}'s split committed (its children were promoted to
-     * active), or {@link #NO_SPLIT_COMMIT_TIMESTAMP} if none is recorded -- either because the shard isn't a
-     * committed split parent, or because the split committed on a cluster old enough to predate this field
-     * (see {@link Version#V_3_8_0} wire gating). A merge-trigger cool-down gate must treat the sentinel as
-     * "no floor" (fail open), not as a commit at epoch 0.
-     */
-    public long getSplitCommitTimestamp(int parentShardId) {
-        return splitCommitTimestamps.getOrDefault(parentShardId, NO_SPLIT_COMMIT_TIMESTAMP);
-    }
-
     public boolean isSplitOfShardInProgress(int shardId) {
         return inProgressSplitShardIds.contains(shardId);
     }
 
-    /**
-     * Parent shard ids whose two-phase in-place merge is pending (parent revived but children not yet
-     * removed). The mirror of {@link #getInProgressSplitShardIds()}, and what
-     * {@code MetadataInPlaceMergeShardCommitService} iterates to drive each pending merge to commit or
-     * cancel. Returned directly (the field is unmodifiable).
-     */
-    public Set<Integer> getInProgressMergeParentShardIds() {
-        return inProgressMergeParentShardIds;
-    }
-
-    /**
-     * Whether an in-place merge of {@code parentShardId}'s children back into it is currently pending
-     * (its revived parent primary has not yet reached STARTED and the children are still live).
-     */
-    public boolean isMergeOfShardInProgress(int parentShardId) {
-        return inProgressMergeParentShardIds.contains(parentShardId);
-    }
-
-    /**
-     * Whether {@code shardId} is a still-live child of a currently-pending in-place merge -- i.e. it is
-     * about to be folded into its revived parent and retired once that parent starts. Writes to such a
-     * child are rejected ({@code IndexShard#ensureWriteAllowed}) so no document acknowledged after the
-     * parent snapshotted the children can be stranded and lost when the children are retired at commit --
-     * the exact mirror of split's in-progress-split-parent write rejection (CC1).
-     */
-    public boolean isChildOfInProgressMerge(int shardId) {
-        for (Integer parentShardId : inProgressMergeParentShardIds) {
-            ShardRange[] children = parentToChildShards.get(parentShardId);
-            if (children == null) {
-                continue;
-            }
-            for (ShardRange child : children) {
-                if (child.shardId() == shardId) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
     public boolean isSplitParent(int shardId) {
         return activeShardIds.contains(shardId) == false && parentToChildShards.containsKey(shardId);
-    }
-
-    /**
-     * Every shard ID that is currently recorded as a split parent -- i.e. every key in the
-     * parent-to-children map, covering both still-in-progress splits and already-committed ones.
-     * Callers that only want mergeable (committed, unsplit-further) parents should pair this with
-     * {@link #canMergeChildrenBackToParent(int)}. Returned as a fresh copy, so mutating it can't
-     * disturb this immutable instance.
-     */
-    public Set<Integer> getSplitParentShardIds() {
-        return new HashSet<>(parentToChildShards.keySet());
-    }
-
-    /**
-     * Non-mutating counterpart to {@link Builder#startMergeChildrenToParent(int)} (and, by extension,
-     * {@link Builder#mergeChildrenBackToParent(int)}): reports whether starting an in-place merge of
-     * {@code parentShardId}'s children back into it would satisfy every precondition those primitives
-     * enforce, {@code true} only if it would (so a caller -- e.g. an automatic merge-trigger policy --
-     * can screen candidate parents without provoking either primitive's {@link IllegalArgumentException}
-     * just to discover ineligibility). Mirrors those primitives' own checks exactly: {@code parentShardId}
-     * must be an original root shard, must currently be split, must not still be mid-split, must not
-     * already have an in-place merge pending, and none of its direct children may have been split
-     * further (or be mid-split themselves). Deliberately does <em>not</em> check per-child routing
-     * liveness (started, non-relocating primaries) -- that's a routing-table concern the merge service
-     * validates separately, not a {@link SplitShardsMetadata} one.
-     */
-    public boolean canMergeChildrenBackToParent(int parentShardId) {
-        if (parentShardId < 0 || parentShardId >= rootShardsToAllChildren.length) {
-            return false;
-        }
-        if (inProgressSplitShardIds.contains(parentShardId)) {
-            return false;
-        }
-        if (inProgressMergeParentShardIds.contains(parentShardId)) {
-            return false;
-        }
-        ShardRange[] children = parentToChildShards.get(parentShardId);
-        if (children == null || children.length == 0) {
-            return false;
-        }
-        for (ShardRange child : children) {
-            if (activeShardIds.contains(child.shardId()) == false || inProgressSplitShardIds.contains(child.shardId())) {
-                return false;
-            }
-        }
-        return true;
     }
 
     public boolean isRecoveringChild(int shardId, int parentShardId) {
@@ -969,8 +542,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         if (!inProgressSplitShardIds.equals(that.inProgressSplitShardIds)) return false;
         if (!Arrays.deepEquals(rootShardsToAllChildren, that.rootShardsToAllChildren)) return false;
         if (!activeShardIds.equals(that.activeShardIds)) return false;
-        if (!splitCommitTimestamps.equals(that.splitCommitTimestamps)) return false;
-        if (!inProgressMergeParentShardIds.equals(that.inProgressMergeParentShardIds)) return false;
         if (parentToChildShards.size() != that.parentToChildShards.size()) return false;
         for (Integer key : parentToChildShards.keySet()) {
             if (!Arrays.deepEquals(parentToChildShards.get(key), that.parentToChildShards.get(key))) {
@@ -989,8 +560,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         result = 31 * result + maxShardId;
         result = 31 * result + inProgressSplitShardIds.hashCode();
         result = 31 * result + activeShardIds.hashCode();
-        result = 31 * result + splitCommitTimestamps.hashCode();
-        result = 31 * result + inProgressMergeParentShardIds.hashCode();
         return result;
     }
 
@@ -1000,9 +569,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         builder.field(KEY_MAX_SHARD_ID, maxShardId);
         if (!inProgressSplitShardIds.isEmpty()) {
             builder.field(KEY_IN_PROGRESS_SPLIT_SHARD_IDS, new ArrayList<>(inProgressSplitShardIds));
-        }
-        if (!inProgressMergeParentShardIds.isEmpty()) {
-            builder.field(KEY_IN_PROGRESS_MERGE_PARENT_SHARD_IDS, new ArrayList<>(inProgressMergeParentShardIds));
         }
         builder.field(KEY_ACTIVE_SHARD_IDS, new ArrayList<>(activeShardIds));
         builder.startObject(KEY_ROOT_SHARDS_TO_ALL_CHILDREN);
@@ -1028,49 +594,19 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         }
         builder.endObject();
 
-        if (!splitCommitTimestamps.isEmpty()) {
-            builder.startObject(KEY_SPLIT_COMMIT_TIMESTAMPS);
-            for (Map.Entry<Integer, Long> entry : splitCommitTimestamps.entrySet()) {
-                builder.field(String.valueOf(entry.getKey()), entry.getValue());
-            }
-            builder.endObject();
-        }
-
         return builder;
     }
 
-    /**
-     * Reads this custom back from an XContent blob (a remote-store manifest), applying the same
-     * invariants {@link Builder} enforces on every mutation -- see {@link #validateRootShardRanges}
-     * for why skipping them used to be a routing-crash vector.
-     *
-     * <p>Deliberately <b>field-order independent</b>: {@code num_of_root_shards} is now consumed
-     * once the whole object has been read rather than at the moment {@code
-     * root_shards_to_all_children} happens to arrive. The old shape sized the root array from
-     * whatever {@code numberOfRootShards} held at that instant, so a blob that merely listed its
-     * fields in the other order still carried the {@code -1} initial value into {@code new
-     * ShardRange[-1][]} and died with a bare {@link NegativeArraySizeException}. Every count and
-     * every map key that indexes into that array is now range-checked before it is used.
-     *
-     * @throws IllegalArgumentException if the blob is truncated, omits {@code num_of_root_shards},
-     *                                  claims an impossible shard count, names a root/parent shard id
-     *                                  outside the table, or carries child ranges that are not a
-     *                                  gapless ordered partition.
-     */
     public static SplitShardsMetadata parse(XContentParser parser) throws IOException {
         XContentParser.Token token;
         String currentFieldName = null;
         int maxShardId = -1;
         Set<Integer> inProgressSplitShardIds = new HashSet<>();
-        Set<Integer> inProgressMergeParentShardIds = new HashSet<>();
         Set<Integer> activeShardIds = new HashSet<>();
-        Map<Integer, ShardRange[]> rootShards = new HashMap<>();
+        ShardRange[][] rootShardsToAllChildren = null;
         Map<Integer, ShardRange[]> tempShardIdToChildShards = new HashMap<>();
-        Map<Integer, Long> splitCommitTimestamps = new HashMap<>();
         int numberOfRootShards = -1;
-        // `token != null` as well as the END_OBJECT check: at end of input nextToken() returns null
-        // forever, so a blob truncated mid-object would otherwise spin this loop indefinitely.
-        while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
+        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
             if (token == XContentParser.Token.FIELD_NAME) {
                 currentFieldName = parser.currentName();
             } else if (token == XContentParser.Token.VALUE_NUMBER) {
@@ -1081,20 +617,18 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                 }
             } else if (token == XContentParser.Token.START_OBJECT) {
                 if (KEY_ROOT_SHARDS_TO_ALL_CHILDREN.equals(currentFieldName)) {
-                    rootShards = parseShardsMap(parser, KEY_ROOT_SHARDS_TO_ALL_CHILDREN);
+                    Map<Integer, ShardRange[]> rootShards = parseShardsMap(parser);
+                    rootShardsToAllChildren = new ShardRange[numberOfRootShards][];
+                    for (Map.Entry<Integer, ShardRange[]> entry : rootShards.entrySet()) {
+                        rootShardsToAllChildren[entry.getKey()] = entry.getValue();
+                    }
                 } else if (KEY_PARENT_TO_CHILD_SHARDS.equals(currentFieldName)) {
-                    tempShardIdToChildShards = parseShardsMap(parser, KEY_PARENT_TO_CHILD_SHARDS);
-                } else if (KEY_SPLIT_COMMIT_TIMESTAMPS.equals(currentFieldName)) {
-                    splitCommitTimestamps = parseSplitCommitTimestamps(parser);
+                    tempShardIdToChildShards = parseShardsMap(parser);
                 }
             } else if (token == XContentParser.Token.START_ARRAY) {
                 if (KEY_IN_PROGRESS_SPLIT_SHARD_IDS.equals(currentFieldName)) {
                     while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
                         inProgressSplitShardIds.add(parser.intValue());
-                    }
-                } else if (KEY_IN_PROGRESS_MERGE_PARENT_SHARD_IDS.equals(currentFieldName)) {
-                    while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
-                        inProgressMergeParentShardIds.add(parser.intValue());
                     }
                 } else if (KEY_ACTIVE_SHARD_IDS.equals(currentFieldName)) {
                     while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
@@ -1103,136 +637,36 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                 }
             }
         }
-        if (token == null) {
-            throw new IllegalArgumentException("Split shards metadata is truncated");
-        }
-
-        if (numberOfRootShards < 0) {
-            throw new IllegalArgumentException(
-                "Split shards metadata is missing a valid [" + KEY_NUMBER_OF_ROOT_SHARDS + "]: got " + numberOfRootShards
-            );
-        }
-        if (numberOfRootShards > MAX_ROOT_SHARDS) {
-            throw new IllegalArgumentException(
-                "["
-                    + KEY_NUMBER_OF_ROOT_SHARDS
-                    + "] of "
-                    + numberOfRootShards
-                    + " exceeds the maximum supported value of "
-                    + MAX_ROOT_SHARDS
-            );
-        }
-        // maxShardId starts at numberOfRootShards - 1 (Builder(int)) and only ever grows, so
-        // anything below that floor means the blob's own fields disagree with each other.
-        if (maxShardId < numberOfRootShards - 1) {
-            throw new IllegalArgumentException(
-                "["
-                    + KEY_MAX_SHARD_ID
-                    + "] of "
-                    + maxShardId
-                    + " is inconsistent with ["
-                    + KEY_NUMBER_OF_ROOT_SHARDS
-                    + "] of "
-                    + numberOfRootShards
-            );
-        }
-
-        ShardRange[][] rootShardsToAllChildren = new ShardRange[numberOfRootShards][];
-        for (Map.Entry<Integer, ShardRange[]> entry : rootShards.entrySet()) {
-            int rootShardId = entry.getKey();
-            if (rootShardId < 0 || rootShardId >= numberOfRootShards) {
-                throw new IllegalArgumentException(
-                    "["
-                        + KEY_ROOT_SHARDS_TO_ALL_CHILDREN
-                        + "] names root shard "
-                        + rootShardId
-                        + ", which is outside the "
-                        + numberOfRootShards
-                        + " root shard(s) this index has"
-                );
-            }
-            rootShardsToAllChildren[rootShardId] = entry.getValue();
-        }
-        validateRootShardRanges(rootShardsToAllChildren);
 
         return new SplitShardsMetadata(
             rootShardsToAllChildren,
             tempShardIdToChildShards,
             inProgressSplitShardIds,
             activeShardIds,
-            maxShardId,
-            splitCommitTimestamps,
-            inProgressMergeParentShardIds
+            maxShardId
         );
     }
 
-    private static Map<Integer, Long> parseSplitCommitTimestamps(XContentParser parser) throws IOException {
-        XContentParser.Token token;
-        String currentFieldName = null;
-        Map<Integer, Long> timestamps = new HashMap<>();
-        while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
-            if (token == XContentParser.Token.FIELD_NAME) {
-                currentFieldName = parser.currentName();
-            } else if (token == XContentParser.Token.VALUE_NUMBER) {
-                timestamps.put(parseShardIdKey(currentFieldName, KEY_SPLIT_COMMIT_TIMESTAMPS), parser.longValue());
-            }
-        }
-        if (token == null) {
-            throw new IllegalArgumentException("[" + KEY_SPLIT_COMMIT_TIMESTAMPS + "] is truncated");
-        }
-        return timestamps;
-    }
-
-    private static Map<Integer, ShardRange[]> parseShardsMap(XContentParser parser, String key) throws IOException {
+    private static Map<Integer, ShardRange[]> parseShardsMap(XContentParser parser) throws IOException {
         XContentParser.Token token;
         String currentFieldName = null;
         Map<Integer, ShardRange[]> shardsMap = new HashMap<>();
-        while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
+        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
             if (token == XContentParser.Token.FIELD_NAME) {
                 currentFieldName = parser.currentName();
             } else if (token == XContentParser.Token.START_ARRAY) {
-                // The key is read (and rejected if it isn't a real shard id) BEFORE the array is
-                // consumed, so a malformed key fails without first materialising whatever list of
-                // ranges follows it.
-                Integer parentShard = parseShardIdKey(currentFieldName, key);
                 List<ShardRange> childShardRanges = new ArrayList<>();
                 while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
                     ShardRange shardRange = ShardRange.parse(parser);
                     childShardRanges.add(shardRange);
                 }
+                assert currentFieldName != null;
+                Integer parentShard = Integer.parseInt(currentFieldName);
                 shardsMap.put(parentShard, childShardRanges.toArray(new ShardRange[0]));
             }
         }
-        if (token == null) {
-            throw new IllegalArgumentException("[" + key + "] is truncated");
-        }
 
         return shardsMap;
-    }
-
-    /**
-     * Turns one of the shard-id-keyed objects' field names back into a shard id.
-     *
-     * <p>{@code Integer.parseInt} on its own throws a bare {@link NumberFormatException} naming
-     * nothing but the offending string, and accepts negatives that then flow on as array indices or
-     * map keys. Both are wrapped into the same descriptive {@link IllegalArgumentException} the rest
-     * of this class's validation raises, so a malformed blob reports which object it was malformed
-     * in rather than surfacing as an opaque failure.
-     */
-    private static int parseShardIdKey(String fieldName, String key) {
-        if (fieldName == null) {
-            throw new IllegalArgumentException("[" + key + "] has an entry with no field name");
-        }
-        final int shardId;
-        try {
-            shardId = Integer.parseInt(fieldName);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("[" + key + "] has a non-numeric shard id key [" + fieldName + "]", e);
-        }
-        if (shardId < 0) {
-            throw new IllegalArgumentException("[" + key + "] has a negative shard id key [" + fieldName + "]");
-        }
-        return shardId;
     }
 
     public static Diff<SplitShardsMetadata> readDiffFrom(StreamInput in) throws IOException {

@@ -8,7 +8,6 @@
 
 package org.opensearch.cluster.metadata;
 
-import org.opensearch.Version;
 import org.opensearch.cluster.Diff;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.xcontent.json.JsonXContent;
@@ -19,7 +18,6 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.test.OpenSearchTestCase;
 
-import java.io.EOFException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -42,57 +40,8 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(5);
 
         // Test: When there are no children, should return the root shard id
-        int result = builder.build().getShardIdOfHash(0, 100);
+        int result = builder.build().getShardIdOfHash(0, 100, false);
         assertEquals(0, result);
-    }
-
-    public void testGetParentAndRangeOfChild_inProgressSplit() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        List<ShardRange> children = builder.splitShard(0, 2);
-        SplitShardsMetadata metadata = builder.build();
-
-        for (ShardRange child : children) {
-            org.opensearch.common.collect.Tuple<Integer, ShardRange> parentAndRange = metadata.getParentAndRangeOfChild(child.shardId());
-            assertNotNull(parentAndRange);
-            assertEquals(Integer.valueOf(0), parentAndRange.v1());
-            assertEquals(child, parentAndRange.v2());
-        }
-    }
-
-    public void testGetParentAndRangeOfChild_notAChild() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        SplitShardsMetadata metadata = builder.build();
-
-        assertNull(metadata.getParentAndRangeOfChild(1));
-        assertNull(metadata.getParentAndRangeOfChild(999));
-    }
-
-    public void testGetParentAndRangeOfChild_afterCommitReturnsNull() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        List<ShardRange> children = builder.splitShard(0, 2);
-        Set<Integer> childIds = new HashSet<>();
-        children.forEach(c -> childIds.add(c.shardId()));
-        builder.updateSplitMetadataForChildShards(0, childIds);
-        SplitShardsMetadata metadata = builder.build();
-
-        for (ShardRange child : children) {
-            assertNull(
-                "a committed child is no longer resolvable via the in-progress-only lookup",
-                metadata.getParentAndRangeOfChild(child.shardId())
-            );
-        }
-    }
-
-    public void testGetParentAndRangeOfChild_afterCancelReturnsNull() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        List<ShardRange> children = builder.splitShard(0, 2);
-        builder.cancelSplit(0);
-        SplitShardsMetadata metadata = builder.build();
-
-        for (ShardRange child : children) {
-            assertNull(metadata.getParentAndRangeOfChild(child.shardId()));
-        }
     }
 
     public void testGetRootShards_splitInProgress() {
@@ -219,10 +168,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
     }
 
     /**
-     * Tests getShardIdOfHash resolves to a committed child while an in-progress split of that child
-     * is ignored. Routing never targets an in-progress (not-yet-committed) child -- writes stay on
-     * the last committed shard until commit -- so a hash under shard 2's committed range resolves to
-     * shard 2, not to shard 2's still-recovering grandchildren.
+     * Tests getShardIdOfHash when there are existing child shards and in-progress children.
      */
     public void testGetShardIdOfHashWithExistingAndInProgressChildren() {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
@@ -230,33 +176,31 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         builder.splitShard(0, 3);
         builder.updateSplitMetadataForChildShards(0, Set.of(1, 2, 3));
 
-        // Second split - split the middle shard (ID 2), still in progress (not committed)
+        // Second split - split the middle shard (ID 2)
         builder.splitShard(2, 2);
         SplitShardsMetadata metadata = builder.build();
 
-        // Execute - test hash that falls in the range of the committed child shard 2
-        int result = metadata.getShardIdOfHash(0, 500);
+        // Execute - test hash that falls in the range of first child of shard 2
+        int result = metadata.getShardIdOfHash(0, 500, true);
 
-        // Assert - resolves to the committed child, ignoring the in-progress grandchildren
-        assertEquals("Hash should route to committed child, not the in-progress grandchild", 2, result);
+        // Assert - should route to the first child of the in-progress split
+        assertEquals("Hash should route to first child of in-progress split", 5, result);
     }
 
     /**
-     * Test getShardIdOfHash when root shard has no committed children but an in-progress split exists:
-     * routing resolves to the root (parent) shard, since an in-progress split's children are never
-     * routing targets until the split commits.
+     * Test getShardIdOfHash when root shard has no children but in-progress split exists
      */
     public void testGetShardIdOfHashWithInProgressSplit() {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
-        // Setup - split root shard (in progress, not committed)
+        // Setup - split root shard
         builder.splitShard(0, 2);
         SplitShardsMetadata metadata = builder.build();
 
-        // Execute
-        int result = metadata.getShardIdOfHash(0, 100);
+        // Execute - test with hash that should go to second child
+        int result = metadata.getShardIdOfHash(0, 100, true);
 
-        // Verify - resolves to the still-active parent shard, not a recovering child
-        assertEquals("Should route to the parent shard while the split is in progress", 0, result);
+        // Verify - should route to the second child shard
+        assertEquals("Should route to second child shard", 2, result);
     }
 
     /**
@@ -267,8 +211,8 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         builder.splitShard(0, 2);
         SplitShardsMetadata metadata = builder.build();
 
-        // Should return root shard ID while the split is in progress
-        assertEquals(0, metadata.getShardIdOfHash(0, 100));
+        // Should return root shard ID when includeInProgressChildren is false
+        assertEquals(0, metadata.getShardIdOfHash(0, 100, false));
     }
 
     /**
@@ -278,12 +222,13 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         // Arrange
         int rootShardId = 0;
         int hash = 123;
+        boolean includeInProgressChildren = false;
 
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // 1 root shard
         SplitShardsMetadata metadata = builder.build();
 
         // Act
-        int result = metadata.getShardIdOfHash(rootShardId, hash);
+        int result = metadata.getShardIdOfHash(rootShardId, hash, includeInProgressChildren);
 
         // Assert
         assertEquals("Should return the root shard ID when there are no children", rootShardId, result);
@@ -296,6 +241,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         // Setup
         int rootShardId = 0;
         int hash = 500;
+        boolean includeInProgressChildren = true;
 
         // Setup
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
@@ -310,7 +256,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         SplitShardsMetadata metadata = builder.build();
 
         // Execute
-        int result = metadata.getShardIdOfHash(rootShardId, hash);
+        int result = metadata.getShardIdOfHash(rootShardId, hash, includeInProgressChildren);
 
         // Verify
         assertEquals(2, result);
@@ -507,130 +453,6 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         // Verify the split was canceled
         assertTrue(metadata.getInProgressSplitShardIds().isEmpty());
         assertNull(metadata.getChildShardsOfParent(sourceShardId));
-    }
-
-    /**
-     * mergeChildrenBackToParent reverses an already-committed, flat (non-nested) split: the parent
-     * shard becomes active again, both children become inactive, and the root reverts to its
-     * pre-split (null) state -- dynamic-partitioning-plan.md Phase 2 item 2.1's first increment.
-     */
-    public void testMergeChildrenBackToParentReversesACommittedSplit() {
-        int numberOfShards = 3;
-        int parentShardId = 0;
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(numberOfShards);
-        List<ShardRange> children = builder.splitShard(parentShardId, 2);
-        Set<Integer> childIds = new HashSet<>();
-        children.forEach(c -> childIds.add(c.shardId()));
-        builder.updateSplitMetadataForChildShards(parentShardId, childIds);
-
-        builder.mergeChildrenBackToParent(parentShardId);
-        SplitShardsMetadata metadata = builder.build();
-
-        Set<Integer> activeShardIds = new HashSet<>();
-        metadata.getActiveShardIterator().forEachRemaining(activeShardIds::add);
-        assertTrue("the parent shard must be active again after the merge", activeShardIds.contains(parentShardId));
-        for (Integer childId : childIds) {
-            assertFalse("a merged-away child must no longer be active", activeShardIds.contains(childId));
-        }
-        assertNull("the root must revert to its pre-split (unsplit) state", metadata.getChildShardsOfParent(parentShardId));
-        assertEquals(numberOfShards, metadata.getNumberOfShards());
-    }
-
-    /**
-     * The nested case is a deliberate, documented scope boundary (dynamic-partitioning-progress.md's
-     * "Phase 2 item 2.1" entry): if one of the parent's direct children has itself been split
-     * further, {@code mergeChildrenBackToParent} must reject the merge with a clear error rather than
-     * silently reversing only the top level and leaving the grandchildren's ranges orphaned from any
-     * still-active parent range.
-     */
-    public void testMergeChildrenBackToParentRejectsWhenAChildHasBeenSplitFurther() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(1, 2));
-
-        // Split one of the two children further -- now shard 1 has its own children (3, 4), so
-        // reversing shard 0's split can no longer simply reactivate shards 1 and 2.
-        builder.splitShard(1, 2);
-        builder.updateSplitMetadataForChildShards(1, Set.of(3, 4));
-
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(0));
-        assertTrue(
-            "must name the child that was split further and explain nested merge isn't supported, got: " + e.getMessage(),
-            e.getMessage().contains("Child shard [1]") && e.getMessage().contains("nested in-place merge is not supported")
-        );
-
-        // Nothing must have been mutated by the rejected attempt: shard 0 is still split, and both
-        // levels of the split remain intact exactly as before the rejected call.
-        SplitShardsMetadata metadata = builder.build();
-        assertTrue("shard 0 must still be reported as split", metadata.isSplitOfShardInProgress(0) || metadata.isSplitParent(0));
-        assertNotNull("shard 0's children must be unaffected by the rejected merge attempt", metadata.getChildShardsOfParent(0));
-        assertNotNull("shard 1's own children must be unaffected by the rejected merge attempt", metadata.getChildShardsOfParent(1));
-    }
-
-    /**
-     * Once merged back, the parent's own hash range must resolve to itself again -- the same
-     * pre-split behavior getShardIdOfHash was already written to handle, requiring zero routing
-     * code changes (see dynamic-partitioning-progress.md's "Phase 2 item 2.1" entry).
-     */
-    public void testGetShardIdOfHashResolvesToParentAfterMerge() {
-        int numberOfShards = 3;
-        int parentShardId = 0;
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(numberOfShards);
-        List<ShardRange> children = builder.splitShard(parentShardId, 2);
-        Set<Integer> childIds = new HashSet<>();
-        children.forEach(c -> childIds.add(c.shardId()));
-        builder.updateSplitMetadataForChildShards(parentShardId, childIds);
-        builder.mergeChildrenBackToParent(parentShardId);
-        SplitShardsMetadata metadata = builder.build();
-
-        for (ShardRange formerChild : children) {
-            assertEquals(
-                "every hash formerly owned by a merged-away child must resolve back to the parent",
-                parentShardId,
-                metadata.getShardIdOfHash(parentShardId, formerChild.start())
-            );
-        }
-    }
-
-    public void testMergeChildrenBackToParentRejectsAnInProgressSplit() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-
-        expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(0));
-    }
-
-    public void testMergeChildrenBackToParentRejectsAnUnsplitShard() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-
-        expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(1));
-    }
-
-    public void testMergeChildrenBackToParentRejectsANonRootShardId() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        List<ShardRange> children = builder.splitShard(0, 2);
-        Set<Integer> childIds = new HashSet<>();
-        children.forEach(c -> childIds.add(c.shardId()));
-        builder.updateSplitMetadataForChildShards(0, childIds);
-
-        // A committed child's shard id is >= numberOfShards, deliberately outside
-        // rootShardsToAllChildren's own [0, numberOfShards) index range.
-        int aChildShardId = childIds.iterator().next();
-        expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(aChildShardId));
-    }
-
-    public void testMergeChildrenBackToParentRejectsAFurtherSplitChild() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        List<ShardRange> children = builder.splitShard(0, 2);
-        Set<Integer> childIds = new HashSet<>();
-        children.forEach(c -> childIds.add(c.shardId()));
-        builder.updateSplitMetadataForChildShards(0, childIds);
-
-        // Split one of the two children further -- it's no longer a simple, unsplit leaf, so the
-        // parent's children no longer form a flat, mergeable partition.
-        int aChildShardId = childIds.iterator().next();
-        builder.splitShard(aChildShardId, 2);
-
-        expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(0));
     }
 
     /**
@@ -893,7 +715,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
                 builder = new SplitShardsMetadata.Builder(metadata);
                 int splittingShard = activeAndNotInProgress.get(randomIntBetween(0, activeAndNotInProgress.size() - 1));
 
-                int numberOfChildren = randomIntBetween(2, 50);
+                int numberOfChildren = randomIntBetween(1, 50);
                 List<ShardRange> childShardRanges;
                 try {
                     childShardRanges = builder.splitShard(splittingShard, numberOfChildren);
@@ -1035,18 +857,6 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         assertTrue(exception.getMessage().contains("Cannot split shard [0] further."));
     }
 
-    public void testSplitShardRejectsFewerThanTwoChildren() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1);
-        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> { builder.splitShard(0, 1); });
-        assertTrue(exception.getMessage().contains("Cannot split shard [0] into fewer than 2 children."));
-    }
-
-    public void testSplitShardRejectsZeroChildren() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1);
-        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> { builder.splitShard(0, 0); });
-        assertTrue(exception.getMessage().contains("Cannot split shard [0] into fewer than 2 children."));
-    }
-
     public void testSplitInvalidShardId() {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1);
         IllegalArgumentException exception = assertThrows(
@@ -1117,7 +927,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         long childShardRangeDiff = Math.abs((long) parentRange.end() - parentRange.start() + 1) / 3;
         int hashInFirstThird = parentRange.start() + (int) childShardRangeDiff - 1;
 
-        assertEquals("Hash should route to first child of nested split", 3, metadata.getShardIdOfHash(0, hashInFirstThird));
+        assertEquals("Hash should route to first child of nested split", 3, metadata.getShardIdOfHash(0, hashInFirstThird, true));
     }
 
     public void testHashCodeAndEquals() {
@@ -1432,230 +1242,6 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         }
     }
 
-    public void testSplitCommitTimestampAbsentBeforeCommit() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        SplitShardsMetadata inProgress = builder.build();
-        // A split reserved but not yet committed has no recorded commit timestamp.
-        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, inProgress.getSplitCommitTimestamp(0));
-    }
-
-    public void testSplitCommitTimestampAbsentForNonSplitShard() {
-        SplitShardsMetadata metadata = new SplitShardsMetadata.Builder(3).build();
-        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, metadata.getSplitCommitTimestamp(0));
-        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, metadata.getSplitCommitTimestamp(999));
-    }
-
-    public void testSplitCommitTimestampRecordedOnCommit() {
-        long committedAt = 1_700_000_000_000L;
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
-        SplitShardsMetadata committed = builder.build();
-        assertEquals(committedAt, committed.getSplitCommitTimestamp(0));
-    }
-
-    public void testSplitCommitTimestampNoTimestampOverloadRecordsNone() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4)); // no-timestamp overload
-        SplitShardsMetadata committed = builder.build();
-        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, committed.getSplitCommitTimestamp(0));
-    }
-
-    public void testSplitCommitTimestampClearedOnMergeBack() {
-        long committedAt = 1_700_000_000_000L;
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
-        builder.mergeChildrenBackToParent(0);
-        SplitShardsMetadata merged = builder.build();
-        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, merged.getSplitCommitTimestamp(0));
-    }
-
-    public void testStreamSerdeSplitCommitTimestampRoundTrip() throws IOException {
-        long committedAt = 1_700_000_000_000L;
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
-        SplitShardsMetadata original = builder.build();
-
-        SplitShardsMetadata deserialized = streamRoundTrip(original);
-        assertEquals(original, deserialized);
-        assertEquals(committedAt, deserialized.getSplitCommitTimestamp(0));
-    }
-
-    public void testXContentSerdeSplitCommitTimestampRoundTrip() throws IOException {
-        long committedAt = 1_700_000_000_000L;
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
-        SplitShardsMetadata original = builder.build();
-
-        SplitShardsMetadata deserialized = xContentRoundTrip(original);
-        assertEquals(original, deserialized);
-        assertEquals(committedAt, deserialized.getSplitCommitTimestamp(0));
-    }
-
-    public void testStreamSerdePreV380DropsSplitCommitTimestamp() throws IOException {
-        long committedAt = 1_700_000_000_000L;
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
-        SplitShardsMetadata original = builder.build();
-
-        // Serialize as if writing to a pre-V_3_8_0 peer: the timestamp field must not be written, and a
-        // matching-version read must come back with no recorded timestamp rather than a corrupt stream.
-        BytesStreamOutput out = new BytesStreamOutput();
-        out.setVersion(Version.V_3_7_0);
-        original.writeTo(out);
-        try (StreamInput in = out.bytes().streamInput()) {
-            in.setVersion(Version.V_3_7_0);
-            SplitShardsMetadata deserialized = new SplitShardsMetadata(in);
-            assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, deserialized.getSplitCommitTimestamp(0));
-        }
-    }
-
-    // --- two-phase in-place merge: pending-merge state (start / commit / cancel) ---
-
-    /** Phase 1 (start): marks the merge pending without destroying anything -- children stay recorded. */
-    public void testStartMergeMarksPendingWithoutRemovingChildren() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
-        builder.startMergeChildrenToParent(0);
-        SplitShardsMetadata pending = builder.build();
-
-        assertTrue("merge must be pending", pending.isMergeOfShardInProgress(0));
-        assertEquals(Set.of(0), pending.getInProgressMergeParentShardIds());
-        // Nothing destroyed: parent is still a split parent, children still recorded and range-owning.
-        assertTrue(pending.isSplitParent(0));
-        assertEquals(Set.of(3, 4), pending.getChildShardIdsOfParent(0));
-        assertTrue("root hash still resolves to a child", Set.of(3, 4).contains(pending.getShardIdOfHash(0, randomInt())));
-        // Children are flagged as in-progress-merge children (for the write guard).
-        assertTrue(pending.isChildOfInProgressMerge(3));
-        assertTrue(pending.isChildOfInProgressMerge(4));
-        assertFalse(pending.isChildOfInProgressMerge(0));
-    }
-
-    /** Phase 2 (commit): mergeChildrenBackToParent finalizes and clears the pending marker. */
-    public void testCommitPendingMergeRemovesChildrenAndClearsMarker() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
-        builder.startMergeChildrenToParent(0);
-        builder.mergeChildrenBackToParent(0);
-        SplitShardsMetadata committed = builder.build();
-
-        assertFalse("pending marker cleared on commit", committed.isMergeOfShardInProgress(0));
-        assertFalse("parent no longer a split parent", committed.isSplitParent(0));
-        assertEquals(0, committed.getChildShardIdsOfParent(0).size());
-        assertEquals(0, committed.getShardIdOfHash(0, randomInt()));
-        assertFalse(committed.isChildOfInProgressMerge(3));
-    }
-
-    /** Phase 2 (cancel/rollback): cancelMerge clears only the marker, leaving the split fully intact. */
-    public void testCancelPendingMergeRestoresChildrenExactly() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
-        SplitShardsMetadata beforeMerge = new SplitShardsMetadata.Builder(builder.build()).build();
-
-        builder.startMergeChildrenToParent(0);
-        builder.cancelMerge(0);
-        SplitShardsMetadata rolledBack = builder.build();
-
-        assertFalse("pending marker cleared on cancel", rolledBack.isMergeOfShardInProgress(0));
-        // The rolled-back metadata is identical to the pre-merge metadata -- a lossless rollback.
-        assertEquals(beforeMerge, rolledBack);
-        assertTrue(rolledBack.isSplitParent(0));
-        assertEquals(Set.of(3, 4), rolledBack.getChildShardIdsOfParent(0));
-        assertTrue("children serve the range again", Set.of(3, 4).contains(rolledBack.getShardIdOfHash(0, randomInt())));
-    }
-
-    public void testStartMergeRejectsAlreadyPendingMerge() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
-        builder.startMergeChildrenToParent(0);
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.startMergeChildrenToParent(0));
-        assertTrue(e.getMessage().contains("already in progress"));
-    }
-
-    public void testStartMergeRejectsNeverSplitParent() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.startMergeChildrenToParent(0));
-        assertTrue(e.getMessage().contains("has not been split"));
-    }
-
-    /**
-     * Regression test: canMergeChildrenBackToParent exists specifically so a caller (e.g. an
-     * automatic merge-trigger policy) can screen a candidate parent without provoking
-     * startMergeChildrenToParent's own IllegalArgumentException. Once a merge is already pending
-     * for a parent, that primitive throws ("already in progress") -- the screening predicate must
-     * therefore also report false for that same parent, or a caller relying on it as a pre-check
-     * would call straight into the exception it exists to let them avoid.
-     */
-    public void testCanMergeChildrenBackToParentIsFalseOnceAMergeIsPending() {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
-        assertTrue("mergeable before any merge is started", builder.build().canMergeChildrenBackToParent(0));
-
-        builder.startMergeChildrenToParent(0);
-        SplitShardsMetadata pending = builder.build();
-
-        assertFalse("must not report mergeable while a merge is already pending", pending.canMergeChildrenBackToParent(0));
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> new SplitShardsMetadata.Builder(pending).startMergeChildrenToParent(0)
-        );
-        assertTrue(e.getMessage().contains("already in progress"));
-    }
-
-    public void testStreamSerdePendingMergeRoundTrip() throws IOException {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
-        builder.startMergeChildrenToParent(0);
-        SplitShardsMetadata original = builder.build();
-
-        SplitShardsMetadata deserialized = streamRoundTrip(original);
-        assertEquals(original, deserialized);
-        assertTrue(deserialized.isMergeOfShardInProgress(0));
-        assertEquals(Set.of(0), deserialized.getInProgressMergeParentShardIds());
-    }
-
-    public void testXContentSerdePendingMergeRoundTrip() throws IOException {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
-        builder.startMergeChildrenToParent(0);
-        SplitShardsMetadata original = builder.build();
-
-        SplitShardsMetadata deserialized = xContentRoundTrip(original);
-        assertEquals(original, deserialized);
-        assertTrue(deserialized.isMergeOfShardInProgress(0));
-    }
-
-    public void testStreamSerdePreV380DropsPendingMergeMarker() throws IOException {
-        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
-        builder.splitShard(0, 2);
-        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
-        builder.startMergeChildrenToParent(0);
-        SplitShardsMetadata original = builder.build();
-
-        BytesStreamOutput out = new BytesStreamOutput();
-        out.setVersion(Version.V_3_7_0);
-        original.writeTo(out);
-        try (StreamInput in = out.bytes().streamInput()) {
-            in.setVersion(Version.V_3_7_0);
-            SplitShardsMetadata deserialized = new SplitShardsMetadata(in);
-            assertFalse("pending-merge marker must not survive a pre-V_3_8_0 round trip", deserialized.isMergeOfShardInProgress(0));
-            assertTrue(deserialized.getInProgressMergeParentShardIds().isEmpty());
-        }
-    }
-
     private SplitShardsMetadata streamRoundTrip(SplitShardsMetadata original) throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
         original.writeTo(out);
@@ -1674,175 +1260,4 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         }
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Deserialization hardening. Both read paths bypass Builder entirely, so until this pass
-    // neither ran any of the invariants Builder enforces on every mutation. That mattered on the
-    // document-routing hot path: getShardIdOfHash binary-searches a root's child ranges and its
-    // only protection against a hash falling into a gap was a bare `assert`, disabled in
-    // production -- so a single crafted or corrupt custom NPE'd routing on every node that applied
-    // it. These tests build states Builder can never produce (via the package-private constructor)
-    // and prove both read paths now refuse them.
-    // ---------------------------------------------------------------------------------------
-
-    /** A root whose children leave hashes 101..199 owned by nobody -- exactly the routing-NPE shape. */
-    private static SplitShardsMetadata metadataWithGappedChildRanges() {
-        ShardRange[][] roots = new ShardRange[1][];
-        roots[0] = new ShardRange[] { new ShardRange(1, Integer.MIN_VALUE, 100), new ShardRange(2, 200, Integer.MAX_VALUE) };
-        return new SplitShardsMetadata(roots, new HashMap<>(), new HashSet<>(), new HashSet<>(Arrays.asList(1, 2)), 2);
-    }
-
-    /** A root whose children both claim hashes 50..100. */
-    private static SplitShardsMetadata metadataWithOverlappingChildRanges() {
-        ShardRange[][] roots = new ShardRange[1][];
-        roots[0] = new ShardRange[] { new ShardRange(1, Integer.MIN_VALUE, 100), new ShardRange(2, 50, Integer.MAX_VALUE) };
-        return new SplitShardsMetadata(roots, new HashMap<>(), new HashSet<>(), new HashSet<>(Arrays.asList(1, 2)), 2);
-    }
-
-    public void testStreamReadRejectsGappedChildRanges() throws IOException {
-        BytesStreamOutput out = new BytesStreamOutput();
-        metadataWithGappedChildRanges().writeTo(out);
-
-        try (StreamInput in = out.bytes().streamInput()) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> new SplitShardsMetadata(in));
-            assertTrue(e.getMessage(), e.getMessage().contains("is missing from the list of shard ranges"));
-        }
-    }
-
-    public void testStreamReadRejectsOverlappingChildRanges() throws IOException {
-        BytesStreamOutput out = new BytesStreamOutput();
-        metadataWithOverlappingChildRanges().writeTo(out);
-
-        try (StreamInput in = out.bytes().streamInput()) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> new SplitShardsMetadata(in));
-            assertTrue(e.getMessage(), e.getMessage().contains("Shard range overlap"));
-        }
-    }
-
-    public void testXContentParseRejectsGappedChildRanges() throws IOException {
-        XContentBuilder builder = JsonXContent.contentBuilder();
-        builder.startObject();
-        metadataWithGappedChildRanges().toXContent(builder, ToXContent.EMPTY_PARAMS);
-        builder.endObject();
-
-        try (XContentParser parser = createParser(JsonXContent.jsonXContent, BytesReference.bytes(builder))) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
-            assertTrue(e.getMessage(), e.getMessage().contains("is missing from the list of shard ranges"));
-        }
-    }
-
-    public void testXContentParseRejectsOverlappingChildRanges() throws IOException {
-        XContentBuilder builder = JsonXContent.contentBuilder();
-        builder.startObject();
-        metadataWithOverlappingChildRanges().toXContent(builder, ToXContent.EMPTY_PARAMS);
-        builder.endObject();
-
-        try (XContentParser parser = createParser(JsonXContent.jsonXContent, BytesReference.bytes(builder))) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
-            assertTrue(e.getMessage(), e.getMessage().contains("Shard range overlap"));
-        }
-    }
-
-    /**
-     * The root-shard count used to be a raw vint sizing {@code new ShardRange[n][]} <em>before</em>
-     * a single element byte was consumed, so five bytes could demand a multi-gigabyte array. The
-     * guarded read now bounds the claimed count by the bytes that could possibly back it.
-     */
-    public void testStreamReadRejectsAnImpossiblyLargeRootShardCountBeforeAllocating() throws IOException {
-        BytesStreamOutput out = new BytesStreamOutput();
-        out.writeVInt(1_000_000_000);
-
-        try (StreamInput in = out.bytes().streamInput()) {
-            expectThrows(EOFException.class, () -> new SplitShardsMetadata(in));
-        }
-    }
-
-    public void testStreamReadRejectsANegativeRootShardCount() throws IOException {
-        BytesStreamOutput out = new BytesStreamOutput();
-        // A five-byte vint whose decoded value is negative -- writeVInt itself never emits this.
-        out.writeByte((byte) 0x80);
-        out.writeByte((byte) 0x80);
-        out.writeByte((byte) 0x80);
-        out.writeByte((byte) 0x80);
-        out.writeByte((byte) 0x08);
-
-        try (StreamInput in = out.bytes().streamInput()) {
-            expectThrows(Exception.class, () -> new SplitShardsMetadata(in));
-        }
-    }
-
-    /**
-     * Field-order independence. {@code root_shards_to_all_children} arriving before {@code
-     * num_of_root_shards} used to size the root array from the {@code -1} initial value and die
-     * with a bare {@link NegativeArraySizeException}; JSON object members carry no ordering
-     * guarantee, so that was a real blob shape, not a hypothetical one.
-     */
-    public void testXContentParseIsIndependentOfFieldOrder() throws IOException {
-        String json = "{\"root_shards_to_all_children\":{\"0\":["
-            + "{\"shard_id\":1,\"start\":-2147483648,\"end\":0},"
-            + "{\"shard_id\":2,\"start\":1,\"end\":2147483647}]},"
-            + "\"num_of_root_shards\":1,\"max_shard_id\":2,"
-            + "\"active_shard_ids\":[1,2],\"parent_to_child_shards\":{}}";
-
-        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
-            SplitShardsMetadata parsed = SplitShardsMetadata.parse(parser);
-            assertEquals(1, parsed.getNumberOfRootShards());
-            assertEquals(1, parsed.getShardIdOfHash(0, -5));
-            assertEquals(2, parsed.getShardIdOfHash(0, 5));
-        }
-    }
-
-    public void testXContentParseRejectsAMissingRootShardCount() throws IOException {
-        String json = "{\"max_shard_id\":2,\"active_shard_ids\":[0],\"root_shards_to_all_children\":{},\"parent_to_child_shards\":{}}";
-
-        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
-            assertTrue(e.getMessage(), e.getMessage().contains("num_of_root_shards"));
-        }
-    }
-
-    /** The count has no stream length to bound it here, so it needs its own explicit ceiling. */
-    public void testXContentParseRejectsAnImpossiblyLargeRootShardCount() throws IOException {
-        String json = "{\"num_of_root_shards\":2000000,\"max_shard_id\":0,\"active_shard_ids\":[0],"
-            + "\"root_shards_to_all_children\":{},\"parent_to_child_shards\":{}}";
-
-        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
-            assertTrue(e.getMessage(), e.getMessage().contains("exceeds the maximum"));
-        }
-    }
-
-    /** A root-shard key is an index into the root array, so it must be inside it. */
-    public void testXContentParseRejectsARootShardKeyOutsideTheTable() throws IOException {
-        String json = "{\"num_of_root_shards\":1,\"max_shard_id\":5,\"active_shard_ids\":[0],"
-            + "\"root_shards_to_all_children\":{\"5\":[{\"shard_id\":1,\"start\":-2147483648,\"end\":2147483647}]},"
-            + "\"parent_to_child_shards\":{}}";
-
-        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
-            assertTrue(e.getMessage(), e.getMessage().contains("outside the"));
-        }
-    }
-
-    /** {@code Integer.parseInt} on a field name used to surface as a bare NumberFormatException. */
-    public void testXContentParseRejectsANonNumericShardIdKeyWithAClearMessage() throws IOException {
-        String json = "{\"num_of_root_shards\":1,\"max_shard_id\":2,\"active_shard_ids\":[0],"
-            + "\"root_shards_to_all_children\":{\"not-a-number\":[{\"shard_id\":1,\"start\":-2147483648,\"end\":2147483647}]},"
-            + "\"parent_to_child_shards\":{}}";
-
-        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
-            assertTrue(e.getMessage(), e.getMessage().contains("non-numeric shard id key"));
-        }
-    }
-
-    /** {@code max_shard_id} starts at {@code numberOfRootShards - 1} and only ever grows. */
-    public void testXContentParseRejectsAMaxShardIdInconsistentWithTheRootShardCount() throws IOException {
-        String json = "{\"num_of_root_shards\":4,\"max_shard_id\":0,\"active_shard_ids\":[0],"
-            + "\"root_shards_to_all_children\":{},\"parent_to_child_shards\":{}}";
-
-        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
-            assertTrue(e.getMessage(), e.getMessage().contains("is inconsistent with"));
-        }
-    }
 }

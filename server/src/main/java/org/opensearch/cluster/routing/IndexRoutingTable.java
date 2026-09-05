@@ -129,22 +129,15 @@ public class IndexRoutingTable extends AbstractDiffable<IndexRoutingTable>
             throw new IllegalStateException(index.getName() + " exists in routing but does not exist in metadata with the same uuid");
         }
 
-        // Check every base shard (< numberOfShards) has a routing entry, unless it's a legitimate
-        // in-place split parent -- its own IndexShardRoutingTable is deliberately retired once its
-        // children are all STARTED (MetadataInPlaceSplitShardCommitService#applyCommit), replaced by
-        // real entries for its child shard ids, which live at indices >= numberOfShards by design
-        // (see IndexMetadata#inSyncAllocationIds's javadoc) and are therefore not otherwise covered by
-        // this loop.
-        Set<Integer> expected = new HashSet<>();
-        for (int i = 0; i < indexMetadata.getNumberOfShards(); i++) {
-            if (indexMetadata.getSplitShardsMetadata().isSplitParent(i) == false) {
+        // check the number of shards
+        if (indexMetadata.getNumberOfShards() != shards().size()) {
+            Set<Integer> expected = new HashSet<>();
+            for (int i = 0; i < indexMetadata.getNumberOfShards(); i++) {
                 expected.add(i);
             }
-        }
-        for (IndexShardRoutingTable indexShardRoutingTable : this) {
-            expected.remove(indexShardRoutingTable.shardId().id());
-        }
-        if (expected.isEmpty() == false) {
+            for (IndexShardRoutingTable indexShardRoutingTable : this) {
+                expected.remove(indexShardRoutingTable.shardId().id());
+            }
             throw new IllegalStateException("Wrong number of shards in routing table, missing: " + expected);
         }
 

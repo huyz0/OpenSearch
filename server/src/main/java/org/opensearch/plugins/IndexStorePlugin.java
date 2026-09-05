@@ -43,7 +43,6 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.ShardLock;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
-import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.store.IndexStoreListener;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.store.remote.filecache.FileCache;
@@ -79,24 +78,6 @@ public interface IndexStorePlugin {
          * @throws IOException if an IOException occurs while opening the directory
          */
         Directory newDirectory(IndexSettings indexSettings, ShardPath shardPath) throws IOException;
-
-        /**
-         * Same as {@link #newDirectory(IndexSettings, ShardPath)}, but also given the {@link ShardRouting}
-         * of the specific shard copy being created, so an implementation can pick a different directory
-         * depending on the copy's role (e.g. a read-only, remote-backed directory for a search-only
-         * replica vs. a normal writable one for a primary) -- the same per-copy differentiation
-         * {@link EnginePlugin#getEngineFactory(IndexSettings, ShardRouting)} already provides for engines.
-         * Defaults to delegating to the two-argument overload, so every existing {@link DirectoryFactory}
-         * keeps its current behavior unchanged; only an implementation that wants per-copy behavior needs
-         * to override this one instead.
-         *
-         * @param shardRouting the routing of the specific shard copy being created, or {@code null} if
-         *                      not available to the caller
-         */
-        default Directory newDirectory(IndexSettings indexSettings, ShardPath shardPath, @Nullable ShardRouting shardRouting)
-            throws IOException {
-            return newDirectory(indexSettings, shardPath);
-        }
 
         Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException;
     }
@@ -237,25 +218,6 @@ public interface IndexStorePlugin {
      */
     @ExperimentalApi
     default Map<String, StoreFactory> getStoreFactories() {
-        return Collections.emptyMap();
-    }
-
-    /**
-     * The {@link ShardRecoveryStrategy} mappings for this plugin: how a shard's local store gets populated during
-     * recovery, and what is authoritative once it is. When an index is created the strategy setting
-     * {@link org.opensearch.index.IndexModule#INDEX_RECOVERY_STRATEGY_SETTING} on the index will be examined and
-     * either use the built-in {@link ShardRecoveryStrategy#LOCAL_LUCENE} strategy or one looked up among all the
-     * strategies from {@link IndexStorePlugin} plugins.
-     *
-     * <p>This lives here, alongside {@link #getDirectoryFactories()}/{@link #getStoreFactories()}/
-     * {@link #getRecoveryStateFactories()}, because it answers the same question they do -- where this shard's bytes
-     * come from -- one step further out: those three decide how the store is opened and accounted for, this one
-     * decides how it gets filled and who owns its durability.
-     *
-     * @return a map from strategy name to a shard recovery strategy
-     */
-    @ExperimentalApi
-    default Map<String, ShardRecoveryStrategy> getShardRecoveryStrategies() {
         return Collections.emptyMap();
     }
 }

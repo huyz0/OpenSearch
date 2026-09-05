@@ -85,8 +85,6 @@ import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
 import org.opensearch.cluster.metadata.MetadataCreateIndexService;
-import org.opensearch.cluster.metadata.MetadataInPlaceMergeShardCommitService;
-import org.opensearch.cluster.metadata.MetadataInPlaceSplitShardCommitService;
 import org.opensearch.cluster.metadata.MetadataIndexUpgradeService;
 import org.opensearch.cluster.metadata.SystemIndexMetadataUpgradeService;
 import org.opensearch.cluster.metadata.TemplateUpgradeService;
@@ -177,7 +175,6 @@ import org.opensearch.index.mapper.MappingTransformerRegistry;
 import org.opensearch.index.recovery.RemoteStoreRestoreService;
 import org.opensearch.index.remote.RemoteIndexPathUploader;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
-import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.store.DefaultCompositeDirectoryFactory;
 import org.opensearch.index.store.DefaultDataFormatAwareStoreDirectoryFactory;
 import org.opensearch.index.store.IndexStoreListener;
@@ -1008,9 +1005,8 @@ public class Node implements Closeable {
 
             // collect engine factory providers from plugins
             final Collection<EnginePlugin> enginePlugins = pluginsService.filterPlugins(EnginePlugin.class);
-            final Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders = enginePlugins
-                .stream()
-                .map(plugin -> (BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>) plugin::getEngineFactory)
+            final Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders = enginePlugins.stream()
+                .map(plugin -> (Function<IndexSettings, Optional<EngineFactory>>) plugin::getEngineFactory)
                 .collect(Collectors.toList());
 
             // collect ingestion consumer factory providers from plugins
@@ -1101,25 +1097,6 @@ public class Node implements Closeable {
                 .flatMap(m -> m.entrySet().stream())
                 .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 
-            // Core seeds its own local-lucene strategy into the very map plugins contribute to, then merges
-            // plugin contributions on top with a duplicate-name check -- the same shape RepositoriesModule uses
-            // for the fs repository and ClusterModule for the balanced allocator. A plugin claiming a name core
-            // (or another plugin) already owns fails the node at startup rather than silently winning the map.
-            final Map<String, ShardRecoveryStrategy> shardRecoveryStrategies = IndexModule.createBuiltInShardRecoveryStrategies();
-            for (IndexStorePlugin indexStorePlugin : pluginsService.filterPlugins(IndexStorePlugin.class)) {
-                for (Map.Entry<String, ShardRecoveryStrategy> entry : indexStorePlugin.getShardRecoveryStrategies().entrySet()) {
-                    if (shardRecoveryStrategies.put(entry.getKey(), entry.getValue()) != null) {
-                        throw new IllegalArgumentException(
-                            "ShardRecoveryStrategy ["
-                                + entry.getKey()
-                                + "] from ["
-                                + indexStorePlugin.getClass().getName()
-                                + "] was already defined"
-                        );
-                    }
-                }
-            }
-
             final RerouteService rerouteService = new BatchedRerouteService(clusterService, clusterModule.getAllocationService()::reroute);
             rerouteServiceReference.set(rerouteService);
             clusterService.setRerouteService(rerouteService);
@@ -1179,7 +1156,6 @@ public class Node implements Closeable {
                 searchModule.getValuesSourceRegistry(),
                 recoveryStateFactories,
                 storeFactories,
-                Map.copyOf(shardRecoveryStrategies),
                 remoteDirectoryFactory,
                 repositoriesServiceReference::get,
                 searchRequestStats,
@@ -1829,27 +1805,6 @@ public class Node implements Closeable {
             resourcesToClose.add(persistentTasksClusterService);
             final PersistentTasksService persistentTasksService = new PersistentTasksService(clusterService, threadPool, client);
 
-            // Finalizes or aborts in-place shard splits once their child shards converge -- see
-            // MetadataInPlaceSplitShardCommitService's javadoc for why this can't reuse
-            // PersistentTasksClusterService itself despite the similar shape.
-            new MetadataInPlaceSplitShardCommitService(settings, clusterService);
-
-            // Surfaces a revived in-place-merge parent that exhausted its allocation retries as a loud,
-            // operator-actionable warning (merge has no automatic rollback yet -- see the service's javadoc).
-            new MetadataInPlaceMergeShardCommitService(settings, clusterService);
-
-            // The service TransportInPlaceSplitShardAction actually calls to trigger a split --
-            // previously constructed nowhere, making the whole in-place split feature unreachable
-            // from any user-facing API despite MetadataInPlaceSplitShardService itself existing.
-            final org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService metadataInPlaceSplitShardService =
-                new org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService(clusterService, clusterModule.getAllocationService());
-
-            // The service TransportInPlaceMergeShardAction calls to reverse a split in place -- the
-            // merge counterpart of metadataInPlaceSplitShardService above, likewise previously
-            // constructed nowhere, so the whole in-place merge feature was unreachable from any API.
-            final org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService metadataInPlaceMergeShardService =
-                new org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService(clusterService, clusterModule.getAllocationService());
-
             mergedSegmentWarmerFactory = new MergedSegmentWarmerFactory(transportService, recoverySettings, clusterService);
 
             final MappingTransformerRegistry mappingTransformerRegistry = new MappingTransformerRegistry(mapperPlugins, xContentRegistry);
@@ -1899,8 +1854,6 @@ public class Node implements Closeable {
                 }
                 b.bind(AliasValidator.class).toInstance(aliasValidator);
                 b.bind(MetadataCreateIndexService.class).toInstance(metadataCreateIndexService);
-                b.bind(org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService.class).toInstance(metadataInPlaceSplitShardService);
-                b.bind(org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService.class).toInstance(metadataInPlaceMergeShardService);
                 b.bind(AwarenessReplicaBalance.class).toInstance(awarenessReplicaBalance);
                 b.bind(MetadataCreateDataStreamService.class).toInstance(metadataCreateDataStreamService);
                 b.bind(ViewService.class).toInstance(viewService);

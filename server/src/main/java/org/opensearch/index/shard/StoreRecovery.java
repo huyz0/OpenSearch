@@ -63,7 +63,6 @@ import org.opensearch.index.remote.RemoteStorePathStrategy;
 import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.snapshots.IndexShardRestoreFailedException;
-import org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot;
 import org.opensearch.index.snapshots.blobstore.RemoteStoreShardShallowCopySnapshot;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
@@ -87,7 +86,6 @@ import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -378,115 +376,6 @@ final class StoreRecovery {
             }
         } catch (Exception e) {
             listener.onFailure(e);
-        }
-    }
-
-    /**
-     * Restores this shard from a snapshot, probing first for an engine-native snapshot pointer
-     * (one written by {@link org.opensearch.index.engine.Engine#attemptEngineNativeSnapshot})
-     * before falling back unmodified to {@link #recoverFromRepository}.
-     *
-     * <p>Deliberately a runtime probe rather than a persisted, pre-decided flag on {@code
-     * SnapshotInfo}/{@code SnapshotRecoverySource} (the shape {@code remoteStoreIndexShallowCopy}
-     * uses): that shape decides ahead of snapshot-finalize time, from a static repository setting,
-     * which would need giving {@code SnapshotsService} a new dependency on {@code EnginePlugin} to
-     * resolve whether an index's engine supports this ahead of any shard actually being
-     * snapshotted -- a materially bigger change than this seam needs. A cheap blob-existence check
-     * at restore time, mirroring the same probe {@link
-     * org.opensearch.repositories.blobstore.BlobStoreRepository#loadShardSnapshot(org.opensearch.common.blobstore.BlobContainer, org.opensearch.snapshots.SnapshotId)}
-     * already does internally for classic vs. shallow-copy, avoids that entirely.
-     *
-     * @param indexShard the index shard instance to recover the snapshot from
-     * @param repository the repository holding either the engine-native pointer or the physical
-     *                    files this shard should be recovered from
-     * @param listener    resolves as {@link #recoverFromRepository} documents
-     */
-    void recoverFromEngineNativeSnapshot(final IndexShard indexShard, Repository repository, ActionListener<Boolean> listener) {
-        try {
-            if (canRecover(indexShard) == false) {
-                listener.onResponse(false);
-                return;
-            }
-            RecoverySource.Type recoveryType = indexShard.recoveryState().getRecoverySource().getType();
-            assert recoveryType == RecoverySource.Type.SNAPSHOT : "expected snapshot recovery type: " + recoveryType;
-            SnapshotRecoverySource recoverySource = (SnapshotRecoverySource) indexShard.recoveryState().getRecoverySource();
-
-            final Optional<ShardRecoveryStrategy.EngineNativeSnapshots> engineNativeSnapshots = indexShard.getShardRecoveryStrategy()
-                .engineNativeSnapshots();
-            if (engineNativeSnapshots.isEmpty()) {
-                // This shard's own engine never produces engine-native snapshots (the overwhelming
-                // common case -- see ShardRecoveryStrategy#engineNativeSnapshots's own javadoc) --
-                // skip the remote getEngineNativeShardSnapshotMetadata probe entirely rather than
-                // paying a blob-existence round trip to confirm what's already known locally.
-                recoverFromRepository(indexShard, repository, listener);
-                return;
-            }
-
-            final Optional<EngineNativeShardSnapshot> engineNativeSnapshot = repository.getEngineNativeShardSnapshotMetadata(
-                recoverySource.snapshot().getSnapshotId(),
-                recoverySource.index(),
-                shardId
-            );
-            if (engineNativeSnapshot.isEmpty()) {
-                // No engine-native blob for this shard's snapshot -- nothing in this method has
-                // mutated shard state yet, so falling back to the complete, unmodified classic path
-                // is safe.
-                recoverFromRepository(indexShard, repository, listener);
-                return;
-            }
-
-            indexShard.preRecovery();
-            indexShard.prepareForIndexRecovery();
-            final Store store = indexShard.store();
-            final byte[] snapshotPointer = engineNativeSnapshot.get().payload();
-            if (restoreEngineNativeSnapshot(engineNativeSnapshots.get(), indexShard, store, snapshotPointer) == false) {
-                throw new IndexShardRecoveryException(
-                    shardId,
-                    "shard recovery strategy declined to restore the engine-native snapshot its engine originally produced",
-                    null
-                );
-            }
-            assert indexShard.shardRouting.primary() : "only primary shards can recover from store";
-            writeEmptyRetentionLeasesFile(indexShard);
-            indexShard.recoveryState().getIndex().setFileDetailsComplete();
-            indexShard.openEngineAndRecoverFromTranslog();
-            indexShard.getIndexer().fillSeqNoGaps(indexShard.getPendingPrimaryTerm());
-            indexShard.finalizeRecovery();
-            indexShard.postRecovery("restore done");
-            listener.onResponse(true);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
-    }
-
-    /**
-     * See {@link ShardRecoveryStrategy.EngineNativeSnapshots#restore} for the full contract. Wraps the
-     * strategy's own {@link IOException} the same way every other dispatch on this seam does, so a
-     * failed restore reaches the recovery listener as this shard's own recovery failure rather than as
-     * a bare I/O error with no shard attached.
-     */
-    private boolean restoreEngineNativeSnapshot(
-        ShardRecoveryStrategy.EngineNativeSnapshots engineNativeSnapshots,
-        IndexShard indexShard,
-        Store store,
-        byte[] snapshotPointer
-    ) throws IndexShardRecoveryException {
-        try {
-            return engineNativeSnapshots.restore(indexShard, store, snapshotPointer);
-        } catch (IOException e) {
-            throw new IndexShardRecoveryException(shardId, "shard recovery strategy failed to restore the engine-native snapshot", e);
-        }
-    }
-
-    /**
-     * See {@link ShardRecoveryStrategy#localStoreIsStale} for the full contract.
-     */
-    private boolean localStoreIsStaleAccordingToStrategy(IndexShard indexShard, String localSegmentsFileName)
-        throws IndexShardRecoveryException {
-        try {
-            return indexShard.getShardRecoveryStrategy().localStoreIsStale(indexShard, localSegmentsFileName);
-        } catch (IOException e) {
-            throw new IndexShardRecoveryException(shardId, "shard recovery strategy failed to check whether the local store is stale", e);
         }
     }
 
@@ -814,16 +703,7 @@ final class StoreRecovery {
     private void internalRecoverFromStore(IndexShard indexShard) throws IndexShardRecoveryException {
         indexShard.preRecovery();
         final RecoveryState recoveryState = indexShard.recoveryState();
-        final boolean isInPlaceSplitChild = recoveryState.getRecoverySource().getType() == RecoverySource.Type.IN_PLACE_SPLIT_SHARD;
-        final boolean isInPlaceMergeParent = recoveryState.getRecoverySource().getType() == RecoverySource.Type.IN_PLACE_MERGE_SHARD;
-        // An in-place split's child shard (or an in-place merge's revived parent) starts exactly as
-        // empty on disk as a brand-new EMPTY_STORE shard: core does no data copying of its own for
-        // either. Unlike EMPTY_STORE though, they may become non-empty below -- see
-        // recoverLocalStoreFromStrategy and inPlaceSplitMaterialized.
-        final boolean indexShouldExists = recoveryState.getRecoverySource().getType() != RecoverySource.Type.EMPTY_STORE
-            && isInPlaceSplitChild == false
-            && isInPlaceMergeParent == false;
-        boolean inPlaceSplitMaterialized = false;
+        final boolean indexShouldExists = recoveryState.getRecoverySource().getType() != RecoverySource.Type.EMPTY_STORE;
         indexShard.prepareForIndexRecovery();
         SegmentInfos si = null;
         final Store store = indexShard.store();
@@ -834,97 +714,27 @@ final class StoreRecovery {
                 try {
                     si = store.readLastCommittedSegmentsInfo();
                 } catch (Exception e) {
-                    if (indexShouldExists && recoverLocalStoreFromStrategy(indexShard, store, RecoverySource.Type.EXISTING_STORE)) {
-                        // The strategy says it materialized this shard's last durable state from
-                        // elsewhere -- re-read rather than fail outright. The motivating case is a
-                        // strategy whose durability lives in remote storage with no peer recovery: no
-                        // node's local disk is ever the shard's authoritative copy, so finding
-                        // nothing here is the expected, not exceptional, starting state.
-                        si = store.readLastCommittedSegmentsInfo();
-                    } else if (isInPlaceSplitChild
-                        && recoverLocalStoreFromStrategy(indexShard, store, RecoverySource.Type.IN_PLACE_SPLIT_SHARD)) {
-                            // Symmetric to the branch above, but for a shard that has never had ANY prior
-                            // durable state of its own -- this is its first-ever activation, attaching it
-                            // to its share of a split parent's data, not "recovering" pre-existing state
-                            // (see ShardRecoveryStrategy#recoverLocalStore's own javadoc for why this
-                            // must happen here, before a local translog exists, not later).
-                            si = store.readLastCommittedSegmentsInfo();
-                            inPlaceSplitMaterialized = true;
-                        } else if (isInPlaceMergeParent
-                            && recoverLocalStoreFromStrategy(indexShard, store, RecoverySource.Type.IN_PLACE_MERGE_SHARD)) {
-                                // Symmetric to the split branch above, but for a parent shard revived by an
-                                // in-place merge -- reviving the parent by folding its (now-retired) children's
-                                // authoritative data back together (see ShardRecoveryStrategy#recoverLocalStore's
-                                // own javadoc for the mechanism, and why the children's ranges ride on the
-                                // recovery source rather than SplitShardsMetadata, which is already de-committed
-                                // by the time this parent recovers).
-                                si = store.readLastCommittedSegmentsInfo();
-                                inPlaceSplitMaterialized = true;
-                            } else {
-                                String files = "_unknown_";
-                                try {
-                                    files = Arrays.toString(store.directory().listAll());
-                                } catch (Exception inner) {
-                                    inner.addSuppressed(e);
-                                    files += " (failure=" + ExceptionsHelper.detailedMessage(inner) + ")";
-                                }
-                                if (indexShouldExists) {
-                                    throw new IndexShardRecoveryException(
-                                        shardId,
-                                        "shard allocated for local recovery (post api), should exist, but doesn't, current files: " + files,
-                                        e
-                                    );
-                                }
-                            }
-                }
-                if (si != null && indexShouldExists && localStoreIsStaleAccordingToStrategy(indexShard, si.getSegmentsFileName())) {
-                    // The local commit was readable, so none of the catch-clause branches above ran --
-                    // but the strategy says its own durable copy has moved on from it, and for such a
-                    // strategy this node's disk is a cache, not the authority. Structurally the same
-                    // situation the in-place-merge-parent branch just below handles (a readable but
-                    // stale local store hiding the authoritative one), which is why it is handled the
-                    // same way: clean the leftover, then give the strategy its chance to materialize.
-                    //
-                    // The motivating case is a restore. An index closed, restored to an earlier point,
-                    // and reopened on the same node still has the pre-restore files on disk, and
-                    // recovering from them undoes the restore with no error anywhere.
-                    logger.debug("shard recovery strategy reports the local store is stale; replacing it from its durable copy");
-                    Lucene.cleanLuceneIndex(store.directory());
-                    if (recoverLocalStoreFromStrategy(indexShard, store, RecoverySource.Type.EXISTING_STORE) == false) {
-                        // The strategy said stale and then declined to materialize. The local store is
-                        // already gone at this point, so there is nothing to fall back to -- fail
-                        // loudly rather than open an engine on a store this method just emptied.
+                    String files = "_unknown_";
+                    try {
+                        files = Arrays.toString(store.directory().listAll());
+                    } catch (Exception inner) {
+                        inner.addSuppressed(e);
+                        files += " (failure=" + ExceptionsHelper.detailedMessage(inner) + ")";
+                    }
+                    if (indexShouldExists) {
                         throw new IndexShardRecoveryException(
                             shardId,
-                            "the shard recovery strategy reported the local store as stale but did not replace it; the "
-                                + "local store has been cleaned and there is nothing left to recover from",
-                            null
+                            "shard allocated for local recovery (post api), should exist, but doesn't, current files: " + files,
+                            e
                         );
                     }
-                    si = store.readLastCommittedSegmentsInfo();
                 }
-                if (si != null && indexShouldExists == false && inPlaceSplitMaterialized == false) {
+                if (si != null && indexShouldExists == false) {
                     // it exists on the directory, but shouldn't exist on the FS, its a leftover (possibly dangling)
                     // its a "new index create" API, we have to do something, so better to clean it than use same data
                     logger.trace("cleaning existing shard, shouldn't exists");
                     Lucene.cleanLuceneIndex(store.directory());
                     si = null;
-                    // A revived in-place-merge parent reuses its pre-split shard id, so it can find a
-                    // stale leftover local store from before it was split -- readLastCommittedSegmentsInfo
-                    // above then succeeds on that stale commit and the strategy-materialize branch in the
-                    // catch clause is never reached (unlike a split child, whose shard id is brand new
-                    // and has no leftover). That stale store is never authoritative: the authoritative
-                    // data is folded from the retired children by the strategy. Now that the leftover
-                    // is cleaned, give the strategy its merge chance, exactly as the catch clause would have.
-                    if (isInPlaceMergeParent
-                        && recoverLocalStoreFromStrategy(indexShard, store, RecoverySource.Type.IN_PLACE_MERGE_SHARD)) {
-                        si = store.readLastCommittedSegmentsInfo();
-                        inPlaceSplitMaterialized = true;
-                    } else if (isInPlaceSplitChild
-                        && recoverLocalStoreFromStrategy(indexShard, store, RecoverySource.Type.IN_PLACE_SPLIT_SHARD)) {
-                            si = store.readLastCommittedSegmentsInfo();
-                            inPlaceSplitMaterialized = true;
-                        }
                 }
             } catch (Exception e) {
                 throw new IndexShardRecoveryException(shardId, "failed to fetch index version after copying it over", e);
@@ -933,15 +743,12 @@ final class StoreRecovery {
                 assert indexShouldExists;
                 bootstrap(indexShard, store);
                 writeEmptyRetentionLeasesFile(indexShard);
-            } else if (indexShouldExists || inPlaceSplitMaterialized) {
-                if (indexShouldExists && recoveryState.getRecoverySource().shouldBootstrapNewHistoryUUID()) {
+            } else if (indexShouldExists) {
+                if (recoveryState.getRecoverySource().shouldBootstrapNewHistoryUUID()) {
                     store.bootstrapNewHistory();
                     writeEmptyRetentionLeasesFile(indexShard);
-                } else if (inPlaceSplitMaterialized) {
-                    writeEmptyRetentionLeasesFile(indexShard);
                 }
-                // since we recover from local (or, for an in-place split child, from what the strategy
-                // just materialized locally), just fill the files and size
+                // since we recover from local, just fill the files and size
                 final ReplicationLuceneIndex index = recoveryState.getIndex();
                 try {
                     if (si != null) {
@@ -1013,25 +820,6 @@ final class StoreRecovery {
             throw new IndexShardRecoveryException(shardId, "Failed to recover from gateway", e);
         } finally {
             store.decRef();
-        }
-    }
-
-    /**
-     * See {@link ShardRecoveryStrategy#recoverLocalStore} for the full contract. The three cases this
-     * dispatches ({@code EXISTING_STORE}, {@code IN_PLACE_SPLIT_SHARD}, {@code IN_PLACE_MERGE_SHARD})
-     * were three separate hooks with byte-identical dispatch bodies until they were folded into one
-     * call carrying the {@link RecoverySource.Type} that was the only thing distinguishing them.
-     */
-    private boolean recoverLocalStoreFromStrategy(IndexShard indexShard, Store store, RecoverySource.Type recoverySourceType)
-        throws IndexShardRecoveryException {
-        try {
-            return indexShard.getShardRecoveryStrategy().recoverLocalStore(indexShard, store, recoverySourceType);
-        } catch (IOException e) {
-            throw new IndexShardRecoveryException(
-                shardId,
-                "shard recovery strategy failed to recover the local store for recovery source [" + recoverySourceType + "]",
-                e
-            );
         }
     }
 

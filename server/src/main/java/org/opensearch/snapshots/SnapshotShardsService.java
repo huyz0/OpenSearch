@@ -58,10 +58,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.index.snapshots.IndexShardSnapshotFailedException;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.engine.Engine;
-import org.opensearch.index.engine.EngineNativeSnapshotPointer;
-import org.opensearch.index.engine.EngineNativeSnapshotReleasers;
 import org.opensearch.index.seqno.SequenceNumbers;
-import org.opensearch.index.shard.IllegalIndexShardStateException;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
@@ -82,7 +79,6 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -389,45 +385,6 @@ public class SnapshotShardsService extends AbstractLifecycleComponent implements
             }
 
             final Repository repository = repositoriesService.repository(snapshot.getRepository());
-
-            // Tried ahead of both the classic and remote-store shallow-copy paths below: if this
-            // shard's engine already maintains its own durable remote copy, use that pointer
-            // directly instead of reading local Lucene commit bytes at all. See
-            // Engine#attemptEngineNativeSnapshot's own javadoc for the full contract.
-            Optional<EngineNativeSnapshotPointer> engineNativeSnapshotPointer;
-            try {
-                engineNativeSnapshotPointer = indexShard.attemptEngineNativeSnapshot(snapshot.getSnapshotId());
-            } catch (IllegalIndexShardStateException e) {
-                // Neither STARTED nor CLOSED right now (e.g. a brief POST_RECOVERY window). The
-                // classic/remote-store shallow-copy branches below have their own, independently
-                // correct handling for shard states like this -- the closed-index shallow-copy path
-                // in particular has no IndexShardState gate at all -- so this falls through to them
-                // exactly as if no engine-native pointer were available, rather than letting this
-                // new, unconditional check fail an attempt those branches would otherwise handle.
-                engineNativeSnapshotPointer = Optional.empty();
-            }
-            if (engineNativeSnapshotPointer.isPresent()) {
-                final EngineNativeSnapshotPointer pointer = engineNativeSnapshotPointer.get();
-                repository.snapshotEngineNative(
-                    indexShard.store(),
-                    snapshot.getSnapshotId(),
-                    indexId,
-                    snapshotStatus,
-                    threadPool.relativeTimeInMillis(),
-                    pointer.engineId(),
-                    pointer.payload(),
-                    ActionListener.wrap(listener::onResponse, e -> {
-                        // attemptEngineNativeSnapshot above already registered a durable pin for this
-                        // pointer's generation. If the write we just attempted never completes, no
-                        // snapshot record exists for a later delete to key a release off of -- this
-                        // is the only remaining chance to release it, or it leaks forever.
-                        releaseEngineNativeSnapshotPointer(pointer);
-                        listener.onFailure(e);
-                    })
-                );
-                return;
-            }
-
             GatedCloseable<IndexCommit> wrappedSnapshot = null;
             try {
                 if (remoteStoreIndexShallowCopy && indexShard.indexSettings().isRemoteStoreEnabled()) {
@@ -537,32 +494,6 @@ public class SnapshotShardsService extends AbstractLifecycleComponent implements
         } catch (Exception e) {
             listener.onFailure(e);
         }
-    }
-
-    /**
-     * Best-effort release of the durable pin {@link Engine#attemptEngineNativeSnapshot} already
-     * registered for {@code pointer}, called when the write {@link #snapshot} just attempted with it
-     * never completes successfully. Without this, that pin would be orphaned forever: the only other
-     * release path -- {@link org.opensearch.repositories.blobstore.BlobStoreRepository}'s
-     * delete-time cleanup -- can only ever find a pin via the very blob this failed write never got
-     * to create. Mirrors that same release-registry lookup and the same non-fatal, log-and-continue
-     * contract: a release failure here must never additionally mask the original snapshot failure
-     * already being reported to the caller.
-     */
-    private static void releaseEngineNativeSnapshotPointer(EngineNativeSnapshotPointer pointer) {
-        EngineNativeSnapshotReleasers.find(pointer.engineId()).ifPresent(releaser -> {
-            try {
-                releaser.release(pointer.payload());
-            } catch (Exception e) {
-                logger.warn(
-                    () -> new ParameterizedMessage(
-                        "failed to release engine-native snapshot pin for engineId [{}] after a failed snapshot attempt",
-                        pointer.engineId()
-                    ),
-                    e
-                );
-            }
-        });
     }
 
     /**

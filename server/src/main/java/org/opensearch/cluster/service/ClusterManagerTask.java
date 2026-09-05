@@ -56,8 +56,7 @@ public enum ClusterManagerTask {
     INDEX_ALIASES("index-aliases", 200),
     PUT_MAPPING("put-mapping", 10000),
     UPDATE_SNAPSHOT_STATE("update-snapshot-state", 5000),
-    IN_PLACE_SPLIT_SHARD("in-place-split-shard", 50),
-    IN_PLACE_MERGE_SHARD("in-place-merge-shard", 50);
+    IN_PLACE_SPLIT_SHARD("in-place-split-shard", 50);
 
     private final String key;
     private final int threshold;

@@ -607,7 +607,7 @@ public class OperationRouting {
         // of original index to hash documents
         int rootShardId = Math.floorMod(hash, indexMetadata.getRoutingNumShards()) / indexMetadata.getRoutingFactor();
 
-        return indexMetadata.getSplitShardsMetadata().getShardIdOfHash(rootShardId, hash);
+        return indexMetadata.getSplitShardsMetadata().getShardIdOfHash(rootShardId, hash, false);
     }
 
     private void checkPreferenceBasedRoutingAllowed(Preference preference, @Nullable WeightedRoutingMetadata weightedRoutingMetadata) {

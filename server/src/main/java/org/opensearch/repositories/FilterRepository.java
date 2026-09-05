@@ -46,7 +46,6 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.snapshots.IndexShardSnapshotStatus;
-import org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot;
 import org.opensearch.index.snapshots.blobstore.RemoteStoreShardShallowCopySnapshot;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManagerFactory;
@@ -57,7 +56,6 @@ import org.opensearch.snapshots.SnapshotInfo;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -263,20 +261,6 @@ public class FilterRepository implements Repository {
     }
 
     @Override
-    public void snapshotEngineNative(
-        Store store,
-        SnapshotId snapshotId,
-        IndexId indexId,
-        IndexShardSnapshotStatus snapshotStatus,
-        long startTime,
-        String engineId,
-        byte[] snapshotPointer,
-        ActionListener<String> listener
-    ) {
-        in.snapshotEngineNative(store, snapshotId, indexId, snapshotStatus, startTime, engineId, snapshotPointer, listener);
-    }
-
-    @Override
     public void restoreShard(
         Store store,
         SnapshotId snapshotId,
@@ -295,15 +279,6 @@ public class FilterRepository implements Repository {
         ShardId snapshotShardId
     ) {
         return in.getRemoteStoreShallowCopyShardMetadata(snapshotId, indexId, snapshotShardId);
-    }
-
-    @Override
-    public Optional<EngineNativeShardSnapshot> getEngineNativeShardSnapshotMetadata(
-        SnapshotId snapshotId,
-        IndexId indexId,
-        ShardId snapshotShardId
-    ) {
-        return in.getEngineNativeShardSnapshotMetadata(snapshotId, indexId, snapshotShardId);
     }
 
     @Override

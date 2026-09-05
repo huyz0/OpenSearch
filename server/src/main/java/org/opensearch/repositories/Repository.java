@@ -49,7 +49,6 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.snapshots.IndexShardSnapshotStatus;
-import org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot;
 import org.opensearch.index.snapshots.blobstore.RemoteStoreShardShallowCopySnapshot;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.Store;
@@ -64,7 +63,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -515,50 +513,6 @@ public interface Repository extends LifecycleComponent {
     }
 
     /**
-     * Stores an engine-native snapshot pointer -- the opaque bytes {@link
-     * org.opensearch.index.engine.Engine#attemptEngineNativeSnapshot} produced for this shard,
-     * instead of copying real segment bytes the way {@link #snapshotShard} does or referencing
-     * remote-store file names the way {@link #snapshotRemoteStoreIndexShard} does. Default throws
-     * {@link UnsupportedOperationException}, matching {@link #snapshotRemoteStoreIndexShard}'s own
-     * default -- callers only ever reach this after {@code Engine#attemptEngineNativeSnapshot} has
-     * already returned a non-empty pointer, so a repository type that hasn't implemented this
-     * should fail loudly rather than silently falling back to a different snapshot shape.
-     * <p>
-     * As with {@link #snapshotShard}, implementations should update {@code snapshotStatus} and
-     * check {@link IndexShardSnapshotStatus#isAborted()} as the operation progresses -- though for
-     * an opaque payload this is typically a single, small, fast write rather than the incremental
-     * multi-file upload loop {@link #snapshotShard} drives.
-     *
-     * @param store            the shard's store, passed for parity with the other snapshot
-     *                         methods and possible diagnostic use; implementations must not read
-     *                         segment bytes from it -- {@code snapshotPointer} is the entire
-     *                         payload.
-     * @param snapshotId       snapshot id.
-     * @param indexId          id for the index being snapshotted.
-     * @param snapshotStatus   snapshot status.
-     * @param startTime        start time of the snapshot commit.
-     * @param engineId         opaque tag identifying which engine produced {@code
-     *                         snapshotPointer}, so a later delete can route release back to the
-     *                         same engine's {@link
-     *                         org.opensearch.index.shard.ShardRecoveryStrategy.EngineNativeSnapshots#release}.
-     *                         Core only equality-compares this string; it never interprets it.
-     * @param snapshotPointer  the exact bytes {@code Engine#attemptEngineNativeSnapshot} returned.
-     * @param listener         listener invoked on completion.
-     */
-    default void snapshotEngineNative(
-        Store store,
-        SnapshotId snapshotId,
-        IndexId indexId,
-        IndexShardSnapshotStatus snapshotStatus,
-        long startTime,
-        String engineId,
-        byte[] snapshotPointer,
-        ActionListener<String> listener
-    ) {
-        throw new UnsupportedOperationException();
-    }
-
-    /**
      * Restores snapshot of the shard.
      * <p>
      * The index can be renamed on restore, hence different {@code shardId} and {@code snapshotShardId} are supplied.
@@ -600,34 +554,6 @@ public interface Repository extends LifecycleComponent {
         ShardId snapshotShardId
     ) {
         throw new UnsupportedOperationException();
-    }
-
-    /**
-     * Probes for an engine-native snapshot record for one shard, i.e. whether this specific
-     * shard's snapshot was written via {@link #snapshotEngineNative} rather than {@link
-     * #snapshotShard}/{@link #snapshotRemoteStoreIndexShard}.
-     * <p>
-     * Deliberately returns {@link Optional#empty()}, not a thrown exception, both when no
-     * engine-native record exists for this shard <em>and</em> when the repository implementation
-     * hasn't overridden this method at all -- unlike {@link #getRemoteStoreShallowCopyShardMetadata}
-     * (only ever called once core has already decided, ahead of time, that the shallow-copy format
-     * applies), this method is called unconditionally as a cheap probe on every classic-shaped
-     * restore, specifically so restore doesn't need any separate persisted flag to know which
-     * format a given shard's snapshot used. A repository that hasn't implemented {@link
-     * #snapshotEngineNative} can therefore never have written one of these records, so "no
-     * override" and "no record" are the same case here, both correctly meaning "use the classic
-     * restore path instead."
-     *
-     * @param snapshotId      snapshot id.
-     * @param indexId         id of the index in the repository from which the restore is occurring.
-     * @param snapshotShardId shard id (in the snapshot).
-     */
-    default Optional<EngineNativeShardSnapshot> getEngineNativeShardSnapshotMetadata(
-        SnapshotId snapshotId,
-        IndexId indexId,
-        ShardId snapshotShardId
-    ) {
-        return Optional.empty();
     }
 
     /**

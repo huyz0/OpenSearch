@@ -2266,66 +2266,6 @@ public class IndexShardTests extends IndexShardTestCase {
         }
     }
 
-    /**
-     * Two-phase in-place merge rollback safety: while a shard is a still-live child of an in-progress
-     * in-place merge (its parent is being revived by folding the children back in), new primary writes to
-     * that child must be rejected. The revived parent snapshots each child once at its recovery time; a
-     * document a child acknowledges after that snapshot but before the merge commits would be lost when
-     * the children are retired at commit. The rejection is a shard-not-available (retriable) exception, so
-     * the write succeeds after re-routing to the merged parent (or, on rollback, to the child again). The
-     * exact mirror of {@link #testRejectsPrimaryWriteWhileInPlaceSplitInProgress}.
-     */
-    public void testRejectsPrimaryWriteWhileInPlaceMergeOfParentInProgress() throws IOException {
-        // Shard 2 is a child produced by splitting shard 0 of a 2-shard index -- give the metadata the
-        // extra primary-term / in-sync entry a real split child carries, so the shard is servable at id 2.
-        final Settings settings = Settings.builder()
-            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
-            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2)
-            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
-            .build();
-        final IndexMetadata childIndexMetadata = IndexMetadata.builder("index")
-            .settings(settings)
-            .primaryTerm(2, 1)
-            .putInSyncAllocationIds(2, java.util.Collections.emptySet())
-            .build();
-        final ShardId childShardId = new ShardId(childIndexMetadata.getIndex(), 2);
-        final IndexShard shard = newStartedShard(primary -> newShard(childShardId, primary, "node1", childIndexMetadata, null), true);
-        try {
-            // A write succeeds normally before the merge starts.
-            indexDoc(shard, "_doc", "0");
-
-            // Build metadata in which shard 2 is a live child of an in-progress merge back into parent 0.
-            final SplitShardsMetadata.Builder mergingBuilder = new SplitShardsMetadata.Builder(2);
-            mergingBuilder.splitShard(0, 2); // children {2, 3}
-            mergingBuilder.updateSplitMetadataForChildShards(0, Set.of(2, 3));
-            mergingBuilder.startMergeChildrenToParent(0);
-            final SplitShardsMetadata merging = mergingBuilder.build();
-            assertTrue(merging.isChildOfInProgressMerge(shard.shardId().id()));
-
-            final IndexMetadata current = shard.indexSettings().getIndexMetadata();
-            shard.indexSettings()
-                .updateIndexMetadata(IndexMetadata.builder(current).primaryTerm(2, 1).splitShardsMetadata(merging).build());
-
-            // A new primary index is now cleanly rejected...
-            final IllegalIndexShardStateException indexRejection = expectThrows(
-                IllegalIndexShardStateException.class,
-                () -> indexDoc(shard, "_doc", "1")
-            );
-            assertThat(indexRejection.getMessage(), containsString("in-place merge of this shard's parent is in progress"));
-            // ...with a shard-not-available (retriable) exception, exactly like a relocating/closing shard.
-            assertTrue(TransportActions.isShardNotAvailableException(indexRejection));
-
-            // Deletes are rejected the same way.
-            final IllegalIndexShardStateException deleteRejection = expectThrows(
-                IllegalIndexShardStateException.class,
-                () -> deleteDoc(shard, "0")
-            );
-            assertTrue(TransportActions.isShardNotAvailableException(deleteRejection));
-        } finally {
-            closeShards(shard);
-        }
-    }
-
     public void testRelocatedSegRepError() throws IOException, InterruptedException {
         final IndexShard shard = newStartedShard(true);
         final ShardRouting originalRouting = shard.routingEntry();

@@ -58,11 +58,7 @@ import org.opensearch.env.Environment;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
-import org.opensearch.index.snapshots.IndexShardSnapshotStatus;
-import org.opensearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
-import org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
-import org.opensearch.index.store.Store;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManagerFactory;
 import org.opensearch.indices.recovery.RecoverySettings;
@@ -94,7 +90,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -109,7 +104,6 @@ import org.mockito.Mockito;
 
 import static org.opensearch.repositories.RepositoryDataTests.generateRandomRepoData;
 import static org.opensearch.repositories.blobstore.BlobStoreRepository.calculateMaxWithinIntLimit;
-import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.ArgumentMatchers.any;
@@ -276,77 +270,6 @@ public class BlobStoreRepositoryTests extends BlobStoreRepositoryHelperTests {
         expectThrows(
             RepositoryException.class,
             () -> writeIndexGen(repository, repositoryData.withGenId(startingGeneration + 1), repositoryData.getGenId())
-        );
-    }
-
-    public void testSnapshotEngineNativeWritesRecoverableMetadata() throws Exception {
-        final BlobStoreRepository repository = setupRepo();
-        final ShardId shardId = new ShardId("test-index", "_na_", 0);
-        final IndexId indexId = new IndexId("test-index", "test-index-uuid");
-        final SnapshotId snapshotId = new SnapshotId("test-snap", UUIDs.randomBase64UUID());
-        final Store store = mock(Store.class);
-        when(store.shardId()).thenReturn(shardId);
-        final byte[] payload = randomByteArrayOfLength(32);
-        final String engineId = "test-engine/v1";
-
-        final PlainActionFuture<String> future = PlainActionFuture.newFuture();
-        repository.snapshotEngineNative(
-            store,
-            snapshotId,
-            indexId,
-            IndexShardSnapshotStatus.newInitializing(ShardGenerations.NEW_SHARD_GEN),
-            0L,
-            engineId,
-            payload,
-            future
-        );
-        future.actionGet();
-
-        final Optional<EngineNativeShardSnapshot> read = repository.getEngineNativeShardSnapshotMetadata(snapshotId, indexId, shardId);
-        assertTrue("engine-native metadata must be readable back after a successful write", read.isPresent());
-        assertEquals(engineId, read.get().engineId());
-        assertArrayEquals(payload, read.get().payload());
-        assertEquals(snapshotId.getName(), read.get().snapshot());
-    }
-
-    public void testGetEngineNativeShardSnapshotMetadataReturnsEmptyWhenAbsent() {
-        final BlobStoreRepository repository = setupRepo();
-        final ShardId shardId = new ShardId("test-index", "_na_", 0);
-        final IndexId indexId = new IndexId("test-index", "test-index-uuid");
-        final SnapshotId snapshotId = new SnapshotId("test-snap", UUIDs.randomBase64UUID());
-
-        // No engine-native snapshot was ever written for this (snapshotId, indexId, shardId) -- the
-        // shape every classic (non-engine-native) snapshot in existence today has -- so the probe
-        // must return empty rather than throw, letting StoreRecovery fall back to the classic
-        // restore path instead of failing outright.
-        assertEquals(Optional.empty(), repository.getEngineNativeShardSnapshotMetadata(snapshotId, indexId, shardId));
-    }
-
-    /**
-     * The stale-blob sweep must treat {@code engine-native-snap-<uuid>.dat} like {@code snap-<uuid>.dat}:
-     * it belongs to exactly one snapshot, so once that snapshot is gone the blob is garbage. Without the
-     * prefix in the filter, a removed snapshot's engine-native pointer blob was orphaned for as long as
-     * any other snapshot of the shard survived (only a whole-shard delete swept it), and a re-run of the
-     * same delete would read it again and release the engine's pin a second time.
-     */
-    public void testUnusedBlobsIncludesEngineNativeBlobsOfRemovedSnapshots() {
-        final String survivingUuid = "surviving-uuid";
-        final String removedUuid = "removed-uuid";
-        final Set<String> blobs = Set.of(
-            BlobStoreRepository.ENGINE_NATIVE_SNAPSHOT_PREFIX + survivingUuid + ".dat",
-            BlobStoreRepository.ENGINE_NATIVE_SNAPSHOT_PREFIX + removedUuid + ".dat",
-            BlobStoreRepository.SNAPSHOT_PREFIX + survivingUuid + ".dat",
-            BlobStoreRepository.SNAPSHOT_PREFIX + removedUuid + ".dat"
-        );
-
-        final List<String> unused = BlobStoreRepository.unusedBlobs(blobs, Set.of(survivingUuid), BlobStoreIndexShardSnapshots.EMPTY, null);
-
-        assertThat(
-            unused,
-            containsInAnyOrder(
-                BlobStoreRepository.ENGINE_NATIVE_SNAPSHOT_PREFIX + removedUuid + ".dat",
-                BlobStoreRepository.SNAPSHOT_PREFIX + removedUuid + ".dat"
-            )
         );
     }
 

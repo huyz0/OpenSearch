@@ -139,7 +139,6 @@ import org.opensearch.index.engine.EngineBackedIndexer;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineConfigFactory;
 import org.opensearch.index.engine.EngineException;
-import org.opensearch.index.engine.EngineNativeSnapshotPointer;
 import org.opensearch.index.engine.IngestionEngine;
 import org.opensearch.index.engine.MergedSegmentWarmerFactory;
 import org.opensearch.index.engine.NRTReplicationEngine;
@@ -331,13 +330,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     private final Object engineMutex = new Object(); // lock ordering: engineMutex -> mutex
     private final AtomicReference<Indexer> currentEngineReference = new AtomicReference<>();
     final IndexerFactory indexerFactory;
-    /**
-     * How this shard's local store gets populated during recovery, and what is authoritative once it is -- resolved
-     * once per index from {@link org.opensearch.index.IndexModule#INDEX_RECOVERY_STRATEGY_SETTING}. Read by {@link
-     * StoreRecovery} (which is constructed per recovery attempt from this shard, so it reads it from here rather
-     * than holding its own) and by {@link #newEngineConfig} for the remote-durability question.
-     */
-    private final ShardRecoveryStrategy shardRecoveryStrategy;
     final EngineConfigFactory engineConfigFactory;
 
     private final IndexingOperationListener indexingOperationListeners;
@@ -472,8 +464,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         @Nullable final MergedSegmentPublisher mergedSegmentPublisher,
         @Nullable final ReferencedSegmentsPublisher referencedSegmentsPublisher,
         final Map<String, FormatChecksumStrategy> checksumStrategies,
-        @Nullable final DataFormatRegistry dataFormatRegistry,
-        final ShardRecoveryStrategy shardRecoveryStrategy
+        @Nullable final DataFormatRegistry dataFormatRegistry
     ) throws IOException {
         super(shardRouting.shardId(), indexSettings);
         assert shardRouting.initializing();
@@ -483,7 +474,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.similarityService = similarityService;
         Objects.requireNonNull(store, "Store must be provided to the index shard");
         this.indexerFactory = Objects.requireNonNull(indexerFactory);
-        this.shardRecoveryStrategy = Objects.requireNonNull(shardRecoveryStrategy);
         this.engineConfigFactory = Objects.requireNonNull(engineConfigFactory);
         this.codecService = engineConfigFactory.newDefaultCodecService(indexSettings, mapperService, logger);
         this.store = store;
@@ -1900,20 +1890,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         GatedCloseable<IndexCommit> indexCommit = acquireLastIndexCommit(flushFirst);
         getIndexer().refresh("Snapshot for Remote Store based Shard");
         return indexCommit;
-    }
-
-    /**
-     * Dispatches to the current engine's {@link Engine#attemptEngineNativeSnapshot}, mirroring
-     * {@link #acquireLastIndexCommit}'s own shard-state check and {@code applyOnEngine} dispatch.
-     * See that method's javadoc for the full contract.
-     */
-    public Optional<EngineNativeSnapshotPointer> attemptEngineNativeSnapshot(SnapshotId snapshotId) throws EngineException {
-        final IndexShardState state = this.state; // one time volatile read
-        if (state == IndexShardState.STARTED || state == IndexShardState.CLOSED) {
-            return applyOnEngine(getIndexer(), engine -> engine.attemptEngineNativeSnapshot(snapshotId));
-        } else {
-            throw new IllegalIndexShardStateException(shardId, state, "snapshot is not allowed");
-        }
     }
 
     /**
@@ -3468,7 +3444,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             }
             if (origin == Engine.Operation.Origin.PRIMARY) {
                 ensureNotInProgressSplitParent();
-                ensureNotInProgressMergeChild();
             }
         }
     }
@@ -3501,35 +3476,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                 shardId,
                 state,
                 "operation rejected while an in-place split of this shard is in progress; retry once the split completes"
-            );
-        }
-    }
-
-    /**
-     * Rejects a new primary write while this shard is a still-live child of an in-progress in-place
-     * <em>merge</em> -- the exact mirror of {@link #ensureNotInProgressSplitParent()} (CC1).
-     *
-     * <p>During a two-phase merge the revived parent snapshots each child's then-current published
-     * manifest once, at its own recovery time, while ordinary indexing keeps routing to the still-live
-     * children by hash. Any document a child acknowledged after the parent had already snapshotted it but
-     * before the merge committed would live only in a later child manifest generation the parent never
-     * folded in; once {@code MetadataInPlaceMergeShardCommitService} commits and retires the children,
-     * those documents would become permanently unreachable -- silent data loss under continuous write load
-     * during a merge. Rejecting the write here closes that window: nothing is acknowledged on a child once
-     * its merge is in progress. The thrown {@link IllegalIndexShardStateException} is a
-     * shard-not-available exception (see {@code TransportActions#isShardNotAvailableException}), so it is
-     * retriable -- the write succeeds once it re-routes to the merged parent (or, if the merge rolls back,
-     * to the child again, which is live once more).
-     */
-    private void ensureNotInProgressMergeChild() throws IllegalIndexShardStateException {
-        final IndexMetadata indexMetadata = indexSettings.getIndexMetadata();
-        if (indexMetadata != null
-            && indexMetadata.getSplitShardsMetadata() != null
-            && indexMetadata.getSplitShardsMetadata().isChildOfInProgressMerge(shardId.id())) {
-            throw new IllegalIndexShardStateException(
-                shardId,
-                state,
-                "operation rejected while an in-place merge of this shard's parent is in progress; retry once the merge completes"
             );
         }
     }
@@ -3764,24 +3710,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                 + recoveryState.getRecoverySource();
             StoreRecovery storeRecovery = new StoreRecovery(shardId, logger);
             storeRecovery.recoverFromRepository(this, repository, listener);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
-    }
-
-    /**
-     * Restores this shard from a snapshot, probing first for an engine-native snapshot pointer
-     * (one written by {@link Engine#attemptEngineNativeSnapshot}) before falling back to the
-     * classic, copy-based {@link #restoreFromRepository}. See {@code StoreRecovery#recoverFromEngineNativeSnapshot}
-     * for why this is a probe rather than a persisted, pre-decided flag.
-     */
-    public void restoreFromEngineNativeSnapshot(Repository repository, ActionListener<Boolean> listener) {
-        try {
-            assert shardRouting.primary() : "recover from store only makes sense if the shard is a primary shard";
-            assert recoveryState.getRecoverySource().getType() == RecoverySource.Type.SNAPSHOT : "invalid recovery type: "
-                + recoveryState.getRecoverySource();
-            StoreRecovery storeRecovery = new StoreRecovery(shardId, logger);
-            storeRecovery.recoverFromEngineNativeSnapshot(this, repository, listener);
         } catch (Exception e) {
             listener.onFailure(e);
         }
@@ -4697,7 +4625,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             case EMPTY_STORE:
             case EXISTING_STORE:
             case IN_PLACE_SPLIT_SHARD:
-            case IN_PLACE_MERGE_SHARD:
                 executeRecovery("from store", recoveryState, recoveryListener, this::recoverFromStore);
                 break;
             case REMOTE_STORE:
@@ -4727,16 +4654,11 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     // indicesService.indexService(shardRouting.shardId().getIndex()).addMetadataListener();
                 } else {
                     final String repo = recoverySource.snapshot().getRepository();
-                    // restoreFromEngineNativeSnapshot probes for an engine-native pointer first,
-                    // falling back unmodified to restoreFromRepository (the classic, copy-based
-                    // path) when none exists -- see that method's own javadoc for why this is a
-                    // runtime probe rather than a persisted flag alongside isSearchableSnapshot/
-                    // remoteStoreIndexShallowCopy above.
                     executeRecovery(
                         "from snapshot",
                         recoveryState,
                         recoveryListener,
-                        l -> restoreFromEngineNativeSnapshot(repositoriesService.repository(repo), l)
+                        l -> restoreFromRepository(repositoriesService.repository(repo), l)
                     );
                 }
                 break;
@@ -4966,12 +4888,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             });
         }
 
-        // Skipped entirely when this shard's ShardRecoveryStrategy declares it already keeps every segment
-        // durably reachable remotely by its own mechanism -- wiring core's own upload path in on top would
-        // be pure wasted upload work, not a correctness requirement. See that method's own javadoc: it is a
-        // durability claim, so a strategy answering true when segments are NOT otherwise durable is a
-        // correctness regression, not merely a slow path.
-        if ((isRemoteStoreEnabled() || isMigratingToRemote()) && shardRecoveryStrategy.ownsRemoteSegmentDurability() == false) {
+        if (isRemoteStoreEnabled() || isMigratingToRemote()) {
             internalRefreshListener.add(
                 new RemoteStoreRefreshListener(
                     this,
@@ -5224,19 +5141,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     // in the order submitted. We need to guard against another term bump
                     if (getOperationPrimaryTerm() < newPrimaryTerm) {
                         replicationTracker.setOperationPrimaryTerm(newPrimaryTerm);
-                        // Fires strictly after the term above is set, strictly before onBlocked's
-                        // own engine-reset work and before operations unblock -- see
-                        // Engine#onPrimaryTermBumped's own javadoc for exactly what atomicity this
-                        // guarantees a listener. getIndexerOrNull(), not getIndexer(): an engine
-                        // that hasn't been constructed yet (still mid-recovery) has nothing to
-                        // notify, and that is not an error here. Unwrapped to the concrete Engine
-                        // via EngineBackedIndexer#getEngine(), the same resolution
-                        // #replayEngineRecoveryOperations already uses, rather than adding a
-                        // second, Indexer-level copy of this hook.
-                        Indexer currentIndexer = getIndexerOrNull();
-                        if (currentIndexer instanceof EngineBackedIndexer) {
-                            ((EngineBackedIndexer) currentIndexer).getEngine().onPrimaryTermBumped(newPrimaryTerm);
-                        }
                         onBlocked.run();
                     }
                 } catch (final Exception e) {
@@ -5621,14 +5525,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     IndexerFactory getIndexerFactory() {
         return indexerFactory;
-    }
-
-    /**
-     * This shard's {@link ShardRecoveryStrategy}. Package-private, for {@link StoreRecovery}: it is constructed
-     * fresh per recovery attempt from this shard and has no registry of its own to resolve one from.
-     */
-    ShardRecoveryStrategy getShardRecoveryStrategy() {
-        return shardRecoveryStrategy;
     }
 
     EngineConfigFactory getEngineConfigFactory() {

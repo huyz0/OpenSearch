@@ -603,9 +603,8 @@ public final class ServerlessNode implements Closeable {
      */
     private
         java.util.Collection<
-            java.util.function.BiFunction<
+            java.util.function.Function<
                 org.opensearch.index.IndexSettings,
-                org.opensearch.cluster.routing.ShardRouting,
                 java.util.Optional<org.opensearch.index.engine.EngineFactory>>>
         engineFactoryProviders() {
         if (roles.contains(ROLE_INGEST)) {
@@ -616,7 +615,7 @@ public final class ServerlessNode implements Closeable {
                 config,
                 shardId -> reconciler == null ? java.util.List.of() : reconciler.replayRecordsFor(shardId)
             );
-            return java.util.List.of((indexSettings, routing) -> java.util.Optional.of(writer));
+            return java.util.List.of(indexSettings -> java.util.Optional.of(writer));
         }
         final org.opensearch.index.engine.EngineFactory readOnly = config -> new org.opensearch.index.engine.ReadOnlyEngine(
             config,
@@ -626,7 +625,7 @@ public final class ServerlessNode implements Closeable {
             java.util.function.Function.identity(),
             false
         );
-        return java.util.List.of((indexSettings, routing) -> java.util.Optional.of(readOnly));
+        return java.util.List.of(indexSettings -> java.util.Optional.of(readOnly));
     }
 
     /**

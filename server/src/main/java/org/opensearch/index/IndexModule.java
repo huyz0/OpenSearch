@@ -47,7 +47,6 @@ import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.CheckedFunction;
 import org.opensearch.common.CheckedTriFunction;
-import org.opensearch.common.Nullable;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.TriFunction;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -84,10 +83,8 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexingOperationListener;
-import org.opensearch.index.shard.LocalLuceneShardRecoveryStrategy;
 import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.index.shard.ShardPath;
-import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.similarity.SimilarityService;
 import org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory;
 import org.opensearch.index.store.DefaultCompositeDirectoryFactory;
@@ -207,30 +204,6 @@ public final class IndexModule {
         Property.NodeScope
     );
 
-    /**
-     * Index setting that selects this index's {@link ShardRecoveryStrategy} -- how a shard's local store gets
-     * populated during recovery, and what is authoritative once it is. Defaults to {@link
-     * ShardRecoveryStrategy#LOCAL_LUCENE}, core's own strategy, so an index that says nothing behaves exactly as
-     * it always has. Unlike {@link #INDEX_RECOVERY_TYPE_SETTING} and {@link #INDEX_STORE_FACTORY_SETTING} the
-     * default is a real name rather than the empty string, because core registers a real implementation under it
-     * into the same map plugins contribute to rather than special-casing "unset" ahead of the lookup.
-     *
-     * <p><b>Final, because this is not a knob.</b> The strategy describes where an index's durable copy already
-     * lives and how it is addressed -- a property fixed when the index was created, not a preference. Allowing an
-     * update would let an operator tell a running index to recover by a method that cannot read what it has
-     * written, and the damage would not appear until the next recovery, long after the setting change was
-     * acknowledged. There is no migration between strategies to express here: an index is one kind or the other
-     * for its whole life, so the setting is fixed at creation like the storage opt-in it accompanies.
-     */
-    public static final Setting<String> INDEX_RECOVERY_STRATEGY_SETTING = new Setting<>(
-        "index.recovery.strategy",
-        ShardRecoveryStrategy.LOCAL_LUCENE,
-        Function.identity(),
-        Property.IndexScope,
-        Property.NodeScope,
-        Property.Final
-    );
-
     /** On which extensions to load data into the file-system cache upon opening of files.
      *  This only works with the mmap directory, and even in that case is still
      *  best-effort only. */
@@ -300,10 +273,6 @@ public final class IndexModule {
     private final IndexSettings indexSettings;
     private final AnalysisRegistry analysisRegistry;
     private final IndexerFactory indexerFactory;
-    // Resolves the IndexerFactory for a specific shard copy given its ShardRouting, so an EnginePlugin can select a
-    // different engine for shard roles that will never be promoted to primary (e.g. search-only replicas) than for
-    // promotable ones. Falls back to the index-wide `indexerFactory` above when absent.
-    private final BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider;
     private final EngineConfigFactory engineConfigFactory;
     private final SetOnce<Function<IndexService, CheckedFunction<DirectoryReader, DirectoryReader, IOException>>> indexReaderWrapper =
         new SetOnce<>();
@@ -320,7 +289,6 @@ public final class IndexModule {
     private final BooleanSupplier allowExpensiveQueries;
     private final Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories;
     private final Map<String, IndexStorePlugin.StoreFactory> storeFactories;
-    private final Map<String, ShardRecoveryStrategy> shardRecoveryStrategies;
     private final NodeCacheService nodeCacheService;
     private final CompositeIndexSettings compositeIndexSettings;
 
@@ -338,7 +306,6 @@ public final class IndexModule {
         final IndexSettings indexSettings,
         final AnalysisRegistry analysisRegistry,
         final IndexerFactory indexerFactory,
-        @Nullable final BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider,
         final EngineConfigFactory engineConfigFactory,
         final Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         final Map<String, IndexStorePlugin.CompositeDirectoryFactory> compositeDirectoryFactories,
@@ -346,7 +313,6 @@ public final class IndexModule {
         final IndexNameExpressionResolver expressionResolver,
         final Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories,
         final Map<String, IndexStorePlugin.StoreFactory> storeFactories,
-        final Map<String, ShardRecoveryStrategy> shardRecoveryStrategies,
         final NodeCacheService nodeCacheService,
         final CompositeIndexSettings compositeIndexSettings,
         final Map<String, DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories
@@ -354,7 +320,6 @@ public final class IndexModule {
         this.indexSettings = indexSettings;
         this.analysisRegistry = analysisRegistry;
         this.indexerFactory = Objects.requireNonNull(indexerFactory);
-        this.indexerFactoryProvider = indexerFactoryProvider != null ? indexerFactoryProvider : (settings, routing) -> this.indexerFactory;
         this.engineConfigFactory = Objects.requireNonNull(engineConfigFactory);
         this.searchOperationListeners.add(new SearchSlowLog(indexSettings));
         this.indexOperationListeners.add(new IndexingSlowLog(indexSettings));
@@ -365,7 +330,6 @@ public final class IndexModule {
         this.expressionResolver = expressionResolver;
         this.recoveryStateFactories = recoveryStateFactories;
         this.storeFactories = storeFactories;
-        this.shardRecoveryStrategies = shardRecoveryStrategies;
         this.nodeCacheService = nodeCacheService;
         this.compositeIndexSettings = compositeIndexSettings;
     }
@@ -385,7 +349,6 @@ public final class IndexModule {
             indexSettings,
             analysisRegistry,
             new EngineBackedIndexerFactory(engineFactory),
-            null,
             engineConfigFactory,
             directoryFactories,
             Collections.emptyMap(),
@@ -393,7 +356,6 @@ public final class IndexModule {
             expressionResolver,
             recoveryStateFactories,
             Collections.emptyMap(),
-            createBuiltInShardRecoveryStrategies(),
             null,
             null,
             Collections.emptyMap()
@@ -1101,7 +1063,6 @@ public final class IndexModule {
                 shardStoreDeleter,
                 indexAnalyzers,
                 indexerFactory,
-                indexerFactoryProvider,
                 engineConfigFactory,
                 circuitBreakerService,
                 bigArrays,
@@ -1114,7 +1075,6 @@ public final class IndexModule {
                 compositeDirectoryFactory,
                 remoteDirectoryFactory,
                 resolveStoreFactory(indexSettings, storeFactories),
-                resolveShardRecoveryStrategy(indexSettings, shardRecoveryStrategies),
                 eventListener,
                 readerWrapperFactory,
                 mapperRegistry,
@@ -1247,24 +1207,6 @@ public final class IndexModule {
         return factory;
     }
 
-    /**
-     * Resolves this index's {@link ShardRecoveryStrategy} by name from {@link #INDEX_RECOVERY_STRATEGY_SETTING},
-     * looked up in the same map core's own {@link ShardRecoveryStrategy#LOCAL_LUCENE} strategy was registered into
-     * -- so there is no "built-in vs. plugin" branch here, only a lookup that fails loudly on an unknown name, the
-     * same shape {@link #getRecoveryStateFactory} and {@code ClusterModule#createShardsAllocator} already use.
-     */
-    private static ShardRecoveryStrategy resolveShardRecoveryStrategy(
-        final IndexSettings indexSettings,
-        final Map<String, ShardRecoveryStrategy> shardRecoveryStrategies
-    ) {
-        final String name = indexSettings.getValue(INDEX_RECOVERY_STRATEGY_SETTING);
-        final ShardRecoveryStrategy strategy = shardRecoveryStrategies.get(name);
-        if (strategy == null) {
-            throw new IllegalArgumentException("Unknown shard recovery strategy [" + name + "]");
-        }
-        return strategy;
-    }
-
     private static IndexStorePlugin.StoreFactory resolveStoreFactory(
         final IndexSettings indexSettings,
         final Map<String, IndexStorePlugin.StoreFactory> storeFactories
@@ -1346,19 +1288,6 @@ public final class IndexModule {
         if (this.frozen.get()) {
             throw new IllegalStateException("Can't modify IndexModule once the index service has been created");
         }
-    }
-
-    /**
-     * Core's own {@link ShardRecoveryStrategy} registrations, seeded into the very map {@link
-     * IndexStorePlugin#getShardRecoveryStrategies()} contributions are merged on top of -- the same dogfooding
-     * {@link #createBuiltInDirectoryFactories} does for {@code niofs}/{@code mmapfs}/{@code hybridfs} and {@code
-     * RepositoriesModule} does for {@code fs}. A plugin re-registering {@link ShardRecoveryStrategy#LOCAL_LUCENE}
-     * therefore collides like any other duplicate name instead of silently shadowing core's behavior.
-     */
-    public static Map<String, ShardRecoveryStrategy> createBuiltInShardRecoveryStrategies() {
-        final Map<String, ShardRecoveryStrategy> strategies = new HashMap<>();
-        strategies.put(ShardRecoveryStrategy.LOCAL_LUCENE, LocalLuceneShardRecoveryStrategy.INSTANCE);
-        return strategies;
     }
 
     public static Map<String, IndexStorePlugin.DirectoryFactory> createBuiltInDirectoryFactories(

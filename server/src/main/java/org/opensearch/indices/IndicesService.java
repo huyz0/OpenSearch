@@ -152,7 +152,6 @@ import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.index.shard.IndexingOperationListener;
 import org.opensearch.index.shard.IndexingStats;
 import org.opensearch.index.shard.ShardPath;
-import org.opensearch.index.shard.ShardRecoveryStrategy;
 import org.opensearch.index.store.remote.filecache.NodeCacheService;
 import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
@@ -463,14 +462,13 @@ public class IndicesService extends AbstractLifecycleComponent
     final IndicesRequestCache indicesRequestCache; // pkg-private for testing
     private final IndicesQueryCache indicesQueryCache;
     private final MetaStateService metaStateService;
-    private final Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders;
+    private final Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders;
     private final Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories;
     private final Map<String, IndexStorePlugin.CompositeDirectoryFactory> compositeDirectoryFactories;
     private final Map<String, IngestionConsumerFactory> ingestionConsumerFactories;
     private final Supplier<IngestService> ingestServiceSupplier;
     private final Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories;
     private final Map<String, IndexStorePlugin.StoreFactory> storeFactories;
-    private final Map<String, ShardRecoveryStrategy> shardRecoveryStrategies;
     final AbstractRefCounted indicesRefCount; // pkg-private for testing
     private final CountDownLatch closeLatch = new CountDownLatch(1);
     private volatile boolean idFieldDataEnabled;
@@ -524,14 +522,13 @@ public class IndicesService extends AbstractLifecycleComponent
         ClusterService clusterService,
         Client client,
         MetaStateService metaStateService,
-        Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders,
+        Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders,
         Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         Map<String, IndexStorePlugin.CompositeDirectoryFactory> compositeDirectoryFactories,
         Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories,
         ValuesSourceRegistry valuesSourceRegistry,
         Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories,
         Map<String, IndexStorePlugin.StoreFactory> storeFactories,
-        Map<String, ShardRecoveryStrategy> shardRecoveryStrategies,
         IndexStorePlugin.DirectoryFactory remoteDirectoryFactory,
         Supplier<RepositoriesService> repositoriesServiceSupplier,
         SearchRequestStats searchRequestStats,
@@ -607,7 +604,6 @@ public class IndicesService extends AbstractLifecycleComponent
         this.dataFormatAwareStoreDirectoryFactories = dataFormatAwareStoreDirectoryFactories;
         this.recoveryStateFactories = recoveryStateFactories;
         this.storeFactories = storeFactories;
-        this.shardRecoveryStrategies = shardRecoveryStrategies;
         this.ingestionConsumerFactories = ingestionConsumerFactories;
         this.ingestServiceSupplier = ingestServiceSupplier;
         // doClose() is called when shutting down a node, yet there might still be ongoing requests
@@ -717,7 +713,7 @@ public class IndicesService extends AbstractLifecycleComponent
         ClusterService clusterService,
         Client client,
         MetaStateService metaStateService,
-        Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders,
+        Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders,
         Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         ValuesSourceRegistry valuesSourceRegistry,
         Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories,
@@ -756,7 +752,6 @@ public class IndicesService extends AbstractLifecycleComponent
             Collections.emptyMap(),
             // Not emptyMap(): every index resolves a strategy by name, and core's own local-lucene has to be
             // in the map to be found -- the same reason Node seeds it before merging plugin contributions.
-            IndexModule.createBuiltInShardRecoveryStrategies(),
             remoteDirectoryFactory,
             repositoriesServiceSupplier,
             searchRequestStats,
@@ -1206,7 +1201,7 @@ public class IndicesService extends AbstractLifecycleComponent
             indexCreationContext
         );
 
-        final IndexModule indexModule = newIndexModule(idxSettings, this::getIndexerFactory);
+        final IndexModule indexModule = newIndexModule(idxSettings);
         for (IndexingOperationListener operationListener : indexingOperationListeners) {
             indexModule.addIndexOperationListener(operationListener);
         }
@@ -1278,28 +1273,14 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     private IndexerFactory getIndexerFactory(final IndexSettings idxSettings) {
-        return getIndexerFactory(idxSettings, null);
-    }
-
-    /**
-     * Resolves the {@link IndexerFactory} for a specific shard copy. {@code shardRouting} is {@code null} when
-     * resolving the index-wide default ahead of any shard being allocated (e.g. administrative lookups); it is
-     * non-null when resolving for an actual shard, letting registered {@link org.opensearch.plugins.EnginePlugin}s
-     * pick a different engine depending on the shard's role (see {@link ShardRouting#isSearchOnly()}).
-     */
-    private IndexerFactory getIndexerFactory(final IndexSettings idxSettings, @Nullable final ShardRouting shardRouting) {
         if (idxSettings.isPluggableDataFormatEnabled()) {
             return new DataFormatAwareIndexerFactory();
         } else {
-            return new EngineBackedIndexerFactory(getEngineFactory(idxSettings, shardRouting));
+            return new EngineBackedIndexerFactory(getEngineFactory(idxSettings));
         }
     }
 
     private EngineFactory getEngineFactory(final IndexSettings idxSettings) {
-        return getEngineFactory(idxSettings, null);
-    }
-
-    private EngineFactory getEngineFactory(final IndexSettings idxSettings, @Nullable final ShardRouting shardRouting) {
         final IndexMetadata indexMetadata = idxSettings.getIndexMetadata();
         if (indexMetadata != null && indexMetadata.getState() == IndexMetadata.State.CLOSE) {
             // NoOpEngine takes precedence as long as the index is closed
@@ -1313,7 +1294,7 @@ public class IndicesService extends AbstractLifecycleComponent
         }
 
         final List<Optional<EngineFactory>> engineFactories = engineFactoryProviders.stream()
-            .map(engineFactoryProvider -> engineFactoryProvider.apply(idxSettings, shardRouting))
+            .map(engineFactoryProvider -> engineFactoryProvider.apply(idxSettings))
             .filter(maybe -> Objects.requireNonNull(maybe).isPresent())
             .collect(Collectors.toList());
         if (engineFactories.isEmpty()) {
@@ -1395,7 +1376,7 @@ public class IndicesService extends AbstractLifecycleComponent
      */
     public MapperService createMapperServiceForValidation(IndexMetadata indexMetadata) throws IOException {
         final IndexSettings idxSettings = new IndexSettings(indexMetadata, this.settings, indexScopedSettings);
-        final IndexModule indexModule = newIndexModule(idxSettings, null);
+        final IndexModule indexModule = newIndexModule(idxSettings);
         synchronized (this) {
             // The one part that runs code this class does not own. Held for the callback and released
             // before the analyzers are built, which is where the time actually goes.
@@ -1412,25 +1393,19 @@ public class IndicesService extends AbstractLifecycleComponent
      */
     public synchronized MapperService createIndexMapperService(IndexMetadata indexMetadata) throws IOException {
         final IndexSettings idxSettings = new IndexSettings(indexMetadata, this.settings, indexScopedSettings);
-        final IndexModule indexModule = newIndexModule(idxSettings, null);
+        final IndexModule indexModule = newIndexModule(idxSettings);
         pluginsService.onIndexModule(indexModule);
         return indexModule.newIndexMapperService(xContentRegistry, mapperRegistry, scriptService);
     }
 
     /**
-     * Builds an {@link IndexModule} from this service's node-level registries. {@code indexerFactoryProvider}
-     * is non-null only when resolving per-shard indexer factories (index creation); administrative
-     * mapper-service builds pass {@code null}.
+     * Builds an {@link IndexModule} from this service's node-level registries.
      */
-    private IndexModule newIndexModule(
-        IndexSettings idxSettings,
-        @Nullable BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider
-    ) {
+    private IndexModule newIndexModule(IndexSettings idxSettings) {
         return new IndexModule(
             idxSettings,
             analysisRegistry,
             getIndexerFactory(idxSettings),
-            indexerFactoryProvider,
             getEngineConfigFactory(idxSettings),
             directoryFactories,
             compositeDirectoryFactories,
@@ -1438,7 +1413,6 @@ public class IndicesService extends AbstractLifecycleComponent
             indexNameExpressionResolver,
             recoveryStateFactories,
             storeFactories,
-            shardRecoveryStrategies,
             nodeCacheService,
             compositeIndexSettings,
             dataFormatAwareStoreDirectoryFactories
