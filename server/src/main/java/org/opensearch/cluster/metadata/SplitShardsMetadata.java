@@ -327,6 +327,9 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
          * @param numberOfChildren Number of child shards this shard is going to have.
          */
         public List<ShardRange> splitShard(int splitShardId, int numberOfChildren) {
+            if (numberOfChildren < 2) {
+                throw new IllegalArgumentException("Cannot split shard [" + splitShardId + "] into fewer than 2 children.");
+            }
             if (inProgressSplitShardIds.contains(splitShardId) || parentToChildShards.containsKey(splitShardId)) {
                 throw new IllegalArgumentException("Split of shard [" + splitShardId + "] is already in progress or completed.");
             }
