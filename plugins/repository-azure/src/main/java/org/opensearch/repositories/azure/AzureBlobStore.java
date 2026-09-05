@@ -40,6 +40,7 @@ import com.azure.core.util.Context;
 import com.azure.storage.blob.BlobClient;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobServiceClient;
+import com.azure.storage.blob.models.BlobDownloadContentResponse;
 import com.azure.storage.blob.models.BlobErrorCode;
 import com.azure.storage.blob.models.BlobItem;
 import com.azure.storage.blob.models.BlobItemProperties;
@@ -60,20 +61,26 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.common.collect.MapBuilder;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.repositories.azure.AzureRepository.Repository;
 import org.opensearch.secure_sm.AccessController;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
 import java.nio.file.FileAlreadyExistsException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -82,6 +89,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
@@ -391,6 +399,115 @@ public class AzureBlobStore implements BlobStore {
         }
 
         logger.trace(() -> new ParameterizedMessage("writeBlob({}, stream, {}) - done", blobName, blobSize));
+    }
+
+    /**
+     * Reads the register at {@code blobName}: an ordinary blob whose body is {@code <8-byte
+     * big-endian generation><value bytes>}, the same wire format {@code FsBlobContainer}/
+     * {@code S3BlobContainer} use -- unlike GCS, Azure blob ETags are opaque (like S3's), so a
+     * self-managed generation counter has to be embedded in the blob's own bytes rather than read
+     * back from blob metadata.
+     */
+    public Optional<BlobRegister> readRegister(String blobName) throws URISyntaxException, IOException {
+        final Tuple<BlobServiceClient, Supplier<Context>> client = client();
+        final BlobContainerClient blobContainer = client.v1().getBlobContainerClient(container);
+        final BlobClient blob = blobContainer.getBlobClient(blobName);
+        try {
+            final BlobDownloadContentResponse response = AccessController.doPrivileged(
+                () -> blob.downloadContentWithResponse(null, null, timeout(), client.v2().get())
+            );
+            return Optional.of(deserializeRegister(response.getValue().toBytes()));
+        } catch (final BlobStorageException e) {
+            if (e.getStatusCode() == HttpURLConnection.HTTP_NOT_FOUND) {
+                return Optional.empty();
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * CASes the register at {@code blobName} using Azure's real conditional-write primitives
+     * ({@code If-Match}/{@code If-None-Match} via {@link BlobRequestConditions}) as the actual
+     * concurrency guard: a freshly-read generation is checked client-side purely as a fast-fail,
+     * but the authoritative check is Azure itself evaluating the conditional upload atomically
+     * against the blob's live ETag, so a racing writer between our read and our write is caught
+     * there (as an {@code HTTP_PRECON_FAILED} response), not missed.
+     */
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws URISyntaxException, IOException {
+        final Tuple<BlobServiceClient, Supplier<Context>> client = client();
+        final BlobContainerClient blobContainer = client.v1().getBlobContainerClient(container);
+        final BlobClient blob = blobContainer.getBlobClient(blobName);
+
+        String currentETag;
+        long currentGeneration;
+        try {
+            final BlobDownloadContentResponse response = AccessController.doPrivileged(
+                () -> blob.downloadContentWithResponse(null, null, timeout(), client.v2().get())
+            );
+            currentETag = response.getDeserializedHeaders().getETag();
+            currentGeneration = deserializeRegister(response.getValue().toBytes()).generation();
+        } catch (final BlobStorageException e) {
+            if (e.getStatusCode() != HttpURLConnection.HTTP_NOT_FOUND) {
+                throw e;
+            }
+            currentETag = null;
+            currentGeneration = BlobRegister.ABSENT_GENERATION;
+        }
+
+        if (currentGeneration != expectedGeneration) {
+            return BlobRegisterCasResult.conflict(currentGeneration);
+        }
+
+        final long newGeneration = expectedGeneration + 1;
+        final byte[] bytesToWrite = serializeRegister(newGeneration, newValue);
+        final BlobRequestConditions conditions = new BlobRequestConditions();
+        if (currentETag == null) {
+            conditions.setIfNoneMatch(Constants.HeaderConstants.ETAG_WILDCARD);
+        } else {
+            conditions.setIfMatch(currentETag);
+        }
+
+        try {
+            AccessController.doPrivileged(
+                () -> blob.uploadWithResponse(
+                    new BlobParallelUploadOptions(new ByteArrayInputStream(bytesToWrite), bytesToWrite.length).setRequestConditions(
+                        conditions
+                    ),
+                    timeout(),
+                    client.v2().get()
+                )
+            );
+            return BlobRegisterCasResult.applied(newGeneration);
+        } catch (final BlobStorageException e) {
+            // Azure returns 412 for an If-Match mismatch (updating an existing register) but 409
+            // BlobAlreadyExists for an If-None-Match:* mismatch (racing put-if-absent) -- both mean
+            // the same thing here: someone raced us between our read and this write.
+            final boolean ifMatchConflict = e.getStatusCode() == HttpURLConnection.HTTP_PRECON_FAILED;
+            final boolean ifNoneMatchConflict = e.getStatusCode() == HttpURLConnection.HTTP_CONFLICT
+                && BlobErrorCode.BLOB_ALREADY_EXISTS.equals(e.getErrorCode());
+            if (ifMatchConflict || ifNoneMatchConflict) {
+                long actualGeneration = readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                return BlobRegisterCasResult.conflict(actualGeneration);
+            }
+            throw e;
+        }
+    }
+
+    private static BlobRegister deserializeRegister(byte[] bytes) {
+        final ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        final long generation = buffer.getLong();
+        final byte[] value = new byte[buffer.remaining()];
+        buffer.get(value);
+        return new BlobRegister(generation, new BytesArray(value));
+    }
+
+    private static byte[] serializeRegister(long generation, BytesReference value) {
+        final byte[] valueBytes = BytesReference.toBytes(value);
+        final ByteBuffer buffer = ByteBuffer.allocate(8 + valueBytes.length);
+        buffer.putLong(generation);
+        buffer.put(valueBytes);
+        return buffer.array();
     }
 
     private Tuple<BlobServiceClient, Supplier<Context>> client() {

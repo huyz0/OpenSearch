@@ -38,6 +38,7 @@ import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CommonPrefix;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
@@ -75,6 +76,8 @@ import org.opensearch.common.blobstore.AsyncMultiStreamBlobContainer;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStoreException;
 import org.opensearch.common.blobstore.BlobVersionConflictException;
 import org.opensearch.common.blobstore.DeleteResult;
@@ -90,6 +93,8 @@ import org.opensearch.common.io.InputStreamContainer;
 import org.opensearch.common.util.concurrent.FutureUtils;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.repositories.s3.async.S3AsyncDeleteHelper;
@@ -103,10 +108,13 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -193,7 +201,24 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
     }
 
     /**
-     * This implementation ignores the failIfAlreadyExists flag as the S3 API has no way to enforce this due to its weak consistency model.
+     * Honours {@code failIfAlreadyExists} by asking S3 to enforce it, throwing
+     * {@link FileAlreadyExistsException} when the key is already present, which is what
+     * {@code FsBlobContainer} does and therefore what every caller was already written against.
+     *
+     * <p>This used to be documented as unenforceable, "as the S3 API has no way to enforce this due to
+     * its weak consistency model". Both halves stopped being true: S3 became strongly consistent in
+     * December 2020 and gained conditional writes in August 2024. {@link #compareAndSwapRegister} in this
+     * same class has used {@code If-None-Match} since it was written.
+     *
+     * <p>The flag being silently dropped was not only a trap for future code. Six callers in
+     * {@code serverless-storage} already pass true for write-once state (commit manifests, bundles, clone
+     * lineage, resharding ranges), and every one of them was protected on a filesystem repository and
+     * unprotected on S3, so the divergence was invisible to tests. A losing manifest write is a lost
+     * commit.
+     *
+     * <p>Requires an endpoint that implements conditional writes. Older S3-compatible stores do not, and
+     * against those the precondition is ignored by the server and this reverts to the previous
+     * last-writer-wins behaviour rather than failing.
      */
     @Override
     public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
@@ -216,9 +241,9 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         assert inputStream.markSupported() : "No mark support on inputStream breaks the S3 SDK's ability to retry requests";
         AccessController.doPrivilegedChecked(() -> {
             if (blobSize <= getLargeBlobThresholdInBytes()) {
-                executeSingleUpload(blobStore, buildKey(blobName), inputStream, blobSize, metadata, cryptoMetadata);
+                executeSingleUpload(blobStore, buildKey(blobName), inputStream, blobSize, metadata, cryptoMetadata, failIfAlreadyExists);
             } else {
-                executeMultipartUpload(blobStore, buildKey(blobName), inputStream, blobSize, metadata, cryptoMetadata);
+                executeMultipartUpload(blobStore, buildKey(blobName), inputStream, blobSize, metadata, cryptoMetadata, failIfAlreadyExists);
             }
         });
     }
@@ -407,7 +432,11 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                         inputStream.getInputStream(),
                         uploadRequest.getContentLength(),
                         uploadRequest.getMetadata(),
-                        crypto
+                        crypto,
+                        // The async upload path carries no such flag, and its callers write
+                        // content-addressed segment data where a rewrite is the same bytes. Passing false
+                        // keeps this path exactly as it was rather than inventing a guarantee for it.
+                        false
                     );
                     completionListener.onResponse(null);
                 } catch (Exception ex) {
@@ -694,7 +723,8 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         final InputStream input,
         final long blobSize,
         final Map<String, String> metadata,
-        @Nullable CryptoMetadata cryptoMetadata
+        @Nullable CryptoMetadata cryptoMetadata,
+        final boolean failIfAlreadyExists
     ) throws IOException {
 
         // Extra safety checks
@@ -718,6 +748,13 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             putObjectRequestBuilder = putObjectRequestBuilder.metadata(metadata);
         }
 
+        if (failIfAlreadyExists) {
+            // The precondition is the enforcement, evaluated atomically by S3 against the live object.
+            // Reading first and then writing would leave a window a concurrent creator fits through,
+            // which is the race compareAndSwapRegister already documents avoiding the same way.
+            putObjectRequestBuilder.ifNoneMatch("*");
+        }
+
         configureEncryptionSettings(putObjectRequestBuilder, blobStore, cryptoMetadata);
 
         PutObjectRequest putObjectRequest = putObjectRequestBuilder.build();
@@ -731,6 +768,13 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             AccessController.doPrivileged(
                 () -> clientReference.get().putObject(putObjectRequest, RequestBody.fromInputStream(requestInputStream, blobSize))
             );
+        } catch (final S3Exception e) {
+            // 412 is the precondition failing, which means the key was already there. Reported as the
+            // same exception FsBlobContainer throws so callers need one catch rather than two.
+            if (failIfAlreadyExists && e.statusCode() == 412) {
+                throw new FileAlreadyExistsException("Blob [" + blobName + "] already exists, cannot overwrite");
+            }
+            throw new IOException("Unable to upload object [" + blobName + "] using a single upload", e);
         } catch (final SdkException e) {
             throw new IOException("Unable to upload object [" + blobName + "] using a single upload", e);
         }
@@ -745,7 +789,8 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         final InputStream input,
         final long blobSize,
         final Map<String, String> metadata,
-        @Nullable CryptoMetadata cryptoMetadata
+        @Nullable CryptoMetadata cryptoMetadata,
+        final boolean failIfAlreadyExists
     ) throws IOException {
 
         ensureMultiPartUploadSize(blobSize);
@@ -822,18 +867,30 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 );
             }
 
-            CompleteMultipartUploadRequest completeMultipartUploadRequest = CompleteMultipartUploadRequest.builder()
+            CompleteMultipartUploadRequest.Builder completeMultipartUploadRequestBuilder = CompleteMultipartUploadRequest.builder()
                 .bucket(bucketName)
                 .key(blobName)
                 .uploadId(uploadId.get())
                 .multipartUpload(CompletedMultipartUpload.builder().parts(parts).build())
                 .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().multipartUploadMetricCollector))
-                .expectedBucketOwner(blobStore.expectedBucketOwner())
-                .build();
+                .expectedBucketOwner(blobStore.expectedBucketOwner());
 
+            if (failIfAlreadyExists) {
+                // The precondition goes on the completion rather than on the creation, because that is the
+                // request that publishes the key. Parts uploaded against a losing upload are discarded by
+                // the abort in the finally block below.
+                completeMultipartUploadRequestBuilder.ifNoneMatch("*");
+            }
+
+            CompleteMultipartUploadRequest completeMultipartUploadRequest = completeMultipartUploadRequestBuilder.build();
             AccessController.doPrivileged(() -> clientReference.get().completeMultipartUpload(completeMultipartUploadRequest));
             success = true;
 
+        } catch (final S3Exception e) {
+            if (failIfAlreadyExists && e.statusCode() == 412) {
+                throw new FileAlreadyExistsException("Blob [" + blobName + "] already exists, cannot overwrite");
+            }
+            throw new IOException("Unable to upload object [" + blobName + "] using multipart upload", e);
         } catch (final SdkException e) {
             throw new IOException("Unable to upload object [" + blobName + "] using multipart upload", e);
         } finally {
@@ -1107,5 +1164,182 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         } catch (Exception e) {
             completionListener.onFailure(new IOException("Failed to initiate async blob deletion", e));
         }
+    }
+
+    /**
+     * Reads the register at {@code blobName}: an ordinary object whose body is {@code <8-byte
+     * big-endian generation><value bytes>}, per the same wire format {@code FsBlobContainer} uses.
+     */
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        String key = buildKey(blobName);
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            GetObjectRequest getObjectRequest = GetObjectRequest.builder()
+                .bucket(blobStore.bucket())
+                .key(key)
+                .expectedBucketOwner(blobStore.expectedBucketOwner())
+                .build();
+            try (
+                ResponseInputStream<GetObjectResponse> response = AccessController.doPrivileged(
+                    () -> clientReference.get().getObject(getObjectRequest)
+                )
+            ) {
+                return Optional.of(deserializeRegister(response.readAllBytes()));
+            }
+        } catch (NoSuchKeyException e) {
+            return Optional.empty();
+        } catch (S3Exception e) {
+            // Real S3 responds to a missing key with a NoSuchKeyException-typed 404, but not every
+            // S3-compatible endpoint (including the fixture this is verified against) returns the
+            // error body needed for the SDK to unmarshal that specific type, so a bare 404 must be
+            // treated as absence too rather than surfacing as a generic failure.
+            if (e.statusCode() == 404) {
+                return Optional.empty();
+            }
+            throw new IOException("Unable to read register [" + blobName + "]", e);
+        } catch (SdkException e) {
+            throw new IOException("Unable to read register [" + blobName + "]", e);
+        }
+    }
+
+    /**
+     * CASes the register at {@code blobName} using S3's real conditional-write primitives
+     * ({@code If-Match}/{@code If-None-Match}) as the actual concurrency guard, rather than
+     * anything client-side: {@code expectedGeneration} is checked against a freshly-read current
+     * generation purely as a fast-fail (no point attempting a write we already know is stale), but
+     * the authoritative check is the conditional {@code PutObject} itself, which S3 evaluates
+     * atomically against the object's live ETag. A concurrent writer racing between our read and
+     * our put is caught there (as a 412 response), not missed.
+     */
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        String key = buildKey(blobName);
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            S3Client client = clientReference.get();
+
+            String currentETag;
+            long currentGeneration;
+            try {
+                GetObjectRequest getObjectRequest = GetObjectRequest.builder()
+                    .bucket(blobStore.bucket())
+                    .key(key)
+                    .expectedBucketOwner(blobStore.expectedBucketOwner())
+                    .build();
+                try (
+                    ResponseInputStream<GetObjectResponse> response = AccessController.doPrivileged(
+                        () -> client.getObject(getObjectRequest)
+                    )
+                ) {
+                    currentETag = response.response().eTag();
+                    currentGeneration = deserializeRegister(response.readAllBytes()).generation();
+                }
+            } catch (NoSuchKeyException e) {
+                currentETag = null;
+                currentGeneration = BlobRegister.ABSENT_GENERATION;
+            } catch (S3Exception e) {
+                // See readRegister: a bare 404 (not a properly-typed NoSuchKeyException) also means absent.
+                if (e.statusCode() != 404) {
+                    throw e;
+                }
+                currentETag = null;
+                currentGeneration = BlobRegister.ABSENT_GENERATION;
+            }
+
+            if (currentGeneration != expectedGeneration) {
+                return BlobRegisterCasResult.conflict(currentGeneration);
+            }
+
+            long newGeneration = expectedGeneration + 1;
+            byte[] bytesToWrite = serializeRegister(newGeneration, newValue);
+            PutObjectRequest.Builder putObjectRequestBuilder = PutObjectRequest.builder()
+                .bucket(blobStore.bucket())
+                .key(key)
+                .contentLength((long) bytesToWrite.length)
+                .expectedBucketOwner(blobStore.expectedBucketOwner());
+            if (currentETag == null) {
+                putObjectRequestBuilder.ifNoneMatch("*");
+            } else {
+                putObjectRequestBuilder.ifMatch(currentETag);
+            }
+            PutObjectRequest putObjectRequest = putObjectRequestBuilder.build();
+
+            try {
+                AccessController.doPrivileged(() -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite)));
+                return BlobRegisterCasResult.applied(newGeneration);
+            } catch (S3Exception e) {
+                if (e.statusCode() == 412) {
+                    // Someone raced us between our read and this put; report a conflict rather
+                    // than a wrapped exception so the caller re-reads and retries as normal.
+                    return BlobRegisterCasResult.conflict(
+                        readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION)
+                    );
+                }
+                throw e;
+            }
+        } catch (SdkException e) {
+            throw new IOException("Unable to CAS register [" + blobName + "]", e);
+        }
+    }
+
+    /**
+     * One conditional PUT, where {@link #compareAndSwapRegister} needs a GET first.
+     *
+     * <p>That GET is not wasted work in the general case: a CAS against an arbitrary generation has to
+     * learn the current one. It is wasted here. The only thing the read tells the create path is that
+     * {@code currentETag} is null, which selects {@code ifNoneMatch("*")}, and that header is itself the
+     * atomic "must not exist" check evaluated by S3 against the live object. The class comment on
+     * {@code compareAndSwapRegister} already says the conditional write is the authoritative guard and
+     * the read is "purely as a fast-fail", so dropping it costs no safety.
+     *
+     * <p>Conflict reports {@link BlobRegister#ABSENT_GENERATION} rather than reading to find the real
+     * generation, because a caller that lost a create race wants to know it lost, and paying a round trip
+     * to decorate that would reintroduce the cost this exists to remove. A caller that needs the winning
+     * value reads it itself, on a path that by definition is not the common one.
+     */
+    @Override
+    public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
+        String key = buildKey(blobName);
+        long newGeneration = BlobRegister.ABSENT_GENERATION + 1;
+        byte[] bytesToWrite = serializeRegister(newGeneration, value);
+
+        PutObjectRequest putObjectRequest = PutObjectRequest.builder()
+            .bucket(blobStore.bucket())
+            .key(key)
+            .contentLength((long) bytesToWrite.length)
+            .expectedBucketOwner(blobStore.expectedBucketOwner())
+            .ifNoneMatch("*")
+            .build();
+
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            S3Client client = clientReference.get();
+            try {
+                AccessController.doPrivileged(() -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite)));
+                return BlobRegisterCasResult.applied(newGeneration);
+            } catch (S3Exception e) {
+                if (e.statusCode() == 412) {
+                    return BlobRegisterCasResult.conflict(BlobRegister.ABSENT_GENERATION);
+                }
+                throw e;
+            }
+        } catch (SdkException e) {
+            throw new IOException("Unable to create register [" + blobName + "]", e);
+        }
+    }
+
+    private static BlobRegister deserializeRegister(byte[] bytes) {
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        long generation = buffer.getLong();
+        byte[] value = new byte[buffer.remaining()];
+        buffer.get(value);
+        return new BlobRegister(generation, new BytesArray(value));
+    }
+
+    private static byte[] serializeRegister(long generation, BytesReference value) {
+        byte[] valueBytes = BytesReference.toBytes(value);
+        ByteBuffer buffer = ByteBuffer.allocate(8 + valueBytes.length);
+        buffer.putLong(generation);
+        buffer.put(valueBytes);
+        return buffer.array();
     }
 }

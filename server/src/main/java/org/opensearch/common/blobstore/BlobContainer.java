@@ -37,6 +37,7 @@ import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -46,6 +47,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * An interface for managing a repository of blob entries, where each blob entry is just a named group of bytes.
@@ -418,5 +420,62 @@ public interface BlobContainer {
         List<BlobMetadata> blobNames = new ArrayList<>(listBlobsByPrefix(blobNamePrefix).values());
         blobNames.sort(blobNameSortOrder.comparator());
         return blobNames.subList(0, Math.min(blobNames.size(), limit));
+    }
+
+    /**
+     * Reads the current value of a "register" blob &mdash; a small blob whose writes are
+     * arbitrated by {@link #compareAndSwapRegister}, giving callers a generic optimistic-
+     * concurrency primitive independent of which repository backend they run against.
+     *
+     * @return empty if the register has never been written (generation {@link BlobRegister#ABSENT_GENERATION}).
+     * @throws UnsupportedOperationException if this blob container does not implement register semantics.
+     */
+    default Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        throw new UnsupportedOperationException(getClass() + " does not support readRegister");
+    }
+
+    /**
+     * Atomically replaces a register blob's value, succeeding only if its current generation
+     * equals {@code expectedGeneration}. Pass {@link BlobRegister#ABSENT_GENERATION} to mean "the
+     * register must not exist yet" (first-ever write, i.e. put-if-absent semantics).
+     *
+     * <p>This is the seam a plugin's externally-managed storage implementation uses to back a
+     * shard-ownership compare-and-swap protocol: a native-object-store-backed
+     * container implements this with its provider's conditional write (S3 If-Match, GCS
+     * generation preconditions, Azure ETag If-Match); {@link org.opensearch.common.blobstore.fs.FsBlobContainer}
+     * implements it with real local-filesystem atomicity for filesystem repositories and tests.
+     *
+     * @return whether the write applied, and either way the generation now actually stored.
+     * @throws UnsupportedOperationException if this blob container does not implement register semantics.
+     */
+    default BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        throw new UnsupportedOperationException(getClass() + " does not support compareAndSwapRegister");
+    }
+
+    /**
+     * Writes a register only if it does not exist yet, in as few round trips as the backend allows.
+     *
+     * <p>Semantically identical to {@code compareAndSwapRegister(blobName, ABSENT_GENERATION, value)},
+     * which is exactly what this defaults to. It exists because that general form cannot be as cheap: a
+     * CAS against an arbitrary generation has to learn the current one, so an object-store implementation
+     * reads before it writes. Creation does not need to. "Must not exist" is expressible as a
+     * precondition on the write itself, so the read is redundant on the path that succeeds.
+     *
+     * <p>That halving matters because of what calls it. Index creation is one create-if-absent, and this
+     * design's whole claim about creation throughput is that it becomes an object-store write with no
+     * cluster-wide serialisation behind it. Two round trips instead of one is a factor of two on the one
+     * operation expected to run at a hundred million.
+     *
+     * <p>Implementations may leave the conflicting generation as
+     * {@link BlobRegister#ABSENT_GENERATION} rather than pay a read to discover it, so callers that need
+     * the current value on conflict should read it themselves. The applied case is authoritative either
+     * way.
+     *
+     * @return whether this caller created the register.
+     * @throws UnsupportedOperationException if this blob container does not implement register semantics.
+     */
+    default BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
+        return compareAndSwapRegister(blobName, BlobRegister.ABSENT_GENERATION, value);
     }
 }

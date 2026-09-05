@@ -1,0 +1,87 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.build'
+
+dependencies {
+  // RFC §4 rule 1: serverless may depend on server. server may never point back.
+  implementation project(':server')
+  implementation project(':libs:opensearch-common')
+  implementation project(':libs:opensearch-core')
+  implementation project(':libs:opensearch-telemetry')
+  // Loading a plugin from disk needs it: core's PluginsService builds an ExtendedPluginsClassLoader for
+  // any plugin that extends another, and server depends on this only at compile time -- a distribution
+  // puts it on the runtime classpath, so a shell that loads plugins has to as well.
+  runtimeOnly project(':libs:opensearch-plugin-classloader')
+  // The shell picks its transport directly instead of discovering it through the plugin system.
+  implementation project(':modules:transport-netty4')
+  // And its scripting engine, for the same reason and by the same route. "No modules are loaded" was never
+  // "no module code is used" -- it is that nothing is discovered from disk. A shell that chooses its
+  // transport by name can choose its script engine by name.
+  implementation project(':modules:lang-painless')
+  // And the ingest processors, by the same rule. M56 recorded that enabling pipelines was "a decision about
+  // loading modules, not about adding an endpoint"; M57 made that decision by choosing painless the way the
+  // transport had always been chosen, so this is that decision applied a third time rather than a new one.
+  implementation project(':modules:ingest-common')
+  // Mustache for search templates and rank-eval templates, rank-eval for its metrics, and the common
+  // search-pipeline processors -- each chosen by name, the same decision as painless and ingest-common.
+  implementation project(':modules:lang-mustache')
+  implementation project(':modules:rank-eval')
+  implementation project(':modules:search-pipeline-common')
+  // Object storage. Used through RepositoryPlugin#getRepositories, the supported API, rather than by
+  // reaching into the plugin's package-private constructors -- which is what the R11 test harness had to
+  // do and is not something production code should copy.
+  implementation project(':plugins:repository-s3')
+}
+
+test.enabled = false
+
+// Netty and the transport module bring transitive third-party jars the audit cannot resolve for a
+// non-distribution project; the shell publishes nothing, so the audit adds no safety here.
+tasks.named('thirdPartyAudit').configure { enabled = false }
+tasks.named('dependencyLicenses').configure { enabled = false }
+tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatures' }
+
+/*
+ * RFC §4 rule 1 / §13.2 — direction is absolute and CI-enforced.
+ *
+ * serverless/ may depend on server. server may NEVER reference serverless. This is what keeps
+ * upstream merges routine; as a convention it would erode one commit at a time, so it is a task.
+ *
+ * Deliberately lives here rather than in server/build.gradle: the rule is ours to enforce, and
+ * putting it in server/ would itself be a change to server/ that upstream never asked for.
+ */
+def serverSourceDirs = [
+  file("${rootDir}/server/src/main/java"),
+  file("${rootDir}/server/src/test/java")
+]
+
+tasks.register('checkServerDoesNotReferenceServerless') {
+  description = 'Fails if any file under server/ references org.opensearch.serverless'
+  group = 'verification'
+  doLast {
+    def offenders = []
+    serverSourceDirs.each { dir ->
+      if (dir.exists()) {
+        fileTree(dir: dir, include: '**/*.java').each { f ->
+          if (f.text.contains('org.opensearch.serverless')) {
+            offenders << f.absolutePath.replace("${rootDir}/", '')
+          }
+        }
+      }
+    }
+    if (!offenders.isEmpty()) {
+      throw new GradleException(
+        "RFC §4 rule 1 violated — server/ must never reference serverless:\n  " + offenders.join("\n  ")
+      )
+    }
+    logger.lifecycle("§4 rule 1 holds: no server/ file references org.opensearch.serverless")
+  }
+}
+
+tasks.named('check').configure { dependsOn 'checkServerDoesNotReferenceServerless' }

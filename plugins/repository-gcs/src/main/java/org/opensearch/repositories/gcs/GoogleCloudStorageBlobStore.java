@@ -50,11 +50,15 @@ import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.common.collect.MapBuilder;
 import org.opensearch.common.io.Streams;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.secure_sm.AccessController;
@@ -71,6 +75,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -462,5 +467,49 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     @Override
     public Map<String, Long> stats() {
         return stats.toMap();
+    }
+
+    /**
+     * Reads the register at {@code blobName}. Unlike {@code FsBlobContainer}/{@code
+     * S3BlobContainer}, no self-managed generation counter needs to be embedded in the blob's own
+     * bytes: GCS objects already carry a real, monotonically increasing generation number as
+     * first-class metadata, which maps directly onto {@link BlobRegister#generation()}.
+     */
+    Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        final BlobId blobId = BlobId.of(bucketName, blobName);
+        final Blob blob = AccessController.doPrivilegedChecked(() -> client().get(blobId));
+        if (blob == null) {
+            return Optional.empty();
+        }
+        final byte[] content = AccessController.doPrivilegedChecked(() -> blob.getContent());
+        return Optional.of(new BlobRegister(blob.getGeneration(), new BytesArray(content)));
+    }
+
+    /**
+     * CASes the register at {@code blobName} using GCS's real conditional-write primitives
+     * ({@code BlobTargetOption.doesNotExist()} / {@code generationMatch(long)}) as the actual
+     * concurrency guard: GCS evaluates the generation match atomically server-side against the
+     * object's live generation, so a concurrent writer racing between our check and this call is
+     * caught there (as an {@code HTTP_PRECON_FAILED} response), not missed.
+     */
+    BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue) throws IOException {
+        final BlobId blobId = BlobId.of(bucketName, blobName);
+        final BlobInfo blobInfo = BlobInfo.newBuilder(blobId).build();
+        final byte[] bytes = BytesReference.toBytes(newValue);
+        final Storage.BlobTargetOption[] targetOptions = expectedGeneration == BlobRegister.ABSENT_GENERATION
+            ? new Storage.BlobTargetOption[] { Storage.BlobTargetOption.doesNotExist() }
+            : new Storage.BlobTargetOption[] { Storage.BlobTargetOption.generationMatch(expectedGeneration) };
+        try {
+            final Blob written = AccessController.doPrivilegedChecked(() -> client().create(blobInfo, bytes, targetOptions));
+            return BlobRegisterCasResult.applied(written.getGeneration());
+        } catch (final StorageException e) {
+            if (e.getCode() == HTTP_PRECON_FAILED) {
+                // Someone raced us; report a conflict with the real current generation rather than
+                // a wrapped exception so the caller re-reads and retries as normal.
+                long actualGeneration = readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                return BlobRegisterCasResult.conflict(actualGeneration);
+            }
+            throw e;
+        }
     }
 }

@@ -1,0 +1,60 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.build'
+
+dependencies {
+  /*
+   * `:server` and nothing else -- deliberately, and it is the point of this module.
+   *
+   * The shell is not on this classpath, so nothing here can reach a ServerlessNode, a MetadataPlane or
+   * a shard. If authentication needed any of that, then the plugin host built in M23 would not really be
+   * a plugin host: it would be a place where privileged code is allowed to live. Everything this module
+   * uses -- Plugin, ActionPlugin, IdentityPlugin, Client, RestHandler -- is API that any third-party
+   * plugin has, which is what makes it evidence.
+   */
+  implementation project(':server')
+  implementation project(':libs:opensearch-common')
+  implementation project(':libs:opensearch-core')
+}
+
+// Tests live in serverless/testkit, which can start a node.
+test.enabled = false
+
+tasks.named('thirdPartyAudit').configure { enabled = false }
+tasks.named('dependencyLicenses').configure { enabled = false }
+tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatures' }
+
+/*
+ * The dependency rule this module exists to demonstrate, enforced rather than described: nothing under
+ * serverless/auth may name the shell. A compile error would catch it today because the shell is not on
+ * the classpath, but a future `implementation project(':serverless:shell')` added for convenience would
+ * silently dissolve the boundary, and this fails that build instead.
+ */
+tasks.register('checkAuthDoesNotReferenceTheShell') {
+  description = 'Fails if the auth plugin reaches into the shell rather than the plugin API'
+  group = 'verification'
+  doLast {
+    def offenders = []
+    fileTree(dir: file("${projectDir}/src"), include: '**/*.java').each { f ->
+      if (f.text.contains('org.opensearch.serverless.shell')
+        || f.text.contains('org.opensearch.serverless.metadata')
+        || f.text.contains('org.opensearch.serverless.shard')) {
+        offenders << f.absolutePath.replace("${rootDir}/", '')
+      }
+    }
+    if (!offenders.isEmpty()) {
+      throw new GradleException(
+        "the auth plugin must use only the plugin API, but these reach into the shell:\n  " + offenders.join("\n  ")
+      )
+    }
+    logger.lifecycle('the auth plugin uses only the plugin API')
+  }
+}
+
+tasks.named('check').configure { dependsOn 'checkAuthDoesNotReferenceTheShell' }
