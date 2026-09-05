@@ -1,0 +1,139 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.build'
+
+dependencies {
+  implementation project(':server')
+  implementation project(':serverless:shell')
+  implementation project(':serverless:auth')
+  runtimeOnly project(':libs:opensearch-plugin-classloader')
+  implementation project(':modules:transport-netty4')
+  testImplementation project(':test:framework')
+  // R11 against a real S3 API: the conformance suite needs the container production would use.
+  testImplementation project(':plugins:repository-s3')
+}
+
+// Spikes (S0, S1) live here. They are disposable probes, not a regression suite —
+// see s0-findings.md and s1-findings.md.
+tasks.named('forbiddenApisMain').configure {
+  replaceSignatureFiles 'jdk-signatures'
+}
+
+// Multi-process tests fork real JVMs. The test framework installs a seccomp system-call filter that
+// blocks execve -- deliberately, since a node has no business spawning children -- so these cannot run
+// under the ordinary `test` task. They get their own task with the filter off rather than the whole
+// module losing it, so everything that does not need to fork keeps the guard.
+tasks.named('test').configure {
+  exclude '**/ServerlessContentionTests.class'
+  exclude '**/ServerlessFleetTests.class'
+  exclude '**/MinioBlobContainerConformanceTests.class'
+  exclude '**/SeaweedBlobContainerConformanceTests.class'
+  exclude '**/ServerlessOnObjectStoreTests.class'
+  exclude '**/ServerlessBucketContentionTests.class'
+  exclude '**/ServerlessCostTests.class'
+  exclude '**/ServerlessRealPluginTests.class'
+  exclude '**/ServerlessTlsTests.class'
+}
+
+/*
+ * Installing a real, assembled plugin.
+ *
+ * analysis-icu is chosen for what it drags with it: a 14MB icu4j and a Lucene analysis jar, so the loader
+ * is exercised on a plugin that brings dependencies rather than on a single class a test compiled. It is
+ * also an AnalysisPlugin, so the test can prove the shell honours an extension point rather than merely
+ * loading something. mapper-murmur3 is the second extension point -- a field type -- and installing both at
+ * once also covers a node running more than one installed plugin, which nothing else does.
+ *
+ * Its own task because it reads that zip out of the build tree, which the test framework's security
+ * manager denies -- rightly, since reading build artefacts is not something a node does. One test loses
+ * the filter rather than the whole module.
+ *
+ * The distributions directory rather than the task's output file: reaching across projects for a task
+ * output couples configuration in a way Gradle keeps making harder, and the test globs for the zip anyway.
+ */
+tasks.register('pluginTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/ServerlessRealPluginTests.class'
+  dependsOn ':plugins:analysis-icu:bundlePlugin'
+  dependsOn ':plugins:mapper-murmur3:bundlePlugin'
+  systemProperty 'tests.serverless.plugin.dists', [
+    project(':plugins:analysis-icu').projectDir.toString() + '/build/distributions',
+    project(':plugins:mapper-murmur3').projectDir.toString() + '/build/distributions'
+  ].join(File.pathSeparator)
+  systemProperty 'tests.security.manager', 'false'
+}
+
+// R11 against a real S3 API. Its own task because it needs a running endpoint and because the AWS SDK v2
+// insists on a config path -- S3Service hands System.getProperty("opensearch.path.conf") straight to
+// System.setProperty, which throws NPE when it is unset. The rest of the module should not carry either.
+tasks.register('s3Test', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/MinioBlobContainerConformanceTests.class'
+  include '**/SeaweedBlobContainerConformanceTests.class'
+  include '**/ServerlessOnObjectStoreTests.class'
+  include '**/ServerlessCostTests.class'
+  systemProperty 'opensearch.path.conf', 'config'
+  systemProperty 'tests.security.manager', 'false'
+  // Netty refuses a second attempt to set its global processor count, and both the node's transport and
+  // the S3 client's event loop group try. Telling it not to is what a real node does too.
+  systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+}
+
+/*
+ * TLS on the transport, which needs the security manager off.
+ *
+ * Netty's SSL handler opens the connection from netty-common's own protection domain, and the test
+ * framework grants that domain nothing -- so the handshake dies with "Denied access to: localhost:<port>"
+ * while a plain netty4 connection in the same build is fine. Nothing about that is the shell's, and one
+ * test class loses the manager rather than the module.
+ */
+tasks.register('tlsTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/ServerlessTlsTests.class'
+  systemProperty 'tests.security.manager', 'false'
+}
+
+tasks.register('processTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/ServerlessContentionTests.class'
+  include '**/ServerlessFleetTests.class'
+  // Forks real JVMs *and* talks to S3, so it needs both this task's seccomp exemption and the config
+  // path the AWS SDK insists on.
+  include '**/ServerlessBucketContentionTests.class'
+  systemProperty 'opensearch.path.conf', 'config'
+  systemProperty 'tests.system_call_filter', 'false'
+  // The forked node must run a PRODUCTION classpath. OpenSearch's Randomness decides it is "running
+  // tests" purely by whether randomizedtesting is loadable, and then demands a test context that a real
+  // main() has no way to provide -- so a child on the test classpath dies inside NodeEnvironment. The
+  // main source set's runtime classpath is server + shell + netty4 without the test framework, which is
+  // also simply the more faithful thing to fork.
+  systemProperty 'serverless.node.classpath', sourceSets.main.runtimeClasspath.asPath
+}
+
+tasks.named('check').configure {
+  dependsOn 'processTest'
+  dependsOn 'pluginTest'
+  dependsOn 'tlsTest'
+  // Safe to always depend on: with no endpoint reachable the tests assume-skip rather than fail, so a
+  // developer without a container gets a loud skip instead of a red build.
+  dependsOn 's3Test'
+}
+
+// The REST API spec, on the test classpath. ServerlessSpecCoverageTests walks every path in it against a
+// running node and asserts each is served or refused with a reason -- never core's default 400 "no
+// handler found for uri". Copied from the spec module rather than duplicated, so the list cannot drift.
+tasks.named('processTestResources').configure {
+  from(project(':rest-api-spec').file('src/main/resources/rest-api-spec/api')) {
+    into 'rest-api-spec/api'
+  }
+}
