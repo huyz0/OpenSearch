@@ -198,52 +198,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 )
             );
         }
-        // The pipeline runs here, before anything is routed or written: a document is shaped and then
-        // stored, and a caller must never be told a write succeeded against a document the pipeline was
-        // supposed to change and did not. A dropped document is not an error and not a write.
-        String shaped = source;
-        boolean dropped = false;
-        if (deletion == false && pipeline != null && source != null) {
-            final var serving0 = node.get();
-            final var plane0 = plane.get();
-            if (serving0 != null && plane0 != null) {
-                try {
-                    final var stored = plane0.pipelines().get(pipeline);
-                    if (stored.isEmpty()) {
-                        return channel -> channel.sendResponse(
-                            IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "pipeline_missing", "no such pipeline: " + pipeline)
-                        );
-                    }
-                    final var compiled = serving0.ingestPipelines().compile(pipeline, stored.get());
-                    final var outcome = serving0.ingestPipelines().run(compiled, index, id, source);
-                    dropped = outcome.dropped();
-                    shaped = outcome.source();
-                } catch (Exception e) {
-                    final String reason = e.getMessage() == null ? e.toString() : e.getMessage();
-                    return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "pipeline_failed", reason)
-                    );
-                }
-            }
-        }
-        if (dropped) {
-            // Reported as what it is. Classic OpenSearch answers "noop" for a dropped document, and a
-            // caller that cannot tell "dropped" from "written" cannot tell whether its pipeline works.
-            return channel -> {
-                try (XContentBuilder builder = channel.newBuilder()) {
-                    builder.startObject();
-                    builder.field("_index", index);
-                    builder.field("_id", id);
-                    builder.field("result", "noop");
-                    builder.field("dropped_by_pipeline", pipeline);
-                    builder.endObject();
-                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-                }
-            };
-        }
-        final String shapedSource = shaped;
-
-        if (deletion == false && (shapedSource == null || shapedSource.isBlank())) {
+        if (deletion == false && (source == null || source.isBlank())) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a document body is required")
             );
@@ -292,6 +247,60 @@ public final class DocumentHandler extends BaseRestHandler {
                 )
             );
         }
+
+        // The pipelines run here: after the index is resolved, because index.default_pipeline and
+        // index.final_pipeline belong to the index actually written to -- a data stream's backing index,
+        // not the name the caller used -- and before anything is routed or written, because a caller must
+        // never be told a write succeeded against a document the pipeline was supposed to change and did
+        // not. A dropped document is not an error and not a write.
+        final java.util.List<String> pipelines = deletion
+            ? java.util.List.of()
+            : org.opensearch.serverless.ingest.IngestPipelines.pipelinesFor(pipeline, descriptor.get().extraSettings());
+        String shaped = source;
+        boolean dropped = false;
+        String droppedBy = null;
+        for (String ran : pipelines) {
+            try {
+                final var stored = metadata.pipelines().get(ran);
+                if (stored.isEmpty()) {
+                    return channel -> channel.sendResponse(
+                        IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "pipeline_missing", "no such pipeline: " + ran)
+                    );
+                }
+                final var outcome = serving.ingestPipelines()
+                    .run(serving.ingestPipelines().compile(ran, stored.get()), writtenIndex, id, shaped);
+                if (outcome.dropped()) {
+                    // A drop ends the document, so a final pipeline does not run over one that is not going
+                    // to be written. Core does the same.
+                    dropped = true;
+                    droppedBy = ran;
+                    break;
+                }
+                shaped = outcome.source();
+            } catch (Exception e) {
+                final String reason = e.getMessage() == null ? e.toString() : e.getMessage();
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "pipeline_failed", reason)
+                );
+            }
+        }
+        if (dropped) {
+            // Reported as what it is. Classic OpenSearch answers "noop" for a dropped document, and a
+            // caller that cannot tell "dropped" from "written" cannot tell whether its pipeline works.
+            final String by = droppedBy;
+            return channel -> {
+                try (XContentBuilder builder = channel.newBuilder()) {
+                    builder.startObject();
+                    builder.field("_index", writtenIndex);
+                    builder.field("_id", id);
+                    builder.field("result", "noop");
+                    builder.field("dropped_by_pipeline", by);
+                    builder.endObject();
+                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                }
+            };
+        }
+        final String shapedSource = shaped;
 
         final int shard = DocumentRouting.shardFor(descriptor.get(), id);
         final ShardId shardId = serving.reconciler()

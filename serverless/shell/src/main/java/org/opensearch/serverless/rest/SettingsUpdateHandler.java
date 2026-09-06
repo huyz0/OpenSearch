@@ -219,9 +219,10 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 + "the object store, not from replica copies. Readers are added by scaling search nodes, not "
                 + "by setting a replica count";
         }
-        // The index-level pipeline settings: dynamic in core's registry, so they passed the static check
-        // below, and read by nothing on this shell's write or search path, so they were stored and never
-        // ran. Refused with the reason rather than acknowledged with "changed": true.
+        // What remains here is the index-level *search* pipeline setting: dynamic in core's registry, so it
+        // passes the static check below, and read by nothing on this shell's search path, so it would be
+        // stored and never run. Refused with the reason rather than acknowledged with "changed": true. The
+        // two ingest ones used to be refused alongside it and are now read by the write path.
         final String unsupported = IndexAdminHandler.unsupportedIndexSetting(requested);
         if (unsupported != null) {
             return unsupported;
