@@ -76,6 +76,12 @@ Two dependency-direction rules are enforced as build tasks rather than conventio
 `server/` may never name `org.opensearch.serverless`, and the auth plugin may reach only for
 plugin API.
 
+## Where it is, and what is unfinished
+
+[`STATUS.md`](STATUS.md) is the current statement of what works, what is refused on purpose,
+and what is genuinely still open -- eleven items, of which the fencing window below is the only
+one that is a correctness question rather than a missing feature.
+
 ## The open risk
 
 The whole safety argument rests on the object store's `compareAndSwapRegister` being genuinely
