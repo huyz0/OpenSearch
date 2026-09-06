@@ -321,8 +321,14 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
 
             final Answer stats = call(port, "GET", "/_nodes/stats");
             assertEquals(stats.body(), 501, stats.status());
-            assertTrue("the reason must be the real one: " + stats.body(), stats.has("what does not exist yet is the fan-out"));
+            // The reason has changed twice, and each time because the previous one stopped being true. It was
+            // "no node can answer this", which the lease registry made false; then "the fan-out does not
+            // exist", which ?nodes=_all made false. What is left is the only thing still true of it: the
+            // body means core's schema, and this shell does not produce those numbers.
+            assertTrue("the reason must be the real one: " + stats.body(), stats.has("core's node-statistics schema"));
+            assertTrue("and point at what does answer: " + stats.body(), stats.has("/_serverless/stats?nodes=_all"));
             assertFalse("not the one that stopped being true: " + stats.body(), stats.has("no node can answer this"));
+            assertFalse("nor the one after it: " + stats.body(), stats.has("what does not exist yet is the fan-out"));
 
             // Allocation-shaped waits are refused rather than silently satisfied.
             final Answer allocation = call(port, "GET", "/_cluster/health?wait_for_active_shards=2");
