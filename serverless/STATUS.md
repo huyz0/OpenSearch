@@ -183,6 +183,13 @@ and core's indexing pressure on the write paths, so a batch larger than the node
 a 429 rather than accepted into memory it does not have. A node at its shard limit evicts its least
 recently used idle shard to make room rather than refusing, and `GET /_serverless/stats` reports the
 counters those refusals are decided from — breakers, in-flight write bytes, and what the node is holding.
+`?nodes=_all` (or a list of ids or names) asks every live node over the authenticated transport and answers
+with each node's own document under its id, plus `_nodes.total/successful/failed` and a `failures` array
+naming the ones that did not answer and why — the nodes worth asking about are the ones most likely to time
+out, so a fan-out that quietly returned only what it could reach would let an operator read "everything is
+fine" off a report missing the node that is not. `/_nodes/stats` stays refused, for a reason that is now
+about schema rather than reach: it means core's indices/os/jvm/fs/transport/thread_pool numbers, which this
+shell does not produce.
 
 **Analysis and batched search.** `GET|POST /{index}/_analyze` shows what the analyzer does to a string — a
 field's own analyzer, a named one, or the index default — read from the mapping, so a dormant index still
@@ -332,10 +339,6 @@ These are decisions, not gaps. Each answers 501 with a reason.
   drop and a translog bootstrap. It cannot be closed by moving the seal any further: a swap and a seal are
   two object-store operations with no transaction spanning them. Closing it entirely would need the
   register itself to carry the seal.
-- `_nodes/stats` is refused, and its reason is now specific rather than shared: each node answers for itself
-  at `GET /_serverless/stats` and this node knows where the others are, so what is missing is the fan-out that
-  would ask them and the accounting that would report which ones did not answer — a scoping decision, not an
-  impossibility.
 - `update` inside `_bulk` is refused: it is a partial merge, which has to read the current document before
   writing one, and the batch path applies without reading. Closing it changes what a batch is, so it is a
   design decision rather than plumbing. `POST /{index}/_update/{id}` does the merge.
@@ -354,9 +357,6 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - `onIndexModule` fires only for plugins loaded from disk. Firing it for a plugin passed in as an instance
   needs `PluginsService` to accept instances.
 - The orphan sweep is not resumable; making it so needs paged `children()` on `BlobContainer`.
-- `/_nodes/stats` stays refused with the rest of the cluster surface — a node cannot speak for another
-  without cluster-wide state. `GET /_serverless/stats` answers for the node it was sent to, which is the
-  honest scope.
 
 **Blocked on something I do not have:**
 

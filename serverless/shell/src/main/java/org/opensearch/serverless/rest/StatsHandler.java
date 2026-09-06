@@ -29,11 +29,19 @@ import java.util.function.Supplier;
 /**
  * {@code GET /_serverless/stats} — what this node is holding, and how close it is to its limits.
  *
- * <p><b>Why not {@code /_nodes/stats}.</b> That endpoint answers for a cluster: it reports every node, and
- * a node here cannot speak for any other without the cluster-wide state this design does not have. It stays
- * refused with the rest of {@code /_cluster/*} for exactly that reason. This answers only for the node it
- * was sent to, which is the honest scope, and lives under {@code /_serverless/} with the rest of what is
- * ours rather than borrowing a name whose meaning is different.
+ * <p><b>Why not {@code /_nodes/stats}.</b> Not because a node cannot reach another — {@code ?nodes=_all}
+ * here does exactly that, over the same authenticated transport every other hop uses. Because that endpoint
+ * has a <em>schema</em>: indices, os, jvm, fs, transport, thread_pool, none of which this shell produces.
+ * Serving this document under that name would hand a client parsing core's schema something that looks
+ * right and answers nothing, which is worse than a refusal that points at the endpoint that does answer. So
+ * this lives under {@code /_serverless/} with the rest of what is ours, and reports what is actually known.
+ *
+ * <p><b>Answering for the fleet.</b> With no {@code nodes} parameter this describes the node it was sent to.
+ * With one — {@code _all}, or a comma-separated list of ids or names — it asks each live member and returns
+ * that member's own document under its id, unmodified. A node that did not answer is <em>named</em>, with a
+ * reason, and counted: the members worth asking about are the ones most likely to time out, so a fan-out
+ * that quietly returned what it could reach would let an operator read "everything is fine" off a report
+ * that is missing the node that is not.
  *
  * <p><b>What it is for.</b> Real circuit breakers and a bound on in-flight writes both turn a node that
  * would have died into a node that refuses a request. That is the right
@@ -90,9 +98,233 @@ public final class StatsHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final ServerlessNode serving = node.get();
         final MetadataPlane metadata = plane.get();
+        final String nodes = request.param("nodes");
+        if (nodes != null) {
+            // Off the calling thread. The fan-out blocks on peers, and Fanout runs the caller's share on
+            // whichever thread called it, so doing this inline would block an HTTP worker for as long as
+            // the slowest node takes to answer.
+            return channel -> serving.threadPool()
+                .executor(org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT)
+                .execute(() -> {
+                    try {
+                        fleet(channel, serving, metadata, nodes);
+                    } catch (Exception e) {
+                        try {
+                            channel.sendResponse(
+                                IndexAdminHandler.error(channel, RestStatus.INTERNAL_SERVER_ERROR, "stats_failed", describeFailure(e))
+                            );
+                        } catch (Exception ignored) {
+                            // The channel is gone; there is nowhere left to report this.
+                        }
+                    }
+                });
+        }
         return channel -> {
             try (XContentBuilder builder = channel.newBuilder()) {
                 builder.startObject();
+                describe(builder, serving, metadata);
+                builder.endObject();
+                channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            }
+        };
+    }
+
+    /**
+     * Answers for more than one node: {@code ?nodes=_all}, or a comma-separated list of ids or names.
+     *
+     * <p><b>Why this is here and not at {@code /_nodes/stats}.</b> That endpoint has a schema — indices,
+     * os, jvm, fs, transport, thread_pool — and this shell does not produce those numbers. Serving this
+     * body under that name would hand a client that parses core's schema a document that looks right and
+     * answers nothing, which is worse than the refusal. So {@code /_nodes/stats} stays refused, and what
+     * was actually missing — a way to ask one node about the fleet — lives in this shell's own namespace
+     * next to the single-node answer whose shape it repeats.
+     *
+     * <p><b>The accounting is the point.</b> A node that did not answer is named in {@code failures} with
+     * the reason, and counted in {@code _nodes.failed}. A fan-out that silently returned the nodes it
+     * could reach would let an operator read "everything is fine" off a report that is missing the node
+     * that is not fine — and the nodes worth asking about are exactly the ones most likely to time out.
+     *
+     * <p>Asked concurrently, and bounded per node by the forward deadline, for the same reason: the whole
+     * answer must not be held up by the slowest member, or it arrives after it was useful.
+     */
+    private void fleet(org.opensearch.rest.RestChannel channel, ServerlessNode serving, MetadataPlane metadata, String nodes)
+        throws IOException {
+        if (metadata == null) {
+            channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+            );
+            return;
+        }
+        final java.util.Set<String> wanted = new java.util.LinkedHashSet<>(List.of(nodes.split(",")));
+        final boolean all = wanted.contains("_all");
+
+        metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
+        final long now = metadata.clock().getAsLong();
+        final List<org.opensearch.serverless.membership.NodeLease> selected = new ArrayList<>();
+        for (org.opensearch.serverless.membership.NodeLease lease : metadata.membership().current()) {
+            if (lease.isExpiredAt(now)) {
+                continue;
+            }
+            if (all || wanted.contains(lease.nodeId()) || wanted.contains(lease.name())) {
+                selected.add(lease);
+            }
+        }
+        selected.sort(Comparator.comparing(org.opensearch.serverless.membership.NodeLease::nodeId));
+
+        // A name that matched nothing is said, rather than quietly producing a shorter list. An operator
+        // who mistyped a node name and got an answer about the others would read it as the fleet.
+        if (all == false) {
+            final java.util.Set<String> matched = new java.util.HashSet<>();
+            for (var lease : selected) {
+                matched.add(lease.nodeId());
+                matched.add(lease.name());
+            }
+            final java.util.List<String> unknown = wanted.stream().filter(one -> matched.contains(one) == false).sorted().toList();
+            if (unknown.isEmpty() == false) {
+                channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.NOT_FOUND,
+                        "node_not_found",
+                        "no live node matches " + unknown + "; GET /_nodes lists the fleet"
+                    )
+                );
+                return;
+            }
+        }
+
+        final String localId = serving.localNode().getId();
+        final List<java.util.concurrent.Callable<Answered>> asks = new ArrayList<>(selected.size());
+        for (var lease : selected) {
+            asks.add(() -> ask(serving, metadata, lease, localId));
+        }
+        final List<Answered> answers;
+        try {
+            answers = Fanout.run(
+                serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT),
+                Fanout.DEFAULT_CONCURRENCY,
+                asks
+            );
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "interrupted", "the fan-out was interrupted")
+            );
+            return;
+        }
+
+        // Fanout leaves a null where a task threw. Nothing above should throw -- ask() catches -- but a
+        // null here would become a NullPointerException in the middle of rendering, which is the one
+        // outcome an accounting endpoint must not have. Filled in as the failure it is.
+        final List<Answered> reported = new ArrayList<>(answers.size());
+        for (int i = 0; i < answers.size(); i++) {
+            final Answered answered = answers.get(i);
+            reported.add(
+                answered != null
+                    ? answered
+                    : new Answered(selected.get(i).nodeId(), selected.get(i).name(), null, "this node could not ask it")
+            );
+        }
+        int successful = 0;
+        for (Answered answered : reported) {
+            if (answered.statistics != null) {
+                successful++;
+            }
+        }
+        try (XContentBuilder builder = channel.newBuilder()) {
+            builder.startObject();
+            builder.startObject("_nodes");
+            builder.field("total", reported.size());
+            builder.field("successful", successful);
+            builder.field("failed", reported.size() - successful);
+            builder.endObject();
+            builder.startObject("nodes");
+            for (Answered answered : reported) {
+                if (answered.statistics == null) {
+                    continue;
+                }
+                builder.field(answered.nodeId);
+                // Copied through rather than re-rendered: the node that owns the numbers decided their
+                // shape, and this is the only place that would have to change if it ever stopped agreeing.
+                builder.rawValue(
+                    new java.io.ByteArrayInputStream(answered.statistics.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                    org.opensearch.common.xcontent.XContentType.JSON
+                );
+            }
+            builder.endObject();
+            builder.startArray("failures");
+            for (Answered answered : reported) {
+                if (answered.statistics != null) {
+                    continue;
+                }
+                builder.startObject();
+                builder.field("node", answered.nodeId);
+                builder.field("name", answered.name);
+                builder.field("reason", answered.reason);
+                builder.endObject();
+            }
+            builder.endArray();
+            builder.endObject();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        }
+    }
+
+    /** One node's answer, or why there is not one. */
+    private record Answered(String nodeId, String name, String statistics, String reason) {}
+
+    private static Answered ask(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        org.opensearch.serverless.membership.NodeLease lease,
+        String localId
+    ) {
+        if (lease.nodeId().equals(localId)) {
+            // No hop to itself. A node that answered its own question over the transport would be one
+            // connection failure away from reporting that it could not reach itself.
+            try (XContentBuilder mine = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+                mine.startObject();
+                describe(mine, serving, metadata);
+                mine.endObject();
+                return new Answered(
+                    lease.nodeId(),
+                    lease.name(),
+                    org.opensearch.core.common.bytes.BytesReference.bytes(mine).utf8ToString(),
+                    null
+                );
+            } catch (Exception e) {
+                return new Answered(lease.nodeId(), lease.name(), null, describeFailure(e));
+            }
+        }
+        try {
+            final var peer = serving.router().peer(lease.nodeId());
+            if (peer.isEmpty()) {
+                return new Answered(lease.nodeId(), lease.name(), null, "its lease names an address this node could not reach");
+            }
+            return new Answered(lease.nodeId(), lease.name(), serving.router().forwardStats(peer.get()).statistics(), null);
+        } catch (Exception e) {
+            return new Answered(lease.nodeId(), lease.name(), null, describeFailure(e));
+        }
+    }
+
+    private static String describeFailure(Exception e) {
+        final String message = e.getMessage();
+        return message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
+    }
+
+    /**
+     * Writes one node's statistics into an object the caller has already opened.
+     *
+     * <p>Separated from the route so that a node answering for itself and a node answering on behalf of a
+     * peer produce byte-identical sections. A fan-out that rendered its own summary of a peer's numbers
+     * would be a second account of them, and the two would drift.
+     *
+     * @param builder the builder, positioned inside an open object
+     * @param serving the node to describe
+     * @param metadata the metadata plane, or null when there is none
+     * @throws IOException if writing fails
+     */
+    public static void describe(XContentBuilder builder, ServerlessNode serving, MetadataPlane metadata) throws IOException {
+        {
                 builder.field("node", serving.localNode().getId());
                 builder.field("name", serving.localNode().getName());
 
@@ -158,11 +390,7 @@ public final class StatsHandler extends BaseRestHandler {
                 scheduler(builder, serving);
                 lease(builder, serving, metadata);
                 heldShards(builder, serving, readers, frozen);
-
-                builder.endObject();
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-            }
-        };
+        }
     }
 
     /** The object store's request counters since this node started, when the store is the metered one. */

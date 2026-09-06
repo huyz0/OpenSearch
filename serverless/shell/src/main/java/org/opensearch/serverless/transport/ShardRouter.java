@@ -125,6 +125,59 @@ public final class ShardRouter {
             ForwardedFrozenSearchRequest::new,
             this::handleFrozenSearch
         );
+        // On MANAGEMENT rather than on the fan-out pool: this is an operator asking a question, and it must
+        // not compete for the threads that answer searches. A node under enough load to be worth asking
+        // about is exactly the node whose fan-out pool is full.
+        transportService.registerRequestHandler(
+            ForwardedStatsRequest.ACTION,
+            ThreadPool.Names.MANAGEMENT,
+            ForwardedStatsRequest::new,
+            this::handleStats
+        );
+    }
+
+    private void handleStats(ForwardedStatsRequest request, TransportChannel channel, org.opensearch.tasks.Task task)
+        throws Exception {
+        requireMac(ForwardedStatsRequest.ACTION, request);
+        // Rendered by the same code that answers this node's own /_serverless/stats, so a node described
+        // through a peer and a node described directly cannot disagree.
+        final org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder();
+        builder.startObject();
+        org.opensearch.serverless.rest.StatsHandler.describe(builder, node, plane.get());
+        builder.endObject();
+        channel.sendResponse(
+            new ForwardedStatsResponse(
+                node.localNode().getId(),
+                org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString()
+            )
+        );
+    }
+
+    /**
+     * Asks one node for its own statistics.
+     *
+     * <p>Bounded by the single-write deadline. A node that cannot describe itself within one lease is a
+     * node the answer should report as unreachable rather than one the whole fan-out should wait for: the
+     * point of the accounting is to say which nodes did not answer, and that is only useful if it arrives.
+     *
+     * @param peer the node to ask
+     * @return that node's statistics
+     * @throws IOException if the request cannot be sent
+     */
+    public ForwardedStatsResponse forwardStats(DiscoveryNode peer) throws IOException {
+        final ForwardedStatsRequest request = new ForwardedStatsRequest();
+        final PlainActionFuture<ForwardedStatsResponse> future = PlainActionFuture.newFuture();
+        final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
+        try (var ignored = withMac(ForwardedStatsRequest.ACTION, request)) {
+            transportService.sendRequest(
+                peer,
+                ForwardedStatsRequest.ACTION,
+                request,
+                TransportRequestOptions.builder().withTimeout(timeout).build(),
+                new Handler<>(future, ForwardedStatsResponse::new)
+            );
+        }
+        return await(future, timeout, peer, ForwardedStatsRequest.ACTION);
     }
 
     private void handleIndex(ForwardedIndexRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {

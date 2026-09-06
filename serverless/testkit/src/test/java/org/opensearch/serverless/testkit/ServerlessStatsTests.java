@@ -143,6 +143,73 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * {@code ?nodes=} asks the fleet, and says which members did not answer.
+     *
+     * <p><b>The accounting is the assertion.</b> A fan-out that returned the nodes it could reach and said
+     * nothing about the rest would let an operator read "everything is fine" off a report that is missing
+     * the node that is not fine — and the node worth asking about is exactly the one most likely not to
+     * answer. So the second half of this stops a node and checks that it is <em>named</em>, with a reason,
+     * and counted in {@code failed}: reaching one node out of two must not look like reaching one node.
+     *
+     * <p>Peers are asked over the transport rather than over HTTP, so this also exercises the authenticated
+     * hop; a node answering for itself takes no hop at all, which is why the local id must be present in
+     * both halves.
+     */
+    public void testTheFleetIsAskedAndTheOnesThatDoNotAnswerAreNamed() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+
+        try (ServerlessNode first = new ServerlessNode(nodeSettings("fleet-stats-a", null))) {
+            final String secondId;
+            try (ServerlessNode second = new ServerlessNode(nodeSettings("fleet-stats-b", null))) {
+                first.start();
+                first.setMetadataPlane(plane);
+                second.start();
+                second.setMetadataPlane(plane);
+                secondId = second.localNode().getId();
+                // Each publishes a lease, which is what a reconcile pass does in a running deployment and
+                // is the only way one node learns where another is.
+                new BackgroundReconciler(first, plane).tick(clock.get());
+                new BackgroundReconciler(second, plane).tick(clock.get());
+
+                final Response all = send(first, "GET", "/_serverless/stats?nodes=_all", null);
+                assertEquals(all.body(), 200, all.status());
+                assertTrue("both nodes asked: " + all.body(), all.body().contains("\"total\":2"));
+                assertTrue("and both answered: " + all.body(), all.body().contains("\"successful\":2"));
+                assertTrue("nothing failed: " + all.body(), all.body().contains("\"failed\":0"));
+                assertTrue("the local node, answered without a hop: " + all.body(), all.body().contains(first.localNode().getId()));
+                assertTrue("and the peer, answered over the transport: " + all.body(), all.body().contains(secondId));
+                // The peer's own document, not a summary of it: this field is produced by the code that
+                // answers /_serverless/stats and by nothing else.
+                assertTrue("each node's own body is carried through: " + all.body(), all.body().contains("\"breakers\""));
+
+                // Named rather than _all, and by name rather than by id, which is how a person asks.
+                final Response one = send(first, "GET", "/_serverless/stats?nodes=fleet-stats-b", null);
+                assertTrue("one node: " + one.body(), one.body().contains("\"total\":1"));
+                assertTrue("the one asked for: " + one.body(), one.body().contains(secondId));
+                assertFalse("and not the other: " + one.body(), one.body().contains(first.localNode().getId()));
+
+                // A name that matches nothing is said, not quietly dropped: an operator who mistyped a node
+                // name and got an answer about the others would read it as the fleet.
+                final Response missing = send(first, "GET", "/_serverless/stats?nodes=no-such-node", null);
+                assertEquals(missing.body(), 404, missing.status());
+                assertTrue("it must name what it could not find: " + missing.body(), missing.body().contains("no-such-node"));
+            }
+
+            // The peer is gone but its lease has not expired, which is precisely the window in which a
+            // fan-out is asked about a node that cannot answer.
+            final Response afterLoss = send(first, "GET", "/_serverless/stats?nodes=_all", null);
+            assertEquals(afterLoss.body(), 200, afterLoss.status());
+            assertTrue("still two members: " + afterLoss.body(), afterLoss.body().contains("\"total\":2"));
+            assertTrue("one answered: " + afterLoss.body(), afterLoss.body().contains("\"successful\":1"));
+            assertTrue("and one is counted as failed: " + afterLoss.body(), afterLoss.body().contains("\"failed\":1"));
+            assertTrue("the one that did not answer is named: " + afterLoss.body(), afterLoss.body().contains(secondId));
+            assertTrue("with a reason: " + afterLoss.body(), afterLoss.body().contains("\"reason\""));
+            assertTrue("the node that did answer still did: " + afterLoss.body(), afterLoss.body().contains(first.localNode().getId()));
+        }
+    }
+
     private record Response(int status, String body) {
     }
 
