@@ -368,8 +368,12 @@ public final class ShardRouter {
      *
      * <p>During the move from the static token to the per-request MAC both are presented: a receiver that
      * knows the MAC prefers it, one that does not still finds the token.
+     *
+     * <p>Package-private rather than private because {@link PluginHopAuthentication} signs a plugin's own
+     * transport request with it. One implementation, so a plugin's hop and the shell's own are authenticated
+     * the same way and cannot drift apart.
      */
-    private org.opensearch.common.util.concurrent.ThreadContext.StoredContext withMac(
+    org.opensearch.common.util.concurrent.ThreadContext.StoredContext withMac(
         String action,
         org.opensearch.transport.TransportRequest request
     ) throws IOException {
@@ -396,8 +400,13 @@ public final class ShardRouter {
      * that has not read the object store is not a member, whatever address it came from. The MAC is
      * preferred and checked whenever presented; the static token is accepted only in its absence, and only
      * until every sender signs.
+     *
+     * <p>Package-private for {@link PluginHopAuthentication}, which applies it to a plugin's action arriving
+     * over the transport. Before that, a plugin's {@code HandledTransportAction} registered its own handler
+     * and nothing checked who called it -- so anything that could reach the port could invoke a plugin's
+     * action, the auth plugin's own included.
      */
-    private void requireMac(String action, org.opensearch.transport.TransportRequest request) throws IOException {
+    void requireMac(String action, org.opensearch.transport.TransportRequest request) throws IOException {
         final String mac = transportService.getThreadPool().getThreadContext().getHeader(TransportAuthenticator.MAC_HEADER);
         if (mac != null) {
             authenticator.verify(action, request, mac);
