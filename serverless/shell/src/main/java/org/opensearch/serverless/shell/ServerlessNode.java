@@ -3019,22 +3019,38 @@ public final class ServerlessNode implements Closeable {
             return new BulkOperation(record, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L, false);
         }
 
-        /** @return the record */
+        /**
+         * Returns what this operation writes or deletes.
+         *
+         * @return the record
+         */
         public org.opensearch.serverless.store.WalRecord record() {
             return record;
         }
 
-        /** @return the sequence number the document must be at, or unassigned */
+        /**
+         * Returns the condition on the document's current sequence number, if any.
+         *
+         * @return the sequence number the document must be at, or unassigned
+         */
         public long ifSeqNo() {
             return ifSeqNo;
         }
 
-        /** @return the primary term the document must be at, or 0 */
+        /**
+         * Returns the condition on the document's current primary term, if any.
+         *
+         * @return the primary term the document must be at, or 0
+         */
         public long ifPrimaryTerm() {
             return ifPrimaryTerm;
         }
 
-        /** @return whether the document must not already exist */
+        /**
+         * Returns whether this operation is a create rather than an overwrite.
+         *
+         * @return whether the document must not already exist
+         */
         public boolean requireAbsent() {
             return requireAbsent;
         }
@@ -3451,6 +3467,13 @@ public final class ServerlessNode implements Closeable {
             return retryable;
         }
 
+        /**
+         * An outcome for an item that could not be applied.
+         *
+         * @param id the document id
+         * @param reason what went wrong, as the caller should see it
+         * @return the outcome
+         */
         public static BulkOutcome failed(String id, String reason) {
             return new BulkOutcome(
                 id,
@@ -4339,7 +4362,12 @@ public final class ServerlessNode implements Closeable {
         return Collections.unmodifiableSortedSet(out);
     }
 
-    /** The lease roles as a node attribute, so the serverless role is readable off a {@code DiscoveryNode} too. */
+    /**
+     * The lease roles as a node attribute, so the serverless role is readable off a {@code DiscoveryNode} too.
+     *
+     * @param leaseRoles the roles from the lease or the {@code serverless.roles} setting
+     * @return the attributes to describe a node with
+     */
     public static Map<String, String> discoveryAttributesFor(Set<String> leaseRoles) {
         return Map.of("serverless.roles", String.join(",", new java.util.TreeSet<>(leaseRoles)));
     }

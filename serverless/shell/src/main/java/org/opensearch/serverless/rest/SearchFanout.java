@@ -156,6 +156,16 @@ public final class SearchFanout {
         }
     }
 
+    /**
+     * Runs one search across the shards of every index named, and merges what comes back.
+     *
+     * @param serving the node coordinating the search
+     * @param metadata the metadata plane, for routing and for shards this node does not hold
+     * @param indices the indices to search, by name
+     * @param source the search itself
+     * @return the merged hits, with the coverage this answer was assembled from
+     * @throws IOException if the fan-out cannot be run
+     */
     public static ShardOperations.SearchOutcome run(
         ServerlessNode serving,
         MetadataPlane metadata,

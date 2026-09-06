@@ -209,6 +209,13 @@ public final class DescriptorStore {
         return result.applied() ? Optional.of(result.currentGeneration()) : Optional.empty();
     }
 
+    /**
+     * Creates an alias record, refusing if one of that name already exists.
+     *
+     * @param alias the record to create
+     * @return the generation it was created at
+     * @throws IOException if the name is not a legal one, or the register cannot be written
+     */
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
         Names.validateIndexOrAlias(alias.name());
         return createRegister(alias.name(), alias.toBytes());

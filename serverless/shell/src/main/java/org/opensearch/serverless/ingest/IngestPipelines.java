@@ -131,7 +131,12 @@ public final class IngestPipelines {
     /** Core's name for "no pipeline", which both settings and the request parameter accept. */
     private static final String NONE = org.opensearch.ingest.IngestService.NOOP_PIPELINE_NAME;
 
-    /** What running a pipeline did to a document. */
+    /**
+     * What running a pipeline did to a document.
+     *
+     * @param source the document as the pipeline left it, unchanged if no processor touched it
+     * @param dropped whether a processor dropped the document, in which case it is not written
+     */
     public record Result(String source, boolean dropped) {
     }
 

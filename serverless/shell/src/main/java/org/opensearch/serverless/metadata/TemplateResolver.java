@@ -61,7 +61,14 @@ public final class TemplateResolver {
         }
     }
 
-    /** What matching templates contributed, before the request is layered on top. */
+    /**
+     * What matching templates contributed, before the request is layered on top.
+     *
+     * @param settings the settings the templates contributed, un-normalised
+     * @param mappings the mappings the templates contributed, already composed
+     * @param from the name of the template these came from, for the response to attribute them
+     * @param dataStream the data-stream block, or null when no matching template declared one
+     */
     public record Inherited(Map<String, Object> settings, Map<String, Object> mappings, String from, Map<String, Object> dataStream) {
         /**
          * Creates an inheritance with no data-stream block.

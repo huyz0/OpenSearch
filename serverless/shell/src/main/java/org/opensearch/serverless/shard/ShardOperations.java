@@ -720,7 +720,14 @@ public final class ShardOperations {
         }
     }
 
-    /** An explanation, and which copy produced it. */
+    /**
+     * An explanation, and which copy produced it.
+     *
+     * @param exists whether the document was found at all
+     * @param explanation Lucene's own account of the score, or null when the document does not exist
+     * @param servedBy the node that produced it, which may not be the node asked
+     * @param realtime whether it came from a writer, and so sees writes not yet published
+     */
     public record Explained(boolean exists, org.apache.lucene.search.Explanation explanation, String servedBy, boolean realtime) {
 
         /**
@@ -1445,6 +1452,8 @@ public final class ShardOperations {
      * @param docAsUpsert if true, write {@code doc} itself when none exists
      * @param detectNoop if true, a merge that changed nothing is not written
      * @param refresh whether to make the result visible to search before returning
+     * @param ifSeqNo the sequence number the document must currently be at, or unassigned for none
+     * @param ifPrimaryTerm the primary term the document must currently be at, ignored without {@code ifSeqNo}
      * @return what happened
      * @throws DocumentMissingException if nothing exists and neither {@code upsert} nor {@code docAsUpsert}
      *     was given

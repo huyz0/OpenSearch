@@ -64,7 +64,12 @@ public final class ClusterConfig {
         this.container = container;
     }
 
-    /** The register's current value and the generation it was read at. */
+    /**
+     * The register's current value and the generation it was read at.
+     *
+     * @param generation the generation this value was read at, for a later compare-and-swap
+     * @param settings the settings the register held
+     */
     public record Value(long generation, Settings settings) {
     }
 

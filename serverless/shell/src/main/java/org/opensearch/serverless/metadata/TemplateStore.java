@@ -111,6 +111,9 @@ public final class TemplateStore {
      */
     public static final class Cache {
         private volatile Snapshot snapshot;
+
+        /** Creates an empty cache, which the first read fills. */
+        public Cache() {}
     }
 
     /** One consistent reading of the store: the marker's version, the hashes it named, their contents. */
