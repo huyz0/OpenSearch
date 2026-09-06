@@ -389,6 +389,13 @@ These are decisions, not gaps. Each answers 501 with a reason.
   log during recovery. See [`README.md`](README.md) for the file-by-file account. The direction rule
   still holds and is still a build task: no file under `server/` may reference
   `org.opensearch.serverless`. D4 permits narrow shared interfaces, and these are them.
+- **One build-tooling file is touched too, and it is not part of that count.** `doc-tools/missing-doclet`
+  reported every record's accessors and canonical constructor as undocumented, which no amount of writing
+  could satisfy: a record's `@param` tags are the only place those can be documented, and the doclet never
+  looked at them. That made the strictest level unreachable for any module using records. It now skips
+  those implicit members and checks the record's own `@param` coverage instead — which nothing did before,
+  so the check is stricter than it was, not looser. The serverless modules stay at `parameter`, the
+  strictest level, and above core's own `server/`, which sits at `class`.
 - The REST surface is an allowlist. Anything not registered answers 404 or an explicit 501, never an empty
   success.
 - Storage layout changed in M32 (uuid in the path); an existing deployment's data is not found by a node

@@ -928,6 +928,17 @@ public final class IndexAdminHandler extends BaseRestHandler {
         return "could not forward to " + owner + ", which the shard-head named as owner: " + e.getMessage();
     }
 
+    /**
+     * Runs work through the node's action filters, or directly when there is no node to ask.
+     *
+     * @param <T> what the work produces
+     * @param serving the node whose filters apply, or null before one is serving
+     * @param action the action name the filters see
+     * @param request the request the filters see
+     * @param work what to run if the filters allow it
+     * @return whatever the work returned
+     * @throws Exception if a filter refused, or the work itself failed
+     */
     public static <T> T gate(
         org.opensearch.serverless.shell.ServerlessNode serving,
         String action,

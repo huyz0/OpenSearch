@@ -55,6 +55,14 @@ public final class RoutingHints {
     /** Where a head comes from: the register, or a copy read moments ago by the same pass. */
     @FunctionalInterface
     public interface HeadLookup {
+        /**
+         * Reads one shard's head.
+         *
+         * @param index the index
+         * @param shard the shard number
+         * @return the head, or empty if the shard was never activated
+         * @throws IOException if the register cannot be read
+         */
         Optional<ShardHead> read(String index, int shard) throws IOException;
     }
 

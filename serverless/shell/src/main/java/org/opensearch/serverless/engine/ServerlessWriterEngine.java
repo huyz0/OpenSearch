@@ -57,6 +57,8 @@ public final class ServerlessWriterEngine extends InternalEngine {
     @FunctionalInterface
     public interface ReplayLog {
         /**
+         * Returns the write-ahead records a shard being opened must replay.
+         *
          * @param shardId the shard being opened
          * @return the records to replay, in order; empty if this shard should not replay any
          * @throws IOException if the log cannot be read

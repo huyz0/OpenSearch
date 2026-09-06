@@ -507,6 +507,13 @@ public final class MetadataPlane {
         return applied;
     }
 
+    /**
+     * Creates an alias, and lists it on each index it names.
+     *
+     * @param alias the alias to create
+     * @return the generation the alias record was created at
+     * @throws IOException if a descriptor or the alias register cannot be written
+     */
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
         // The hint before the truth: an index that lists an alias which was never created over-approximates
         // and is filtered on read; an alias that exists and is listed nowhere would be invisible to the
@@ -935,10 +942,20 @@ public final class MetadataPlane {
         return new TemplateStore(blobStore.blobContainer(RegisterMap.searchPipelines(base)), cacheFor(RegisterMap.searchPipelines(base)));
     }
 
+    /**
+     * Returns the store holding ingest pipelines.
+     *
+     * @return the pipeline store
+     */
     public TemplateStore pipelines() {
         return new TemplateStore(blobStore.blobContainer(RegisterMap.pipelines(base)), cacheFor(RegisterMap.pipelines(base)));
     }
 
+    /**
+     * Returns the store holding component templates.
+     *
+     * @return the component-template store
+     */
     public TemplateStore componentTemplates() {
         return new TemplateStore(
             blobStore.blobContainer(RegisterMap.componentTemplates(base)),
@@ -946,6 +963,13 @@ public final class MetadataPlane {
         );
     }
 
+    /**
+     * Reads one index's descriptor.
+     *
+     * @param indexName the index
+     * @return its descriptor, or empty if there is no such index
+     * @throws IOException if the register cannot be read
+     */
     public Optional<IndexDescriptor> describe(String indexName) throws IOException {
         return descriptors.get(indexName);
     }
@@ -1627,6 +1651,11 @@ public final class MetadataPlane {
 
     private static final String TRANSPORT_SECRET_BLOB = "transport-secret";
 
+    /**
+     * Returns the deployment's cluster-settings register.
+     *
+     * @return the cluster config
+     */
     public ClusterConfig clusterConfig() {
         return clusterConfig;
     }
