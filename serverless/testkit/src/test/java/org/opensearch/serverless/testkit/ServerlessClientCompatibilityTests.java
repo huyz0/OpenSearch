@@ -349,9 +349,7 @@ public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
                 { "/alpha/_forcemerge", "merging is the shard writer" },
                 { "/alpha/_update_by_query", "search_after" },
                 { "/_search/scroll", "point in time" },
-                { "/_cluster/state", "no cluster-wide state" },
-                // Its reason is its own since M53: enumeration cost, not missing cluster state.
-                { "/_cat/indices", "unbounded" } }) {
+                { "/_cluster/state", "no cluster-wide state" } }) {
                 final Answer answer = call("GET", expected[0], null);
                 assertEquals(expected[0] + " must be a 501: " + answer.body(), 501, answer.status());
                 assertTrue(expected[0] + " must say why: " + answer.body(), answer.has(expected[1]));

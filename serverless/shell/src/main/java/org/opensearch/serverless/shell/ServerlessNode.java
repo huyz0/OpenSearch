@@ -1041,7 +1041,6 @@ public final class ServerlessNode implements Closeable {
             + "one bounded listing and refuses a prefix that matches more than the cap rather than cutting it "
             + "off -- OpenSearch added _list for this reason and left _cat alone";
         for (String[] refusal : new String[][] {
-            { "/_cat/indices", enumeration },
             {
                 "/_cat/shards",
                 "the same unbounded listing as _cat/indices, one row per shard. GET "
@@ -1064,7 +1063,6 @@ public final class ServerlessNode implements Closeable {
                 "this reports per-node thread pools, and answering for the fleet needs the "
                     + "same fan-out /_nodes/stats is waiting on; GET /_serverless/stats answers for the node it is "
                     + "sent to" },
-            { "/_list/indices", enumeration },
             { "/_list/shards", "the same unbounded listing as _cat/shards" } }) {
             controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
         }

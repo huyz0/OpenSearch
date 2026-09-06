@@ -75,13 +75,22 @@ public final class ListIndicesHandler extends BaseRestHandler {
             // The spelling both AWS OpenSearch Serverless and Elastic Cloud Serverless keep of the _cat
             // family, served under the same bounded-prefix rule: a name or a prefix pattern answers, and
             // the bare /_cat/indices stays refused as the enumeration it is.
-            new Route(RestRequest.Method.GET, "/_cat/indices/{index}")
+            new Route(RestRequest.Method.GET, "/_cat/indices/{index}"),
+            // The bare forms, which used to be refused outright as enumeration. They are the same
+            // bounded listing with an empty prefix: one listBlobsByPrefixInSortedOrder capped at the
+            // pattern cap, refused past it rather than truncated. That refusal is what makes serving
+            // them honest -- a deployment small enough to answer gets its answer, and one too large is
+            // told to narrow rather than handed a page that looks complete and is not.
+            new Route(RestRequest.Method.GET, "/_list/indices"),
+            new Route(RestRequest.Method.GET, "/_cat/indices")
         );
     }
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        final String index = request.param("index");
+        // An absent {index} is the bare form, which means every index -- expressed as the prefix
+        // pattern that already has a bound, so it travels the identical path rather than a second one.
+        final String index = request.param("index", "*");
         final String nextToken = request.param("next_token");
         final String unsupportedCat = CatTable.unsupported(request);
         request.param("format");

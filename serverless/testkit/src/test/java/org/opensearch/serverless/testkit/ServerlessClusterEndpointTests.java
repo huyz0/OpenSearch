@@ -314,7 +314,7 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
             node.setMetadataPlane(plane(clock, createTempDir()));
             final int port = portOf(node);
 
-            for (String path : new String[] { "/_cluster/state", "/_cluster/stats", "/_cat/indices", "/_cluster/reroute" }) {
+            for (String path : new String[] { "/_cluster/state", "/_cluster/stats", "/_cluster/reroute" }) {
                 final Answer refused = call(port, "GET", path);
                 assertEquals(path + " must stay refused: " + refused.body(), 501, refused.status());
             }
