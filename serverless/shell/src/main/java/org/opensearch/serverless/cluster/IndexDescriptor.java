@@ -67,6 +67,23 @@ public final class IndexDescriptor {
     private final List<String> aliasedBy;
 
     /**
+     * This descriptor rendered for routing, built once on demand.
+     *
+     * <p>Routing asks per document -- a bulk of ten thousand asks ten thousand times -- and rendering
+     * parses the mapping, so the answer has to be remembered somewhere. Here, on the descriptor, rather
+     * than in a map keyed by uuid: a descriptor is immutable and is replaced whenever the index changes,
+     * so the memo cannot go stale and dies when the descriptor does. A static cache was tried first and
+     * is why this comment exists -- it pinned an {@code IndexMetadata} per index for the life of the JVM,
+     * which in a test run holding many nodes at once was enough to turn two suites into GC thrash and an
+     * eight-hundred-second timeout.
+     *
+     * <p>Not volatile, and it does not need to be: the value is derived purely from final fields, so two
+     * threads racing produce equal objects and either is correct. A torn read is impossible for a
+     * reference.
+     */
+    private IndexMetadata routingMetadata;
+
+    /**
      * Creates a descriptor.
      *
      * @param name the index name
@@ -290,6 +307,24 @@ public final class IndexDescriptor {
      * @return the metadata
      * @throws IOException if the mapping cannot be parsed
      */
+    /**
+     * This descriptor as {@link IndexMetadata}, for routing a document to a shard.
+     *
+     * <p>Separate from {@link #toIndexMetadata} because it takes no primary terms -- routing never reads
+     * them -- which is what makes one remembered rendering correct for every caller.
+     *
+     * @return the metadata core's {@code OperationRouting} needs
+     * @throws IOException if the mapping cannot be parsed
+     */
+    public IndexMetadata routingMetadata() throws IOException {
+        IndexMetadata rendered = routingMetadata;
+        if (rendered == null) {
+            rendered = toIndexMetadata(Map.of());
+            routingMetadata = rendered;
+        }
+        return rendered;
+    }
+
     public IndexMetadata toIndexMetadata(Map<Integer, Long> primaryTerms) throws IOException {
         final IndexMetadata.Builder builder = IndexMetadata.builder(name)
             .settings(

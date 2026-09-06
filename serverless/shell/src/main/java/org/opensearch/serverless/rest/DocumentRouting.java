@@ -36,6 +36,11 @@ public final class DocumentRouting {
      * @return the shard number
      */
     public static int shardFor(IndexDescriptor descriptor, String id) {
-        return Math.floorMod(Murmur3HashFunction.hash(id), descriptor.numberOfShards());
+        try {
+            return org.opensearch.cluster.routing.OperationRouting.generateShardId(descriptor.routingMetadata(), id, null);
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("could not render [" + descriptor.name() + "] for routing", e);
+        }
     }
+
 }
