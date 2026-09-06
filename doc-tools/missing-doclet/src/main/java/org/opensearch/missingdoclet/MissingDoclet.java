@@ -254,13 +254,50 @@ public class MissingDoclet extends StandardDoclet {
             case CONSTRUCTOR:
             case FIELD:
             case ENUM_CONSTANT:
-                if (level(element) >= METHOD && !isSyntheticEnumMethod(element)) {
+                if (level(element) >= METHOD && !isSyntheticEnumMethod(element) && !isImplicitRecordMember(element)) {
                     checkComment(element);
                 }
                 break;
             default:
                 error(element, "I don't know how to analyze " + element.getKind() + " yet.");
         }
+    }
+
+    /**
+     * Return true if the element is a record's canonical constructor or one of its component accessors.
+     *
+     * <p>Neither has anywhere to put a javadoc comment. The place to document them is the record's own
+     * {@code @param} tags, which {@link #checkComment} already requires at PARAMETER level. Checking them
+     * for comments of their own reports every fully documented record as undocumented, and no amount of
+     * writing can satisfy it — {@code GarbageCollector.ShardSweep} carries an {@code @param} for each of
+     * its two components and was still reported for both accessors.
+     *
+     * <p>Same shape as {@link #isSyntheticEnumMethod} below, and for the same underlying reason: the
+     * "included" set contains members with no source declaration behind them.
+     *
+     * <p><b>The two are detected differently, and that is not a style choice.</b> The canonical
+     * constructor comes back as {@code MANDATED}, but javac reports the accessors as {@code EXPLICIT} —
+     * so an origin test alone silences the constructors and leaves every accessor still failing. The
+     * accessors are matched against the components they belong to instead, which is what actually
+     * identifies them.
+     */
+    private boolean isImplicitRecordMember(Element element) {
+        final Element enclosing = element.getEnclosingElement();
+        if (enclosing == null || enclosing.getKind() != ElementKind.RECORD) {
+            return false;
+        }
+        if (elementUtils.getOrigin(element) == Elements.Origin.MANDATED) {
+            return true;
+        }
+        if (element.getKind() != ElementKind.METHOD || enclosing instanceof TypeElement == false) {
+            return false;
+        }
+        for (var component : ((TypeElement) enclosing).getRecordComponents()) {
+            if (element.equals(component.getAccessor())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -405,27 +442,45 @@ public class MissingDoclet extends StandardDoclet {
         return result;
     }
 
-    /** Checks there is a corresponding "param" tag for each method parameter */
+    /**
+     * Checks there is a corresponding "param" tag for each method parameter, or for each record component.
+     *
+     * <p>The record case is where a record's components are actually verified. Its accessors and canonical
+     * constructor are skipped by {@link #isImplicitRecordMember}, because neither has a declaration to
+     * carry a comment; the record's own javadoc is the one place its components can be documented, so it
+     * is the one place they are required.
+     */
     private void checkParameters(Element element, DocCommentTree tree) {
+        final Set<String> documented = documentedParameters(tree);
         if (element instanceof ExecutableElement) {
-            // record each @param that we see
-            Set<String> seenParameters = new HashSet<>();
-            if (tree != null) {
-                for (var tag : tree.getBlockTags()) {
-                    if (tag instanceof ParamTree) {
-                        var name = ((ParamTree)tag).getName().getName().toString();
-                        seenParameters.add(name);
-                    }
-                }
-            }
             // now compare the method's formal parameter list against it
             for (var param : ((ExecutableElement)element).getParameters()) {
                 var name = param.getSimpleName().toString();
-                if (!seenParameters.contains(name)) {
+                if (!documented.contains(name)) {
                     error(element, "missing javadoc @param for parameter '" + name + "'");
                 }
             }
+        } else if (element.getKind() == ElementKind.RECORD && element instanceof TypeElement) {
+            for (var component : ((TypeElement)element).getRecordComponents()) {
+                var name = component.getSimpleName().toString();
+                if (!documented.contains(name)) {
+                    error(element, "missing javadoc @param for record component '" + name + "'");
+                }
+            }
         }
+    }
+
+    /** The names every {@code @param} tag in a doc comment documents. */
+    private Set<String> documentedParameters(DocCommentTree tree) {
+        Set<String> seenParameters = new HashSet<>();
+        if (tree != null) {
+            for (var tag : tree.getBlockTags()) {
+                if (tag instanceof ParamTree) {
+                    seenParameters.add(((ParamTree)tag).getName().getName().toString());
+                }
+            }
+        }
+        return seenParameters;
     }
 
     /** logs a new error for the particular element */

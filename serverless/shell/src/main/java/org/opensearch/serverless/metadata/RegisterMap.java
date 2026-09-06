@@ -179,6 +179,12 @@ public final class RegisterMap {
         return base.add("search_pipelines");
     }
 
+    /**
+     * Returns where snapshot repository descriptors live.
+     *
+     * @param base the deployment root
+     * @return the repositories container
+     */
     public static BlobPath repositories(BlobPath base) {
         return base.add("repositories");
     }

@@ -35,6 +35,12 @@ public class StaleWriterException extends IOException {
         super(message);
     }
 
+    /**
+     * Creates the exception for a publish the manifest refused.
+     *
+     * @param attemptedTerm the term this node tried to publish at
+     * @param currentTerm the term the manifest already holds, or negative when it changed concurrently
+     */
     public StaleWriterException(long attemptedTerm, long currentTerm) {
         super(
             "refusing to publish at term "

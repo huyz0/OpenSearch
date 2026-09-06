@@ -325,6 +325,13 @@ public final class IndexDescriptor {
         return rendered;
     }
 
+    /**
+     * Renders this descriptor as the {@code IndexMetadata} the data plane expects.
+     *
+     * @param primaryTerms the term to stamp on each shard, by shard number; absent shards get term zero
+     * @return the metadata
+     * @throws IOException if the mapping cannot be parsed
+     */
     public IndexMetadata toIndexMetadata(Map<Integer, Long> primaryTerms) throws IOException {
         final IndexMetadata.Builder builder = IndexMetadata.builder(name)
             .settings(

@@ -114,6 +114,11 @@ public final class ShardHead {
         return indexUuid;
     }
 
+    /**
+     * Returns the index this head belongs to.
+     *
+     * @return the index name
+     */
     public String indexName() {
         return indexName;
     }
