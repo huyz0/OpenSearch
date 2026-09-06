@@ -46,15 +46,26 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
     private int port;
 
     private Settings nodeSettings(String name) {
-        return Settings.builder()
+        return nodeSettings(name, 0);
+    }
+
+    /**
+     * @param cap the pattern cap, or 0 for the default -- a low one is how the refusal past the cap is
+     *            reachable at all, since the real default of five hundred is out of a test's reach
+     */
+    private Settings nodeSettings(String name, int cap) {
+        final Settings.Builder settings = Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-discovery")
             .put("path.home", createTempDir())
             .put("network.host", "127.0.0.1")
             .put("http.port", "0")
             .put("transport.port", "0")
-            .put("serverless.roles", "ingest")
-            .build();
+            .put("serverless.roles", "ingest");
+        if (cap > 0) {
+            settings.put("serverless.search.pattern.max_indices", cap);
+        }
+        return settings.build();
     }
 
     private record Answer(int status, String body) {
@@ -130,26 +141,53 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
     }
 
     /**
-     * The unbounded forms are refused, and say what to use instead.
+     * The bare forms answer under the cap and are refused past it, rather than truncating.
      *
-     * <p>This is the assertion that keeps the endpoint honest. Returning the first hundred indices of a
-     * deployment would look exactly like returning all of them, and a client would have no way to tell.
+     * <p>They used to be refused outright as enumeration. That was stricter than the machinery needed:
+     * an empty prefix is the same one bounded listing every other prefix takes, capped and refusing past
+     * the cap, so a deployment small enough to answer can be answered without lying to anyone. What must
+     * never happen is the middle case -- returning the first hundred of a larger deployment, which looks
+     * exactly like returning all of them and gives a client no way to tell.
      */
-    public void testTheUnboundedListingsAreRefusedRatherThanTruncated() throws Exception {
+    public void testTheBareListingsAnswerUnderTheCapAndAreRefusedPastIt() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
-        try (ServerlessNode node = running(plane(clock, createTempDir()), "list-unbounded")) {
+        try (ServerlessNode node = running(plane(clock, createTempDir()), "list-bare")) {
             assertNotNull(node);
 
             for (String path : new String[] { "/_list/indices", "/_cat/indices" }) {
-                final Answer refused = call("GET", path, null);
-                assertEquals(path + " must refuse: " + refused.body(), 501, refused.status());
-                assertTrue(path + " must point at what works: " + refused.body(), refused.has("/_list/indices/{prefix}*"));
-                assertTrue(path + " must say why: " + refused.body(), refused.has("refuses an answer it would have to truncate"));
+                final Answer served = call("GET", path + "?format=json", null);
+                assertEquals(path + " must answer under the cap: " + served.body(), 200, served.status());
+                assertTrue(
+                    path + " must list every index: " + served.body(),
+                    served.has("logs-a") && served.has("logs-b") && served.has("other")
+                );
             }
+        }
 
-            // A cursor is refused rather than silently restarting the walk. Accepting the token and
-            // answering from the beginning would mean a caller paginating a large deployment never
-            // finishes and is never told why.
+        // And past the cap, refused rather than cut off. Two allowed, three present.
+        final AtomicLong tight = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(tight, createTempDir());
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("list-over-cap", 2))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            port = node.boundHttpAddress().publishAddress().getPort();
+            call("PUT", "/logs-a", "{\"settings\":{\"number_of_shards\":1}}");
+            call("PUT", "/logs-b", "{\"settings\":{\"number_of_shards\":1}}");
+            call("PUT", "/other", "{\"settings\":{\"number_of_shards\":1}}");
+
+            for (String path : new String[] { "/_list/indices", "/_cat/indices" }) {
+                final Answer refused = call("GET", path + "?format=json", null);
+                assertEquals(path + " must refuse past the cap: " + refused.body(), 400, refused.status());
+                assertFalse("and must not answer partially: " + refused.body(), refused.has("logs-a"));
+            }
+        }
+    }
+
+    /** A cursor is still refused, and still names the primitive core does not expose. */
+    public void testACursorIsRefusedRatherThanSilentlyRestartingTheWalk() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        try (ServerlessNode node = running(plane(clock, createTempDir()), "list-cursor")) {
+            assertNotNull(node);
             final Answer token = call("GET", "/_list/indices/logs-*?next_token=abc", null);
             assertEquals(token.body(), 501, token.status());
             assertTrue("naming the missing primitive: " + token.body(), token.has("start-after"));
@@ -282,7 +320,8 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
         try (ServerlessNode node = running(plane(clock, createTempDir()), "reasons")) {
             assertNotNull(node);
             for (String[] expected : new String[][] {
-                { "/_cat/indices", "unbounded" },
+                // /_cat/indices is no longer here: it is served now, bounded by the pattern cap and
+                // refused past it. See testTheBareListingsAnswerUnderTheCapAndAreRefusedPastIt.
                 { "/_cat/shards", "_cluster/health/{index}?level=shards" },
                 { "/_cat/aliases", "found by name here, not enumerated" },
                 { "/_cat/count", "/{index}/_count answers for one" },
