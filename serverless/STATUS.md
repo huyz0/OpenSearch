@@ -321,10 +321,12 @@ These are decisions, not gaps. Each answers 501 with a reason.
   it, but placement is only a hint, so two nodes can still each end up opening one view under an unlucky or
   stale routing decision — narrowed, not closed, by giving frozen search the same placement a live search
   already had. No slicing.
-- One fencing window is still open: the shard-head is won at the compare-and-swap, but the log is sealed
-  slightly later, when the shard is opened, so a predecessor's appends in between are still replayed.
-  Closing it means sealing at the swap, which the path that opens a shard from projected truth rather than
-  from an acquisition does not have. The unbounded half is closed.
+- One fencing window is narrowed but not closed. The log is now sealed at the compare-and-swap that
+  transfers ownership rather than later, when the shard is opened, so the stretch in which a predecessor's
+  appends still fall in front of the cutoff is one blob write instead of a shard creation, a local-file
+  drop and a translog bootstrap. It cannot be closed by moving the seal any further: a swap and a seal are
+  two object-store operations with no transaction spanning them. Closing it entirely would need the
+  register itself to carry the seal.
 - `index.default_pipeline` and `index.final_pipeline` are not read on any write path; a client setting a
   default pipeline gets no pipeline. (`?pipeline=` is honoured on single-document and bulk writes, per line
   or per request, and `_ingest/pipeline/_simulate` exists — M58 and M61.)
