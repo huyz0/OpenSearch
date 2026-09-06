@@ -327,8 +327,17 @@ These are decisions, not gaps. Each answers 501 with a reason.
   That is a design choice — re-running every filter per hop would make one that counts or rate-limits wrong
   — but it does mean a plugin cannot enforce at the shard. (A caller *does* travel: a thread-context header
   set by a plugin arrives on the far side, which is core's own mechanism and is tested.)
-- A plugin's action runs on the node the request reached: nothing forwards one, and no identity crosses a
-  transport hop, so an action that must run somewhere particular cannot ask.
+- A plugin's action can now be run on a node the plugin chose, and the hop is authenticated. This entry
+  used to say a plugin could not forward one at all; that was wrong, and testing it is what found out.
+  Every piece was already present — the projected cluster state carries every live member, a
+  `HandledTransportAction` registers its own handler everywhere, and the thread context travels — so a
+  plugin doing what it does on a classic node already worked. What was missing was that nothing signed the
+  hop and nothing checked it: **any process that could reach the transport port could invoke any plugin's
+  action**, including the credential API an auth plugin ships. A transport interceptor now signs a plugin
+  action on the way out with the deployment's MAC and refuses an unsigned one on the way in, reusing the
+  shell's own signing rather than a second scheme. Plugins need no shell API for any of it.
+  One caveat: members reach the projected cluster state on an activation or on the periodic resync — ten
+  minutes at the default interval — so a freshly started node holding nothing may not see a peer yet.
 - A point in time is still node-local once opened: the record is in the object store and any node can serve
   it, but placement is only a hint, so two nodes can still each end up opening one view under an unlucky or
   stale routing decision — narrowed, not closed, by giving frozen search the same placement a live search
