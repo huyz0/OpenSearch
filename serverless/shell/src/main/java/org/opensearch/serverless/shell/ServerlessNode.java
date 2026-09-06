@@ -367,7 +367,7 @@ public final class ServerlessNode implements Closeable {
                 transport,
                 null,
                 threadPool,
-                networkModule.getTransportInterceptor(),
+                authenticatedPluginHops(networkModule.getTransportInterceptor()),
                 boundAddress -> new DiscoveryNode(
                     nodeName,
                     nodeEnvironment.nodeId(),
@@ -1302,6 +1302,50 @@ public final class ServerlessNode implements Closeable {
             controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
         }
         return controller;
+    }
+
+    /**
+     * Wraps the plugins' own interceptors in the one that authenticates a plugin's action across a hop.
+     *
+     * <p>The shell's is outermost on both paths, and that is the point of the ordering rather than an
+     * accident of composition: inbound, an unauthenticated plugin action is refused before any plugin's
+     * interceptor is given it; outbound, the signature is on the context before a plugin's interceptor
+     * runs, so a plugin that inspects or forwards the request sees it as it will go on the wire.
+     *
+     * <p>Both dependencies are looked up lazily. This runs while the transport service is being built,
+     * which is before the router exists and long before the plugins' actions have been constructed.
+     *
+     * @param fromPlugins what the network module composed from the installed plugins
+     * @return the composed interceptor
+     */
+    private org.opensearch.transport.TransportInterceptor authenticatedPluginHops(
+        org.opensearch.transport.TransportInterceptor fromPlugins
+    ) {
+        final org.opensearch.transport.TransportInterceptor shell = new org.opensearch.serverless.transport.PluginHopAuthentication(
+            () -> router,
+            name -> pluginActions.find(name).isPresent()
+        );
+        return new org.opensearch.transport.TransportInterceptor() {
+            @Override
+            public <T extends org.opensearch.transport.TransportRequest> org.opensearch.transport.TransportRequestHandler<T> interceptHandler(
+                String action,
+                String executor,
+                boolean forceExecution,
+                org.opensearch.transport.TransportRequestHandler<T> actualHandler
+            ) {
+                return shell.interceptHandler(
+                    action,
+                    executor,
+                    forceExecution,
+                    fromPlugins.interceptHandler(action, executor, forceExecution, actualHandler)
+                );
+            }
+
+            @Override
+            public AsyncSender interceptSender(AsyncSender sender) {
+                return shell.interceptSender(fromPlugins.interceptSender(sender));
+            }
+        };
     }
 
     /**
