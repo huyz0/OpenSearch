@@ -1060,23 +1060,27 @@ public final class ServerlessNode implements Closeable {
             { "/_cat/pending_tasks", "there is no cluster manager and no task queue, so there is nothing pending" },
             {
                 "/_cat/thread_pool",
-                "this reports per-node thread pools, and answering for the fleet needs the "
-                    + "same fan-out /_nodes/stats is waiting on; GET /_serverless/stats answers for the node it is "
-                    + "sent to" },
+                "this reports per-node thread pools, which are not among the numbers this shell reports "
+                    + "about itself; GET /_serverless/stats answers for the node it is sent to, and "
+                    + "?nodes=_all for the fleet" },
             { "/_list/shards", "the same unbounded listing as _cat/shards" } }) {
             controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
         }
 
-        // Refused for a reason of its own, because the general one is no longer true of it. A node can now
-        // reach every other node -- that is what the lease registry is for -- so "no node can answer this"
-        // would be wrong. What is missing is narrower and worth saying precisely.
+        // Refused for a reason of its own, and the reason has changed. The fan-out this used to be waiting
+        // for exists: GET /_serverless/stats?nodes=_all asks every live node and reports which ones did not
+        // answer. What is still missing is not the reach, it is the schema -- this endpoint means indices,
+        // os, jvm, fs, transport and thread_pool, and none of those numbers are produced here. Serving the
+        // shell's own document under this name would hand a client that parses core's schema something that
+        // looks right and answers nothing, which is worse than a refusal that points at the real endpoint.
         controller.registerHandler(
             new NotImplementedHandler(
                 "/_nodes/stats",
-                "each node can answer for itself at GET /_serverless/stats, and this node knows where the "
-                    + "others are; what does not exist yet is the fan-out that would ask them and the "
-                    + "accounting that would report which ones did not answer. Until that is built, asking "
-                    + "one node for the fleet's statistics would return one node's statistics"
+                "this endpoint's body is core's node-statistics schema -- indices, os, jvm, fs, transport, "
+                    + "thread_pool -- and this shell does not produce those numbers, so there is nothing "
+                    + "honest to put under this name. GET /_serverless/stats answers for the node it is sent "
+                    + "to, and GET /_serverless/stats?nodes=_all asks every live node and names the ones that "
+                    + "did not answer"
             )
         );
         controller.registerHandler(
