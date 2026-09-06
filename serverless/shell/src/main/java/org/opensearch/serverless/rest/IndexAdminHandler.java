@@ -601,24 +601,21 @@ public final class IndexAdminHandler extends BaseRestHandler {
     /**
      * Names an index setting this design accepts nowhere, with the reason, or null.
      *
-     * <p>The three pipeline settings are registered dynamic settings core honours on every write and
-     * search; nothing on this shell's write or search path reads them. Stored, they would report a
-     * pipeline that never ran -- a document written un-piped under {@code "changed": true}.
+     * <p>{@code index.default_pipeline} and {@code index.final_pipeline} used to be here, refused because
+     * nothing read them: stored, they would have reported a pipeline that never ran. The write path reads
+     * both now -- see {@code IngestPipelines#pipelinesFor} -- so they are ordinary settings. The search
+     * one is still refused, for the reason all three were.
      *
      * @param settings normalised settings
      * @return the reason to refuse, or null when there is none
      */
     static String unsupportedIndexSetting(Settings settings) {
-        for (String key : new String[] {
-            org.opensearch.index.IndexSettings.DEFAULT_PIPELINE.getKey(),
-            org.opensearch.index.IndexSettings.FINAL_PIPELINE.getKey(),
-            org.opensearch.index.IndexSettings.DEFAULT_SEARCH_PIPELINE.getKey() }) {
-            if (settings.hasValue(key)) {
-                return key
-                    + " is not supported: an index-level pipeline is applied by the write and search paths, and "
-                    + "this shell's do not read it, so the value would be stored and never run. Name the pipeline on "
-                    + "the request instead (?pipeline= on a write, ?search_pipeline= on a search)";
-            }
+        final String key = org.opensearch.index.IndexSettings.DEFAULT_SEARCH_PIPELINE.getKey();
+        if (settings.hasValue(key)) {
+            return key
+                + " is not supported: an index-level search pipeline is applied by the search path, and this "
+                + "shell's does not read it, so the value would be stored and never run. Name the pipeline on "
+                + "the request instead (?search_pipeline=)";
         }
         return null;
     }

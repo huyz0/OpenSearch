@@ -291,6 +291,13 @@ public final class BulkHandler extends BaseRestHandler {
             item.writtenIndex = target.get().index().name();
             item.writtenUuid = target.get().index().uuid();
             item.shard = DocumentRouting.shardFor(target.get().index(), item.operation.id());
+            // Resolved here rather than in shape(), because this is where the index actually written to is
+            // known: index.default_pipeline belongs to the backing index a data stream write lands on, not
+            // to the name the caller used.
+            item.pipelines = org.opensearch.serverless.ingest.IngestPipelines.pipelinesFor(
+                item.pipeline,
+                target.get().index().extraSettings()
+            );
         }
     }
 
@@ -299,31 +306,42 @@ public final class BulkHandler extends BaseRestHandler {
      *
      * <p>The same rule as the single-document path: a document is shaped and then stored, and a caller
      * must never be told a write succeeded against a document the pipeline was supposed to change and did
-     * not. An action line's own {@code pipeline} wins over the request's, as in core. A pipeline that is
-     * missing or fails is that item's failure, not the batch's; a document the pipeline drops is a
-     * {@code noop}, which is not an error and not a write. Compiled once per distinct pipeline per batch.
+     * not. An action line's own {@code pipeline} wins over the request's and over the index's
+     * {@code index.default_pipeline}, as in core; {@code index.final_pipeline} runs after whichever of
+     * those ran, and is the one a caller cannot opt out of. The order is settled in {@code route}, where
+     * the index actually written to is known -- see {@code IngestPipelines#pipelinesFor}.
+     *
+     * <p>A pipeline that is missing or fails is that item's failure, not the batch's; a document a pipeline
+     * drops is a {@code noop}, which is not an error and not a write, and ends that item so a final
+     * pipeline does not run over a document nobody will store. Compiled once per distinct pipeline per
+     * batch, which now matters more: a default pipeline is by definition the same one for every item.
      */
     private void shape(ServerlessNode serving, MetadataPlane metadata, List<Item> items) {
         final Map<String, org.opensearch.ingest.Pipeline> compiled = new HashMap<>();
         for (Item item : items) {
-            if (item.failed() || item.pipeline == null || item.operation.isDeletion()) {
+            if (item.failed() || item.pipelines.isEmpty() || item.operation.isDeletion()) {
                 continue;
             }
             try {
-                org.opensearch.ingest.Pipeline pipeline = compiled.get(item.pipeline);
-                if (pipeline == null) {
-                    final var stored = metadata.pipelines().get(item.pipeline);
-                    if (stored.isEmpty()) {
-                        item.fail(RestStatus.BAD_REQUEST, "pipeline_missing", "no such pipeline: " + item.pipeline);
-                        continue;
+                for (String id : item.pipelines) {
+                    org.opensearch.ingest.Pipeline pipeline = compiled.get(id);
+                    if (pipeline == null) {
+                        final var stored = metadata.pipelines().get(id);
+                        if (stored.isEmpty()) {
+                            item.fail(RestStatus.BAD_REQUEST, "pipeline_missing", "no such pipeline: " + id);
+                            break;
+                        }
+                        pipeline = serving.ingestPipelines().compile(id, stored.get());
+                        compiled.put(id, pipeline);
                     }
-                    pipeline = serving.ingestPipelines().compile(item.pipeline, stored.get());
-                    compiled.put(item.pipeline, pipeline);
-                }
-                final var outcome = serving.ingestPipelines().run(pipeline, item.index, item.operation.id(), item.operation.source());
-                if (outcome.dropped()) {
-                    item.noop(serving.localNode().getId());
-                } else {
+                    final var outcome = serving.ingestPipelines()
+                        .run(pipeline, item.index, item.operation.id(), item.operation.source());
+                    if (outcome.dropped()) {
+                        // A drop ends the document, so a final pipeline does not run over one that is not
+                        // going to be written. Core does the same.
+                        item.noop(serving.localNode().getId());
+                        break;
+                    }
                     item.operation = new WalRecord(item.operation.id(), outcome.source());
                 }
             } catch (Exception e) {
@@ -861,6 +879,8 @@ public final class BulkHandler extends BaseRestHandler {
         private String writtenUuid;
         private WalRecord operation;
         private String pipeline;
+        /** The pipelines to run, in order: the request's or the index's default, then the index's final. */
+        private List<String> pipelines = List.of();
         private int shard = -1;
         private RestStatus status;
         private String result;

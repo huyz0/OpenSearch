@@ -83,6 +83,54 @@ public final class IngestPipelines {
         return Pipeline.create(id, config, factories, scriptService);
     }
 
+    /**
+     * The pipelines one write must run, in order.
+     *
+     * <p>Core's precedence, kept deliberately identical because a client that has configured
+     * {@code index.default_pipeline} has configured it against core's rules:
+     *
+     * <ul>
+     *   <li>A pipeline named on the request wins over the index's {@code index.default_pipeline}. It does
+     *       <em>not</em> displace {@code index.final_pipeline}, which is the whole point of a final
+     *       pipeline: it is the one a caller cannot opt out of.</li>
+     *   <li>{@code _none} means no pipeline. On the request it also suppresses the index's default, which
+     *       is how a caller opts out of one; as a setting's value it simply means none is configured.</li>
+     *   <li>The final pipeline runs last, after whichever of the two ran first.</li>
+     * </ul>
+     *
+     * <p>Returned as a list rather than resolved one at a time, so the caller runs them in order and
+     * cannot accidentally run a final pipeline before a default one — which is the mistake this shape
+     * exists to make impossible.
+     *
+     * @param requestPipeline the pipeline named on the request or the action line, or null
+     * @param indexSettings the settings of the index actually being written to
+     * @return the pipeline ids to run, in order, never containing {@code _none}
+     */
+    public static java.util.List<String> pipelinesFor(String requestPipeline, org.opensearch.common.settings.Settings indexSettings) {
+        final java.util.List<String> pipelines = new java.util.ArrayList<>(2);
+        final String first;
+        if (requestPipeline != null) {
+            first = requestPipeline;
+        } else if (indexSettings != null && org.opensearch.index.IndexSettings.DEFAULT_PIPELINE.exists(indexSettings)) {
+            first = org.opensearch.index.IndexSettings.DEFAULT_PIPELINE.get(indexSettings);
+        } else {
+            first = NONE;
+        }
+        if (NONE.equals(first) == false) {
+            pipelines.add(first);
+        }
+        if (indexSettings != null && org.opensearch.index.IndexSettings.FINAL_PIPELINE.exists(indexSettings)) {
+            final String last = org.opensearch.index.IndexSettings.FINAL_PIPELINE.get(indexSettings);
+            if (NONE.equals(last) == false) {
+                pipelines.add(last);
+            }
+        }
+        return pipelines;
+    }
+
+    /** Core's name for "no pipeline", which both settings and the request parameter accept. */
+    private static final String NONE = org.opensearch.ingest.IngestService.NOOP_PIPELINE_NAME;
+
     /** What running a pipeline did to a document. */
     public record Result(String source, boolean dropped) {
     }

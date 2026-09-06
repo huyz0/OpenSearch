@@ -383,11 +383,17 @@ public class ServerlessAliasAtomicityTests extends OpenSearchTestCase {
             assertEquals(badCreate.body(), 400, badCreate.status());
             assertEquals(404, send(node, "GET", "/bad", null).status());
 
-            // And a pipeline setting nothing here reads is refused with the reason, not stored.
-            final Response piped = send(node, "PUT", "/alpha/_settings", "{\"index.default_pipeline\":\"tag\"}");
-            assertEquals(piped.body(), 501, piped.status());
-            assertTrue(piped.body(), piped.body().contains("default_pipeline"));
+            // The pipeline setting nothing here reads is still refused with the reason, not stored. The two
+            // ingest ones used to be refused alongside it and are read by the write path now, so the
+            // dividing line is exactly "does anything run it", which is what this pins.
+            final Response searchPiped = send(node, "PUT", "/alpha/_settings", "{\"index.search.default_pipeline\":\"tag\"}");
+            assertEquals(searchPiped.body(), 501, searchPiped.status());
+            assertTrue(searchPiped.body(), searchPiped.body().contains("default_pipeline"));
             assertFalse(send(node, "GET", "/alpha/_settings", null).body().contains("default_pipeline"));
+
+            final Response ingestPiped = send(node, "PUT", "/alpha/_settings", "{\"index.default_pipeline\":\"tag\"}");
+            assertEquals("the write path reads it, so it is an ordinary setting: " + ingestPiped.body(), 200, ingestPiped.status());
+            assertTrue(send(node, "GET", "/alpha/_settings", null).body().contains("default_pipeline"));
         }
     }
 

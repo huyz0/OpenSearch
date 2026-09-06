@@ -201,7 +201,11 @@ OpenSearch added `_list` for exactly this reason (`m53-discovery-notes.md` (on `
 **Ingest pipelines, and dynamic mapping.** `_ingest/pipeline/{id}` stores a pipeline in a register and
 compiles it at `PUT`, so one naming a processor this deployment does not have is refused where the operator is
 standing rather than at the first write that uses it. `?pipeline=` runs it before the document is routed or
-written, and a dropped document is reported as dropped. Separately: a document carrying a field the mapping
+written, and a dropped document is reported as dropped. `index.default_pipeline` and `index.final_pipeline`
+are honoured too, with core's precedence: a pipeline named on the request displaces the index's default and
+never its final, `_none` opts out of the default alone, and the default runs before the final. They are
+resolved against the index actually written to, so a data stream write uses its backing index's settings.
+Separately: a document carrying a field the mapping
 does not describe now grows the mapping and is indexed — before M58 an index created without an explicit
 mapping could not accept a single document (`m58-ingest-notes.md` (on `feature/serverlessnode`)).
 
@@ -303,6 +307,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 | `/_cluster/*` except `settings` | There is no cluster-wide state; a node-local answer would mislead. |
 | `collapse`, `suggest`, `profile` | Each needs cross-shard machinery that does not exist yet. |
 | Two request wrappers, or two plugins contributing one setting | Which one wins would depend on load order. |
+| `index.search.default_pipeline` | A search pipeline is applied by the search path and this shell's does not read it, so the value would be stored and never run. Name it on the request (`?search_pipeline=`). The two *ingest* pipeline settings were refused here for the same reason until the write path started reading them. |
 | `IndexNameExpressionResolver` for plugins | A node's `ClusterState` holds only the indices it has open, so resolving would answer a wildcard with a subset — which for privilege evaluation fails open. |
 | Scripting from a plugin's own engine | The shell registers painless and mustache by name; a plugin cannot contribute a third engine, and gets core's own "no lang registered" for one. |
 | On-behalf-of and service-account tokens | They delegate authority, and this deployment authenticates without a general authorization model to delegate. |
@@ -327,9 +332,6 @@ These are decisions, not gaps. Each answers 501 with a reason.
   drop and a translog bootstrap. It cannot be closed by moving the seal any further: a swap and a seal are
   two object-store operations with no transaction spanning them. Closing it entirely would need the
   register itself to carry the seal.
-- `index.default_pipeline` and `index.final_pipeline` are not read on any write path; a client setting a
-  default pipeline gets no pipeline. (`?pipeline=` is honoured on single-document and bulk writes, per line
-  or per request, and `_ingest/pipeline/_simulate` exists — M58 and M61.)
 - `_nodes/stats` is refused, and its reason is now specific rather than shared: each node answers for itself
   at `GET /_serverless/stats` and this node knows where the others are, so what is missing is the fan-out that
   would ask them and the accounting that would report which ones did not answer — a scoping decision, not an
