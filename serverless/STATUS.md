@@ -296,6 +296,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 | Refused | Because |
 | --- | --- |
 | Alias options: `filter`, `routing`, `index_routing`, `search_routing`, `is_write_index`, `is_hidden` | An alias here names indices and nothing else. Refused on all three doors -- the index-scoped spelling, the alias-scoped one, and an action inside `POST /_aliases` -- and pinned by a canaried test. This was once the last place something was accepted and not honoured: a filtered alias was created unfiltered and answered `{"acknowledged": true}`. |
+| Enumerating indices past the pattern cap | `GET /_list/indices` and `GET /_cat/indices` are served now, as the empty prefix under the same bounded listing every other prefix takes -- one capped `listBlobsByPrefixInSortedOrder`. Past the cap they are refused rather than truncated, which is the point: a page that looks complete and is not is worse than a refusal. |
 | `POST /_data_stream/_modify` | A data stream here is an alias with a generation, so its backing indices are the alias's members and change by rolling it over, not by being reassigned underneath it. |
 | Patterns that are not a prefix (`*-2026`, `lo*s-a`, `logs-?`) | A prefix can be answered by one bounded listing; these cannot be answered by a listing at all, only by reading every index name in the deployment and matching each. Supporting a wildcard syntax whose cost depends on where the caller put the star would be worse than the split. |
 | Enumerating indices (`/_serverless/indices`) | An inventory operation, not a serving one — it is asked to return everything, where a pattern is capped and refuses when the cap is exceeded. Look an index up by name, or run an offline inventory. |
@@ -331,8 +332,6 @@ These are decisions, not gaps. Each answers 501 with a reason.
   at `GET /_serverless/stats` and this node knows where the others are, so what is missing is the fan-out that
   would ask them and the accounting that would report which ones did not answer — a scoping decision, not an
   impossibility.
-- `_cat/indices` could be served under the wildcard cap that already exists (one bounded listing, refused past
-  the cap rather than truncated) and is not. The objection to it is weaker than the current refusal implies.
 - `update` inside `_bulk` is refused: it is a partial merge, which has to read the current document before
   writing one, and the batch path applies without reading. Closing it changes what a batch is, so it is a
   design decision rather than plumbing. `POST /{index}/_update/{id}` does the merge.
