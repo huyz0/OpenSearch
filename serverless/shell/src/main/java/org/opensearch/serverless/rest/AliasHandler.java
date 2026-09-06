@@ -12,6 +12,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.AliasRecord;
@@ -553,7 +554,7 @@ public final class AliasHandler extends BaseRestHandler {
             for (String index : indices) {
                 builder.startObject(index);
                 builder.startObject("aliases");
-                builder.startObject(name).endObject();
+                writeAliasBody(builder, name, resolved.alias().writeIndex(), index);
                 builder.endObject();
                 builder.endObject();
             }
@@ -922,7 +923,7 @@ public final class AliasHandler extends BaseRestHandler {
             for (String index : resolved.alias().indices()) {
                 builder.startObject(index);
                 builder.startObject("aliases");
-                builder.startObject(name).endObject();
+                writeAliasBody(builder, name, resolved.alias().writeIndex(), index);
                 builder.endObject();
                 builder.endObject();
             }
@@ -943,7 +944,8 @@ public final class AliasHandler extends BaseRestHandler {
             builder.startObject(index);
             builder.startObject("aliases");
             for (String alias : metadata.aliasesOf(descriptor.get())) {
-                builder.startObject(alias).endObject();
+                final var record = metadata.aliasWithGeneration(alias);
+                writeAliasBody(builder, alias, record.isPresent() ? record.get().alias().writeIndex() : null, index);
             }
             builder.endObject();
             builder.endObject();
@@ -990,4 +992,28 @@ public final class AliasHandler extends BaseRestHandler {
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
     }
+
+    /**
+     * Writes one alias body the way core writes it.
+     *
+     * <p>This surface used to emit {@code {}} for every alias, which is right for an alias carrying
+     * nothing and silently wrong for one with an explicit write index: real OpenSearch reports
+     * {@code is_write_index} there, and a client that reads it to decide where to send a write saw
+     * nothing to read. Handing the job to {@link AliasMetadata.Builder#toXContent} fixes that and, more
+     * to the point, stops this shape being a thing someone has to keep in step by hand -- filter,
+     * routing and hidden come along the moment this shell has anything to put in them.
+     *
+     * @param builder the builder, positioned inside the {@code aliases} object
+     * @param alias the alias name
+     * @param writeIndex the index this alias writes to, or null when it names no particular one
+     * @param index the index this body is being written under
+     */
+    private static void writeAliasBody(XContentBuilder builder, String alias, String writeIndex, String index) throws IOException {
+        final AliasMetadata.Builder metadata = AliasMetadata.builder(alias);
+        if (writeIndex != null) {
+            metadata.writeIndex(writeIndex.equals(index));
+        }
+        AliasMetadata.Builder.toXContent(metadata.build(), builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+    }
+
 }
