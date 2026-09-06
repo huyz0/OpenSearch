@@ -418,6 +418,19 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
      * type in a constructor -- and the store has {@code put}. Returning it would let a second plugin
      * rewrite the configured account by asking for a {@code CredentialStore}. This plugin's own handlers
      * hold the store directly and need nothing from the list.
+     *
+     * @param client the node client, kept so a handler can act as this plugin
+     * @param clusterService core's cluster service, unused here
+     * @param threadPool the node's pools, for the thread context and the credential-checking pool
+     * @param resourceWatcherService core's watcher service, unused here
+     * @param scriptService core's script service, unused here
+     * @param xContentRegistry core's parser registry, unused here
+     * @param environment the node's environment, for the settings the checker pool is sized from
+     * @param nodeEnvironment the node's paths, unused here
+     * @param namedWriteableRegistry core's writeable registry, unused here
+     * @param indexNameExpressionResolver core's resolver, unused here
+     * @param repositoriesServiceSupplier core's repositories, unused here
+     * @return nothing, deliberately -- see above
      */
     @Override
     public Collection<Object> createComponents(
