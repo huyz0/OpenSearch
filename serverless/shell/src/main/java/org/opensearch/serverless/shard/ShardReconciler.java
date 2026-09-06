@@ -449,13 +449,11 @@ public final class ShardReconciler {
                     // seal is durable, so it binds every later successor too and not just this recovery --
                     // see WalStore#sealAt for why that distinction is the whole point.
                     //
-                    // <b>The window this leaves is real and worth naming.</b> The shard-head was won earlier,
-                    // in MetadataPlane#activate, and anything the predecessor appends between that moment and
-                    // this one still falls inside the seal. Narrowing it further means sealing at the
-                    // compare-and-swap, which the path that opens a shard from projected truth rather than
-                    // from an acquisition does not have. What is closed here is the unbounded half: after
-                    // this point the predecessor can append for as long as it likes and none of it is ever
-                    // read, by anyone.
+                    // This is the second seal on the acquisition path: MetadataPlane#activate takes one at
+                    // the compare-and-swap, which is where the tight bound comes from. This one is still
+                    // needed, and is not merely a repeat -- a shard released locally and reopened at the
+                    // same term arrives here without passing through an acquisition at all. It cannot
+                    // loosen the earlier bound, because seals merge by taking the lowest position per term.
                     pendingCutoff.put(shardId, log.sealAt(shardHeadTerm));
                 }
                 try {

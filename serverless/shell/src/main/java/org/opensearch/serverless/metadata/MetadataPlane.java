@@ -1005,6 +1005,41 @@ public final class MetadataPlane {
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
         final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId, indexUuid);
         if (acquisition.acquired()) {
+            // Seal the log here, at the swap, rather than leaving it to whoever opens the shard.
+            //
+            // The seal is what stops a predecessor that has not yet noticed it lost this shard from
+            // having its later appends replayed as acknowledged history. It used to be taken when the
+            // shard was opened, which is several object-store round trips and a whole shard creation
+            // after the moment ownership actually moved -- and every one of the predecessor's appends
+            // inside that window fell in front of the cutoff and replayed. Taking it here narrows the
+            // window to the one blob write below: from the swap that transferred ownership to the seal
+            // that records where the predecessor's history ended.
+            //
+            // The open path still seals, and must: a shard released locally and reopened at the same
+            // term never passes through here. That second seal cannot loosen this one, because seals
+            // merge by taking the lowest recorded position per term -- see WalStore#sealAt -- so the
+            // tighter bound taken here is the one every later recovery inherits. The cost is one extra
+            // seal per acquisition, on a path that runs at failover rather than per write.
+            //
+            // Only when the uuid is known, because that is what locates the shard's bytes. A caller
+            // that acquires without one -- the overload that skips the incarnation check -- gets the
+            // old behaviour, with the open path's seal as the bound.
+            if (acquisition.head().indexUuid() != null) {
+                try {
+                    walStore(indexName, acquisition.head().indexUuid(), shardId).sealAt(acquisition.head().term());
+                } catch (IOException e) {
+                    // A head won and a log unsealed is worse than no head at all: this node would go on
+                    // to open the shard and seal late, which is the window this exists to close. Give
+                    // the head back at the term just won and let the caller see the failure, exactly as
+                    // the unwritten claim below does.
+                    try {
+                        heads.release(indexName, shardId, nodeId, acquisition.head().term());
+                    } catch (IOException release) {
+                        e.addSuppressed(release);
+                    }
+                    throw e;
+                }
+            }
             // Record the claim so this node can find it again without reading the world. Written after
             // the compare-and-swap, never before: if the process dies in between, the node simply does
             // not see the shard on its next read and re-acquires, which self-heals. Writing it first
