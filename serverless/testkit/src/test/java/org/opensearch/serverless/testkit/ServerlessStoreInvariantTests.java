@@ -193,7 +193,14 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
 
         // Once the record is gone, the sweep proceeds.
         pits.deleteBlobsIgnoringIfNotExists(List.of(torn));
-        assertEquals(List.of("t=1/_z.cfs"), gc.sweepShard(plane, "alpha", 0, null).deleted());
+        // Lucene's ExtrasFS drops an "extra0" into random directories, and about one seed in several it
+        // lands in t=1/ -- where it is a genuine orphan that the sweep is right to take, and the exact
+        // list then has two entries instead of one. Its arrival is not what this test is about. Dropped
+        // rather than tolerated by loosening to a contains(), so "exactly one of ours went" survives.
+        // ServerlessPointInTimeTests#testAStrayObjectAmongTheViewsIsNotTreatedAsOne has the same note.
+        final List<String> swept = new java.util.ArrayList<>(gc.sweepShard(plane, "alpha", 0, null).deleted());
+        swept.removeIf(name -> name.endsWith("/extra0"));
+        assertEquals(List.of("t=1/_z.cfs"), swept);
     }
 
     /**
