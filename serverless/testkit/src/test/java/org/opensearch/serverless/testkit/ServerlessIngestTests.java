@@ -259,4 +259,84 @@ public class ServerlessIngestTests extends OpenSearchTestCase {
             assertEquals("and the document is not there", 404, call("GET", "/alpha/_doc/2", null).status());
         }
     }
+
+    /**
+     * {@code index.default_pipeline} and {@code index.final_pipeline}, which used to be refused.
+     *
+     * <p>They were refused honestly: nothing on the write path read them, so storing one would have
+     * reported a pipeline that never ran. Both are read now, with core's precedence, and this pins the
+     * three things about that precedence a client can actually depend on:
+     *
+     * <ul>
+     *   <li><b>Order.</b> The default runs, then the final. Each processor appends its own letter to the
+     *       same array, so the document itself carries the order it was shaped in — an assertion on two
+     *       separate fields would pass whichever way round they ran.</li>
+     *   <li><b>A request pipeline displaces the default, not the final.</b> That is the point of a final
+     *       pipeline: it is the one a caller cannot opt out of.</li>
+     *   <li><b>{@code _none} opts out of the default</b> and still leaves the final in place.</li>
+     * </ul>
+     *
+     * <p>Through {@code _doc} and through {@code _bulk}, because they resolve pipelines on different code
+     * paths and an index-level default that worked on only one of them would be worse than none.
+     */
+    public void testTheIndexPipelineSettingsRunInOrderAndOnlyTheDefaultCanBeDisplaced() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock, createTempDir());
+        try (ServerlessNode node = running(plane, clock, "index-pipelines")) {
+            assertNotNull(node);
+            for (String each : new String[] { "dflt", "fin", "req" }) {
+                final Answer stored = call(
+                    "PUT",
+                    "/_ingest/pipeline/" + each,
+                    "{\"processors\":[{\"append\":{\"field\":\"trail\",\"value\":\"" + each + "\"}}]}"
+                );
+                assertEquals(stored.body(), 200, stored.status());
+            }
+
+            final Answer created = call(
+                "PUT",
+                "/beta",
+                "{\"settings\":{\"number_of_shards\":1,\"index.default_pipeline\":\"dflt\",\"index.final_pipeline\":\"fin\"}}"
+            );
+            assertEquals("the settings that used to be refused: " + created.body(), 200, created.status());
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("beta", 0);
+            loop.tick(clock.get());
+
+            // Nothing named on the request: the index's own two, in order.
+            assertEquals(201, call("PUT", "/beta/_doc/1?refresh=true", "{\"msg\":\"a\"}").status());
+            assertTrue(
+                "default then final, in that order: " + call("GET", "/beta/_doc/1", null).body(),
+                call("GET", "/beta/_doc/1", null).has("\"trail\":[\"dflt\",\"fin\"]")
+            );
+
+            // A request pipeline takes the default's place and leaves the final alone.
+            assertEquals(201, call("PUT", "/beta/_doc/2?pipeline=req&refresh=true", "{\"msg\":\"b\"}").status());
+            assertTrue(
+                "the request pipeline displaces the default, not the final: " + call("GET", "/beta/_doc/2", null).body(),
+                call("GET", "/beta/_doc/2", null).has("\"trail\":[\"req\",\"fin\"]")
+            );
+
+            // _none opts out of the default. The final is not opt-out-able, which is what it is for.
+            assertEquals(201, call("PUT", "/beta/_doc/3?pipeline=_none&refresh=true", "{\"msg\":\"c\"}").status());
+            assertTrue(
+                "_none drops the default and keeps the final: " + call("GET", "/beta/_doc/3", null).body(),
+                call("GET", "/beta/_doc/3", null).has("\"trail\":[\"fin\"]")
+            );
+
+            // And the same three, through the batch path, which resolves them somewhere else entirely.
+            final Answer batch = call(
+                "POST",
+                "/_bulk?refresh=true",
+                "{\"index\":{\"_index\":\"beta\",\"_id\":\"b1\"}}\n{\"msg\":\"d\"}\n"
+                    + "{\"index\":{\"_index\":\"beta\",\"_id\":\"b2\",\"pipeline\":\"req\"}}\n{\"msg\":\"e\"}\n"
+                    + "{\"index\":{\"_index\":\"beta\",\"_id\":\"b3\",\"pipeline\":\"_none\"}}\n{\"msg\":\"f\"}\n"
+            );
+            assertEquals(batch.body(), 200, batch.status());
+            assertTrue("the batch must not have failed: " + batch.body(), batch.has("\"errors\":false"));
+            assertTrue(call("GET", "/beta/_doc/b1", null).has("\"trail\":[\"dflt\",\"fin\"]"));
+            assertTrue(call("GET", "/beta/_doc/b2", null).has("\"trail\":[\"req\",\"fin\"]"));
+            assertTrue(call("GET", "/beta/_doc/b3", null).has("\"trail\":[\"fin\"]"));
+        }
+    }
 }
