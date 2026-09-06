@@ -8,7 +8,9 @@
 
 package org.opensearch.serverless.testkit;
 
+import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
@@ -22,7 +24,9 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.io.InputStream;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -239,6 +243,116 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
 
             assertTrue("published history must still be there", c.get(onC, "legitimate").found());
             assertFalse("an empty seal must be read as 'there was nothing here', not as 'nothing is known'", c.get(onC, "zombie").found());
+        }
+    }
+
+    /**
+     * The window between the swap that moves ownership and the seal that records where history ended.
+     *
+     * <p><b>What this is about.</b> The seal used to be taken when the successor opened the shard, which is
+     * a shard creation, a local-file drop and a translog bootstrap after the compare-and-swap that actually
+     * transferred ownership. Every append a predecessor made inside that stretch was in front of the cutoff
+     * and replayed as acknowledged history — a wrong answer, not a missing feature. The seal is now taken at
+     * the swap, so the stretch is one blob write instead.
+     *
+     * <p><b>Where the append is injected, and why there.</b> {@code MetadataPlane#activate} writes the
+     * acquiring node's assignment claim immediately after it seals, so a hook on that write fires strictly
+     * after the seal under the current code and strictly before it under the old code, while sitting inside
+     * the window either way. That is the whole discrimination: nothing else about the test changes.
+     *
+     * <p><b>What this does not claim.</b> The window is narrowed, not closed. A swap and a seal are two
+     * object-store operations and there is no transaction spanning them, so an append landing between them
+     * is still inside the cutoff. Closing it entirely would need the register itself to carry the seal.
+     *
+     * <p><b>D5:</b> {@code FsBlobContainer} only.
+     */
+    public void testAZombieAppendingBetweenTheSwapAndTheOpenIsFenced() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Path objectStore = createTempDir();
+        final MetadataPlane setup = freshIndex(clock, objectStore);
+
+        final WalStore zombieLog;
+        final long zombieTerm;
+
+        final ServerlessNode a = new ServerlessNode(nodeSettings("window-a"));
+        a.start();
+        final BackgroundReconciler loopA = new BackgroundReconciler(a, setup);
+        loopA.want("alpha", 0);
+        loopA.tick(clock.get());
+        final ShardId onA = a.reconciler().openShards().iterator().next();
+
+        // Legitimate history, never published, so the log is the only account of it and the cutoff is what
+        // decides whether it survives.
+        a.index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
+        zombieTerm = a.get(onA, "legitimate").primaryTerm();
+        zombieLog = a.reconciler().wal(onA);
+
+        a.close();
+        clock.set(clock.get() + TTL + 1);
+
+        // The successor's plane, with one hook: the moment it records its claim on the shard it has just
+        // won, the predecessor appends. That is inside the window by construction.
+        final AtomicBoolean appended = new AtomicBoolean();
+        final BlobStore hooked = new ClaimHookingBlobStore(new FsBlobStore(1024, objectStore, false), () -> {
+            if (appended.compareAndSet(false, true)) {
+                try {
+                    zombieLog.append(
+                        zombieTerm,
+                        List.of(new WalRecord("zombie", "{\"msg\":\"appended inside the window\"}", 99L, zombieTerm, 1L))
+                    );
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException("the zombie could not append, so the window was never exercised", e);
+                }
+            }
+        });
+        final MetadataPlane plane = new MetadataPlane(hooked, BlobPath.cleanPath(), clock::get, TTL);
+
+        try (ServerlessNode b = new ServerlessNode(nodeSettings("window-b"))) {
+            b.start();
+            final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
+            loopB.want("alpha", 0);
+            loopB.tick(clock.get());
+            assertTrue("the hook must have fired, or this test proves nothing", appended.get());
+
+            final ShardId onB = b.reconciler().openShards().iterator().next();
+            assertTrue("history written before the takeover must still survive", b.get(onB, "legitimate").found());
+            assertFalse(
+                "a record appended between the swap and the open must not be replayed as acknowledged history",
+                b.get(onB, "zombie").found()
+            );
+        }
+    }
+
+    /** Fires a hook when a node records its claim on a shard it has just acquired. */
+    private static final class ClaimHookingBlobStore implements BlobStore {
+
+        private final BlobStore delegate;
+        private final Runnable onClaim;
+
+        ClaimHookingBlobStore(BlobStore delegate, Runnable onClaim) {
+            this.delegate = delegate;
+            this.onClaim = onClaim;
+        }
+
+        @Override
+        public BlobContainer blobContainer(BlobPath path) {
+            final BlobContainer honest = delegate.blobContainer(path);
+            if (path.buildAsString().startsWith("assignments/") == false) {
+                return honest;
+            }
+            return new DelegatingBlobContainer(honest) {
+                @Override
+                public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+                    throws IOException {
+                    onClaim.run();
+                    super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+                }
+            };
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
         }
     }
 }

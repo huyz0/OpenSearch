@@ -182,7 +182,9 @@ public final class RendezvousBlobStore implements BlobStore {
 
         @Override
         public InputStream readBlob(String blobName) throws IOException {
-            meet(Meet.READS);
+            if (isSeal(blobName) == false) {
+                meet(Meet.READS);
+            }
             return inner.readBlob(blobName);
         }
 
@@ -194,15 +196,24 @@ public final class RendezvousBlobStore implements BlobStore {
 
         @Override
         public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
-            // A takeover seal is not part of the operation under test. This class exists to prove that the
-            // shard groups of ONE request run at the same time, and it does that by refusing to let a shard
-            // proceed until its peers have arrived. Shards are activated one at a time, long before any
-            // request, so a write on the activation path can never meet peers -- it would deadlock every
-            // test using this store rather than discriminate between concurrent and sequential fan-out.
-            if (blobName.startsWith("seal-") == false) {
+            if (isSeal(blobName) == false) {
                 meet(Meet.WRITES);
             }
             inner.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        /**
+         * Whether a blob is a takeover seal, which is not part of any operation under test.
+         *
+         * <p>This class exists to prove that the shard groups of ONE request run at the same time, and it
+         * does that by refusing to let a shard proceed until its peers have arrived. Shards are activated
+         * one at a time, long before any request, so anything on the activation path can never meet peers
+         * — it would deadlock every test using this store rather than discriminate between concurrent and
+         * sequential fan-out. Sealing happens twice on that path, at the acquisition and again at the open,
+         * and the second one reads what the first one wrote, so both the write and the read have to be out.
+         */
+        private boolean isSeal(String blobName) {
+            return blobName.startsWith("seal-");
         }
 
         @Override
