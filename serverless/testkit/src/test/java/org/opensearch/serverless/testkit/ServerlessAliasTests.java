@@ -186,6 +186,70 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * Every alias option this design cannot keep is refused, on every spelling that can carry one.
+     *
+     * <p>These used to be read into the body map and never looked at again: a filtered alias was created
+     * unfiltered and answered {@code {"acknowledged": true}}, which is the worst shape a refusal can take
+     * because it is indistinguishable from success. The refusals exist now; this is what stops them being
+     * removed by someone who reads the parse as dead code, and it covers all three doors -- the
+     * index-scoped spelling, the alias-scoped one, and an action inside POST /_aliases -- because the
+     * defect was originally that one of them did not parse its body at all.
+     */
+    public void testEveryAliasOptionThisCannotKeepIsRefusedRatherThanDropped() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("opts", "uuid-opts-0000000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-options"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            hold(node, plane, clock, "opts");
+
+            final String[][] refused = {
+                { "filter", "{\"filter\":{\"term\":{\"msg\":\"x\"}}}" },
+                { "routing", "{\"routing\":\"7\"}" },
+                { "index_routing", "{\"index_routing\":\"7\"}" },
+                { "search_routing", "{\"search_routing\":\"7\"}" },
+                { "is_write_index", "{\"is_write_index\":true}" },
+                { "is_hidden", "{\"is_hidden\":true}" }, };
+
+            for (String[] each : refused) {
+                // The index-scoped door.
+                final Response scoped = send(node, "PUT", "/opts/_alias/a-" + each[0], each[1]);
+                assertEquals(each[0] + " must be refused, not dropped: " + scoped.body(), 501, scoped.status());
+                assertTrue(
+                    "and the refusal must name it: " + scoped.body(),
+                    scoped.body().contains(each[0]) || scoped.body().contains("routing")
+                );
+                assertEquals("and nothing may be created: " + each[0], 404, send(node, "GET", "/_alias/a-" + each[0], null).status());
+
+                // The alias-scoped door, which is the one that used not to parse its body at all.
+                final String body = each[1].substring(0, each[1].length() - 1) + ",\"indices\":[\"opts\"]}";
+                final Response direct = send(node, "PUT", "/_alias/b-" + each[0], body);
+                assertEquals(each[0] + " must be refused on the alias spelling too: " + direct.body(), 501, direct.status());
+                assertEquals("and nothing created: " + each[0], 404, send(node, "GET", "/_alias/b-" + each[0], null).status());
+
+                // And inside an action, where a whole batch would otherwise be acknowledged.
+                // each[1] is a whole object; splice its one field into the action body.
+                final String option = each[1].substring(1, each[1].length() - 1);
+                final String action = "{\"actions\":[{\"add\":{\"index\":\"opts\",\"alias\":\"c-"
+                    + each[0]
+                    + "\","
+                    + option
+                    + "}}]}";
+                final Response inAction = send(node, "POST", "/_aliases", action);
+                assertEquals(each[0] + " must be refused inside an action: " + inAction.body(), 501, inAction.status());
+                assertEquals("and the batch must not land: " + each[0], 404, send(node, "GET", "/_alias/c-" + each[0], null).status());
+            }
+
+            // The control: the same requests without an option are served, so the refusals above are about
+            // the option and not about the shape of the request carrying it.
+            assertEquals(200, send(node, "PUT", "/opts/_alias/plain", "{}").status());
+            assertEquals(200, send(node, "GET", "/_alias/plain", null).status());
+        }
+    }
+
     private MetadataPlane plane(AtomicLong clock) throws java.io.IOException {
         return new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
     }
