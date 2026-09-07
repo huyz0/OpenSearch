@@ -58,6 +58,16 @@ public final class DescriptorStore {
 
     private final BlobContainer container;
 
+    /**
+     * Told the name of every record this store changes, so a cache over it cannot go stale through a
+     * mutation nobody remembered to announce.
+     *
+     * <p>A callback rather than a call at each site in {@code MetadataPlane}: the sites are eight and
+     * growing, and one of them forgetting is a routing cache serving a descriptor this very node has just
+     * replaced. Announcing from the one class that does the writing makes that impossible to get wrong.
+     */
+    private volatile java.util.function.Consumer<String> onChanged = name -> {};
+
     private static boolean isTombstone(org.opensearch.core.common.bytes.BytesReference value) {
         if (value.length() < TOMBSTONE_PREFIX.length()) {
             return false;
@@ -98,6 +108,17 @@ public final class DescriptorStore {
     }
 
     /**
+     * Registers what to tell when a record changes.
+     *
+     * @param listener told the name of each created, updated or deleted record
+     * @return this, for chaining
+     */
+    public DescriptorStore onChanged(java.util.function.Consumer<String> listener) {
+        this.onChanged = listener == null ? name -> {} : listener;
+        return this;
+    }
+
+    /**
      * Creates an index descriptor, failing if the name is taken.
      *
      * @param descriptor the descriptor to write
@@ -133,12 +154,14 @@ public final class DescriptorStore {
         // that is taken is read, to tell a tombstone from a live record.
         final BlobRegisterCasResult created = container.createRegisterIfAbsent(blobName, value);
         if (created.applied()) {
+            onChanged.accept(name);
             return created.currentGeneration();
         }
         final Optional<BlobRegister> current = container.readRegister(blobName);
         if (current.isPresent() && isTombstone(current.get().value())) {
             final BlobRegisterCasResult swapped = container.compareAndSwapRegister(blobName, current.get().generation(), value);
             if (swapped.applied()) {
+                onChanged.accept(name);
                 return swapped.currentGeneration();
             }
         }
@@ -206,6 +229,9 @@ public final class DescriptorStore {
             expectedGeneration,
             alias.toBytes()
         );
+        if (result.applied()) {
+            onChanged.accept(alias.name());
+        }
         return result.applied() ? Optional.of(result.currentGeneration()) : Optional.empty();
     }
 
@@ -352,6 +378,9 @@ public final class DescriptorStore {
             expectedGeneration,
             descriptor.toBytes()
         );
+        if (result.applied()) {
+            onChanged.accept(descriptor.name());
+        }
         return result.applied() ? Optional.of(result.currentGeneration()) : Optional.empty();
     }
 
@@ -363,6 +392,7 @@ public final class DescriptorStore {
      */
     public void delete(String indexName) throws IOException {
         container.deleteBlobsIgnoringIfNotExists(List.of(RegisterMap.descriptorBlob(indexName)));
+        onChanged.accept(indexName);
     }
 
     /**
@@ -395,6 +425,7 @@ public final class DescriptorStore {
         if (swapped.applied() == false) {
             return false;
         }
+        onChanged.accept(indexName);
         // The tombstone stays, for the quarantine: see createRegister for why a deleted name must keep
         // its generation, and sweepTombstones for why not forever.
         return true;

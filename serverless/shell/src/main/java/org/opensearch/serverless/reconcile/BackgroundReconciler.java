@@ -935,7 +935,12 @@ public final class BackgroundReconciler implements Closeable {
         if (renewalDrivenByTimer) {
             // The timer renews the lease; the backstop's job is the half that verifies. Renewing here too
             // was a fourth lease write per TTL that guaranteed nothing the timer's three did not.
-            return node.verifyHeads(plane);
+            //
+            // IfDue, not unconditionally: the scan is one register read per held shard, and running it on
+            // every renewal and every backstop alike made it the largest standing cost of an idle node.
+            // See ServerlessNode#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS for why a bounded wait is safe here
+            // and where the unconditional scan still happens.
+            return node.verifyHeadsIfDue(plane);
         }
         return node.heartbeat(plane);
     }
@@ -962,6 +967,16 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> verifyHeads() throws Exception {
+        return node.verifyHeadsIfDue(plane);
+    }
+
+    /**
+     * Reads the head of every held writer shard now, whatever the interval says.
+     *
+     * @return the shards released
+     * @throws Exception if the metadata plane cannot be reached
+     */
+    public Set<ShardId> verifyHeadsNow() throws Exception {
         return node.verifyHeads(plane);
     }
 
