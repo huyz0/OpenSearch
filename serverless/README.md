@@ -9,16 +9,27 @@ This branch is built directly on `opensearch-project/OpenSearch` `main`.
 
 ## What it costs core
 
-Six files, 408 lines, all additive.
+Six files, 364 lines, all additive.
 
 | File | Lines | Why |
 | --- | --- | --- |
-| `common/blobstore/BlobRegister.java` | 65 | the compare-and-swap register |
+| `common/blobstore/BlobRegister.java` | 42 | the compare-and-swap register |
 | `common/blobstore/BlobRegisterCasResult.java` | 53 | its outcome |
 | `common/blobstore/BlobContainer.java` | 59 | `readRegister`, `compareAndSwapRegister`, `createRegisterIfAbsent` |
 | `common/blobstore/fs/FsBlobContainer.java` | 136 | the filesystem implementation |
-| `index/engine/Engine.java` | 41 | `engineRecoveryOperations()` |
+| `index/engine/Engine.java` | 20 | `engineRecoveryOperations()` |
 | `index/shard/IndexShard.java` | 54 | `recoverAdditionalEngineOperations`, which replays them |
+
+It was 408 until an audit of what core actually needs. `Engine` also carried
+`globalCheckpointSupplierForCombinedDeletionPolicy`, a hook nothing overrode and nothing
+called -- `InternalEngine` still passes the supplier inline, so it was never even wired to
+its own default. `BlobRegister` was a hand-written value class whose `equals` and `hashCode`
+were exactly what a record generates. Neither removal changed a call site.
+
+`BlobRegisterCasResult` stays a class deliberately. A record's canonical constructor cannot
+be less accessible than the record, so making it one would expose
+`new BlobRegisterCasResult(true, generation)` -- the boolean-blind construction its named
+`applied` and `conflict` factories exist to prevent -- to save sixteen lines.
 
 The S3, Azure and GCS implementations of the register live in the repository plugins,
 outside core.
