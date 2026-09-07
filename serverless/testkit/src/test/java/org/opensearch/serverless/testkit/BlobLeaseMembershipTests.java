@@ -131,6 +131,72 @@ public class BlobLeaseMembershipTests extends OpenSearchTestCase {
         assertEquals("node-a", deltas.get(1).left().iterator().next().nodeId());
     }
 
+    /**
+     * A refresh does not re-read a lease whose own stamp says it cannot have run out.
+     *
+     * <p><b>The cost this pins.</b> The loop read one register per member on every refresh, and a request
+     * path refreshes at half a lease. So each node spent one read per other node every few seconds, which
+     * across the fleet is quadratic in its size — paid to be told that leases renewed every third of a
+     * lifetime had not expired within half of one. An expiry only ever moves forward, so a stamp still in
+     * the future cannot have become false, and the read is skipped.
+     *
+     * <p>Counted through a store that records requests, because the claim is a number.
+     */
+    public void testARefreshDoesNotRereadLeasesThatCannotHaveExpired() throws Exception {
+        final AtomicLong now = new AtomicLong(1_000L);
+        final CountingBlobStore store = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final BlobLeaseMembership membership = new BlobLeaseMembership(store.blobContainer(BlobPath.cleanPath()), now::get, TTL);
+        for (int i = 0; i < 5; i++) {
+            membership.renew(lease("node-" + i));
+        }
+
+        // The first refresh has nothing remembered and reads every one of them.
+        store.reset();
+        assertEquals(5, membership.refresh().size());
+        final long cold = store.registerReads();
+
+        // The second, a moment later, reads only the members index.
+        store.reset();
+        assertEquals(5, membership.refresh().size());
+        final long warm = store.registerReads();
+
+        logger.info("membership: a cold refresh over 5 members read {} registers, a warm one read {}", cold, warm);
+        assertTrue("a cold refresh must read a lease per member: " + cold, cold >= 5);
+        assertEquals("a warm refresh must read the members index and nothing else", 1, warm);
+
+        // And once the leases have run out by their own stamps, it reads them again rather than trusting
+        // what it remembered -- which is what lets a node that renewed come back, and one that did not go.
+        now.addAndGet(TTL + 1);
+        store.reset();
+        assertTrue("every lease has expired, so none is live", membership.refresh().isEmpty());
+        assertTrue("and each must have been read again: " + store.registerReads(), store.registerReads() >= 5);
+    }
+
+    /**
+     * A node that stops renewing still leaves the snapshot, on the schedule its own lease describes.
+     *
+     * <p>The saving is that an unexpired lease is not re-read. What must not follow is that a dead node
+     * lives forever in the snapshot because nobody looks again — so the memory is bounded by the stamp it
+     * came with, and expiry is still expiry.
+     */
+    public void testANodeThatStopsRenewingStillLeaves() throws Exception {
+        final AtomicLong now = new AtomicLong(1_000L);
+        final BlobLeaseMembership membership = new BlobLeaseMembership(container(createTempDir()), now::get, TTL);
+        membership.renew(lease("stays"));
+        membership.renew(lease("goes"));
+        assertEquals(2, membership.refresh().size());
+
+        // Half a lifetime on, both are still believed live without a read.
+        now.addAndGet(TTL / 2);
+        assertEquals(2, membership.refresh().size());
+
+        // Past the lifetime, one renews and the other does not.
+        now.addAndGet(TTL);
+        membership.renew(lease("stays"));
+        final Set<String> live = membership.refresh().stream().map(NodeLease::nodeId).collect(Collectors.toSet());
+        assertEquals("only the node still renewing may remain", Set.of("stays"), live);
+    }
+
     public void testLeaseSurvivesASerializationRoundTrip() throws Exception {
         final NodeLease original = new NodeLease("node-x", "eph-7", "10.0.0.4:9300", Set.of("ingest", "search"), 12_345L);
         final NodeLease parsed = NodeLease.fromStream(new ByteArrayInputStream(BytesToArray(original)));
