@@ -848,13 +848,25 @@ public final class ServerlessNode implements Closeable {
                 // directory here would look like an empty index; refusing says what happened.
                 throw new java.io.IOException("the point in time [" + viewId + "] is no longer held");
             }
+            final var frozenCommit = pit.get().shards().get(shardNumber);
+            if (frozenCommit == null) {
+                // The same refusal as above, for the other way this commit can be absent. A null manifest
+                // is a legitimate "nothing published yet" for a writer opening a fresh shard, and it is
+                // exactly the wrong reading here: a view that does not cover this shard would open an
+                // empty directory, the shard would answer nothing, and the search would count it as having
+                // answered -- a hole in the coverage reported as a complete result. No view reaches this
+                // holding no commit for the shard being opened, and if one ever does it says so.
+                throw new java.io.IOException(
+                    "the point in time [" + viewId + "] holds no commit for shard " + shardNumber + " of " + shardBase.buildAsString()
+                );
+            }
             return org.opensearch.serverless.store.BlockCacheDirectory.create(
                 local,
                 plane.blobStore(),
                 shardBase,
                 blockCache,
                 viewId + "#" + shardNumber,
-                pit.get().shards().get(shardNumber)
+                frozenCommit
             );
         }
         return org.opensearch.serverless.store.BlockCacheDirectory.create(
