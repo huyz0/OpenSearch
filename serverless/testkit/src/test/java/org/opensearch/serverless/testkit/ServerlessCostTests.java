@@ -481,19 +481,20 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                     afterwards
                 );
 
-                if (onBucket) {
-                    assertEquals(
-                        "on s3, reclaiming " + deadTerms + " dead terms should stop costing listings once they are gone",
-                        reclaiming - deadTerms,
-                        afterwards
-                    );
-                } else {
-                    assertEquals(
-                        "on fs, emptied term directories remain and are re-listed; if that changed, say so here",
-                        reclaiming,
-                        afterwards
-                    );
-                }
+                // Once per dead term, and then never again -- on either store, which is the part that
+                // changed. This used to expect the count to fall by one per reclaimed term on s3 and to
+                // stay put on fs, on the reasoning that a filesystem keeps an emptied directory and would
+                // go on listing it. Both halves are now wrong for the same reason: {@code WalStore} drops
+                // older terms at most once per term per instance ({@code olderTermsDroppedFor}), so the
+                // second publish does not walk the term containers at all and the store underneath it
+                // stops mattering. The old fs expectation was measuring the filesystem's directory
+                // semantics; there is no longer a listing for those semantics to show up in.
+                assertTrue("the reclaiming publish must list at least once per dead term: " + reclaiming, reclaiming >= deadTerms);
+                assertEquals(
+                    "on " + label + ", a publish after the dead terms were reclaimed must not walk them again",
+                    0,
+                    afterwards
+                );
             }
         }
     }
@@ -560,6 +561,109 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 // The whole claim, and it is an equality rather than a ratio: a batch on one shard is one
                 // log append, not a smaller number of them.
                 assertEquals("on " + label + ", a batch on one shard must cost exactly one object-store write", 1, batched);
+            }
+        }
+    }
+
+    /**
+     * What concurrency costs once the log group-commits, and the one number in this suite that a
+     * filesystem cannot report.
+     *
+     * <p>{@code testWhatABatchCosts} covers the case where the <em>caller</em> batches. This is the case
+     * where it does not: many clients writing single documents to one shard at the same time, which is what
+     * an ingest fleet actually looks like. Group commit shares one PUT between whatever arrives while a PUT
+     * for that shard is already in flight, so the saving is the product of the write rate and the store's
+     * write latency.
+     *
+     * <p><b>Both stores batch, and the gap between them is the point.</b> The first version of this comment
+     * predicted the filesystem would save nothing, on the reasoning that a system call has no latency to
+     * accumulate behind. It was wrong, and the measurement is why the comment now says otherwise: at
+     * sixteen writers over ninety-six documents a filesystem still reached 3.2 documents per PUT, because
+     * even a system call is long enough for fifteen other threads to queue behind. Against MinIO on
+     * loopback the same workload reached 8.0. A remote bucket has round trips an order of magnitude longer
+     * than loopback, so 8.0 is a floor on what a real endpoint gives rather than an estimate of it.
+     *
+     * <p>Only the bucket is asserted on, and only as an inequality: the ratio is set by the endpoint's
+     * latency, which is a property of the store rather than of this design.
+     */
+    public void testWhatConcurrentWritesCostOnceTheLogGroupCommits() throws Exception {
+        for (boolean onBucket : new boolean[] { false, true }) {
+            if (onBucket) {
+                assumeEndpoint();
+            }
+            final CountingBlobStore store = onBucket ? bucket() : filesystem();
+            final String label = onBucket ? "s3" : "fs";
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+            try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-group-" + label))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+                loop.want("alpha", 0);
+                loop.tick(System.currentTimeMillis());
+                final ShardId shardId = node.reconciler().openShards().iterator().next();
+
+                final int documents = 96;
+                final int writers = 16;
+
+                // The baseline, re-measured rather than quoted: one writer, so nothing is ever in flight
+                // when the next write arrives and nothing can be grouped.
+                store.reset();
+                for (int i = 0; i < documents; i++) {
+                    node.index(shardId, "serial-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
+                }
+                final long serial = store.blobWrites();
+
+                // The same documents, written by writers that overlap. Released together so they contend
+                // from the first document rather than ramping into it.
+                final java.util.concurrent.CyclicBarrier start = new java.util.concurrent.CyclicBarrier(writers);
+                final java.util.List<Throwable> failures = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+                final java.util.List<Thread> threads = new java.util.ArrayList<>();
+                store.reset();
+                for (int w = 0; w < writers; w++) {
+                    final int which = w;
+                    final Thread thread = new Thread(() -> {
+                        try {
+                            start.await(30, TimeUnit.SECONDS);
+                            for (int i = which; i < documents; i += writers) {
+                                node.index(shardId, "concurrent-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
+                            }
+                        } catch (Throwable t) {
+                            failures.add(t);
+                        }
+                    }, "cost-writer-" + w);
+                    threads.add(thread);
+                    thread.start();
+                }
+                for (Thread thread : threads) {
+                    thread.join(120_000);
+                }
+                final long concurrent = store.blobWrites();
+
+                assertTrue("every concurrent write must have succeeded: " + failures, failures.isEmpty());
+                logger.info(
+                    "cost[{}]: {} documents cost {} writes from one writer, {} writes from {} concurrent writers ({} docs per PUT)",
+                    label,
+                    documents,
+                    serial,
+                    concurrent,
+                    writers,
+                    concurrent == 0 ? "n/a" : String.format(Locale.ROOT, "%.1f", (double) documents / concurrent)
+                );
+
+                assertEquals("on " + label + ", a lone writer must still pay one PUT per document", documents, serial);
+                assertTrue("on " + label + ", grouping must never cost more than not grouping: " + concurrent, concurrent <= documents);
+                if (onBucket) {
+                    // The claim, and only a bucket can carry it: with a real round trip to wait behind,
+                    // concurrent writers share PUTs. Asserted as a strict inequality rather than a ratio --
+                    // the ratio is set by the endpoint's latency, which is a property of the store and not
+                    // of this design, and pinning it here would be pinning MinIO's loopback timings.
+                    assertTrue(
+                        "on a bucket, concurrent writers must share PUTs: " + concurrent + " for " + documents + " documents",
+                        concurrent < documents
+                    );
+                }
             }
         }
     }
@@ -647,6 +751,16 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 }
                 loop.tick(System.currentTimeMillis());
 
+                // A throwaway search first, and it is what makes the two measurements comparable.
+                // SearchHandler probes membership at most once per MEMBERSHIP_PROBE_INTERVAL_MILLIS, so the
+                // first search after a quiet moment pays a members-index read and a lease read that the
+                // next one does not. Measuring the plain search cold and the aggregated one warm therefore
+                // compared a search carrying a probe against one that skipped it -- which is why this
+                // asserted 3 == 1 and read as though aggregating were somehow cheaper than not
+                // aggregating. The probe belongs to neither search; warming it puts both on the same side
+                // of it.
+                search(writer, "/aggs/_search?q=msg:aggcost&size=0");
+
                 store.reset();
                 long startedAt = System.nanoTime();
                 final Response plain = search(writer, "/aggs/_search?q=msg:aggcost&size=0");
@@ -684,10 +798,19 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 // The claim. A reduce runs on the coordinating node over answers the shards computed from
                 // segments they were reading anyway, so it must add nothing to what the deployment pays
                 // its object store.
-                assertEquals(
-                    "on " + label + ", aggregating must not cost object-store requests beyond the search itself",
-                    plainRequests,
-                    aggregatedRequests
+                // "Beyond", not "exactly": an inequality is the literal claim, and it is also the only form
+                // that cannot flake. The membership probe warmed above expires on a wall clock, so a build
+                // machine slow enough to put a second between these two searches would have the later one
+                // pay a probe again -- which would break an equality while saying nothing at all about
+                // what an aggregation costs.
+                assertTrue(
+                    "on "
+                        + label
+                        + ", aggregating must not cost object-store requests beyond the search itself: "
+                        + aggregatedRequests
+                        + " against "
+                        + plainRequests,
+                    aggregatedRequests <= plainRequests
                 );
                 assertEquals("and must read no data blobs, having held the shards already", 0, store.blobReads());
             }
