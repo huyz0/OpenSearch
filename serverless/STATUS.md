@@ -327,7 +327,13 @@ These are decisions, not gaps. Each answers 501 with a reason.
   That is a design choice — re-running every filter per hop would make one that counts or rate-limits wrong
   — but it does mean a plugin cannot enforce at the shard. (A caller *does* travel: a thread-context header
   set by a plugin arrives on the far side, which is core's own mechanism and is tested.)
-- A plugin's action can now be run on a node the plugin chose, and the hop is authenticated. This entry
+- A plugin's action can now be run on a node the plugin chose, and the hop is authenticated from the
+  first request rather than from the end of startup. The check first asked the built registry whether an
+  action was a plugin's — but a `HandledTransportAction` registers its handler from its own constructor,
+  those constructors run inside the loop that builds the registry, and the registry is assigned only when
+  the loop returns. The transport has been accepting since well before. So each plugin action was live and
+  unchecked for the length of that loop. It reads the declared names instead, which come off
+  `getActions()` and are known before the transport accepts anything. This entry
   used to say a plugin could not forward one at all; that was wrong, and testing it is what found out.
   Every piece was already present — the projected cluster state carries every live member, a
   `HandledTransportAction` registers its own handler everywhere, and the thread context travels — so a
