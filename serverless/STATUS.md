@@ -431,9 +431,62 @@ These are decisions, not gaps. Each answers 501 with a reason.
   because closing them needs a real feature (a version model), not a response-shape change. See
   `m47-api-compatibility-notes.md` (on `feature/serverlessnode`).
 
+## What a correctness review found
+
+A deliberate review, after the work above was already committed and green. Five real defects and one
+hardening. **Two of the five had been introduced earlier the same day**, which is the first thing worth
+recording: the newest code was the least reviewed code, and reviewing it as hard as the old code is what
+caught them before they shipped rather than after.
+
+| Finding | Class | Where |
+| --- | --- | --- |
+| A plugin's action was reachable and unauthenticated while the node started | security hole | `PluginHopAuthentication` |
+| The sweep could delete files a freeze was still reading | data loss | `GarbageCollector` / `PointInTime` |
+| `deleteIndex` claimed a cleanup mechanism that does not exist | false safety argument | `MetadataPlane` |
+| A freeze in progress pinned nothing, so deleting its index took its files | wrong answer | `pinnedByView`, both copies |
+| A capture marker was usable as a view: zero hits, `"complete": true` | wrong answer | `pointInTime`, `_pit` list and `_all` |
+| A frozen shard whose view holds no commit for it now refuses | hardening, not a live bug | `openFrozenView` |
+
+**Three of the five are one shape: a guard that exists on the snapshot-capture path and was never mirrored
+onto the point-in-time path.** Snapshots have had a two-phase capture guard since they were written — an
+index a capture has named is pinned in full, and sweeps leave it alone. Points in time did not, and every
+consequence of that absence was a separate bug. If a third pin-like mechanism is ever added, check it
+against both.
+
+**Every finding came from running or probing, not from reading.** The first fix for the freeze/sweep race
+was dead code whose own test passed: the capture marker did not round-trip, because the parser refuses a
+record holding no shards, so it read back as the placeholder the plane substitutes for anything unreadable
+— and the protection observed in the test came from the placeholder path, which stops the sweep for every
+shard of every index rather than the one being frozen. A probe printing the record after a round trip is
+what exposed it. Reading the code confirmed the wrong belief three times.
+
+**The last finding came from searching for the bug class rather than the next file.** After four findings
+shared a shape, grepping every consumer of `livePointsInTime` was more productive than continuing linearly:
+two of the nine had never been checked and both were wrong. Worth doing deliberately rather than after the
+fourth instance.
+
+**Two testing hazards, both of which produced a false green during the review.** Gradle's task cache does
+not notice the `missing-doclet` jar changing, and did not re-run tests after a source change on two
+occasions — so a canary reported success without having recompiled. Every canary here now runs with
+`--rerun-tasks`. And Lucene's `ExtrasFS` drops an `extra0` into random directories, where the orphan sweep
+is right to take it; that has broken three separate tests in `ServerlessStoreInvariantTests`. Assert on the
+blob the test planted, never on an empty list.
+
+**What the review checked and did not fault**, so a later reader knows where it has already been: the
+write path from acknowledgement through publish to truncation, including that truncation deliberately lags
+one publish; the lease and shard-identity fence on all three write paths; sealing at the swap against the
+clock-skew budget `BlobLeaseMembership` documents; rollover's create-then-swap and its compensating delete;
+alias hint ordering; search coverage (`answered == shards`, and the fan-out claims each shard's slot
+exactly once, so it cannot be inflated); `_mget` never rendering an unreachable shard as `"found": false`;
+snapshot restore, which fails loudly on a missing source blob rather than restoring a truncated commit;
+mapping growth under concurrency; `_update`'s conditional write-back; the publish fence the collector's
+first condition depends on, which is bypassable on its fast path and saved by the re-read after a failed
+compare-and-swap; that a pipeline cannot run stale, because the marker register is read fresh on every
+lookup; and that a conditional write keeps its meaning across a forward, conflict included.
+
 ## How it is tested
 
-549 tests in `:serverless:testkit:test`, plus `pluginTest` (a real plugin installed from its
+560 tests in `:serverless:testkit:test`, plus `pluginTest` (a real plugin installed from its
 assembled zip), `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off)
 and `s3Test` (against live MinIO and SeaweedFS endpoints, which assume-skips with no endpoint
 reachable).
