@@ -187,8 +187,17 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
         membership.renew(lease("node-a", "127.0.0.1:9301"));
         assertEquals(1, membership.refresh().size());
 
-        // Somebody sweeps the blob; a refresh then finds the id listed with no lease and prunes it.
+        // Somebody sweeps the blob. A refresh finds the id listed with no lease and prunes it -- but not
+        // instantly any more, and the delay is the point of the memory rather than a defect in it: a
+        // refresh does not re-read a lease whose own stamp is still in the future, so a blob deleted
+        // underneath an unexpired stamp is not noticed until that stamp runs out. Nothing that decides
+        // ownership reads this snapshot, and a peer missing from it is still resolved by a direct read
+        // when a forward needs its address; a departure lingering for at most the rest of its lease is
+        // inside the staleness this snapshot already documents.
         c.deleteBlobsIgnoringIfNotExists(List.of(BlobLeaseMembership.LEASE_PREFIX + "node-a"));
+        assertEquals("still believed live while its own stamp says it cannot have expired", 1, membership.refresh().size());
+
+        now.addAndGet(TTL + 1);
         assertEquals(0, membership.refresh().size());
         assertFalse(c.readRegister(BlobLeaseMembership.MEMBERS).orElseThrow().value().utf8ToString().contains("node-a"));
 

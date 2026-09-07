@@ -109,6 +109,12 @@ public final class BlobLeaseMembership implements MembershipSource {
     private volatile long lastRefreshedAt = Long.MIN_VALUE;
     private volatile long lastIndexGeneration = BlobRegister.ABSENT_GENERATION;
     private final Set<String> enrolled = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Each member's lease as this node last read it, kept only while its own stamped expiry is still in
+     * the future. This is what makes a refresh cost one register read rather than one per member.
+     */
+    private final java.util.Map<String, NodeLease> lastRead = new java.util.concurrent.ConcurrentHashMap<>();
     /** The expiry this node last published for itself, so the write path can check it without I/O. */
     private volatile long ownExpiresAtMillis = 0L;
     private volatile long skewMarginMillis;
@@ -502,9 +508,27 @@ public final class BlobLeaseMembership implements MembershipSource {
             // with readBlob yields framed bytes that fail to parse — and, because the catch below
             // treats an unreadable lease as an absent one, that mistake presents as "no nodes exist"
             // rather than as an error. Found exactly that way.
+            // A lease this node has already read and whose own stamp says it has not run out yet. Skipped,
+            // and that is the whole saving: this loop was one register read per member on every refresh,
+            // so a fleet of N nodes spent N reads each and N-squared between them, to be told that leases
+            // renewed every third of a lifetime had not expired in the last half of one.
+            //
+            // Safe because an expiry only ever moves forward -- renewal writes now + ttl, and nothing
+            // shortens it -- so a stamp still in the future cannot have become false. What it can miss is
+            // a node that left cleanly or restarted at another address inside the remaining lifetime, and
+            // neither is a safety question: this snapshot picks reader placements and renders _cat and
+            // _nodes. Nothing that decides ownership consults it. The liveness oracle behind
+            // ShardHeadStore reads the lease directly, and so does ShardRouter when it resolves an address
+            // to forward to, precisely so that being wrong here costs a retry rather than a shard.
+            final NodeLease known = lastRead.get(nodeId);
+            if (known != null && known.isExpiredAt(now) == false) {
+                live.add(known);
+                continue;
+            }
             try {
                 final Optional<BlobRegister> register = container.readRegister(LEASE_PREFIX + nodeId);
                 if (register.isEmpty()) {
+                    lastRead.remove(nodeId);
                     // Listed and gone: a clean leave whose index swap was lost. Pruned below.
                     missing.add(nodeId);
                     continue;
@@ -513,6 +537,7 @@ public final class BlobLeaseMembership implements MembershipSource {
                     final NodeLease lease = NodeLease.fromStream(in);
                     if (lease.isExpiredAt(now) == false) {
                         live.add(lease);
+                        lastRead.put(nodeId, lease);
                     } else if (now - lease.expiresAtMillis() >= DEAD_LEASE_PRUNE_TTLS * ttlMillis) {
                         // Expired for many lifetimes. A slow node is expired for seconds; this is a node
                         // that is gone, and every refresh everywhere has been paying a read to confirm it.
@@ -522,7 +547,13 @@ public final class BlobLeaseMembership implements MembershipSource {
                         longDead.add(nodeId);
                     }
                 }
+                if (live.contains(lastRead.get(nodeId)) == false) {
+                    // Expired, or read as something this pass did not accept. Forgotten, so the next
+                    // refresh reads it again and sees a renewal the moment there is one.
+                    lastRead.remove(nodeId);
+                }
             } catch (IOException e) {
+                lastRead.remove(nodeId);
                 // A lease being deleted underneath a read is normal, not exceptional. Skipping an
                 // unreadable one is safe: it can only make us believe fewer nodes exist, and nothing
                 // about safety depends on the member list (§10.1).
