@@ -245,6 +245,48 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
     }
 
     /**
+     * Deleting an index while a freeze is reading it leaves the blobs the freeze is about to name.
+     *
+     * <p><b>Why this is not covered by the ordinary view pin.</b> A pin names shards, and a freeze that
+     * has not finished names none — so "is any shard of this pinned" answers no for every one of them, and
+     * the delete purges exactly the files the freeze is mid-way through reading. The freeze then completes
+     * and hands its caller a {@code pit_id} for a view whose blobs are already gone: a broken view
+     * reported as a good one.
+     *
+     * <p>A snapshot capture has had this branch since it was written — {@code pinnedBySnapshot} treats an
+     * index a capture has named as pinned in full. A freeze can now say the same thing about itself, so
+     * both sweeps honour it: this one, and the collector's.
+     */
+    public void testDeletingAnIndexMidFreezeLeavesWhatTheFreezeIsReading() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = planeOver(store, clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 2, MAPPING, null));
+
+        final BlobContainer shardZero = store.blobContainer(plane.shardData("alpha", 0).add("t=1"));
+        final BlobContainer shardOne = store.blobContainer(plane.shardData("alpha", 1).add("t=1"));
+        write(shardZero, "_0.cfs", "shard zero");
+        write(shardOne, "_0.cfs", "shard one");
+
+        // A freeze begins and has read nothing yet, which is the whole point: it names no shard.
+        final String pitId = UUIDs.randomBase64UUID();
+        plane.beginPointInTime(new PointInTime(pitId, "alpha", "uuid-alpha-00000000", clock.get() + 600_000L, Map.of(), true));
+
+        assertTrue("the delete itself still happens", plane.deleteIndex("alpha"));
+        assertTrue("shard 0's bytes must survive a delete that raced the freeze", shardZero.blobExists("_0.cfs"));
+        assertTrue("and shard 1's, which the freeze had not reached either", shardOne.blobExists("_0.cfs"));
+
+        // Once the freeze is gone, they are ordinary orphans and the operator's sweep takes them.
+        assertTrue(plane.releasePointInTime(pitId));
+        final List<String> swept = new GarbageCollector(store, BlobPath.cleanPath()).collectOrphanedShards(plane);
+        assertEquals(
+            "both containers, once nothing names them: " + swept,
+            List.of("alpha#uuid-alpha-00000000#0", "alpha#uuid-alpha-00000000#1"),
+            swept.stream().sorted().toList()
+        );
+    }
+
+    /**
      * A view record the plane cannot read stops the sweep rather than pinning nothing.
      *
      * <p>The plane stands in for such a record with a placeholder that names no shards, and "treated as
