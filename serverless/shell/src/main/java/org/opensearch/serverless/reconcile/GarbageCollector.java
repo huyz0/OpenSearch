@@ -553,6 +553,13 @@ public final class GarbageCollector {
 
         final BlobContainer segments = blobStore.blobContainer(base.add("segments"));
         final List<String> deleted = new ArrayList<>();
+        // One descriptor read per index, not one per shard container. The loop below visits
+        // index#uuid#shard, so a fifty-shard index used to read its descriptor fifty times to be told the
+        // same thing. Memoised for the length of this pass only, which also makes the pass consistent: a
+        // create or delete landing midway can no longer have the sweep judge two shards of one index
+        // differently. Absent is memoised too -- that is the answer that decides a collection, and re-reading
+        // it per shard is how one index's shards could be half swept.
+        final Map<String, Optional<IndexDescriptor>> described = new java.util.HashMap<>();
         for (Map.Entry<String, BlobContainer> child : segments.children().entrySet()) {
             final String container = child.getKey();
             // index#uuid#shard, split from the right, because an index name may contain the separator in
@@ -571,7 +578,11 @@ public final class GarbageCollector {
                 continue;
             }
 
-            final Optional<IndexDescriptor> descriptor = plane.describe(indexName);
+            Optional<IndexDescriptor> descriptor = described.get(indexName);
+            if (descriptor == null) {
+                descriptor = plane.describe(indexName);
+                described.put(indexName, descriptor);
+            }
             if (descriptor.isPresent() && descriptor.get().uuid().equals(uuid)) {
                 continue;
             }
