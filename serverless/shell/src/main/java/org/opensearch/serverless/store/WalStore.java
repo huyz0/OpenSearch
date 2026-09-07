@@ -69,6 +69,32 @@ public final class WalStore {
     private volatile long publishedUpTo = 0L;
     /** The term whose older-term containers this instance has already emptied. */
     private volatile long olderTermsDroppedFor = -1L;
+    /** When that emptying last ran, so it can run again for what appeared afterwards. */
+    private volatile long olderTermsDroppedAtNanos = Long.MIN_VALUE;
+    private final long olderTermRescanMillis;
+
+    /**
+     * How long a publish may go before it looks at the older term containers again.
+     *
+     * <p><b>Why looking again is needed at all.</b> Emptying them once per term was very nearly right: a
+     * successor replays every older record before it starts, so after one pass there is nothing left to
+     * find. What it missed is the writer that has lost the shard and not yet noticed. It goes on appending
+     * under its own, now-older term for up to a lease, and every one of those records lands <em>after</em>
+     * the one drop that would have collected it. Nothing else reclaims them -- the collector walks
+     * {@code t=N} directories under the shard container and steps over {@code wal} -- so for a shard that
+     * never fails over again they stayed for the life of the index. Not a correctness fault: they are
+     * behind the successor's seal and never replay. Just bytes nobody was ever going to read, billed
+     * monthly.
+     *
+     * <p>Ten minutes, and the interval is doing two jobs. A zombie stops within a lease of losing the
+     * shard, so nothing accumulates for longer than that however rarely this runs; the interval decides
+     * how long the bytes sit, not how many there are. Against that, a re-scan is a listing, and a listing
+     * is billed at the write tier -- so running it per publish, or per lease, would have cost far more
+     * than the storage it reclaims. Ten minutes is two orders of magnitude below "forever" and cheap
+     * enough to disappear into the noise: on an object store an emptied prefix lists nothing, so the usual
+     * re-scan is one request that finds one live term and stops.
+     */
+    public static final long DEFAULT_OLDER_TERM_RESCAN_MILLIS = 600_000L;
 
     /**
      * Creates a WAL for one shard.
@@ -77,8 +103,23 @@ public final class WalStore {
      * @param shardBase the shard's base path
      */
     public WalStore(BlobStore blobStore, BlobPath shardBase) {
+        this(blobStore, shardBase, DEFAULT_OLDER_TERM_RESCAN_MILLIS);
+    }
+
+    /**
+     * Creates a WAL for one shard with an explicit re-scan interval.
+     *
+     * <p>Zero re-scans on every publish and {@link Long#MAX_VALUE} never re-scans, which is the behaviour
+     * this had before the interval existed. For tests that want one end or the other without waiting.
+     *
+     * @param blobStore the backing store
+     * @param shardBase the shard's base path
+     * @param olderTermRescanMillis see {@link #DEFAULT_OLDER_TERM_RESCAN_MILLIS}
+     */
+    public WalStore(BlobStore blobStore, BlobPath shardBase, long olderTermRescanMillis) {
         this.blobStore = blobStore;
         this.shardBase = shardBase;
+        this.olderTermRescanMillis = olderTermRescanMillis;
     }
 
     private BlobContainer containerFor(long term) {
@@ -286,8 +327,23 @@ public final class WalStore {
      */
     public Map<Long, String> sealAt(long term) throws IOException {
         final Map<Long, String> here = position();
-        final Map<Long, String> sealed = sealedPosition();
-        final long sealedBelow = highestSealedTerm();
+        final BlobContainer sealsContainer = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
+        // One listing doing the three jobs that used to cost three: which seals to merge, the highest term
+        // any of them was written at, and which of them this one supersedes.
+        //
+        // <b>Taking the supersede set from this listing rather than from a fresh one after the write is a
+        // correctness fix, not only a cheaper way to get the same answer.</b> The delete used to be driven
+        // by a listing taken *after* the seal below was written, which could therefore see a seal that a
+        // concurrent lower-term sealer landed after the merge above had already read the container -- and
+        // delete it, unmerged. Seals merge by taking the lowest recorded position per term, so the seal
+        // dropped that way was the tighter bound, and losing it widens the cutoff: a zombie's records
+        // between the two bounds replay as though they had been acknowledged. Bounding the delete by what
+        // was read is what makes "everything this seal supersedes" mean "everything this seal has already
+        // accounted for". A concurrent seal is now neither merged nor deleted; it stays, and the next
+        // sealer merges it.
+        final List<String> sealNames = sealNamesIn(sealsContainer.listBlobs().keySet());
+        final Map<Long, String> sealed = mergeSeals(sealsContainer, sealNames);
+        final long sealedBelow = highestSealedTerm(sealNames);
         final Map<Long, String> cutoff = new java.util.HashMap<>();
         for (Map.Entry<Long, String> entry : here.entrySet()) {
             if (entry.getKey() >= sealedBelow) {
@@ -323,13 +379,14 @@ public final class WalStore {
         }
         final byte[] bytes = body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         final String name = String.format(java.util.Locale.ROOT, "seal-%020d", term);
-        final BlobContainer seals = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
-        seals.writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, false);
+        sealsContainer.writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, false);
 
-        final List<String> superseded = new ArrayList<>(seals.listBlobs().keySet());
-        superseded.removeIf(other -> SEAL_NAME.matcher(other).matches() == false || other.compareTo(name) >= 0);
+        // Only what was read above, so nothing that arrived since is dropped unmerged. One delete call for
+        // all of them: the container batches, and a seal per takeover meant a request per takeover.
+        final List<String> superseded = new ArrayList<>(sealNames);
+        superseded.removeIf(other -> other.compareTo(name) >= 0);
         if (superseded.isEmpty() == false) {
-            seals.deleteBlobsIgnoringIfNotExists(superseded);
+            sealsContainer.deleteBlobsIgnoringIfNotExists(superseded);
         }
         return cutoff;
     }
@@ -342,13 +399,26 @@ public final class WalStore {
      */
     public Map<Long, String> sealedPosition() throws IOException {
         final BlobContainer seals = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
-        final Map<Long, String> merged = new java.util.HashMap<>();
-        for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : seals.listBlobs().entrySet()) {
-            if (SEAL_NAME.matcher(blob.getKey()).matches() == false) {
-                continue;
+        return mergeSeals(seals, sealNamesIn(seals.listBlobs().keySet()));
+    }
+
+    /** The seal blobs among a listing's names, in the order the listing gave them. */
+    private static List<String> sealNamesIn(java.util.Collection<String> names) {
+        final List<String> seals = new ArrayList<>();
+        for (String name : names) {
+            if (SEAL_NAME.matcher(name).matches()) {
+                seals.add(name);
             }
+        }
+        return seals;
+    }
+
+    /** Merges the named seals, taking the lowest recorded position per term. Caller supplies the listing. */
+    private Map<Long, String> mergeSeals(BlobContainer seals, List<String> sealNames) throws IOException {
+        final Map<Long, String> merged = new java.util.HashMap<>();
+        for (String sealName : sealNames) {
             final byte[] bytes;
-            try (InputStream in = seals.readBlob(blob.getKey())) {
+            try (InputStream in = seals.readBlob(sealName)) {
                 bytes = in.readAllBytes();
             }
             for (String line : new String(bytes, java.nio.charset.StandardCharsets.UTF_8).split("\n")) {
@@ -357,11 +427,11 @@ public final class WalStore {
                 }
                 final int space = line.indexOf(' ');
                 if (space < 0) {
-                    throw new IOException("unreadable WAL seal at " + seals.path().buildAsString() + blob.getKey());
+                    throw new IOException("unreadable WAL seal at " + seals.path().buildAsString() + sealName);
                 }
                 final Long term = parseTermNumber(line.substring(0, space));
                 if (term == null) {
-                    throw new IOException("unreadable WAL seal at " + seals.path().buildAsString() + blob.getKey());
+                    throw new IOException("unreadable WAL seal at " + seals.path().buildAsString() + sealName);
                 }
                 final String position = line.substring(space + 1);
                 merged.merge(term, position, (a, b) -> a.compareTo(b) <= 0 ? a : b);
@@ -375,16 +445,15 @@ public final class WalStore {
      * seal mentions it — a seal that does not mention a term is saying the term was empty, which is a
      * stronger statement than saying nothing.
      *
+     * <p>A pure function of the listing the caller already has, so asking this costs nothing on top of
+     * the merge it is asked alongside.
+     *
+     * @param sealNames the seal blob names, from one listing
      * @return the highest sealing term, or {@link Long#MIN_VALUE} if the log has never been sealed
-     * @throws IOException if listing fails
      */
-    private long highestSealedTerm() throws IOException {
-        final BlobContainer seals = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
+    private static long highestSealedTerm(List<String> sealNames) {
         long highest = Long.MIN_VALUE;
-        for (String name : seals.listBlobs().keySet()) {
-            if (SEAL_NAME.matcher(name).matches() == false) {
-                continue;
-            }
+        for (String name : sealNames) {
             final Long term = parseTermNumber(name.substring("seal-".length()));
             if (term != null && term > highest) {
                 highest = term;
@@ -468,11 +537,14 @@ public final class WalStore {
         previousSnapshot = current;
         publishedUpTo = upTo;
         int dropped = toDelete.size();
-        if (olderTermsDroppedFor != term) {
-            // Older terms are emptied once per term per instance: nothing but a zombie can add to one
-            // afterwards, and a zombie's late record loses on replay anyway.
+        // Once when the term changes, and then on a slow timer -- because a zombie is exactly the thing
+        // that adds to an older term after the first drop, and "its records lose on replay anyway" answers
+        // whether they are dangerous, not whether anything ever removes them. See
+        // DEFAULT_OLDER_TERM_RESCAN_MILLIS.
+        if (olderTermsDroppedFor != term || rescanOlderTermsDue()) {
             dropped += dropOlderTerms(term);
             olderTermsDroppedFor = term;
+            olderTermsDroppedAtNanos = System.nanoTime();
         }
         return dropped;
     }
@@ -501,6 +573,23 @@ public final class WalStore {
      * @return how many records were dropped
      * @throws IOException if listing or deleting fails
      */
+    /**
+     * Whether enough time has passed to look at the older terms again.
+     *
+     * <p>On {@link System#nanoTime} rather than the plane's clock, deliberately: this paces a reclamation
+     * and decides nothing about ownership or expiry. A monotonic source is the right one for an interval
+     * that must not be moved by a clock adjustment, and nothing here needs to agree with another node
+     * about when it ran.
+     */
+    private boolean rescanOlderTermsDue() {
+        if (olderTermRescanMillis == Long.MAX_VALUE) {
+            return false;
+        }
+        final long last = olderTermsDroppedAtNanos;
+        return last == Long.MIN_VALUE
+            || System.nanoTime() - last >= java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(olderTermRescanMillis);
+    }
+
     private int dropOlderTerms(long term) throws IOException {
         final BlobContainer walRoot = blobStore.blobContainer(shardBase.add("wal"));
         int dropped = 0;
