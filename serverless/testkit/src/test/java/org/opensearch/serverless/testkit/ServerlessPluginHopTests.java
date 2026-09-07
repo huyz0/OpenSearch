@@ -184,27 +184,32 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
                 listener.onFailure(e);
                 return;
             }
-            transportService.sendRequest(peer, WhereAction.NAME, new WhereRequest((String) null), new TransportResponseHandler<WhereResponse>() {
-                @Override
-                public WhereResponse read(StreamInput in) throws IOException {
-                    return new WhereResponse(in);
-                }
+            transportService.sendRequest(
+                peer,
+                WhereAction.NAME,
+                new WhereRequest((String) null),
+                new TransportResponseHandler<WhereResponse>() {
+                    @Override
+                    public WhereResponse read(StreamInput in) throws IOException {
+                        return new WhereResponse(in);
+                    }
 
-                @Override
-                public void handleResponse(WhereResponse response) {
-                    listener.onResponse(response);
-                }
+                    @Override
+                    public void handleResponse(WhereResponse response) {
+                        listener.onResponse(response);
+                    }
 
-                @Override
-                public void handleException(TransportException e) {
-                    listener.onFailure(e);
-                }
+                    @Override
+                    public void handleException(TransportException e) {
+                        listener.onFailure(e);
+                    }
 
-                @Override
-                public String executor() {
-                    return ThreadPool.Names.SAME;
+                    @Override
+                    public String executor() {
+                        return ThreadPool.Names.SAME;
+                    }
                 }
-            });
+            );
         }
     }
 
@@ -541,27 +546,32 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
                 transport.connectToNode(target);
 
                 final PlainActionFuture<WhereResponse> future = PlainActionFuture.newFuture();
-                transport.sendRequest(target, WhereAction.NAME, new WhereRequest((String) null), new TransportResponseHandler<WhereResponse>() {
-                    @Override
-                    public WhereResponse read(StreamInput in) throws IOException {
-                        return new WhereResponse(in);
-                    }
+                transport.sendRequest(
+                    target,
+                    WhereAction.NAME,
+                    new WhereRequest((String) null),
+                    new TransportResponseHandler<WhereResponse>() {
+                        @Override
+                        public WhereResponse read(StreamInput in) throws IOException {
+                            return new WhereResponse(in);
+                        }
 
-                    @Override
-                    public void handleResponse(WhereResponse response) {
-                        future.onResponse(response);
-                    }
+                        @Override
+                        public void handleResponse(WhereResponse response) {
+                            future.onResponse(response);
+                        }
 
-                    @Override
-                    public void handleException(TransportException e) {
-                        future.onFailure(e);
-                    }
+                        @Override
+                        public void handleException(TransportException e) {
+                            future.onFailure(e);
+                        }
 
-                    @Override
-                    public String executor() {
-                        return ThreadPool.Names.SAME;
+                        @Override
+                        public String executor() {
+                            return ThreadPool.Names.SAME;
+                        }
                     }
-                });
+                );
 
                 final Exception refused = expectThrows(
                     Exception.class,

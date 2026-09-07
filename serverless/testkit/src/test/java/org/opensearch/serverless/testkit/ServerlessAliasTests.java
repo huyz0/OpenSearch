@@ -233,11 +233,7 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
                 // And inside an action, where a whole batch would otherwise be acknowledged.
                 // each[1] is a whole object; splice its one field into the action body.
                 final String option = each[1].substring(1, each[1].length() - 1);
-                final String action = "{\"actions\":[{\"add\":{\"index\":\"opts\",\"alias\":\"c-"
-                    + each[0]
-                    + "\","
-                    + option
-                    + "}}]}";
+                final String action = "{\"actions\":[{\"add\":{\"index\":\"opts\",\"alias\":\"c-" + each[0] + "\"," + option + "}}]}";
                 final Response inAction = send(node, "POST", "/_aliases", action);
                 assertEquals(each[0] + " must be refused inside an action: " + inAction.body(), 501, inAction.status());
                 assertEquals("and the batch must not land: " + each[0], 404, send(node, "GET", "/_alias/c-" + each[0], null).status());

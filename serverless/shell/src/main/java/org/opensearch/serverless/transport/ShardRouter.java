@@ -136,8 +136,7 @@ public final class ShardRouter {
         );
     }
 
-    private void handleStats(ForwardedStatsRequest request, TransportChannel channel, org.opensearch.tasks.Task task)
-        throws Exception {
+    private void handleStats(ForwardedStatsRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         requireMac(ForwardedStatsRequest.ACTION, request);
         // Rendered by the same code that answers this node's own /_serverless/stats, so a node described
         // through a peer and a node described directly cannot disagree.

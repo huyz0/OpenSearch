@@ -103,21 +103,19 @@ public final class StatsHandler extends BaseRestHandler {
             // Off the calling thread. The fan-out blocks on peers, and Fanout runs the caller's share on
             // whichever thread called it, so doing this inline would block an HTTP worker for as long as
             // the slowest node takes to answer.
-            return channel -> serving.threadPool()
-                .executor(org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT)
-                .execute(() -> {
+            return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT).execute(() -> {
+                try {
+                    fleet(channel, serving, metadata, nodes);
+                } catch (Exception e) {
                     try {
-                        fleet(channel, serving, metadata, nodes);
-                    } catch (Exception e) {
-                        try {
-                            channel.sendResponse(
-                                IndexAdminHandler.error(channel, RestStatus.INTERNAL_SERVER_ERROR, "stats_failed", describeFailure(e))
-                            );
-                        } catch (Exception ignored) {
-                            // The channel is gone; there is nowhere left to report this.
-                        }
+                        channel.sendResponse(
+                            IndexAdminHandler.error(channel, RestStatus.INTERNAL_SERVER_ERROR, "stats_failed", describeFailure(e))
+                        );
+                    } catch (Exception ignored) {
+                        // The channel is gone; there is nowhere left to report this.
                     }
-                });
+                }
+            });
         }
         return channel -> {
             try (XContentBuilder builder = channel.newBuilder()) {
@@ -270,7 +268,8 @@ public final class StatsHandler extends BaseRestHandler {
     }
 
     /** One node's answer, or why there is not one. */
-    private record Answered(String nodeId, String name, String statistics, String reason) {}
+    private record Answered(String nodeId, String name, String statistics, String reason) {
+    }
 
     private static Answered ask(
         ServerlessNode serving,
@@ -325,71 +324,71 @@ public final class StatsHandler extends BaseRestHandler {
      */
     public static void describe(XContentBuilder builder, ServerlessNode serving, MetadataPlane metadata) throws IOException {
         {
-                builder.field("node", serving.localNode().getId());
-                builder.field("name", serving.localNode().getName());
+            builder.field("node", serving.localNode().getId());
+            builder.field("name", serving.localNode().getName());
 
-                // What it is serving, split the way the design splits it: a writer holds a shard-head and
-                // can accept writes, a reader holds a commit and cannot. Reporting one number for both
-                // would hide the distinction the whole architecture turns on.
-                final Set<ShardId> open = serving.reconciler().openShards();
-                final Set<ShardId> frozen = serving.reconciler().frozenShards();
-                // A frozen view is a reader the reconciler keeps in its reader set and leaves out of its
-                // open set, so "open minus readers" went to zero with one writer and one view open, and
-                // negative with two views and none. Counted directly instead: a writer is an open shard
-                // that is not a reader, and a reader is a reader that is not a view.
-                final Set<ShardId> readers = new java.util.HashSet<>(serving.reconciler().readerShards());
-                readers.removeAll(frozen);
-                long writers = 0;
-                for (ShardId shard : open) {
-                    if (readers.contains(shard) == false) {
-                        writers++;
-                    }
+            // What it is serving, split the way the design splits it: a writer holds a shard-head and
+            // can accept writes, a reader holds a commit and cannot. Reporting one number for both
+            // would hide the distinction the whole architecture turns on.
+            final Set<ShardId> open = serving.reconciler().openShards();
+            final Set<ShardId> frozen = serving.reconciler().frozenShards();
+            // A frozen view is a reader the reconciler keeps in its reader set and leaves out of its
+            // open set, so "open minus readers" went to zero with one writer and one view open, and
+            // negative with two views and none. Counted directly instead: a writer is an open shard
+            // that is not a reader, and a reader is a reader that is not a view.
+            final Set<ShardId> readers = new java.util.HashSet<>(serving.reconciler().readerShards());
+            readers.removeAll(frozen);
+            long writers = 0;
+            for (ShardId shard : open) {
+                if (readers.contains(shard) == false) {
+                    writers++;
                 }
-                builder.startObject("shards");
-                builder.field("open", open.size());
-                builder.field("readers", readers.size());
-                builder.field("writers", writers);
-                // Counted apart from both: a frozen view is a reader that no policy will take away, so
-                // folding it into the reader count would make a node look like it had readers it could
-                // shed.
-                builder.field("frozen_views", frozen.size());
+            }
+            builder.startObject("shards");
+            builder.field("open", open.size());
+            builder.field("readers", readers.size());
+            builder.field("writers", writers);
+            // Counted apart from both: a frozen view is a reader that no policy will take away, so
+            // folding it into the reader count would make a node look like it had readers it could
+            // shed.
+            builder.field("frozen_views", frozen.size());
+            builder.endObject();
+
+            builder.startArray("roles");
+            for (String role : serving.roles()) {
+                builder.value(role);
+            }
+            builder.endArray();
+
+            // The breakers, as core reports them. "limit" and "estimated" are the two numbers a
+            // refusal is decided from, so they are the two an operator needs to see it coming.
+            builder.startObject("breakers");
+            // From the service's own stats rather than by asking for breakers by name: the parent is
+            // not a child in the registry, so a hand-written list of names silently omitted the one
+            // that actually trips first. This is the same source _nodes/stats reads.
+            for (var breaker : serving.circuitBreakerService().stats().getAllStats()) {
+                builder.startObject(breaker.getName());
+                builder.field("limit_bytes", breaker.getLimit());
+                builder.field("estimated_bytes", breaker.getEstimated());
+                builder.field("tripped", breaker.getTrippedCount());
                 builder.endObject();
+            }
+            builder.endObject();
 
-                builder.startArray("roles");
-                for (String role : serving.roles()) {
-                    builder.value(role);
-                }
-                builder.endArray();
+            // In-flight writes, which the breakers do not cover: these are the bytes of the writes
+            // themselves rather than what computing an answer allocated.
+            final var pressure = serving.indexingPressure().stats();
+            builder.startObject("indexing_pressure");
+            builder.field("current_bytes", pressure.getCurrentCombinedCoordinatingAndPrimaryBytes());
+            builder.field("total_bytes", pressure.getTotalCombinedCoordinatingAndPrimaryBytes());
+            builder.field("rejections", pressure.getCoordinatingRejections());
+            builder.endObject();
 
-                // The breakers, as core reports them. "limit" and "estimated" are the two numbers a
-                // refusal is decided from, so they are the two an operator needs to see it coming.
-                builder.startObject("breakers");
-                // From the service's own stats rather than by asking for breakers by name: the parent is
-                // not a child in the registry, so a hand-written list of names silently omitted the one
-                // that actually trips first. This is the same source _nodes/stats reads.
-                for (var breaker : serving.circuitBreakerService().stats().getAllStats()) {
-                    builder.startObject(breaker.getName());
-                    builder.field("limit_bytes", breaker.getLimit());
-                    builder.field("estimated_bytes", breaker.getEstimated());
-                    builder.field("tripped", breaker.getTrippedCount());
-                    builder.endObject();
-                }
-                builder.endObject();
-
-                // In-flight writes, which the breakers do not cover: these are the bytes of the writes
-                // themselves rather than what computing an answer allocated.
-                final var pressure = serving.indexingPressure().stats();
-                builder.startObject("indexing_pressure");
-                builder.field("current_bytes", pressure.getCurrentCombinedCoordinatingAndPrimaryBytes());
-                builder.field("total_bytes", pressure.getTotalCombinedCoordinatingAndPrimaryBytes());
-                builder.field("rejections", pressure.getCoordinatingRejections());
-                builder.endObject();
-
-                objectStore(builder, metadata);
-                blockCache(builder, serving);
-                scheduler(builder, serving);
-                lease(builder, serving, metadata);
-                heldShards(builder, serving, readers, frozen);
+            objectStore(builder, metadata);
+            blockCache(builder, serving);
+            scheduler(builder, serving);
+            lease(builder, serving, metadata);
+            heldShards(builder, serving, readers, frozen);
         }
     }
 

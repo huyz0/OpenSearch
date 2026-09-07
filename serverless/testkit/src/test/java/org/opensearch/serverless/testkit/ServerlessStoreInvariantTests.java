@@ -225,10 +225,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         // test is about -- the same note as testAnUnreadableViewRecordStopsTheSweepRatherThanPinningNothing.
         final var pinned = gc.sweepShard(plane, "alpha", 0, blocked.candidates());
         assertFalse("a finished view pins it too: " + pinned.deleted(), pinned.deleted().contains("t=1/_z.cfs"));
-        assertTrue(
-            "and the bytes are still there",
-            store.blobContainer(plane.shardData("alpha", 0).add("t=1")).blobExists("_z.cfs")
-        );
+        assertTrue("and the bytes are still there", store.blobContainer(plane.shardData("alpha", 0).add("t=1")).blobExists("_z.cfs"));
 
         // Released -- and the grace restarts rather than the file becoming collectable at once. Being
         // named by a view took it off watch, so the sweep after the release only puts it back on, and the

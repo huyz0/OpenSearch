@@ -302,10 +302,7 @@ public final class ServerlessNode implements Closeable {
                 "serverless.wal.group_commit.max_records",
                 org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_RECORDS
             ),
-            settings.getAsLong(
-                "serverless.wal.group_commit.max_bytes",
-                org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES
-            )
+            settings.getAsLong("serverless.wal.group_commit.max_bytes", org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES)
         );
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
@@ -636,9 +633,7 @@ public final class ServerlessNode implements Closeable {
      */
     private
         java.util.Collection<
-            java.util.function.Function<
-                org.opensearch.index.IndexSettings,
-                java.util.Optional<org.opensearch.index.engine.EngineFactory>>>
+            java.util.function.Function<org.opensearch.index.IndexSettings, java.util.Optional<org.opensearch.index.engine.EngineFactory>>>
         engineFactoryProviders() {
         if (roles.contains(ROLE_INGEST)) {
             // Core's own writer engine, with one thing added: it knows this shard's history may continue
@@ -1359,12 +1354,13 @@ public final class ServerlessNode implements Closeable {
         );
         return new org.opensearch.transport.TransportInterceptor() {
             @Override
-            public <T extends org.opensearch.transport.TransportRequest> org.opensearch.transport.TransportRequestHandler<T> interceptHandler(
-                String action,
-                String executor,
-                boolean forceExecution,
-                org.opensearch.transport.TransportRequestHandler<T> actualHandler
-            ) {
+            public <
+                T extends org.opensearch.transport.TransportRequest> org.opensearch.transport.TransportRequestHandler<T> interceptHandler(
+                    String action,
+                    String executor,
+                    boolean forceExecution,
+                    org.opensearch.transport.TransportRequestHandler<T> actualHandler
+                ) {
                 return shell.interceptHandler(
                     action,
                     executor,

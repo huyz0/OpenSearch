@@ -279,9 +279,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 shaped = outcome.source();
             } catch (Exception e) {
                 final String reason = e.getMessage() == null ? e.toString() : e.getMessage();
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "pipeline_failed", reason)
-                );
+                return channel -> channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "pipeline_failed", reason));
             }
         }
         if (dropped) {
