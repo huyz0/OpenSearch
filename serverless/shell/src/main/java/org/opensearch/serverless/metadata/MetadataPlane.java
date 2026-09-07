@@ -71,6 +71,11 @@ public final class MetadataPlane {
     public MetadataPlane(BlobStore blobStore, BlobPath base, LongSupplier clock, long leaseTtlMillis) {
 
         this.descriptors = new DescriptorStore(blobStore.blobContainer(RegisterMap.indices(base)));
+        // Every change this node makes drops the name from its own routing cache, so a client that
+        // creates, rolls over or deletes and immediately writes sees its own change rather than a
+        // resolution from a moment ago. Announced by the store rather than at each call site, because
+        // there are eight of those and one forgetting is a stale route.
+        this.descriptors.onChanged(this::forgetRouting);
         final BlobLeaseMembership leases = new BlobLeaseMembership(
             blobStore.blobContainer(RegisterMap.members(base)),
             clock,
@@ -641,7 +646,7 @@ public final class MetadataPlane {
      * @throws IOException if a register cannot be read
      */
     public Optional<WriteTarget> writeTarget(String name) throws IOException {
-        final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+        final DescriptorStore.Resolution resolved = resolveForRouting(name);
         if (resolved.index() != null) {
             return Optional.of(new WriteTarget(resolved.index(), null));
         }
@@ -660,6 +665,93 @@ public final class MetadataPlane {
      */
     public DescriptorStore.Resolution resolve(String name) throws IOException {
         return descriptors.resolve(name);
+    }
+
+    /**
+     * How long a routing lookup may answer from a resolution it read earlier.
+     *
+     * <p>One second, which is the interval {@code SearchHandler} already probes membership on and is
+     * chosen to match it rather than independently. Both are the same trade: a fact that changes rarely,
+     * read on the critical path of every request, is worth serving from a snapshot that is at most this
+     * far behind.
+     */
+    public static final long DEFAULT_ROUTING_CACHE_MILLIS = 1_000L;
+
+    /** A resolution and when it was read. */
+    private record CachedResolution(DescriptorStore.Resolution resolution, long atMillis) {
+    }
+
+    private final Map<String, CachedResolution> routingCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile long routingCacheMillis = DEFAULT_ROUTING_CACHE_MILLIS;
+
+    /**
+     * Resolves a name for <em>routing</em>, which may be answered from a recent read.
+     *
+     * <p><b>Why this is separate from {@link #resolve} rather than replacing it.</b> A descriptor read was
+     * the whole object-store cost of a warm search and half the cost of a write -- one register GET per
+     * request per index named, for a fact that changes when an operator changes it. But most callers of
+     * {@code resolve} are <em>mutating</em>: they need the generation they read to hold a compare-and-swap
+     * together, and a generation from a second ago is a swap that will be refused or, worse, one that lands
+     * on a record it never saw. Those callers keep reading through. Only routing uses this.
+     *
+     * <p><b>What a stale answer can and cannot do.</b> It cannot misroute a write. A descriptor carries the
+     * index's uuid, and the uuid is checked again wherever the write actually lands: {@code place} matches
+     * an open shard on uuid as well as name, and a forwarded write is refused by {@code ShardRouter} when
+     * the uuid it carries is not the one the shard has. So a resolution left over from a deleted and
+     * recreated index produces "not held here" -- a refusal the caller retries, by which time the window
+     * has passed -- and never a write acknowledged into the previous incarnation. That check is what makes
+     * a bounded cache safe here where an unbounded one would not be.
+     *
+     * <p><b>A miss is never cached.</b> Create-then-write against a name this node has not seen reads
+     * through and finds it, so a new index is usable the instant it exists. What ages is only a name
+     * already in hand: a mapping or rollover reaching this node up to a second late, which is the window
+     * open shards already have for mapping changes, and a deleted index resolving for up to a second more.
+     *
+     * @param name the index or alias name
+     * @return what it names
+     * @throws IOException if the register cannot be read or parsed
+     */
+    public DescriptorStore.Resolution resolveForRouting(String name) throws IOException {
+        if (routingCacheMillis <= 0L) {
+            return resolve(name);
+        }
+        final long now = clock.getAsLong();
+        final CachedResolution seen = routingCache.get(name);
+        if (seen != null && now - seen.atMillis() <= routingCacheMillis) {
+            return seen.resolution();
+        }
+        final DescriptorStore.Resolution fresh = descriptors.resolve(name);
+        if (fresh.absent()) {
+            routingCache.remove(name);
+        } else {
+            routingCache.put(name, new CachedResolution(fresh, now));
+        }
+        return fresh;
+    }
+
+    /**
+     * Drops a name from the routing cache, so a change this node just made is visible to its own next
+     * request rather than a window later.
+     *
+     * <p>Only this node's cache: another node's ages out on its own. That asymmetry is deliberate and is
+     * what keeps read-your-writes true where a client is most likely to notice it, which is against the
+     * node it just wrote to.
+     *
+     * @param name the index or alias name
+     */
+    public void forgetRouting(String name) {
+        routingCache.remove(name);
+    }
+
+    /**
+     * Sets how long a routing lookup may serve an earlier read; zero reads through every time.
+     *
+     * @param millis the window
+     * @return this, for chaining
+     */
+    public MetadataPlane setRoutingCacheMillis(long millis) {
+        this.routingCacheMillis = Math.max(0L, millis);
+        return this;
     }
 
     /**
