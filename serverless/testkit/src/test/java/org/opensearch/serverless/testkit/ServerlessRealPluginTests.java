@@ -217,7 +217,9 @@ public class ServerlessRealPluginTests extends OpenSearchTestCase {
         assumeTrue("this test needs the assembled plugin zips; run it through Gradle", dists != null);
 
         int installed = 0;
-        for (String dist : dists.split(java.io.File.pathSeparator)) {
+        // The platform's path separator without naming java.io.File: the property carries the same value
+        // that constant is initialised from, and this is a list of paths joined by Gradle, not a file.
+        for (String dist : dists.split(java.util.regex.Pattern.quote(System.getProperty("path.separator")))) {
             final Path distributions = Path.of(dist);
             assumeTrue("no distributions directory at " + distributions, Files.isDirectory(distributions));
             final Path zip;

@@ -10,6 +10,7 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.io.PathUtils;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
@@ -18,7 +19,6 @@ import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -102,11 +102,11 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
 
     /** {@code /proc/self/fd} is Linux-only; every other platform's equivalent is not a directory listing. */
     private static boolean fileDescriptorCountingIsAvailable() {
-        return Files.isDirectory(Paths.get("/proc/self/fd"));
+        return Files.isDirectory(PathUtils.get("/proc/self/fd"));
     }
 
     private static long openFileDescriptorCount() throws Exception {
-        try (var listing = Files.list(Paths.get("/proc/self/fd"))) {
+        try (var listing = Files.list(PathUtils.get("/proc/self/fd"))) {
             return listing.count();
         }
     }
