@@ -287,6 +287,40 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
     }
 
     /**
+     * A freeze in progress is not a view a caller can find, search or release.
+     *
+     * <p>The marker a freeze writes has to be visible to the sweeps — that is its whole job — but it must
+     * not be visible as a <em>view</em>. It names no shard, and "every shard answered" is trivially true
+     * of no shards, so a search against it would report zero hits with {@code "complete": true}: a wrong
+     * answer, not a missing one. Its id is not the caller's yet either, since the freeze has not returned.
+     *
+     * <p>So the sweeps see it and the request paths do not: looking it up by id answers absent, and it is
+     * neither listed nor picked up by a release of {@code _all} — which would otherwise drop the pin
+     * holding the commits the freeze is reading, and then be undone when the freeze wrote its record back
+     * under the same id.
+     */
+    public void testAFreezeInProgressIsNotYetAViewAnybodyCanUse() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = planeOver(store, clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        final String pitId = UUIDs.randomBase64UUID();
+        plane.beginPointInTime(new PointInTime(pitId, "alpha", "uuid-alpha-00000000", clock.get() + 600_000L, Map.of(), true));
+
+        // The sweeps must see it -- that is what livePointsInTime is for -- and a request must not.
+        assertEquals("the sweeps still see it", 1, plane.livePointsInTime(clock.get()).size());
+        assertTrue("but it is capturing", plane.livePointsInTime(clock.get()).get(0).isCapturing());
+        assertTrue("and looking it up by id answers absent", plane.pointInTime(pitId).isEmpty());
+
+        // Once the freeze finishes it is an ordinary view by every route.
+        final CommitManifest frozen = new CommitManifest(1L, Map.of("_0.cfs", "t=1"));
+        plane.finishPointInTime(new PointInTime(pitId, "alpha", "uuid-alpha-00000000", clock.get() + 600_000L, Map.of(0, frozen)));
+        assertTrue("a finished view is found by id", plane.pointInTime(pitId).isPresent());
+        assertFalse("and is not capturing", plane.pointInTime(pitId).get().isCapturing());
+    }
+
+    /**
      * A view record the plane cannot read stops the sweep rather than pinning nothing.
      *
      * <p>The plane stands in for such a record with a placeholder that names no shards, and "treated as

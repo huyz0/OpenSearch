@@ -819,7 +819,14 @@ public final class MetadataPlane {
             return java.util.Optional.empty();
         }
         try (java.io.InputStream in = container.readBlob(id)) {
-            return java.util.Optional.of(PointInTime.fromStream(in));
+            final PointInTime read = PointInTime.fromStream(in);
+            if (read.isCapturing()) {
+                // A freeze that has not finished is not a view yet: it names no shard, and a search
+                // against it would find nothing and report the nothing as a complete answer, because
+                // "every shard answered" is trivially true of no shards. Absent until it is real.
+                return java.util.Optional.empty();
+            }
+            return java.util.Optional.of(read);
         } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
             // Released between the check and the read, which is ordinary rather than exceptional.
             return java.util.Optional.empty();
