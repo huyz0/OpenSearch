@@ -39,7 +39,11 @@ acknowledged but not yet published when the operation starts is not touched by i
 plain `search_after` export of matching ids would have. Routing is resolved
 once per request, so a multi-get's object-store cost is the shards it touches and not the documents it asks
 for: ten documents cost 4 requests and twenty cost 4, against 30 for the same ten fetched one at a time. A write is durable in a write-ahead log before it is
-acknowledged, and replayed by a successor. **A writer that has lost its shard but not yet noticed is fenced
+acknowledged, and replayed by a successor. **A single write no longer costs an object-store PUT of its
+own**: concurrent writes to one shard share the PUT already in flight for it, so a shard's write cost is
+set by the store's write latency rather than by its write rate — 96 documents from 16 writers cost 12 PUTs
+against MinIO where one writer pays 96. Nothing is acknowledged before the blob carrying it lands, so the
+durability contract is the one it was. **A writer that has lost its shard but not yet noticed is fenced
 out of that log**: it refuses to write past the lease deadline it last published for itself, which needs no
 I/O and so is checked on every write; and a successor seals the log at takeover, durably, so nothing
 appended after ownership moved is ever replayed — by that successor or by any node after it
@@ -484,9 +488,59 @@ first condition depends on, which is bypassable on its fast path and saved by th
 compare-and-swap; that a pipeline cannot run stale, because the marker register is read fresh on every
 lookup; and that a conditional write keeps its meaning across a forward, conflict included.
 
+## What an object-store cost audit found
+
+A deliberate pass over every `put`, `list` and `get` this shell issues, asking of each whether it is the
+minimum that preserves correctness. Two independent reviews of the audit followed, and **both corrected it
+in ways worth recording, because the corrections are more instructive than the findings**.
+
+| Finding | Class | Where |
+| --- | --- | --- |
+| A single write cost one PUT; concurrent writes now share one | cost, the dominant term | `WalGroupCommitter` |
+| A seal deleted a concurrently-written seal it never merged, widening a replay cutoff | data loss | `WalStore#sealAt` |
+| A zombie's records under a dead term were reclaimed once and then never | storage leak | `WalStore#onPublished` |
+| A descriptor was read from the store on every write, get and search | cost, per request | `MetadataPlane#resolveForRouting` |
+| Deletes were issued one blob at a time where the container batches a thousand | cost | `ShardHeadStore`, `DescriptorStore` |
+| A sweep read one index's descriptor once per shard rather than once per index | cost | `GarbageCollector` |
+| Two cost assertions had been failing since the rebase, unnoticed because `s3Test` skips without an endpoint | stale test | `ServerlessCostTests` |
+
+**The write path is priced by the store's latency now, not by the write rate.** Group commit batches only
+what arrives while a PUT for that shard is already in flight — no timer, so a quiet shard pays exactly what
+it paid before and a busy one stops paying per document. Measured: 3.3 documents per PUT on a filesystem,
+8.0 against MinIO, and a remote bucket has longer round trips than loopback so 8.0 is a floor.
+
+**Two of the three correctness findings came out of fixing something else.** The seal bug was found by an
+adversarial reviewer arguing the *opposite* case — that taking the supersede set from a pre-write listing
+would delete an unmerged seal. It is the post-write listing that can, which is what the code did. The WAL
+leak was found by digging into one of the two stale cost tests rather than simply re-baselining it.
+
+**What the reviews corrected, which is the part worth keeping.** The audit claimed two in-memory generation
+memos bought nothing on S3, because the container's compare-and-swap re-reads anyway; they save one request
+of three, and a test already pinned it. It ranked the read-then-CAS cost first when that path carries no
+per-request traffic at all, and listed a method with no production callers among its hot costs. It proposed
+a descriptor cache whose invalidation could not fire for the names a coordinator actually caches, and a
+replacement for the head scan that would have let a node resume acknowledging on the strength of an absent
+notification. **Ranking by "looks redundant" is what produced those; ranking by what a cost scales with —
+requests, shards, indices, nodes, bytes — is what corrected them.**
+
+**Two costs that scale with load rather than with the deployment, and only one is fixed.** A descriptor
+read is gone from the request path, answered from a read taken within the last second; a stale answer
+cannot misroute a write, because the uuid is checked again where the write lands and a mismatch is a
+retryable refusal. The per-shard head scan is the other, and it is **not** fixed: it can be put on an
+interval, and that is built, measured and off by default, because the saving is bought with
+ownership-detection latency and three existing tests encode the current bargain as a guarantee. Making it
+genuinely flat needs a signal carrying evidence of ownership; a revocation marker is not written atomically
+with the swap that moves ownership, so its absence proves nothing. `RegisterMap#assignments` already says
+exactly that about the listing it maintains.
+
+**Still open, in the order the cost model ranks them:** the per-shard head poll above; membership refresh,
+which reads one register per member per node and is therefore quadratic in fleet size; block reads, which
+fetch one 64 KB range per miss with no coalescing, so a cold 100 MB segment costs about 1,600 requests; and
+the sweeps that walk the whole population — tombstones, points in time, snapshots — on a slow cadence.
+
 ## How it is tested
 
-560 tests in `:serverless:testkit:test`, plus `pluginTest` (a real plugin installed from its
+574 tests in `:serverless:testkit:test` and 37 in `s3Test`, plus `pluginTest` (a real plugin installed from its
 assembled zip), `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off)
 and `s3Test` (against live MinIO and SeaweedFS endpoints, which assume-skips with no endpoint
 reachable).

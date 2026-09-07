@@ -47,9 +47,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * cycle elapsed and the record was applied and committed. Replaying a few extra records costs nothing
  * because replay is idempotent — see {@link WalRecord}.
  *
- * <p><b>One blob per append, and an append may be a batch.</b> A single write still costs one PUT; a
- * bulk request landing on one shard costs one PUT for the whole batch rather than one per document.
- * See {@link #append(long, List)} for the container format and why an older writer's log still reads.
+ * <p><b>One blob per append, and an append may be a batch.</b> A bulk request landing on one shard costs
+ * one PUT for the whole batch rather than one per document. See {@link #append(long, List)} for the
+ * container format and why an older writer's log still reads.
+ *
+ * <p><b>A single write no longer costs a PUT of its own either.</b> This paragraph used to say it did,
+ * and {@link WalGroupCommitter} is what changed it: concurrent writes to one shard share the PUT that is
+ * already in flight for it, so what a document costs is set by the store's write latency rather than by
+ * the write rate. Nothing about the format or the ordering here changes -- a group is one append of a
+ * list, which is the call this class already had.
  */
 public final class WalStore {
 
