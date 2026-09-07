@@ -1229,6 +1229,14 @@ public final class ShardOperations {
 
         // A frozen view, exactly as _pit takes one -- see the class javadoc for why the query is decided
         // once rather than re-evaluated as the walk goes.
+        // The capture marker before the first manifest read, so the commits this is about to freeze
+        // cannot be swept while it is reading them. See PointInTime#isCapturing.
+        final String pitId = org.opensearch.common.UUIDs.randomBase64UUID();
+        final long expiresAt = plane.clock().getAsLong() + DELETE_BY_QUERY_KEEP_ALIVE_MILLIS;
+        plane.beginPointInTime(
+            new org.opensearch.serverless.metadata.PointInTime(pitId, index, descriptor.uuid(), expiresAt, java.util.Map.of(), true)
+        );
+
         final java.util.Map<Integer, org.opensearch.serverless.store.CommitManifest> shards = new java.util.LinkedHashMap<>();
         for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
             final var manifest = plane.segmentPublisher(index, descriptor.uuid(), shard).readManifest();
@@ -1240,16 +1248,13 @@ public final class ShardOperations {
             shards.put(shard, manifest.get());
         }
         if (shards.isEmpty()) {
+            // Nothing to freeze, so the marker must not be left pinning the index's sweep.
+            plane.releasePointInTime(pitId);
             return new DeleteByQueryOutcome(0, 0);
         }
 
-        final var pit = new org.opensearch.serverless.metadata.PointInTime(
-            org.opensearch.common.UUIDs.randomBase64UUID(),
-            index,
-            plane.clock().getAsLong() + DELETE_BY_QUERY_KEEP_ALIVE_MILLIS,
-            shards
-        );
-        plane.createPointInTime(pit);
+        final var pit = new org.opensearch.serverless.metadata.PointInTime(pitId, index, descriptor.uuid(), expiresAt, shards);
+        plane.finishPointInTime(pit);
         try {
             long visited = 0;
             long deleted = 0;
