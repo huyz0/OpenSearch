@@ -8,11 +8,11 @@
 
 package org.opensearch.serverless.rest;
 
+import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
-import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.AliasRecord;

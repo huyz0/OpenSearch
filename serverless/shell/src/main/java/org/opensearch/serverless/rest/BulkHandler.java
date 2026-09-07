@@ -334,8 +334,7 @@ public final class BulkHandler extends BaseRestHandler {
                         pipeline = serving.ingestPipelines().compile(id, stored.get());
                         compiled.put(id, pipeline);
                     }
-                    final var outcome = serving.ingestPipelines()
-                        .run(pipeline, item.index, item.operation.id(), item.operation.source());
+                    final var outcome = serving.ingestPipelines().run(pipeline, item.index, item.operation.id(), item.operation.source());
                     if (outcome.dropped()) {
                         // A drop ends the document, so a final pipeline does not run over one that is not
                         // going to be written. Core does the same.

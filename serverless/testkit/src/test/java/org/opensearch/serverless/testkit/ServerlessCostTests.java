@@ -490,11 +490,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 // stops mattering. The old fs expectation was measuring the filesystem's directory
                 // semantics; there is no longer a listing for those semantics to show up in.
                 assertTrue("the reclaiming publish must list at least once per dead term: " + reclaiming, reclaiming >= deadTerms);
-                assertEquals(
-                    "on " + label + ", a publish after the dead terms were reclaimed must not walk them again",
-                    0,
-                    afterwards
-                );
+                assertEquals("on " + label + ", a publish after the dead terms were reclaimed must not walk them again", 0, afterwards);
             }
         }
     }
