@@ -128,7 +128,6 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiFunction;
 import java.util.function.Function;
-import java.util.function.LongSupplier;
 
 import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
 import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
@@ -1021,26 +1020,6 @@ public abstract class Engine implements LifecycleAware, Closeable {
                 engineConfig.getIndexSettings().getTranslogRetentionTotalFiles()
             )
         );
-    }
-
-    /**
-     * The floor {@link CombinedDeletionPolicy} uses to decide which local Lucene commits are safe
-     * to delete: a commit whose max seq-no is at or below this value is eligible for deletion.
-     * Defaults to the translog's own last-synced global checkpoint -- unchanged from every
-     * engine's behavior before this method existed, since that is exactly what {@link
-     * InternalEngine} always passed directly before this hook was introduced.
-     *
-     * <p>Overriding this is for an engine whose durability model does not depend on the classic
-     * global-checkpoint/retention-lease chain (for example, one that treats an independent,
-     * already-durable remote store as authoritative and can safely retain less locally than a
-     * replica-recovery-oriented global checkpoint alone would justify). Widening the returned
-     * value only ever permits deleting <em>more</em> than the default would -- it can never keep a
-     * commit that core's own logic would otherwise have deleted, since {@link
-     * CombinedDeletionPolicy} always uses this value as a pure "safe to delete at or below"
-     * threshold, never as a floor that suppresses deletion.
-     */
-    protected LongSupplier globalCheckpointSupplierForCombinedDeletionPolicy(TranslogManager translogManagerRef) {
-        return translogManagerRef::getLastSyncedGlobalCheckpoint;
     }
 
     protected void fillSegmentStats(SegmentReader segmentReader, boolean includeSegmentFileSizes, SegmentsStats stats) {

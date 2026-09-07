@@ -384,7 +384,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 ## Decisions a reader should know about
 
-- **`server/` is no longer untouched, and the exact extent is six files and 408 lines** -- the
+- **`server/` is no longer untouched, and the exact extent is six files and 364 lines** -- the
   object-store compare-and-swap register, and the pair of engine hooks that replay the write-ahead
   log during recovery. See [`README.md`](README.md) for the file-by-file account. The direction rule
   still holds and is still a build task: no file under `server/` may reference
@@ -421,7 +421,7 @@ and `s3Test` (against live MinIO and SeaweedFS endpoints, which assume-skips wit
 reachable).
 
 Core's own suite passes on this base too: `:server:test` is 20,643 tests, 0 failures. That matters
-here because the 408 lines this branch adds to `server/` are additive, and this is the evidence
+here because the 364 lines this branch adds to `server/` are additive, and this is the evidence
 rather than the assumption.
 
 Both dependency-direction rules are enforced as build tasks:
