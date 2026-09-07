@@ -243,6 +243,16 @@ public final class GarbageCollector {
             }
         }
 
+        for (PointInTime pit : views) {
+            // A freeze that has named this index and not yet read its manifests. Which commit it will
+            // record is not known until it has, so every file of this shard may be one it is about to
+            // name. The same rule the snapshot capture below gets, and for the same reason -- see
+            // PointInTime#isCapturing for the window it closes.
+            if (pit.isCapturing() && pit.pins(indexName, null)) {
+                return new ShardSweep(List.of(), previousCandidates == null ? Set.of() : Set.copyOf(previousCandidates));
+            }
+        }
+
         final SegmentPublisher publisher = plane.segmentPublisher(indexName, shardId);
         final Optional<CommitManifest> manifest = publisher.readManifest();
         if (manifest.isEmpty()) {

@@ -155,6 +155,96 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
     }
 
     /**
+     * A freeze in progress stops the sweep, so the commit it is about to freeze cannot be swept first.
+     *
+     * <p><b>The window.</b> Freezing reads one manifest per shard and only then writes the record. Until
+     * that write, the collector has no idea a view is being taken: files the first shards froze can stop
+     * being referenced — the writer publishes again — and be deleted before the record naming them
+     * exists. The wall-clock floor on unreferenced blobs makes a <em>short</em> freeze safe and only a
+     * short one. At {@code IndexDescriptor.MAX_SHARDS} the manifest reads alone pass the default floor at
+     * any per-read latency over about fifteen milliseconds, which an object store under load exceeds
+     * easily.
+     *
+     * <p>Snapshots already had the guard — an index named by a capture that has not recorded its commits
+     * sweeps nothing. Points in time did not, and now do: the freeze writes a marker naming the index and
+     * holding no shards before it reads anything, and replaces it under the same id when it is done.
+     *
+     * <p>The blob here is one a sweep would otherwise take: unreferenced by the live commit, in a dead
+     * term, and already a candidate from a previous pass with its grace elapsed.
+     */
+    public void testAFreezeInProgressStopsTheSweepThatWouldOutrunIt() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final BlobPath base = BlobPath.cleanPath();
+        final MetadataPlane plane = planeOver(store, clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        // Published at term 2, with a file left behind under term 1 that the live commit does not name.
+        final BlobContainer shard = store.blobContainer(plane.shardData("alpha", 0));
+        shard.compareAndSwapRegister(
+            SegmentPublisher.MANIFEST,
+            BlobRegister.ABSENT_GENERATION,
+            new CommitManifest(2L, Map.of("_0.cfs", "t=2")).toBytes()
+        );
+        write(store.blobContainer(plane.shardData("alpha", 0).add("t=2")), "_0.cfs", "live");
+        write(store.blobContainer(plane.shardData("alpha", 0).add("t=1")), "_z.cfs", "about to be frozen");
+
+        final GarbageCollector gc = new GarbageCollector(store, base);
+
+        // One pass to put it on watch, then past the grace, so the next pass would delete it outright.
+        // An empty set rather than null: null means "delete on first sight", which is the operator's
+        // sweep, and this test is about the graced one a schedule runs.
+        final Set<String> watched = gc.sweepShard(plane, "alpha", 0, Set.of()).candidates();
+        assertTrue("the blob must be a candidate for this test to mean anything: " + watched, watched.contains("t=1/_z.cfs"));
+        clock.addAndGet(GarbageCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS + 1);
+
+        // A freeze begins: the marker names the index and holds nothing yet.
+        final String pitId = UUIDs.randomBase64UUID();
+        plane.beginPointInTime(new PointInTime(pitId, "alpha", "uuid-alpha-00000000", clock.get() + 600_000L, Map.of(), true));
+
+        final var blocked = gc.sweepShard(plane, "alpha", 0, watched);
+        assertTrue("nothing may go while a freeze is reading manifests: " + blocked.deleted(), blocked.deleted().isEmpty());
+        assertTrue(
+            "and the file the freeze is about to name must still be there",
+            store.blobContainer(plane.shardData("alpha", 0).add("t=1")).blobExists("_z.cfs")
+        );
+        assertTrue("what was on watch stays on watch", blocked.candidates().contains("t=1/_z.cfs"));
+
+        // The freeze finishes, naming that very file. It stays pinned for the ordinary reason now.
+        plane.finishPointInTime(
+            new PointInTime(
+                pitId,
+                "alpha",
+                "uuid-alpha-00000000",
+                clock.get() + 600_000L,
+                Map.of(0, new CommitManifest(1L, Map.of("_z.cfs", "t=1")))
+            )
+        );
+        // Asserted about this blob rather than about an empty list: ExtrasFS drops its own file into these
+        // directories, and it is a genuine orphan the sweep is right to take. Its arrival is not what this
+        // test is about -- the same note as testAnUnreadableViewRecordStopsTheSweepRatherThanPinningNothing.
+        final var pinned = gc.sweepShard(plane, "alpha", 0, blocked.candidates());
+        assertFalse("a finished view pins it too: " + pinned.deleted(), pinned.deleted().contains("t=1/_z.cfs"));
+        assertTrue(
+            "and the bytes are still there",
+            store.blobContainer(plane.shardData("alpha", 0).add("t=1")).blobExists("_z.cfs")
+        );
+
+        // Released -- and the grace restarts rather than the file becoming collectable at once. Being
+        // named by a view took it off watch, so the sweep after the release only puts it back on, and the
+        // one after that takes it. That is the collector's own rule and it is worth pinning here: a pin
+        // dropped a moment ago must not be a pin that never protected anything.
+        assertTrue(plane.releasePointInTime(pitId));
+        final var rearmed = gc.sweepShard(plane, "alpha", 0, pinned.candidates());
+        assertFalse("the sweep straight after a release only re-arms the watch", rearmed.deleted().contains("t=1/_z.cfs"));
+        assertTrue("and it is on watch again", rearmed.candidates().contains("t=1/_z.cfs"));
+
+        final List<String> swept = new java.util.ArrayList<>(gc.sweepShard(plane, "alpha", 0, rearmed.candidates()).deleted());
+        swept.removeIf(name -> name.endsWith("/extra0"));
+        assertEquals("once nothing names it, it goes", List.of("t=1/_z.cfs"), swept);
+    }
+
+    /**
      * A view record the plane cannot read stops the sweep rather than pinning nothing.
      *
      * <p>The plane stands in for such a record with a placeholder that names no shards, and "treated as

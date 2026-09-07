@@ -271,6 +271,13 @@ public final class PointInTimeHandler extends BaseRestHandler {
         }
         final Optional<IndexDescriptor> descriptor = Optional.of(resolved.index());
 
+        // The capture marker first, before a single manifest is read: from here the collector deletes
+        // nothing for this index, so the commit each shard is about to be frozen at cannot be swept out
+        // from under the freeze. See PointInTime#isCapturing.
+        final String pitId = UUIDs.randomBase64UUID();
+        final long now = metadata.clock().getAsLong();
+        metadata.beginPointInTime(new PointInTime(pitId, index, descriptor.get().uuid(), now + keepAlive, Map.of(), true));
+
         final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
         for (int shard = 0; shard < descriptor.get().numberOfShards(); shard++) {
             final var manifest = metadata.segmentPublisher(index, descriptor.get().uuid(), shard).readManifest();
@@ -278,6 +285,9 @@ public final class PointInTimeHandler extends BaseRestHandler {
                 // A shard with nothing published cannot be frozen, and freezing the rest would give a view
                 // that silently covers part of the index -- which is exactly what the coverage numbers on a
                 // search exist to make impossible.
+                // The capture marker goes with the refusal. Left behind it would pin this index's sweep
+                // for the whole keep-alive the caller asked for, on a request that froze nothing.
+                metadata.releasePointInTime(pitId);
                 channel.sendResponse(
                     IndexAdminHandler.error(
                         channel,
@@ -291,13 +301,12 @@ public final class PointInTimeHandler extends BaseRestHandler {
             shards.put(shard, manifest.get());
         }
 
-        final long now = metadata.clock().getAsLong();
         // With the index's uuid: a view of "logs" must not outlive a delete-and-recreate of the name, or its
         // manifest would be looked up under the new index's bytes and served as frozen.
-        final PointInTime pit = new PointInTime(UUIDs.randomBase64UUID(), index, descriptor.get().uuid(), now + keepAlive, shards);
-        // Written before it is answered with, because the collector reads these and a view nobody had
-        // recorded would be a promise the sweep never heard.
-        metadata.createPointInTime(pit);
+        final PointInTime pit = new PointInTime(pitId, index, descriptor.get().uuid(), now + keepAlive, shards);
+        // Replaces the capture marker written above, under the same id, so the index is pinned without a
+        // gap from before the first manifest read to after the last.
+        metadata.finishPointInTime(pit);
 
         // Core's CreatePitResponse shape -- pit_id, a broadcast _shards header, creation_time -- with the
         // index and the deadline this shell's own callers read after it. Every shard is in the view or the

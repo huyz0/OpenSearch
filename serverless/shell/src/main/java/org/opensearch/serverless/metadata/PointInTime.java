@@ -61,6 +61,8 @@ public final class PointInTime {
     private final String indexUuid;
     private final long expiresAtMillis;
     private final Map<Integer, CommitManifest> shards;
+    /** Whether this is a freeze that has begun and not finished; see {@link #isCapturing}. */
+    private final boolean capturing;
 
     /**
      * Creates a record that names its index by name only.
@@ -87,11 +89,33 @@ public final class PointInTime {
      * @param shards each shard's commit at the moment it was taken
      */
     public PointInTime(String id, String index, String indexUuid, long expiresAtMillis, Map<Integer, CommitManifest> shards) {
+        this(id, index, indexUuid, expiresAtMillis, shards, false);
+    }
+
+    /**
+     * Creates a record, saying whether it is a finished view or a capture in progress.
+     *
+     * @param id the identifier
+     * @param index the index frozen
+     * @param indexUuid the incarnation frozen, or null for a record written before uuids were recorded
+     * @param expiresAtMillis when it stops being honoured, in the plane's clock
+     * @param shards each shard's commit at the moment it was taken; empty only while capturing
+     * @param capturing whether this marks a freeze that has begun and not finished
+     */
+    public PointInTime(
+        String id,
+        String index,
+        String indexUuid,
+        long expiresAtMillis,
+        Map<Integer, CommitManifest> shards,
+        boolean capturing
+    ) {
         this.id = id;
         this.index = index;
         this.indexUuid = indexUuid;
         this.expiresAtMillis = expiresAtMillis;
         this.shards = Map.copyOf(shards);
+        this.capturing = capturing;
     }
 
     /**
@@ -176,6 +200,36 @@ public final class PointInTime {
     }
 
     /**
+     * Reports whether this record marks a freeze that has begun and not yet finished.
+     *
+     * <p><b>Why this exists.</b> Freezing reads one manifest per shard and only then writes the record.
+     * Between the first read and that write, the collector has no idea a view is being taken: the files
+     * shard 0 froze can stop being referenced by the live commit — the writer publishes again — and be
+     * swept before the record naming them exists. The wall-clock floor on unreferenced blobs makes a
+     * short freeze safe, and only a short one: at {@code IndexDescriptor.MAX_SHARDS} the manifest reads
+     * alone exceed the default floor at any per-read latency above about fifteen milliseconds, which is
+     * ordinary for an object store under load.
+     *
+     * <p>So a freeze writes this record <em>first</em>, naming its index and holding no shards, and
+     * overwrites it with the real one once every manifest is read. The collector deletes nothing for an
+     * index one of these names, exactly as it already does for a snapshot capture that has named an index
+     * and not yet recorded its commits — {@code GarbageCollector#capturing}. This is that same guard,
+     * which points in time did not have.
+     *
+     * <p>A finished view always holds at least one shard: both callers refuse to record one that covers
+     * no shard at all. So "names an index and holds nothing" is unambiguous, and is distinct from
+     * {@link #isPlaceholder}, which names no index.
+     *
+     * <p>An abandoned capture — the node died mid-freeze — pins its index until the record expires, which
+     * the reaper enforces. Bounded, and the same exposure a snapshot capture already has.
+     *
+     * @return true if this is a freeze in progress rather than a finished view
+     */
+    public boolean isCapturing() {
+        return capturing;
+    }
+
+    /**
      * Reports whether this view holds files of the given index.
      *
      * <p>By uuid when both sides know one, by name otherwise. A view taken over an index that has since
@@ -244,6 +298,10 @@ public final class PointInTime {
                 builder.field("index_uuid", indexUuid);
             }
             builder.field("expires_at", expiresAtMillis);
+            if (capturing) {
+                // Only on a capture marker, so an ordinary view's bytes are byte-for-byte what they were.
+                builder.field("capturing", true);
+            }
             builder.startArray("shards");
             for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
                 builder.startObject();
@@ -315,7 +373,10 @@ public final class PointInTime {
                     );
                 }
             }
-            if (shards.isEmpty()) {
+            final boolean capturing = Boolean.parseBoolean(String.valueOf(body.get("capturing")));
+            if (shards.isEmpty() && capturing == false) {
+                // A finished view that froze nothing is malformed, and stays so. A capture marker is the
+                // one record that legitimately holds none: it is written before the manifests are read.
                 throw new IOException("malformed point in time: it froze no shards");
             }
             return new PointInTime(
@@ -323,7 +384,8 @@ public final class PointInTime {
                 index.toString(),
                 indexUuid == null ? null : indexUuid.toString(),
                 Long.parseLong(String.valueOf(expiresAt)),
-                shards
+                shards,
+                capturing
             );
         }
     }
@@ -373,6 +435,9 @@ public final class PointInTime {
         }
         this.shards = Map.copyOf(read);
         this.indexUuid = in.readOptionalString();
+        // Never on the wire: a capture marker is not forwarded anywhere. Only a finished view is sent, to
+        // open a frozen shard of it, and one that arrived mid-capture would name no shard to open.
+        this.capturing = false;
     }
 
     /**
