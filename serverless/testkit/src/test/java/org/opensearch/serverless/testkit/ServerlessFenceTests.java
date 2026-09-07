@@ -376,8 +376,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             }
             final byte[] body = "1 00000000000000000001\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
             try {
-                sealsContainer.get()
-                    .writeBlob("seal-00000000000000000005", new java.io.ByteArrayInputStream(body), body.length, false);
+                sealsContainer.get().writeBlob("seal-00000000000000000005", new java.io.ByteArrayInputStream(body), body.length, false);
             } catch (IOException e) {
                 throw new AssertionError("the intruding sealer could not write its seal", e);
             }
@@ -458,11 +457,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         latched.append(1L, List.of(new WalRecord("zombie", "{\"msg\":\"zombie\"}")));
         assertEquals(1, recordsUnderTerm(store, shardBase, 1L));
         latched.onPublished(2L);
-        assertEquals(
-            "with no re-scan the zombie's record is never collected -- the leak",
-            1,
-            recordsUnderTerm(store, shardBase, 1L)
-        );
+        assertEquals("with no re-scan the zombie's record is never collected -- the leak", 1, recordsUnderTerm(store, shardBase, 1L));
 
         // The same sequence on one instance that does re-scan, and it has to be one instance across both
         // publishes: a *fresh* store drops on its first publish whatever the interval says, because the

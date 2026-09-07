@@ -23,8 +23,8 @@ import org.opensearch.serverless.store.WalStore;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.io.InputStream;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;

@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.rest;
 
-import org.opensearch.cluster.routing.Murmur3HashFunction;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 
 /**
