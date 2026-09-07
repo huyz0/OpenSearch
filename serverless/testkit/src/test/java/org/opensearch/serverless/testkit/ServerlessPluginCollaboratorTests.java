@@ -30,8 +30,10 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -208,17 +210,33 @@ public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
         // The three deliberate exceptions, each of which touches no cluster state.
         final List<String> honest = List.of("resolveDateMathExpression", "isSystemIndexAccessAllowed", "getExpressionResolvers");
 
+        // What the shell's resolver actually declares, as opposed to what it inherits. Read from
+        // getMethods() filtered by declaring class rather than from getDeclaredMethods(), which the
+        // forbidden-apis policy refuses: the two agree exactly here, because an override cannot reduce
+        // visibility, so every override of a public method is itself public and appears in getMethods().
+        //
+        // The distinction this test is built on survives the rewrite, and it is the only thing that
+        // matters. A method merely *inherited* from core is declared by core, so it is absent from this
+        // set and reported as missing -- which is the whole point. Asking getMethod() instead would have
+        // found the inherited method and quietly reported nothing wrong.
+        final Set<String> overridden = new HashSet<>();
+        for (Method declared : RefusingIndexNameExpressionResolver.class.getMethods()) {
+            if (declared.getDeclaringClass() == RefusingIndexNameExpressionResolver.class) {
+                overridden.add(signatureOf(declared));
+            }
+        }
+
         final List<String> missing = new ArrayList<>();
-        for (Method method : IndexNameExpressionResolver.class.getDeclaredMethods()) {
-            if (Modifier.isPublic(method.getModifiers()) == false || Modifier.isStatic(method.getModifiers())) {
+        for (Method method : IndexNameExpressionResolver.class.getMethods()) {
+            // getMethods() reaches inherited methods too -- Object's among them -- and core's own
+            // declarations are the only ones this test speaks for.
+            if (method.getDeclaringClass() != IndexNameExpressionResolver.class || Modifier.isStatic(method.getModifiers())) {
                 continue;
             }
             if (honest.contains(method.getName())) {
                 continue;
             }
-            try {
-                RefusingIndexNameExpressionResolver.class.getDeclaredMethod(method.getName(), method.getParameterTypes());
-            } catch (NoSuchMethodException e) {
+            if (overridden.contains(signatureOf(method)) == false) {
                 missing.add(method.toString());
             }
         }
@@ -228,5 +246,14 @@ public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
                 + missing,
             missing.isEmpty()
         );
+    }
+
+    /** A method's name and parameter types, which is what "the same method" means for an override. */
+    private static String signatureOf(Method method) {
+        final StringBuilder signature = new StringBuilder(method.getName());
+        for (Class<?> parameter : method.getParameterTypes()) {
+            signature.append('|').append(parameter.getName());
+        }
+        return signature.toString();
     }
 }

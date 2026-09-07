@@ -434,7 +434,8 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
 
         final Path classes = createTempDir();
         try (StandardJavaFileManager files = compiler.getStandardFileManager(null, null, StandardCharsets.UTF_8)) {
-            files.setLocation(StandardLocation.CLASS_OUTPUT, List.of(classes.toFile()));
+            // setLocationFromPaths rather than setLocation, so the output directory never becomes a File.
+            files.setLocationFromPaths(StandardLocation.CLASS_OUTPUT, List.of(classes));
             final var unit = new SimpleJavaFileObject(
                 URI.create("string:///" + className.substring(className.lastIndexOf('.') + 1) + ".java"),
                 javax.tools.JavaFileObject.Kind.SOURCE
