@@ -126,11 +126,20 @@ public class ServerlessCostTests extends OpenSearchTestCase {
 
     /** What one node holding {@code shards} shards spends on a tick that has nothing to do. */
     private long[] steadyStateTick(CountingBlobStore store, String label, int shards, int ticks) throws Exception {
+        return steadyStateTick(store, label, shards, ticks, ServerlessNode.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
+    }
+
+    /**
+     * The same, with an explicit head-verification interval: zero scans on every pass, which is the only
+     * way to measure what a scanning pass costs rather than what the passes between scans cost.
+     */
+    private long[] steadyStateTick(CountingBlobStore store, String label, int shards, int ticks, long headVerifyMillis) throws Exception {
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-" + label + "-" + shards))) {
             node.start();
+            node.setHeadVerifyIntervalMillis(headVerifyMillis);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             for (int shard = 0; shard < shards; shard++) {
                 loop.want("alpha", shard);
@@ -222,6 +231,26 @@ public class ServerlessCostTests extends OpenSearchTestCase {
         assertTrue(
             "register reads are expected to scale with shard count even when batched: " + readsAtOne + " -> " + readsAtEight,
             readsAtEight > readsAtOne
+        );
+
+        // What it would cost not to. The head scan can be put on an interval rather than run on every
+        // pass -- see ServerlessNode#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS, which is zero by default because
+        // the saving is bought with ownership-detection latency, and three tests above encode the bargain
+        // it would change. Measured here rather than argued, so the trade is a number rather than a
+        // claim: between scans the tick costs the same at eight shards as at one, which is the O(shards)
+        // term above gone.
+        final long[] gatedOne = steadyStateTick(filesystem(), "fs-gated", 1, 10, 60_000L);
+        final long[] gatedEight = steadyStateTick(filesystem(), "fs-gated", 8, 10, 60_000L);
+        logger.info(
+            "cost: with the head scan on an interval -- register reads per tick {} -> {} (1 to 8 shards)",
+            gatedOne[4] / 10.0,
+            gatedEight[4] / 10.0
+        );
+        assertEquals(
+            "between head scans a tick must cost the same at eight shards as at one: " + gatedOne[4] + " -> " + gatedEight[4],
+            gatedOne[4] / 10.0,
+            gatedEight[4] / 10.0,
+            0.001
         );
     }
 
