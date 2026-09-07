@@ -146,6 +146,13 @@ public final class ServerlessNode implements Closeable {
     private final Map<org.opensearch.core.index.shard.ShardId, java.util.concurrent.locks.ReentrantReadWriteLock> shardFences =
         new java.util.concurrent.ConcurrentHashMap<>();
     /**
+     * Shares one object-store PUT between the concurrent writes to a shard. See
+     * {@link org.opensearch.serverless.store.WalGroupCommitter}: it batches only what arrives while a PUT
+     * is already in flight, so a quiet shard pays exactly what it did before and a busy one stops paying
+     * per document.
+     */
+    private final org.opensearch.serverless.store.WalGroupCommitter walCommitter;
+    /**
      * Writer shards whose log could not be appended to. Still open and still readable; refusing writes;
      * reopened from the log by the next heartbeat that reaches the store. See {@link #appendOrRelease}.
      */
@@ -285,6 +292,19 @@ public final class ServerlessNode implements Closeable {
                         org.opensearch.serverless.store.BlockCache.DEFAULT_BLOCK_SIZE
                     )
                 )
+            )
+        );
+        // Group commit for the log. Batching only ever happens while a PUT for the same shard is already
+        // in flight, so these bound the size of a group rather than schedule one -- there is no window to
+        // configure. Setting max_records to 1 restores one PUT per write, which is what this replaced.
+        this.walCommitter = new org.opensearch.serverless.store.WalGroupCommitter(
+            settings.getAsInt(
+                "serverless.wal.group_commit.max_records",
+                org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_RECORDS
+            ),
+            settings.getAsLong(
+                "serverless.wal.group_commit.max_bytes",
+                org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES
             )
         );
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
@@ -2657,7 +2677,11 @@ public final class ServerlessNode implements Closeable {
         }
         ensureOwnLeaseIsStillValid(shardId);
         try {
-            wal.append(shard.getOperationPrimaryTerm(), records);
+            // Through the group committer rather than straight to the log: concurrent writes to this shard
+            // share one PUT, and this caller returns only once the blob carrying its own records has
+            // landed. The two lease checks around this call are unchanged and remain per-caller, so every
+            // member of a group independently establishes that its record sits ahead of any seal.
+            walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
         } catch (Exception e) {
             writeFenced.add(shardId);
             throw new java.io.IOException(
@@ -4518,6 +4542,10 @@ public final class ServerlessNode implements Closeable {
                 // shard it ever held. A writer that fetched this fence and locks it after this point
                 // notices the swap in enterWritePath and starts over on the current one.
                 shardFences.remove(shardId, fence);
+                // And the group committer's queue for it, for the same reason and with the same safety: a
+                // flush already in flight holds its own reference and finishes, and its members are judged
+                // by the shard-identity check every caller makes after the append.
+                walCommitter.forget(shardId);
             }
         }
     }
