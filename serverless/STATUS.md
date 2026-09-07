@@ -371,7 +371,12 @@ These are decisions, not gaps. Each answers 501 with a reason.
   that has not recorded its commits sweeps nothing — and points in time now do too, by writing a marker
   before reading anything and replacing it under the same id.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
-  runs on every pass. A reader whose node cannot reach the object store for longer than the grace can lose
+  runs on every pass. **Deleting an index while it is being published to lands in exactly that gap**: the
+  delete purges the shard data, and a writer that had already begun a publish completes it afterwards,
+  leaving blobs under the deleted uuid. Nothing serves them — no descriptor, no head, and a uuid no later
+  index can be minted with — so no answer is wrong, but nothing automatic reclaims them either. `deleteIndex`
+  used to claim the next index of that name cleared them on creation; it does not, and cannot, because the
+  uuid in the path means the new index writes somewhere else. A reader whose node cannot reach the object store for longer than the grace can lose
   the commit it is reading — it fails with an error rather than answering wrongly, but it is a real limit.
 
 **Open under D4 (each needs a narrow shared interface in `server/`, which D4 permits and nobody has built):**
