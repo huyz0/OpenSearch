@@ -49,6 +49,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -208,7 +209,7 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
     }
 
     /** Ships the action and a REST handler that names a node and a caller. */
-    public static final class WherePlugin extends Plugin implements ActionPlugin {
+    public static class WherePlugin extends Plugin implements ActionPlugin {
 
         @Override
         public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
@@ -446,6 +447,139 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
                 HttpResponse.BodyHandlers.ofString()
             );
             return new Response(response.statusCode(), response.body());
+        }
+    }
+
+    /** Latches that hold a starting node inside createComponents, so a probe can run in that window. */
+    private static final AtomicReference<CountDownLatch> IN_WINDOW = new AtomicReference<>();
+    private static final AtomicReference<CountDownLatch> LEAVE_WINDOW = new AtomicReference<>();
+
+    /**
+     * A second plugin whose action constructor blocks, holding the registry-building loop open.
+     *
+     * <p>This is what makes the window observable. {@code buildPluginActions()} constructs each plugin's
+     * transport actions in turn, and a {@code HandledTransportAction} registers its handler from its own
+     * constructor -- so by the time this one blocks, the first plugin's action is already reachable, and
+     * the registry naming it is not assigned until the whole loop returns.
+     */
+    public static final class BlockingActionPlugin extends Plugin implements ActionPlugin {
+        @Override
+        public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
+            return List.of(new ActionHandler<>(BlockingAction.INSTANCE, TransportBlockingAction.class));
+        }
+    }
+
+    /** The second plugin's action type. */
+    public static final class BlockingAction extends ActionType<WhereResponse> {
+        static final BlockingAction INSTANCE = new BlockingAction();
+
+        private BlockingAction() {
+            super("cluster:admin/serverless_testkit/blocking", WhereResponse::new);
+        }
+    }
+
+    /** Blocks in its constructor, which is where the registry-building loop stops. */
+    public static final class TransportBlockingAction extends HandledTransportAction<WhereRequest, WhereResponse> {
+        public TransportBlockingAction(TransportService transportService, ActionFilters actionFilters) {
+            super(BlockingAction.INSTANCE.name(), transportService, actionFilters, WhereRequest::new);
+            IN_WINDOW.get().countDown();
+            try {
+                LEAVE_WINDOW.get().await(30, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        @Override
+        protected void doExecute(Task task, WhereRequest request, ActionListener<WhereResponse> listener) {
+            listener.onFailure(new UnsupportedOperationException("this action exists only to hold the window open"));
+        }
+    }
+
+    /**
+     * A plugin's action is authenticated from the first request, not from the end of startup.
+     *
+     * <p><b>The window this closes.</b> {@code acceptIncomingRequests()} runs before {@code
+     * createComponents}, which runs before the plugin-action registry is built — and a
+     * {@code HandledTransportAction} registers its handler from its own constructor. So a plugin action is
+     * reachable over the transport strictly before the registry naming it exists. A check that consulted
+     * that registry would wave requests through for the whole of that span: every plugin's
+     * {@code createComponents} plus the construction loop. It was doing exactly that.
+     *
+     * <p>Two plugins, and the second one's action constructor blocks. By then the first plugin's action
+     * has registered its handler and the registry has not been assigned, so the probe runs inside the
+     * window itself rather than near it. The node is started on another thread because {@code start()}
+     * has not returned — that is the point.
+     */
+    public void testAPluginsActionIsAuthenticatedBeforeStartupFinishes() throws Exception {
+        IN_WINDOW.set(new CountDownLatch(1));
+        LEAVE_WINDOW.set(new CountDownLatch(1));
+        STRANGER_TRANSPORT.set(null);
+
+        try (
+            ServerlessNode owner = new ServerlessNode(nodeSettings("window-owner"), List.of(new WherePlugin(), new BlockingActionPlugin()));
+            ServerlessNode stranger = new ServerlessNode(nodeSettings("window-stranger"), List.of(new TransportCapturingPlugin()))
+        ) {
+            stranger.start();
+            final AtomicReference<Exception> startFailure = new AtomicReference<>();
+            final Thread starting = new Thread(() -> {
+                try {
+                    owner.start();
+                } catch (Exception e) {
+                    startFailure.set(e);
+                }
+            }, "window-owner-start");
+            starting.start();
+            try {
+                assertTrue("the owner never reached the window", IN_WINDOW.get().await(30, java.util.concurrent.TimeUnit.SECONDS));
+
+                // Mid-startup: the transport is accepting, and the plugin's handler is registered.
+                final TransportService transport = STRANGER_TRANSPORT.get();
+                assertNotNull(transport);
+                final DiscoveryNode target = owner.localNode();
+                assertNotNull("the owner must have bound its transport by now", target);
+                transport.connectToNode(target);
+
+                final PlainActionFuture<WhereResponse> future = PlainActionFuture.newFuture();
+                transport.sendRequest(target, WhereAction.NAME, new WhereRequest((String) null), new TransportResponseHandler<WhereResponse>() {
+                    @Override
+                    public WhereResponse read(StreamInput in) throws IOException {
+                        return new WhereResponse(in);
+                    }
+
+                    @Override
+                    public void handleResponse(WhereResponse response) {
+                        future.onResponse(response);
+                    }
+
+                    @Override
+                    public void handleException(TransportException e) {
+                        future.onFailure(e);
+                    }
+
+                    @Override
+                    public String executor() {
+                        return ThreadPool.Names.SAME;
+                    }
+                });
+
+                final Exception refused = expectThrows(
+                    Exception.class,
+                    () -> future.actionGet(org.opensearch.common.unit.TimeValue.timeValueSeconds(30))
+                );
+                final StringBuilder chain = new StringBuilder();
+                for (Throwable t = refused; t != null; t = t.getCause()) {
+                    chain.append(t).append(" | ");
+                }
+                assertTrue(
+                    "a plugin action must be authenticated during startup, not only after it: " + chain,
+                    chain.toString().contains("transport token")
+                );
+            } finally {
+                LEAVE_WINDOW.get().countDown();
+                starting.join(60_000);
+            }
+            assertNull("the owner should still have started cleanly: " + startFailure.get(), startFailure.get());
         }
     }
 }
