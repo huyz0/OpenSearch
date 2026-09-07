@@ -345,6 +345,13 @@ public final class PointInTimeHandler extends BaseRestHandler {
             // more on request is what the endpoint is for.
             targets = new java.util.ArrayList<>();
             for (PointInTime live : metadata.livePointsInTime(metadata.clock().getAsLong())) {
+                if (live.isCapturing()) {
+                    // A freeze still reading its manifests is not a view a caller took and can release:
+                    // releasing it would drop the pin holding the commits it is reading, and the freeze
+                    // would then write its record back under the same id -- so "_all" would report having
+                    // released something that promptly exists again.
+                    continue;
+                }
                 targets.add(live.id());
             }
         } else {
@@ -392,6 +399,12 @@ public final class PointInTimeHandler extends BaseRestHandler {
             builder.startObject();
             builder.startArray("pits");
             for (PointInTime live : metadata.livePointsInTime(now)) {
+                if (live.isCapturing()) {
+                    // Not listed until it is a view. Its id is not the caller's yet -- the freeze has not
+                    // returned it -- and handing it out here would let somebody search a view that names
+                    // no shard, which answers nothing and calls the nothing complete.
+                    continue;
+                }
                 builder.startObject();
                 builder.field("pit_id", live.id());
                 // What is left, not what was asked: this record carries a deadline rather than a creation
