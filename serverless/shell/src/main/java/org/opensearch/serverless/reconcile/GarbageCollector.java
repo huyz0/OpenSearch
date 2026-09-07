@@ -612,7 +612,14 @@ public final class GarbageCollector {
 
     private static boolean pinnedByView(List<PointInTime> views, String indexName, String uuid, int shard) {
         for (PointInTime pit : views) {
-            if (pit.pins(indexName, uuid) && pit.shards().containsKey(shard)) {
+            if (pit.pins(indexName, uuid) == false) {
+                continue;
+            }
+            // A freeze in progress names the index and none of its shards yet: it is about to read exactly
+            // these blobs and must find them there. The same branch pinnedBySnapshot has for a capture, and
+            // for the same reason -- without it, deleting an index mid-freeze purges the files the freeze
+            // is reading and the view it goes on to publish names blobs that are already gone.
+            if (pit.isCapturing() || pit.shards().containsKey(shard)) {
                 return true;
             }
         }

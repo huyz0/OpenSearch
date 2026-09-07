@@ -266,7 +266,16 @@ public final class MetadataPlane {
 
     private static boolean pinnedByView(List<PointInTime> views, String indexName, String uuid, int shard) {
         for (PointInTime view : views) {
-            if (view.isPlaceholder() || (view.pins(indexName, uuid) && view.shards().containsKey(shard))) {
+            if (view.isPlaceholder()) {
+                return true;
+            }
+            if (view.pins(indexName, uuid) == false) {
+                continue;
+            }
+            // A freeze in progress pins every shard of the index it names: it has read none of them yet
+            // and is about to read all of them. See GarbageCollector#pinnedByView, which mirrors this, and
+            // pinnedBy, which has had the same branch for a snapshot capture all along.
+            if (view.isCapturing() || view.shards().containsKey(shard)) {
                 return true;
             }
         }
@@ -361,11 +370,19 @@ public final class MetadataPlane {
         // And the bytes. Heads first, so a writer cannot renew and the node holding it closes the shard on
         // its next tick; the data after, so a deleted index stops being paid for.
         //
-        // <b>The residual race is real and bounded.</b> Publishing is fenced by the manifest register's
-        // term rather than by the head, so a writer that has lost its head can still complete a publish it
-        // had already begun, and leave blobs behind this sweep. They are unreachable -- no descriptor, no
-        // head -- and the next index of this name clears them on creation, which is why that is where the
-        // correctness argument lives rather than here.
+        // <b>The residual race is real, and it leaks rather than resolving itself.</b> Publishing is fenced
+        // by the manifest register's term rather than by the head, so a writer that has lost its head can
+        // still complete a publish it had already begun, and leave blobs behind this sweep.
+        //
+        // They are unreachable, which is the part that holds: no descriptor and no head, under a uuid no
+        // later index can be minted with, so nothing serves them and no answer is wrong because of them.
+        //
+        // What is NOT true -- this comment used to say it was -- is that the next index of this name
+        // clears them. It cannot: createIndex deliberately clears nothing, because the uuid in the path
+        // means a new index of the same name writes somewhere else entirely, where these blobs are neither
+        // in the way nor visible. So they are storage nothing automatic reclaims: the per-shard sweep runs
+        // only for shards of live indices, and GarbageCollector#collectOrphanedShards, which would find
+        // them, is the operator's sweep and is on no loop. See serverless/STATUS.md.
         purgeShardData(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards());
         return true;
     }
