@@ -363,6 +363,13 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - There is no cursor over indices. `GET /_list/indices/{prefix}*` answers in one bounded page or refuses;
   paginating a deployment whose indices fit under no usable prefix is not possible, because resuming a listing
   needs `start-after` and core's `BlobContainer` does not expose it.
+- A freeze and the sweep no longer race. Freezing reads one manifest per shard and only then wrote the
+  record, so files the early shards froze could stop being referenced and be swept before the record
+  naming them existed. The wall-clock floor on unreferenced blobs makes a *short* freeze safe and only a
+  short one: at `MAX_SHARDS` the manifest reads alone pass the default sixty-second floor at any per-read
+  latency above about fifteen milliseconds. Snapshots already had the guard — an index named by a capture
+  that has not recorded its commits sweeps nothing — and points in time now do too, by writing a marker
+  before reading anything and replacing it under the same id.
 - The whole-deployment orphan sweep (shard containers no index owns) is still manual; the per-shard sweep
   runs on every pass. A reader whose node cannot reach the object store for longer than the grace can lose
   the commit it is reading — it fails with an error rather than answering wrongly, but it is a real limit.

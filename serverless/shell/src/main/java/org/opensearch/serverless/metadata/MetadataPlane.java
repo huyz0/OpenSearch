@@ -694,9 +694,45 @@ public final class MetadataPlane {
      * @throws IOException if the write fails
      */
     public void createPointInTime(PointInTime pit) throws IOException {
+        writePointInTime(pit, true);
+    }
+
+    /**
+     * Records that a freeze has begun, before any manifest is read.
+     *
+     * <p>The first half of the two-phase capture {@link PointInTime#isCapturing} describes: this record
+     * names the index and holds no shards, and the collector deletes nothing for that index while it
+     * stands. {@link #finishPointInTime} replaces it with the real view.
+     *
+     * @param pit a record naming the index, with no shards
+     * @throws IOException if the write fails
+     * @throws IllegalArgumentException if the record is not a capture marker
+     */
+    public void beginPointInTime(PointInTime pit) throws IOException {
+        if (pit.isCapturing() == false) {
+            throw new IllegalArgumentException("a capture marker must name an index and hold no shards: " + pit.id());
+        }
+        writePointInTime(pit, true);
+    }
+
+    /**
+     * Replaces a capture marker with the finished view, under the same id.
+     *
+     * <p>Overwrites rather than creates, which is the whole point: the id is already pinning the index,
+     * and a second id would leave the marker behind to expire on its own while the real view stood beside
+     * it.
+     *
+     * @param pit the finished view
+     * @throws IOException if the write fails
+     */
+    public void finishPointInTime(PointInTime pit) throws IOException {
+        writePointInTime(pit, false);
+    }
+
+    private void writePointInTime(PointInTime pit, boolean failIfAlreadyExists) throws IOException {
         final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
         final var bytes = pit.toBytes();
-        container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), true);
+        container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), failIfAlreadyExists);
     }
 
     /**
