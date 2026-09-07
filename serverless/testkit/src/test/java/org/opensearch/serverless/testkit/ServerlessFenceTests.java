@@ -348,6 +348,149 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         assertEquals("00000000000000000002", log.sealedPosition().get(1L));
     }
 
+    /**
+     * A seal deletes only what it merged.
+     *
+     * <p><b>The bug this pins.</b> {@code sealAt} used to compute the seals it supersedes from a listing
+     * taken <em>after</em> writing its own — so a seal that a concurrent lower-term sealer landed in the
+     * window between the merge and the write was deleted without ever having been merged. Seals merge by
+     * taking the lowest recorded position per term, so the one dropped that way was the <em>tighter</em>
+     * bound; losing it widens the cutoff, and the records between the two bounds replay as though they had
+     * been acknowledged. That is exactly the zombie history a seal exists to exclude.
+     *
+     * <p>The interleaving is forced rather than raced for: the store below lets the intruding sealer land
+     * its blob at the instant the sealer under test has finished listing, which is the one moment that
+     * produces the fault.
+     */
+    public void testASealDoesNotDeleteASealItNeverMerged() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore backing = new FsBlobStore(1024, createTempDir(), false);
+        final AtomicReference<BlobContainer> sealsContainer = new AtomicReference<>();
+        final AtomicBoolean intruded = new AtomicBoolean();
+
+        // A lower-term sealer that lands its seal for term 1 at a tighter position than the sealer under
+        // test is about to record, in the window after that sealer has read the container.
+        final Runnable intruder = () -> {
+            if (intruded.compareAndSet(false, true) == false) {
+                return;
+            }
+            final byte[] body = "1 00000000000000000001\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            try {
+                sealsContainer.get()
+                    .writeBlob("seal-00000000000000000005", new java.io.ByteArrayInputStream(body), body.length, false);
+            } catch (IOException e) {
+                throw new AssertionError("the intruding sealer could not write its seal", e);
+            }
+        };
+
+        final BlobStore store = new BlobStore() {
+            @Override
+            public BlobContainer blobContainer(BlobPath path) {
+                final BlobContainer inner = backing.blobContainer(path);
+                if (path.buildAsString().endsWith("seals/") == false) {
+                    return inner;
+                }
+                sealsContainer.compareAndSet(null, backing.blobContainer(path));
+                return new DelegatingBlobContainer(inner) {
+                    @Override
+                    public Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobs() throws IOException {
+                        final Map<String, org.opensearch.common.blobstore.BlobMetadata> listed = super.listBlobs();
+                        intruder.run();
+                        return listed;
+                    }
+                };
+            }
+
+            @Override
+            public void close() throws IOException {
+                backing.close();
+            }
+        };
+
+        final MetadataPlane plane = planeOver(store, clock);
+        createAlpha(plane);
+        final WalStore log = plane.walStore("alpha", "uuid-alpha-00000000", 0);
+        log.append(1L, List.of(new WalRecord("a", "{\"msg\":\"a\"}")));
+        log.append(1L, List.of(new WalRecord("b", "{\"msg\":\"b\"}")));
+
+        // The sealer under test would record term 1 at ...0002, having listed two records.
+        log.sealAt(7L);
+        assertTrue("the intruding sealer must actually have landed its seal", intruded.get());
+
+        // The merged bound is the intruder's, because it is the lower of the two. Before the fix its seal
+        // had been deleted by the time this read it, and the answer was the looser ...0002.
+        assertEquals(
+            "a seal written between the merge and the write must survive, so its tighter bound still counts",
+            "00000000000000000001",
+            log.sealedPosition().get(1L)
+        );
+    }
+
+    /**
+     * A zombie's late records are reclaimed, not left forever.
+     *
+     * <p><b>The leak this pins.</b> Older term containers were emptied once per term per instance, on the
+     * reasoning that a successor replays everything under them before it starts, so a second pass would
+     * find nothing. The exception is the writer that has lost the shard and not yet noticed: it appends
+     * under its own now-older term for up to a lease, and all of it lands after the one drop that would
+     * have taken it. Nothing else collects it — the sweep walks {@code t=N} under the shard container and
+     * steps over {@code wal} — so on a shard that never failed over again those bytes stayed for the life
+     * of the index. Never a correctness fault, because the seal keeps them out of replay; purely storage
+     * that only grew.
+     *
+     * <p>Both ends of the interval are pinned here rather than a duration waited out, so nothing in this
+     * test depends on timing.
+     */
+    public void testAZombiesLateRecordsAreReclaimedByALaterPublish() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = planeOver(store, clock);
+        createAlpha(plane);
+        final BlobPath shardBase = RegisterMap.shardData(BlobPath.cleanPath(), "alpha", "uuid-alpha-00000000", 0);
+
+        // Never re-scans: the behaviour before the interval existed.
+        final WalStore latched = new WalStore(store, shardBase, Long.MAX_VALUE);
+        latched.append(1L, List.of(new WalRecord("old", "{\"msg\":\"old\"}")));
+        latched.onPublished(2L);
+        assertEquals("the first drop takes what was there", 0, recordsUnderTerm(store, shardBase, 1L));
+
+        // The zombie, still appending under the term it has lost, after that drop.
+        latched.append(1L, List.of(new WalRecord("zombie", "{\"msg\":\"zombie\"}")));
+        assertEquals(1, recordsUnderTerm(store, shardBase, 1L));
+        latched.onPublished(2L);
+        assertEquals(
+            "with no re-scan the zombie's record is never collected -- the leak",
+            1,
+            recordsUnderTerm(store, shardBase, 1L)
+        );
+
+        // The same sequence on one instance that does re-scan, and it has to be one instance across both
+        // publishes: a *fresh* store drops on its first publish whatever the interval says, because the
+        // term has changed under it. Only the second publish on the same instance can tell an interval
+        // that elapsed from a latch that never lifts, which is the whole difference being tested.
+        final WalStore rescanning = new WalStore(store, shardBase, 0L);
+        rescanning.append(1L, List.of(new WalRecord("second-old", "{\"msg\":\"old\"}")));
+        rescanning.onPublished(2L);
+        assertEquals("its first publish drops what was there, as the latched one also did", 0, recordsUnderTerm(store, shardBase, 1L));
+
+        rescanning.append(1L, List.of(new WalRecord("second-zombie", "{\"msg\":\"zombie\"}")));
+        assertEquals(1, recordsUnderTerm(store, shardBase, 1L));
+        rescanning.onPublished(2L);
+        assertEquals("a later publish re-scans and reclaims what the zombie left", 0, recordsUnderTerm(store, shardBase, 1L));
+    }
+
+    /** How many WAL records sit under one term, read straight off the store. */
+    private static int recordsUnderTerm(BlobStore store, BlobPath shardBase, long term) throws IOException {
+        final BlobContainer container = store.blobContainer(shardBase.add("wal").add("t=" + term));
+        int records = 0;
+        for (String name : container.listBlobs().keySet()) {
+            if (name.matches("\\d{20}")) {
+                records++;
+            }
+        }
+        return records;
+    }
+
     // ---------------------------------------------------------------- forwarded writes ask the head
 
     /**
