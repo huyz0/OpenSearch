@@ -446,8 +446,17 @@ public final class DescriptorStore {
             if (nowMillis - tombstoneDeletedAt(register.get().value()) < quarantineMillis) {
                 continue;
             }
-            container.deleteBlobsIgnoringIfNotExists(List.of(blobName));
             removed.add(blobName);
+        }
+        // One call rather than one per tombstone: the container batches, and a deployment that has been
+        // creating and deleting a daily index for a year sweeps a year's worth in a single request.
+        //
+        // The reads above are the real cost of this method and batching does not touch them -- it is
+        // O(population) register reads by construction, which is why it runs on a slow cadence and not on
+        // any request path. Making the deletes free does not make this cheap; it makes it one request
+        // instead of hundreds on top of a walk that was always going to be proportional to the population.
+        if (removed.isEmpty() == false) {
+            container.deleteBlobsIgnoringIfNotExists(removed);
         }
         return removed;
     }

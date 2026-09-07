@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.BlobRegisterCasResult;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.LongSupplier;
@@ -279,8 +280,17 @@ public final class ShardHeadStore {
      * @throws IOException if the delete fails
      */
     public void deleteAllFor(String indexName, int numberOfShards) throws IOException {
+        // One call for every head, not one per shard. The container batches -- an S3 multi-delete carries a
+        // thousand keys -- so deleting a hundred-shard index was a hundred billed requests to do what one
+        // does. Nothing here depends on the order or on the deletes being separately observable: the index
+        // is already tombstoned by the time this runs, so a head that outlives this call is an orphan the
+        // sweep collects either way.
+        final List<String> names = new ArrayList<>(numberOfShards);
         for (int shard = 0; shard < numberOfShards; shard++) {
-            container.deleteBlobsIgnoringIfNotExists(List.of(RegisterMap.shardHeadBlob(indexName, shard)));
+            names.add(RegisterMap.shardHeadBlob(indexName, shard));
+        }
+        if (names.isEmpty() == false) {
+            container.deleteBlobsIgnoringIfNotExists(names);
         }
     }
 }
