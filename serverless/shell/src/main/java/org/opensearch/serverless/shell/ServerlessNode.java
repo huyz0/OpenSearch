@@ -1323,7 +1323,7 @@ public final class ServerlessNode implements Closeable {
     ) {
         final org.opensearch.transport.TransportInterceptor shell = new org.opensearch.serverless.transport.PluginHopAuthentication(
             () -> router,
-            name -> pluginActions.find(name).isPresent()
+            name -> pluginActionNames.contains(name)
         );
         return new org.opensearch.transport.TransportInterceptor() {
             @Override
@@ -1610,6 +1610,12 @@ public final class ServerlessNode implements Closeable {
      * Starts the node. S0/F3: {@link IndicesService} and {@link SearchService} reject work until started.
      */
     public void start() {
+        // Before anything can be sent to this node. A plugin's action is reachable over the transport
+        // from the moment its handler registers, which is well before the registry that names it exists
+        // -- see pluginActionNames for the ordering. Naming them here is what lets the interceptor
+        // demand authentication on the very first one.
+        pluginActionNames = declaredPluginActionNames();
+
         clusterService.start();
         indicesService.start();
         searchService.start();
@@ -1673,6 +1679,23 @@ public final class ServerlessNode implements Closeable {
     private PluginActions pluginActions = PluginActions.none();
 
     /**
+     * The names of every action the installed plugins declare, known before any of them is built.
+     *
+     * <p><b>Why not ask {@link #pluginActions}.</b> A {@code HandledTransportAction} registers its own
+     * transport handler from its constructor, and those constructors run inside {@link
+     * #buildPluginActions()} -- which cannot run until {@code createComponents} has, which cannot run
+     * until the node has started, which is after {@code acceptIncomingRequests()}. So each plugin action
+     * becomes reachable over the transport strictly before the registry naming it exists, and a check
+     * that consulted the registry would wave those requests through for the whole of that window: the
+     * duration of every plugin's {@code createComponents} plus the construction loop.
+     *
+     * <p>The names do not need any of that. They come off {@code ActionPlugin#getActions()}, which is a
+     * list of descriptors, so this is filled in before the transport accepts anything and the window
+     * closes. Volatile because it is written on the starting thread and read on transport threads.
+     */
+    private volatile Set<String> pluginActionNames = Set.of();
+
+    /**
      * Returns the actions the plugins provide.
      *
      * @return the registry, empty on a node whose plugins declared none
@@ -1691,6 +1714,21 @@ public final class ServerlessNode implements Closeable {
      *
      * @return the registry
      */
+    /**
+     * Every action name the installed plugins declare, read from their handler descriptors.
+     *
+     * @return the names, empty when no plugin contributes an action
+     */
+    private Set<String> declaredPluginActionNames() {
+        final Set<String> names = new java.util.HashSet<>();
+        for (org.opensearch.plugins.ActionPlugin plugin : plugins.filter(org.opensearch.plugins.ActionPlugin.class)) {
+            for (org.opensearch.plugins.ActionPlugin.ActionHandler<?, ?> handler : plugin.getActions()) {
+                names.add(handler.getAction().name());
+            }
+        }
+        return Set.copyOf(names);
+    }
+
     private PluginActions buildPluginActions() {
         final java.util.List<org.opensearch.plugins.ActionPlugin> actionPlugins = plugins.filter(org.opensearch.plugins.ActionPlugin.class);
         if (actionPlugins.isEmpty()) {
