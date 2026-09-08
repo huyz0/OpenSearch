@@ -143,7 +143,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeSingleUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null)
+            () -> blobContainer.executeSingleUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null, false)
         );
         assertEquals("Upload request size [" + blobSize + "] can't be larger than 5gb", e.getMessage());
     }
@@ -163,7 +163,8 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
                 new ByteArrayInputStream(new byte[0]),
                 ByteSizeUnit.MB.toBytes(2),
                 null,
-                null
+                null,
+                false
             )
         );
         assertEquals("Upload request size [2097152] can't be larger than buffer size", e.getMessage());
@@ -923,6 +924,56 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         assertEquals("java.lang.RuntimeException: Simulated delete error", exceptionRef.get().getMessage());
     }
 
+    /**
+     * {@code failIfAlreadyExists} reaches S3 as a precondition, and its absence does not.
+     *
+     * <p>This container used to say the flag could not be honoured -- "the S3 API has no way to enforce
+     * this due to its weak consistency model" -- and ignored it. Conditional writes made that false, and
+     * the flag is now load-bearing above: the write-ahead log appends each record with it set, so that a
+     * shard reopened at the same term refuses to overwrite a record it has just replayed rather than
+     * silently landing on top of it. Enforcement that is quietly dropped would turn that refusal into the
+     * overwrite it exists to prevent, and nothing was checking that the header is actually sent.
+     */
+    public void testFailIfAlreadyExistsIsSentAsAPrecondition() throws IOException {
+        for (boolean failIfAlreadyExists : new boolean[] { true, false }) {
+            final String bucketName = randomAlphaOfLengthBetween(1, 10);
+            final String blobName = randomAlphaOfLengthBetween(1, 10);
+            final BlobPath blobPath = BlobPath.cleanPath();
+
+            final S3BlobStore blobStore = mock(S3BlobStore.class);
+            when(blobStore.bucket()).thenReturn(bucketName);
+            when(blobStore.getStorageClass()).thenReturn(randomFrom(StorageClass.values()));
+            when(blobStore.serverSideEncryptionType()).thenReturn(ServerSideEncryption.AES256.toString());
+            when(blobStore.bufferSizeInBytes()).thenReturn(ByteSizeUnit.MB.toBytes(5));
+            when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+
+            final S3BlobContainer blobContainer = new S3BlobContainer(blobPath, blobStore);
+            final S3Client client = mock(S3Client.class);
+            when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+
+            final ArgumentCaptor<PutObjectRequest> captor = ArgumentCaptor.forClass(PutObjectRequest.class);
+            when(client.putObject(captor.capture(), any(RequestBody.class))).thenReturn(PutObjectResponse.builder().build());
+
+            final byte[] bytes = new byte[] { 1, 2, 3 };
+            blobContainer.executeSingleUpload(
+                blobStore,
+                blobName,
+                new ByteArrayInputStream(bytes),
+                bytes.length,
+                null,
+                null,
+                failIfAlreadyExists
+            );
+
+            final PutObjectRequest request = captor.getValue();
+            if (failIfAlreadyExists) {
+                assertEquals("the precondition is what enforces the flag; without it the write overwrites", "*", request.ifNoneMatch());
+            } else {
+                assertNull("an unconditional write must not carry a precondition", request.ifNoneMatch());
+            }
+        }
+    }
+
     public void testExecuteSingleUpload() throws IOException {
         final String bucketName = randomAlphaOfLengthBetween(1, 10);
         final String blobName = randomAlphaOfLengthBetween(1, 10);
@@ -987,7 +1038,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         when(client.putObject(putReqCaptor.capture(), bodyCaptor.capture())).thenReturn(PutObjectResponse.builder().build());
 
         // Pass the known-length stream + tell the code the exact size
-        blobContainer.executeSingleUpload(blobStore, blobName, inputStream, blobSize, metadata, null);
+        blobContainer.executeSingleUpload(blobStore, blobName, inputStream, blobSize, metadata, null, false);
 
         final PutObjectRequest request = putReqCaptor.getValue();
         final RequestBody requestBody = bodyCaptor.getValue();
@@ -1025,7 +1076,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null)
+            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null, false)
         );
         assertEquals("Multipart upload request size [" + blobSize + "] can't be larger than 5tb", e.getMessage());
     }
@@ -1037,7 +1088,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null)
+            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null, false)
         );
         assertEquals("Multipart upload request size [" + blobSize + "] can't be smaller than 5mb", e.getMessage());
     }
@@ -1131,7 +1182,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final ByteArrayInputStream inputStream = new ByteArrayInputStream(new byte[0]);
         final S3BlobContainer blobContainer = new S3BlobContainer(blobPath, blobStore);
-        blobContainer.executeMultipartUpload(blobStore, blobName, inputStream, blobSize, metadata, null);
+        blobContainer.executeMultipartUpload(blobStore, blobName, inputStream, blobSize, metadata, null, false);
 
         final CreateMultipartUploadRequest initRequest = createMultipartUploadRequestArgumentCaptor.getValue();
         assertEquals(bucketName, initRequest.bucket());
@@ -1261,7 +1312,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IOException e = expectThrows(IOException.class, () -> {
             final S3BlobContainer blobContainer = new S3BlobContainer(blobPath, blobStore);
-            blobContainer.executeMultipartUpload(blobStore, blobName, new ByteArrayInputStream(new byte[0]), blobSize, null, null);
+            blobContainer.executeMultipartUpload(blobStore, blobName, new ByteArrayInputStream(new byte[0]), blobSize, null, null, false);
         });
 
         assertEquals("Unable to upload object [" + blobName + "] using multipart upload", e.getMessage());
