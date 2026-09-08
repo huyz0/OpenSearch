@@ -533,10 +533,20 @@ genuinely flat needs a signal carrying evidence of ownership; a revocation marke
 with the swap that moves ownership, so its absence proves nothing. `RegisterMap#assignments` already says
 exactly that about the listing it maintains.
 
-**Still open, in the order the cost model ranks them:** the per-shard head poll above; membership refresh,
-which reads one register per member per node and is therefore quadratic in fleet size; block reads, which
-fetch one 64 KB range per miss with no coalescing, so a cold 100 MB segment costs about 1,600 requests; and
-the sweeps that walk the whole population — tombstones, points in time, snapshots — on a slow cadence.
+**Two more since**, both measured. Membership refresh no longer re-reads a lease whose own stamp says it
+cannot have expired — six registers over five members on a cold refresh, one on a warm one, which takes the
+fleet-wide term from quadratic to linear. And a cold read no longer pays one request per block: read-ahead
+ramps while the reads stay sequential and drops back to one block on a seek, so a scan of 512 blocks costs
+11 requests where it cost 512, while eight scattered reads still cost exactly eight.
+
+**Still open, in the order the cost model ranks them:** the per-shard head poll above, which needs a signal
+carrying evidence of ownership rather than a cheaper timer; and the sweeps that walk the whole population —
+tombstones, points in time, snapshots — on a slow cadence. Neither is a request-path cost.
+
+**And the one that is not a cost at all.** Every argument above assumes `compareAndSwapRegister` is
+genuinely linearizable on the store underneath. The checker passes against MinIO and SeaweedFS and has
+never been pointed at a real cloud provider. That is the largest open risk on this branch, and no amount of
+cost work substitutes for it.
 
 ## How it is tested
 
