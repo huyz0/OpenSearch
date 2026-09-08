@@ -1268,9 +1268,29 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 AccessController.doPrivileged(() -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite)));
                 return BlobRegisterCasResult.applied(newGeneration);
             } catch (S3Exception e) {
-                if (e.statusCode() == 412) {
-                    // Someone raced us between our read and this put; report a conflict rather
-                    // than a wrapped exception so the caller re-reads and retries as normal.
+                // Three status codes, one meaning: the conditional write did not happen, so somebody else
+                // got there first. Reporting a conflict rather than a wrapped exception is what lets the
+                // caller re-read and retry as normal, and it is safe for all three because none of them
+                // can be returned for a write that landed.
+                //
+                // 412 is the ordinary lost race. The other two are documented outcomes of the same races
+                // and were being thrown as store failures, which is a different thing entirely: a lost
+                // acquisition arriving as an IOException reads as "the object store is broken" rather than
+                // "someone else owns this shard now".
+                //
+                // 409 Conflict: "You can also receive a 409 Conflict response in the case of concurrent
+                // requests." 404 Not Found: "You will receive a 404 Not Found response if a concurrent
+                // delete request to an object succeeds before a conditional write operation on that object
+                // completes, as the object key no longer exists" -- and likewise when the current version
+                // is a delete marker. Registers here are deleted routinely (an index delete removes shard
+                // heads, a tombstone sweep removes descriptors, a node release removes its lease), so a
+                // compare-and-swap racing one of those is an ordinary event and not an exceptional one.
+                //
+                // See https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html
+                // ("Conditional write behavior"). Grounded in the specification rather than observed: the
+                // conformance endpoints this suite runs against do not produce 409 or 404 for these races,
+                // which is exactly why reading the contract was worth doing.
+                if (e.statusCode() == 412 || e.statusCode() == 409 || e.statusCode() == 404) {
                     return BlobRegisterCasResult.conflict(
                         readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION)
                     );
@@ -1317,7 +1337,12 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 AccessController.doPrivileged(() -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite)));
                 return BlobRegisterCasResult.applied(newGeneration);
             } catch (S3Exception e) {
-                if (e.statusCode() == 412) {
+                // 412 is the name already being taken, which is what this call is for. 409 is the same
+                // answer under concurrency -- "a 409 Conflict response in the case of concurrent requests
+                // if a delete request to an object succeeds before a conditional write operation on that
+                // object completes" -- and it too means this create did not happen, which is all a caller
+                // needs to know. See the note in compareAndSwapRegister.
+                if (e.statusCode() == 412 || e.statusCode() == 409) {
                     return BlobRegisterCasResult.conflict(BlobRegister.ABSENT_GENERATION);
                 }
                 throw e;

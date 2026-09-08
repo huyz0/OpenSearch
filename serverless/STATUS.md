@@ -543,10 +543,32 @@ ramps while the reads stay sequential and drops back to one block on a seek, so 
 carrying evidence of ownership rather than a cheaper timer; and the sweeps that walk the whole population —
 tombstones, points in time, snapshots — on a slow cadence. Neither is a request-path cost.
 
-**And the one that is not a cost at all.** Every argument above assumes `compareAndSwapRegister` is
-genuinely linearizable on the store underneath. The checker passes against MinIO and SeaweedFS and has
-never been pointed at a real cloud provider. That is the largest open risk on this branch, and no amount of
-cost work substitutes for it.
+**And the one that is not a cost at all.** Every argument above assumes `compareAndSwapRegister` behaves
+on the store underneath. The checker passes against MinIO and SeaweedFS and has never been pointed at a
+real cloud provider. That remains the largest open risk on this branch.
+
+It is no longer *ungrounded*, though, which is a different thing from being closed. AWS documents both
+halves of what this design actually needs. For mutual exclusion: "If multiple conditional writes or copies
+occur for the same object name, the first write operation to finish succeeds. Amazon S3 then fails
+subsequent writes with a `412 Precondition Failed` response." For the reads and listings every other path
+depends on: since December 2020, "all S3 GET, PUT, and LIST operations ... are now strongly consistent", in
+all regions, list operations included. So the register is a documented primitive rather than an assumed
+one, and the listing-driven paths — WAL replay, prefix resolution, every sweep — rest on a stated guarantee
+rather than on a hope.
+
+**What that does not establish, and it matters.** A specification is what a provider commits to, not
+evidence that an implementation delivers it under partition, throttling or failover — which is precisely
+what a linearizability checker is for. It says nothing about the S3-compatible stores that are not S3, and
+`ObjectStores` will point this shell at any of them. It is a floor under the argument, not a proof.
+
+**Reading the contract found a real defect that no amount of testing against MinIO would have.** The same
+page documents two more outcomes of the same races: `409 Conflict` "in the case of concurrent requests",
+and, for `If-Match`, `404 Not Found` when a concurrent delete wins or the current version is a delete
+marker. `S3BlobContainer` mapped only `412` to a conflict and threw the other two, so a lost race against a
+routine deletion — an index delete removing shard heads, a tombstone sweep, a node releasing its lease —
+surfaced as "the object store is broken" rather than "someone else owns this now". All three mean the write
+did not happen, so all three are now conflicts. The conformance endpoints do not produce 409 or 404 for
+these races, which is exactly why the specification was worth reading.
 
 ## How it is tested
 

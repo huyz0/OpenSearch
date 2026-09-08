@@ -98,3 +98,15 @@ one that is a correctness question rather than a missing feature.
 The whole safety argument rests on the object store's `compareAndSwapRegister` being genuinely
 linearizable. There is a linearizability checker, and it passes against MinIO and SeaweedFS.
 It has never been pointed at a real cloud provider, and no fake can close that.
+
+What has been done instead is to read the contract. AWS documents the exclusion this design needs --
+concurrent conditional writes to one key are resolved to a single winner, the rest refused with `412` --
+and has provided strong read-after-write consistency for `GET`, `PUT` and `LIST` in every region since
+December 2020. That makes the register a documented primitive rather than an assumed one. It is a floor
+under the argument and not a substitute for the checker: a specification says what a provider commits to,
+not that the implementation holds under partition, and it speaks for S3 rather than for the S3-compatible
+stores `ObjectStores` will equally happily point this shell at.
+
+Reading it was not merely reassuring. The same page documents two further outcomes of those races -- `409`
+under concurrency, and `404` when a delete beats an `If-Match` write -- which the S3 register mapped to
+exceptions rather than to conflicts. See `STATUS.md`.
