@@ -2487,6 +2487,7 @@ public class InternalEngine extends Engine {
     /**
      * Returned the last local checkpoint value has been refreshed internally.
      */
+    @Override
     public final long lastRefreshedCheckpoint() {
         return lastRefreshedCheckpointListener.lastRefreshedCheckpoint();
     }
@@ -2494,6 +2495,7 @@ public class InternalEngine extends Engine {
     /**
      * Returns the current local checkpoint getting refreshed internally.
      */
+    @Override
     public final long currentOngoingRefreshCheckpoint() {
         return lastRefreshedCheckpointListener.pendingCheckpoint();
     }

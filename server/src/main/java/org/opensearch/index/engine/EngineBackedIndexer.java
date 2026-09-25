@@ -396,18 +396,12 @@ public class EngineBackedIndexer implements Indexer {
 
     @Override
     public long lastRefreshedCheckpoint() {
-        if (engine instanceof InternalEngine) {
-            return ((InternalEngine) engine).lastRefreshedCheckpoint();
-        }
-        return Indexer.super.lastRefreshedCheckpoint();
+        return engine.lastRefreshedCheckpoint();
     }
 
     @Override
     public long currentOngoingRefreshCheckpoint() {
-        if (engine instanceof InternalEngine) {
-            return ((InternalEngine) engine).currentOngoingRefreshCheckpoint();
-        }
-        return Indexer.super.currentOngoingRefreshCheckpoint();
+        return engine.currentOngoingRefreshCheckpoint();
     }
 
     /** Engine-backed indexer uses only JVM heap for indexing buffers, no native memory. */

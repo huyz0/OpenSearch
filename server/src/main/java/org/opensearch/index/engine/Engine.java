@@ -943,6 +943,26 @@ public abstract class Engine implements LifecycleAware, Closeable {
     public abstract long getProcessedLocalCheckpoint();
 
     /**
+     * Returns the local checkpoint the last completed refresh made searchable. A segment replication
+     * primary's {@code CopyState} reads it, so an engine that can serve as one must override this.
+     *
+     * @throws UnsupportedOperationException if this engine does not track refreshed checkpoints
+     */
+    public long lastRefreshedCheckpoint() {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not track refreshed checkpoints");
+    }
+
+    /**
+     * Returns the local checkpoint of the refresh in progress, or the last refreshed checkpoint when
+     * none is running.
+     *
+     * @throws UnsupportedOperationException if this engine does not track refreshed checkpoints
+     */
+    public long currentOngoingRefreshCheckpoint() {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not track refreshed checkpoints");
+    }
+
+    /**
      * @return a {@link SeqNoStats} object, using local state and the supplied global checkpoint
      */
     public abstract SeqNoStats getSeqNoStats(long globalCheckpoint);
