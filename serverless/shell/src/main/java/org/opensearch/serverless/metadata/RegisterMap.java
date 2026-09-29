@@ -323,11 +323,24 @@ public final class RegisterMap {
     /**
      * Returns the blob name of a shard-head within the shard-heads container.
      *
+     * <p><b>Led by two hex digits of a hash of the name.</b> S3 scales request rates per key prefix -- about
+     * 5,500 GETs a second each -- and splits partitions on leading characters, not on slashes. Named plainly,
+     * every head sat under one prefix whose leading characters are the index names themselves, so a
+     * deployment whose names share a stem ({@code logs-2026...}) put its whole head traffic on one partition
+     * well before a million shards. Two hashed characters give 256 evenly loaded prefixes from the first
+     * request. Nothing lists this container, so nothing needs the names in order; heads are only ever
+     * addressed by name, through this method.
+     *
+     * <p>Not compatible with heads written under the unhashed names: a deployment changing layout must start
+     * from an empty {@code shards/}, or two nodes would each find the shard unowned under its own name.
+     *
      * @param indexName the index
      * @param shardId the shard number
      * @return the blob name
      */
     public static String shardHeadBlob(String indexName, int shardId) {
-        return indexName + SHARD_SEPARATOR + shardId;
+        final String name = indexName + SHARD_SEPARATOR + shardId;
+        final int bucket = org.opensearch.cluster.routing.Murmur3HashFunction.hash(name) & 0xFF;
+        return (bucket < 0x10 ? "0" : "") + Integer.toHexString(bucket) + "-" + name;
     }
 }
