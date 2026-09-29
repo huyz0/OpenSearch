@@ -560,6 +560,14 @@ fleet-wide term from quadratic to linear. And a cold read no longer pays one req
 ramps while the reads stay sequential and drops back to one block on a seek, so a scan of 512 blocks costs
 11 requests where it cost 512, while eight scattered reads still cost exactly eight.
 
+**The per-node caches hold what is recent, not everything ever seen.** The routing cache and the head
+sightings each dropped an entry only when a lookup happened to find it stale, so a name or shard touched
+once stayed for the life of the process — every routing entry with its whole descriptor, mapping included.
+Past 10,000 entries, each now drops what no reader would believe any more (a routing entry past its one
+second, a sighting past a lease), at most once per that interval, so no answer changes and the size is set by
+what was touched recently rather than by the population. `ServerlessCacheBoundTests` pins both, and fails
+with either prune removed.
+
 **The membership probe is capped for every request path, not only search.** Within a young snapshot a join
 is detected by one read of the members index's generation, and that read was made on every call: every
 health check a load balancer sends, every stats call and node listing. Search had capped it in its own

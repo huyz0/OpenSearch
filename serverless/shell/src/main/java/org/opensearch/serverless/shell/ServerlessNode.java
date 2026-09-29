@@ -1499,7 +1499,51 @@ public final class ServerlessNode implements Closeable {
             recentHeads.remove(index + "#" + shard);
         } else {
             recentHeads.put(index + "#" + shard, new SeenHead(head, now));
+            pruneRecentHeads(now);
         }
+    }
+
+    /**
+     * Past this many shards, sightings older than a lease are dropped.
+     *
+     * <p>No reader believes one that old -- {@link #ownerHint} discards it and every {@link #recentHead}
+     * caller asks for less -- so dropping it changes no answer. Only the lookups that happened to find one
+     * used to remove it, so a shard routed to once and never asked about again stayed for the life of the
+     * process: a coordinator that routed to a million shards held a million sightings.
+     */
+    public static final int DEFAULT_RECENT_HEADS_PRUNE_ABOVE = 10_000;
+
+    private volatile int recentHeadsPruneAbove = DEFAULT_RECENT_HEADS_PRUNE_ABOVE;
+    private volatile long recentHeadsPrunedAt = Long.MIN_VALUE;
+
+    /**
+     * Sets how many head sightings this node may hold before those older than a lease are dropped.
+     *
+     * @param entries the threshold
+     */
+    public void setRecentHeadsPruneAbove(int entries) {
+        this.recentHeadsPruneAbove = Math.max(0, entries);
+    }
+
+    private void pruneRecentHeads(long now) {
+        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
+        // The oldest any reader accepts: a lease, or a second where a test runs a shorter one.
+        final long ttl = Math.max(1_000L, plane == null ? 30_000L : plane.leaseTtlMillis());
+        // At most once per lease: a sighting cannot age out faster than that.
+        if (recentHeads.size() <= recentHeadsPruneAbove || (recentHeadsPrunedAt != Long.MIN_VALUE && now - recentHeadsPrunedAt < ttl)) {
+            return;
+        }
+        recentHeadsPrunedAt = now;
+        recentHeads.values().removeIf(seen -> now - seen.atMillis() > ttl);
+    }
+
+    /**
+     * Returns how many shards this node holds a head sighting for, for tests that pin its bound.
+     *
+     * @return the entry count
+     */
+    public int recentHeadCount() {
+        return recentHeads.size();
     }
 
     /**
