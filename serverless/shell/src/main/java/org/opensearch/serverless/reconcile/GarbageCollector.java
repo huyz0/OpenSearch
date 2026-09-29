@@ -480,6 +480,36 @@ public final class GarbageCollector {
     }
 
     /**
+     * Removes descriptor tombstones older than the quarantine, from the hourly buckets this node owns.
+     *
+     * <p>Every node runs the sweep, and each takes the buckets that rendezvous hashing over the live
+     * members hands it, so a deployment pays for each deleted name once rather than once per node. Views
+     * of membership can differ; a bucket two nodes both take is contended on the tombstone's claim, and one
+     * nobody takes this pass is taken on a later one.
+     *
+     * @param plane the metadata plane
+     * @param nowMillis the plane's clock
+     * @param selfId this node's id, as its lease names it
+     * @return the names whose tombstones were removed
+     * @throws IOException if membership cannot be read, or listing, reading or deleting fails
+     */
+    public List<String> collectTombstones(MetadataPlane plane, long nowMillis, String selfId) throws IOException {
+        // Refreshed first: an idle node's view is only as fresh as its last request, and a stale one that
+        // still listed a dead node would leave that node's buckets to nobody until something woke it.
+        final java.util.Set<String> members = new java.util.TreeSet<>();
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().refreshIfOlderThan(plane.leaseTtlMillis() / 2)) {
+            members.add(lease.nodeId());
+        }
+        members.add(selfId);
+        return plane.descriptors()
+            .sweepTombstones(
+                nowMillis,
+                DescriptorStore.DEFAULT_TOMBSTONE_QUARANTINE_MILLIS,
+                bucket -> selfId.equals(org.opensearch.serverless.cluster.Rendezvous.owner("tombstones/" + bucket, members))
+            );
+    }
+
+    /**
      * Names every pin in the deployment, cheaply enough to compare between passes.
      *
      * <p>The per-node sweep gate runs a shard's sweep when that node can see something became

@@ -70,7 +70,12 @@ public final class MetadataPlane {
      */
     public MetadataPlane(BlobStore blobStore, BlobPath base, LongSupplier clock, long leaseTtlMillis) {
 
-        this.descriptors = new DescriptorStore(blobStore.blobContainer(RegisterMap.indices(base)));
+        this.descriptors = new DescriptorStore(
+            blobStore.blobContainer(RegisterMap.indices(base)),
+            blobStore,
+            RegisterMap.tombstones(base),
+            clock
+        );
         // Every change this node makes drops the name from its own routing cache, so a client that
         // creates, rolls over or deletes and immediately writes sees its own change rather than a
         // resolution from a moment ago. Announced by the store rather than at each call site, because
@@ -549,7 +554,7 @@ public final class MetadataPlane {
                 noteAlias(index, alias.name(), true);
             }
             return generation;
-        } catch (IndexAlreadyExistsException e) {
+        } catch (IndexAlreadyExistsException | NameBeingReclaimedException e) {
             // The hint was written for an alias that was not created; take it back so a name that keeps
             // losing this race does not accumulate a stale entry per attempt -- unless the alias that won
             // the race names the index, in which case the hint is the winner's and stripping it would

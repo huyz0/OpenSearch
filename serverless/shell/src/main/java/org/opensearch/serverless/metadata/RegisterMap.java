@@ -65,6 +65,22 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns the container path holding one marker per deleted name, bucketed by the hour it was deleted.
+     *
+     * <p>The tombstone itself has to stay under {@link #indices} -- it is what keeps a recreated name's
+     * generations moving -- so the sweep cannot find tombstones by listing anything but the whole
+     * population. This is the index that lets it: a delete also drops an empty marker named for the index
+     * into its hour's bucket, and a sweep lists only the buckets old enough to have expired. Its cost is
+     * then set by how many names were deleted in an hour, not by how many exist.
+     *
+     * @param base the deployment's base path
+     * @return the tombstone-marker container path; each bucket is a child of it
+     */
+    public static BlobPath tombstones(BlobPath base) {
+        return base.add("tombstones");
+    }
+
+    /**
      * Returns the container path holding frozen views of an index.
      *
      * <p>Its own container because the sweep has to list them all, and a listing that also had to step over

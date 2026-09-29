@@ -272,6 +272,9 @@ public final class IndexAdminHandler extends BaseRestHandler {
                         channel.sendResponse(error(channel, e.status, e.type, e.getMessage()));
                     } catch (IndexAlreadyExistsException e) {
                         channel.sendResponse(error(channel, RestStatus.BAD_REQUEST, "index_already_exists", e.getMessage()));
+                    } catch (org.opensearch.serverless.metadata.NameBeingReclaimedException e) {
+                        // The name is free within seconds; a retry is the whole remedy.
+                        channel.sendResponse(error(channel, RestStatus.SERVICE_UNAVAILABLE, "name_being_reclaimed", e.getMessage()));
                     } catch (Exception e) {
                         // A filter chain hands the work's own exception back wrapped; a refusal inside it
                         // is still a refusal.
