@@ -219,11 +219,7 @@ public final class BackgroundReconciler implements Closeable {
             // buckets this node owns, so the deployment pays once per deleted name, not once per node.
             final org.opensearch.cluster.node.DiscoveryNode self = node.localNode();
             if (reaps % TOMBSTONE_SWEEP_EVERY_REAPS == 0 && self != null) {
-                try {
-                    collector.collectTombstones(plane, plane.clock().getAsLong(), self.getId());
-                } catch (Exception e) {
-                    logger.warn("could not sweep descriptor tombstones; the next sweep will retry", e);
-                }
+                sweepTombstonesOffThePass(self.getId());
             }
         }
         // One small register read: the stored scripts are re-read only when their marker has moved, which
@@ -535,6 +531,46 @@ public final class BackgroundReconciler implements Closeable {
 
     /** How many reaps between sweeps of descriptor tombstones past their quarantine: about hourly at the defaults. */
     public static final int TOMBSTONE_SWEEP_EVERY_REAPS = 12;
+
+    private final java.util.concurrent.atomic.AtomicBoolean sweepingTombstones = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile java.util.concurrent.Future<?> tombstoneSweep = java.util.concurrent.CompletableFuture.completedFuture(null);
+
+    /**
+     * Starts a tombstone sweep on the generic pool, unless one is still running.
+     *
+     * <p>Off the pass because its length is set by how much was deleted, and the pass is on a fixed delay:
+     * run inline, a node draining a backlog of deletions held up its own idle release, backstop publish,
+     * view reaping and resync for as long as the drain took. Single-flight, so a drain that outlasts the
+     * interval is not joined by a second one over the same buckets.
+     */
+    private void sweepTombstonesOffThePass(String selfId) {
+        if (sweepingTombstones.compareAndSet(false, true) == false) {
+            return;
+        }
+        try {
+            tombstoneSweep = node.threadPool().generic().submit(() -> {
+                try {
+                    collector.collectTombstones(plane, plane.clock().getAsLong(), selfId);
+                } catch (Exception e) {
+                    logger.warn("could not sweep descriptor tombstones; the next sweep will retry", e);
+                } finally {
+                    sweepingTombstones.set(false);
+                }
+            });
+        } catch (RuntimeException e) {
+            sweepingTombstones.set(false);
+            logger.warn("could not start a tombstone sweep; the next pass that is due will try again", e);
+        }
+    }
+
+    /**
+     * Returns the most recently started tombstone sweep, for a caller that needs to wait on it.
+     *
+     * @return the sweep's future, complete if none is running
+     */
+    public java.util.concurrent.Future<?> tombstoneSweep() {
+        return tombstoneSweep;
+    }
 
     /**
      * How many reaps between readings of the deployment's pins: two listings each, so every third reap

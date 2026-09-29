@@ -20,6 +20,7 @@ import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.NameBeingReclaimedException;
 import org.opensearch.serverless.metadata.RegisterMap;
+import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -214,6 +215,103 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         assertEquals("not this node's bucket: no register read", 0L, store.registerReads());
         assertEquals("one listing of the buckets and nothing else", 1L, store.reads());
         assertEquals(List.of("other"), plane.descriptors().sweepTombstones(clock.get(), QUARANTINE, bucket -> true));
+    }
+
+    /** A bucket holding more markers than one page is drained completely, a page at a time. */
+    public void testABucketLargerThanAPageIsDrainedInPages() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.descriptors().setMarkerPage(3);
+        final int deleted = 10;
+        for (int i = 0; i < deleted; i++) {
+            plane.createIndex(index("paged-" + i));
+            assertTrue(plane.deleteIndex("paged-" + i));
+        }
+        clock.addAndGet(PAST_QUARANTINE);
+        assertEquals(
+            "every marker must be reached, not only the first page",
+            deleted,
+            plane.descriptors().sweepTombstones(clock.get(), QUARANTINE).size()
+        );
+        assertEquals(List.of(), plane.namesWithPrefix("paged-", deleted + 1));
+    }
+
+    /**
+     * A pass keeps its cadence while a sweep is draining: the sweep runs beside the pass, not inside it.
+     *
+     * <p>The sweep is held open on its first read of a deleted name, and the passes that follow must still
+     * complete. Run inline, the pass that started the sweep would wait for it -- and with it the node's
+     * idle release, backstop publish and view reaping.
+     */
+    public void testAPassKeepsItsCadenceWhileASweepDrains() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final java.util.concurrent.CountDownLatch reached = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        final HookedStore store = new HookedStore(new FsBlobStore(1024, createTempDir(), false));
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(index("held"));
+        plane.createIndex(index("drained"));
+        assertTrue(plane.deleteIndex("drained"));
+        clock.addAndGet(PAST_QUARANTINE);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings())) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final org.opensearch.serverless.reconcile.BackgroundReconciler loop =
+                new org.opensearch.serverless.reconcile.BackgroundReconciler(node, plane);
+            loop.want("held", 0);
+            store.afterDescriptorRead = name -> {
+                if (name.equals("drained")) {
+                    reached.countDown();
+                    try {
+                        release.await(60, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            };
+            final int passes = org.opensearch.serverless.reconcile.BackgroundReconciler.REAP_EVERY_PASSES
+                * org.opensearch.serverless.reconcile.BackgroundReconciler.TOMBSTONE_SWEEP_EVERY_REAPS + 10;
+            final java.util.concurrent.ExecutorService ticker = java.util.concurrent.Executors.newSingleThreadExecutor();
+            try {
+                final java.util.concurrent.Future<?> ticks = ticker.submit(() -> {
+                    for (int pass = 0; pass < passes; pass++) {
+                        clock.addAndGet(TTL / 3);
+                        loop.tick(clock.get());
+                    }
+                    return null;
+                });
+                assertTrue("a sweep must have started and be held open", reached.await(60, java.util.concurrent.TimeUnit.SECONDS));
+                ticks.get(30, java.util.concurrent.TimeUnit.SECONDS);
+                assertFalse("the sweep must still be draining while the passes completed", loop.tombstoneSweep().isDone());
+            } finally {
+                release.countDown();
+                ticker.shutdown();
+                assertTrue(ticker.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS));
+            }
+            loop.tombstoneSweep().get(30, java.util.concurrent.TimeUnit.SECONDS);
+            store.afterDescriptorRead = null;
+            // The passes moved the clock on by many minutes while the sweep was held, so its claim was past
+            // the deadline by the time it could delete: a paused sweeper must leave the tombstone, not delete.
+            assertEquals("a sweep paused past its deadline must not delete", List.of("drained"), plane.namesWithPrefix("drained", 5));
+            assertTrue("and the name still reads as absent", plane.describe("drained").isEmpty());
+            // Once the abandoned claim is past the handoff, the next sweep takes it.
+            clock.addAndGet(DescriptorStore.TOMBSTONE_REAP_HANDOFF_MILLIS);
+            assertEquals(List.of("drained"), plane.descriptors().sweepTombstones(clock.get(), QUARANTINE));
+            assertEquals(List.of(), plane.namesWithPrefix("drained", 5));
+        }
+    }
+
+    private org.opensearch.common.settings.Settings nodeSettings() {
+        return org.opensearch.common.settings.Settings.builder()
+            .put("node.name", "sweep-cadence")
+            .put("cluster.name", "serverless-sweep")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", "ingest")
+            .build();
     }
 
     /** Every key has exactly one owner, the same one whichever node asks, and losing a node moves only its keys. */

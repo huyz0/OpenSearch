@@ -622,35 +622,68 @@ public final class DescriptorStore {
         KEEP
     }
 
+    /** The default number of markers a sweep lists and holds at once. */
+    public static final int DEFAULT_MARKER_PAGE = 1000;
+
+    private volatile int markerPage = DEFAULT_MARKER_PAGE;
+
+    /**
+     * Sets how many markers a sweep lists and holds at once; for tests that drain a bucket in several pages.
+     *
+     * @param markers the page size
+     * @return this, for chaining
+     */
+    public DescriptorStore setMarkerPage(int markers) {
+        this.markerPage = Math.max(1, markers);
+        return this;
+    }
+
     private void sweepBucket(String bucket, long bucketStart, long nowMillis, long quarantineMillis, List<String> removed)
         throws IOException {
         final BlobContainer markers = blobStore.blobContainer(tombstonesPath.add(bucket));
-        final List<String> finished = new ArrayList<>();
-        final List<String> claimed = new ArrayList<>();
-        long oldestClaim = 0L;
+        final int page = markerPage;
         boolean kept = false;
-        for (String blobName : new ArrayList<>(markers.listBlobs().keySet())) {
-            // Deletes are batched, but a claim only licenses a delete for the deadline, so the batch is
-            // flushed well inside it rather than whenever it happens to fill.
-            if (claimed.isEmpty() == false
-                && (claimed.size() >= 1000 || clock.getAsLong() >= oldestClaim + TOMBSTONE_REAP_DEADLINE_MILLIS / 2)) {
-                kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
-            }
-            final long claimAt = clock.getAsLong();
-            switch (reap(blobName, bucketStart, nowMillis, quarantineMillis, claimAt)) {
-                case CLAIMED -> {
-                    if (claimed.isEmpty()) {
-                        oldestClaim = claimAt;
-                    }
-                    claimed.add(blobName);
+        // In pages rather than one listing held whole: an hour's bucket at a thousand deletes a second is
+        // millions of names. There is no resuming a listing through BlobContainer, but there need not be --
+        // every page deletes the markers it finished, so listing the first page again lists the next ones.
+        while (true) {
+            final List<org.opensearch.common.blobstore.BlobMetadata> listed = markers.listBlobsByPrefixInSortedOrder(
+                "",
+                page,
+                BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC
+            );
+            final List<String> finished = new ArrayList<>();
+            final List<String> claimed = new ArrayList<>();
+            long oldestClaim = 0L;
+            for (org.opensearch.common.blobstore.BlobMetadata marker : listed) {
+                final String blobName = marker.name();
+                // Deletes are batched, but a claim only licenses a delete for the deadline, so the batch is
+                // flushed well inside it rather than whenever it happens to fill.
+                if (claimed.isEmpty() == false
+                    && (claimed.size() >= 1000 || clock.getAsLong() >= oldestClaim + TOMBSTONE_REAP_DEADLINE_MILLIS / 2)) {
+                    kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
                 }
-                case STALE -> finished.add(blobName);
-                case KEEP -> kept = true;
+                final long claimAt = clock.getAsLong();
+                switch (reap(blobName, bucketStart, nowMillis, quarantineMillis, claimAt)) {
+                    case CLAIMED -> {
+                        if (claimed.isEmpty()) {
+                            oldestClaim = claimAt;
+                        }
+                        claimed.add(blobName);
+                    }
+                    case STALE -> finished.add(blobName);
+                    case KEEP -> kept = true;
+                }
             }
-        }
-        kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
-        if (finished.isEmpty() == false) {
-            markers.deleteBlobsIgnoringIfNotExists(finished);
+            kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
+            if (finished.isEmpty() == false) {
+                markers.deleteBlobsIgnoringIfNotExists(finished);
+            }
+            // A short page was the last. A page that finished nothing holds only markers kept for later,
+            // and listing again would return that same page.
+            if (listed.size() < page || finished.isEmpty()) {
+                break;
+            }
         }
         // An emptied bucket goes too, or a filesystem store would keep a directory an hour forever. Listed
         // again first, so a marker a badly skewed clock dropped in meanwhile is not taken with it.
