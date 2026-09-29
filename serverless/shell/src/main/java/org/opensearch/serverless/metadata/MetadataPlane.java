@@ -41,6 +41,7 @@ public final class MetadataPlane {
 
     private final DescriptorStore descriptors;
     private final ShardHeadStore heads;
+    private final ReclaimQueue reclaimQueue;
     private final ClusterConfig clusterConfig;
     private final BlobLeaseMembership membershipField;
     private final BlobStore blobStore;
@@ -81,6 +82,8 @@ public final class MetadataPlane {
         // resolution from a moment ago. Announced by the store rather than at each call site, because
         // there are eight of those and one forgetting is a stale route.
         this.descriptors.onChanged(this::forgetRouting);
+        this.descriptors.probeAt(RegisterMap.probe(base));
+        this.reclaimQueue = new ReclaimQueue(blobStore, RegisterMap.reclaim(base));
         final BlobLeaseMembership leases = new BlobLeaseMembership(
             blobStore.blobContainer(RegisterMap.members(base)),
             clock,
@@ -366,20 +369,38 @@ public final class MetadataPlane {
      * @throws IOException if the delete fails
      */
     public boolean deleteIndex(String indexName) throws IOException {
-        final long generation = descriptors.generationOf(indexName);
-        final Optional<IndexDescriptor> descriptor = descriptors.get(indexName);
+        // The descriptor and the generation it was read at, from one read: read separately, a change
+        // landing between the two handed the delete a fresh generation for a stale descriptor.
+        final DescriptorStore.Resolution resolved = descriptors.resolve(indexName);
+        final Optional<IndexDescriptor> descriptor = Optional.ofNullable(resolved.index());
         if (descriptor.isEmpty()) {
             return false;
         }
+        final boolean conditional = descriptors.conditionalDelete();
+        if (conditional) {
+            // Before anything is removed, so no crash after this point can leave heads or bytes that
+            // nothing names. A delete that then loses leaves an intent naming a live index, which the
+            // reclaimer drops. See ReclaimQueue.
+            reclaimQueue.enqueue(
+                new ReclaimQueue.Intent(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards()),
+                clock.getAsLong()
+            );
+        }
         // Order the delete against any concurrent lifecycle change before removing anything. If the
         // descriptor moved underneath us, someone else is mid-operation and this delete loses.
-        if (descriptors.deleteIfUnchanged(indexName, generation, clock.getAsLong()) == false) {
+        if (descriptors.deleteIfUnchanged(indexName, resolved.generation(), clock.getAsLong()) == false) {
             return false;
         }
         // Heads only after the descriptor is ordered away: the shard count needed to enumerate them
         // lives in the descriptor, and it is bounded by IndexDescriptor.MAX_SHARDS, so this is a
-        // bounded loop rather than a listing.
-        heads.deleteAllFor(indexName, descriptor.get().numberOfShards());
+        // bounded loop rather than a listing. Where the store deletes conditionally, only this
+        // incarnation's heads and only as they were read: the name is free from the moment the
+        // descriptor went, and a head deleted by name could be a new incarnation's (see deleteAllOf).
+        if (conditional) {
+            heads.deleteAllOf(indexName, descriptor.get().numberOfShards(), descriptor.get().uuid());
+        } else {
+            heads.deleteAllFor(indexName, descriptor.get().numberOfShards());
+        }
         // The aliases that named it stop naming it, as core's delete does. Left in place, the alias
         // record still listed the name while the new index of that name (created with an empty hint) said
         // nothing named it -- GET /_alias/x and a search through x included the newcomer, GET /i/_alias
@@ -1683,6 +1704,37 @@ public final class MetadataPlane {
      */
     public BlobPath basePath() {
         return base;
+    }
+
+    /**
+     * Returns the reclaim queue, where deletes record what they still owe.
+     *
+     * @return the queue
+     */
+    public ReclaimQueue reclaimQueue() {
+        return reclaimQueue;
+    }
+
+    /**
+     * Finishes a delete whose intent has fallen due: removes whatever outlived it.
+     *
+     * <p>Every step is safe to repeat and safe against a recreated name. An intent naming an index that
+     * still exists under that uuid is a delete that never happened, and is dropped. Otherwise the deleted
+     * incarnation's heads are removed conditionally and only while they name its uuid -- a writer that had
+     * not noticed the delete may have re-created one -- and its bytes are purged again, since that writer
+     * may have completed a publish after the first purge. The path of those bytes carries the uuid, which no
+     * later index can be minted with.
+     *
+     * @param intent the due intent
+     * @throws IOException if the store cannot be reached; the intent is kept and tried again
+     */
+    public void reclaim(ReclaimQueue.Intent intent) throws IOException {
+        final DescriptorStore.Resolution current = descriptors.resolve(intent.name());
+        if (current.index() != null && intent.uuid().equals(current.index().uuid())) {
+            return;
+        }
+        heads.deleteAllOf(intent.name(), intent.shards(), intent.uuid());
+        purgeShardData(intent.name(), intent.uuid(), intent.shards());
     }
 
     /**

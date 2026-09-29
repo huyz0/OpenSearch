@@ -49,6 +49,12 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
     private static final long PAST_QUARANTINE = QUARANTINE + DescriptorStore.TOMBSTONE_BUCKET_MILLIS + 60_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
 
+    /** The tombstone path is the fallback for a store that does not honour a conditional delete; these test it. */
+    private static MetadataPlane tombstoning(MetadataPlane plane) {
+        plane.descriptors().setConditionalDelete(false);
+        return plane;
+    }
+
     private static IndexDescriptor index(String name) {
         return new IndexDescriptor(name, org.opensearch.common.UUIDs.randomBase64UUID(), 1, MAPPING, null);
     }
@@ -68,7 +74,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
     private long sweepReadsWithPopulation(int live) throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final CountingBlobStore store = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
         for (int i = 0; i < live; i++) {
             plane.createIndex(index("live-" + i));
         }
@@ -101,7 +107,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
     public void testACreateInsideTheSweepsWindowIsRefusedRatherThanLost() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final HookedStore store = new HookedStore(new FsBlobStore(1024, createTempDir(), false));
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
         plane.createIndex(index("reused"));
         assertTrue(plane.deleteIndex("reused"));
         clock.addAndGet(PAST_QUARANTINE);
@@ -137,7 +143,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
     public void testACreateBeforeTheClaimWinsAndTheSweepDeletesNothing() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final HookedStore store = new HookedStore(new FsBlobStore(1024, createTempDir(), false));
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
         plane.createIndex(index("raced"));
         assertTrue(plane.deleteIndex("raced"));
         clock.addAndGet(PAST_QUARANTINE);
@@ -163,7 +169,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
     public void testAClaimPastItsDeadlineIsAbandonedNotActedOn() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final HookedStore store = new HookedStore(new FsBlobStore(1024, createTempDir(), false));
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
         plane.createIndex(index("slow"));
         assertTrue(plane.deleteIndex("slow"));
         clock.addAndGet(PAST_QUARANTINE);
@@ -189,7 +195,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
     public void testAMarkerFromALostDeleteIsDroppedAndTheIndexKept() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
         plane.createIndex(index("kept"));
         final long stale = plane.descriptors().generationOf("kept") + 7;
         assertFalse(plane.descriptors().deleteIfUnchanged("kept", stale, clock.get()));
@@ -205,7 +211,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
     public void testABucketThisNodeDoesNotOwnCostsNothing() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final CountingBlobStore store = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
         plane.createIndex(index("other"));
         assertTrue(plane.deleteIndex("other"));
         clock.addAndGet(PAST_QUARANTINE);
@@ -220,7 +226,9 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
     /** A bucket holding more markers than one page is drained completely, a page at a time. */
     public void testABucketLargerThanAPageIsDrainedInPages() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
-        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane plane = tombstoning(
+            new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL)
+        );
         plane.descriptors().setMarkerPage(3);
         final int deleted = 10;
         for (int i = 0; i < deleted; i++) {
@@ -248,7 +256,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         final java.util.concurrent.CountDownLatch reached = new java.util.concurrent.CountDownLatch(1);
         final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
         final HookedStore store = new HookedStore(new FsBlobStore(1024, createTempDir(), false));
-        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
         plane.createIndex(index("held"));
         plane.createIndex(index("drained"));
         assertTrue(plane.deleteIndex("drained"));

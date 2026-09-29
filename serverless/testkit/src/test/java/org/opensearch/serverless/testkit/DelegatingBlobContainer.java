@@ -92,6 +92,11 @@ abstract class DelegatingBlobContainer implements BlobContainer {
     }
 
     @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        return delegate.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+    }
+
+    @Override
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
         return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);

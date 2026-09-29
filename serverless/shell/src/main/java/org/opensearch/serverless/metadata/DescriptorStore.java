@@ -500,9 +500,10 @@ public final class DescriptorStore {
      * caller had never seen. Lifecycle is the one place in this design where operations on a single
      * index are ordered, and it is only ordered if <em>all</em> of them go through the register.
      *
-     * <p>Implemented as a swap to a tombstone followed by removal, because the object store has no
-     * conditional delete. The swap is the linearization point: after it, {@link #get} reports the index
-     * as absent whether or not the blob has actually gone yet.
+     * <p>Where the store honours a conditional delete ({@link #conditionalDelete()}), that is all it is: the
+     * register is deleted at the generation the caller read, and nothing is left behind. Otherwise it is a
+     * swap to a tombstone, which the sweep removes later. Either way the conditional step is the
+     * linearization point: after it, {@link #get} reports the index as absent.
      *
      * <p>The tombstone records when the delete happened, in the caller's clock, so
      * {@link #sweepTombstones} can tell one that has outlived every operation it could have been guarding
@@ -522,6 +523,16 @@ public final class DescriptorStore {
      */
     public boolean deleteIfUnchanged(String indexName, long expectedGeneration, long nowMillis) throws IOException {
         final String blobName = RegisterMap.descriptorBlob(indexName);
+        if (conditionalDelete()) {
+            // No tombstone and no marker: the store refuses the delete if the register moved, and a
+            // register created again starts at a generation this one never had, so a swap carrying a
+            // generation read before this delete cannot land on what is created after it.
+            final boolean deleted = container.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+            if (deleted) {
+                onChanged.accept(indexName);
+            }
+            return deleted;
+        }
         blobStore.blobContainer(tombstonesPath.add(tombstoneBucket(nowMillis)))
             .writeBlob(blobName, new ByteArrayInputStream(new byte[0]), 0, false);
         final BlobRegisterCasResult swapped = container.compareAndSwapRegister(blobName, expectedGeneration, tombstone(nowMillis));
@@ -532,6 +543,54 @@ public final class DescriptorStore {
         // The tombstone stays, for the quarantine: see createRegister for why a deleted name must keep
         // its generation, and sweepTombstones for why not forever.
         return true;
+    }
+
+    private volatile Boolean conditionalDelete;
+    private volatile BlobPath probePath;
+
+    /**
+     * Says where the conditional-delete probe may write.
+     *
+     * @param path see {@link RegisterMap#probe}
+     * @return this, for chaining
+     */
+    public DescriptorStore probeAt(BlobPath path) {
+        this.probePath = path;
+        return this;
+    }
+
+    /**
+     * Fixes whether deletes are conditional or tombstoned, rather than probing the store.
+     *
+     * <p>For a caller that has probed already, and for tests of the tombstone path, which is the fallback
+     * for a store that does not honour a conditional delete.
+     *
+     * @param conditional true to delete registers outright, false to leave tombstones
+     * @return this, for chaining
+     */
+    public DescriptorStore setConditionalDelete(boolean conditional) {
+        this.conditionalDelete = conditional;
+        return this;
+    }
+
+    /**
+     * Whether this store deletes descriptors outright, with the store's conditional delete, rather than
+     * leaving tombstones -- decided once, by {@link ConditionalDeleteProbe}, against the store in use.
+     *
+     * @return true for conditional deletes
+     */
+    public boolean conditionalDelete() {
+        Boolean decided = conditionalDelete;
+        if (decided == null) {
+            synchronized (this) {
+                decided = conditionalDelete;
+                if (decided == null) {
+                    decided = probePath != null && ConditionalDeleteProbe.honoured(blobStore, probePath);
+                    conditionalDelete = decided;
+                }
+            }
+        }
+        return decided;
     }
 
     /**

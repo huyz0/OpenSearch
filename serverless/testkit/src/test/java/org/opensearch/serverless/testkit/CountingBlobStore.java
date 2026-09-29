@@ -294,6 +294,13 @@ public final class CountingBlobStore implements BlobStore {
         }
 
         @Override
+        public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+            writes.incrementAndGet();
+            deletes.incrementAndGet();
+            return inner.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+        }
+
+        @Override
         public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
             throws IOException {
             writes.incrementAndGet();

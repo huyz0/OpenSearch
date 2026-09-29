@@ -177,4 +177,14 @@ public final class MinioBlobStores {
             null
         );
     }
+
+    /**
+     * Returns how many requests of each kind a store's S3 client has made, from the client's own metrics.
+     *
+     * @param store a store made by {@link #create}
+     * @return counts by operation: GetObject, PutObject, ListObjects, DeleteObjects, PutMultipartObject
+     */
+    public static java.util.Map<String, Long> requestCounts(org.opensearch.common.blobstore.BlobStore store) {
+        return ((S3BlobStore) store).getStatsMetricPublisher().getStats().toMap();
+    }
 }

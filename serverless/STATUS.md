@@ -581,6 +581,58 @@ fleet-wide term from quadratic to linear. And a cold read no longer pays one req
 ramps while the reads stay sequential and drops back to one block on a seek, so a scan of 512 blocks costs
 11 requests where it cost 512, while eight scattered reads still cost exactly eight.
 
+**Deleting an index no longer needs a tombstone, where the store can delete conditionally.** A tombstone
+existed for one reason: a register's generation lived in its body and restarted at 1 when the blob was
+deleted and created again, so a compare-and-swap carrying a generation read before a delete landed on
+whatever was created after it. Two changes remove the reason. A register now starts at a random 62-bit
+generation (`BlobRegister#initialGeneration`), so a recreated register never reuses its predecessor's
+numbers; and `BlobContainer#deleteRegisterIfUnchanged` deletes only at the generation the caller read, with
+the store's own condition — `If-Match` on the ETag for S3 and Azure, a generation precondition for GCS, a
+lock for the filesystem. A delete then writes a reclaim intent (`reclaim/<due-minute>/<name>#<uuid>`), deletes
+the descriptor conditionally, and deletes only *this incarnation's* heads, conditionally — the earlier
+by-name head delete could remove a head a recreated index had just won, which a third node could then take
+while its owner still held the shard. Two minutes later a reclaimer, off the background pass and split by
+rendezvous, drops the intent if the index turned out to live on, or else deletes any head a writer that missed
+the delete re-created and purges the uuid's bytes again: the delete-during-publish leak this file lists
+below is closed for the index-delete case. No quarantine, no marker, no claim, no `name_being_reclaimed`.
+
+**Only where the store is seen to honour it.** A store can accept `If-Match` on a delete and ignore it, and
+then a delete racing a write removes the write. So `ConditionalDeleteProbe` runs once per node against the
+store in use: it moves a register on through a second container and deletes through the first at the stale
+generation; a store that deletes it anyway fails, and that node keeps tombstones, markers and the sweep —
+the fallback is the whole previous path, unchanged. **MinIO (`RELEASE.2025-04-22`) fails the probe**: it
+ignores `If-Match` on `DeleteObject`, and a node on it stays on tombstones. AWS documents conditional deletes
+for S3; that has **not** been checked against real S3 here, and neither has R11's linearizability checker —
+both need an AWS account this work did not have.
+
+**A compare-and-swap on a known version is one request.** With generations unique across incarnations, no
+two versions of a register have the same body, so an S3 ETag identifies a version as exactly as its
+generation does. `S3BlobContainer` remembers the ETag of the version it last read or wrote, and a swap
+against that version is one conditional PUT instead of a GET and a PUT; a stale memory costs a refused PUT
+and a read, never a wrong write. Register requests are now counted in the S3 client's request metrics, which
+they were not. Measured on MinIO with those metrics (`ServerlessDeleteCostTests`, in `s3Test`):
+
+| operation | before | after |
+| --- | ---: | ---: |
+| compare-and-swap on a version the container just read or wrote | GET + PUT | PUT |
+| compare-and-swap from a container that knows nothing | GET + PUT | GET + PUT |
+
+| deleting a 1-shard index with a held head | at the delete | deferred | total | PUTs |
+| --- | ---: | ---: | ---: | --- |
+| tombstone path (fallback; this run already has the one-PUT swap) | 7 | 8 | 15 | marker, tombstone; claim |
+| conditional path | 8 | 11 | 19 | one intent; none |
+
+The conditional path writes one object where the tombstone path wrote three, and spends nothing on
+quarantine or claims; its deferred work reads and lists more, because it re-purges the dead uuid's bytes and
+re-checks its heads — work the tombstone path never did, and leaked instead. Pinned by
+`ServerlessConditionalDeleteTests`, each with a planted defect that fails it: a stale swap cannot land on a
+recreated name (fails with generations restarting at 1); a head and a publish left by a writer that missed
+the delete are reclaimed (fails with a no-op reclaim); an old incarnation's reclaim leaves the new
+incarnation's head (fails with heads deleted by name); a store ignoring the condition fails the probe and
+keeps tombstones (fails with a probe that trusts the store). The conformance suite gained a recreated
+register never reusing a generation and a conditional delete refusing a stale one; both pass on the
+filesystem and on MinIO.
+
 **Background cost, measured flat in index count.** `ServerlessScaleMeasurementTests` (in `s3Test`) runs one
 node against MinIO with the production intervals, holding 8 shards over 4 indices, beside `P` indices it never
 touches and 50 deleted long enough ago that their tombstones are due. It then counts every request over 120

@@ -303,4 +303,44 @@ public final class ShardHeadStore {
             container.deleteBlobsIgnoringIfNotExists(names);
         }
     }
+
+    /**
+     * Removes the heads of one incarnation of an index, each only if it still belongs to that incarnation
+     * and has not changed since it was read.
+     *
+     * <p>What a delete uses when the store honours a conditional delete, in place of {@link #deleteAllFor}.
+     * That one deletes by name, and a name outlives its incarnation: once the descriptor is gone the name can
+     * be created again at once, a node can activate the new index's shard, and a head deleted by name after
+     * that is the new owner's -- which a third node then finds absent and takes, and the shard has two
+     * writers. Here a head is deleted only while it still names the deleted uuid, and only at the generation
+     * it was read at, so a head the new incarnation wrote is never touched.
+     *
+     * @param indexName the index
+     * @param numberOfShards how many shards the incarnation had
+     * @param indexUuid the incarnation's uuid
+     * @return how many heads were removed
+     * @throws IOException if a head cannot be read or deleted
+     */
+    public int deleteAllOf(String indexName, int numberOfShards, String indexUuid) throws IOException {
+        int removed = 0;
+        for (int shard = 0; shard < numberOfShards; shard++) {
+            final String name = RegisterMap.shardHeadBlob(indexName, shard);
+            final Optional<BlobRegister> existing = container.readRegister(name);
+            if (existing.isEmpty()) {
+                continue;
+            }
+            final ShardHead head;
+            try (InputStream in = existing.get().value().streamInput()) {
+                head = ShardHead.fromStream(in);
+            }
+            // A head naming another uuid is a later incarnation's and is left. One naming none predates
+            // heads recording their incarnation -- activation always records it now -- so it cannot be a
+            // later incarnation's, and goes like this one's.
+            final boolean ours = head.indexUuid() == null || indexUuid.equals(head.indexUuid());
+            if (ours && container.deleteRegisterIfUnchanged(name, existing.get().generation())) {
+                removed++;
+            }
+        }
+        return removed;
+    }
 }
