@@ -581,6 +581,16 @@ fleet-wide term from quadratic to linear. And a cold read no longer pays one req
 ramps while the reads stay sequential and drops back to one block on a seek, so a scan of 512 blocks costs
 11 requests where it cost 512, while eight scattered reads still cost exactly eight.
 
+**Shard heads are spread over 256 key prefixes.** S3 scales request rates per key prefix, about 5,500
+GETs a second each, and splits partitions on leading characters. A head was named `<index>#<shard>`, so a
+deployment whose index names share a stem put its whole head traffic behind one prefix well before a million
+shards. The name now leads with two hex digits of a hash of itself (`3f-logs-2026-01-01#0`); nothing lists
+the container, so nothing needed the order. Index descriptors stay unhashed on purpose: `logs-*` is answered
+by a prefix listing of them. **Not compatible with heads written under the old names** — a deployment
+switching must start from an empty `shards/`, or two nodes would each find a shard unowned under a different
+key. `ServerlessKeyLayoutTests` pins the spread (a year of daily indices over more than 200 of the 256
+prefixes) and the key actually written.
+
 **The per-node caches hold what is recent, not everything ever seen.** The routing cache and the head
 sightings each dropped an entry only when a lookup happened to find it stale, so a name or shard touched
 once stayed for the life of the process — every routing entry with its whole descriptor, mapping included.
