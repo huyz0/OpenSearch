@@ -749,8 +749,54 @@ public final class MetadataPlane {
             routingCache.remove(name);
         } else {
             routingCache.put(name, new CachedResolution(fresh, now));
+            pruneRoutingCache(now);
         }
         return fresh;
+    }
+
+    /**
+     * Past this many names, entries older than the window are dropped.
+     *
+     * <p>An entry past the window answers nothing -- the next lookup reads through and overwrites it -- so
+     * dropping one changes no answer. Without this the map kept every name this node ever wrote to or read,
+     * for the life of the process, each with its whole descriptor, mapping included: a coordinator that
+     * touched a million daily indices over a year held them all. With it, the map holds what was resolved
+     * in the last second, plus up to this many stragglers.
+     */
+    public static final int DEFAULT_ROUTING_CACHE_PRUNE_ABOVE = 10_000;
+
+    private volatile int routingCachePruneAbove = DEFAULT_ROUTING_CACHE_PRUNE_ABOVE;
+    private volatile long routingCachePrunedAt = Long.MIN_VALUE;
+
+    /**
+     * Sets how many names the routing cache may hold before expired ones are dropped.
+     *
+     * @param entries the threshold
+     * @return this, for chaining
+     */
+    public MetadataPlane setRoutingCachePruneAbove(int entries) {
+        this.routingCachePruneAbove = Math.max(0, entries);
+        return this;
+    }
+
+    private void pruneRoutingCache(long now) {
+        // At most once per window: a walk per insert would make a busy coordinator pay for its own cache.
+        if (routingCache.size() <= routingCachePruneAbove
+            || (routingCachePrunedAt != Long.MIN_VALUE && now - routingCachePrunedAt < routingCacheMillis)) {
+            return;
+        }
+        routingCachePrunedAt = now;
+        final long window = routingCacheMillis;
+        routingCache.values().removeIf(seen -> now - seen.atMillis() > window);
+    }
+
+    /**
+     * Returns how many names the routing cache holds, for tests that pin its bound.
+     *
+     * @return the entry count
+     */
+    public int routingCacheSize() {
+        return routingCache.size();
     }
 
     /**
