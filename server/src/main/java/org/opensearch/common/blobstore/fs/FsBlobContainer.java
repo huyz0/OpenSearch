@@ -474,6 +474,9 @@ public class FsBlobContainer extends AbstractBlobContainer {
                 assert fileLock != null;
                 return readRegisterUnderLock(channel);
             }
+        } catch (java.nio.file.NoSuchFileException e) {
+            // Deleted between the existence check and the open: absent, which is what it now is.
+            return Optional.empty();
         } finally {
             lock.unlock();
         }

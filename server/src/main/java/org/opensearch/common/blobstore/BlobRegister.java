@@ -30,6 +30,13 @@ public record BlobRegister(long generation, BytesReference value) {
     public static final long ABSENT_GENERATION = 0L;
 
     /**
+     * Where starting generations come from: one secure source for the whole process, never a seeded or
+     * per-thread one. Uniqueness is the property, and a test framework hands threads generators derived from one
+     * seed, which drew the same "random" generation for two registers created at once.
+     */
+    private static final java.security.SecureRandom GENERATIONS = org.opensearch.common.Randomness.createSecure();
+
+    /**
      * The generation a register starts at when it is created from absent.
      *
      * <p>Random, not 1, so that generations never repeat across a register's incarnations: a register
@@ -45,7 +52,7 @@ public record BlobRegister(long generation, BytesReference value) {
      * @return a fresh starting generation
      */
     public static long initialGeneration() {
-        return 1L << 32 | (org.opensearch.common.Randomness.get().nextLong() & ((1L << 62) - 1));
+        return 1L << 32 | (GENERATIONS.nextLong() & ((1L << 62) - 1));
     }
 
     /**
