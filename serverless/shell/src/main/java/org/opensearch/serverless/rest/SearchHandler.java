@@ -668,7 +668,10 @@ public final class SearchHandler extends BaseRestHandler {
             // register. An alias is expanded here rather than deeper down, so everything below this line
             // deals only in indices and a shard count -- searching through an alias and searching the
             // indices it stands for are the same code path, which is the only way they cannot drift.
-            final var resolved = metadata.resolve(name);
+            // Through the routing cache: this was a register read per named index on every search. A stale
+            // resolution routes to a shard that refuses to answer for a deleted incarnation; see
+            // MetadataPlane#resolveForRouting.
+            final var resolved = metadata.resolveForRouting(name);
             if (resolved.absent()) {
                 if (fromPattern.contains(name)) {
                     // A name the listing returned and the register does not describe: a tombstone left by
@@ -707,7 +710,7 @@ public final class SearchHandler extends BaseRestHandler {
                 continue;
             }
             for (String target : resolved.alias().indices()) {
-                final Optional<IndexDescriptor> behind = metadata.describe(target);
+                final Optional<IndexDescriptor> behind = metadata.describeForRouting(target);
                 if (behind.isEmpty()) {
                     // An alias outliving one of its indices is ordinary: somebody deleted an index and did
                     // not update the alias. Skipping it silently would make a search over an alias quietly

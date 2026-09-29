@@ -324,7 +324,9 @@ public final class DataStreamHandler extends BaseRestHandler {
         for (String backing : record.indices()) {
             metadata.deleteIndex(backing);
         }
-        acknowledge(channel);
+        // Answered once no node can still be acknowledging into a backing index it deleted; see
+        // IndexAdminHandler#afterDeleteSettles.
+        IndexAdminHandler.afterDeleteSettles(node.get(), () -> acknowledge(channel));
     }
 
     private static void acknowledge(org.opensearch.rest.RestChannel channel) throws IOException {

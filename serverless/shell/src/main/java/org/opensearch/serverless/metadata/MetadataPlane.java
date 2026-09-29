@@ -656,9 +656,24 @@ public final class MetadataPlane {
             return Optional.of(new WriteTarget(resolved.index(), null));
         }
         if (resolved.alias() != null && resolved.alias().dataStream()) {
-            return descriptors.get(resolved.alias().writeIndex()).map(backing -> new WriteTarget(backing, resolved.alias()));
+            // The backing index through the same cache: it was a second descriptor read on every write to
+            // a data stream, and the uuid check where the write lands covers it exactly as it covers a name.
+            return describeForRouting(resolved.alias().writeIndex()).map(backing -> new WriteTarget(backing, resolved.alias()));
         }
         return Optional.empty();
+    }
+
+    /**
+     * Reads an index's descriptor for <em>routing</em> -- finding its shards to read, search or write --
+     * which may be answered from a recent read. See {@link #resolveForRouting} for what that can and
+     * cannot get wrong; a caller that goes on to swap the descriptor uses {@link #describe}.
+     *
+     * @param indexName the index
+     * @return the descriptor, or empty if the name is not an index
+     * @throws IOException if the register cannot be read or parsed
+     */
+    public Optional<IndexDescriptor> describeForRouting(String indexName) throws IOException {
+        return Optional.ofNullable(resolveForRouting(indexName).index());
     }
 
     /**
@@ -699,13 +714,17 @@ public final class MetadataPlane {
      * together, and a generation from a second ago is a swap that will be refused or, worse, one that lands
      * on a record it never saw. Those callers keep reading through. Only routing uses this.
      *
-     * <p><b>What a stale answer can and cannot do.</b> It cannot misroute a write. A descriptor carries the
-     * index's uuid, and the uuid is checked again wherever the write actually lands: {@code place} matches
-     * an open shard on uuid as well as name, and a forwarded write is refused by {@code ShardRouter} when
-     * the uuid it carries is not the one the shard has. So a resolution left over from a deleted and
-     * recreated index produces "not held here" -- a refusal the caller retries, by which time the window
-     * has passed -- and never a write acknowledged into the previous incarnation. That check is what makes
-     * a bounded cache safe here where an unbounded one would not be.
+     * <p><b>What a stale answer can and cannot do.</b> A descriptor carries the index's uuid, and the uuid
+     * is checked again wherever the request lands: {@code place} matches an open shard on uuid as well as
+     * name, and a forwarded request is refused by {@code ShardRouter} when the uuid it carries is not the
+     * one the shard has. That catches a stale resolution only when the landing node no longer holds the old
+     * incarnation's shard. When it still does, the uuids match -- both are the old one -- and this cache
+     * alone acknowledged a write into a deleted index. What closes that is the landing node's own fence:
+     * it answers from a shard only within {@code ServerlessNode#INCARNATION_FENCE_MILLIS} of having read
+     * that the shard's incarnation still exists, and a delete answers only after that window has passed.
+     * So a request routed here can be refused and retried, and is never answered from an incarnation whose
+     * delete has returned. Search, get, multi-get and the shard operations behind them route through here
+     * on the same terms as writes.
      *
      * <p><b>A miss is never cached.</b> Create-then-write against a name this node has not seen reads
      * through and finds it, so a new index is usable the instant it exists. What ages is only a name

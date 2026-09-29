@@ -90,7 +90,10 @@ public final class ShardOperations {
     private final java.util.concurrent.ConcurrentHashMap<String, Optional<String>> owners = new java.util.concurrent.ConcurrentHashMap<>();
 
     private Optional<IndexDescriptor> describeOnce(String index) throws IOException {
-        return once(described, index, () -> plane.describe(index));
+        // Every use here is placement -- a shard number and a uuid -- so the routing cache answers it: a
+        // stale uuid lands on a shard that refuses to answer for a deleted incarnation (see
+        // ServerlessNode#INCARNATION_FENCE_MILLIS) or on none at all.
+        return once(described, index, () -> plane.describeForRouting(index));
     }
 
     private Optional<String> ownerOnce(String index, int shard) throws IOException {

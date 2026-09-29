@@ -423,6 +423,11 @@ public final class BulkHandler extends BaseRestHandler {
                 // to escape into the fan-out, which swallowed it, and every item answered 500 "the writer
                 // returned no outcome". The reason and the right status: the shard is moving, retry.
                 serving.signals().ownershipDoubted(index, shard);
+                if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.serverless.shell.StaleIncarnationException.class) != null) {
+                    // Both the name the client wrote to and the index it resolved to, which differ for a data stream.
+                    plane.get().forgetRouting(group.get(0).index);
+                    plane.get().forgetRouting(index);
+                }
                 failGroup(
                     group,
                     RestStatus.SERVICE_UNAVAILABLE,
