@@ -86,18 +86,26 @@ public final class MetadataPlane {
             clock,
             leaseTtlMillis
         );
-        final LivenessOracle oracle = (nodeId, ephemeralId) -> {
-            try {
-                final var lease = leases.read(nodeId);
-                // An ephemeral id that has moved on means the process that took the shard is gone, even
-                // though a node with the same name is back. It does not inherit the claim.
-                return lease.isPresent()
-                    && lease.get().isExpiredAt(clock.getAsLong()) == false
-                    && (ephemeralId == null || ephemeralId.equals(lease.get().ephemeralId()));
-            } catch (java.io.IOException e) {
-                // Unreadable is not "dead": refusing to acquire is the safe answer, since the cost is a
-                // retry and the cost of the alternative is two writers.
-                return true;
+        final LivenessOracle oracle = new LivenessOracle() {
+            @Override
+            public boolean isLive(String nodeId, String ephemeralId) {
+                try {
+                    final var lease = leases.read(nodeId);
+                    // An ephemeral id that has moved on means the process that took the shard is gone, even
+                    // though a node with the same name is back. It does not inherit the claim.
+                    return lease.isPresent()
+                        && lease.get().isExpiredAt(clock.getAsLong()) == false
+                        && (ephemeralId == null || ephemeralId.equals(lease.get().ephemeralId()));
+                } catch (java.io.IOException e) {
+                    // Unreadable is not "dead": refusing to acquire is the safe answer, since the cost is a
+                    // retry and the cost of the alternative is two writers.
+                    return true;
+                }
+            }
+
+            @Override
+            public boolean revoke(String nodeId, String ephemeralId) {
+                return leases.revoke(nodeId, ephemeralId);
             }
         };
         this.heads = new ShardHeadStore(blobStore.blobContainer(RegisterMap.shards(base)), clock, leaseTtlMillis, oracle);

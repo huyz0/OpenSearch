@@ -200,6 +200,18 @@ public final class BlobLeaseMembership implements MembershipSource {
         final NodeLease renewed = self.renewedUntil(clock.getAsLong() + ttlMillis);
         final String name = LEASE_PREFIX + self.nodeId();
         BlobRegisterCasResult result = container.compareAndSwapRegister(name, ownGeneration, renewed.toBytes());
+        // Only for a node that has written its lease before: starting afresh -- the renewal after this one
+        // throws, or the first after a restart -- writes over a revocation, which by then has done its job.
+        if (result.applied() == false && ownGeneration != BlobRegister.ABSENT_GENERATION && revokedUnderneath(name, self)) {
+            // A node taking one of this node's shards revoked the lease (see #revoke), which it does only
+            // once it judges the lease expired by its own clock -- so this node may have lost shards it
+            // still holds open, and must not simply write over the revocation, which is what the retry
+            // below used to do. The caller treats this as a lapse; the next renewal starts afresh.
+            final long expected = ownGeneration;
+            ownGeneration = BlobRegister.ABSENT_GENERATION;
+            enrolled.clear();
+            throw new LeaseRevokedException(self.nodeId(), expected, result.currentGeneration());
+        }
         if (result.applied() == false) {
             // Re-read and retry once against the generation actually stored -- unless what is stored is
             // another live incarnation under this node id. Two processes with one id share every head
@@ -257,6 +269,78 @@ public final class BlobLeaseMembership implements MembershipSource {
             enrolled.add(self.nodeId());
         }
         return renewed;
+    }
+
+    /**
+     * Whether the register holds a revoked copy of this very process's lease.
+     *
+     * <p>Only that, and not any change: a lease removed by a clean release or collected after a long lapse
+     * is not evidence of a takeover this node could have missed -- it had released, or lapsed by its own
+     * clock and re-read every head -- and those keep the plain retry. An unreadable register is not
+     * treated as a revocation either; the retry below then contends on it as it always did.
+     */
+    private boolean revokedUnderneath(String name, NodeLease self) {
+        try {
+            final Optional<BlobRegister> actual = container.readRegister(name);
+            if (actual.isEmpty()) {
+                return false;
+            }
+            try (java.io.InputStream in = actual.get().value().streamInput()) {
+                final NodeLease stored = NodeLease.fromStream(in);
+                return stored.revoked() && stored.ephemeralId().equals(self.ephemeralId());
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Makes sure a node judged dead cannot renew the lease it held, before its shard is taken.
+     *
+     * <p><b>This is what lets a node skip re-reading its heads while its renewals succeed.</b> A head is
+     * taken only from an owner whose lease the taker judges expired, by the taker's clock. Within the skew
+     * budget the owner has lapsed by its own clock too and re-reads every head before acknowledging again.
+     * Beyond it, the owner believes its lease still valid and would never look -- so the taker first swaps
+     * the lease, at the generation it read, to a revoked copy. That swap and the owner's own renewal
+     * contend on one register: if the owner renewed first, the swap fails and the taker leaves the shard
+     * alone; if the swap lands first, the owner's next renewal fails, which it treats as a lapse. Either
+     * way no head changes hands without the owner being able to tell, from one write per renewal however
+     * many shards it holds -- where the alternative was a read per held shard per pass.
+     *
+     * @param nodeId the owner's node id
+     * @param ephemeralId the owner process's ephemeral id as the head recorded it, or null if unknown
+     * @return true if the owner can no longer renew; false if it is alive after all, or its lease could
+     *     not be read -- refusing the takeover is the safe answer to both
+     */
+    public boolean revoke(String nodeId, String ephemeralId) {
+        final String name = LEASE_PREFIX + nodeId;
+        try {
+            final Optional<BlobRegister> register = container.readRegister(name);
+            if (register.isEmpty()) {
+                // Released cleanly, or collected -- which a refresh does only ten TTLs after expiry. An owner
+                // that has not noticed by its own clock after ten TTLs is outside any skew budget; there is
+                // nothing left here to revoke, and the owner would recreate a revocation marker anyway.
+                return true;
+            }
+            final NodeLease lease;
+            try (java.io.InputStream in = register.get().value().streamInput()) {
+                lease = NodeLease.fromStream(in);
+            }
+            if (lease.revoked()) {
+                return true;
+            }
+            if (ephemeralId != null && ephemeralId.equals(lease.ephemeralId()) == false) {
+                // A later process under this id has replaced the lease; the one that took the head can no
+                // longer renew it, and revoking the newcomer would take shards it never held.
+                return true;
+            }
+            if (lease.isExpiredAt(clock.getAsLong()) == false) {
+                return false;
+            }
+            return container.compareAndSwapRegister(name, register.get().generation(), lease.revokedCopy().toBytes()).applied();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**

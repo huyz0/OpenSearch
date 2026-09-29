@@ -547,7 +547,28 @@ incarnation's document; a delete takes at least the settle window) and `Serverle
 warm search, msearch, get and mget read no descriptor), each with a planted defect that fails it. The price
 is that deleting an index takes at least a second and a quarter.
 
-The per-shard head scan is the other, and it is **not** fixed: it can be put on an
+**The per-shard head scan is the other, and it is now fixed in deployment by a revocation carried on the
+node's own lease.** A head is taken only from an owner whose lease the taker judges expired, by the taker's
+clock; within the skew budget the owner has lapsed by its own clock too and re-reads every head, and the
+scan existed for the case beyond it. The taker now swaps the owner's lease register, at the generation it
+read, to a revoked copy *before* swapping the head. That swap and the owner's own renewal contend on one
+register, so either the owner renewed first and the taker backs off, or the revocation landed first and the
+owner's next renewal fails — which it now treats as a lapse (suspend acknowledgement, re-read every head),
+where it used to be written over silently. The objection this file raised below — that a revocation marker
+is not atomic with the swap that moves ownership — holds for a marker kept anywhere else; on the owner's own
+lease it is the owner's renewal that it is atomic with, and that is the comparison that matters. A node
+whose renewals keep succeeding has lost no head to a takeover, at one write per renewal however many shards
+it holds, so `ServerlessBootstrap` runs the scan every five minutes as a backstop (for a head released by
+someone other than its owner, which nothing in this shell does) and re-reads the descriptors of open
+indices every thirty seconds rather than every pass — an index in use is re-read within a second by the
+incarnation fence, which now applies what it reads. The library defaults stay per pass, because the tests
+that encode the old bargain construct nodes directly. `ServerlessLeaseRevocationTests` pins it: an owner a
+whole lease behind the taker's clock, which never scans on its own, learns of the takeover from its next
+renewal and lets go; a live lease is never revoked; and with the production intervals a pass reads no
+register at all, holding two shards or eight. A planted defect in each of the revocation, the owner's
+reaction, the scan after it, and either interval fails a test. Whatever this leaves, the earlier text:
+
+The per-shard head scan was **not** fixed: it can be put on an
 interval, and that is built, measured and off by default, because the saving is bought with
 ownership-detection latency and three existing tests encode the current bargain as a guarantee. Making it
 genuinely flat needs a signal carrying evidence of ownership; a revocation marker is not written atomically

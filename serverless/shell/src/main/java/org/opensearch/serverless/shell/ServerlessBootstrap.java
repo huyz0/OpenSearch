@@ -74,6 +74,33 @@ public final class ServerlessBootstrap implements Closeable {
     public static final String EVICT_AFTER = "serverless.activation.evict_after_millis";
 
     /**
+     * How long a node goes between re-reading the head of every writer shard it holds. Zero reads them on
+     * every pass, which is the library default.
+     *
+     * <p>On here and at five minutes, because a head cannot move away from a node whose renewals succeed
+     * without that node being told: a taker revokes the owner's lease before taking its shard, and the
+     * owner's next renewal fails on it (see {@code BlobLeaseMembership#revoke}). What the scan still catches
+     * is a head released by someone other than its owner, which nothing in this shell does; five minutes
+     * bounds how long that would go unnoticed, where every pass cost a read per held shard.
+     */
+    public static final String HEAD_VERIFY_INTERVAL = "serverless.heads.verify_interval_millis";
+
+    /** The production head-verification interval; see {@link #HEAD_VERIFY_INTERVAL}. */
+    public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 300_000L;
+
+    /**
+     * How long a node goes between re-reading the descriptors of the indices it holds open, where nothing
+     * else has read them meanwhile. Zero reads them on every pass, which is the library default.
+     *
+     * <p>An index being used is re-read at most a second apart by the incarnation fence, which also
+     * applies what it read, so this only paces the idle ones -- whose shards the idle release lets go of in
+     * minutes anyway.
+     */
+    public static final String DESCRIPTOR_REFRESH_INTERVAL = "serverless.descriptors.refresh_interval_millis";
+
+    /** The production descriptor refresh interval; see {@link #DESCRIPTOR_REFRESH_INTERVAL}. */
+    public static final long DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS = 30_000L;
+    /**
      * How long writes are gathered before one publish covers them all. Exposed because it is the knob
      * that decides how much a crashed node leaves for its successor to replay from the log.
      */
@@ -209,6 +236,10 @@ public final class ServerlessBootstrap implements Closeable {
         );
         final MetadataPlane plane = new MetadataPlane(store.blobStore(), BlobPath.cleanPath(), System::currentTimeMillis, ttl);
         node.setMetadataPlane(plane);
+        node.setHeadVerifyIntervalMillis(complete.getAsLong(HEAD_VERIFY_INTERVAL, DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS));
+        node.setDescriptorRefreshIntervalMillis(
+            complete.getAsLong(DESCRIPTOR_REFRESH_INTERVAL, DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS)
+        );
 
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(
             complete.getAsBoolean(ON_DEMAND, true)

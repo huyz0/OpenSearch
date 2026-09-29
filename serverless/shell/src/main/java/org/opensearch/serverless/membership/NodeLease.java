@@ -41,6 +41,7 @@ public final class NodeLease {
     private final long expiresAtMillis;
     private final String name;
     private final String version;
+    private final boolean revoked;
 
     /**
      * Creates a lease.
@@ -92,6 +93,40 @@ public final class NodeLease {
         this.expiresAtMillis = expiresAtMillis;
         this.name = name;
         this.version = version;
+        this.revoked = false;
+    }
+
+    private NodeLease(NodeLease lease, boolean revoked) {
+        this.nodeId = lease.nodeId;
+        this.ephemeralId = lease.ephemeralId;
+        this.address = lease.address;
+        this.roles = lease.roles;
+        this.expiresAtMillis = lease.expiresAtMillis;
+        this.name = lease.name;
+        this.version = lease.version;
+        this.revoked = revoked;
+    }
+
+    /**
+     * Returns this lease revoked: a node that took one of its holder's shards has marked it so, and the
+     * holder's next renewal, which expects the generation it last wrote, fails on the change.
+     *
+     * <p>Still a whole lease rather than a bare marker, because every reader of this register parses it
+     * and treats an unreadable one as alive -- a marker that did not parse would block every takeover.
+     *
+     * @return the revoked copy
+     */
+    public NodeLease revokedCopy() {
+        return new NodeLease(this, true);
+    }
+
+    /**
+     * Reports whether a successor has revoked this lease.
+     *
+     * @return true if revoked
+     */
+    public boolean revoked() {
+        return revoked;
     }
 
     /**
@@ -164,7 +199,8 @@ public final class NodeLease {
      * @return whether this lease has expired from the observer's point of view
      */
     public boolean isExpiredAt(long nowMillis) {
-        return nowMillis >= expiresAtMillis;
+        // A revoked lease is dead whatever it says about its expiry.
+        return revoked || nowMillis >= expiresAtMillis;
     }
 
     /**
@@ -199,6 +235,9 @@ public final class NodeLease {
             if (version != null) {
                 builder.field("version", version);
             }
+            if (revoked) {
+                builder.field("revoked", true);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -221,6 +260,7 @@ public final class NodeLease {
             String address = null;
             String name = null;
             String version = null;
+            boolean revoked = false;
             long expiry = 0L;
             final Set<String> roles = new LinkedHashSet<>();
             String field = null;
@@ -240,6 +280,7 @@ public final class NodeLease {
                         case "expires_at_millis" -> expiry = parser.longValue();
                         case "name" -> name = parser.text();
                         case "version" -> version = parser.text();
+                        case "revoked" -> revoked = parser.booleanValue();
                         default -> {
                             // forward compatibility: ignore fields written by a newer node
                         }
@@ -249,7 +290,8 @@ public final class NodeLease {
             if (nodeId == null || ephemeralId == null || address == null) {
                 throw new IOException("malformed node lease: missing a required field");
             }
-            return new NodeLease(nodeId, ephemeralId, address, roles, expiry, name, version);
+            final NodeLease lease = new NodeLease(nodeId, ephemeralId, address, roles, expiry, name, version);
+            return revoked ? lease.revokedCopy() : lease;
         }
     }
 
@@ -260,6 +302,7 @@ public final class NodeLease {
         }
         if (o instanceof NodeLease other) {
             return expiresAtMillis == other.expiresAtMillis
+                && revoked == other.revoked
                 && nodeId.equals(other.nodeId)
                 && ephemeralId.equals(other.ephemeralId)
                 && address.equals(other.address)
