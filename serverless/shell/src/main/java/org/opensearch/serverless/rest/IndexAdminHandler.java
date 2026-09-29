@@ -371,13 +371,15 @@ public final class IndexAdminHandler extends BaseRestHandler {
                             serving.forgetOwner(index, shard);
                         }
                     }
-                    try (XContentBuilder builder = channel.newBuilder()) {
-                        builder.startObject();
-                        builder.field("acknowledged", true);
-                        builder.field("index", index);
-                        builder.endObject();
-                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-                    }
+                    afterDeleteSettles(serving, () -> {
+                        try (XContentBuilder builder = channel.newBuilder()) {
+                            builder.startObject();
+                            builder.field("acknowledged", true);
+                            builder.field("index", index);
+                            builder.endObject();
+                            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                        }
+                    });
                 });
             }
             default:
@@ -963,8 +965,45 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * @return the response
      * @throws IOException if rendering fails
      */
+    /**
+     * Answers a delete only once no node can still be acknowledging into what it deleted.
+     *
+     * <p>A node answers from a shard only within {@code ServerlessNode#INCARNATION_FENCE_MILLIS} of having
+     * read that the shard's index still exists, so once that window has passed since the tombstone landed,
+     * nothing anywhere is answering from the deleted incarnation. Waiting it out before saying "deleted" is
+     * what makes a write acknowledged after this answer impossible, rather than merely brief. Scheduled,
+     * not slept: no thread is held for the wait.
+     *
+     * @param serving the node, for its scheduler; null answers at once, since then nothing serves shards
+     * @param answer what to send once the window has passed
+     */
+    static void afterDeleteSettles(
+        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.common.CheckedRunnable<IOException> answer
+    ) throws IOException {
+        if (serving == null) {
+            answer.run();
+            return;
+        }
+        serving.threadPool().schedule(() -> {
+            try {
+                answer.run();
+            } catch (IOException e) {
+                org.apache.logging.log4j.LogManager.getLogger(IndexAdminHandler.class)
+                    .warn("could not answer a delete after it settled", e);
+            }
+        },
+            org.opensearch.common.unit.TimeValue.timeValueMillis(org.opensearch.serverless.shell.ServerlessNode.DELETE_SETTLE_MILLIS),
+            org.opensearch.threadpool.ThreadPool.Names.GENERIC
+        );
+    }
+
     static BytesRestResponse failure(org.opensearch.rest.RestChannel channel, Exception e) throws IOException {
         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.opensearch.serverless.shell.StaleIncarnationException) {
+                // Routed by a resolution that has since gone stale; resolving again is the whole remedy.
+                return error(channel, RestStatus.SERVICE_UNAVAILABLE, "index_recreated", cause.getMessage());
+            }
             if (cause instanceof java.nio.file.FileSystemException fs) {
                 final String blob = fs.getFile() == null ? "?" : java.nio.file.Path.of(fs.getFile()).getFileName().toString();
                 return error(

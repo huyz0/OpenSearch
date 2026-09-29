@@ -157,7 +157,9 @@ public final class GetHandler extends BaseRestHandler {
                 )
             );
         }
-        final Optional<IndexDescriptor> descriptor = metadata.describe(index);
+        // For the shard number and the placement, both checked against the uuid where the read lands, so a
+        // descriptor up to a second old costs nothing it can get wrong. See MetadataPlane#resolveForRouting.
+        final Optional<IndexDescriptor> descriptor = metadata.describeForRouting(index);
         if (descriptor.isEmpty()) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index)

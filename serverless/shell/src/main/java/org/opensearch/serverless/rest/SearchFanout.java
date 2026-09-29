@@ -949,11 +949,19 @@ public final class SearchFanout {
         long nowInMillis
     ) throws IOException {
         serving.reconciler().enter(shardId);
+        final org.opensearch.serverless.shard.ShardQuery.Result result;
         try {
-            return org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard, nowInMillis);
+            result = org.opensearch.serverless.shard.ShardQuery.execute(serving.searchService(), shardId, perShard, nowInMillis);
         } finally {
             serving.reconciler().exit(shardId);
         }
+        // An answer from a deleted incarnation is refused rather than merged; see ServerlessNode#INCARNATION_FENCE_MILLIS.
+        // Not for a frozen view: it is keyed by its view's id rather than the index's uuid, and outliving
+        // its index is what a point in time is for.
+        if (serving.reconciler().frozenShards().contains(shardId) == false) {
+            serving.ensureIncarnationLive(shardId);
+        }
+        return result;
     }
 
     private static ShardId localFrozenView(ServerlessNode serving, org.opensearch.serverless.metadata.PointInTime pit, int shard) {

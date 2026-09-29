@@ -148,6 +148,131 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
     }
 
     /**
+     * The same property through the REST write path, which is the one that actually uses the cache.
+     *
+     * <p>{@link #testAStaleResolutionIsRefusedRatherThanMisrouted} writes through {@code ShardOperations};
+     * this writes through {@code DocumentHandler}, which routes by {@code writeTarget} and so by the cached
+     * resolution, while this node still holds the old incarnation's shard open. The uuid check matches --
+     * both uuids are the old one -- and before the incarnation fence this was a 201, durable in the log, in
+     * an index that had been deleted.
+     */
+    public void testAStaleResolutionIsRefusedThroughTheRestWritePath() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane mine = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane theirs = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("freshness-rest"))) {
+            node.start();
+            node.setMetadataPlane(mine);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, mine);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+
+            assertEquals("uuid-alpha-00000000", mine.writeTarget("alpha").orElseThrow().index().uuid());
+            theirs.deleteIndex("alpha");
+            theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-11111111", 1, MAPPING, null));
+            // The other node's delete answered after the settle window; that wait is what this stands for.
+            node.setIncarnationFenceMillis(0L);
+
+            final Response response = send(node, "PUT", "/alpha/_doc/doc", "{\"msg\":\"stale\"}");
+            logger.info("freshness: a REST write routed by a stale resolution answered {} {}", response.status(), response.body());
+            assertEquals(
+                "a REST write routed by a stale resolution must be refused as retryable, not acknowledged into the previous incarnation: "
+                    + response.body(),
+                503,
+                response.status()
+            );
+        }
+    }
+
+    /**
+     * Neither a get nor a search routed by a stale resolution answers from the previous incarnation.
+     *
+     * <p>The same window as the write, from the other side: the cached descriptor names the old uuid, this
+     * node still holds that shard open with a document in it, and the index has been deleted and recreated
+     * empty elsewhere. The old document must not come back.
+     */
+    public void testAStaleResolutionCannotReadThePreviousIncarnation() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane mine = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        final MetadataPlane theirs = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("freshness-read"))) {
+            node.start();
+            node.setMetadataPlane(mine);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, mine);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            assertEquals(201, send(node, "PUT", "/alpha/_doc/old?refresh=true", "{\"msg\":\"previous\"}").status());
+            // Warm the cache for both paths on the old incarnation.
+            assertEquals(200, send(node, "GET", "/alpha/_doc/old", null).status());
+
+            theirs.deleteIndex("alpha");
+            theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-11111111", 1, MAPPING, null));
+            node.setIncarnationFenceMillis(0L);
+
+            final Response get = send(node, "GET", "/alpha/_doc/old", null);
+            assertFalse("a get must not return a document from a deleted incarnation: " + get.body(), get.body().contains("previous"));
+            final Response search = send(node, "GET", "/alpha/_search?q=msg:previous", null);
+            assertFalse(
+                "a search must not return a document from a deleted incarnation: " + search.body(),
+                search.body().contains("\"previous\"")
+            );
+        }
+    }
+
+    /**
+     * A delete answers only once the fence window has passed, which is the other half of the fence: no node
+     * answers from a shard it has not confirmed within the window, and none can have confirmed a deleted
+     * incarnation after the delete landed.
+     */
+    public void testADeleteAnswersOnlyAfterTheFenceWindow() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("freshness-delete"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final long startedAt = System.nanoTime();
+            final Response deleted = send(node, "DELETE", "/alpha", null);
+            final long tookMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+            assertEquals(deleted.body(), 200, deleted.status());
+            assertTrue(
+                "a delete answered in " + tookMillis + " ms, inside the fence window of " + ServerlessNode.INCARNATION_FENCE_MILLIS + " ms",
+                tookMillis >= ServerlessNode.DELETE_SETTLE_MILLIS
+            );
+            assertTrue(plane.describe("alpha").isEmpty());
+        }
+    }
+
+    private record Response(int status, String body) {
+    }
+
+    private static Response send(ServerlessNode node, String method, String path, String body) throws Exception {
+        final var address = node.boundHttpAddress().publishAddress();
+        try (var client = java.net.http.HttpClient.newHttpClient()) {
+            final var response = client.send(
+                java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create("http://" + address.getAddress() + ":" + address.getPort() + path))
+                    .header("Content-Type", "application/json")
+                    .method(
+                        method,
+                        body == null
+                            ? java.net.http.HttpRequest.BodyPublishers.noBody()
+                            : java.net.http.HttpRequest.BodyPublishers.ofString(body)
+                    )
+                    .build(),
+                java.net.http.HttpResponse.BodyHandlers.ofString()
+            );
+            return new Response(response.statusCode(), response.body());
+        }
+    }
+
+    /**
      * A shard lost to another node is still released, once the head-verification interval comes round.
      *
      * <p>The saving is that the scan does not run on every pass. What must not change is that it runs, and

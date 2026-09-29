@@ -319,6 +319,7 @@ public final class ShardRouter {
         } finally {
             node.reconciler().exit(shardId);
         }
+        node.ensureIncarnationLive(shardId);
         channel.sendResponse(new ForwardedSearchResponse(result));
     }
 

@@ -480,6 +480,10 @@ public final class DocumentHandler extends BaseRestHandler {
                 // The backing index, as core reports it and as the forwarded path has always reported it.
                 respond(channel, writtenIndex, id, shard, serving.localNode().getId(), deletion, outcome, refreshed);
             } catch (Exception e) {
+                if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.serverless.shell.StaleIncarnationException.class) != null) {
+                    // Routed by a resolution that has gone stale: the retry should resolve afresh, not wait it out.
+                    metadata.forgetRouting(index);
+                }
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
