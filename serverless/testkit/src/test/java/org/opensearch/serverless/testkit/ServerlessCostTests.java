@@ -777,7 +777,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 loop.tick(System.currentTimeMillis());
 
                 // A throwaway search first, and it is what makes the two measurements comparable.
-                // SearchHandler probes membership at most once per MEMBERSHIP_PROBE_INTERVAL_MILLIS, so the
+                // Membership is probed at most once per GENERATION_PROBE_INTERVAL_MILLIS, so the
                 // first search after a quiet moment pays a members-index read and a lease read that the
                 // next one does not. Measuring the plain search cold and the aggregated one warm therefore
                 // compared a search carrying a probe against one that skipped it -- which is why this

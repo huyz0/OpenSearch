@@ -48,17 +48,6 @@ public final class SearchHandler extends BaseRestHandler {
     private final Supplier<MetadataPlane> plane;
 
     /**
-     * When this handler last asked the object store whether membership moved, in {@link System#nanoTime}
-     * terms; see {@link #refreshMembership}.
-     */
-    private final java.util.concurrent.atomic.AtomicLong membershipProbedAtNanos = new java.util.concurrent.atomic.AtomicLong(
-        Long.MIN_VALUE
-    );
-
-    /** How long a membership snapshot is served without asking the object store whether it moved. */
-    static final long MEMBERSHIP_PROBE_INTERVAL_MILLIS = 1_000L;
-
-    /**
      * Creates the handler.
      *
      * @param node supplies the node serving the request
@@ -507,21 +496,14 @@ public final class SearchHandler extends BaseRestHandler {
      * lease is, and a join moves the members index's generation, which one register read detects -- but
      * one read per search is one object-store round trip on the critical path of every search, which at a
      * thousand searches a second is millions of reads an hour for a fact that changes at join and leave.
-     * So the read is made at most once per {@link #MEMBERSHIP_PROBE_INTERVAL_MILLIS}, wall-clock, and the
-     * searches in between are served from the snapshot. A node that joined inside that second is reached
-     * a second late; a node already known is reached at once, and a peer missing from the snapshot is
-     * still looked up by its lease when a forward needs its address.
+     * So the read is made at most once per {@code BlobLeaseMembership#GENERATION_PROBE_INTERVAL_MILLIS},
+     * wall-clock, and the searches in between are served from the snapshot. That cap used to live here,
+     * and so covered search alone; it lives in the membership now, where every request path gets it. A
+     * node that joined inside that second is reached a second late; a node already known is reached at
+     * once, and a peer missing from the snapshot is still looked up by its lease when a forward needs its
+     * address.
      */
     private void refreshMembership(MetadataPlane metadata) {
-        final long now = System.nanoTime();
-        final long last = membershipProbedAtNanos.get();
-        if (last != Long.MIN_VALUE && now - last < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(MEMBERSHIP_PROBE_INTERVAL_MILLIS)) {
-            return;
-        }
-        if (membershipProbedAtNanos.compareAndSet(last, now) == false) {
-            // Somebody else is probing this instant; their answer is as good as ours.
-            return;
-        }
         try {
             metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
         } catch (Exception e) {
