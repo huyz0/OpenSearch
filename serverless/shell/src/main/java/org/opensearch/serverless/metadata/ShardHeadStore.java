@@ -169,6 +169,16 @@ public final class ShardHeadStore {
         if (otherIncarnation == false && isHeld(current, now) && nodeId.equals(current.ownerNodeId()) == false) {
             return Acquisition.heldByAnother(current);
         }
+        // Taking a dead owner's shard: revoke its lease first, so that if it is not as dead as it looks --
+        // a clock beyond the skew budget -- its next renewal fails and it re-reads every head, rather than
+        // serving on. Not for another incarnation, whose owner is serving a deleted index, nor for this
+        // node's own id, whose lease is the restarted process's own.
+        if (otherIncarnation == false
+            && current.ownerNodeId() != null
+            && nodeId.equals(current.ownerNodeId()) == false
+            && oracle.revoke(current.ownerNodeId(), current.ownerEphemeralId()) == false) {
+            return Acquisition.heldByAnother(current);
+        }
 
         final ShardHead next = new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), next.toBytes());

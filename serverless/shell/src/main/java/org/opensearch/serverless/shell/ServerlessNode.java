@@ -1617,31 +1617,73 @@ public final class ServerlessNode implements Closeable {
         // What was read, for the caller: present, or definitely absent. An index whose read failed is
         // left out, so a transient error is never mistaken for a deletion.
         final java.util.Map<String, java.util.Optional<IndexDescriptor>> read = new java.util.LinkedHashMap<>();
+        final long intervalNanos = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(descriptorRefreshIntervalMillis);
+        final long nowNanos = System.nanoTime();
         for (String indexName : indices) {
+            final Long lastRead = descriptorReadAtNanos.get(indexName);
+            if (intervalNanos > 0L && lastRead != null && nowNanos - lastRead < intervalNanos) {
+                // Read within the interval -- by an earlier pass, or by the incarnation fence answering a
+                // request -- and applied then. Left out of the result, which the caller reads as "not
+                // known" rather than "deleted": a deletion is refused at the fence meanwhile.
+                continue;
+            }
             try {
+                final long startedAt = System.nanoTime();
                 final var descriptor = plane.describe(indexName);
                 read.put(indexName, descriptor);
+                descriptorReadAtNanos.put(indexName, startedAt);
                 if (descriptor.isEmpty()) {
                     continue;
                 }
-                // The copies the next projection is built from follow what was read, or a reader opened
-                // after a mapping update would be projected with the mapping from before it.
-                hosted.computeIfPresent(indexName, (k, v) -> descriptor.get());
-                served.computeIfPresent(indexName, (k, v) -> descriptor.get());
-                final long[] applied = appliedDescriptorVersions.computeIfAbsent(indexName, k -> new long[] { -1L, -1L });
-                if (applied[0] != descriptor.get().mappingVersion()) {
-                    reconciler.refreshMapping(indexName, descriptor.get());
-                    applied[0] = descriptor.get().mappingVersion();
-                }
-                if (applied[1] != descriptor.get().settingsVersion()) {
-                    reconciler.refreshSettings(indexName, descriptor.get());
-                    applied[1] = descriptor.get().settingsVersion();
-                }
+                applyDescriptor(indexName, descriptor.get());
             } catch (Exception e) {
                 logger.warn("could not refresh the descriptor of " + indexName + " on this node's open shards", e);
             }
         }
+        descriptorReadAtNanos.keySet().retainAll(indices);
         return read;
+    }
+
+    /**
+     * Brings this node's open shards of an index up to a descriptor just read.
+     *
+     * <p>From the per-pass refresh and from the incarnation fence, which reads the same register for an
+     * index being used and so keeps its mapping and settings current at no further cost.
+     */
+    private void applyDescriptor(String indexName, IndexDescriptor descriptor) throws java.io.IOException {
+        // The copies the next projection is built from follow what was read, or a reader opened after a
+        // mapping update would be projected with the mapping from before it.
+        hosted.computeIfPresent(indexName, (k, v) -> descriptor);
+        served.computeIfPresent(indexName, (k, v) -> descriptor);
+        final long[] applied = appliedDescriptorVersions.computeIfAbsent(indexName, k -> new long[] { -1L, -1L });
+        synchronized (applied) {
+            if (applied[0] != descriptor.mappingVersion()) {
+                reconciler.refreshMapping(indexName, descriptor);
+                applied[0] = descriptor.mappingVersion();
+            }
+            if (applied[1] != descriptor.settingsVersion()) {
+                reconciler.refreshSettings(indexName, descriptor);
+                applied[1] = descriptor.settingsVersion();
+            }
+        }
+    }
+
+    /** When each open index's descriptor was last read, by the refresh or by the fence, in {@link System#nanoTime} terms. */
+    private final java.util.Map<String, Long> descriptorReadAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private volatile long descriptorRefreshIntervalMillis = 0L;
+
+    /**
+     * Sets how long the descriptors of open indices go between re-reads when nothing else has read them;
+     * zero re-reads them on every pass, which is the library default. See
+     * {@code ServerlessBootstrap#DESCRIPTOR_REFRESH_INTERVAL}.
+     *
+     * @param millis the interval
+     * @return this, for chaining
+     */
+    public ServerlessNode setDescriptorRefreshIntervalMillis(long millis) {
+        this.descriptorRefreshIntervalMillis = Math.max(0L, millis);
+        return this;
     }
 
     private void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
@@ -2163,10 +2205,23 @@ public final class ServerlessNode implements Closeable {
                 logger.warn("could not give back the head of " + lost.getKey() + "; will retry on the next renewal", e);
             }
         }
+        boolean revoked = false;
         synchronized (leaseRenewalLock) {
-            renewOwnLease(plane);
+            try {
+                renewOwnLease(plane);
+            } catch (org.opensearch.serverless.membership.LeaseRevokedException e) {
+                // Someone changed this node's lease: a node taking one of its shards revoked it, which a
+                // taker does only once it judges the lease expired -- so a clock beyond the skew budget
+                // has had this node serving shards it may have lost. The same suspension as a lapse, and
+                // the same full scan before it lifts. The renewal after this one starts the lease afresh.
+                lapseEpoch.incrementAndGet();
+                ownershipUnverified = true;
+                revoked = true;
+                logger.warn("{}; acknowledgement is suspended until every held head is re-read", e.getMessage());
+                renewOwnLease(plane);
+            }
         }
-        if (lapsed) {
+        if (lapsed || revoked) {
             // Now, not on the next timer: the suspension lasts exactly as long as this scan.
             released.addAll(verifyHeads(plane));
         }
@@ -2238,14 +2293,18 @@ public final class ServerlessNode implements Closeable {
      * longer interval buys is a node serving reads from a shard it has lost, for up to the interval --
      * bounded, and never an acknowledged write that nobody replays.
      *
-     * <p><b>And it is a constant factor, not a change of shape.</b> The scan is still one read per held
-     * shard and still runs on a timer, so an idle node's cost still grows with the shards it holds; a
-     * longer interval divides it rather than flattening it. Making it flat needs a different signal than a
-     * per-shard read, and the two candidates -- a revocation marker written by the acquirer, a per-node
-     * claim listing -- fail on the same point: neither is written atomically with the compare-and-swap
-     * that moves ownership, so its absence is not evidence that ownership stayed put.
-     * {@code RegisterMap#assignments} already says exactly that about the listing it maintains. Until
-     * something can carry that evidence, this is a knob and not a solved problem.
+     * <p><b>What made a long interval safe to deploy is a signal carried on the node's own lease.</b> A
+     * revocation marker written somewhere else fails because it is not atomic with the swap that moves
+     * ownership, so its absence proves nothing -- {@code RegisterMap#assignments} says the same of the
+     * listing it maintains. A revocation written <em>onto the owner's lease register</em>, before the head
+     * is swapped, does not: the taker's swap of the lease and the owner's renewal of it contend on one
+     * register, so either the owner renewed first and the taker backs off, or the revocation landed first
+     * and the owner's next renewal fails, which it treats as a lapse -- suspend, re-read every head (see
+     * {@code BlobLeaseMembership#revoke} and {@link #renewLease}). A node whose renewals keep succeeding has
+     * therefore lost no head to a takeover, at one write per renewal however many shards it holds, and
+     * {@code ServerlessBootstrap#HEAD_VERIFY_INTERVAL} runs this scan every five minutes as a backstop for a
+     * head released by someone other than its owner. The library default below stays per pass, because the
+     * tests that encode the old bargain construct nodes directly.
      */
     public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 0L;
 
@@ -2945,6 +3004,13 @@ public final class ServerlessNode implements Closeable {
                 throw new StaleIncarnationException(shardId);
             }
             incarnationConfirmedAtNanos.put(uuid, startedAt);
+            // The read is the refresh's read too: apply it, and let the periodic refresh skip this index.
+            try {
+                applyDescriptor(shardId.getIndexName(), descriptor.get());
+                descriptorReadAtNanos.put(shardId.getIndexName(), startedAt);
+            } catch (Exception e) {
+                logger.warn("could not apply the descriptor of " + shardId.getIndexName() + " read by the incarnation fence", e);
+            }
             if (incarnationConfirmedAtNanos.size() > 4096) {
                 // A confirmation older than the window licenses nothing, so those are all that is dropped.
                 final long now = System.nanoTime();

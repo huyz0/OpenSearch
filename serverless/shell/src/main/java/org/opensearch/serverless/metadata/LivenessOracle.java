@@ -35,4 +35,16 @@ public interface LivenessOracle {
      * @return true when that exact process is still holding a live lease
      */
     boolean isLive(String nodeId, String ephemeralId);
+
+    /**
+     * Makes sure an owner judged dead cannot renew, before one of its shards is taken; see
+     * {@code BlobLeaseMembership#revoke}.
+     *
+     * @param nodeId the owner's stable id
+     * @param ephemeralId the id it had when it took the shard, or null if unknown
+     * @return true if the owner can no longer renew; false if it turned out to be alive, which refuses the takeover
+     */
+    default boolean revoke(String nodeId, String ephemeralId) {
+        return true;
+    }
 }
