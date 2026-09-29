@@ -9,17 +9,26 @@
 package org.opensearch.serverless.metadata;
 
 import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 
 /**
  * Index descriptors as object-store registers.
@@ -56,7 +65,34 @@ public final class DescriptorStore {
      */
     public static final long DEFAULT_TOMBSTONE_QUARANTINE_MILLIS = 6L * 60L * 60L * 1000L;
 
+    /** The width of one tombstone-marker bucket: a sweep lists a bucket only once its oldest name could have expired. */
+    public static final long TOMBSTONE_BUCKET_MILLIS = 60L * 60L * 1000L;
+
+    /**
+     * How long a sweep may take, by its own clock, between claiming a tombstone and deleting it.
+     *
+     * <p>Past this the sweep leaves the tombstone for a later pass rather than delete it. The delete is
+     * unconditional -- the object store has none other -- so it is only safe while no create can have
+     * swapped over the claim, and creates are held off for {@link #TOMBSTONE_REAP_HANDOFF_MILLIS}.
+     */
+    public static final long TOMBSTONE_REAP_DEADLINE_MILLIS = 10_000L;
+
+    /**
+     * How long a create refuses a claimed tombstone before treating the claim as abandoned.
+     *
+     * <p>Six times the deadline: the gap is what absorbs clock skew between the sweeping node and the
+     * creating one, the same trade the node lease makes with its own margin.
+     */
+    public static final long TOMBSTONE_REAP_HANDOFF_MILLIS = 60_000L;
+
+    /** Buckets are named for the UTC hour they start at, so an operator reading a bucket can tell when. */
+    private static final DateTimeFormatter BUCKET_FORMAT = DateTimeFormatter.ofPattern("uuuuMMddHH", java.util.Locale.ROOT)
+        .withZone(ZoneOffset.UTC);
+
     private final BlobContainer container;
+    private final BlobStore blobStore;
+    private final BlobPath tombstonesPath;
+    private final LongSupplier clock;
 
     /**
      * Told the name of every record this store changes, so a cache over it cannot go stale through a
@@ -78,13 +114,32 @@ public final class DescriptorStore {
 
     /** Renders a tombstone recording when the delete happened. */
     private static org.opensearch.core.common.bytes.BytesArray tombstone(long deletedAtMillis) {
+        return tombstone(deletedAtMillis, 0L);
+    }
+
+    /**
+     * Renders a tombstone recording when the delete happened and, if non-zero, when a sweep claimed it for
+     * removal. Still begins with {@link #TOMBSTONE_PREFIX}, so every reader that treats a tombstone as
+     * absent treats a claimed one the same way.
+     */
+    private static org.opensearch.core.common.bytes.BytesArray tombstone(long deletedAtMillis, long reapingAtMillis) {
+        final String claim = reapingAtMillis == 0L ? "" : ",\"reaping_at\":" + reapingAtMillis;
         return new org.opensearch.core.common.bytes.BytesArray(
-            (TOMBSTONE_PREFIX + ",\"deleted_at\":" + deletedAtMillis + "}").getBytes(java.nio.charset.StandardCharsets.UTF_8)
+            (TOMBSTONE_PREFIX + ",\"deleted_at\":" + deletedAtMillis + claim + "}").getBytes(java.nio.charset.StandardCharsets.UTF_8)
         );
     }
 
     /** When a tombstone's delete happened, or 0 for one written before that was recorded. */
     private static long tombstoneDeletedAt(org.opensearch.core.common.bytes.BytesReference value) throws IOException {
+        return tombstoneField(value, "deleted_at");
+    }
+
+    /** When a sweep claimed a tombstone for removal, or 0 if none has. */
+    private static long tombstoneReapingAt(org.opensearch.core.common.bytes.BytesReference value) throws IOException {
+        return tombstoneField(value, "reaping_at");
+    }
+
+    private static long tombstoneField(org.opensearch.core.common.bytes.BytesReference value, String field) throws IOException {
         try (
             org.opensearch.core.xcontent.XContentParser parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
                 .createParser(
@@ -93,18 +148,47 @@ public final class DescriptorStore {
                     value.streamInput()
                 )
         ) {
-            final Object deletedAt = parser.map().get("deleted_at");
-            return deletedAt instanceof Number number ? number.longValue() : 0L;
+            final Object stamp = parser.map().get(field);
+            return stamp instanceof Number number ? number.longValue() : 0L;
+        }
+    }
+
+    /** The bucket a delete at this moment drops its marker into. */
+    static String tombstoneBucket(long millis) {
+        return BUCKET_FORMAT.format(Instant.ofEpochMilli(millis));
+    }
+
+    /** When a bucket starts, or -1 for a name that is not a bucket this store wrote. */
+    static long tombstoneBucketStart(String bucket) {
+        if (bucket.length() != 10 || bucket.chars().allMatch(Character::isDigit) == false) {
+            return -1L;
+        }
+        try {
+            return LocalDateTime.of(
+                Integer.parseInt(bucket.substring(0, 4)),
+                Integer.parseInt(bucket.substring(4, 6)),
+                Integer.parseInt(bucket.substring(6, 8)),
+                Integer.parseInt(bucket.substring(8, 10)),
+                0
+            ).toInstant(ZoneOffset.UTC).toEpochMilli();
+        } catch (java.time.DateTimeException e) {
+            return -1L;
         }
     }
 
     /**
-     * Creates a store over a container.
+     * Creates a store.
      *
      * @param container the container holding the {@code indices/} prefix
+     * @param blobStore the store, for the per-hour tombstone-marker buckets
+     * @param tombstonesPath where those buckets live; see {@link RegisterMap#tombstones}
+     * @param clock the clock tombstones are stamped with and a sweep's claim is timed by
      */
-    public DescriptorStore(BlobContainer container) {
+    public DescriptorStore(BlobContainer container, BlobStore blobStore, BlobPath tombstonesPath, LongSupplier clock) {
         this.container = container;
+        this.blobStore = blobStore;
+        this.tombstonesPath = tombstonesPath;
+        this.clock = clock;
     }
 
     /**
@@ -145,8 +229,15 @@ public final class DescriptorStore {
      * @param name the register name
      * @param value what to store
      * @return the generation as stored
+     * <p><b>Except a tombstone a sweep has claimed.</b> The sweep's delete cannot be made conditional, so a
+     * create that swapped in between the sweep's claim and its delete would be deleted with the tombstone
+     * -- an acknowledged index gone. A claim is refused for {@link #TOMBSTONE_REAP_HANDOFF_MILLIS} and the
+     * sweep deletes within {@link #TOMBSTONE_REAP_DEADLINE_MILLIS} of making it or not at all; past the
+     * handoff the claim was abandoned and the tombstone is taken as usual.
+     *
      * @throws IOException if the store cannot be read or written
      * @throws IndexAlreadyExistsException if the name is taken by a live record
+     * @throws NameBeingReclaimedException if a sweep is removing the name's tombstone right now
      */
     private long createRegister(String name, org.opensearch.core.common.bytes.BytesReference value) throws IOException {
         final String blobName = RegisterMap.descriptorBlob(name);
@@ -159,6 +250,10 @@ public final class DescriptorStore {
         }
         final Optional<BlobRegister> current = container.readRegister(blobName);
         if (current.isPresent() && isTombstone(current.get().value())) {
+            final long reapingAt = tombstoneReapingAt(current.get().value());
+            if (reapingAt != 0L && clock.getAsLong() < reapingAt + TOMBSTONE_REAP_HANDOFF_MILLIS) {
+                throw new NameBeingReclaimedException(name);
+            }
             final BlobRegisterCasResult swapped = container.compareAndSwapRegister(blobName, current.get().generation(), value);
             if (swapped.applied()) {
                 onChanged.accept(name);
@@ -413,6 +508,12 @@ public final class DescriptorStore {
      * {@link #sweepTombstones} can tell one that has outlived every operation it could have been guarding
      * from one written a moment ago.
      *
+     * <p><b>The marker goes first.</b> The sweep finds tombstones only through the marker a delete drops
+     * into its hour's bucket, so a tombstone written without one would never be collected. Written before
+     * the swap, a crash between the two leaves a marker for a delete that never happened, which the sweep
+     * reads, finds a live record or nothing behind, and drops. Written after, the same crash would leave a
+     * tombstone nothing will ever find.
+     *
      * @param indexName the index to delete
      * @param expectedGeneration the generation the caller read
      * @param nowMillis when, in the clock the sweep will be run with
@@ -421,6 +522,8 @@ public final class DescriptorStore {
      */
     public boolean deleteIfUnchanged(String indexName, long expectedGeneration, long nowMillis) throws IOException {
         final String blobName = RegisterMap.descriptorBlob(indexName);
+        blobStore.blobContainer(tombstonesPath.add(tombstoneBucket(nowMillis)))
+            .writeBlob(blobName, new ByteArrayInputStream(new byte[0]), 0, false);
         final BlobRegisterCasResult swapped = container.compareAndSwapRegister(blobName, expectedGeneration, tombstone(nowMillis));
         if (swapped.applied() == false) {
             return false;
@@ -433,10 +536,7 @@ public final class DescriptorStore {
 
     /**
      * Deletes an index only if its descriptor still holds the generation the caller read, stamping the
-     * tombstone with the wall clock.
-     *
-     * <p>Prefer the form that takes the plane's clock, so the stamp and the sweep agree on what "now"
-     * means; this one exists for a caller that has no clock to hand.
+     * tombstone with this store's clock.
      *
      * @param indexName the index to delete
      * @param expectedGeneration the generation the caller read
@@ -444,7 +544,7 @@ public final class DescriptorStore {
      * @throws IOException if the write fails
      */
     public boolean deleteIfUnchanged(String indexName, long expectedGeneration) throws IOException {
-        return deleteIfUnchanged(indexName, expectedGeneration, System.currentTimeMillis());
+        return deleteIfUnchanged(indexName, expectedGeneration, clock.getAsLong());
     }
 
     /**
@@ -457,10 +557,27 @@ public final class DescriptorStore {
      * prefix pattern counts — a tenant creating and deleting a daily index poisoned {@code logs-*} after
      * five hundred days with one live index under it.
      *
-     * <p>A tombstone written before the delete time was recorded reads as infinitely old and goes on the
-     * first sweep; it predates every operation that could still be in flight.
+     * <p><b>Found through markers, not by walking the population.</b> Every delete drops a marker into its
+     * hour's bucket ({@link RegisterMap#tombstones}), so this lists the buckets, skips any too young to
+     * hold an expired name, and reads only the names in the rest. It used to list every descriptor and
+     * read each one, on every node, hourly: at a million indices that was a million reads per node per
+     * hour to find the few hundred names deleted that hour. The cost is now one listing of the buckets,
+     * plus a read and a claim per name deleted in the buckets this node owns.
      *
-     * <p>O(population) reads, like every whole-deployment walk here: for a sweep, not a request path.
+     * <p><b>Claimed, then deleted, never deleted on the strength of a read.</b> The object store has no
+     * conditional delete, and the walk this replaced read a tombstone, moved on, and deleted it at the end:
+     * a name recreated in between -- hours, at scale -- lost its new descriptor, and the collector then
+     * deleted the new index's shards as orphans. Now a tombstone is first swapped to a claimed one, which
+     * {@code createRegister} refuses to swap over, and deleted only if the claim is still younger than
+     * {@link #TOMBSTONE_REAP_DEADLINE_MILLIS} by this node's clock. What is left is the pause between
+     * that check and the delete landing, the same residual every lease-timed write here carries.
+     *
+     * <p><b>Safe to run on more than one node.</b> Two sweeps of the same bucket contend on the claim and
+     * one of them loses it; which is what lets {@code ownsBucket} be a hint drawn from membership rather
+     * than an election.
+     *
+     * <p>A tombstone written before the delete time was recorded reads as infinitely old. One written
+     * before markers existed has none and is never found; those are left where they are.
      *
      * @param nowMillis the current time, in the clock the tombstones were stamped with
      * @param quarantineMillis how long a tombstone must have stood
@@ -468,28 +585,131 @@ public final class DescriptorStore {
      * @throws IOException if listing, reading or deleting fails
      */
     public List<String> sweepTombstones(long nowMillis, long quarantineMillis) throws IOException {
+        return sweepTombstones(nowMillis, quarantineMillis, bucket -> true);
+    }
+
+    /**
+     * Removes tombstones that have outlived their quarantine, from the buckets this caller owns.
+     *
+     * @param nowMillis the current time, in the clock the tombstones were stamped with
+     * @param quarantineMillis how long a tombstone must have stood
+     * @param ownsBucket whether this caller should sweep a bucket; see {@link #sweepTombstones(long, long)}
+     * @return the names whose tombstones were removed
+     * @throws IOException if listing, reading or deleting fails
+     */
+    public List<String> sweepTombstones(long nowMillis, long quarantineMillis, Predicate<String> ownsBucket) throws IOException {
         final List<String> removed = new ArrayList<>();
-        for (String blobName : new ArrayList<>(container.listBlobs().keySet())) {
-            final Optional<BlobRegister> register = container.readRegister(blobName);
-            if (register.isEmpty() || isTombstone(register.get().value()) == false) {
+        for (String bucket : new ArrayList<>(blobStore.blobContainer(tombstonesPath).children().keySet())) {
+            final long start = tombstoneBucketStart(bucket);
+            // Only a bucket whose oldest possible name has passed the quarantine; younger ones are not
+            // listed at all. Not waiting for the whole bucket keeps the quarantine exact rather than up to
+            // a bucket late, and costs at most one more listing of it, since each name is still checked.
+            if (start < 0L || start + quarantineMillis > nowMillis || ownsBucket.test(bucket) == false) {
                 continue;
             }
-            if (nowMillis - tombstoneDeletedAt(register.get().value()) < quarantineMillis) {
-                continue;
-            }
-            removed.add(blobName);
-        }
-        // One call rather than one per tombstone: the container batches, and a deployment that has been
-        // creating and deleting a daily index for a year sweeps a year's worth in a single request.
-        //
-        // The reads above are the real cost of this method and batching does not touch them -- it is
-        // O(population) register reads by construction, which is why it runs on a slow cadence and not on
-        // any request path. Making the deletes free does not make this cheap; it makes it one request
-        // instead of hundreds on top of a walk that was always going to be proportional to the population.
-        if (removed.isEmpty() == false) {
-            container.deleteBlobsIgnoringIfNotExists(removed);
+            sweepBucket(bucket, start, nowMillis, quarantineMillis, removed);
         }
         return removed;
+    }
+
+    /** What a sweep did with one marker. */
+    private enum Reaped {
+        /** The tombstone is claimed and waiting on the batched delete. */
+        CLAIMED,
+        /** Nothing for this marker to do: the name is live, gone, or deleted again later. */
+        STALE,
+        /** Not now: inside its quarantine, or another sweep's claim. */
+        KEEP
+    }
+
+    private void sweepBucket(String bucket, long bucketStart, long nowMillis, long quarantineMillis, List<String> removed)
+        throws IOException {
+        final BlobContainer markers = blobStore.blobContainer(tombstonesPath.add(bucket));
+        final List<String> finished = new ArrayList<>();
+        final List<String> claimed = new ArrayList<>();
+        long oldestClaim = 0L;
+        boolean kept = false;
+        for (String blobName : new ArrayList<>(markers.listBlobs().keySet())) {
+            // Deletes are batched, but a claim only licenses a delete for the deadline, so the batch is
+            // flushed well inside it rather than whenever it happens to fill.
+            if (claimed.isEmpty() == false
+                && (claimed.size() >= 1000 || clock.getAsLong() >= oldestClaim + TOMBSTONE_REAP_DEADLINE_MILLIS / 2)) {
+                kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
+            }
+            final long claimAt = clock.getAsLong();
+            switch (reap(blobName, bucketStart, nowMillis, quarantineMillis, claimAt)) {
+                case CLAIMED -> {
+                    if (claimed.isEmpty()) {
+                        oldestClaim = claimAt;
+                    }
+                    claimed.add(blobName);
+                }
+                case STALE -> finished.add(blobName);
+                case KEEP -> kept = true;
+            }
+        }
+        kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
+        if (finished.isEmpty() == false) {
+            markers.deleteBlobsIgnoringIfNotExists(finished);
+        }
+        // An emptied bucket goes too, or a filesystem store would keep a directory an hour forever. Listed
+        // again first, so a marker a badly skewed clock dropped in meanwhile is not taken with it.
+        if (kept == false && markers.listBlobs().isEmpty()) {
+            markers.delete();
+        }
+    }
+
+    /**
+     * Deletes the claimed tombstones if the claims are still inside the deadline.
+     *
+     * @return false if they were not, and the markers are kept for a later sweep
+     */
+    private boolean flushClaims(List<String> claimed, long oldestClaim, List<String> finished, List<String> removed) throws IOException {
+        if (claimed.isEmpty()) {
+            return true;
+        }
+        try {
+            if (clock.getAsLong() >= oldestClaim + TOMBSTONE_REAP_DEADLINE_MILLIS) {
+                // Too late to be sure no create has taken a claim over. Left claimed; a later sweep finds the
+                // marker, sees the claim has aged past the handoff, and claims it afresh.
+                return false;
+            }
+            container.deleteBlobsIgnoringIfNotExists(claimed);
+            removed.addAll(claimed);
+            finished.addAll(claimed);
+            return true;
+        } finally {
+            claimed.clear();
+        }
+    }
+
+    private Reaped reap(String blobName, long bucketStart, long nowMillis, long quarantineMillis, long claimAt) throws IOException {
+        final Optional<BlobRegister> register = container.readRegister(blobName);
+        if (register.isEmpty() || isTombstone(register.get().value()) == false) {
+            // Already removed, recreated since, or a delete whose swap lost after its marker was written.
+            return Reaped.STALE;
+        }
+        final org.opensearch.core.common.bytes.BytesReference value = register.get().value();
+        final long deletedAt = tombstoneDeletedAt(value);
+        if (deletedAt >= bucketStart + TOMBSTONE_BUCKET_MILLIS) {
+            // Recreated and deleted again later. That delete dropped its own marker in its own bucket.
+            return Reaped.STALE;
+        }
+        if (nowMillis - deletedAt < quarantineMillis) {
+            // Stamped by a clock running ahead of this one. Its quarantine is not this sweep's to shorten.
+            return Reaped.KEEP;
+        }
+        final long reapingAt = tombstoneReapingAt(value);
+        if (reapingAt != 0L && claimAt < reapingAt + TOMBSTONE_REAP_HANDOFF_MILLIS) {
+            // Another sweep's claim, not yet abandoned.
+            return Reaped.KEEP;
+        }
+        final BlobRegisterCasResult swapped = container.compareAndSwapRegister(
+            blobName,
+            register.get().generation(),
+            tombstone(deletedAt, claimAt)
+        );
+        return swapped.applied() ? Reaped.CLAIMED : Reaped.KEEP;
     }
 
     /**

@@ -539,9 +539,26 @@ fleet-wide term from quadratic to linear. And a cold read no longer pays one req
 ramps while the reads stay sequential and drops back to one block on a seek, so a scan of 512 blocks costs
 11 requests where it cost 512, while eight scattered reads still cost exactly eight.
 
+**The tombstone sweep no longer walks the population, and no longer loses a recreated index.** It used to
+list every descriptor and read each one, on every node, hourly — a million reads per node per hour at a
+million indices, to find the few hundred names deleted that hour — and it deleted the expired tombstones in
+one batch at the end of that walk, with nothing checking at delete time that the name had not been recreated
+since. At scale the walk takes hours, and a name recreated inside it lost its new descriptor; the collector
+then deleted the new index's shards as orphans. Now a delete also drops an empty marker into an hourly bucket
+under `tombstones/`, and the sweep reads only the markers in buckets old enough to hold an expired name — one
+listing of the buckets, then a read per deleted name. Rendezvous hashing over membership gives each bucket to
+one node, so the deployment pays once per deleted name rather than once per node. The unconditional delete
+is made safe by a claim: the sweep first swaps the tombstone to a claimed one, a create refuses to swap over
+a claim for a minute (`name_being_reclaimed`, 503), and the sweep deletes only within ten seconds of
+claiming, by its own clock. What remains is a pause between that check and the delete landing, the same
+residual every lease-timed write here carries. Tombstones written before markers existed have none and are
+never swept. Pinned by `ServerlessTombstoneSweepTests`: register reads equal at populations of 10 and 200,
+and each of the claim, the deadline, the create's refusal, the marker and bucket ownership has a planted
+defect that fails a test.
+
 **Still open, in the order the cost model ranks them:** the per-shard head poll above, which needs a signal
-carrying evidence of ownership rather than a cheaper timer; and the sweeps that walk the whole population —
-tombstones, points in time, snapshots — on a slow cadence. Neither is a request-path cost.
+carrying evidence of ownership rather than a cheaper timer; and the sweeps that still walk the whole
+population — points in time, snapshots — on a slow cadence. Neither is a request-path cost.
 
 **And the one that is not a cost at all.** Every argument above assumes `compareAndSwapRegister` behaves
 on the store underneath. The checker passes against MinIO and SeaweedFS and has never been pointed at a

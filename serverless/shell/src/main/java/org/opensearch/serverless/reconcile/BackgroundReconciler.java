@@ -215,10 +215,12 @@ public final class BackgroundReconciler implements Closeable {
                 }
             }
             // Descriptor tombstones past their quarantine, rarely: a name created and deleted daily used
-            // to poison its prefix pattern after a year, because nothing ever removed them.
-            if (reaps % TOMBSTONE_SWEEP_EVERY_REAPS == 0) {
+            // to poison its prefix pattern after a year, because nothing ever removed them. Only the
+            // buckets this node owns, so the deployment pays once per deleted name, not once per node.
+            final org.opensearch.cluster.node.DiscoveryNode self = node.localNode();
+            if (reaps % TOMBSTONE_SWEEP_EVERY_REAPS == 0 && self != null) {
                 try {
-                    collector.collectTombstones(plane, plane.clock().getAsLong());
+                    collector.collectTombstones(plane, plane.clock().getAsLong(), self.getId());
                 } catch (Exception e) {
                     logger.warn("could not sweep descriptor tombstones; the next sweep will retry", e);
                 }
