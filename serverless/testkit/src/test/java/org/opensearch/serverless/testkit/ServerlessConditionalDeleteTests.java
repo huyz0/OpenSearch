@@ -120,6 +120,39 @@ public class ServerlessConditionalDeleteTests extends OpenSearchTestCase {
     }
 
     /**
+     * With a writer holding a shard at the delete, its bytes are purged once -- at reclaim, after that writer
+     * can have stopped -- and not at the delete, where a publish it had begun could land after the purge.
+     */
+    public void testAnIndexWithAWriterIsPurgedOnceAtReclaim() throws Exception {
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(index("alpha", "uuid-alpha-busy"));
+        assertTrue(plane.heads().acquire("alpha", 0, "writer", "writer-eph", "uuid-alpha-busy").acquired());
+        final BlobPath segments = RegisterMap.shardData(BlobPath.cleanPath(), "alpha", "uuid-alpha-busy", 0).add("t=1");
+        store.blobContainer(segments).writeBlob("_0.cfs", new ByteArrayInputStream(new byte[] { 1 }), 1, false);
+
+        assertTrue(plane.deleteIndex("alpha"));
+        assertTrue("its head goes at once", plane.heads().read("alpha", 0).isEmpty());
+        assertFalse("its bytes wait for the writer to have stopped", real(store.blobContainer(segments).listBlobs()).isEmpty());
+
+        clock.addAndGet(ReclaimQueue.DEFAULT_DELAY_MILLIS + 61_000L);
+        assertTrue(drain(plane, clock.get()) >= 1);
+        assertTrue("and go at reclaim", real(store.blobContainer(segments).listBlobs()).isEmpty());
+    }
+
+    /** With no writer at the delete, the bytes go at once. */
+    public void testAnIdleIndexIsPurgedAtTheDelete() throws Exception {
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), new AtomicLong(1_000L)::get, TTL);
+        plane.createIndex(index("alpha", "uuid-alpha-idle"));
+        final BlobPath segments = RegisterMap.shardData(BlobPath.cleanPath(), "alpha", "uuid-alpha-idle", 0).add("t=1");
+        store.blobContainer(segments).writeBlob("_0.cfs", new ByteArrayInputStream(new byte[] { 1 }), 1, false);
+        assertTrue(plane.deleteIndex("alpha"));
+        assertTrue(real(store.blobContainer(segments).listBlobs()).isEmpty());
+    }
+
+    /**
      * The reclaim of an old incarnation leaves the new one's head alone, though both are named alike: a head
      * deleted by name here would let a third node take a shard its owner still holds.
      */

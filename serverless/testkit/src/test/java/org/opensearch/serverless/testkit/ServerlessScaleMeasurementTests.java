@@ -112,8 +112,8 @@ public class ServerlessScaleMeasurementTests extends OpenSearchTestCase {
         final String bucket = "scale-" + population + "-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         final BlobStore s3 = org.opensearch.repositories.s3.MinioBlobStores.create(
             endpoint(),
-            "minioadmin",
-            "minioadmin",
+            System.getProperty("tests.serverless.s3.access_key", "minioadmin"),
+            System.getProperty("tests.serverless.s3.secret_key", "minioadmin"),
             bucket,
             createTempDir()
         );
@@ -222,7 +222,13 @@ public class ServerlessScaleMeasurementTests extends OpenSearchTestCase {
     @org.junit.After
     public void removeBucketsThisTestMade() throws Exception {
         for (String bucket : created) {
-            org.opensearch.repositories.s3.MinioBlobStores.deleteBucket(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir());
+            org.opensearch.repositories.s3.MinioBlobStores.deleteBucket(
+                endpoint(),
+                System.getProperty("tests.serverless.s3.access_key", "minioadmin"),
+                System.getProperty("tests.serverless.s3.secret_key", "minioadmin"),
+                bucket,
+                createTempDir()
+            );
         }
         created.clear();
     }

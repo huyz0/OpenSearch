@@ -280,6 +280,10 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
 
             assertEquals(200, send(node, "DELETE", "/costly", null).status());
             loop.tick(clock.get());
+            // A shard with a writer at the delete has its bytes purged at reclaim, once that writer can no longer
+            // be mid-publish, rather than at the delete; on a store that keeps tombstones they go at once.
+            clock.addAndGet(org.opensearch.serverless.metadata.ReclaimQueue.DEFAULT_DELAY_MILLIS + 61_000L);
+            plane.reclaimQueue().drain(clock.get(), bucket -> true, plane::reclaim);
 
             final long after = bytesUnder(store);
             assertTrue("a deleted index must stop costing storage: " + before + " bytes before, " + after + " after", after < before / 2);

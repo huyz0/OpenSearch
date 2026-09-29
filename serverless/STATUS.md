@@ -601,9 +601,21 @@ then a delete racing a write removes the write. So `ConditionalDeleteProbe` runs
 store in use: it moves a register on through a second container and deletes through the first at the stale
 generation; a store that deletes it anyway fails, and that node keeps tombstones, markers and the sweep —
 the fallback is the whole previous path, unchanged. **MinIO (`RELEASE.2025-04-22`) fails the probe**: it
-ignores `If-Match` on `DeleteObject`, and a node on it stays on tombstones. AWS documents conditional deletes
-for S3; that has **not** been checked against real S3 here, and neither has R11's linearizability checker —
-both need an AWS account this work did not have.
+ignores `If-Match` on `DeleteObject`, and a node on it stays on tombstones. **RustFS 1.0.0 passes it**
+(`rustfs/rustfs@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`), both as one node on
+one drive and as one node over a four-drive erasure set (four tmpfs mounts, since it refuses drives sharing a
+device). Against both layouts the full conformance suite passes, including a linearizability check extended
+to histories mixing concurrent reads, swaps, create-if-absent and conditional deletes on one register — run 25
+times over per layout, 100 rounds of four contenders each — with a planted store that deletes despite a stale
+generation to show the check fails when it should. Nothing reported against earlier RustFS builds (a
+conditional delete checking `If-Match` on arrival and then deleting whatever was current) reproduced on 1.0.0.
+**That is evidence for RustFS 1.0.0, not for AWS, GCS or Azure**: R11 stays open for all three, since this
+work had no account on any of them.
+
+The extended check also found two defects in the filesystem store, fixed: a register read racing a delete
+threw `NoSuchFileException` instead of answering "absent", and starting generations were drawn from the test
+framework's per-thread seeded randomness, which handed two concurrently created registers the same one.
+Starting generations now come from one process-wide `SecureRandom`.
 
 **A compare-and-swap on a known version is one request.** With generations unique across incarnations, no
 two versions of a register have the same body, so an S3 ETag identifies a version as exactly as its
@@ -617,14 +629,18 @@ they were not. Measured on MinIO with those metrics (`ServerlessDeleteCostTests`
 | compare-and-swap on a version the container just read or wrote | GET + PUT | PUT |
 | compare-and-swap from a container that knows nothing | GET + PUT | GET + PUT |
 
-| deleting a 1-shard index with a held head | at the delete | deferred | total | PUTs |
+| deleting a 1-shard index | at the delete | deferred | total | PUTs |
 | --- | ---: | ---: | ---: | --- |
-| tombstone path (fallback; this run already has the one-PUT swap) | 7 | 8 | 15 | marker, tombstone; claim |
-| conditional path | 8 | 11 | 19 | one intent; none |
+| tombstone path (fallback; already has the one-PUT swap), idle or with a writer | 7 | 8 | 15 | marker, tombstone; claim |
+| conditional path, idle index | 8 | 6 | 14 | one intent; none |
+| conditional path, a writer holding the shard | 5 | 10 | 15 | one intent; none |
 
-The conditional path writes one object where the tombstone path wrote three, and spends nothing on
-quarantine or claims; its deferred work reads and lists more, because it re-purges the dead uuid's bytes and
-re-checks its heads — work the tombstone path never did, and leaked instead. Pinned by
+Identical request counts on MinIO, RustFS single-node and RustFS erasure. The conditional path writes one
+object where the tombstone path wrote three and spends nothing on quarantine or claims, and it purges an
+index's bytes exactly once: at the delete when nothing held a shard, and otherwise at reclaim, after any
+writer that missed the delete has stopped — a head of the dead uuid found then, re-created by such a writer,
+also triggers the purge. An earlier version purged at the delete and again at reclaim, which cost 19 requests
+per delete; the reclaim's extra listing of an already-empty bucket went too. Pinned by
 `ServerlessConditionalDeleteTests`, each with a planted defect that fails it: a stale swap cannot land on a
 recreated name (fails with generations restarting at 1); a head and a publish left by a writer that missed
 the delete are reclaimed (fails with a no-op reclaim); an old incarnation's reclaim leaves the new
@@ -643,6 +659,12 @@ and 100,000, on the branch before this work (`57b924b9840`) and after it:
 | --- | ---: | ---: | --- |
 | before: requests per node-hour | 11,834 | 101,834 | by exactly one register read per index |
 | after: requests per node-hour | 930 | 930 | no |
+
+The same run on RustFS 1.0.0, where the probe passes and the 50 deletions go the conditional way and are
+reclaimed rather than swept, is flat too: 1,006 and 1,007 requests per node-hour at 10,000 and 100,000 indices
+on one drive, 1,010 and 1,007 over the four-drive erasure set. The difference from MinIO's 930 is those 50
+reclaims — an intent read and a descriptor and head check each — and the few-request spread between runs is
+the thirty-second descriptor refresh, which runs on the wall clock.
 
 Before, 1,834 of those were the per-pass head and descriptor scans of the held shards and `P` were the sweep
 reading every descriptor. After, the head scan runs every five minutes, descriptors every thirty seconds, and

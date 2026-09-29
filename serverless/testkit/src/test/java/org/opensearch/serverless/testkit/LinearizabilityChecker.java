@@ -75,6 +75,9 @@ public final class LinearizabilityChecker {
     private record State(long generation, String value) {
     }
 
+    /** The generation of a register that does not exist, as {@code BlobRegister#ABSENT_GENERATION} reports it. */
+    private static final long ABSENT = 0L;
+
     private record DeadEnd(State state, long remaining) {
     }
 
@@ -94,6 +97,19 @@ public final class LinearizabilityChecker {
         }
         final List<RegisterHistory.Entry> entries = new ArrayList<>(history);
         entries.sort(java.util.Comparator.comparingLong(RegisterHistory.Entry::invoked));
+        // No write may produce a generation the register has held before, in any incarnation: a delete
+        // followed by a create that reused one would let a swap carrying it land on the new incarnation.
+        // Order-independent, so checked outright rather than searched.
+        final Set<Long> produced = new HashSet<>();
+        produced.add(initialGeneration);
+        for (RegisterHistory.Entry entry : entries) {
+            final long generation = entry.op() instanceof RegisterHistory.Cas cas && cas.applied() ? cas.currentGeneration()
+                : entry.op() instanceof RegisterHistory.Create create && create.applied() ? create.currentGeneration()
+                : Long.MIN_VALUE;
+            if (generation != Long.MIN_VALUE && produced.add(generation) == false) {
+                return new Verdict(false, "generation " + generation + " was produced twice. History: " + describe(entries));
+            }
+        }
         final long all = entries.size() == 64 ? -1L : (1L << entries.size()) - 1;
         final boolean found = search(entries, all, new State(initialGeneration, initialValue), new HashSet<>());
         if (found) {
@@ -146,11 +162,35 @@ public final class LinearizabilityChecker {
 
     /** The sequential specification: the state after this call, or null if a correct register could not. */
     private static State apply(State state, RegisterHistory.Op op) {
+        final boolean absent = state.generation() == ABSENT;
         if (op instanceof RegisterHistory.Read read) {
-            if (read.generation() != state.generation() || Objects.equals(read.value(), state.value()) == false) {
+            final long seen = read.generation() == RegisterHistory.ABSENT ? ABSENT : read.generation();
+            if (seen != state.generation() || Objects.equals(read.value(), state.value()) == false) {
                 return null;
             }
             return state;
+        }
+        if (op instanceof RegisterHistory.Create create) {
+            if (absent) {
+                // Nothing there: it must have created, at a generation that means present.
+                return create.applied() && create.currentGeneration() != ABSENT
+                    ? new State(create.currentGeneration(), create.value())
+                    : null;
+            }
+            // Something there: refused, reporting either what is stored or nothing at all.
+            if (create.applied() || (create.currentGeneration() != ABSENT && create.currentGeneration() != state.generation())) {
+                return null;
+            }
+            return state;
+        }
+        if (op instanceof RegisterHistory.Delete delete) {
+            if (absent == false && delete.expected() == state.generation()) {
+                // At the generation stored: it must have deleted.
+                return delete.deleted() ? new State(ABSENT, null) : null;
+            }
+            // At any other generation, or nothing there: it must have refused. A delete that removes a register
+            // at a generation it no longer holds is a delete that removed someone else's write.
+            return delete.deleted() ? null : state;
         }
         final RegisterHistory.Cas cas = (RegisterHistory.Cas) op;
         if (cas.expected() == state.generation()) {
@@ -184,6 +224,15 @@ public final class LinearizabilityChecker {
             text.append("\n  [").append(entry.invoked()).append("..").append(entry.returned()).append("] ");
             if (entry.op() instanceof RegisterHistory.Read read) {
                 text.append("read -> gen ").append(read.generation()).append(" value ").append(read.value());
+            } else if (entry.op() instanceof RegisterHistory.Create create) {
+                text.append("create ")
+                    .append(create.value())
+                    .append(" -> ")
+                    .append(create.applied() ? "applied" : "refused")
+                    .append(", gen ")
+                    .append(create.currentGeneration());
+            } else if (entry.op() instanceof RegisterHistory.Delete delete) {
+                text.append("delete expecting ").append(delete.expected()).append(" -> ").append(delete.deleted() ? "deleted" : "refused");
             } else {
                 final RegisterHistory.Cas cas = (RegisterHistory.Cas) entry.op();
                 text.append("cas expecting ")

@@ -40,7 +40,7 @@ public final class RegisterHistory {
     public static final long ABSENT = -1L;
 
     /** What a call returned, and when it was in flight. */
-    public sealed interface Op permits Read, Cas {}
+    public sealed interface Op permits Read, Cas, Create, Delete {}
 
     /**
      * A read and what it saw.
@@ -60,6 +60,26 @@ public final class RegisterHistory {
      * @param currentGeneration the generation it reported as now stored
      */
     public record Cas(long expected, String value, boolean applied, long currentGeneration) implements Op {
+    }
+
+    /**
+     * A create-if-absent: the value it tried to write, whether it applied, and the generation reported --
+     * the new one if it applied, and on a refusal either the one stored or {@code 0} for "not read".
+     *
+     * @param value the value written
+     * @param applied whether it created the register
+     * @param currentGeneration the generation reported
+     */
+    public record Create(String value, boolean applied, long currentGeneration) implements Op {
+    }
+
+    /**
+     * A conditional delete: the generation it was conditioned on, and whether it deleted.
+     *
+     * @param expected the generation it expected
+     * @param deleted whether it deleted the register
+     */
+    public record Delete(long expected, boolean deleted) implements Op {
     }
 
     /**

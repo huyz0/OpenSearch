@@ -65,8 +65,16 @@ public final class ReclaimQueue {
     private final BlobPath path;
     private volatile long delayMillis = DEFAULT_DELAY_MILLIS;
 
-    /** One deleted index and what it takes to finish deleting it. */
-    public record Intent(String name, String uuid, int shards) {
+    /**
+     * One deleted index and what it takes to finish deleting it.
+     *
+     * @param name the index name
+     * @param uuid the deleted incarnation's uuid
+     * @param shards how many shards it had
+     * @param hadWriter whether any of its shards had an owner when it was deleted: then its bytes are purged
+     *     at reclaim, once a writer that missed the delete has stopped, rather than at the delete and again
+     */
+    public record Intent(String name, String uuid, int shards, boolean hadWriter) {
     }
 
     /**
@@ -99,8 +107,15 @@ public final class ReclaimQueue {
      * @throws IOException if the intent cannot be written, in which case the delete must not proceed
      */
     public void enqueue(Intent intent, long nowMillis) throws IOException {
-        final byte[] body = ("{\"name\":\"" + intent.name() + "\",\"uuid\":\"" + intent.uuid() + "\",\"shards\":" + intent.shards() + "}")
-            .getBytes(StandardCharsets.UTF_8);
+        final byte[] body = ("{\"name\":\""
+            + intent.name()
+            + "\",\"uuid\":\""
+            + intent.uuid()
+            + "\",\"shards\":"
+            + intent.shards()
+            + ",\"had_writer\":"
+            + intent.hadWriter()
+            + "}").getBytes(StandardCharsets.UTF_8);
         final String bucket = BUCKET.format(Instant.ofEpochMilli(nowMillis + delayMillis));
         blobStore.blobContainer(path.add(bucket))
             .writeBlob(intent.name() + RegisterMap.SHARD_SEPARATOR + intent.uuid(), new ByteArrayInputStream(body), body.length, false);
@@ -173,7 +188,10 @@ public final class ReclaimQueue {
                 break;
             }
         }
-        if (kept == false && entries.listBlobs().isEmpty()) {
+        // Removed without listing it again to see that it is empty: it is. Its last page came back short and
+        // every entry was finished, and nothing is added to a bucket once it is due -- an intent is filed under
+        // the minute its delay ends in, which only a clock more than the delay behind could put in the past.
+        if (kept == false) {
             entries.delete();
         }
         return taken;
@@ -186,7 +204,8 @@ public final class ReclaimQueue {
         ) {
             final Map<String, Object> map = parser.map();
             if (map.get("name") instanceof String name && map.get("uuid") instanceof String uuid && map.get("shards") instanceof Number n) {
-                return new Intent(name, uuid, n.intValue());
+                // Absent reads as true: purging again is only a cost, and skipping it could leak.
+                return new Intent(name, uuid, n.intValue(), Boolean.FALSE.equals(map.get("had_writer")) == false);
             }
             throw new IOException("not a reclaim intent");
         }
