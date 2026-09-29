@@ -110,6 +110,14 @@ public final class BlobLeaseMembership implements MembershipSource {
     private volatile long lastIndexGeneration = BlobRegister.ABSENT_GENERATION;
     private final Set<String> enrolled = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /** How long a young snapshot is served without reading whether the members index moved; see {@link #refreshIfOlderThan}. */
+    public static final long GENERATION_PROBE_INTERVAL_MILLIS = 1_000L;
+
+    /** When {@link #refreshIfOlderThan} last read the members index's generation, in {@link System#nanoTime} terms. */
+    private final java.util.concurrent.atomic.AtomicLong generationProbedAtNanos = new java.util.concurrent.atomic.AtomicLong(
+        Long.MIN_VALUE
+    );
+
     /**
      * Each member's lease as this node last read it, kept only while its own stamped expiry is still in
      * the future. This is what makes a refresh cost one register read rather than one per member.
@@ -429,6 +437,14 @@ public final class BlobLeaseMembership implements MembershipSource {
      * listing and a read per node per search; the snapshot is good for as long as a lease is, so a
      * fraction of the lease's life is the right age.
      *
+     * <p><b>The young-snapshot probe is capped here, for every caller.</b> Within that age a join is still
+     * detected, by one read of the members index's generation -- but that read was made on every call, and
+     * every call is a request: the health endpoint a load balancer polls, stats, the node listings. Search
+     * alone capped it, in its own handler. So the probe is made at most once per
+     * {@link #GENERATION_PROBE_INTERVAL_MILLIS} of wall-clock time and calls in between answer from the
+     * snapshot: a node that joined is seen up to that much later, and nothing a request path asks costs a
+     * read more often than that.
+     *
      * @param maxAgeMillis how old the snapshot may be
      * @return the live members
      * @throws IOException if the store cannot be read
@@ -439,9 +455,21 @@ public final class BlobLeaseMembership implements MembershipSource {
         if (lastRefreshedAt == Long.MIN_VALUE || now - lastRefreshedAt >= maxAgeMillis) {
             return refresh();
         }
+        // Wall-clock rather than the plane's clock, which a test may hold still: a probe that never came
+        // due would hide every join from a node whose snapshot stays young.
+        final long nowNanos = System.nanoTime();
+        final long probedAt = generationProbedAtNanos.get();
+        if (probedAt != Long.MIN_VALUE
+            && nowNanos - probedAt < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(GENERATION_PROBE_INTERVAL_MILLIS)) {
+            return observed;
+        }
+        if (generationProbedAtNanos.compareAndSet(probedAt, nowNanos) == false) {
+            // Another request is probing this instant; its answer is as good as this one's would be.
+            return observed;
+        }
         // Young enough, but a join or a clean leave moves the index's generation, and one register read
-        // tells whether it moved: a node that just joined is visible to the next request rather than to
-        // the first one after the snapshot ages out.
+        // tells whether it moved: a node that just joined is visible within a probe interval rather than
+        // only once the snapshot ages out.
         final Optional<BlobRegister> index = container.readRegister(MEMBERS);
         if (index.isPresent() && index.get().generation() == lastIndexGeneration) {
             return observed;

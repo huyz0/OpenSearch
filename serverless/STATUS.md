@@ -499,7 +499,7 @@ in ways worth recording, because the corrections are more instructive than the f
 | A single write cost one PUT; concurrent writes now share one | cost, the dominant term | `WalGroupCommitter` |
 | A seal deleted a concurrently-written seal it never merged, widening a replay cutoff | data loss | `WalStore#sealAt` |
 | A zombie's records under a dead term were reclaimed once and then never | storage leak | `WalStore#onPublished` |
-| A descriptor was read from the store on every write, get and search | cost, per request | `MetadataPlane#resolveForRouting` |
+| A descriptor was read from the store on every write (get and search still read it; see below) | cost, per request | `MetadataPlane#resolveForRouting` |
 | Deletes were issued one blob at a time where the container batches a thousand | cost | `ShardHeadStore`, `DescriptorStore` |
 | A sweep read one index's descriptor once per shard rather than once per index | cost | `GarbageCollector` |
 | Two cost assertions had been failing since the rebase, unnoticed because `s3Test` skips without an endpoint | stale test | `ServerlessCostTests` |
@@ -524,9 +524,22 @@ notification. **Ranking by "looks redundant" is what produced those; ranking by 
 requests, shards, indices, nodes, bytes — is what corrected them.**
 
 **Two costs that scale with load rather than with the deployment, and only one is fixed.** A descriptor
-read is gone from the request path, answered from a read taken within the last second; a stale answer
-cannot misroute a write, because the uuid is checked again where the write lands and a mismatch is a
-retryable refusal. The per-shard head scan is the other, and it is **not** fixed: it can be put on an
+read is gone from the write path, answered from a read taken within the last second. Search, multi-search,
+get and multi-get still read it on every request; an earlier version of this paragraph and the table above
+said otherwise, and the code never did.
+
+**And the argument for that cache is wrong in one case, which is an open correctness bug.** It said a stale
+answer cannot misroute a write because the uuid is checked again where the write lands. That holds when the
+old incarnation's shard is no longer open on the landing node; it does not when it still is. Another node
+deletes and recreates an index; this node, having resolved the name within the last second, still holds the
+old incarnation's shard open, and routes by the cached descriptor, whose uuid is the old one — so the uuid
+check matches the old shard and the write is acknowledged into an index that has been deleted. Reproduced
+through `PUT /{index}/_doc` (a 201, durable in the log). `ServerlessRoutingFreshnessTests` did not catch it
+because it writes through `ShardOperations`, which reads the descriptor fresh. Extending the cache to reads
+would carry the same window to them, which is why it has not been. The window is at most the cache's one
+second after this node's last resolution of the name, and only on a node still holding the old shard.
+
+The per-shard head scan is the other, and it is **not** fixed: it can be put on an
 interval, and that is built, measured and off by default, because the saving is bought with
 ownership-detection latency and three existing tests encode the current bargain as a guarantee. Making it
 genuinely flat needs a signal carrying evidence of ownership; a revocation marker is not written atomically
@@ -538,6 +551,13 @@ cannot have expired — six registers over five members on a cold refresh, one o
 fleet-wide term from quadratic to linear. And a cold read no longer pays one request per block: read-ahead
 ramps while the reads stay sequential and drops back to one block on a seek, so a scan of 512 blocks costs
 11 requests where it cost 512, while eight scattered reads still cost exactly eight.
+
+**The membership probe is capped for every request path, not only search.** Within a young snapshot a join
+is detected by one read of the members index's generation, and that read was made on every call: every
+health check a load balancer sends, every stats call and node listing. Search had capped it in its own
+handler. The cap now lives in `BlobLeaseMembership#refreshIfOlderThan` — at most one probe a second per
+node, wall-clock — and search's copy is gone. `ServerlessRequestPathCostTests` counts it: ten health checks
+in well under a second read the members index at most once, and fail with the cap removed.
 
 **The tombstone sweep no longer walks the population, and no longer loses a recreated index.** It used to
 list every descriptor and read each one, on every node, hourly — a million reads per node per hour at a
