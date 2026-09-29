@@ -114,6 +114,31 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
     }
 
     /**
+     * Whether this store honours {@code If-Match} on {@code DeleteObject}, answered by the same probe a node
+     * runs before it stops writing tombstones.
+     *
+     * <p>Reported rather than asserted either way: a store that ignores the condition is not a broken store,
+     * it is one the shell keeps tombstones for, and which it is belongs in the run's output. What is asserted
+     * is that the answer is the one {@code tests.serverless.s3.conditional_delete} says to expect, when set.
+     */
+    public void testWhetherThisStoreHonoursAConditionalDelete() throws Exception {
+        final String endpoint = endpoint();
+        assumeTrue("no S3-compatible endpoint at " + endpoint + "; start one with: " + howToStart(), reachable(endpoint));
+        final String bucket = "r11-" + randomAlphaOfLength(12).toLowerCase(java.util.Locale.ROOT);
+        final var store = MinioBlobStores.create(endpoint, accessKey(), secretKey(), bucket, createTempDir());
+        created.add(bucket);
+        final boolean honoured = org.opensearch.serverless.metadata.ConditionalDeleteProbe.honoured(
+            store,
+            BlobPath.cleanPath().add("probe")
+        );
+        logger.info("conformance: {} {} If-Match on DeleteObject", endpoint, honoured ? "honours" : "does NOT honour");
+        final String expected = System.getProperty("tests.serverless.s3.conditional_delete");
+        if (expected != null) {
+            assertEquals("the probe's answer for " + endpoint, Boolean.parseBoolean(expected), honoured);
+        }
+    }
+
+    /**
      * The suite must discriminate <em>on this transport</em>, not merely on a filesystem.
      *
      * <p>{@code ConformanceSuiteSelfTests} already plants these defects over {@code FsBlobContainer},

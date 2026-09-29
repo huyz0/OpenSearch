@@ -81,6 +81,31 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns the container path holding reclaim intents, bucketed by the minute they fall due.
+     *
+     * <p>A delete writes one before it removes the descriptor: the index's name, uuid and shard count, which
+     * is everything needed to finish deleting it later without the descriptor. A reclaimer takes each once
+     * it is due and removes whatever outlived the delete -- a head re-created by a writer that had not yet
+     * noticed, blobs published by one -- before dropping the intent.
+     *
+     * @param base the deployment's base path
+     * @return the reclaim container path; each due-minute bucket is a child of it
+     */
+    public static BlobPath reclaim(BlobPath base) {
+        return base.add("reclaim");
+    }
+
+    /**
+     * Returns the container path the conditional-delete probe writes to, and removes from again.
+     *
+     * @param base the deployment's base path
+     * @return the probe container path
+     */
+    public static BlobPath probe(BlobPath base) {
+        return base.add("probe");
+    }
+
+    /**
      * Returns the container path holding frozen views of an index.
      *
      * <p>Its own container because the sweep has to list them all, and a listing that also had to step over

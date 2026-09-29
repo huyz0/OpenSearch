@@ -221,6 +221,11 @@ public final class BackgroundReconciler implements Closeable {
             if (reaps % TOMBSTONE_SWEEP_EVERY_REAPS == 0 && self != null) {
                 sweepTombstonesOffThePass(self.getId());
             }
+            // And the deletes whose reclaim intents have fallen due, every reap: an intent is due minutes
+            // after its delete, not hours, and the queue lists only the buckets that are.
+            if (self != null) {
+                reclaimOffThePass(self.getId());
+            }
         }
         // One small register read: the stored scripts are re-read only when their marker has moved, which
         // is how a script put on another node reaches this one without a listing per pass.
@@ -561,6 +566,39 @@ public final class BackgroundReconciler implements Closeable {
             sweepingTombstones.set(false);
             logger.warn("could not start a tombstone sweep; the next pass that is due will try again", e);
         }
+    }
+
+    private final java.util.concurrent.atomic.AtomicBoolean reclaiming = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile java.util.concurrent.Future<?> reclaimSweep = java.util.concurrent.CompletableFuture.completedFuture(null);
+
+    /** Drains the due reclaim intents this node owns on the generic pool, unless a drain is still running. */
+    private void reclaimOffThePass(String selfId) {
+        if (reclaiming.compareAndSet(false, true) == false) {
+            return;
+        }
+        try {
+            reclaimSweep = node.threadPool().generic().submit(() -> {
+                try {
+                    collector.collectReclaims(plane, plane.clock().getAsLong(), selfId);
+                } catch (Exception e) {
+                    logger.warn("could not drain the reclaim queue; the next reap will retry", e);
+                } finally {
+                    reclaiming.set(false);
+                }
+            });
+        } catch (RuntimeException e) {
+            reclaiming.set(false);
+            logger.warn("could not start draining the reclaim queue; the next reap will try again", e);
+        }
+    }
+
+    /**
+     * Returns the most recently started reclaim drain, for a caller that needs to wait on it.
+     *
+     * @return the drain's future, complete if none is running
+     */
+    public java.util.concurrent.Future<?> reclaimSweep() {
+        return reclaimSweep;
     }
 
     /**

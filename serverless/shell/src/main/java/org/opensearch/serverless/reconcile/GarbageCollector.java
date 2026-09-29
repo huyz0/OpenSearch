@@ -480,12 +480,42 @@ public final class GarbageCollector {
     }
 
     /**
+     * Finishes the deletes whose intents have fallen due, in the minute buckets this node owns.
+     *
+     * <p>Rendezvous over membership, like the tombstone sweep: each bucket is drained by one node in the
+     * common case, and by two harmlessly when views of membership differ, since every step of a reclaim is
+     * conditional or scoped to a dead uuid.
+     *
+     * @param plane the metadata plane
+     * @param nowMillis the plane's clock
+     * @param selfId this node's id
+     * @return how many intents were taken
+     * @throws IOException if membership or the queue cannot be read
+     */
+    public int collectReclaims(MetadataPlane plane, long nowMillis, String selfId) throws IOException {
+        final java.util.Set<String> members = new java.util.TreeSet<>();
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().refreshIfOlderThan(plane.leaseTtlMillis() / 2)) {
+            members.add(lease.nodeId());
+        }
+        members.add(selfId);
+        return plane.reclaimQueue()
+            .drain(
+                nowMillis,
+                bucket -> selfId.equals(org.opensearch.serverless.cluster.Rendezvous.owner("reclaim/" + bucket, members)),
+                plane::reclaim
+            );
+    }
+
+    /**
      * Removes descriptor tombstones older than the quarantine, from the hourly buckets this node owns.
      *
      * <p>Every node runs the sweep, and each takes the buckets that rendezvous hashing over the live
      * members hands it, so a deployment pays for each deleted name once rather than once per node. Views
      * of membership can differ; a bucket two nodes both take is contended on the tombstone's claim, and one
      * nobody takes this pass is taken on a later one.
+     *
+     * <p>Only tombstones left by a store that does not honour a conditional delete, and by deletes made
+     * before the store was known to: where it does, a delete leaves none (see {@link #collectReclaims}).
      *
      * @param plane the metadata plane
      * @param nowMillis the plane's clock

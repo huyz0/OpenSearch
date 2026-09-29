@@ -224,6 +224,44 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     /**
+     * A register created again does not reuse its predecessor's generation, so a swap carrying a generation
+     * read before the delete is refused by what was created after it. This is what lets a deleted register
+     * be removed outright rather than tombstoned.
+     */
+    public void testARecreatedRegisterDoesNotReuseAGeneration() throws Exception {
+        final BlobContainer container = newContainer();
+        container.createRegisterIfAbsent("head", bytes("first"));
+        final long before = container.readRegister("head").orElseThrow().generation();
+        container.deleteBlobsIgnoringIfNotExists(java.util.List.of("head"));
+        // The same bytes again: a store keying its token on content must still not repeat one.
+        assertTrue(container.createRegisterIfAbsent("head", bytes("first")).applied());
+        final long after = container.readRegister("head").orElseThrow().generation();
+        assertNotEquals("a recreated register must not reuse a generation", before, after);
+        assertFalse(
+            "a swap carrying the old incarnation's generation must lose",
+            container.compareAndSwapRegister("head", before, bytes("stale")).applied()
+        );
+        assertEquals("first", container.readRegister("head").orElseThrow().value().utf8ToString());
+    }
+
+    /** A conditional delete removes a register only at the generation it holds. */
+    public void testAConditionalDeleteRefusesAStaleGeneration() throws Exception {
+        final BlobContainer container = newContainer();
+        container.createRegisterIfAbsent("head", bytes("v1"));
+        final long stale = container.readRegister("head").orElseThrow().generation();
+        final long current = container.compareAndSwapRegister("head", stale, bytes("v2")).currentGeneration();
+
+        assertFalse(
+            "a delete at a generation the register no longer holds must be refused",
+            container.deleteRegisterIfUnchanged("head", stale)
+        );
+        assertEquals("v2", container.readRegister("head").orElseThrow().value().utf8ToString());
+        assertTrue(container.deleteRegisterIfUnchanged("head", current));
+        assertTrue("and one at the generation it holds removes it", container.readRegister("head").isEmpty());
+        assertFalse("an absent register is not deleted twice", container.deleteRegisterIfUnchanged("head", current));
+    }
+
+    /**
      * A concurrent workload must have a sequential order that explains it.
      *
      * <p><b>Why this is not one more property.</b> The tests above ask questions somebody thought of: two

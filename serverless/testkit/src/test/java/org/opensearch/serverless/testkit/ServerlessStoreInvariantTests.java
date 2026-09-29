@@ -72,6 +72,8 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
     public void testAPrefixPatternCountsOnlyLiveNamesAgainstItsCap() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = planeOver(new FsBlobStore(1024, createTempDir(), false), clock);
+        // The tombstone path, which is the fallback for a store that does not honour a conditional delete.
+        plane.descriptors().setConditionalDelete(false);
         for (int day = 1; day <= 7; day++) {
             plane.createIndex(new IndexDescriptor("logs-" + day, "uuid-logs-0000000000" + day, 1, MAPPING, null));
         }

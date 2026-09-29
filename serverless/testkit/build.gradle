@@ -38,6 +38,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessBucketContentionTests.class'
   exclude '**/ServerlessCostTests.class'
   exclude '**/ServerlessScaleMeasurementTests.class'
+  exclude '**/ServerlessDeleteCostTests.class'
   exclude '**/ServerlessRealPluginTests.class'
   exclude '**/ServerlessTlsTests.class'
 }
@@ -82,6 +83,7 @@ tasks.register('s3Test', Test) {
   include '**/ServerlessOnObjectStoreTests.class'
   include '**/ServerlessCostTests.class'
   include '**/ServerlessScaleMeasurementTests.class'
+  include '**/ServerlessDeleteCostTests.class'
   systemProperty 'opensearch.path.conf', 'config'
   systemProperty 'tests.security.manager', 'false'
   // Netty refuses a second attempt to set its global processor count, and both the node's transport and
