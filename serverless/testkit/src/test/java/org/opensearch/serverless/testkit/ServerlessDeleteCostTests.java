@@ -53,6 +53,14 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
     private final List<String> created = new ArrayList<>();
 
+    private static String accessKey() {
+        return System.getProperty("tests.serverless.s3.access_key", "minioadmin");
+    }
+
+    private static String secretKey() {
+        return System.getProperty("tests.serverless.s3.secret_key", "minioadmin");
+    }
+
     private String endpoint() {
         return System.getProperty(MinioBlobContainerConformanceTests.ENDPOINT, DEFAULT_ENDPOINT);
     }
@@ -61,7 +69,7 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
         assumeTrue("no S3-compatible endpoint at " + endpoint(), reachable(endpoint()));
         final String name = "delcost-" + randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
         created.add(name);
-        return org.opensearch.repositories.s3.MinioBlobStores.create(endpoint(), "minioadmin", "minioadmin", name, createTempDir());
+        return org.opensearch.repositories.s3.MinioBlobStores.create(endpoint(), accessKey(), secretKey(), name, createTempDir());
     }
 
     /** A swap on a version this container knows is one PUT; from a container that does not, a GET and a PUT. */
@@ -86,47 +94,61 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
     }
 
     /**
-     * What deleting an index costs at the moment of the delete and in its deferred work, on each path.
+     * What deleting an index costs at the moment of the delete and in its deferred work, on each path, for an
+     * idle index and for one with a writer holding its shard.
      *
-     * <p>Asserted on where the writes go, which is what the design changes. The tombstone path writes a marker
-     * and a tombstone at the delete and a claim later; the conditional path writes one reclaim intent and
-     * nothing else -- no quarantine, no claim. Its deferred work lists and reads more than the tombstone
-     * sweep does, because it re-purges the deleted uuid's bytes and re-checks its heads: the tombstone path
-     * never did that, and leaked what a writer that missed the delete published.
+     * <p>The writes are what the design changes: the tombstone path writes a marker and a tombstone at the
+     * delete and a claim later; the conditional path writes one reclaim intent and nothing else. And its bytes
+     * are purged once -- at the delete if nothing was writing, at reclaim if something was -- so in neither case
+     * may it cost more requests than the tombstone path.
      */
     public void testTheRequestsADeleteCostsOnEachPath() throws Exception {
-        final Phases tombstoned = deleteCost(false);
-        final Phases conditional = deleteCost(true);
-        logger.info(
-            "delete cost: tombstone path {} at the delete + {} deferred (total {}); conditional path {} at the delete + {} deferred (total {})",
-            tombstoned.atDelete(),
-            tombstoned.deferred(),
-            total(tombstoned.atDelete()) + total(tombstoned.deferred()),
-            conditional.atDelete(),
-            conditional.deferred(),
-            total(conditional.atDelete()) + total(conditional.deferred())
-        );
-        assertEquals(
-            "the tombstone path writes a marker and a tombstone at the delete",
-            2L,
-            (long) tombstoned.atDelete().getOrDefault("PutObject", 0L)
-        );
-        assertEquals("and a claim later", 1L, (long) tombstoned.deferred().getOrDefault("PutObject", 0L));
-        assertEquals(
-            "the conditional path writes one intent at the delete",
-            1L,
-            (long) conditional.atDelete().getOrDefault("PutObject", 0L)
-        );
-        assertEquals("and nothing later: no quarantine, no claim", 0L, (long) conditional.deferred().getOrDefault("PutObject", 0L));
+        for (boolean writer : new boolean[] { false, true }) {
+            final Phases tombstoned = deleteCost(false, writer);
+            final Phases conditional = deleteCost(true, writer);
+            final long tombstonedTotal = total(tombstoned.atDelete()) + total(tombstoned.deferred());
+            final long conditionalTotal = total(conditional.atDelete()) + total(conditional.deferred());
+            logger.info(
+                "delete cost ({}): tombstone path {} at the delete + {} deferred (total {}); conditional path {} at the delete + {} deferred (total {})",
+                writer ? "a writer holding the shard" : "idle",
+                tombstoned.atDelete(),
+                tombstoned.deferred(),
+                tombstonedTotal,
+                conditional.atDelete(),
+                conditional.deferred(),
+                conditionalTotal
+            );
+            assertEquals(
+                "the tombstone path writes a marker and a tombstone at the delete",
+                2L,
+                (long) tombstoned.atDelete().getOrDefault("PutObject", 0L)
+            );
+            assertEquals("and a claim later", 1L, (long) tombstoned.deferred().getOrDefault("PutObject", 0L));
+            assertEquals(
+                "the conditional path writes one intent at the delete",
+                1L,
+                (long) conditional.atDelete().getOrDefault("PutObject", 0L)
+            );
+            assertEquals("and nothing later: no quarantine, no claim", 0L, (long) conditional.deferred().getOrDefault("PutObject", 0L));
+            assertTrue(
+                "the conditional path must cost no more requests than the tombstone path: "
+                    + conditionalTotal
+                    + " against "
+                    + tombstonedTotal,
+                conditionalTotal <= tombstonedTotal
+            );
+        }
     }
 
-    private Phases deleteCost(boolean conditional) throws Exception {
+    private Phases deleteCost(boolean conditional, boolean writer) throws Exception {
         final BlobStore store = bucket();
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, 30_000L);
         plane.descriptors().setConditionalDelete(conditional);
         plane.createIndex(new IndexDescriptor("doomed", "uuid-doomed", 1, MAPPING, null));
-        assertTrue(plane.heads().acquire("doomed", 0, "owner", "owner-eph", "uuid-doomed").acquired());
+        if (writer) {
+            assertTrue(plane.heads().acquire("doomed", 0, "owner", "owner-eph", "uuid-doomed").acquired());
+        }
 
         Map<String, Long> before = org.opensearch.repositories.s3.MinioBlobStores.requestCounts(store);
         assertTrue(plane.deleteIndex("doomed"));
@@ -176,7 +198,7 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
     @org.junit.After
     public void removeBucketsThisTestMade() throws Exception {
         for (String bucket : created) {
-            org.opensearch.repositories.s3.MinioBlobStores.deleteBucket(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir());
+            org.opensearch.repositories.s3.MinioBlobStores.deleteBucket(endpoint(), accessKey(), secretKey(), bucket, createTempDir());
         }
         created.clear();
     }

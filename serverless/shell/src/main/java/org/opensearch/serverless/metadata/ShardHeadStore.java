@@ -322,7 +322,26 @@ public final class ShardHeadStore {
      * @throws IOException if a head cannot be read or deleted
      */
     public int deleteAllOf(String indexName, int numberOfShards, String indexUuid) throws IOException {
-        int removed = 0;
+        return deleteIfUnchanged(readAllOf(indexName, numberOfShards, indexUuid));
+    }
+
+    /** A head of one incarnation, as read, and the generation it was read at. */
+    public record HeadAt(String blobName, long generation, ShardHead head) {
+    }
+
+    /**
+     * Reads the heads of one incarnation of an index: those naming its uuid, or naming none -- a head that
+     * predates heads recording their incarnation, which activation always does now, so it cannot be a later
+     * incarnation's. A head naming another uuid is a later incarnation's and is not returned.
+     *
+     * @param indexName the index
+     * @param numberOfShards how many shards the incarnation had
+     * @param indexUuid the incarnation's uuid
+     * @return the heads found, each with the generation it was read at
+     * @throws IOException if a head cannot be read
+     */
+    public List<HeadAt> readAllOf(String indexName, int numberOfShards, String indexUuid) throws IOException {
+        final List<HeadAt> found = new ArrayList<>();
         for (int shard = 0; shard < numberOfShards; shard++) {
             final String name = RegisterMap.shardHeadBlob(indexName, shard);
             final Optional<BlobRegister> existing = container.readRegister(name);
@@ -333,11 +352,24 @@ public final class ShardHeadStore {
             try (InputStream in = existing.get().value().streamInput()) {
                 head = ShardHead.fromStream(in);
             }
-            // A head naming another uuid is a later incarnation's and is left. One naming none predates
-            // heads recording their incarnation -- activation always records it now -- so it cannot be a
-            // later incarnation's, and goes like this one's.
-            final boolean ours = head.indexUuid() == null || indexUuid.equals(head.indexUuid());
-            if (ours && container.deleteRegisterIfUnchanged(name, existing.get().generation())) {
+            if (head.indexUuid() == null || indexUuid.equals(head.indexUuid())) {
+                found.add(new HeadAt(name, existing.get().generation(), head));
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Deletes heads read by {@link #readAllOf}, each only if it has not changed since.
+     *
+     * @param heads the heads, as read
+     * @return how many were removed
+     * @throws IOException if a delete fails
+     */
+    public int deleteIfUnchanged(List<HeadAt> heads) throws IOException {
+        int removed = 0;
+        for (HeadAt head : heads) {
+            if (container.deleteRegisterIfUnchanged(head.blobName(), head.generation())) {
                 removed++;
             }
         }

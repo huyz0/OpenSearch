@@ -34,6 +34,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessFleetTests.class'
   exclude '**/MinioBlobContainerConformanceTests.class'
   exclude '**/SeaweedBlobContainerConformanceTests.class'
+  exclude '**/Rustfs*BlobContainerConformanceTests.class'
   exclude '**/ServerlessOnObjectStoreTests.class'
   exclude '**/ServerlessBucketContentionTests.class'
   exclude '**/ServerlessCostTests.class'
@@ -80,6 +81,7 @@ tasks.register('s3Test', Test) {
   classpath = sourceSets.test.runtimeClasspath
   include '**/MinioBlobContainerConformanceTests.class'
   include '**/SeaweedBlobContainerConformanceTests.class'
+  include '**/Rustfs*BlobContainerConformanceTests.class'
   include '**/ServerlessOnObjectStoreTests.class'
   include '**/ServerlessCostTests.class'
   include '**/ServerlessScaleMeasurementTests.class'

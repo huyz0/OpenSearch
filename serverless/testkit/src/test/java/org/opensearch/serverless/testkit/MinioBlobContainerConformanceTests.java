@@ -90,6 +90,19 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
         return store.blobContainer(BlobPath.cleanPath().add("conformance"));
     }
 
+    private Boolean honours;
+
+    @Override
+    protected boolean honoursConditionalDelete() throws Exception {
+        if (honours == null) {
+            final String bucket = "r11-" + randomAlphaOfLength(12).toLowerCase(java.util.Locale.ROOT);
+            final var store = MinioBlobStores.create(endpoint(), accessKey(), secretKey(), bucket, createTempDir());
+            created.add(bucket);
+            honours = org.opensearch.serverless.metadata.ConditionalDeleteProbe.honoured(store, BlobPath.cleanPath().add("probe"));
+        }
+        return honours;
+    }
+
     /** Buckets this test made, so the next run does not inherit them. */
     private final java.util.List<String> created = new java.util.ArrayList<>();
 

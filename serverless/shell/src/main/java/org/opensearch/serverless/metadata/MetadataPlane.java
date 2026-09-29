@@ -377,12 +377,18 @@ public final class MetadataPlane {
             return false;
         }
         final boolean conditional = descriptors.conditionalDelete();
+        // This incarnation's heads, read once: whether any shard has a writer decides when the bytes are
+        // purged, and they are deleted below at exactly the generations read here.
+        final List<ShardHeadStore.HeadAt> owned = conditional
+            ? heads.readAllOf(indexName, descriptor.get().numberOfShards(), descriptor.get().uuid())
+            : List.of();
+        final boolean hadWriter = owned.stream().anyMatch(head -> head.head().ownerNodeId() != null);
         if (conditional) {
             // Before anything is removed, so no crash after this point can leave heads or bytes that
             // nothing names. A delete that then loses leaves an intent naming a live index, which the
             // reclaimer drops. See ReclaimQueue.
             reclaimQueue.enqueue(
-                new ReclaimQueue.Intent(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards()),
+                new ReclaimQueue.Intent(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards(), hadWriter),
                 clock.getAsLong()
             );
         }
@@ -397,7 +403,7 @@ public final class MetadataPlane {
         // incarnation's heads and only as they were read: the name is free from the moment the
         // descriptor went, and a head deleted by name could be a new incarnation's (see deleteAllOf).
         if (conditional) {
-            heads.deleteAllOf(indexName, descriptor.get().numberOfShards(), descriptor.get().uuid());
+            heads.deleteIfUnchanged(owned);
         } else {
             heads.deleteAllFor(indexName, descriptor.get().numberOfShards());
         }
@@ -422,7 +428,13 @@ public final class MetadataPlane {
         // in the way nor visible. So they are storage nothing automatic reclaims: the per-shard sweep runs
         // only for shards of live indices, and GarbageCollector#collectOrphanedShards, which would find
         // them, is the operator's sweep and is on no loop. See serverless/STATUS.md.
-        purgeShardData(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards());
+        //
+        // Where the delete is conditional and a shard had a writer, not now: that writer may yet publish
+        // before it notices, and purging now would only have to be done again once it has stopped. The
+        // reclaim does it then, once. With no writer there is nothing to wait for, and the bytes go now.
+        if (conditional == false || hadWriter == false) {
+            purgeShardData(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards());
+        }
         return true;
     }
 
@@ -1733,8 +1745,12 @@ public final class MetadataPlane {
         if (current.index() != null && intent.uuid().equals(current.index().uuid())) {
             return;
         }
-        heads.deleteAllOf(intent.name(), intent.shards(), intent.uuid());
-        purgeShardData(intent.name(), intent.uuid(), intent.shards());
+        // A head of the dead uuid found now was re-created by a writer that missed the delete, which may
+        // have published too; that is the one sign a delete with no writer at the time left anything behind.
+        final int reappeared = heads.deleteAllOf(intent.name(), intent.shards(), intent.uuid());
+        if (intent.hadWriter() || reappeared > 0) {
+            purgeShardData(intent.name(), intent.uuid(), intent.shards());
+        }
     }
 
     /**
