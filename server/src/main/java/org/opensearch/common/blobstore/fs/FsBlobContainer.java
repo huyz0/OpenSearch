@@ -511,10 +511,50 @@ public class FsBlobContainer extends AbstractBlobContainer {
                     return BlobRegisterCasResult.conflict(currentGeneration);
                 }
 
-                long newGeneration = currentGeneration + 1;
+                long newGeneration = currentGeneration == BlobRegister.ABSENT_GENERATION
+                    ? BlobRegister.initialGeneration()
+                    : currentGeneration + 1;
                 writeRegisterUnderLock(channel, newGeneration, newValue);
                 return BlobRegisterCasResult.applied(newGeneration);
             }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Deletes a register if it still holds the expected generation.
+     *
+     * <p>Emptied under both locks -- an empty file reads as absent -- and then removed while the in-process
+     * lock is still held, so no writer in this JVM can land between the compare and the removal. A writer in
+     * another process could, in the instant between releasing the file lock and removing the file; a
+     * filesystem repository shared between processes is a test and development arrangement, and it is the
+     * one place this leaves a gap.
+     */
+    @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        Path registerPath = path.resolve(blobName);
+        if (Files.exists(registerPath) == false) {
+            return false;
+        }
+        ReentrantLock lock = registerLockFor(registerPath);
+        lock.lock();
+        try {
+            try (FileChannel channel = FileChannel.open(registerPath, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                try (FileLock fileLock = channel.lock()) {
+                    assert fileLock != null;
+                    Optional<BlobRegister> current = readRegisterUnderLock(channel);
+                    if (current.isEmpty() || current.get().generation() != expectedGeneration) {
+                        return false;
+                    }
+                    channel.truncate(0);
+                    channel.force(true);
+                }
+            } catch (java.nio.file.NoSuchFileException e) {
+                return false;
+            }
+            Files.deleteIfExists(registerPath);
+            return true;
         } finally {
             lock.unlock();
         }

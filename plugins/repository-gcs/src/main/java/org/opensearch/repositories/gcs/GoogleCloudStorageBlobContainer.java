@@ -133,6 +133,11 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        return blobStore.deleteRegisterIfUnchanged(buildKey(blobName), expectedGeneration);
+    }
+
+    @Override
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
         return blobStore.compareAndSwapRegister(buildKey(blobName), expectedGeneration, newValue);

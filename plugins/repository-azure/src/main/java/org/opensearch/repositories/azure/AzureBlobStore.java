@@ -459,7 +459,11 @@ public class AzureBlobStore implements BlobStore {
             return BlobRegisterCasResult.conflict(currentGeneration);
         }
 
-        final long newGeneration = expectedGeneration + 1;
+        // A random start rather than 1, so generations never repeat across a register's incarnations; see
+        // BlobRegister#initialGeneration.
+        final long newGeneration = expectedGeneration == BlobRegister.ABSENT_GENERATION
+            ? BlobRegister.initialGeneration()
+            : expectedGeneration + 1;
         final byte[] bytesToWrite = serializeRegister(newGeneration, newValue);
         final BlobRequestConditions conditions = new BlobRequestConditions();
         if (currentETag == null) {
@@ -489,6 +493,42 @@ public class AzureBlobStore implements BlobStore {
             if (ifMatchConflict || ifNoneMatchConflict) {
                 long actualGeneration = readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
                 return BlobRegisterCasResult.conflict(actualGeneration);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Deletes the register only if it still holds {@code expectedGeneration}: its ETag is read with its
+     * generation, and the delete carries {@code If-Match} on that ETag, which Azure evaluates atomically
+     * against the live blob. A write landing after the read is refused, not deleted.
+     */
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws URISyntaxException, IOException {
+        final Tuple<BlobServiceClient, Supplier<Context>> client = client();
+        final BlobContainerClient blobContainer = client.v1().getBlobContainerClient(container);
+        final BlobClient blob = blobContainer.getBlobClient(blobName);
+        final String eTag;
+        try {
+            final BlobDownloadContentResponse response = AccessController.doPrivileged(
+                () -> blob.downloadContentWithResponse(null, null, timeout(), client.v2().get())
+            );
+            if (deserializeRegister(response.getValue().toBytes()).generation() != expectedGeneration) {
+                return false;
+            }
+            eTag = response.getDeserializedHeaders().getETag();
+        } catch (final BlobStorageException e) {
+            if (e.getStatusCode() == HttpURLConnection.HTTP_NOT_FOUND) {
+                return false;
+            }
+            throw e;
+        }
+        final BlobRequestConditions conditions = new BlobRequestConditions().setIfMatch(eTag);
+        try {
+            AccessController.doPrivileged(() -> blob.deleteWithResponse(null, conditions, timeout(), client.v2().get()));
+            return true;
+        } catch (final BlobStorageException e) {
+            if (e.getStatusCode() == HttpURLConnection.HTTP_PRECON_FAILED || e.getStatusCode() == HttpURLConnection.HTTP_NOT_FOUND) {
+                return false;
             }
             throw e;
         }

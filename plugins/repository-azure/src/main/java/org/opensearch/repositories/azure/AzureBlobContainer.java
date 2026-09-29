@@ -247,6 +247,15 @@ public class AzureBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        try {
+            return blobStore.deleteRegisterIfUnchanged(buildKey(blobName), expectedGeneration);
+        } catch (URISyntaxException | BlobStorageException e) {
+            throw new IOException("Can not conditionally delete register " + blobName, e);
+        }
+    }
+
+    @Override
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
         try {

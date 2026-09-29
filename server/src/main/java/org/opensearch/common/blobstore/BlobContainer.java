@@ -478,4 +478,28 @@ public interface BlobContainer {
     default BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
         return compareAndSwapRegister(blobName, BlobRegister.ABSENT_GENERATION, value);
     }
+
+    /**
+     * Deletes a register only if it still holds {@code expectedGeneration}, with the backend's own
+     * conditional delete (S3 and Azure If-Match on the object's ETag, a GCS generation precondition, a
+     * lock on a filesystem).
+     *
+     * <p>What lets a caller delete a register outright rather than leave a tombstone in its place. An
+     * unconditional delete races a concurrent write: it can remove a value written a moment after the
+     * caller last read it. And together with {@link BlobRegister#initialGeneration()} -- a register
+     * created again starts at a generation its predecessor almost surely never had -- a compare-and-swap
+     * carrying a generation from before the delete cannot land on what is created after it.
+     *
+     * <p><b>Not every store that answers the call honours the condition.</b> An S3-compatible store may
+     * accept {@code If-Match} on a delete and ignore it, and a caller relying on this for safety should
+     * probe the store first: a delete against a wrong generation must be refused.
+     *
+     * @param blobName the register
+     * @param expectedGeneration the generation the caller read
+     * @return true if this call deleted it; false if it held another generation or did not exist
+     * @throws UnsupportedOperationException if this blob container does not implement a conditional delete
+     */
+    default boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        throw new UnsupportedOperationException(getClass() + " does not support deleteRegisterIfUnchanged");
+    }
 }

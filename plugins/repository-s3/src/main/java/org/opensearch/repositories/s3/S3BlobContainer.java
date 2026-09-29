@@ -1178,15 +1178,19 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 .bucket(blobStore.bucket())
                 .key(key)
                 .expectedBucketOwner(blobStore.expectedBucketOwner())
+                .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().getObjectMetricPublisher))
                 .build();
             try (
                 ResponseInputStream<GetObjectResponse> response = AccessController.doPrivileged(
                     () -> clientReference.get().getObject(getObjectRequest)
                 )
             ) {
-                return Optional.of(deserializeRegister(response.readAllBytes()));
+                final BlobRegister register = deserializeRegister(response.readAllBytes());
+                remember(blobName, register.generation(), response.response().eTag());
+                return Optional.of(register);
             }
         } catch (NoSuchKeyException e) {
+            forget(blobName);
             return Optional.empty();
         } catch (S3Exception e) {
             // Real S3 responds to a missing key with a NoSuchKeyException-typed 404, but not every
@@ -1215,6 +1219,10 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
         String key = buildKey(blobName);
+        final KnownVersion known = knownVersion(blobName);
+        if (expectedGeneration != BlobRegister.ABSENT_GENERATION && known != null && known.generation() == expectedGeneration) {
+            return putIfMatch(blobName, known.eTag(), expectedGeneration + 1, newValue);
+        }
         try (AmazonS3Reference clientReference = blobStore.clientReference()) {
             S3Client client = clientReference.get();
 
@@ -1225,6 +1233,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                     .bucket(blobStore.bucket())
                     .key(key)
                     .expectedBucketOwner(blobStore.expectedBucketOwner())
+                    .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().getObjectMetricPublisher))
                     .build();
                 try (
                     ResponseInputStream<GetObjectResponse> response = AccessController.doPrivileged(
@@ -1250,13 +1259,16 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 return BlobRegisterCasResult.conflict(currentGeneration);
             }
 
-            long newGeneration = expectedGeneration + 1;
+            long newGeneration = expectedGeneration == BlobRegister.ABSENT_GENERATION
+                ? BlobRegister.initialGeneration()
+                : expectedGeneration + 1;
             byte[] bytesToWrite = serializeRegister(newGeneration, newValue);
             PutObjectRequest.Builder putObjectRequestBuilder = PutObjectRequest.builder()
                 .bucket(blobStore.bucket())
                 .key(key)
                 .contentLength((long) bytesToWrite.length)
-                .expectedBucketOwner(blobStore.expectedBucketOwner());
+                .expectedBucketOwner(blobStore.expectedBucketOwner())
+                .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().putObjectMetricPublisher));
             if (currentETag == null) {
                 putObjectRequestBuilder.ifNoneMatch("*");
             } else {
@@ -1265,9 +1277,13 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             PutObjectRequest putObjectRequest = putObjectRequestBuilder.build();
 
             try {
-                AccessController.doPrivileged(() -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite)));
+                final PutObjectResponse written = AccessController.doPrivileged(
+                    () -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite))
+                );
+                remember(blobName, newGeneration, written.eTag());
                 return BlobRegisterCasResult.applied(newGeneration);
             } catch (S3Exception e) {
+                forget(blobName);
                 // Three status codes, one meaning: the conditional write did not happen, so somebody else
                 // got there first. Reporting a conflict rather than a wrapped exception is what lets the
                 // caller re-read and retry as normal, and it is safe for all three because none of them
@@ -1320,7 +1336,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
     @Override
     public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
         String key = buildKey(blobName);
-        long newGeneration = BlobRegister.ABSENT_GENERATION + 1;
+        long newGeneration = BlobRegister.initialGeneration();
         byte[] bytesToWrite = serializeRegister(newGeneration, value);
 
         PutObjectRequest putObjectRequest = PutObjectRequest.builder()
@@ -1328,13 +1344,17 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             .key(key)
             .contentLength((long) bytesToWrite.length)
             .expectedBucketOwner(blobStore.expectedBucketOwner())
+            .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().putObjectMetricPublisher))
             .ifNoneMatch("*")
             .build();
 
         try (AmazonS3Reference clientReference = blobStore.clientReference()) {
             S3Client client = clientReference.get();
             try {
-                AccessController.doPrivileged(() -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite)));
+                final PutObjectResponse written = AccessController.doPrivileged(
+                    () -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite))
+                );
+                remember(blobName, newGeneration, written.eTag());
                 return BlobRegisterCasResult.applied(newGeneration);
             } catch (S3Exception e) {
                 // 412 is the name already being taken, which is what this call is for. 409 is the same
@@ -1349,6 +1369,122 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             }
         } catch (SdkException e) {
             throw new IOException("Unable to create register [" + blobName + "]", e);
+        }
+    }
+
+    /**
+     * Deletes the register only if it still holds {@code expectedGeneration}, with S3's conditional
+     * {@code DeleteObject} ({@code If-Match} on the object's ETag).
+     *
+     * <p>The ETag of the expected version is the one this container last saw for that generation, or is
+     * read first. S3 evaluates {@code If-Match} on a delete atomically against the live object, so a write
+     * that landed after the read is not deleted: the delete is refused with a 412. An S3-compatible store
+     * that ignores the header would delete it anyway, which is why a caller relying on this probes first.
+     */
+    @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        KnownVersion known = knownVersion(blobName);
+        if (known == null || known.generation() != expectedGeneration) {
+            final Optional<BlobRegister> current = readRegister(blobName);
+            if (current.isEmpty() || current.get().generation() != expectedGeneration) {
+                return false;
+            }
+            known = knownVersion(blobName);
+            if (known == null || known.generation() != expectedGeneration) {
+                return false;
+            }
+        }
+        final software.amazon.awssdk.services.s3.model.DeleteObjectRequest request =
+            software.amazon.awssdk.services.s3.model.DeleteObjectRequest.builder()
+                .bucket(blobStore.bucket())
+                .key(buildKey(blobName))
+                .expectedBucketOwner(blobStore.expectedBucketOwner())
+                .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().deleteObjectsMetricPublisher))
+                .ifMatch(known.eTag())
+                .build();
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            AccessController.doPrivileged(() -> clientReference.get().deleteObject(request));
+            forget(blobName);
+            return true;
+        } catch (S3Exception e) {
+            forget(blobName);
+            if (e.statusCode() == 412 || e.statusCode() == 409 || e.statusCode() == 404) {
+                return false;
+            }
+            throw new IOException("Unable to conditionally delete register [" + blobName + "]", e);
+        } catch (SdkException e) {
+            throw new IOException("Unable to conditionally delete register [" + blobName + "]", e);
+        }
+    }
+
+    /** The generation and ETag this container last saw for a register. */
+    private record KnownVersion(long generation, String eTag) {
+    }
+
+    /**
+     * What this container last read or wrote for each register, so a compare-and-swap against that very
+     * version can be one conditional PUT rather than a GET and a PUT.
+     *
+     * <p><b>Why the ETag is a safe token for a generation.</b> A register's body begins with its generation,
+     * a generation only increases within an incarnation, and a new incarnation starts at a random
+     * {@link BlobRegister#initialGeneration()} -- so no two versions of one register ever have the same
+     * body, and none the same ETag. {@code If-Match} on the remembered ETag therefore succeeds exactly when
+     * the object is still the version whose generation was remembered, which is the condition the caller
+     * asked for. A stale entry costs a refused write and a read, never a wrong one.
+     *
+     * <p>Bounded: an entry that fell out costs the GET it would have saved, nothing more.
+     */
+    private final Map<String, KnownVersion> knownVersions = java.util.Collections.synchronizedMap(
+        new java.util.LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, KnownVersion> eldest) {
+                return size() > 10_000;
+            }
+        }
+    );
+
+    private KnownVersion knownVersion(String blobName) {
+        return knownVersions.get(blobName);
+    }
+
+    private void remember(String blobName, long generation, String eTag) {
+        if (eTag != null) {
+            knownVersions.put(blobName, new KnownVersion(generation, eTag));
+        }
+    }
+
+    private void forget(String blobName) {
+        knownVersions.remove(blobName);
+    }
+
+    /** The compare-and-swap against a version this container already knows: one conditional PUT, no GET. */
+    private BlobRegisterCasResult putIfMatch(String blobName, String eTag, long newGeneration, BytesReference newValue) throws IOException {
+        final byte[] bytesToWrite = serializeRegister(newGeneration, newValue);
+        final PutObjectRequest request = PutObjectRequest.builder()
+            .bucket(blobStore.bucket())
+            .key(buildKey(blobName))
+            .contentLength((long) bytesToWrite.length)
+            .expectedBucketOwner(blobStore.expectedBucketOwner())
+            .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().putObjectMetricPublisher))
+            .ifMatch(eTag)
+            .build();
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            final PutObjectResponse written = AccessController.doPrivileged(
+                () -> clientReference.get().putObject(request, RequestBody.fromBytes(bytesToWrite))
+            );
+            remember(blobName, newGeneration, written.eTag());
+            return BlobRegisterCasResult.applied(newGeneration);
+        } catch (S3Exception e) {
+            forget(blobName);
+            // The same three codes, and the same meaning, as in compareAndSwapRegister.
+            if (e.statusCode() == 412 || e.statusCode() == 409 || e.statusCode() == 404) {
+                return BlobRegisterCasResult.conflict(
+                    readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION)
+                );
+            }
+            throw new IOException("Unable to CAS register [" + blobName + "]", e);
+        } catch (SdkException e) {
+            throw new IOException("Unable to CAS register [" + blobName + "]", e);
         }
     }
 

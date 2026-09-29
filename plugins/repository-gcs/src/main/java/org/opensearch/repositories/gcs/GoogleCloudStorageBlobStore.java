@@ -512,4 +512,23 @@ class GoogleCloudStorageBlobStore implements BlobStore {
             throw e;
         }
     }
+
+    /**
+     * Deletes the register only if its live generation is still {@code expectedGeneration}, with GCS's own
+     * {@code generationMatch} precondition on the delete. A GCS generation is already unique across an
+     * object's incarnations, so nothing more is needed to keep a delete from removing a later write.
+     */
+    boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        final BlobId blobId = BlobId.of(bucketName, blobName);
+        try {
+            return AccessController.doPrivilegedChecked(
+                () -> client().delete(blobId, Storage.BlobSourceOption.generationMatch(expectedGeneration))
+            );
+        } catch (final StorageException e) {
+            if (e.getCode() == HTTP_PRECON_FAILED) {
+                return false;
+            }
+            throw e;
+        }
+    }
 }
