@@ -581,6 +581,35 @@ fleet-wide term from quadratic to linear. And a cold read no longer pays one req
 ramps while the reads stay sequential and drops back to one block on a seek, so a scan of 512 blocks costs
 11 requests where it cost 512, while eight scattered reads still cost exactly eight.
 
+**Background cost, measured flat in index count.** `ServerlessScaleMeasurementTests` (in `s3Test`) runs one
+node against MinIO with the production intervals, holding 8 shards over 4 indices, beside `P` indices it never
+touches and 50 deleted long enough ago that their tombstones are due. It then counts every request over 120
+backstop passes — an hour at the 30-second backstop, including one tombstone sweep. Measured at `P` = 10,000
+and 100,000, on the branch before this work (`57b924b9840`) and after it:
+
+| | P = 10,000 | P = 100,000 | grows with P? |
+| --- | ---: | ---: | --- |
+| before: requests per node-hour | 11,834 | 101,834 | by exactly one register read per index |
+| after: requests per node-hour | 930 | 930 | no |
+
+Before, 1,834 of those were the per-pass head and descriptor scans of the held shards and `P` were the sweep
+reading every descriptor. After, the head scan runs every five minutes, descriptors every thirty seconds, and
+the sweep reads only the 50 deleted names. At S3 list prices ($0.40 per million GETs, $5 per million PUTs and
+LISTs), per node, extrapolating the "before" line by its measured slope of one read per index:
+
+| population | before: GETs/s | before: $/node-month | after: requests/s | after: $/node-month |
+| ---: | ---: | ---: | ---: | ---: |
+| 100,000 | 28 | ≈ $30 | 0.26 | ≈ $0.93 |
+| 1,000,000 | 278 | ≈ $293 | 0.26 | ≈ $0.93 |
+| 10,000,000 | 2,778 | ≈ $2,900, and the sweep never finishes | 0.26 | ≈ $0.93 |
+
+The "before" cost is paid by *every* node, since each ran the whole sweep; at 10M indices one serial sweep
+is 10M reads, 14 to 55 hours at 5 to 20 ms per GET, against an hourly interval. The "after" cost is per node
+and independent of the population; deletion itself costs about three PUTs and three GETs per deleted index,
+paid once by whichever node owns its hour's bucket. Two caveats: these are MinIO request counts priced at S3
+list prices, not an S3 bill; and the test's pass also renews the lease, where production renews on its own
+timer three times per TTL, adding about 240 PUTs per node-hour to both lines alike.
+
 **Shard heads are spread over 256 key prefixes.** S3 scales request rates per key prefix, about 5,500
 GETs a second each, and splits partitions on leading characters. A head was named `<index>#<shard>`, so a
 deployment whose index names share a stem put its whole head traffic behind one prefix well before a million
