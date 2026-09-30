@@ -90,8 +90,9 @@ plugin API.
 ## Where it is, and what is unfinished
 
 [`STATUS.md`](STATUS.md) is the current statement of what works, what is refused on purpose,
-and what is genuinely still open -- eleven items, of which the fencing window below is the only
-one that is a correctness question rather than a missing feature.
+and what is genuinely still open. The one open item that was a correctness question rather than a missing
+feature -- the window between moving a shard's ownership and sealing its log -- is closed; see
+[`rfc-fencing-closure.md`](rfc-fencing-closure.md).
 
 ## The open risk
 

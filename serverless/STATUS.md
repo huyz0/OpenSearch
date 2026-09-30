@@ -352,12 +352,31 @@ These are decisions, not gaps. Each answers 501 with a reason.
   it, but placement is only a hint, so two nodes can still each end up opening one view under an unlucky or
   stale routing decision — narrowed, not closed, by giving frozen search the same placement a live search
   already had. No slicing.
-- One fencing window is narrowed but not closed. The log is now sealed at the compare-and-swap that
-  transfers ownership rather than later, when the shard is opened, so the stretch in which a predecessor's
-  appends still fall in front of the cutoff is one blob write instead of a shard creation, a local-file
-  drop and a translog bootstrap. It cannot be closed by moving the seal any further: a swap and a seal are
-  two object-store operations with no transaction spanning them. Closing it entirely would need the
-  register itself to carry the seal.
+- The swap/seal fencing window is **closed**, by fencing the write-ahead log itself rather than recording
+  where it ended (`rfc-fencing-closure.md`). A takeover occupies the predecessor's next log slot with a fence
+  -- a blob of no bytes, written put-if-absent -- so exactly one of {the predecessor's append at that slot,
+  the fence} lands. Whatever landed is ahead of every fence and is replayed, and a write whose record landed
+  is now acknowledged whatever its writer's lease says afterwards; nothing can land after a fence. That
+  needed four things the log did not have: a writer stops for good after any failed or ambiguous append, so
+  its names are contiguous; every writer fences its own term before writing, which is the same-term reopen
+  case done the same way, and confirms the head still names it; truncation always keeps a term's highest
+  record, so a successor can find the slot; and fences are never deleted. A node that wins a shard it
+  already holds at an older term now reopens it at the new term -- before, its later writes landed behind
+  the seal and were never replayed, acknowledged and lost. **What remains is assumption, not window**: that
+  the store's put-if-absent on one key is linearizable (conformance checks it on the filesystem, MinIO and
+  RustFS 1.0.0; R11 is open for real S3, GCS and Azure), and that an append whose outcome is unknown -- a
+  timeout -- may or may not be in the log, which is what "unknown" means. The log's cutoff no longer rests on
+  clocks; lease expiry still decides when a takeover may begin. Pinned by `FsLogFencingTests` and
+  `S3LogFencingTests` (the same history on MinIO and on RustFS single-node and erasure: an append before the
+  fence is kept, one after it is refused, a refused writer never writes again, truncation cannot hide the
+  slot, a fence survives its term being dropped, a same-term reopen fences its predecessor, a superseded
+  writer stops, and a concurrent writer racing two takers loses nothing acknowledged and replays nothing
+  refused) and by `ServerlessWriteFencingTests` end to end (an append between the swap and the fence is
+  acknowledged and replayed; a write that landed before a takeover is acknowledged and kept). Removing any
+  one of the fence, the poisoning, the kept record, the kept fence, the own-term fence, the acknowledgement
+  change or the reopen at a newer term fails at least one of them. An append is still one conditional PUT;
+  a takeover costs 8 requests against the seals' 9 on the log (6 listings and 2 PUTs, against 6 listings, 2
+  PUTs and a GET), plus the head read a writer makes after fencing its own term.
 - `update` inside `_bulk` is refused: it is a partial merge, which has to read the current document before
   writing one, and the batch path applies without reading. Closing it changes what a batch is, so it is a
   design decision rather than plumbing. `POST /{index}/_update/{id}` does the merge.

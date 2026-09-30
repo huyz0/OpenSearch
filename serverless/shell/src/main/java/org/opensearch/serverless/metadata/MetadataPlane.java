@@ -1313,7 +1313,7 @@ public final class MetadataPlane {
             // old behaviour, with the open path's seal as the bound.
             if (acquisition.head().indexUuid() != null) {
                 try {
-                    walStore(indexName, acquisition.head().indexUuid(), shardId).sealAt(acquisition.head().term());
+                    walStore(indexName, acquisition.head().indexUuid(), shardId).fenceOlderTerms(acquisition.head().term());
                 } catch (IOException e) {
                     // A head won and a log unsealed is worse than no head at all: this node would go on
                     // to open the shard and seal late, which is the window this exists to close. Give

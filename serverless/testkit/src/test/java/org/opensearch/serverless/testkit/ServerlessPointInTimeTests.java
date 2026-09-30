@@ -140,7 +140,8 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
             assertTrue(plane.heads().release("swept", 0, node.localNode().getId()));
             node.activateWriter(plane, "swept", 0);
             for (int i = 5; i <= 12; i++) {
-                assertEquals(201, send(node, "PUT", "/swept/_doc/s" + i + "?refresh=true", body(i)).status());
+                final Response written = send(node, "PUT", "/swept/_doc/s" + i + "?refresh=true", body(i));
+                assertEquals(written.body(), 201, written.status());
             }
             loop.tick(clock.get() + 1);
 

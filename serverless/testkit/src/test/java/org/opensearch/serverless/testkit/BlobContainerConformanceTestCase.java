@@ -235,6 +235,48 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     /**
+     * Concurrent put-if-absent writes of one blob admit exactly one, and the others are refused rather than
+     * overwriting it. The write-ahead log's fence is exactly this: a successor and a stale writer racing for
+     * one slot, of which the store must let only one land.
+     *
+     * @throws Exception if the backend cannot be reached
+     */
+    public void testPutIfAbsentBlobWritesAdmitExactlyOne() throws Exception {
+        final BlobContainer container = newContainer();
+        for (int round = 0; round < 5; round++) {
+            final String name = "slot-" + round;
+            final int contenders = Math.min(8, contenders());
+            final CountDownLatch start = new CountDownLatch(1);
+            final java.util.concurrent.atomic.AtomicInteger landed = new java.util.concurrent.atomic.AtomicInteger();
+            final java.util.concurrent.atomic.AtomicInteger refused = new java.util.concurrent.atomic.AtomicInteger();
+            final java.util.List<Exception> errors = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+            final Thread[] threads = new Thread[contenders];
+            for (int c = 0; c < contenders; c++) {
+                final byte[] body = ("contender-" + c).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                threads[c] = new Thread(() -> {
+                    try {
+                        start.await();
+                        container.writeBlob(name, new ByteArrayInputStream(body), body.length, true);
+                        landed.incrementAndGet();
+                    } catch (java.nio.file.FileAlreadyExistsException e) {
+                        refused.incrementAndGet();
+                    } catch (Exception e) {
+                        errors.add(e);
+                    }
+                });
+                threads[c].start();
+            }
+            start.countDown();
+            for (Thread t : threads) {
+                t.join(120_000);
+            }
+            assertEquals("no contender should have errored: " + errors, java.util.List.of(), errors);
+            assertEquals("exactly one put-if-absent write of a blob may land", 1, landed.get());
+            assertEquals("and every other must be refused", contenders - 1, refused.get());
+        }
+    }
+
+    /**
      * A register created again does not reuse its predecessor's generation, so a swap carrying a generation
      * read before the delete is refused by what was created after it. This is what lets a deleted register
      * be removed outright rather than tombstoned.

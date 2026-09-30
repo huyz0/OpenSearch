@@ -86,6 +86,19 @@ public final class ShardReconciler {
     private final Set<ShardId> readers = ConcurrentHashMap.newKeySet();
     private volatile java.util.function.Function<ShardId, SegmentPublisher> publishers;
     private volatile java.util.function.Function<ShardId, org.opensearch.serverless.store.WalStore> walStores;
+
+    /** Whether this node still owns a shard at a term, asked by a writer after it fences its own term. */
+    private volatile java.util.function.BiPredicate<ShardId, Long> ownsAtTerm;
+
+    /**
+     * Sets how a writer confirms, after fencing its own term, that the term is still this node's.
+     *
+     * @param ownsAtTerm true while the shard's head names this node at that term
+     */
+    public void setOwnershipCheck(java.util.function.BiPredicate<ShardId, Long> ownsAtTerm) {
+        this.ownsAtTerm = ownsAtTerm;
+    }
+
     private final Map<ShardId, org.opensearch.serverless.store.WalStore> walCache = new ConcurrentHashMap<>();
     /** One publisher per open shard, so it can remember the generation of its own last publish. */
     private final Map<ShardId, SegmentPublisher> publisherCache = new ConcurrentHashMap<>();
@@ -244,8 +257,19 @@ public final class ShardReconciler {
                 );
             }
             final ShardId shardId = new ShardId(indexMetadata.getIndex(), assignment.shardId());
-            if (open.containsKey(shardId)) {
-                continue;
+            final IndexShard already = open.get(shardId);
+            if (already != null) {
+                if (already.getOperationPrimaryTerm() >= assignment.term()) {
+                    continue;
+                }
+                // Held here at an older term than the one this node has just won. The takeover fenced that
+                // term's log, so a write through the old shard would land at the fence and be refused -- and
+                // before the fence existed it landed behind the seal and was never replayed. Reopen at the
+                // term that was won, which fences this node's own earlier writer and replays what it wrote.
+                releaseShard(
+                    shardId,
+                    "reopening at term " + assignment.term() + ", won while held at " + already.getOperationPrimaryTerm()
+                );
             }
             // A writer opens lazily too. It used to download every published file first, which made a
             // cold start proportional to the shard rather than to what the first write touches; a merge
@@ -307,16 +331,6 @@ public final class ShardReconciler {
         new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
-     * The cutoff each pending replay is bounded by, snapshotted when the replay was armed.
-     *
-     * <p>See {@link org.opensearch.serverless.store.WalStore#position()} for what the cutoff is and why a
-     * successor needs one. It is held next to the log rather than inside it because a {@code WalStore} is
-     * the shard's live log, shared with the write path, and a cutoff belongs to one act of recovery.
-     */
-    private final java.util.concurrent.ConcurrentHashMap<ShardId, java.util.Map<Long, String>> pendingCutoff =
-        new java.util.concurrent.ConcurrentHashMap<>();
-
-    /**
      * Returns the records the shard currently being opened should replay, if any.
      *
      * <p>Called by {@link org.opensearch.serverless.engine.ServerlessWriterEngine} from inside recovery.
@@ -332,7 +346,7 @@ public final class ShardReconciler {
         if (wal == null) {
             return java.util.List.of();
         }
-        return wal.replayable(pendingCutoff.get(shardId));
+        return wal.replayableAfterFencing();
     }
 
     /**
@@ -444,17 +458,18 @@ public final class ShardReconciler {
                     // numbers.
                     final org.opensearch.serverless.store.WalStore log = wal(shardId);
                     pendingReplay.put(shardId, log);
-                    // Seal the log before recovery reads anything, so a predecessor that has not yet noticed
-                    // it lost this shard cannot have its later appends replayed as acknowledged history. The
-                    // seal is durable, so it binds every later successor too and not just this recovery --
-                    // see WalStore#sealAt for why that distinction is the whole point.
+                    // Fence the log before recovery reads anything: every older term, so a predecessor that has
+                    // not noticed it lost this shard can write nothing after what is replayed here, and this
+                    // term, so an earlier writer of it -- the instance a same-term reopen replaced -- can write
+                    // nothing either. Whatever either of them landed is before a fence and is replayed; nothing
+                    // can land after one. See WalStore#establish and serverless/rfc-fencing-closure.md.
                     //
-                    // This is the second seal on the acquisition path: MetadataPlane#activate takes one at
-                    // the compare-and-swap, which is where the tight bound comes from. This one is still
-                    // needed, and is not merely a repeat -- a shard released locally and reopened at the
-                    // same term arrives here without passing through an acquisition at all. It cannot
-                    // loosen the earlier bound, because seals merge by taking the lowest position per term.
-                    pendingCutoff.put(shardId, log.sealAt(shardHeadTerm));
+                    // The takeover fenced the older terms already, at the compare-and-swap; doing it again here
+                    // costs a listing for a term already fenced, and covers a shard reopened without passing
+                    // through an acquisition.
+                    log.fenceOlderTerms(shardHeadTerm);
+                    final java.util.function.BiPredicate<ShardId, Long> check = ownsAtTerm;
+                    log.establish(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
                 }
                 try {
                     shard.markAsRecovering("serverless-store", new RecoveryState(initializing, localNode, null));
@@ -465,7 +480,6 @@ public final class ShardReconciler {
                     }
                 } finally {
                     pendingReplay.remove(shardId);
-                    pendingCutoff.remove(shardId);
                 }
 
                 final ShardRouting started = initializing.moveToStarted();
@@ -568,7 +582,7 @@ public final class ShardReconciler {
     private void replayRecordsWithoutSequenceIdentity(IndexShard shard, ShardId shardId) throws IOException {
         final var wal = wal(shardId);
         int replayed = 0;
-        for (org.opensearch.serverless.store.WalRecord record : wal.replayable()) {
+        for (org.opensearch.serverless.store.WalRecord record : wal.replayableAfterFencing()) {
             if (record.hasSequenceIdentity()) {
                 continue;
             }

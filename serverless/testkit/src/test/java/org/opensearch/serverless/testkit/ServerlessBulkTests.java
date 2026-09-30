@@ -420,7 +420,13 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         );
 
         final var container = store.blobContainer(BlobPath.cleanPath().add("shard").add("wal").add("t=1"));
-        final List<String> names = new ArrayList<>(container.listBlobs().keySet());
+        // A blob of no bytes is a fence, not a record.
+        final List<String> names = new ArrayList<>();
+        container.listBlobs().forEach((name, blob) -> {
+            if (blob.length() > 0) {
+                names.add(name);
+            }
+        });
         // Only records. The test framework plants foreign files in temp directories at random -- this
         // assertion caught an `extra0` on roughly one run in ten -- which is precisely the case
         // WalStore filters for and says it filters for: a foreign object sharing the container is not

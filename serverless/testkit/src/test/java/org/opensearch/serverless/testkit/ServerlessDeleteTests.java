@@ -492,7 +492,12 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final var walRoot = store.blobContainer(plane.shardData("alpha", 0).add("wal"));
         long records = 0;
         for (var termDir : walRoot.children().values()) {
-            records += termDir.listBlobs().keySet().stream().filter(n -> n.matches("\\d{20}")).count();
+            // A blob of no bytes is a fence, not a record.
+            records += termDir.listBlobs()
+                .entrySet()
+                .stream()
+                .filter(e -> e.getKey().matches("\\d{20}") && e.getValue().length() > 0)
+                .count();
         }
         return records;
     }
