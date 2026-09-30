@@ -42,6 +42,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessDeleteCostTests.class'
   exclude '**/S3LogFencingTests.class'
   exclude '**/Serverless*MeasurementTests.class'
+  exclude '**/ServerlessFleetScaleTests.class'
   exclude '**/ServerlessRealPluginTests.class'
   exclude '**/ServerlessTlsTests.class'
 }
@@ -129,6 +130,37 @@ tasks.register('processTest', Test) {
   // main source set's runtime classpath is server + shell + netty4 without the test framework, which is
   // also simply the more faithful thing to fork.
   systemProperty 'serverless.node.classpath', sourceSets.main.runtimeClasspath.asPath
+}
+
+/*
+ * A fleet of real shell processes on an S3 API, under load and through failures, judged by a ledger of every
+ * write. Parameterised by -Dtests.fleet.* (see ServerlessFleetScaleTests) so a real bucket needs no code change:
+ *
+ *   ./gradlew :serverless:testkit:fleetTest -Dtests.fleet.endpoint=http://127.0.0.1:9200
+ *       -Dtests.fleet.nodes=6 -Dtests.fleet.population=1000000 -Dtests.fleet.scenario_seconds=600
+ *
+ * Not part of check: it runs for an hour or more and needs a store to point at.
+ */
+tasks.register('fleetTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/ServerlessFleetScaleTests.class'
+  systemProperty 'opensearch.path.conf', 'config'
+  systemProperty 'tests.system_call_filter', 'false'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+  systemProperty 'serverless.node.classpath', sourceSets.main.runtimeClasspath.asPath
+  maxHeapSize = '4g'
+  // Runs for hours: the framework's thirty-minute default would abandon it mid-scenario.
+  systemProperty 'tests.timeoutSuite', '86400000!'
+  systemProperty 'tests.timeout', '86400000!'
+  // Every tests.fleet.* property given to Gradle reaches the test JVM.
+  System.getProperties().each { key, value ->
+    if (key.toString().startsWith('tests.fleet.')) {
+      systemProperty key.toString(), value.toString()
+    }
+  }
+  outputs.upToDateWhen { false }
 }
 
 tasks.named('check').configure {

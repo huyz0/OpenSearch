@@ -65,8 +65,24 @@ final class NodeProcess implements Closeable {
      * @throws Exception if the node does not start
      */
     static NodeProcess start(String name, Path store, Path home, Map<String, String> extra) throws Exception {
+        return start(name, store, home, extra, List.of());
+    }
+
+    /**
+     * Forks a node with JVM arguments of its own -- a heap size, say -- and waits until it reports itself ready.
+     *
+     * @param name the node name
+     * @param store the shared object store directory, or null for an object store named in {@code extra}
+     * @param home this node's private path.home
+     * @param extra any additional settings
+     * @param jvmArgs arguments for the node's JVM
+     * @return the running process
+     * @throws Exception if the node does not start
+     */
+    static NodeProcess start(String name, Path store, Path home, Map<String, String> extra, List<String> jvmArgs) throws Exception {
         final List<String> command = new ArrayList<>();
         command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+        command.addAll(jvmArgs);
         command.add("-cp");
         // Not java.class.path: see the comment on processTest in build.gradle. A child forked onto the
         // test classpath dies inside NodeEnvironment because Randomness sees randomizedtesting and asks
@@ -103,6 +119,9 @@ final class NodeProcess implements Closeable {
             settings.put(ServerlessBootstrap.STORE_PATH, store.toString());
         }
         final Path readyFile = home.resolve("ready");
+        // A restart reuses the home, and the previous process's file names the ports it had: waiting on that one
+        // returned at once, with a node that was not up at an address nobody was listening on.
+        java.nio.file.Files.deleteIfExists(readyFile);
         settings.put(ServerlessBootstrap.READY_FILE, readyFile.toString());
         settings.putAll(extra);
         settings.forEach((k, v) -> command.add("-D" + k + "=" + v));
@@ -255,7 +274,40 @@ final class NodeProcess implements Closeable {
         signal("CONT");
     }
 
+    /**
+     * Returns the operating-system process id.
+     *
+     * @return the pid
+     */
+    long pid() {
+        return process.pid();
+    }
+
     private void signal(String name) throws Exception {
+        if (System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("windows")) {
+            // Windows has no SIGSTOP; NtSuspendProcess is its equivalent -- every thread of the process stops,
+            // the collector's included -- reached through PowerShell so nothing needs installing.
+            final String call = "STOP".equals(name) ? "NtSuspendProcess" : "NtResumeProcess";
+            final String script = "$s='[DllImport(\"ntdll.dll\")] public static extern int NtSuspendProcess(IntPtr h);"
+                + " [DllImport(\"ntdll.dll\")] public static extern int NtResumeProcess(IntPtr h);';"
+                + " Add-Type -MemberDefinition $s -Name Nt -Namespace Suspend;"
+                + " $p=Get-Process -Id "
+                + process.pid()
+                + "; exit [Suspend.Nt]::"
+                + call
+                + "($p.Handle)";
+            // Encoded, because Windows' own argument parsing strips the quotes inside a -Command script and
+            // DllImport("ntdll.dll") arrives as DllImport(ntdll.dll), which does not compile.
+            final String encoded = java.util.Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
+            final Process ps = new ProcessBuilder("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded)
+                .redirectErrorStream(true)
+                .start();
+            final String out = new String(ps.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            if (ps.waitFor(60, TimeUnit.SECONDS) == false || ps.exitValue() != 0) {
+                throw new IllegalStateException("could not " + call + " " + this.name + ": " + out);
+            }
+            return;
+        }
         final Process kill = new ProcessBuilder("kill", "-" + name, String.valueOf(process.pid())).redirectErrorStream(true).start();
         if (kill.waitFor(30, TimeUnit.SECONDS) == false || kill.exitValue() != 0) {
             throw new IllegalStateException("could not send SIG" + name + " to " + this.name);
