@@ -180,10 +180,22 @@ public final class SearchFanout {
      *
      * @param allowPartialActivation whether a search needing more cold shards than the activation budget
      *     answers from the first ones within it, reporting the rest as failed, rather than being refused
+     * @param preSkippedShards shards resolution already ruled out, reported as skipped and successful
+     * @param nowMillis the request's single now, or zero to take one here
+     * @param judged indices the rollups already settled may match, whose shards are not checked again
      */
-    public record Options(boolean allowPartialActivation) {
-        /** Refuse past the budget. */
-        public static final Options DEFAULT = new Options(false);
+    public record Options(boolean allowPartialActivation, int preSkippedShards, long nowMillis, java.util.Set<String> judged) {
+        /** Refuse past the budget; nothing skipped before the fan-out; the fan-out's own clock. */
+        public static final Options DEFAULT = new Options(false, 0, 0L, java.util.Set.of());
+
+        /**
+         * Options with only the partial-activation choice.
+         *
+         * @param allowPartialActivation whether to answer from the shards within the budget
+         */
+        public Options(boolean allowPartialActivation) {
+            this(allowPartialActivation, 0, 0L, java.util.Set.of());
+        }
     }
 
     /** One shard of one index, as the fan-out addresses it. */
@@ -241,16 +253,16 @@ public final class SearchFanout {
         perShard.from(0);
         perShard.size(from + size);
 
-        // One instant for every shard of this request; see runFrozen.
-        final long nowInMillis = System.currentTimeMillis();
+        // One instant for every shard of this request; see runFrozen. The caller's, when it judged anything by it.
+        final long nowInMillis = options.nowMillis() > 0L ? options.nowMillis() : System.currentTimeMillis();
         final List<Target> everyShard = new ArrayList<>();
         for (org.opensearch.serverless.cluster.IndexDescriptor descriptor : indices.values()) {
             for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
                 everyShard.add(new Target(descriptor, shard));
             }
         }
-        final int shards = everyShard.size();
-        final java.util.Set<Target> pruned = prune(serving, metadata, everyShard, source, nowInMillis);
+        final int shards = everyShard.size() + options.preSkippedShards();
+        final java.util.Set<Target> pruned = prune(serving, metadata, everyShard, source, nowInMillis, options.judged());
         final List<Target> searched = new ArrayList<>();
         for (Target target : everyShard) {
             if (pruned.contains(target) == false) {
@@ -384,8 +396,8 @@ public final class SearchFanout {
                 throw new IOException("no shard of " + indices.keySet() + " could answer this search; no node is serving them");
             }
             // A pruned shard is a successful one, as core counts a skipped shard.
-            merged.answered += pruned.size();
-            return merged.outcome(serving, source, shards, from, size, failures).withSkipped(pruned.size());
+            merged.answered += pruned.size() + options.preSkippedShards();
+            return merged.outcome(serving, source, shards, from, size, failures).withSkipped(pruned.size() + options.preSkippedShards());
         } finally {
             merged.release(serving);
         }
@@ -400,7 +412,8 @@ public final class SearchFanout {
         MetadataPlane metadata,
         List<Target> candidates,
         SearchSourceBuilder source,
-        long nowInMillis
+        long nowInMillis,
+        java.util.Set<String> judged
     ) throws IOException {
         final java.util.Set<Target> pruned = java.util.concurrent.ConcurrentHashMap.newKeySet();
         if (serving.searchPruning() == false
@@ -412,6 +425,10 @@ public final class SearchFanout {
         }
         final List<java.util.concurrent.Callable<Boolean>> checks = new ArrayList<>();
         for (Target target : candidates) {
+            if (judged.contains(target.descriptor().name())) {
+                // The rollup entry already said this index may match, and its shards' digests are no wider.
+                continue;
+            }
             checks.add(() -> {
                 final ShardId local = localShard(serving, target.descriptor(), target.shard());
                 if (local != null && serving.reconciler().readerShards().contains(local) == false) {
@@ -442,7 +459,7 @@ public final class SearchFanout {
     }
 
     /** A global aggregation ignores the query, so no shard can be skipped for what the query excludes. */
-    private static boolean hasGlobalAggregation(SearchSourceBuilder source) {
+    static boolean hasGlobalAggregation(SearchSourceBuilder source) {
         if (source.aggregations() == null) {
             return false;
         }

@@ -171,7 +171,11 @@ public class ServerlessWideSearchMeasurementTests extends OpenSearchTestCase {
             port = node.boundHttpAddress().publishAddress().getPort();
             call("GET", "/_cluster/health", null);
             store.setDelayMillis(delay);
-            for (String pass : new String[] { "cold", "warm" }) {
+            // What resolving the pattern alone costs: its listing pages are one after another by nature.
+            final long listingSince = System.nanoTime();
+            assertEquals(population, plane.namesWithPrefix("logs-", 10_000).size());
+            report.put("listing", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - listingSince) + "ms to list the pattern's names");
+            for (String pass : new String[] { "cold", "warm", "warm2", "warm3" }) {
                 store.drain();
                 final Map<String, Long> before = org.opensearch.repositories.s3.MinioBlobStores.requestCounts(s3);
                 final long startedAt = System.nanoTime();

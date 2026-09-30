@@ -881,11 +881,9 @@ canary created and deleted an index on each side of the cursor: the walk returne
 throughout exactly once, the one created ahead of the cursor, and neither the one created behind it nor
 the one deleted ahead of it -- the documented semantics. A walk is not a snapshot.
 
-**Found failing before this work, and still failing.** `ServerlessCostTests#testWhatASearchCosts` (its cold
-search is answered 500, "no node is serving them"; the cause is not yet diagnosed)
-and `#testWhatAGetCosts` (the filesystem's batched-read bound) fail identically on `7bfec04d070`, on the
-filesystem and on MinIO; `ServerlessInstalledPluginTests` fails on Windows because a plugin jar is still open
-when the test directory is removed. None of the three was changed here.
+**Found failing before this work.** `ServerlessInstalledPluginTests` fails on Windows because a plugin jar is
+still open when the test directory is removed; it fails identically on `7bfec04d070`. The two cost tests that
+failed alongside it are fixed in the next round, below.
 
 **What it adds to the flat background cost.** The orphan slice, hourly per node: a cursor read and write,
 the pins' two listings, one child listing and at most a descriptor read per index among 100 containers --
@@ -893,6 +891,106 @@ about 105 requests per node-hour at worst, independent of the population. Measur
 `ServerlessScaleMeasurementTests` on RustFS 1.0.0 after this work: **1,016 requests per node-hour at both
 10,000 and 100,000 indices** (1,007 before), the nine extra being the slice over the test's eight shard
 containers.
+
+**The two red cost tests, bisected.** Both had been failing since before the last round, and both now pass,
+for different reasons:
+
+- `ServerlessCostTests#testWhatAGetCosts` first failed at `5cd68a7a96b`, which moved gets onto the one-second
+  routing cache and the incarnation fence's one-second confirmation. Inside a warm second ten single gets now
+  read nothing, and neither does a multi-get, so "a multi-get costs well under ten singles" compared zero with
+  zero. An intended cost reduction: the test is re-baselined to what still has to hold -- neither path reads
+  more than the two registers an entry expiring mid-loop can cost, however many documents are asked for -- with
+  the reason written beside it.
+- `#testWhatASearchCosts` first failed at `fad3afbf5`. A regression, and a real one: a node that had just
+  started was missing from its own membership view -- renewing its lease did not put it there, and the view is
+  refreshed at most once a second -- so a search it coordinated found no reader for a shard nobody owned,
+  itself included, and answered 500. A node's own view now includes the lease it last renewed, while it is
+  unexpired -- added when the view is read, so a refresh still reads the lease and subscribers still hear the
+  join.
+
+Both pass on the filesystem and on MinIO, with the rest of `ServerlessCostTests`.
+
+**Nothing between a node and its store can stand an interface default in for the backend again.**
+`BlobContainerWrapperGuardTests` walks the shell's compiled classes, finds every `BlobContainer` it declares,
+and fails if any of them inherits one of the interface's default methods rather than overriding it -- so a
+method added to `BlobContainer` later cannot be silently dropped by a wrapper that predates it. The wrapper it
+exists for, `ObjectStores.Metered`, now delegates every one of them, including the metadata-carrying reads
+and writes, the conditional write and the asynchronous sorted listing it still inherited. The same class builds
+stores through the production factory (`ObjectStores.create`) on a filesystem and on an S3 API and drives each
+path through the whole chain: register create, read and swap, the conditional delete, put-if-absent, the
+bounded and paged listings (each counted as one listing), paged children, and the node's conditional-delete
+probe -- which passes through the chain on RustFS and correctly fails on MinIO. Its canary is the wrapper as it
+stood at `7bfec04d070`, which the guard flags method by method; putting the bug back into `Metered` fails both
+the guard and the filesystem chain test.
+
+**A digest bug the rollup tests found, in last round's code.** A digest's bounds were normalised through
+`c ? Double.valueOf(x) : Long.valueOf(y)`, and a conditional expression mixing the two boxes promotes both to
+`double`. Every bound was stored as a double, so a long above 2^53 was rounded -- and rounded down is narrower,
+so a shard holding exactly its maximum could be skipped by a query for that value. Dates, far below 2^53, were
+unaffected. Branches now, and `PruningDigestTests#testALargeLongBoundIsKeptExactly` pins a maximum of 2^60 + 1,
+through the manifest's JSON and back.
+
+**Wide searches read a few registers, not three per index.** Last round a `logs-*` search over 5,000 hourly
+indices read a descriptor, a head and a manifest for every one of them: 15,258 requests warm. Every publish now
+also records its digest in a **digest rollup** -- indices grouped by the first five characters of their names,
+each group spread over 64 registers, each holding per index its uuid, shard count and, per shard, the digest of
+what it has published and the term of any writer holding it. A search over a prefix of five characters or more
+that matches at least 32 indices (`serverless.search.rollup.min_indices`) reads the group's 64 registers first,
+drops every index they rule out before reading anything of it, and skips the per-shard checks for indices the
+entry already settles may match. And the incarnation fence accepts the routing read resolution just made, when it
+found the same uuid within the fence's second -- a read is a read whoever made it -- so a kept index's descriptor
+is read once per search, not twice.
+
+What keeps a rollup safe, since a stale one could otherwise skip a shard that matches:
+
+- every searchable document of an index is covered by its entry before it becomes searchable. A publish widens
+  the entry before it writes its manifest; a writer records its term before it opens the shard, and a shard
+  with a writer is never ruled out;
+- letting go clears the term only if it is still that writer's, so a predecessor's late clear cannot unmark a
+  successor;
+- within an incarnation an entry only widens -- a union over the fields both sides digest, coarsened outward
+  (dates to the hour) so an appending shard rewrites it about once an hour rather than every publish;
+- an entry for another uuid is replaced by the new incarnation's first publish or writer, before which the new
+  incarnation has nothing searchable;
+- a shard with no digest yet is never ruled out.
+
+A stale entry is therefore wider than the truth or describes nothing searchable, never narrower. The options
+proposed and not taken: a longer-lived descriptor cache is unsafe past the incarnation fence's second -- a
+recreated index could be judged by its predecessor's digest -- and would still leave the head and manifest
+reads; per-time-bucket rollups need the coordinator to know an index's time bucket from its name, which a
+name-grouped register does not.
+
+Measured on RustFS 1.0.0 (`ServerlessWideSearchMeasurementTests`, 5,000 hourly indices, a 250-hour window, no
+injected delay):
+
+| pass | before (last round) | after |
+| --- | ---: | ---: |
+| cold: no reader open | 16,513 requests, 5.5 s | 1,828 requests, 2.3 s |
+| warm: the window's 251 readers open | 15,258 requests, 4.9 s | 322 requests, 1.12-1.21 s over three runs |
+
+The warm 322: six listings to resolve the pattern, the group's 64 rollup registers, one descriptor read for each
+of the 251 indices searched, and one members read. The cold pass adds the 251 reader opens. **The request target
+-- warm under 1,000 -- is met; the latency target, under a second, is not quite.** Timed phase by phase, about
+0.7 s of the warm second is listing the pattern's 5,000 names: six pages of a thousand, one after another,
+because each resumes where the last stopped. The rollups took 80 ms, the descriptor reads 35 ms and the 251
+queries 160 ms. Listing ranges of the prefix concurrently, cut at a previous listing's split points, was built
+and measured: on RustFS ten concurrent listings took as long as six serial ones -- it serves listings one at a
+time -- so it cost four requests and saved nothing, and was taken out. What would remove the listing is keeping
+each group's names in its rollups, written before a descriptor or alias is created so a name can be missing only
+by not existing; that puts a register write on index creation, which this round did not want to pay without a
+store where listing is the bottleneck to justify it.
+
+**What the rollups add elsewhere.** A writer's mark is one register swap at activation and one at an idle
+release -- a read as well when this node's copy of the bucket is stale. A publish writes the rollup only when its
+coarsened digest widens what the entry holds: a shard appending in time order about once an hour, a shard whose
+values do not move never. Idle nodes publish nothing, so the flat background cost is unchanged.
+
+Pinned by `DigestRollupsTests` (widening only, replacement by a new incarnation, a writer's mark and a stale
+clear, unknown shards never ruled out, concurrent publishes all landing, coarsening only widening) and by
+`ServerlessPruningTests`: the forty-range conservativeness canary again with the rollups consulted for every
+pattern; an index deleted and recreated with a document inside the range is found; a shard with a writer is
+not ruled out; and the canary's own canary -- an entry planted narrower than its shard makes the total wrong,
+which is what the canary's totals would catch.
 
 **Still open, in the order the cost model ranks them:** the per-shard head poll above, which needs a signal
 carrying evidence of ownership rather than a cheaper timer; and the sweeps that still walk the whole

@@ -1939,6 +1939,19 @@ public final class ServerlessNode implements Closeable {
         return Math.max(1, settings.getAsInt("serverless.search.fanout.concurrency", DEFAULT_SEARCH_FANOUT_CONCURRENCY));
     }
 
+    /** How many indices a prefix pattern must match before a search reads its group's digest rollups. */
+    public static final int DEFAULT_ROLLUP_MIN_INDICES = 32;
+
+    /**
+     * How many indices a pattern must match before the digest rollups are consulted: below it, the per-index
+     * checks cost less than the group's registers.
+     *
+     * @return the threshold
+     */
+    public int rollupMinIndices() {
+        return Math.max(1, settings.getAsInt("serverless.search.rollup.min_indices", DEFAULT_ROLLUP_MIN_INDICES));
+    }
+
     /** How many cold shards one search may activate by default. */
     public static final int DEFAULT_SEARCH_ACTIVATION_BUDGET = 1024;
 
@@ -1986,6 +1999,9 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setBeforePublish(
+            (id, shards, digest) -> plane.rollups().widen(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), digest)
+        );
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );
@@ -2060,6 +2076,9 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setBeforePublish(
+            (id, shards, digest) -> plane.rollups().widen(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), digest)
+        );
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );
@@ -2126,6 +2145,9 @@ public final class ServerlessNode implements Closeable {
         }
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setBeforePublish(
+            (id, shards, digest) -> plane.rollups().widen(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), digest)
+        );
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );
@@ -2185,6 +2207,9 @@ public final class ServerlessNode implements Closeable {
         // The takeover fenced every older term at the swap, so the open need not list them again.
         reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
         try {
+            // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
+            // documents its published digest does not describe.
+            plane.rollups().markOwned(indexName, described.get().uuid(), described.get().numberOfShards(), shardNumber, assignment.term());
             final ClusterState view = projectAndApply(java.util.List.of(described.get()), java.util.List.of(assignment));
             reconciler.ensureOpen(view, java.util.List.of(assignment));
             confirmIncarnation(described.get().uuid(), describedAt);
@@ -2681,6 +2706,9 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setBeforePublish(
+            (id, shards, digest) -> plane.rollups().widen(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), digest)
+        );
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );
@@ -3142,6 +3170,15 @@ public final class ServerlessNode implements Closeable {
         final String uuid = shardId.getIndex().getUUID();
         final long window = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(incarnationFenceMillis);
         if (confirmedWithin(uuid, window)) {
+            return;
+        }
+        // A routing read this node made moments ago -- resolving a search's names, say -- found this very
+        // incarnation, and a read is a read whoever made it: stamped with when it began, it confirms exactly
+        // what the fence's own read would. A wide search used to read every descriptor twice, once to route
+        // and once here.
+        final java.util.OptionalLong routed = plane.readConfirmingIncarnation(shardId.getIndexName(), uuid);
+        if (routed.isPresent() && System.nanoTime() - routed.getAsLong() <= window) {
+            confirmIncarnation(uuid, routed.getAsLong());
             return;
         }
         synchronized (incarnationLocks[Math.floorMod(uuid.hashCode(), incarnationLocks.length)]) {

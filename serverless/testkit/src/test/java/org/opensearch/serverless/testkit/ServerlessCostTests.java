@@ -935,16 +935,20 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 twentyTogether
             );
 
-            // The property, not the number: a batch's routing cost is the shards it touches, not the
-            // documents it asks for. Ten documents in one index used to read that index's descriptor ten
-            // times over; asserting the constant here would pin a number that may legitimately change,
-            // while asserting that twenty cost what ten cost pins the shape.
-            assertEquals(
-                "on " + label + ", a multi-get's cost must not grow with the number of documents in it",
-                tenTogether,
-                twentyTogether
+            // The property, not the number: a read's routing cost is not per document. Ten documents in one
+            // index used to read that index's descriptor ten times over, singly, and once as a multi-get --
+            // which is what "well below fetching them one at a time" asserted. Since 5cd68a7a96b gets route
+            // through the one-second routing cache and the incarnation fence's one-second confirmation, so
+            // inside a warm second ten singles read nothing and neither does a multi-get: both sides of that
+            // comparison are zero and it cannot hold. What still must hold is the bound -- at most the one
+            // routing read and one fence confirmation either can cost when its entry expires mid-loop,
+            // however many documents are asked for, singly or together.
+            assertTrue("on " + label + ", ten singles within a warm second read at most two registers: " + tenSingly, tenSingly <= 2);
+            assertTrue("on " + label + ", as does a multi-get of ten: " + tenTogether, tenTogether <= 2);
+            assertTrue(
+                "on " + label + ", and a multi-get's cost must not grow with the number of documents in it: " + twentyTogether,
+                twentyTogether <= 2
             );
-            assertTrue("on " + label + ", and must be well below fetching them one at a time", tenTogether * 2 < tenSingly);
 
             // 3. Forwarded: a peer while the writer still owns the shard.
             try (ServerlessNode idle = new ServerlessNode(nodeSettings("cost-get-fwd-" + label))) {

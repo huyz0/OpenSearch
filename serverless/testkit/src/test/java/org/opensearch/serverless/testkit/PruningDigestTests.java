@@ -70,6 +70,23 @@ public class PruningDigestTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * A long above 2^53 is held exactly. The first version stored every bound through a conditional expression
+     * that promoted it to a double, so a maximum of 2^60 + 1 was recorded as 2^60 and a query for exactly
+     * 2^60 + 1 ruled out the shard holding it.
+     */
+    public void testALargeLongBoundIsKeptExactly() throws Exception {
+        final long big = (1L << 60) + 1;
+        final PruningDigest d = new PruningDigest(Map.of("n", new PruningDigest.FieldRange("long", big - 10, big, null, null)));
+        assertEquals(Long.valueOf(big), d.fields().get("n").max());
+        assertTrue("the shard holding exactly the maximum must be asked", d.canMatch(QueryBuilders.termQuery("n", big), NOW));
+        assertTrue(d.canMatch(QueryBuilders.rangeQuery("n").gte(big), NOW));
+        assertFalse(d.canMatch(QueryBuilders.rangeQuery("n").gt(big + 1).gte(big + 1), NOW));
+        final CommitManifest read = CommitManifest.fromStream(new CommitManifest(1L, Map.of(), null, Map.of(), d).toBytes().streamInput());
+        assertEquals("and survives the manifest's JSON", Long.valueOf(big), read.digest().fields().get("n").max());
+        assertTrue(read.digest().canMatch(QueryBuilders.termQuery("n", big), NOW));
+    }
+
     public void testWhatItCannotJudgeIsAMaybe() {
         final PruningDigest d = digest();
         assertTrue("an undigested field", d.canMatch(QueryBuilders.rangeQuery("other").gte(1000), NOW));

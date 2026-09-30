@@ -169,6 +169,15 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
      * have loses that shard's documents from the total.
      */
     public void testTheDigestNeverSkipsAShardThatCouldMatch() throws Exception {
+        canary(Settings.EMPTY);
+    }
+
+    /** The same canary with the digest rollups consulted for every pattern, however few indices it matches. */
+    public void testTheRollupsNeverSkipAShardThatCouldMatch() throws Exception {
+        canary(Settings.builder().put("serverless.search.rollup.min_indices", 1).build());
+    }
+
+    private void canary(Settings extra) throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         final Map<String, List<long[]>> docs = new java.util.LinkedHashMap<>();
@@ -186,7 +195,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
             docs.put(String.format(Locale.ROOT, "logs-canary-%02d", i), index);
         }
         long skippedOverall = 0;
-        try (ServerlessNode node = new ServerlessNode(nodeSettings("canary", Settings.EMPTY))) {
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("canary", extra))) {
             node.start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, docs);
@@ -227,6 +236,141 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
             }
         }
         assertTrue("some queries must have pruned something, or this proves nothing", skippedOverall > 0);
+    }
+
+    private static final Settings ROLLUPS_ALWAYS = Settings.builder().put("serverless.search.rollup.min_indices", 1).build();
+
+    /** An index deleted and recreated with documents inside the range is found, whatever its old incarnation's entry said. */
+    public void testARecreatedIndexIsNotRuledOutByItsPredecessorsEntry() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("recreate", ROLLUPS_ALWAYS))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            seed(node, plane, clock, days(4));
+            final String query = "{\"size\":0,\"track_total_hits\":true,\"query\":{\"range\":{\"@timestamp\":{\"gte\":\"2026-09-20\"}}}}";
+            assertEquals(0L, first(TOTAL, send(node, "POST", "/logs-*/_search", query).body()));
+
+            // Day 2 deleted and recreated, and given a document on the 21st.
+            assertTrue(plane.deleteIndex(day(2)));
+            final Map<String, List<long[]>> again = new java.util.LinkedHashMap<>();
+            again.put(day(2), List.of(new long[] { at(21, 5), 2_105L }));
+            seedAgain(node, plane, clock, again);
+
+            final Response answer = send(node, "POST", "/logs-*/_search", query);
+            assertEquals(answer.body(), 200, answer.status());
+            assertEquals("the new incarnation's document is found: " + answer.body(), 1L, first(TOTAL, answer.body()));
+        }
+    }
+
+    /**
+     * The canary's own canary: an entry planted narrower than its shard -- the one thing the invariant forbids --
+     * makes the total wrong, so a rollup that ever did that would be caught.
+     */
+    public void testAPlantedNarrowEntryIsCaughtByTheTotal() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("planted", ROLLUPS_ALWAYS))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            seed(node, plane, clock, days(4));
+            final String query =
+                "{\"size\":0,\"track_total_hits\":true,\"query\":{\"range\":{\"@timestamp\":{\"gte\":\"2026-09-03\",\"lt\":\"2026-09-04\"}}}}";
+            assertEquals("honest rollups: day 3's four documents", 4L, first(TOTAL, send(node, "POST", "/logs-*/_search", query).body()));
+
+            // Day 3's entry rewritten to claim it holds only day 1.
+            plane.rollups()
+                .plantForTest(
+                    day(3),
+                    new org.opensearch.serverless.metadata.DigestRollups.Entry(
+                        "uuid-" + day(3),
+                        1,
+                        List.of(
+                            new org.opensearch.serverless.metadata.DigestRollups.ShardState(
+                                0L,
+                                new PruningDigest(
+                                    Map.of(
+                                        "@timestamp",
+                                        new PruningDigest.FieldRange(
+                                            "date",
+                                            at(1, 0),
+                                            at(1, 3),
+                                            "strict_date_optional_time||epoch_millis",
+                                            "und"
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                );
+            assertEquals(
+                "a narrow entry loses day 3's documents -- which is what the canary's totals would catch",
+                0L,
+                first(TOTAL, send(node, "POST", "/logs-*/_search", query).body())
+            );
+        }
+    }
+
+    /** A shard held by a writer is not ruled out by the rollups, whatever its published digest says. */
+    public void testAShardWithAWriterIsNotRuledOutByTheRollups() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("writer-mark", ROLLUPS_ALWAYS))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            seed(node, plane, clock, days(3));
+            final String query = "{\"size\":0,\"query\":{\"range\":{\"@timestamp\":{\"gte\":\"2026-09-20\"}}}}";
+            // Everything ruled out, and one kept for the aggregations' shape.
+            assertEquals(2L, first(SKIPPED, send(node, "POST", "/logs-*/_search", query).body()));
+
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want(day(2), 0);
+            loop.tick(clock.get());
+            final var entry = plane.rollups().readGroup("logs-", new org.opensearch.serverless.metadata.DescriptorStore.Reads() {
+                @Override
+                public <T> List<T> runAll(List<java.util.concurrent.Callable<T>> tasks) throws InterruptedException {
+                    final List<T> out = new ArrayList<>();
+                    for (java.util.concurrent.Callable<T> task : tasks) {
+                        try {
+                            out.add(task.call());
+                        } catch (Exception e) {
+                            throw new AssertionError(e);
+                        }
+                    }
+                    return out;
+                }
+            }).get(day(2));
+            assertTrue("the writer is recorded: " + entry, entry.states().get(0).ownerTerm() > 0);
+            assertFalse(entry.rulesOut(org.opensearch.index.query.QueryBuilders.rangeQuery("@timestamp").gte("2026-09-20"), clock.get()));
+        }
+    }
+
+    /** Writes more documents into indices that may exist already, publishes and lets go. */
+    private void seedAgain(ServerlessNode node, MetadataPlane plane, AtomicLong clock, Map<String, List<long[]>> docs) throws Exception {
+        final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+        for (String index : docs.keySet()) {
+            if (plane.describe(index).isEmpty()) {
+                plane.createIndex(new IndexDescriptor(index, "uuid-" + index + "-again", 1, MAPPING, null));
+            }
+            loop.want(index, 0);
+        }
+        loop.tick(clock.get());
+        for (Map.Entry<String, List<long[]>> index : docs.entrySet()) {
+            int id = 100;
+            for (long[] doc : index.getValue()) {
+                final Response put = send(
+                    node,
+                    "PUT",
+                    "/" + index.getKey() + "/_doc/" + (id++),
+                    "{\"@timestamp\":" + doc[0] + ",\"n\":" + doc[1] + ",\"msg\":\"log line\"}"
+                );
+                assertEquals(put.body(), 201, put.status());
+            }
+        }
+        loop.publishAll();
+        loop.setIdleAfterMillis(1);
+        loop.releaseIdle(clock.get() + 60_000L);
     }
 
     /**

@@ -84,6 +84,7 @@ public final class MetadataPlane {
         this.descriptors.onChanged(this::forgetRouting);
         this.descriptors.probeAt(RegisterMap.probe(base));
         this.reclaimQueue = new ReclaimQueue(blobStore, RegisterMap.reclaim(base));
+        this.rollups = new DigestRollups(blobStore, RegisterMap.rollups(base));
         final BlobLeaseMembership leases = new BlobLeaseMembership(
             blobStore.blobContainer(RegisterMap.members(base)),
             clock,
@@ -739,7 +740,7 @@ public final class MetadataPlane {
     public static final long DEFAULT_ROUTING_CACHE_MILLIS = 1_000L;
 
     /** A resolution and when it was read. */
-    private record CachedResolution(DescriptorStore.Resolution resolution, long atMillis) {
+    private record CachedResolution(DescriptorStore.Resolution resolution, long atMillis, long readStartedNanos) {
     }
 
     private final Map<String, CachedResolution> routingCache = new java.util.concurrent.ConcurrentHashMap<>();
@@ -785,14 +786,32 @@ public final class MetadataPlane {
         if (seen != null && now - seen.atMillis() <= routingCacheMillis) {
             return seen.resolution();
         }
+        final long readStartedNanos = System.nanoTime();
         final DescriptorStore.Resolution fresh = descriptors.resolve(name);
         if (fresh.absent()) {
             routingCache.remove(name);
         } else {
-            routingCache.put(name, new CachedResolution(fresh, now));
+            routingCache.put(name, new CachedResolution(fresh, now, readStartedNanos));
             pruneRoutingCache(now);
         }
         return fresh;
+    }
+
+    /**
+     * When this node last read an index's descriptor from the store and found it at this uuid, by
+     * {@link System#nanoTime}, taken as the read began -- for the incarnation fence, which that read confirms as
+     * surely as one of its own. A read answered from the cache is not a read and does not move it.
+     *
+     * @param indexName the index
+     * @param uuid the incarnation
+     * @return when the read began, or empty if no cached read found this index at this uuid
+     */
+    public java.util.OptionalLong readConfirmingIncarnation(String indexName, String uuid) {
+        final CachedResolution seen = routingCache.get(indexName);
+        if (seen == null || seen.resolution().index() == null || uuid.equals(seen.resolution().index().uuid()) == false) {
+            return java.util.OptionalLong.empty();
+        }
+        return java.util.OptionalLong.of(seen.readStartedNanos());
     }
 
     /**
@@ -1133,6 +1152,17 @@ public final class MetadataPlane {
             container.deleteBlobsIgnoringIfNotExists(stillExpired);
         }
         return stillExpired.size();
+    }
+
+    private final DigestRollups rollups;
+
+    /**
+     * Returns the digest rollups: every index's pruning digests, a few registers per name group.
+     *
+     * @return the rollups
+     */
+    public DigestRollups rollups() {
+        return rollups;
     }
 
     /**

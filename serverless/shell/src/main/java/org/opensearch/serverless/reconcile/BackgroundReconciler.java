@@ -1048,6 +1048,13 @@ public final class BackgroundReconciler implements Closeable {
         }
         node.reconciler().releaseShard(shardId, reason);
         lastPublishedMaxSeqNo.remove(shardId);
+        // Unmarked only now, with the last publish recorded and no writer left: from here a coordinator may
+        // rule the shard out from its digest. A clear that fails leaves it marked, which costs a check.
+        try {
+            plane.rollups().clearOwned(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id(), head.get().term());
+        } catch (Exception e) {
+            logger.warn("could not clear the writer mark of " + shardId + " in its digest rollup; searches will not skip it", e);
+        }
         // And forget the claim, so a node that churns through shards does not read a head per stale
         // claim on every heartbeat for the rest of its life.
         plane.forgetAssignment(node.localNode().getId(), shardId.getIndexName(), shardId.id());

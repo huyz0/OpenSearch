@@ -265,6 +265,8 @@ public final class BlobLeaseMembership implements MembershipSource {
         }
         ownGeneration = result.currentGeneration();
         ownExpiresAtMillis = renewed.expiresAtMillis();
+        // This node's own lease, in its own view from now on: see #current.
+        ownLease = renewed;
         if (enrolled.contains(self.nodeId()) == false && enrol(self.nodeId())) {
             enrolled.add(self.nodeId());
         }
@@ -508,6 +510,10 @@ public final class BlobLeaseMembership implements MembershipSource {
     public void release(String nodeId) throws IOException {
         container.deleteBlobsIgnoringIfNotExists(List.of(LEASE_PREFIX + nodeId));
         ownGeneration = BlobRegister.ABSENT_GENERATION;
+        final NodeLease self = ownLease;
+        if (self != null && self.nodeId().equals(nodeId)) {
+            ownLease = null;
+        }
         // The lease first, then the index: a refresh between the two finds a listed node with no lease
         // and prunes it, which is the same end state.
         unenrol(Set.of(nodeId));
@@ -582,9 +588,32 @@ public final class BlobLeaseMembership implements MembershipSource {
         }
     }
 
+    /** The lease this node last renewed, which {@link #current} includes while it is unexpired. */
+    private volatile NodeLease ownLease;
+
+    /**
+     * The members as last refreshed, and this node itself.
+     *
+     * <p>Itself even before a refresh has seen it: the snapshot is refreshed at most once a second, and a node
+     * that had just started was missing from its own view until then -- so a search it coordinated found no
+     * reader for a shard nobody owned, itself included, and answered 500. Added here rather than written into
+     * the snapshot, so a refresh still reads the lease and subscribers still hear the join.
+     */
     @Override
     public Set<NodeLease> current() {
-        return observed;
+        final Set<NodeLease> seen = observed;
+        final NodeLease self = ownLease;
+        if (self == null || self.isExpiredAt(clock.getAsLong())) {
+            return seen;
+        }
+        for (NodeLease member : seen) {
+            if (member.nodeId().equals(self.nodeId())) {
+                return seen;
+            }
+        }
+        final Set<NodeLease> withSelf = new LinkedHashSet<>(seen);
+        withSelf.add(self);
+        return java.util.Collections.unmodifiableSet(withSelf);
     }
 
     @Override
