@@ -203,6 +203,13 @@ public class FsBlobContainer extends AbstractBlobContainer {
                 } catch (FileNotFoundException | NoSuchFileException e) {
                     // The file was concurrently deleted between listing files and trying to get its attributes so we skip it here
                     continue;
+                } catch (java.nio.file.AccessDeniedException e) {
+                    // Windows reports a file that is being deleted as access denied rather than missing; a temporary
+                    // blob is deleted as soon as it is published, so it is skipped the way a deleted one is.
+                    if (isTempBlobName(file.getFileName().toString())) {
+                        continue;
+                    }
+                    throw e;
                 }
                 if (attrs.isRegularFile()) {
                     builder.put(file.getFileName().toString(), new PlainBlobMetadata(file.getFileName().toString(), attrs.size()));
@@ -244,6 +251,12 @@ public class FsBlobContainer extends AbstractBlobContainer {
                     attrs = Files.readAttributes(file, BasicFileAttributes.class);
                 } catch (FileNotFoundException | NoSuchFileException e) {
                     continue;
+                } catch (java.nio.file.AccessDeniedException e) {
+                    // A temporary blob mid-delete on Windows; see listBlobsByPrefix.
+                    if (isTempBlobName(name)) {
+                        continue;
+                    }
+                    throw e;
                 }
                 if (attrs.isRegularFile()) {
                     page.add(new PlainBlobMetadata(name, attrs.size()));
@@ -331,16 +344,43 @@ public class FsBlobContainer extends AbstractBlobContainer {
     @Override
     public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
         final Path file = path.resolve(blobName);
-        try {
-            writeToPath(inputStream, file, blobSize);
-        } catch (FileAlreadyExistsException faee) {
-            if (failIfAlreadyExists) {
-                throw faee;
+        if (failIfAlreadyExists) {
+            createWhole(blobName, inputStream, blobSize);
+        } else {
+            try {
+                writeToPath(inputStream, file, blobSize);
+            } catch (FileAlreadyExistsException faee) {
+                deleteBlobsIgnoringIfNotExists(Collections.singletonList(blobName));
+                writeToPath(inputStream, file, blobSize);
             }
-            deleteBlobsIgnoringIfNotExists(Collections.singletonList(blobName));
-            writeToPath(inputStream, file, blobSize);
         }
         IOUtils.fsync(path, true);
+    }
+
+    /**
+     * Creates a blob only if its name is free, and never lets the name be seen before the content is whole.
+     *
+     * <p>Writing in place created the name first and filled it afterwards, so a concurrent listing could see the
+     * blob at any length from zero up. An object store never shows a partly written object, and callers written
+     * against one rely on that: a log that marks a fence with a blob of no bytes read a record still being written
+     * as a fence, skipped fencing the term, and let the fenced writer append after a takeover. So the content goes to
+     * a temporary blob first and is published under its name by a hard link, which either creates the name with the
+     * whole content behind it or fails because the name is taken -- the same answer put-if-absent gives.
+     */
+    private void createWhole(String blobName, InputStream inputStream, long blobSize) throws IOException {
+        final Path target = path.resolve(blobName);
+        final Path temp = path.resolve(tempBlobName(blobName));
+        writeToPath(inputStream, temp, blobSize);
+        try {
+            try {
+                Files.createLink(target, temp);
+            } catch (UnsupportedOperationException e) {
+                // A filesystem without hard links: a copy still refuses a taken name, though not atomically.
+                Files.copy(temp, target);
+            }
+        } finally {
+            Files.deleteIfExists(temp);
+        }
     }
 
     @Override
