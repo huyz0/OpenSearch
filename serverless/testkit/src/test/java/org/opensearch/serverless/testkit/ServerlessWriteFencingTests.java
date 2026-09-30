@@ -161,7 +161,14 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         // Now the zombie wakes up and appends under its old term, exactly as a node that has not yet
         // noticed it lost the shard would. Nothing rejects this: it is a well-formed write to a path the
         // zombie still believes is its own.
-        zombieLog.append(zombieTerm, List.of(new WalRecord("zombie", "{\"msg\":\"appended after the takeover\"}", 99L, zombieTerm, 1L)));
+        // Refused by the store: the takeover fenced this term, and the fence holds the slot it writes next.
+        expectThrows(
+            IOException.class,
+            () -> zombieLog.append(
+                zombieTerm,
+                List.of(new WalRecord("zombie", "{\"msg\":\"appended after the takeover\"}", 99L, zombieTerm, 1L))
+            )
+        );
 
         // B dies without ever publishing, so the log is still the only account of this shard's history.
         b.close();
@@ -229,7 +236,14 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         assertTrue("the published document must have arrived in the commit", b.get(onB, "legitimate").found());
 
         // The zombie appends under its old term, into a log that was empty when B sealed it.
-        zombieLog.append(zombieTerm, List.of(new WalRecord("zombie", "{\"msg\":\"appended after the takeover\"}", 99L, zombieTerm, 1L)));
+        // Refused by the store: the takeover fenced this term, and the fence holds the slot it writes next.
+        expectThrows(
+            IOException.class,
+            () -> zombieLog.append(
+                zombieTerm,
+                List.of(new WalRecord("zombie", "{\"msg\":\"appended after the takeover\"}", 99L, zombieTerm, 1L))
+            )
+        );
 
         b.close();
         clock.set(clock.get() + TTL + 1);
@@ -260,9 +274,10 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
      * after the seal under the current code and strictly before it under the old code, while sitting inside
      * the window either way. That is the whole discrimination: nothing else about the test changes.
      *
-     * <p><b>What this does not claim.</b> The window is narrowed, not closed. A swap and a seal are two
-     * object-store operations and there is no transaction spanning them, so an append landing between them
-     * is still inside the cutoff. Closing it entirely would need the register itself to carry the seal.
+     * <p><b>And now the store refuses it.</b> The seal is a fence -- the predecessor's next slot, occupied -- so an
+     * append after it is not merely left out of replay but refused. An append between the swap and the fence is
+     * the other half, and is acknowledged and replayed: see
+     * {@link #testAZombieAppendingBetweenTheSwapAndTheFenceIsAcknowledgedAndReplayed}.
      *
      * <p><b>D5:</b> {@code FsBlobContainer} only.
      */
@@ -293,6 +308,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         // The successor's plane, with one hook: the moment it records its claim on the shard it has just
         // won, the predecessor appends. That is inside the window by construction.
         final AtomicBoolean appended = new AtomicBoolean();
+        final AtomicBoolean refused = new AtomicBoolean();
         final BlobStore hooked = new ClaimHookingBlobStore(new FsBlobStore(1024, objectStore, false), () -> {
             if (appended.compareAndSet(false, true)) {
                 try {
@@ -301,7 +317,8 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
                         List.of(new WalRecord("zombie", "{\"msg\":\"appended inside the window\"}", 99L, zombieTerm, 1L))
                     );
                 } catch (IOException e) {
-                    throw new java.io.UncheckedIOException("the zombie could not append, so the window was never exercised", e);
+                    // The takeover fenced the zombie's term before this claim, so the store refuses it.
+                    refused.set(true);
                 }
             }
         });
@@ -313,6 +330,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
             assertTrue("the hook must have fired, or this test proves nothing", appended.get());
+            assertTrue("an append after the fence must be refused by the store, not merely left out of replay", refused.get());
 
             final ShardId onB = b.reconciler().openShards().iterator().next();
             assertTrue("history written before the takeover must still survive", b.get(onB, "legitimate").found());
@@ -320,6 +338,210 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
                 "a record appended between the swap and the open must not be replayed as acknowledged history",
                 b.get(onB, "zombie").found()
             );
+        }
+    }
+
+    /**
+     * The case the open item named, closed: a predecessor appending after the swap that moved ownership and
+     * before the successor's fence. Its record lands ahead of the fence, so its append returns -- it is
+     * acknowledged -- and the successor replays it. It used to be replayed while its writer refused it.
+     *
+     * <p><b>D5:</b> {@code FsBlobContainer} only.
+     */
+    public void testAZombieAppendingBetweenTheSwapAndTheFenceIsAcknowledgedAndReplayed() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Path objectStore = createTempDir();
+        final MetadataPlane setup = freshIndex(clock, objectStore);
+
+        final ServerlessNode a = new ServerlessNode(nodeSettings("swap-a"));
+        a.start();
+        final BackgroundReconciler loopA = new BackgroundReconciler(a, setup);
+        loopA.want("alpha", 0);
+        loopA.tick(clock.get());
+        final ShardId onA = a.reconciler().openShards().iterator().next();
+        a.index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
+        final long zombieTerm = a.get(onA, "legitimate").primaryTerm();
+        final WalStore zombieLog = a.reconciler().wal(onA);
+        a.close();
+        clock.set(clock.get() + TTL + 1);
+
+        // The moment the successor's swap of the head lands -- before it fences -- the predecessor appends.
+        final AtomicBoolean acknowledged = new AtomicBoolean();
+        final BlobStore hooked = new HeadSwapHookingBlobStore(new FsBlobStore(1024, objectStore, false), () -> {
+            if (acknowledged.get() == false) {
+                try {
+                    zombieLog.append(
+                        zombieTerm,
+                        List.of(new WalRecord("inside", "{\"msg\":\"appended between the swap and the fence\"}", 99L, zombieTerm, 1L))
+                    );
+                    acknowledged.set(true);
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException("an append ahead of the fence must land", e);
+                }
+            }
+        });
+        final MetadataPlane plane = new MetadataPlane(hooked, BlobPath.cleanPath(), clock::get, TTL);
+
+        try (ServerlessNode b = new ServerlessNode(nodeSettings("swap-b"))) {
+            b.start();
+            final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
+            loopB.want("alpha", 0);
+            loopB.tick(clock.get());
+            assertTrue("the append between the swap and the fence must have been acknowledged", acknowledged.get());
+
+            final ShardId onB = b.reconciler().openShards().iterator().next();
+            assertTrue("history written before the takeover must survive", b.get(onB, "legitimate").found());
+            assertTrue("and an acknowledged append from inside the window must be replayed, not lost", b.get(onB, "inside").found());
+        }
+    }
+
+    /**
+     * A writer whose record has landed and which then stalls past its lease, while another node takes over,
+     * acknowledges the write when it resumes -- and the successor has it. The record is ahead of the fence, so
+     * it is durable; refusing it, as this used to, is what made a write "refused" and later replayed.
+     *
+     * <p><b>D5:</b> {@code FsBlobContainer} only.
+     */
+    public void testAWriteThatLandedBeforeATakeoverIsAcknowledgedAndKept() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final Path objectStore = createTempDir();
+        final java.util.concurrent.CountDownLatch landed = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch resume = new java.util.concurrent.CountDownLatch(1);
+        final AtomicBoolean armed = new AtomicBoolean();
+        final BlobStore stalling = new StallAfterLogWriteBlobStore(new FsBlobStore(1024, objectStore, false), armed, landed, resume);
+        final MetadataPlane planeA = new MetadataPlane(stalling, BlobPath.cleanPath(), clock::get, TTL);
+        planeA.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        final ServerlessNode a = new ServerlessNode(nodeSettings("stall-a"));
+        a.start();
+        final BackgroundReconciler loopA = new BackgroundReconciler(a, planeA);
+        loopA.want("alpha", 0);
+        loopA.tick(clock.get());
+        final ShardId onA = a.reconciler().openShards().iterator().next();
+
+        armed.set(true);
+        final java.util.concurrent.atomic.AtomicReference<Throwable> outcome = new java.util.concurrent.atomic.AtomicReference<>();
+        final Thread writer = new Thread(() -> {
+            try {
+                a.index(onA, "stalled", "{\"msg\":\"landed, then stalled\"}");
+            } catch (Throwable t) {
+                outcome.set(t);
+            }
+        });
+        writer.start();
+        try {
+            assertTrue("the record must have landed", landed.await(30, java.util.concurrent.TimeUnit.SECONDS));
+            // A stalls past its lease; B takes over and fences.
+            clock.set(clock.get() + TTL + 1);
+            final MetadataPlane planeB = new MetadataPlane(
+                new FsBlobStore(1024, objectStore, false),
+                BlobPath.cleanPath(),
+                clock::get,
+                TTL
+            );
+            try (ServerlessNode b = new ServerlessNode(nodeSettings("stall-b"))) {
+                b.start();
+                final BackgroundReconciler loopB = new BackgroundReconciler(b, planeB);
+                loopB.want("alpha", 0);
+                loopB.tick(clock.get());
+                resume.countDown();
+                writer.join(30_000);
+                assertNull("a write whose record landed before the fence must be acknowledged: " + outcome.get(), outcome.get());
+                final ShardId onB = b.reconciler().openShards().iterator().next();
+                assertTrue("and the successor must have it", b.get(onB, "stalled").found());
+            }
+        } finally {
+            resume.countDown();
+            writer.join(30_000);
+            a.close();
+        }
+    }
+
+    /** Stalls the first log record write, once armed, right after it has landed. */
+    private static final class StallAfterLogWriteBlobStore implements BlobStore {
+
+        private final BlobStore delegate;
+        private final AtomicBoolean armed;
+        private final java.util.concurrent.CountDownLatch landed;
+        private final java.util.concurrent.CountDownLatch resume;
+
+        StallAfterLogWriteBlobStore(
+            BlobStore delegate,
+            AtomicBoolean armed,
+            java.util.concurrent.CountDownLatch landed,
+            java.util.concurrent.CountDownLatch resume
+        ) {
+            this.delegate = delegate;
+            this.armed = armed;
+            this.landed = landed;
+            this.resume = resume;
+        }
+
+        @Override
+        public BlobContainer blobContainer(BlobPath path) {
+            final BlobContainer honest = delegate.blobContainer(path);
+            if (path.buildAsString().contains("/wal/t=") == false) {
+                return honest;
+            }
+            return new DelegatingBlobContainer(honest) {
+                @Override
+                public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+                    throws IOException {
+                    super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+                    if (blobSize > 0 && armed.compareAndSet(true, false)) {
+                        landed.countDown();
+                        try {
+                            resume.await(60, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
+            };
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+    }
+
+    /** Fires a hook right after a compare-and-swap of a shard head lands: after the swap, before the fence. */
+    private static final class HeadSwapHookingBlobStore implements BlobStore {
+
+        private final BlobStore delegate;
+        private final Runnable afterSwap;
+
+        HeadSwapHookingBlobStore(BlobStore delegate, Runnable afterSwap) {
+            this.delegate = delegate;
+            this.afterSwap = afterSwap;
+        }
+
+        @Override
+        public BlobContainer blobContainer(BlobPath path) {
+            final BlobContainer honest = delegate.blobContainer(path);
+            if (path.buildAsString().startsWith("shards/") == false) {
+                return honest;
+            }
+            return new DelegatingBlobContainer(honest) {
+                @Override
+                public org.opensearch.common.blobstore.BlobRegisterCasResult compareAndSwapRegister(
+                    String blobName,
+                    long expectedGeneration,
+                    org.opensearch.core.common.bytes.BytesReference newValue
+                ) throws IOException {
+                    final var result = super.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+                    if (result.applied()) {
+                        afterSwap.run();
+                    }
+                    return result;
+                }
+            };
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
         }
     }
 

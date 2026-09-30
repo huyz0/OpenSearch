@@ -201,6 +201,14 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
      * has been reclaimed shows up here as present with zero records -- which is the distinction that
      * matters, and is why this counts files instead of directories.
      */
+    private static long sizeOf(java.nio.file.Path path) {
+        try {
+            return java.nio.file.Files.size(path);
+        } catch (java.io.IOException e) {
+            return 0L;
+        }
+    }
+
     private static java.util.SortedMap<Long, Integer> walRecordsByTerm(java.nio.file.Path objectStore) throws Exception {
         final java.util.SortedMap<Long, Integer> byTerm = new java.util.TreeMap<>();
         final java.util.List<java.nio.file.Path> termDirs;
@@ -213,7 +221,8 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         }
         for (java.nio.file.Path dir : termDirs) {
             try (var files = java.nio.file.Files.list(dir)) {
-                final int records = (int) files.filter(p -> p.getFileName().toString().matches("\\d{20}")).count();
+                // A blob of no bytes is a fence, not a record.
+                final int records = (int) files.filter(p -> p.getFileName().toString().matches("\\d{20}") && sizeOf(p) > 0).count();
                 byTerm.put(Long.parseLong(dir.getFileName().toString().substring(2)), records);
             }
         }

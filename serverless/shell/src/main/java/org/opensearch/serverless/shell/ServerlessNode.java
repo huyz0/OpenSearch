@@ -1912,6 +1912,7 @@ public final class ServerlessNode implements Closeable {
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
         reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final IndexDescriptor descriptor = plane.describe(pit.index())
             .orElseThrow(() -> new IllegalArgumentException("no such index: " + pit.index()));
         // Every shard's term, not just this one's: the view's IndexService is created once and updated as
@@ -1984,6 +1985,7 @@ public final class ServerlessNode implements Closeable {
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
         reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId(), localNode.getEphemeralId());
 
         // Phase 4 has only writer shards, and a node that does not accept writer activation must not
@@ -2047,6 +2049,7 @@ public final class ServerlessNode implements Closeable {
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
         reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         {
             // The lease first, and it has to be first. Under batched liveness a shard-head is not
             // self-describing: it names an owner, and whether that ownership is live is a fact stored in
@@ -2226,6 +2229,27 @@ public final class ServerlessNode implements Closeable {
             released.addAll(verifyHeads(plane));
         }
         return released;
+    }
+
+    /**
+     * Whether the shard's head names this very process as owner at exactly this term: what a writer asks
+     * after fencing its own term, so one superseded before it had written anything stops rather than writes.
+     * Unreadable answers no, which stops the writer and costs a retry, never a second writer.
+     */
+    private boolean ownsAtTerm(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        org.opensearch.core.index.shard.ShardId id,
+        long term
+    ) {
+        try {
+            final var head = plane.heads().read(id.getIndexName(), id.id());
+            return head.isPresent()
+                && head.get().term() == term
+                && localNode.getId().equals(head.get().ownerNodeId())
+                && (head.get().ownerEphemeralId() == null || localNode.getEphemeralId().equals(head.get().ownerEphemeralId()));
+        } catch (java.io.IOException e) {
+            return false;
+        }
     }
 
     /**
@@ -2563,6 +2587,7 @@ public final class ServerlessNode implements Closeable {
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
         reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final IndexDescriptor descriptor = plane.describe(indexName)
             .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
 
@@ -2838,11 +2863,26 @@ public final class ServerlessNode implements Closeable {
         // until it is synced, and a node with a one-kilobyte request limit found every later search
         // refused by a page a write had left behind. One local fsync per acknowledged write is the price,
         // and it is not an object-store request.
-        shard.sync();
+        syncIfStillOpen(shard);
         // The edge. Fired after the write is durable and applied, so a listener that publishes on it
         // can never publish a commit describing an operation the caller was not told about.
         signals.wrote(shardId);
         return new WriteOutcome(result.getSeqNo(), result.getTerm(), result.getVersion(), result.isCreated(), true);
+    }
+
+    /**
+     * Syncs the shard's local translog, unless the shard was released after its record reached the log.
+     *
+     * <p>The record is durable in the object store by then, and a successor replays it; the local translog is
+     * only this node's copy, and a shard released for a lapsed lease has no further use for it. Failing the
+     * write here would report as refused a write that is in the log.
+     */
+    private static void syncIfStillOpen(org.opensearch.index.shard.IndexShard shard) throws java.io.IOException {
+        try {
+            shard.sync();
+        } catch (org.opensearch.index.shard.IndexShardClosedException e) {
+            // Released after the append; see above.
+        }
     }
 
     /**
@@ -2903,19 +2943,13 @@ public final class ServerlessNode implements Closeable {
                 e
             );
         }
-        // And once more after the PUT landed. A successor seals the log only after this node's lease has
-        // expired, so a record written while the lease was valid on both sides of the PUT is ahead of
-        // any seal. A writer that paused across the expiry may have landed its record behind one, and
-        // the successor never replays it: that record must not be acknowledged, and it is not -- the
-        // shard is released and the caller sees a failure it can retry against the new owner.
-        ensureOwnLeaseIsStillValid(shardId);
-        if (reconciler.shard(shardId) != shard) {
-            // Closed underneath this write by a sibling write's lease failure. The record may or may not
-            // be ahead of a seal; nothing here can tell, so it is not acknowledged.
-            throw new java.io.IOException(
-                "refusing to acknowledge a write to " + shardId + ": the shard was closed while it was in flight"
-            );
-        }
+        // The PUT landed, so the record is durable: a successor fences this term before it replays, and a
+        // fence occupies the slot this writer would have written next, so a record that landed is ahead of
+        // every fence and every successor replays it. It is acknowledged whatever the lease now says --
+        // refusing it was what turned a durable record into one "refused" and later replayed. A lapsed
+        // lease still releases the shard, so nothing further is written here. See
+        // serverless/rfc-fencing-closure.md.
+        releaseIfLeaseLapsed(shardId);
         // After the PUT, so the confirmation is of the index as it stood once the record was down.
         ensureIncarnationLive(shardId);
     }
@@ -3222,13 +3256,30 @@ public final class ServerlessNode implements Closeable {
      * @throws java.io.IOException if this node may no longer write
      */
     private void ensureOwnLeaseIsStillValid(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
+        if (releaseIfLeaseLapsed(shardId)) {
+            throw new java.io.IOException(
+                "refusing to write to "
+                    + shardId
+                    + ": this node's lease has expired, so it can no longer claim to hold the shard; "
+                    + "the shard has been released and the write was not acknowledged"
+            );
+        }
+    }
+
+    /**
+     * Releases the shard if this node's own lease has expired by its own clock, without refusing anything.
+     *
+     * @param shardId the shard
+     * @return true if the lease had lapsed and the shard was released
+     */
+    private boolean releaseIfLeaseLapsed(org.opensearch.core.index.shard.ShardId shardId) {
         final var plane = metadataPlane;
         if (plane == null) {
-            return;
+            return false;
         }
         final long now = plane.clock().getAsLong();
         if (plane.membership().selfLeaseValidAt(now) && ownershipUnverified == false) {
-            return;
+            return false;
         }
         // Remembered so the next renewal gives the head back in the register: a closed shard whose head
         // still names this node, once the lease is renewed, is a shard nobody serves and nobody can take.
@@ -3239,12 +3290,7 @@ public final class ServerlessNode implements Closeable {
         reconciler.releaseShard(shardId, "this node's own lease expired at or before " + now);
         writeFenced.remove(shardId);
         writerAssignments.remove(shardKey(shardId.getIndexName(), shardId.id()));
-        throw new java.io.IOException(
-            "refusing to write to "
-                + shardId
-                + ": this node's lease has expired, so it can no longer claim to hold the shard; "
-                + "the shard has been released and the write was not acknowledged"
-        );
+        return true;
     }
 
     /**
@@ -3330,7 +3376,7 @@ public final class ServerlessNode implements Closeable {
         // shard whose only recent change was a delete still needs publishing or the tombstone lives
         // nowhere but this node's disk and its log.
         // For the breaker, not for durability -- see index.
-        shard.sync();
+        syncIfStillOpen(shard);
         signals.wrote(shardId);
         return new WriteOutcome(result.getSeqNo(), result.getTerm(), result.getVersion(), false, result.isFound());
     }
@@ -3624,7 +3670,7 @@ public final class ServerlessNode implements Closeable {
         appendOrRelease(shardId, shard, applied);
         // One local sync for the batch, for the reason index gives: it gives the translog's page back to
         // the request breaker, and costs no object-store request.
-        shard.sync();
+        syncIfStillOpen(shard);
         // One edge for the batch, not one per document. The
         // edge is raised after everything is applied, so a publish it triggers describes the whole batch
         // or none of it.

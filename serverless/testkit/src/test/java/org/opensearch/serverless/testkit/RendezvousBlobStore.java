@@ -196,7 +196,8 @@ public final class RendezvousBlobStore implements BlobStore {
 
         @Override
         public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
-            if (isSeal(blobName) == false) {
+            // Nor a fence -- a blob of no bytes, written when a writer opens or takes over its log.
+            if (isSeal(blobName) == false && blobSize > 0) {
                 meet(Meet.WRITES);
             }
             inner.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);

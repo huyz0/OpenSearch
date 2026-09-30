@@ -338,14 +338,15 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
 
         log.append(1L, List.of(new WalRecord("a", "{\"msg\":\"a\"}"), new WalRecord("b", "{\"msg\":\"b\"}")));
         final Map<Long, String> reopened = log.sealAt(1L);
-        assertEquals("the reopened writer's own records replay", "00000000000000000001", reopened.get(1L));
+        // Slot 1 is the fence the writer placed before its first append; its records start at 2.
+        assertEquals("the reopened writer's own records replay", "00000000000000000002", reopened.get(1L));
         assertFalse("the sealer's own term must not be written into the seal", log.sealedPosition().containsKey(1L));
 
         // The reopened writer goes on; a successor at the next term seals, and every record replays.
         log.append(1L, List.of(new WalRecord("c", "{\"msg\":\"c\"}")));
         final Map<Long, String> successor = plane.walStore("alpha", "uuid-alpha-00000000", 0).sealAt(2L);
-        assertEquals("records the reopened writer acknowledged after its own seal must replay", "00000000000000000002", successor.get(1L));
-        assertEquals("00000000000000000002", log.sealedPosition().get(1L));
+        assertEquals("records the reopened writer acknowledged after its own seal must replay", "00000000000000000003", successor.get(1L));
+        assertEquals("00000000000000000003", log.sealedPosition().get(1L));
     }
 
     /**
@@ -426,19 +427,13 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
     }
 
     /**
-     * A zombie's late records are reclaimed, not left forever.
+     * A zombie's late records cannot accumulate: the takeover fences its term, so they are refused rather
+     * than written, and the successor's first publish reclaims everything in the term but the fence.
      *
-     * <p><b>The leak this pins.</b> Older term containers were emptied once per term per instance, on the
-     * reasoning that a successor replays everything under them before it starts, so a second pass would
-     * find nothing. The exception is the writer that has lost the shard and not yet noticed: it appends
-     * under its own now-older term for up to a lease, and all of it lands after the one drop that would
-     * have taken it. Nothing else collects it — the sweep walks {@code t=N} under the shard container and
-     * steps over {@code wal} — so on a shard that never failed over again those bytes stayed for the life
-     * of the index. Never a correctness fault, because the seal keeps them out of replay; purely storage
-     * that only grew.
-     *
-     * <p>Both ends of the interval are pinned here rather than a duration waited out, so nothing in this
-     * test depends on timing.
+     * <p><b>The leak this used to pin.</b> A writer that had lost the shard went on appending under its old
+     * term for up to a lease, all of it after the one drop that would have taken it, and nothing collected
+     * it. A re-scan on a timer bounded it. With the log fenced at the takeover there is nothing to collect: the
+     * late append is refused by the store at the fence. See {@code serverless/rfc-fencing-closure.md}.
      */
     public void testAZombiesLateRecordsAreReclaimedByALaterPublish() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -447,39 +442,31 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         createAlpha(plane);
         final BlobPath shardBase = RegisterMap.shardData(BlobPath.cleanPath(), "alpha", "uuid-alpha-00000000", 0);
 
-        // Never re-scans: the behaviour before the interval existed.
-        final WalStore latched = new WalStore(store, shardBase, Long.MAX_VALUE);
-        latched.append(1L, List.of(new WalRecord("old", "{\"msg\":\"old\"}")));
-        latched.onPublished(2L);
-        assertEquals("the first drop takes what was there", 0, recordsUnderTerm(store, shardBase, 1L));
-
-        // The zombie, still appending under the term it has lost, after that drop.
-        latched.append(1L, List.of(new WalRecord("zombie", "{\"msg\":\"zombie\"}")));
+        final WalStore zombie = new WalStore(store, shardBase, Long.MAX_VALUE);
+        zombie.append(1L, List.of(new WalRecord("old", "{\"msg\":\"old\"}")));
         assertEquals(1, recordsUnderTerm(store, shardBase, 1L));
-        latched.onPublished(2L);
-        assertEquals("with no re-scan the zombie's record is never collected -- the leak", 1, recordsUnderTerm(store, shardBase, 1L));
 
-        // The same sequence on one instance that does re-scan, and it has to be one instance across both
-        // publishes: a *fresh* store drops on its first publish whatever the interval says, because the
-        // term has changed under it. Only the second publish on the same instance can tell an interval
-        // that elapsed from a latch that never lifts, which is the whole difference being tested.
-        final WalStore rescanning = new WalStore(store, shardBase, 0L);
-        rescanning.append(1L, List.of(new WalRecord("second-old", "{\"msg\":\"old\"}")));
-        rescanning.onPublished(2L);
-        assertEquals("its first publish drops what was there, as the latched one also did", 0, recordsUnderTerm(store, shardBase, 1L));
+        // The takeover at term 2 fences term 1, and the successor publishes there.
+        final WalStore successor = new WalStore(store, shardBase, Long.MAX_VALUE);
+        successor.fenceOlderTerms(2L);
+        successor.append(2L, List.of(new WalRecord("new", "{\"msg\":\"new\"}")));
+        successor.onPublished(2L);
+        assertEquals("the first drop takes every record of the fenced term", 0, recordsUnderTerm(store, shardBase, 1L));
 
-        rescanning.append(1L, List.of(new WalRecord("second-zombie", "{\"msg\":\"zombie\"}")));
-        assertEquals(1, recordsUnderTerm(store, shardBase, 1L));
-        rescanning.onPublished(2L);
-        assertEquals("a later publish re-scans and reclaims what the zombie left", 0, recordsUnderTerm(store, shardBase, 1L));
+        // The zombie, still appending under the term it has lost: refused at the fence, so nothing lands.
+        expectThrows(java.io.IOException.class, () -> zombie.append(1L, List.of(new WalRecord("zombie", "{\"msg\":\"zombie\"}"))));
+        successor.onPublished(2L);
+        assertEquals("nothing for a later publish to collect", 0, recordsUnderTerm(store, shardBase, 1L));
     }
 
     /** How many WAL records sit under one term, read straight off the store. */
     private static int recordsUnderTerm(BlobStore store, BlobPath shardBase, long term) throws IOException {
         final BlobContainer container = store.blobContainer(shardBase.add("wal").add("t=" + term));
         int records = 0;
-        for (String name : container.listBlobs().keySet()) {
-            if (name.matches("\\d{20}")) {
+        for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : container.listBlobs().entrySet()) {
+            // A blob of no bytes is a fence, not a record.
+            final String name = blob.getKey();
+            if (name.matches("\\d{20}") && blob.getValue().length() > 0) {
                 records++;
             }
         }
@@ -666,7 +653,10 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
                 if (broken != null && pathString.contains(broken)) {
                     throw new IOException("injected: the store refused a write under " + pathString);
                 }
-                pass(Point.WRITE_BLOB, pathString);
+                // A fence (a blob of no bytes, written when a writer opens its log) is not an append under test.
+                if (blobSize > 0) {
+                    pass(Point.WRITE_BLOB, pathString);
+                }
                 super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
             }
 

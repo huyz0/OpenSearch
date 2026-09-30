@@ -70,6 +70,12 @@ public final class WalStore {
 
     private final AtomicLong ordinal = new AtomicLong();
     private volatile long seededTerm = -1L;
+    /** Set by any failed or ambiguous append: this instance never appends to that term again. See {@link #append}. */
+    private volatile boolean poisoned;
+    /** The fences this instance knows of in its own term, which truncation must never delete. */
+    private final java.util.Set<String> ownFences = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** How many times a fence is retried against a predecessor still winning the next slot. */
+    private static final int FENCE_ATTEMPTS = 1000;
     private volatile List<String> previousSnapshot = List.of();
     /** The ordinal the last publish had seen, so the next publish's snapshot is the records after it. */
     private volatile long publishedUpTo = 0L;
@@ -181,6 +187,9 @@ public final class WalStore {
         // Zero-padded so a lexicographic listing is a chronological one. Within a term there is exactly
         // one writer, so the ordinal needs no coordination. A batch takes one ordinal and its records
         // replay in the order they were written, so the total order over a term is (ordinal, position).
+        if (poisoned) {
+            throw new IOException("this log writer stopped appending to term " + term + " after an earlier append failed or it was fenced");
+        }
         seed(term);
         final String name = String.format(java.util.Locale.ROOT, "%020d", ordinal.incrementAndGet());
         // Refused on collision, never overwritten. A store instance is rebuilt on every local release of a
@@ -188,32 +197,157 @@ public final class WalStore {
         // write as record 1 -- over the record it had just replayed. With the ordinal seeded from what
         // the container holds this does not happen, and if it somehow did, failing the write (which
         // releases the shard, see ServerlessNode) is the honest outcome rather than a silent overwrite.
-        containerFor(term).writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, true);
+        //
+        // <b>And any failure ends this writer's use of the term.</b> A refused write means another writer --
+        // a successor's fence, or a newer instance -- holds this slot, and an ambiguous one may or may not
+        // have landed; either way writing the next ordinal would step past a fence and land a record behind
+        // it. Stopping keeps this writer's successful names contiguous, which is what lets a successor find
+        // the one slot to fence. See the class documentation's fencing section.
+        try {
+            containerFor(term).writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, true);
+        } catch (IOException | RuntimeException e) {
+            poisoned = true;
+            throw e;
+        }
     }
 
     /**
-     * Starts the ordinal after the highest record already in the term, once per term.
+     * Begins writing a term, once per term: fences it, and starts the ordinal after the fence.
      *
-     * <p>One listing, paid the first time a term is written to by this instance. Within a term there is
-     * exactly one writer, so after seeding the counter needs no coordination.
+     * <p>A writer does not take its position from a listing and carry on from there. Another instance may be
+     * writing the same term -- the one a same-term reopen replaced, with a PUT still in flight -- and one
+     * that seeded from a listing would write straight past it, and past any fence placed for it. So a writer
+     * first occupies the next slot itself with a fence, and writes only after that: whatever held the term
+     * before is either ahead of the fence, where replay finds it, or refused by the store at the fence.
      */
     private synchronized void seed(long term) throws IOException {
         if (seededTerm == term) {
             return;
         }
-        long highest = 0L;
-        for (String name : containerFor(term).listBlobs().keySet()) {
-            if (RECORD_NAME.matcher(name).matches()) {
-                highest = Math.max(highest, Long.parseLong(name));
-            }
-        }
-        ordinal.set(highest);
+        establish(term, null);
+    }
+
+    /**
+     * Begins writing a term: fences it against every earlier writer of it, and then, if asked, confirms this
+     * node still owns the term.
+     *
+     * <p>The confirmation is what covers a writer that won a head and was superseded before it had written
+     * anything: a successor fences only the terms it finds in the log, and this one had none there yet. It
+     * places its own fence, then reads the head; a successor that took the shard before that read is seen by
+     * it, and this writer stops. One that takes it after finds this term in the log and fences it.
+     *
+     * @param term the term to write under
+     * @param stillOwner asked after the fence is placed; false stops this writer. Null skips the question.
+     * @throws IOException if the fence cannot be placed, or this node no longer owns the term
+     */
+    public synchronized void establish(long term, java.util.function.BooleanSupplier stillOwner) throws IOException {
+        final long fence = fence(term, true);
+        ownFences.add(name(fence));
+        ordinal.set(fence);
         seededTerm = term;
-        // What existed at seeding was replayed before this writer started, so it is in the first commit
-        // this instance publishes and is dropped by the publish after that -- the same cycle a listing
-        // gave it.
+        poisoned = false;
+        // What existed before the fence was replayed before this writer started, so it is in the first
+        // commit this instance publishes and is dropped by the publish after that.
         publishedUpTo = 0L;
         previousSnapshot = List.of();
+        if (stillOwner != null && stillOwner.getAsBoolean() == false) {
+            poisoned = true;
+            throw new IOException("term " + term + " has been taken over; this node will not write under it");
+        }
+    }
+
+    /**
+     * Fences a term: occupies the slot after its highest blob, so nothing can be written after it.
+     *
+     * <p>Put-if-absent decides between the fence and a writer's append aimed at the same slot. If the append
+     * wins, it is before the fence and the next attempt sees it; a writer's names are contiguous (see
+     * {@link #append}), so its next slot is the one fenced now. A fence is a blob of no bytes, which no record
+     * is, so a listing tells one apart by its length.
+     *
+     * @return the fenced ordinal
+     */
+    private long fence(long term, boolean own) throws IOException {
+        final BlobContainer container = containerFor(term);
+        for (int attempt = 0; attempt < FENCE_ATTEMPTS; attempt++) {
+            long highest = 0L;
+            for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : container.listBlobs().entrySet()) {
+                if (RECORD_NAME.matcher(blob.getKey()).matches()) {
+                    highest = Math.max(highest, Long.parseLong(blob.getKey()));
+                    if (own && blob.getValue().length() == 0L) {
+                        ownFences.add(blob.getKey());
+                    }
+                }
+            }
+            final long slot = highest + 1;
+            try {
+                container.writeBlob(name(slot), new ByteArrayInputStream(new byte[0]), 0L, true);
+                return slot;
+            } catch (java.nio.file.FileAlreadyExistsException e) {
+                // A writer took the slot first: its record is before the fence. Look again.
+            }
+        }
+        throw new IOException("could not fence term " + term + ": a writer kept taking the next slot");
+    }
+
+    /**
+     * Fences every older term whose last blob is not already a fence, at a takeover.
+     *
+     * <p>This is the seal, made a fence: rather than recording how far the predecessor's log reached, which
+     * a listing can only say about the past, it stops the log reaching further. Every older term, not just
+     * the predecessor's, because an activation that won a head and failed before fencing leaves the term
+     * before it open, and the next takeover has to close it.
+     *
+     * @param term the term this node has just taken the shard over at
+     * @throws IOException if a term cannot be listed or fenced
+     */
+    public void fenceOlderTerms(long term) throws IOException {
+        for (Map.Entry<Long, BlobContainer> older : termsInOrder().entrySet()) {
+            if (older.getKey() >= term) {
+                continue;
+            }
+            String last = null;
+            long lastLength = -1L;
+            for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : older.getValue().listBlobs().entrySet()) {
+                if (RECORD_NAME.matcher(blob.getKey()).matches() && (last == null || blob.getKey().compareTo(last) > 0)) {
+                    last = blob.getKey();
+                    lastLength = blob.getValue().length();
+                }
+            }
+            if (last != null && lastLength == 0L) {
+                continue;
+            }
+            fence(older.getKey(), false);
+        }
+    }
+
+    /**
+     * Reads every record the log holds, for a writer that has fenced every term it replays.
+     *
+     * <p>Fenced, so nothing is cut off by position: whatever landed is before a fence and belongs in the
+     * history. Only the bounds recorded by seals from before fences existed are still applied, to the terms
+     * they spoke for.
+     *
+     * @return the records to replay, ordered by term and then by ordinal
+     * @throws IOException if listing or reading fails
+     */
+    public List<WalRecord> replayableAfterFencing() throws IOException {
+        final BlobContainer sealsContainer = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
+        final List<String> sealNames = sealNamesIn(sealsContainer.listBlobs().keySet());
+        if (sealNames.isEmpty()) {
+            return replayable(null);
+        }
+        final Map<Long, String> sealed = mergeSeals(sealsContainer, sealNames);
+        final long sealedBelow = highestSealedTerm(sealNames);
+        final Map<Long, String> cutoff = new java.util.HashMap<>();
+        for (Long term : termsInOrder().keySet()) {
+            // Above the last legacy seal, unbounded; at or below it, what that seal recorded.
+            cutoff.put(term, term >= sealedBelow ? null : sealed.getOrDefault(term, ""));
+        }
+        return replayable(cutoff);
+    }
+
+    private static String name(long ordinal) {
+        return String.format(java.util.Locale.ROOT, "%020d", ordinal);
     }
 
     /**
@@ -284,8 +418,10 @@ public final class WalStore {
                 continue;
             }
             final String limit = cutoff == null ? null : cutoff.get(entry.getKey());
-            final List<String> names = new ArrayList<>(container.listBlobs().keySet());
-            names.removeIf(name -> RECORD_NAME.matcher(name).matches() == false);
+            final Map<String, org.opensearch.common.blobstore.BlobMetadata> listed = container.listBlobs();
+            final List<String> names = new ArrayList<>(listed.keySet());
+            // Fences hold no records: a blob of no bytes is one, and is not read.
+            names.removeIf(name -> RECORD_NAME.matcher(name).matches() == false || listed.get(name).length() == 0L);
             if (limit != null) {
                 names.removeIf(name -> name.compareTo(limit) > 0);
             }
@@ -531,14 +667,27 @@ public final class WalStore {
         // per publish used to be the largest fixed cost of a busy shard's pass.
         seed(term);
         final BlobContainer container = containerFor(term);
-        final List<String> toDelete = previousSnapshot;
+        final long upTo = ordinal.get();
+        // The highest blob of the term stays, whatever else goes: it is how a successor finds the slot to
+        // fence, and a term emptied by truncation would hide how far its writer had got. It is replayed again
+        // at the next open and skipped there by sequence number, which truncation lagging a publish already
+        // relies on. It goes once something newer is written.
+        final List<String> toDelete = new ArrayList<>(previousSnapshot);
+        final boolean keptHighest = toDelete.remove(name(upTo));
+        toDelete.removeAll(ownFences);
         if (toDelete.isEmpty() == false) {
             container.deleteBlobsIgnoringIfNotExists(toDelete);
         }
-        final long upTo = ordinal.get();
         final List<String> current = new ArrayList<>();
+        if (keptHighest) {
+            current.add(name(upTo));
+        }
         for (long each = publishedUpTo + 1; each <= upTo; each++) {
-            current.add(String.format(java.util.Locale.ROOT, "%020d", each));
+            final String each20 = name(each);
+            // Never a fence: a deleted fence frees the slot a stopped writer's next PUT is aimed at.
+            if (ownFences.contains(each20) == false) {
+                current.add(each20);
+            }
         }
         previousSnapshot = current;
         publishedUpTo = upTo;
@@ -604,8 +753,14 @@ public final class WalStore {
             if (childTerm == null || childTerm >= term) {
                 continue;
             }
-            final List<String> ours = new ArrayList<>(child.getValue().listBlobs().keySet());
+            final Map<String, org.opensearch.common.blobstore.BlobMetadata> listed = child.getValue().listBlobs();
+            final List<String> ours = new ArrayList<>(listed.keySet());
+            // Fences stay, and so does the term's highest blob -- which after a takeover is its fence, so the
+            // records below it all go; a term not yet fenced keeps its last record, which is how its fence
+            // will find the slot.
             ours.removeIf(name -> RECORD_NAME.matcher(name).matches() == false);
+            final String highest = ours.stream().max(Comparator.naturalOrder()).orElse(null);
+            ours.removeIf(name -> listed.get(name).length() == 0L || name.equals(highest));
             if (ours.isEmpty() == false) {
                 child.getValue().deleteBlobsIgnoringIfNotExists(ours);
                 dropped += ours.size();
