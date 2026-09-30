@@ -72,17 +72,12 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
 
             assertEquals("index creation over HTTP", 200, send(http, "PUT", "/alpha?shards=1", MAPPING).status());
 
-            // The node was told to want nothing. On-demand activation is what makes this write land: the
-            // first attempt is refused because no node owns the shard, and that refusal is the signal.
-            assertEquals(421, send(http, "PUT", "/alpha/_doc/1", "{\"msg\":\"unattended\",\"n\":1}").status());
-            assertBusy(
-                () -> assertFalse("the node should have taken the shard on its own", boot.node().reconciler().openShards().isEmpty()),
-                20,
-                java.util.concurrent.TimeUnit.SECONDS
-            );
-
+            // The node was told to want nothing. On-demand activation is what makes this write land: no node
+            // owns the shard, so this one takes it, and the write waits for that rather than being refused and
+            // left to retry -- which is what it used to be, 421 on the first attempt.
             final Response written = send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"unattended\",\"n\":1}");
-            assertEquals("the write must succeed once the shard is held: " + written.body(), 201, written.status());
+            assertEquals("the first write waits for its shard and lands: " + written.body(), 201, written.status());
+            assertFalse("the node took the shard on its own", boot.node().reconciler().openShards().isEmpty());
 
             final Response found = send(http, "GET", "/alpha/_search?q=msg:unattended", null);
             assertEquals(200, found.status());

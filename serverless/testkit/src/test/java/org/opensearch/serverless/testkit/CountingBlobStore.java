@@ -287,6 +287,33 @@ public final class CountingBlobStore implements BlobStore {
         }
 
         @Override
+        public List<BlobMetadata> listBlobsByPrefix(String blobNamePrefix, String startAfter, int limit) throws IOException {
+            reads.incrementAndGet();
+            // One request per thousand names, as S3 pages.
+            listings.addAndGet(Math.max(1, (limit + 999) / 1000));
+            return inner.listBlobsByPrefix(blobNamePrefix, startAfter, limit);
+        }
+
+        @Override
+        public Map<String, BlobContainer> children(String startAfter, int limit) throws IOException {
+            reads.incrementAndGet();
+            listings.addAndGet(Math.max(1, (limit + 999) / 1000));
+            final Map<String, BlobContainer> counted = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, BlobContainer> child : inner.children(startAfter, limit).entrySet()) {
+                counted.put(child.getKey(), new Counting(child.getValue()));
+            }
+            return counted;
+        }
+
+        @Override
+        public List<BlobMetadata> listBlobsByPrefixInSortedOrder(String blobNamePrefix, int limit, BlobNameSortOrder order)
+            throws IOException {
+            reads.incrementAndGet();
+            listings.addAndGet(Math.max(1, (limit + 999) / 1000));
+            return inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, order);
+        }
+
+        @Override
         public Optional<BlobRegister> readRegister(String blobName) throws IOException {
             reads.incrementAndGet();
             registerReads.incrementAndGet();

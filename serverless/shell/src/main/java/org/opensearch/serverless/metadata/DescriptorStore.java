@@ -808,21 +808,19 @@ public final class DescriptorStore {
      * One bounded page of descriptors, in name order.
      *
      * <p><b>This is the only enumeration a deployment at target scale may use.</b> "List every index" is
-     * not a slow operation at 100 million indices; it is not an operation at all — the answer does not
+     * not a slow operation at 100 million indices; it is not an operation at all -- the answer does not
      * fit in a response, cannot be consumed by a caller, and is stale before it finishes. So the API is
      * a cursor walk, and callers that want everything pay for everything, one page at a time, visibly.
      *
-     * <p><b>Two costs, and only one of them is bounded.</b> The descriptor <b>reads</b> are bounded here
-     * by {@code limit}, on any backend. The <b>listing</b> is not bounded on any backend, including S3:
-     * this calls {@code listBlobs()}, which paginates the whole container, and there is no way to do
-     * better through {@code BlobContainer} because its listing API carries a prefix and a limit but no
-     * {@code start-after}, which is what resuming a cursor needs.
+     * <p><b>Both costs are bounded by the page.</b> The listing resumes from the cursor through
+     * {@link BlobContainer#listBlobsByPrefix(String, String, int)} -- S3's {@code StartAfter}, GCS's
+     * {@code startOffset} -- so nothing before it is listed again, and the descriptor reads are one per name
+     * on the page. A page of a thousand is one listing request on S3 plus the reads.
      *
-     * <p>An earlier version of this comment said the listing was bounded natively by S3's
-     * {@code ListObjectsV2} {@code start-after} plus {@code max-keys}. It never was — the code has always
-     * called the unbounded listing, and the claim described what the API would need rather than what it
-     * does. See {@link #namesWithPrefix}, which <em>is</em> bounded, for the shape that works: a prefix
-     * and a maximum, with no resumption to carry.
+     * <p><b>Not a snapshot.</b> An index created or deleted behind the cursor is not seen by the rest of the
+     * walk; one created or deleted ahead of it is seen or not depending on when its page is read. Every index
+     * that exists for the whole walk appears exactly once. A tombstone takes no row, so a page can be shorter
+     * than the limit, and the last page can be empty when only tombstones followed the cursor.
      *
      * @param after return names strictly greater than this, or null to start at the beginning
      * @param limit maximum descriptors to return
@@ -830,39 +828,122 @@ public final class DescriptorStore {
      * @throws IOException if listing or reading fails
      */
     public Page listPage(String after, int limit) throws IOException {
+        return listPage("", after, limit);
+    }
+
+    /**
+     * One bounded page of the descriptors whose names start with a prefix, in name order.
+     *
+     * @param prefix the prefix, empty for every name
+     * @param after return names strictly greater than this, or null to start at the prefix
+     * @param limit maximum descriptors to return
+     * @return the page
+     * @throws IOException if listing or reading fails
+     * @see #listPage(String, int)
+     */
+    public Page listPage(String prefix, String after, int limit) throws IOException {
+        return listPage(prefix, after, limit, DescriptorStore::readInSequence);
+    }
+
+    /**
+     * How a page's descriptor reads are run: all of them, returning one result per task in order, with null
+     * where a task failed. The REST layer passes its bounded fan-out, so a page of five thousand is not five
+     * thousand round trips end to end.
+     */
+    @FunctionalInterface
+    public interface Reads {
+        /**
+         * Runs the reads.
+         *
+         * @param <T> what a read produces
+         * @param tasks the reads
+         * @return one result per task, in order, null where one failed
+         * @throws InterruptedException if interrupted while waiting
+         */
+        <T> List<T> runAll(List<java.util.concurrent.Callable<T>> tasks) throws InterruptedException;
+    }
+
+    private static <T> List<T> readInSequence(List<java.util.concurrent.Callable<T>> tasks) {
+        final List<T> results = new ArrayList<>(tasks.size());
+        for (java.util.concurrent.Callable<T> task : tasks) {
+            try {
+                results.add(task.call());
+            } catch (Exception e) {
+                results.add(null);
+            }
+        }
+        return results;
+    }
+
+    /**
+     * One bounded page of the descriptors whose names start with a prefix, reading each listed batch's
+     * descriptors through {@code reads}.
+     *
+     * @param prefix the prefix, empty for every name
+     * @param after return names strictly greater than this, or null to start at the prefix
+     * @param limit maximum descriptors to return
+     * @param reads how the descriptor reads of a batch are run
+     * @return the page
+     * @throws IOException if listing or any read fails
+     */
+    public Page listPage(String prefix, String after, int limit, Reads reads) throws IOException {
+        Names.validatePrefix(prefix);
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be positive, got " + limit);
         }
-        final List<String> names = new ArrayList<>(container.listBlobs().keySet());
-        names.sort(String::compareTo);
-
         final Map<String, IndexDescriptor> page = new LinkedHashMap<>();
-        String last = null;
-        for (String blobName : names) {
-            if (after != null && blobName.compareTo(after) <= 0) {
-                continue;
+        String cursor = after;
+        while (true) {
+            // One more than the page can take, so a full page knows whether anything follows it.
+            final int want = Math.min(limit - page.size() + 1, LIST_PAGE);
+            final List<org.opensearch.common.blobstore.BlobMetadata> batch = container.listBlobsByPrefix(prefix, cursor, want);
+            // Every name the page can still take is read at once; the one beyond it only proves there is more.
+            final List<java.util.concurrent.Callable<Optional<IndexDescriptor>>> tasks = new ArrayList<>();
+            for (int i = 0; i < Math.min(batch.size(), limit - page.size()); i++) {
+                final String name = batch.get(i).name();
+                tasks.add(() -> readLive(name));
             }
-            if (page.size() >= limit) {
+            final List<Optional<IndexDescriptor>> read;
+            try {
+                read = reads.runAll(tasks);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted reading a page of descriptors", e);
+            }
+            for (int i = 0; i < read.size(); i++) {
+                cursor = batch.get(i).name();
+                final Optional<IndexDescriptor> descriptor = read.get(i);
+                if (descriptor == null) {
+                    throw new IOException("could not read the descriptor of [" + cursor + "]");
+                }
+                descriptor.ifPresent(d -> page.put(d.name(), d));
+            }
+            if (page.size() >= limit && batch.size() > read.size()) {
                 // There is more. Report a cursor rather than a total: knowing how many there are in
                 // total is itself a full scan, and is the question this API refuses to answer.
-                return new Page(page, last);
+                return new Page(page, cursor);
             }
-            final Optional<BlobRegister> register = container.readRegister(blobName);
-            if (register.isEmpty()) {
-                continue;
+            if (batch.size() < want) {
+                return new Page(page, null);
             }
-            if (isTombstone(register.get().value())) {
-                last = blobName;
-                continue;
-            }
-            try (InputStream in = register.get().value().streamInput()) {
-                final IndexDescriptor descriptor = IndexDescriptor.fromStream(in);
-                page.put(descriptor.name(), descriptor);
-                last = blobName;
-            }
+            // Otherwise tombstones left the page short, or it filled exactly at the end of a listing: list
+            // on from the last name read, which re-lists any name this batch held but did not read.
         }
-        return new Page(page, null);
     }
+
+    /** A descriptor if the name holds a live one; empty for a tombstone or a name deleted since it was listed. */
+    private Optional<IndexDescriptor> readLive(String name) throws IOException {
+        final Optional<BlobRegister> register = container.readRegister(name);
+        if (register.isEmpty() || isTombstone(register.get().value())) {
+            return Optional.empty();
+        }
+        try (InputStream in = register.get().value().streamInput()) {
+            return Optional.of(IndexDescriptor.fromStream(in));
+        }
+    }
+
+    /** The most names one listing request asks for: S3's own page size. */
+    static final int LIST_PAGE = 1000;
 
     /** A bounded page of descriptors, and where to resume. */
     public static final class Page {
@@ -871,14 +952,14 @@ public final class DescriptorStore {
         private final String nextAfter;
 
         Page(Map<String, IndexDescriptor> descriptors, String nextAfter) {
-            this.descriptors = Map.copyOf(descriptors);
+            this.descriptors = java.util.Collections.unmodifiableMap(new LinkedHashMap<>(descriptors));
             this.nextAfter = nextAfter;
         }
 
         /**
          * Returns the descriptors in this page.
          *
-         * @return descriptors by index name
+         * @return descriptors by index name, in name order
          */
         public Map<String, IndexDescriptor> descriptors() {
             return descriptors;
@@ -954,9 +1035,10 @@ public final class DescriptorStore {
      *
      * <p><b>This is what makes an index pattern answerable without enumerating the deployment.</b> §6.3
      * refuses enumeration on a request path, and that refusal was the reason {@code logs-*} was refused
-     * too. It does not have to be: a prefix listing with a maximum key count is one request whose cost is
-     * set by the cap rather than by the population, so a deployment with a hundred million indices pays
-     * exactly what one with ten pays.
+     * too. It does not have to be: a prefix listing with a maximum key count costs one request per thousand
+     * names up to the cap, each page resuming where the last stopped, so its cost is set by the cap rather
+     * than by the population, and a deployment with a hundred million indices pays exactly what one with ten
+     * pays.
      *
      * <p><b>The cap is asked for plus one, deliberately.</b> A listing that returns exactly the cap is
      * indistinguishable from one that was cut off there. Asking for one more is what makes "there are more
@@ -970,9 +1052,10 @@ public final class DescriptorStore {
      * quarantine, and a tenant that creates and deletes a name a day accumulates hundreds under one
      * prefix; a cap that counted them refused {@code logs-*} with one live index beneath it. So when the
      * bounded listing overflows, the names sharing the prefix are read to tell live from deleted, and the
-     * cap is applied to the live ones. That read is proportional to the tombstones under the prefix — the
-     * cost the tombstone sweep exists to bound — and happens only when the bounded listing alone could not
-     * answer. In that case the tombstones are also filtered out of the answer, since they were read anyway.
+     * cap is applied to the live ones, a page at a time, stopping as soon as the live names pass it. That
+     * read is proportional to the tombstones under the prefix — the cost the tombstone sweep exists to bound —
+     * and happens only when the bounded listing alone could not answer. In that case the tombstones are also
+     * filtered out of the answer, since they were read anyway.
      *
      * @param prefix the prefix, which may be empty to mean every name
      * @param cap the most names to return
@@ -985,35 +1068,42 @@ public final class DescriptorStore {
         if (cap < 1) {
             throw new IllegalArgumentException("cap must be positive, got " + cap);
         }
-        final List<org.opensearch.common.blobstore.BlobMetadata> found = container.listBlobsByPrefixInSortedOrder(
-            prefix,
-            cap + 1,
-            BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC
-        );
-        if (found.size() <= cap) {
-            final List<String> names = new ArrayList<>(found.size());
-            for (org.opensearch.common.blobstore.BlobMetadata blob : found) {
+        // Up to cap + 1 names, a thousand per listing, each resuming where the last stopped.
+        final List<String> names = new ArrayList<>();
+        String cursor = null;
+        while (names.size() <= cap) {
+            final int want = Math.min(cap + 1 - names.size(), LIST_PAGE);
+            final List<org.opensearch.common.blobstore.BlobMetadata> batch = container.listBlobsByPrefix(prefix, cursor, want);
+            for (org.opensearch.common.blobstore.BlobMetadata blob : batch) {
                 names.add(blob.name());
             }
-            return names;
+            if (batch.size() < want) {
+                return names;
+            }
+            cursor = batch.get(batch.size() - 1).name();
         }
-        // More names than the cap, deleted ones included. The bounded listing cannot be resumed past its
-        // cap, so this is the one place a prefix is listed whole: the population under it is bounded by
-        // the live indices plus the tombstones still in quarantine, never by the deployment.
-        final List<String> under = new ArrayList<>(container.listBlobsByPrefix(prefix).keySet());
-        under.sort(String::compareTo);
+        // More names than the cap, deleted ones included. Walk the prefix again, a page at a time, reading
+        // each name to tell live from deleted and refusing once the live ones pass the cap: the reads are
+        // bounded by the cap plus the tombstones among them, and the memory by the cap.
         final List<String> live = new ArrayList<>();
-        for (String name : under) {
-            final Optional<BlobRegister> register = container.readRegister(name);
-            if (register.isEmpty() || isTombstone(register.get().value())) {
-                continue;
+        cursor = null;
+        while (true) {
+            final List<org.opensearch.common.blobstore.BlobMetadata> batch = container.listBlobsByPrefix(prefix, cursor, LIST_PAGE);
+            for (org.opensearch.common.blobstore.BlobMetadata blob : batch) {
+                final Optional<BlobRegister> register = container.readRegister(blob.name());
+                if (register.isEmpty() || isTombstone(register.get().value())) {
+                    continue;
+                }
+                live.add(blob.name());
+                if (live.size() > cap) {
+                    throw new TooManyMatchesException(prefix, cap);
+                }
             }
-            live.add(name);
-            if (live.size() > cap) {
-                throw new TooManyMatchesException(prefix, cap);
+            if (batch.size() < LIST_PAGE) {
+                return live;
             }
+            cursor = batch.get(batch.size() - 1).name();
         }
-        return live;
     }
 
     /**

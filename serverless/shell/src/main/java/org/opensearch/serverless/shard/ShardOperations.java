@@ -924,6 +924,28 @@ public final class ShardOperations {
             this.failures = java.util.List.copyOf(failures);
         }
 
+        private int skipped;
+
+        /**
+         * Records how many shards were skipped because they provably could not match.
+         *
+         * @param skipped the count, already included in {@link #answered()}
+         * @return this outcome
+         */
+        public SearchOutcome withSkipped(int skipped) {
+            this.skipped = skipped;
+            return this;
+        }
+
+        /**
+         * Returns how many shards were skipped because their pruning digest ruled the query out.
+         *
+         * @return the count, which {@link #answered()} includes
+         */
+        public int skipped() {
+            return skipped;
+        }
+
         /**
          * Returns whether {@link #total()} is exact or a lower bound.
          *

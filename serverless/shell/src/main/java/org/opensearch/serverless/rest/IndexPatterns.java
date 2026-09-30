@@ -19,13 +19,13 @@ import java.util.Set;
 /**
  * Turning what a caller typed into the index names it means, within a bound.
  *
- * <p><b>The bound is the policy, and it already existed.</b> A prefix pattern resolves through one
- * {@code listBlobsByPrefixInSortedOrder} call with a cap; more matches than the cap is a <em>refusal</em>
+ * <p><b>The bound is the policy, and it already existed.</b> A prefix pattern resolves through a paged
+ * listing, a thousand names per request, up to a cap; more matches than the cap is a <em>refusal</em>
  * rather than a truncated list, because an answer cut off at a limit looks exactly like a complete one. That
  * rule was written for search wildcards and is reused here rather than re-decided, which is the point of this
  * class existing at all.
  *
- * <p><b>Only prefix patterns.</b> {@code logs-*} is one bounded listing; {@code *-2026-*} is a scan of every
+ * <p><b>Only prefix patterns.</b> {@code logs-*} is a bounded listing; {@code *-2026-*} is a scan of every
  * name in the deployment, and there is no index over the middle of a string to make it anything else.
  *
  * <p><b>What this deliberately does not do.</b> {@code SearchHandler} has a richer expansion that also records
@@ -66,7 +66,7 @@ final class IndexPatterns {
     }
 
     /**
-     * Whether a name is a pattern this design can resolve with one bounded listing.
+     * Whether a name is a pattern this design can resolve with a bounded listing.
      *
      * @param name the name as typed
      * @return whether it is a trailing-star prefix pattern

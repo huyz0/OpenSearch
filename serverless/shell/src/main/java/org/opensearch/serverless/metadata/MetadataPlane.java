@@ -1138,12 +1138,14 @@ public final class MetadataPlane {
     /**
      * The most names an index pattern may match before it is refused.
      *
-     * <p><b>Chosen to keep a pattern to one request.</b> S3's {@code ListObjectsV2} returns at most a
-     * thousand keys per round trip, and this asks for the cap plus one, so anything below a thousand is a
-     * single listing. Five hundred leaves room and is already far past what a caller can do anything
-     * useful with: a search fanning out over five hundred indices is not a search anybody debugs.
+     * <p><b>Set by what a search can afford, no longer by one listing.</b> It was five hundred so that a
+     * pattern resolved in one {@code ListObjectsV2} request, because the listing could not be resumed. It can
+     * now: resolution pages a thousand names at a time from where the last page stopped, so ten thousand is
+     * eleven listings, and what bounds a wide search is the fanout window, the pruning digest and the
+     * per-query activation budget rather than the pattern. The refusal past the cap stays -- an answer cut
+     * off at a limit looks exactly like a complete one.
      */
-    public static final int DEFAULT_PATTERN_CAP = 500;
+    public static final int DEFAULT_PATTERN_CAP = 10_000;
 
     /**
      * Returns the index and alias names beginning with a prefix.

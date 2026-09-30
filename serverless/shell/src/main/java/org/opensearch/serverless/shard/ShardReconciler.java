@@ -221,7 +221,8 @@ public final class ShardReconciler {
         try (GatedCloseable<IndexCommit> commit = shard.acquireLastIndexCommit(false)) {
             // Named, so a manifest says who wrote it. A term is not an identity: the publish fence refuses
             // a newer term and cannot tell two nodes holding the same one apart.
-            manifest = publisherCache.computeIfAbsent(shardId, publishers).publish(shard.store(), commit.get(), term, localNode.getId());
+            manifest = publisherCache.computeIfAbsent(shardId, publishers)
+                .publish(shard.store(), commit.get(), term, localNode.getId(), digestOf(shard, commit.get()));
         }
         final var walForPublish = wal(shardId);
         if (walForPublish != null) {
@@ -230,6 +231,23 @@ public final class ShardReconciler {
             walForPublish.onPublished(term);
         }
         return manifest;
+    }
+
+    /**
+     * The pruning digest of exactly the commit being published -- not of the searcher, which may lag or lead
+     * it -- read from the commit's own segments. A digest that cannot be computed is empty, which prunes
+     * nothing: the manifest is published either way.
+     */
+    private static org.opensearch.serverless.store.PruningDigest digestOf(IndexShard shard, IndexCommit commit) {
+        shard.store().incRef();
+        try (org.apache.lucene.index.DirectoryReader reader = org.apache.lucene.index.DirectoryReader.open(commit)) {
+            return org.opensearch.serverless.store.PruningDigest.compute(reader, name -> shard.mapperService().fieldType(name));
+        } catch (Exception e) {
+            logger.warn("could not compute the pruning digest of " + shard.shardId() + "; publishing without one", e);
+            return org.opensearch.serverless.store.PruningDigest.EMPTY;
+        } finally {
+            shard.store().decRef();
+        }
     }
 
     /**
@@ -346,7 +364,32 @@ public final class ShardReconciler {
         if (wal == null) {
             return java.util.List.of();
         }
-        return wal.replayableAfterFencing();
+        final java.util.List<org.opensearch.serverless.store.WalRecord> records = wal.replayableAfterFencing();
+        // Kept for the pass after recovery, which applies the records without sequence identity: the log was
+        // fenced before either read, so nothing can have landed in between, and reading it twice was a listing
+        // per term and a GET per record paid again on every open.
+        replayedRecords.put(shardId, records);
+        return records;
+    }
+
+    /** The records recovery just replayed, per shard, for the pass that follows it in the same open. */
+    private final java.util.concurrent.ConcurrentHashMap<
+        ShardId,
+        java.util.List<org.opensearch.serverless.store.WalRecord>> replayedRecords = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Per index and shard, the term at which a takeover has just fenced every older term of the log. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> olderTermsFenced = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Records that a takeover has fenced every term older than {@code term}, so the open that follows it -- at
+     * that term -- need not list the log again to find them fenced. One use: the open consumes it.
+     *
+     * @param indexName the index
+     * @param shard the shard
+     * @param term the term taken
+     */
+    public void noteOlderTermsFenced(String indexName, int shard, long term) {
+        olderTermsFenced.put(indexName + "#" + shard, term);
     }
 
     /**
@@ -467,7 +510,10 @@ public final class ShardReconciler {
                     // The takeover fenced the older terms already, at the compare-and-swap; doing it again here
                     // costs a listing for a term already fenced, and covers a shard reopened without passing
                     // through an acquisition.
-                    log.fenceOlderTerms(shardHeadTerm);
+                    final Long fencedAt = olderTermsFenced.remove(shardId.getIndexName() + "#" + shardId.id());
+                    if (fencedAt == null || fencedAt != shardHeadTerm) {
+                        log.fenceOlderTerms(shardHeadTerm);
+                    }
                     final java.util.function.BiPredicate<ShardId, Long> check = ownsAtTerm;
                     log.establish(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
                 }
@@ -505,6 +551,8 @@ public final class ShardReconciler {
             } catch (Exception e) {
                 abandon(indexService, shardId, e);
                 throw e;
+            } finally {
+                replayedRecords.remove(shardId);
             }
         } finally {
             opening.remove(shardId);
@@ -580,9 +628,12 @@ public final class ShardReconciler {
      * silent data loss.
      */
     private void replayRecordsWithoutSequenceIdentity(IndexShard shard, ShardId shardId) throws IOException {
-        final var wal = wal(shardId);
+        final java.util.List<org.opensearch.serverless.store.WalRecord> alreadyRead = replayedRecords.remove(shardId);
+        final java.util.List<org.opensearch.serverless.store.WalRecord> records = alreadyRead != null
+            ? alreadyRead
+            : wal(shardId).replayableAfterFencing();
         int replayed = 0;
-        for (org.opensearch.serverless.store.WalRecord record : wal.replayableAfterFencing()) {
+        for (org.opensearch.serverless.store.WalRecord record : records) {
             if (record.hasSequenceIdentity()) {
                 continue;
             }

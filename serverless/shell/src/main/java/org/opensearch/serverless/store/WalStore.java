@@ -134,6 +134,82 @@ public final class WalStore {
         this.olderTermRescanMillis = olderTermRescanMillis;
     }
 
+    /** Where a replay's record reads run concurrently; null reads them one after another. */
+    private volatile java.util.concurrent.Executor reads;
+
+    /** How many record reads a replay keeps in flight. */
+    static final int READ_WIDTH = 8;
+
+    /**
+     * Lets a replay read its records concurrently on the given executor, the calling thread reading too.
+     *
+     * <p>A replay read one record blob at a time, so a log of a hundred records was a hundred round trips
+     * in a row on the path a cold shard's first write waits on.
+     *
+     * @param executor where the reads run
+     * @return this, for chaining
+     */
+    public WalStore readingWith(java.util.concurrent.Executor executor) {
+        this.reads = executor;
+        return this;
+    }
+
+    /** Every named blob's bytes, in order. The caller takes reads too, so a saturated executor only costs width. */
+    private List<byte[]> readAll(BlobContainer container, List<String> names) throws IOException {
+        final byte[][] bodies = new byte[names.size()][];
+        final java.util.concurrent.Executor executor = reads;
+        if (executor == null || names.size() < 2) {
+            for (int i = 0; i < names.size(); i++) {
+                bodies[i] = readOne(container, names.get(i));
+            }
+            return java.util.Arrays.asList(bodies);
+        }
+        final java.util.concurrent.atomic.AtomicInteger next = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicReference<IOException> failed = new java.util.concurrent.atomic.AtomicReference<>();
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(names.size());
+        final Runnable drain = () -> {
+            for (int i = next.getAndIncrement(); i < names.size(); i = next.getAndIncrement()) {
+                try {
+                    if (failed.get() == null) {
+                        bodies[i] = readOne(container, names.get(i));
+                    }
+                } catch (IOException e) {
+                    failed.compareAndSet(null, e);
+                } finally {
+                    done.countDown();
+                }
+            }
+        };
+        for (int helper = 0; helper < Math.min(READ_WIDTH, names.size()) - 1; helper++) {
+            try {
+                executor.execute(drain);
+            } catch (RuntimeException rejected) {
+                break;
+            }
+        }
+        drain.run();
+        try {
+            if (done.await(5, java.util.concurrent.TimeUnit.MINUTES) == false) {
+                throw new IOException("reading the log at " + container.path().buildAsString() + " did not finish");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted reading the log", e);
+        }
+        if (failed.get() != null) {
+            throw failed.get();
+        }
+        return java.util.Arrays.asList(bodies);
+    }
+
+    private static byte[] readOne(BlobContainer container, String name) throws IOException {
+        try (InputStream in = container.readBlob(name)) {
+            return in.readAllBytes();
+        } catch (IOException e) {
+            throw new IOException("unreadable WAL record at " + container.path().buildAsString() + name, e);
+        }
+    }
+
     private BlobContainer containerFor(long term) {
         return blobStore.blobContainer(shardBase.add("wal").add(SegmentPublisher.termSegment(term)));
     }
@@ -267,10 +343,21 @@ public final class WalStore {
      * @return the fenced ordinal
      */
     private long fence(long term, boolean own) throws IOException {
+        return fence(term, own, null);
+    }
+
+    /**
+     * Fences a term, starting from a listing the caller already holds, if it holds one: the first attempt is
+     * then a single put-if-absent, and only a lost race lists again.
+     */
+    private long fence(long term, boolean own, Map<String, org.opensearch.common.blobstore.BlobMetadata> listed) throws IOException {
         final BlobContainer container = containerFor(term);
         for (int attempt = 0; attempt < FENCE_ATTEMPTS; attempt++) {
             long highest = 0L;
-            for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : container.listBlobs().entrySet()) {
+            final Map<String, org.opensearch.common.blobstore.BlobMetadata> blobs = attempt == 0 && listed != null
+                ? listed
+                : container.listBlobs();
+            for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : blobs.entrySet()) {
                 if (RECORD_NAME.matcher(blob.getKey()).matches()) {
                     highest = Math.max(highest, Long.parseLong(blob.getKey()));
                     if (own && blob.getValue().length() == 0L) {
@@ -307,7 +394,8 @@ public final class WalStore {
             }
             String last = null;
             long lastLength = -1L;
-            for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : older.getValue().listBlobs().entrySet()) {
+            final Map<String, org.opensearch.common.blobstore.BlobMetadata> listed = older.getValue().listBlobs();
+            for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : listed.entrySet()) {
                 if (RECORD_NAME.matcher(blob.getKey()).matches() && (last == null || blob.getKey().compareTo(last) > 0)) {
                     last = blob.getKey();
                     lastLength = blob.getValue().length();
@@ -316,7 +404,7 @@ public final class WalStore {
             if (last != null && lastLength == 0L) {
                 continue;
             }
-            fence(older.getKey(), false);
+            fence(older.getKey(), false, listed);
         }
     }
 
@@ -331,6 +419,12 @@ public final class WalStore {
      * @throws IOException if listing or reading fails
      */
     public List<WalRecord> replayableAfterFencing() throws IOException {
+        // One listing of the log's root says which terms exist and whether any legacy seal does: the seals
+        // directory is listed only when it is there, which on a log begun after fences is never.
+        final Map<String, BlobContainer> children = blobStore.blobContainer(shardBase.add("wal")).children();
+        if (children.containsKey(SEALS) == false) {
+            return replayable(null, termsIn(children));
+        }
         final BlobContainer sealsContainer = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
         final List<String> sealNames = sealNamesIn(sealsContainer.listBlobs().keySet());
         if (sealNames.isEmpty()) {
@@ -411,8 +505,12 @@ public final class WalStore {
      * @throws IOException if listing or reading fails
      */
     public List<WalRecord> replayable(Map<Long, String> cutoff) throws IOException {
+        return replayable(cutoff, termsInOrder());
+    }
+
+    private List<WalRecord> replayable(Map<Long, String> cutoff, Map<Long, BlobContainer> terms) throws IOException {
         final List<WalRecord> records = new ArrayList<>();
-        for (Map.Entry<Long, BlobContainer> entry : termsInOrder().entrySet()) {
+        for (Map.Entry<Long, BlobContainer> entry : terms.entrySet()) {
             final BlobContainer container = entry.getValue();
             if (cutoff != null && cutoff.containsKey(entry.getKey()) == false) {
                 continue;
@@ -426,9 +524,11 @@ public final class WalStore {
                 names.removeIf(name -> name.compareTo(limit) > 0);
             }
             names.sort(Comparator.naturalOrder());
-            for (String name : names) {
-                try (InputStream in = container.readBlob(name)) {
-                    records.addAll(parseBatch(in.readAllBytes()));
+            final List<byte[]> bodies = readAll(container, names);
+            for (int i = 0; i < names.size(); i++) {
+                final String name = names.get(i);
+                try {
+                    records.addAll(parseBatch(bodies.get(i)));
                 } catch (IOException e) {
                     // A name that matches ours and does not parse is corruption, and it propagates --
                     // naming the blob, because a parse failure that does not say which record failed
@@ -614,9 +714,12 @@ public final class WalStore {
 
     /** The log's term directories, lowest term first, which is replay order. */
     private Map<Long, BlobContainer> termsInOrder() throws IOException {
-        final BlobContainer walRoot = blobStore.blobContainer(shardBase.add("wal"));
+        return termsIn(blobStore.blobContainer(shardBase.add("wal")).children());
+    }
+
+    private static Map<Long, BlobContainer> termsIn(Map<String, BlobContainer> children) {
         final Map<Long, BlobContainer> byTerm = new TreeMap<>();
-        for (Map.Entry<String, BlobContainer> child : walRoot.children().entrySet()) {
+        for (Map.Entry<String, BlobContainer> child : children.entrySet()) {
             final Long term = parseTerm(child.getKey());
             if (term != null) {
                 byTerm.put(term, child.getValue());

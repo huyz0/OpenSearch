@@ -135,7 +135,7 @@ public final class SearchFanout {
         }
         final List<ShardAnswer> answers;
         try {
-            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), Fanout.DEFAULT_CONCURRENCY, tasks);
+            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchFanoutConcurrency(), tasks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             charged.abandon();
@@ -172,6 +172,58 @@ public final class SearchFanout {
         java.util.Map<String, org.opensearch.serverless.cluster.IndexDescriptor> indices,
         SearchSourceBuilder source
     ) throws IOException {
+        return run(serving, metadata, indices, source, Options.DEFAULT);
+    }
+
+    /**
+     * How a wide search may be narrowed.
+     *
+     * @param allowPartialActivation whether a search needing more cold shards than the activation budget
+     *     answers from the first ones within it, reporting the rest as failed, rather than being refused
+     */
+    public record Options(boolean allowPartialActivation) {
+        /** Refuse past the budget. */
+        public static final Options DEFAULT = new Options(false);
+    }
+
+    /** One shard of one index, as the fan-out addresses it. */
+    private record Target(org.opensearch.serverless.cluster.IndexDescriptor descriptor, int shard) {
+    }
+
+    /**
+     * Runs one search across the shards of every index named, pruning the shards it provably cannot match
+     * and refusing -- or, on request, narrowing -- a search that would activate more cold shards than the
+     * node's budget.
+     *
+     * <p><b>Two phases, as core's {@code can_match} is.</b> The first reads, for each shard not open here,
+     * its head and its manifest, concurrently: a shard with no owner is exactly its published commit, and if
+     * that commit's {@link org.opensearch.serverless.store.PruningDigest} says the query cannot match, the
+     * shard is skipped -- reported in {@code _shards.skipped} and counted as successful, as core counts one.
+     * The phase is skipped outright when the query has nothing a digest can judge. The second phase is the
+     * ordinary fan-out over what is left, and if every shard was pruned one is searched anyway, so the
+     * response has aggregations of the right shape, which is also what core does.
+     *
+     * <p><b>The activation budget.</b> Every shard the second phase searches that is not already open here
+     * may cost a cold open somewhere. More of them than {@code serverless.search.max_activations_per_query}
+     * is refused with a 400 before any is opened, unless the caller asked for
+     * {@code allow_partial_activation}, in which case the first ones within the budget are searched and the
+     * rest reported as failed shards -- a partial answer that says it is partial.
+     *
+     * @param serving the node coordinating the search
+     * @param metadata the metadata plane, for routing and for shards this node does not hold
+     * @param indices the indices to search, by name
+     * @param source the search itself
+     * @param options how the search may be narrowed
+     * @return the merged hits, with the coverage this answer was assembled from
+     * @throws IOException if the fan-out cannot be run
+     */
+    public static ShardOperations.SearchOutcome run(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        java.util.Map<String, org.opensearch.serverless.cluster.IndexDescriptor> indices,
+        SearchSourceBuilder source,
+        Options options
+    ) throws IOException {
         // Every entry point's defaults, in the one place every entry point passes through. The REST
         // handlers and the plugin client each applied them; a caller holding the operations object
         // directly did not, and an unset size became a request for zero hits.
@@ -189,11 +241,28 @@ public final class SearchFanout {
         perShard.from(0);
         perShard.size(from + size);
 
-        // Every shard at once, up to a bound. This loop used to run the shards one after another, so a
-        // query's latency was the sum of its shards rather than the slowest of them -- and the shape of
-        // the loop was the only reason. Each task answers for exactly one shard and swallows nothing: a
-        // shard that cannot be reached comes back null and shows up in the coverage this already reports.
-        int shards = 0;
+        // One instant for every shard of this request; see runFrozen.
+        final long nowInMillis = System.currentTimeMillis();
+        final List<Target> everyShard = new ArrayList<>();
+        for (org.opensearch.serverless.cluster.IndexDescriptor descriptor : indices.values()) {
+            for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
+                everyShard.add(new Target(descriptor, shard));
+            }
+        }
+        final int shards = everyShard.size();
+        final java.util.Set<Target> pruned = prune(serving, metadata, everyShard, source, nowInMillis);
+        final List<Target> searched = new ArrayList<>();
+        for (Target target : everyShard) {
+            if (pruned.contains(target) == false) {
+                searched.add(target);
+            }
+        }
+        if (searched.isEmpty() && everyShard.isEmpty() == false) {
+            // Everything pruned. One shard still runs, so the answer's aggregations have their shape.
+            searched.add(everyShard.get(0));
+            pruned.remove(everyShard.get(0));
+        }
+
         // Why a shard did not answer, kept rather than only logged. A fan-out treats an unanswered shard as
         // a hole in the coverage it reports, which is right while some other shard did answer. When none
         // did there is no answer to report coverage over, and "0 hits" with a flag beside it is exactly the
@@ -205,40 +274,85 @@ public final class SearchFanout {
         // from the answer and had no way to learn whether it was a circuit breaker, a peer that timed out
         // or a shard nobody is serving -- which are three different things to do next.
         final List<org.opensearch.action.search.ShardSearchFailure> failures = java.util.Collections.synchronizedList(new ArrayList<>());
-        final Charged charged = new Charged(serving);
-        // One instant for every shard of this request; see runFrozen.
-        final long nowInMillis = System.currentTimeMillis();
-        final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>();
-        for (java.util.Map.Entry<String, org.opensearch.serverless.cluster.IndexDescriptor> index : indices.entrySet()) {
-            for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
-                final int number = shard;
-                final String name = index.getKey();
-                final org.opensearch.serverless.cluster.IndexDescriptor descriptor = index.getValue();
-                tasks.add(() -> {
-                    try {
-                        final ShardAnswer answer = askOneShard(serving, metadata, descriptor, number, perShard, nowInMillis);
-                        if (answer == null) {
-                            failures.add(
-                                failure(
-                                    name,
-                                    number,
-                                    new org.opensearch.action.NoShardAvailableActionException(
-                                        new ShardId(new org.opensearch.core.index.Index(name, "_na_"), number),
-                                        "no node is serving shard " + number + " of " + name
-                                    )
-                                )
-                            );
-                            return null;
-                        }
-                        return charged.admit(answer);
-                    } catch (Exception e) {
-                        firstFailure.compareAndSet(null, e);
-                        failures.add(failure(name, number, e));
-                        throw e;
-                    }
-                });
-                shards++;
+
+        // The activation budget: shards not open here are the ones that may cost a cold open.
+        final int budget = serving.searchActivationBudget();
+        int cold = 0;
+        for (Target target : searched) {
+            if (localShard(serving, target.descriptor(), target.shard()) == null) {
+                cold++;
             }
+        }
+        if (cold > budget) {
+            if (options.allowPartialActivation() == false) {
+                throw new org.opensearch.OpenSearchStatusException(
+                    "this search would activate "
+                        + cold
+                        + " shards not open on this node, past the budget of "
+                        + budget
+                        + " (serverless.search.max_activations_per_query). Narrow the indices or the time range, or pass "
+                        + "allow_partial_activation=true to search the first "
+                        + budget
+                        + " and have the rest reported as failed shards",
+                    org.opensearch.core.rest.RestStatus.BAD_REQUEST
+                );
+            }
+            int admitted = 0;
+            for (java.util.Iterator<Target> it = searched.iterator(); it.hasNext();) {
+                final Target target = it.next();
+                if (localShard(serving, target.descriptor(), target.shard()) != null) {
+                    continue;
+                }
+                if (admitted++ < budget) {
+                    continue;
+                }
+                it.remove();
+                failures.add(
+                    failure(
+                        target.descriptor().name(),
+                        target.shard(),
+                        new org.opensearch.OpenSearchStatusException(
+                            "not searched: the query's activation budget of " + budget + " was spent on other shards",
+                            org.opensearch.core.rest.RestStatus.TOO_MANY_REQUESTS
+                        )
+                    )
+                );
+            }
+        }
+
+        // Every shard at once, up to a bound. This loop used to run the shards one after another, so a
+        // query's latency was the sum of its shards rather than the slowest of them -- and the shape of
+        // the loop was the only reason. Each task answers for exactly one shard and swallows nothing: a
+        // shard that cannot be reached comes back null and shows up in the coverage this already reports.
+        final Charged charged = new Charged(serving);
+        final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>();
+        for (Target target : searched) {
+            final int number = target.shard();
+            final String name = target.descriptor().name();
+            final org.opensearch.serverless.cluster.IndexDescriptor descriptor = target.descriptor();
+            tasks.add(() -> {
+                try {
+                    final ShardAnswer answer = askOneShard(serving, metadata, descriptor, number, perShard, nowInMillis);
+                    if (answer == null) {
+                        failures.add(
+                            failure(
+                                name,
+                                number,
+                                new org.opensearch.action.NoShardAvailableActionException(
+                                    new ShardId(new org.opensearch.core.index.Index(name, "_na_"), number),
+                                    "no node is serving shard " + number + " of " + name
+                                )
+                            )
+                        );
+                        return null;
+                    }
+                    return charged.admit(answer);
+                } catch (Exception e) {
+                    firstFailure.compareAndSet(null, e);
+                    failures.add(failure(name, number, e));
+                    throw e;
+                }
+            });
         }
         final List<ShardAnswer> answers;
         try {
@@ -248,7 +362,7 @@ public final class SearchFanout {
             // on each other had nothing left to serve each other with -- a deadlock resolved only by the
             // forward timeout. Outgoing waits now live on GENERIC, incoming work on the fan-out pool, and
             // Fanout's caller-runs rule keeps a full GENERIC from parking the coordinator behind itself.
-            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), Fanout.DEFAULT_CONCURRENCY, tasks);
+            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchFanoutConcurrency(), tasks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             charged.abandon();
@@ -257,7 +371,7 @@ public final class SearchFanout {
 
         final Merged merged = merge(serving, answers, source);
         try {
-            if (merged.answered == 0 && shards > 0) {
+            if (merged.answered == 0 && searched.isEmpty() == false) {
                 final Exception cause = firstFailure.get();
                 if (cause instanceof RuntimeException runtime) {
                     // Rethrown as itself, so a circuit-breaking exception still answers 429 and a security
@@ -269,10 +383,75 @@ public final class SearchFanout {
                 }
                 throw new IOException("no shard of " + indices.keySet() + " could answer this search; no node is serving them");
             }
-            return merged.outcome(serving, source, shards, from, size, failures);
+            // A pruned shard is a successful one, as core counts a skipped shard.
+            merged.answered += pruned.size();
+            return merged.outcome(serving, source, shards, from, size, failures).withSkipped(pruned.size());
         } finally {
             merged.release(serving);
         }
+    }
+
+    /**
+     * The shards this search provably cannot match: not open here, owned by nobody, and with a published
+     * digest that excludes the query. Empty when the query has nothing a digest can judge, or pruning is off.
+     */
+    private static java.util.Set<Target> prune(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        List<Target> candidates,
+        SearchSourceBuilder source,
+        long nowInMillis
+    ) throws IOException {
+        final java.util.Set<Target> pruned = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        if (serving.searchPruning() == false
+            || candidates.size() < 2
+            || org.opensearch.serverless.store.PruningDigest.mayPrune(source.query()) == false
+            || source.suggest() != null
+            || hasGlobalAggregation(source)) {
+            return pruned;
+        }
+        final List<java.util.concurrent.Callable<Boolean>> checks = new ArrayList<>();
+        for (Target target : candidates) {
+            checks.add(() -> {
+                final ShardId local = localShard(serving, target.descriptor(), target.shard());
+                if (local != null && serving.reconciler().readerShards().contains(local) == false) {
+                    // Open here as a writer: it may hold refreshed documents its published digest does not
+                    // describe. A reader serves exactly the published commit, so it is judged like any other.
+                    return false;
+                }
+                final var head = metadata.heads().read(target.descriptor().name(), target.shard());
+                if (head.isPresent() && head.get().ownerNodeId() != null) {
+                    return false;
+                }
+                final var manifest = metadata.segmentPublisher(target.descriptor().name(), target.descriptor().uuid(), target.shard())
+                    .readManifest();
+                if (manifest.isEmpty() || manifest.get().digest().canMatch(source.query(), nowInMillis)) {
+                    return false;
+                }
+                pruned.add(target);
+                return true;
+            });
+        }
+        try {
+            Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchFanoutConcurrency(), checks);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while pruning", e);
+        }
+        return pruned;
+    }
+
+    /** A global aggregation ignores the query, so no shard can be skipped for what the query excludes. */
+    private static boolean hasGlobalAggregation(SearchSourceBuilder source) {
+        if (source.aggregations() == null) {
+            return false;
+        }
+        for (org.opensearch.search.aggregations.AggregationBuilder aggregation : source.aggregations().getAggregatorFactories()) {
+            if (aggregation instanceof org.opensearch.search.aggregations.bucket.global.GlobalAggregationBuilder) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** The breaker a coordinator's working set is charged to, which is core's request breaker. */

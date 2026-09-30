@@ -301,6 +301,56 @@ public final class DocumentHandler extends BaseRestHandler {
         final String shapedSource = shaped;
 
         final int shard = DocumentRouting.shardFor(descriptor.get(), id);
+        // A single write is accounted the same way a batch is, for the same reason: a flood of large
+        // documents is a flood of large documents whether or not they arrived together.
+        final long inFlightBytes = shapedSource == null ? 0L : shapedSource.length();
+        // The write, applied here to a shard open here: the ordinary path, and the one a write waiting for its
+        // shard to be taken resumes on.
+        final java.util.function.BiConsumer<org.opensearch.rest.RestChannel, ShardId> writeHere = (channel, into) -> {
+            try (
+                org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
+                    .markCoordinatingOperationStarted(inFlightBytes, false)
+            ) {
+                // The document as it will be written, pipeline applied -- the same one the forwarded path
+                // shows its filters. A redaction filter that saw the pre-pipeline source here inspected a
+                // different document from the one that landed, depending on which node the request reached.
+                final ServerlessNode.WriteOutcome outcome = gated(
+                    serving,
+                    deletion,
+                    writtenIndex,
+                    id,
+                    shapedSource,
+                    () -> deletion
+                        ? serving.delete(into, id, ifSeqNo, ifPrimaryTerm)
+                        : serving.index(into, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent)
+                );
+                boolean refreshed = false;
+                if (refresh) {
+                    // Same meaning as classic OpenSearch: make this write visible to search before
+                    // answering. Without it a caller that writes and immediately searches gets zero
+                    // hits and no error, which reads as data loss and is not. Null-checked: a heartbeat
+                    // can release the shard between the durable append and this refresh, and a 500 for a
+                    // write that is in the log told the client the opposite of the truth.
+                    final var open = serving.reconciler().shard(into);
+                    if (open != null) {
+                        open.refresh("serverless-rest-refresh");
+                        refreshed = true;
+                    }
+                }
+                // The backing index, as core reports it and as the forwarded path has always reported it.
+                respond(channel, writtenIndex, id, shard, serving.localNode().getId(), deletion, outcome, refreshed);
+            } catch (Exception e) {
+                if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.serverless.shell.StaleIncarnationException.class) != null) {
+                    // Routed by a resolution that has gone stale: the retry should resolve afresh, not wait it out.
+                    metadata.forgetRouting(index);
+                }
+                try {
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                } catch (IOException nested) {
+                    logger.error("failed to report a write failure", nested);
+                }
+            }
+        };
         final ShardId shardId = serving.reconciler()
             .openShards()
             .stream()
@@ -330,9 +380,14 @@ public final class DocumentHandler extends BaseRestHandler {
                 // correctly refuse it -- a 500 for what is a normal, brief, self-resolving state. Say
                 // "not yet" instead, which is a status a client retries. The doubt makes the activation
                 // pass run now rather than on the next write, which is what turns "retry" into a short wait.
+                //
+                // Better than either: wait for the activation in flight, which is the one this node's own
+                // single flight is running, and write once it is open.
                 serving.forgetOwner(writtenIndex, shard);
-                serving.signals().ownershipDoubted(writtenIndex, shard);
-                return channel -> channel.sendResponse(activationInProgress(channel, writtenIndex, shard));
+                final String routedUuid = descriptor.get().uuid();
+                return channel -> serving.threadPool()
+                    .executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
+                    .execute(() -> writeOnceActivated(channel, serving, writtenIndex, routedUuid, shard, true, writeHere));
             }
             if (owner != null) {
                 // Forward rather than refuse. The client should not have to know which node owns which
@@ -436,61 +491,77 @@ public final class DocumentHandler extends BaseRestHandler {
                 });
             }
             // No owner at all. Nothing will fix this except some node activating the shard, and the
-            // only reason anyone would is that a write arrived -- which just happened.
-            serving.signals().ownershipDoubted(writtenIndex, shard);
-            return channel -> channel.sendResponse(notTheWriter(channel, writtenIndex, shard, owner));
+            // only reason anyone would is that a write arrived -- which just happened. So this node takes
+            // it, and the write waits for that rather than being sent away to retry.
+            final String routedUuid = descriptor.get().uuid();
+            return channel -> serving.threadPool()
+                .executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
+                .execute(() -> writeOnceActivated(channel, serving, writtenIndex, routedUuid, shard, false, writeHere));
         }
 
         // Off the HTTP thread: a WAL append is an object-store write, and blocking the thread that
         // should be reading the next request on remote IO is how a node stops answering under load.
-        // A single write is accounted the same way a batch is, for the same reason: a flood of large
-        // documents is a flood of large documents whether or not they arrived together.
-        final long inFlightBytes = shapedSource == null ? 0L : shapedSource.length();
-        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
-            try (
-                org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
-                    .markCoordinatingOperationStarted(inFlightBytes, false)
-            ) {
-                // The document as it will be written, pipeline applied -- the same one the forwarded path
-                // shows its filters. A redaction filter that saw the pre-pipeline source here inspected a
-                // different document from the one that landed, depending on which node the request reached.
-                final ServerlessNode.WriteOutcome outcome = gated(
-                    serving,
-                    deletion,
-                    writtenIndex,
-                    id,
-                    shapedSource,
-                    () -> deletion
-                        ? serving.delete(shardId, id, ifSeqNo, ifPrimaryTerm)
-                        : serving.index(shardId, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent)
-                );
-                boolean refreshed = false;
-                if (refresh) {
-                    // Same meaning as classic OpenSearch: make this write visible to search before
-                    // answering. Without it a caller that writes and immediately searches gets zero
-                    // hits and no error, which reads as data loss and is not. Null-checked: a heartbeat
-                    // can release the shard between the durable append and this refresh, and a 500 for a
-                    // write that is in the log told the client the opposite of the truth.
-                    final var open = serving.reconciler().shard(shardId);
-                    if (open != null) {
-                        open.refresh("serverless-rest-refresh");
-                        refreshed = true;
-                    }
-                }
-                // The backing index, as core reports it and as the forwarded path has always reported it.
-                respond(channel, writtenIndex, id, shard, serving.localNode().getId(), deletion, outcome, refreshed);
-            } catch (Exception e) {
-                if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.serverless.shell.StaleIncarnationException.class) != null) {
-                    // Routed by a resolution that has gone stale: the retry should resolve afresh, not wait it out.
-                    metadata.forgetRouting(index);
-                }
-                try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
-                } catch (IOException nested) {
-                    logger.error("failed to report a write failure", nested);
-                }
-            }
-        });
+        return channel -> serving.threadPool()
+            .executor(org.opensearch.threadpool.ThreadPool.Names.WRITE)
+            .execute(() -> writeHere.accept(channel, shardId));
+    }
+
+    /** How long a write to a shard nobody holds waits for this node to take it, before it is told to retry. */
+    static final long ACTIVATION_WAIT_MILLIS = 30_000L;
+
+    /**
+     * Waits for this node to take a shard a write is waiting for, then writes.
+     *
+     * <p>A write to a shard nobody holds used to be answered 421 at once, with the doubt raised so a pass
+     * would take the shard; the client retried, every retry read the head again, and those retries were most
+     * of what a first write cost. The write now waits on the same single-flight activation every pass uses --
+     * so a burst of writes to one cold shard is one activation -- and is written here once the shard is open.
+     * Only a write to the incarnation it was routed for: a shard opened under another uuid is an index
+     * recreated since, and the answer is the refusal a retry resolves afresh.
+     */
+    private void writeOnceActivated(
+        org.opensearch.rest.RestChannel channel,
+        ServerlessNode serving,
+        String writtenIndex,
+        String indexUuid,
+        int shard,
+        boolean ownedHere,
+        java.util.function.BiConsumer<org.opensearch.rest.RestChannel, ShardId> writeHere
+    ) {
+        Optional<ShardId> taken = Optional.empty();
+        try {
+            taken = serving.signals().activate(writtenIndex, shard).get(ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            // Still opening: the same "not yet" a client already retries.
+            sendQuietly(channel, () -> activationInProgress(channel, writtenIndex, shard));
+            return;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (java.util.concurrent.ExecutionException e) {
+            logger.warn("activating shard " + shard + " of " + writtenIndex + " for a waiting write failed", e.getCause());
+        }
+        if (taken.isPresent() && taken.get().getIndex().getUUID().equals(indexUuid)) {
+            writeHere.accept(channel, taken.get());
+            return;
+        }
+        // Not taken here: another node won it (its head is noted, so the retry forwards), this node is full,
+        // or demand-driven activation is off. The answer a client already knows how to act on.
+        serving.signals().ownershipDoubted(writtenIndex, shard);
+        sendQuietly(
+            channel,
+            () -> ownedHere ? activationInProgress(channel, writtenIndex, shard) : notTheWriter(channel, writtenIndex, shard, null)
+        );
+    }
+
+    private void sendQuietly(
+        org.opensearch.rest.RestChannel channel,
+        org.opensearch.common.CheckedSupplier<BytesRestResponse, IOException> response
+    ) {
+        try {
+            channel.sendResponse(response.get());
+        } catch (Exception e) {
+            logger.error("failed to answer a write", e);
+        }
     }
 
     /**

@@ -133,6 +133,22 @@ public final class SegmentPublisher {
      *     this one
      */
     public CommitManifest publish(Store store, org.apache.lucene.index.IndexCommit commit, long term, String writerId) throws IOException {
+        return publish(store, commit, term, writerId, PruningDigest.EMPTY);
+    }
+
+    /**
+     * Publishes a commit with its pruning digest, which rides in the manifest register.
+     *
+     * @param store the shard's store, already flushed to a commit
+     * @param commit the commit to publish, pinned by the caller; null to publish whatever is latest
+     * @param term the publishing writer's term
+     * @param writerId the publishing node, or null to skip the writer check
+     * @param digest the commit's pruning digest
+     * @return the manifest as published
+     * @throws IOException if upload fails
+     */
+    public CommitManifest publish(Store store, org.apache.lucene.index.IndexCommit commit, long term, String writerId, PruningDigest digest)
+        throws IOException {
         // What this instance published last, if it has: the swap below is conditioned on that generation,
         // and a swap that fails re-reads. Reading before every publish was one register read per publish
         // per shard, paid to learn what this writer already knew.
@@ -201,7 +217,7 @@ public final class SegmentPublisher {
             store.decRef();
         }
 
-        final CommitManifest manifest = new CommitManifest(term, published, writerId, lengths);
+        final CommitManifest manifest = new CommitManifest(term, published, writerId, lengths, digest);
         final long expected = remembered != null && rememberedGeneration != BlobRegister.ABSENT_GENERATION
             ? rememberedGeneration
             : existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
@@ -216,7 +232,7 @@ public final class SegmentPublisher {
         if (result.applied() == false && remembered != null) {
             // The register moved under what this instance remembered -- a repair, a restore, a manifest
             // rewritten by hand. Once, the way every publish used to begin: read it and publish over it.
-            return publish(store, commit, term, writerId);
+            return publish(store, commit, term, writerId, digest);
         }
         if (result.applied() == false) {
             // Who moved it. A newer term is the fence this exception exists for. The same term and the

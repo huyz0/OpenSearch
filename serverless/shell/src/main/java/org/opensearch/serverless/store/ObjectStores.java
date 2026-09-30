@@ -396,6 +396,44 @@ public final class ObjectStores {
                 return count(listings, () -> inner.listBlobsByPrefix(blobNamePrefix));
             }
 
+            // Everything below is delegated rather than left to the interface default: a default here would
+            // silently replace the backend's bounded or conditional form with the unbounded or unsupported one.
+
+            @Override
+            public java.util.List<BlobMetadata> listBlobsByPrefixInSortedOrder(
+                String blobNamePrefix,
+                int limit,
+                BlobNameSortOrder blobNameSortOrder
+            ) throws java.io.IOException {
+                return count(listings, () -> inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, blobNameSortOrder));
+            }
+
+            @Override
+            public java.util.List<BlobMetadata> listBlobsByPrefix(String blobNamePrefix, String startAfter, int limit)
+                throws java.io.IOException {
+                return count(listings, () -> inner.listBlobsByPrefix(blobNamePrefix, startAfter, limit));
+            }
+
+            @Override
+            public java.util.Map<String, BlobContainer> children(String startAfter, int limit) throws java.io.IOException {
+                final java.util.Map<String, BlobContainer> children = count(listings, () -> inner.children(startAfter, limit));
+                final java.util.Map<String, BlobContainer> counted = new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<String, BlobContainer> child : children.entrySet()) {
+                    counted.put(child.getKey(), new Counting(child.getValue()));
+                }
+                return counted;
+            }
+
+            @Override
+            public long readBlobPreferredLength() {
+                return inner.readBlobPreferredLength();
+            }
+
+            @Override
+            public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws java.io.IOException {
+                return count(deletes, () -> inner.deleteRegisterIfUnchanged(blobName, expectedGeneration));
+            }
+
             @Override
             public java.util.Optional<BlobRegister> readRegister(String blobName) throws java.io.IOException {
                 return count(registerReads, () -> inner.readRegister(blobName));

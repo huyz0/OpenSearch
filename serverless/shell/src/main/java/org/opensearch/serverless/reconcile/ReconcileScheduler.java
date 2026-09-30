@@ -339,6 +339,15 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         }
     }
 
+    @Override
+    public java.util.concurrent.CompletableFuture<java.util.Optional<ShardId>> activate(String indexName, int shardNumber) {
+        if (closed) {
+            return java.util.concurrent.CompletableFuture.completedFuture(java.util.Optional.empty());
+        }
+        activations.incrementAndGet();
+        return loop.activateForRequest(indexName, shardNumber);
+    }
+
     /**
      * Renews the lease and verifies the heads once, now: the renewal timer's whole pass, exposed so a
      * test can drive it without a clock.

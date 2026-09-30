@@ -79,13 +79,40 @@ final class CatTable {
      * @throws IOException if writing fails
      */
     void send(RestChannel channel, RestRequest request) throws IOException {
+        send(channel, request, null, false);
+    }
+
+    /**
+     * Sends this table as one page of a {@code _list} walk, in core's shape: {@code {"next_token": ..,
+     * "<entity>": [..]}} for a structured format, and a trailing {@code next_token <token>} line for text.
+     *
+     * @param channel the channel to answer on
+     * @param request the request, read for {@code format} and {@code v}
+     * @param entity the array's key in a structured answer
+     * @param nextToken where the next page starts, or null on the last page
+     * @throws IOException if writing fails
+     */
+    void sendPage(RestChannel channel, RestRequest request, String entity, String nextToken) throws IOException {
+        this.entity = entity;
+        send(channel, request, nextToken, true);
+    }
+
+    private String entity;
+
+    private void send(RestChannel channel, RestRequest request, String nextToken, boolean paginated) throws IOException {
         // Any structured format the channel can render -- json, yaml, cbor, smile -- comes out of the
         // same builder, since the channel picks the content type from the format parameter itself. Only
         // text is drawn by hand.
         final String format = request.param("format");
         if (format != null && "text".equals(format) == false) {
             try (XContentBuilder builder = channel.newBuilder()) {
-                builder.startArray();
+                if (paginated) {
+                    builder.startObject();
+                    builder.field("next_token", nextToken);
+                    builder.startArray(entity);
+                } else {
+                    builder.startArray();
+                }
                 for (List<String> row : rows) {
                     builder.startObject();
                     for (int i = 0; i < headers.size(); i++) {
@@ -94,6 +121,9 @@ final class CatTable {
                     builder.endObject();
                 }
                 builder.endArray();
+                if (paginated) {
+                    builder.endObject();
+                }
                 channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
             }
             return;
@@ -118,6 +148,9 @@ final class CatTable {
         }
         for (List<String> row : rows) {
             appendRow(text, row, widths);
+        }
+        if (paginated) {
+            text.append("next_token ").append(nextToken).append('\n');
         }
         channel.sendResponse(new BytesRestResponse(RestStatus.OK, "text/plain; charset=UTF-8", text.toString()));
     }

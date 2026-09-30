@@ -249,6 +249,26 @@ public final class RendezvousBlobStore implements BlobStore {
         }
 
         @Override
+        public List<BlobMetadata> listBlobsByPrefix(String blobNamePrefix, String startAfter, int limit) throws IOException {
+            return inner.listBlobsByPrefix(blobNamePrefix, startAfter, limit);
+        }
+
+        @Override
+        public Map<String, BlobContainer> children(String startAfter, int limit) throws IOException {
+            final Map<String, BlobContainer> wrapped = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, BlobContainer> child : inner.children(startAfter, limit).entrySet()) {
+                wrapped.put(child.getKey(), new Rendezvous(child.getValue()));
+            }
+            return wrapped;
+        }
+
+        @Override
+        public List<BlobMetadata> listBlobsByPrefixInSortedOrder(String blobNamePrefix, int limit, BlobNameSortOrder order)
+            throws IOException {
+            return inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, order);
+        }
+
+        @Override
         public Optional<BlobRegister> readRegister(String blobName) throws IOException {
             return inner.readRegister(blobName);
         }

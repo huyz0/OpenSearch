@@ -9,15 +9,15 @@ This branch is built directly on `opensearch-project/OpenSearch` `main`.
 
 ## What it costs core
 
-Six files, 364 lines, all additive.
+Six files, 615 lines, all additive.
 
 | File | Lines | Why |
 | --- | --- | --- |
-| `common/blobstore/BlobRegister.java` | 42 | the compare-and-swap register |
+| `common/blobstore/BlobRegister.java` | 68 | the compare-and-swap register, and the random generation a register starts at |
 | `common/blobstore/BlobRegisterCasResult.java` | 53 | its outcome |
-| `common/blobstore/BlobContainer.java` | 59 | `readRegister`, `compareAndSwapRegister`, `createRegisterIfAbsent` |
-| `common/blobstore/fs/FsBlobContainer.java` | 136 | the filesystem implementation |
-| `index/engine/Engine.java` | 20 | `engineRecoveryOperations()` |
+| `common/blobstore/BlobContainer.java` | 157 | `readRegister`, `compareAndSwapRegister`, `createRegisterIfAbsent`, `deleteRegisterIfUnchanged`; and the paged listings `listBlobsByPrefix(prefix, startAfter, limit)` and `children(startAfter, limit)`, with defaults that list everything and sort |
+| `common/blobstore/fs/FsBlobContainer.java` | 264 | the filesystem implementation of all of it |
+| `index/engine/Engine.java` | 19 | `engineRecoveryOperations()` |
 | `index/shard/IndexShard.java` | 54 | `recoverAdditionalEngineOperations`, which replays them |
 
 It was 408 until an audit of what core actually needs. `Engine` also carried
@@ -31,8 +31,10 @@ be less accessible than the record, so making it one would expose
 `new BlobRegisterCasResult(true, generation)` -- the boolean-blind construction its named
 `applied` and `conflict` factories exist to prevent -- to save sixteen lines.
 
-The S3, Azure and GCS implementations of the register live in the repository plugins,
-outside core.
+The S3, Azure and GCS implementations of the register and of the paged listings live in the
+repository plugins, outside core: `StartAfter` on S3, `startOffset` on GCS, and on Azure -- whose
+continuation marker is opaque and cannot be built from a name -- a walk from the prefix that skips up to
+the cursor and stops when the page is full.
 
 **Both engine hooks are needed, not just the method.** `ServerlessWriterEngine` overrides
 `engineRecoveryOperations` to replay its object-store write-ahead log during recovery, and
