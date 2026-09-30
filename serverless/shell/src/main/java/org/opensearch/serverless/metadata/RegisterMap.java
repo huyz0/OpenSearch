@@ -81,6 +81,16 @@ public final class RegisterMap {
     }
 
     /**
+     * Where the digest rollups live: one directory per name group, one register per bucket.
+     *
+     * @param base the deployment's base path
+     * @return the path
+     */
+    public static BlobPath rollups(BlobPath base) {
+        return base.add("rollups");
+    }
+
+    /**
      * Returns the container path holding reclaim intents, bucketed by the minute they fall due.
      *
      * <p>A delete writes one before it removes the descriptor: the index's name, uuid and shard count, which

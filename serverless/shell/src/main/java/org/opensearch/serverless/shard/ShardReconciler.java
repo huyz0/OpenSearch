@@ -221,8 +221,15 @@ public final class ShardReconciler {
         try (GatedCloseable<IndexCommit> commit = shard.acquireLastIndexCommit(false)) {
             // Named, so a manifest says who wrote it. A term is not an identity: the publish fence refuses
             // a newer term and cannot tell two nodes holding the same one apart.
+            final org.opensearch.serverless.store.PruningDigest digest = digestOf(shard, commit.get());
+            // Recorded where a coordinator looks for it before the commit is published, never after: a publish
+            // that fails in between leaves the record wider than what is searchable, never narrower.
+            final BeforePublish hook = beforePublish;
+            if (hook != null && digest.isEmpty() == false) {
+                hook.accept(shardId, shard.indexSettings().getNumberOfShards(), digest);
+            }
             manifest = publisherCache.computeIfAbsent(shardId, publishers)
-                .publish(shard.store(), commit.get(), term, localNode.getId(), digestOf(shard, commit.get()));
+                .publish(shard.store(), commit.get(), term, localNode.getId(), digest);
         }
         final var walForPublish = wal(shardId);
         if (walForPublish != null) {
@@ -231,6 +238,31 @@ public final class ShardReconciler {
             walForPublish.onPublished(term);
         }
         return manifest;
+    }
+
+    /** What must happen before a commit's manifest is written, given the commit's digest. */
+    @FunctionalInterface
+    public interface BeforePublish {
+        /**
+         * Runs before the manifest is swapped; a failure stops the publish.
+         *
+         * @param shardId the shard
+         * @param shards the index's shard count
+         * @param digest the commit's digest
+         * @throws IOException if it could not be done
+         */
+        void accept(ShardId shardId, int shards, org.opensearch.serverless.store.PruningDigest digest) throws IOException;
+    }
+
+    private volatile BeforePublish beforePublish;
+
+    /**
+     * Sets what runs before every publish writes its manifest.
+     *
+     * @param hook the hook, or null for none
+     */
+    public void setBeforePublish(BeforePublish hook) {
+        this.beforePublish = hook;
     }
 
     /**

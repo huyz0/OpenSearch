@@ -1068,6 +1068,12 @@ public final class DescriptorStore {
         if (cap < 1) {
             throw new IllegalArgumentException("cap must be positive, got " + cap);
         }
+        final List<String> names = listUpToCap(prefix, cap);
+        return names != null ? names : liveNamesOrRefuse(prefix, cap);
+    }
+
+    /** Up to cap names in one serial walk; null when there are more, for the caller to settle. */
+    private List<String> listUpToCap(String prefix, int cap) throws IOException {
         // Up to cap + 1 names, a thousand per listing, each resuming where the last stopped.
         final List<String> names = new ArrayList<>();
         String cursor = null;
@@ -1082,6 +1088,11 @@ public final class DescriptorStore {
             }
             cursor = batch.get(batch.size() - 1).name();
         }
+        return null;
+    }
+
+    private List<String> liveNamesOrRefuse(String prefix, int cap) throws IOException {
+        String cursor;
         // More names than the cap, deleted ones included. Walk the prefix again, a page at a time, reading
         // each name to tell live from deleted and refusing once the live ones pass the cap: the reads are
         // bounded by the cap plus the tombstones among them, and the memory by the cap.

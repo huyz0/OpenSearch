@@ -109,9 +109,31 @@ public final class SearchHandler extends BaseRestHandler {
      * @param status the refusal's status, or null when the names resolved
      * @param type the refusal's error type, or null
      * @param reason the refusal's reason, or null
+     * @param prunedShards shards of pattern matches the digest rollups ruled out, which are not in {@code indices}
+     * @param judged indices the rollups already found may match, which the fan-out need not check shard by shard
      */
     public record Resolution(java.util.LinkedHashMap<String, IndexDescriptor> indices, java.util.List<String> skipped, RestStatus status,
-        String type, String reason) {
+        String type, String reason, int prunedShards, java.util.Set<String> judged) {
+
+        /**
+         * A resolution with nothing ruled out by the rollups.
+         *
+         * @param indices each index and its shard count, in request order
+         * @param skipped names {@code ignore_unavailable} dropped
+         * @param status the refusal's status, or null
+         * @param type the refusal's error type, or null
+         * @param reason the refusal's reason, or null
+         */
+        public Resolution(
+            java.util.LinkedHashMap<String, IndexDescriptor> indices,
+            java.util.List<String> skipped,
+            RestStatus status,
+            String type,
+            String reason
+        ) {
+            this(indices, skipped, status, type, reason, 0, java.util.Set.of());
+        }
+
         static Resolution refuse(RestStatus status, String type, String reason) {
             return new Resolution(null, null, status, type, reason);
         }
@@ -460,7 +482,16 @@ public final class SearchHandler extends BaseRestHandler {
         // and a default nobody chose is not the caller saying they mean it.
         final boolean ignoreUnavailable = searchRequest.indicesOptions().ignoreUnavailable()
             || (request.hasParam("allow_no_indices") && searchRequest.indicesOptions().allowNoIndices());
-        final Resolution resolved = resolveIndices(metadata, serving, index, ignoreUnavailable);
+        // One instant for the whole request: the rollups judge date math against it here, and the fan-out
+        // must judge against the same one, or a range ending at "now" could be ruled out a millisecond early.
+        final long nowMillis = System.currentTimeMillis();
+        final Resolution resolved = resolveIndices(metadata, serving, index, ignoreUnavailable, true, source, nowMillis);
+        final SearchFanout.Options searchOptions = new SearchFanout.Options(
+            fanoutOptions.allowPartialActivation(),
+            resolved.refused() ? 0 : resolved.prunedShards(),
+            nowMillis,
+            resolved.refused() ? java.util.Set.of() : resolved.judged()
+        );
         if (resolved.refused()) {
             return channel -> channel.sendResponse(IndexAdminHandler.error(channel, resolved.status(), resolved.type(), resolved.reason()));
         }
@@ -482,7 +513,7 @@ public final class SearchHandler extends BaseRestHandler {
                     request,
                     failOnPartial,
                     postProcess,
-                    fanoutOptions
+                    searchOptions
                 );
             } catch (Exception e) {
                 try {
@@ -599,6 +630,38 @@ public final class SearchHandler extends BaseRestHandler {
         boolean ignoreUnavailable,
         boolean throughRequestPath
     ) throws IOException {
+        return resolveIndices(metadata, serving, index, ignoreUnavailable, throughRequestPath, null, 0L);
+    }
+
+    /**
+     * Resolves names, dropping the pattern matches the digest rollups prove the search cannot match.
+     *
+     * <p>A wide pattern used to cost a descriptor read per matching index before a shard was asked anything,
+     * and then a head and a manifest read per shard to prune it. With the rollups, a pattern whose prefix spans
+     * a whole group reads that group's {@value org.opensearch.serverless.metadata.DigestRollups#BUCKETS}
+     * registers and drops every index they rule out -- no descriptor, head or manifest read for it at all --
+     * counting its shards as skipped. At least one match is always kept, so a search that rules out everything
+     * still has a shard to give its aggregations their shape.
+     *
+     * @param metadata the metadata plane
+     * @param serving the node
+     * @param index the names as the caller wrote them, comma-separated
+     * @param ignoreUnavailable whether a name that is not there is an expectation rather than a mistake
+     * @param throughRequestPath whether a plugin's index is out of reach for this caller
+     * @param source the search, whose query the rollups judge; null to rule nothing out
+     * @param nowMillis the request's single now, which the fan-out must use too
+     * @return the indices and their shard counts, or the refusal
+     * @throws IOException if a register cannot be read
+     */
+    public static Resolution resolveIndices(
+        MetadataPlane metadata,
+        ServerlessNode serving,
+        String index,
+        boolean ignoreUnavailable,
+        boolean throughRequestPath,
+        SearchSourceBuilder source,
+        long nowMillis
+    ) throws IOException {
         final java.util.List<String> requested = java.util.List.of(index.split(",", -1));
         for (String name : requested) {
             if (name.isEmpty()) {
@@ -624,6 +687,9 @@ public final class SearchHandler extends BaseRestHandler {
         // quadratic before a single register was read.
         final java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
         final java.util.Set<String> fromPattern = new java.util.HashSet<>();
+        int prunedShards = 0;
+        final java.util.Set<String> judged = new java.util.HashSet<>();
+        final java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> rolledUp = new java.util.HashMap<>();
         for (String name : requested) {
             if (isPrefixPattern(name) == false) {
                 names.add(name);
@@ -636,9 +702,23 @@ public final class SearchHandler extends BaseRestHandler {
             } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
                 return Resolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             }
+            final java.util.Set<String> ruledOut = ruledOutByRollups(
+                metadata,
+                serving,
+                prefix,
+                matched,
+                source,
+                nowMillis,
+                rolledUp,
+                judged
+            );
             for (String match : matched) {
-                names.add(match);
                 fromPattern.add(match);
+                if (ruledOut.contains(match)) {
+                    prunedShards += rolledUp.get(match).shards();
+                    continue;
+                }
+                names.add(match);
             }
         }
         // Whether a name that is not there is a mistake or an expectation.
@@ -770,7 +850,7 @@ public final class SearchHandler extends BaseRestHandler {
                 "none of the indices named exist: " + String.join(", ", visible)
             );
         }
-        return new Resolution(indices, skipped, null, null, null);
+        return new Resolution(indices, skipped, null, null, null, prunedShards, judged);
     }
 
     /**
@@ -1019,6 +1099,75 @@ public final class SearchHandler extends BaseRestHandler {
             failOnPartial,
             postProcess
         );
+    }
+
+    /**
+     * The matches of one prefix pattern the digest rollups prove this search cannot match, all but one of them
+     * at most. Empty when the rollups do not apply: pruning off, too few matches to be worth the group's reads,
+     * a prefix shorter than a group, a query nothing could judge, a suggester or a global aggregation.
+     */
+    private static java.util.Set<String> ruledOutByRollups(
+        MetadataPlane metadata,
+        ServerlessNode serving,
+        String prefix,
+        java.util.List<String> matched,
+        SearchSourceBuilder source,
+        long nowMillis,
+        java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> rolledUp,
+        java.util.Set<String> judged
+    ) {
+        if (source == null
+            || serving.searchPruning() == false
+            || matched.size() < serving.rollupMinIndices()
+            || org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix) == false
+            || org.opensearch.serverless.store.PruningDigest.mayPrune(source.query()) == false
+            || source.suggest() != null
+            || SearchFanout.hasGlobalAggregation(source)) {
+            return java.util.Set.of();
+        }
+        final java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> entries;
+        try {
+            final java.util.concurrent.Executor pool = serving.threadPool().executor(ThreadPool.Names.GENERIC);
+            entries = metadata.rollups()
+                .readGroup(
+                    org.opensearch.serverless.metadata.DigestRollups.group(prefix),
+                    new org.opensearch.serverless.metadata.DescriptorStore.Reads() {
+                        @Override
+                        public <T> java.util.List<T> runAll(java.util.List<java.util.concurrent.Callable<T>> tasks)
+                            throws InterruptedException {
+                            return Fanout.run(pool, serving.searchFanoutConcurrency(), tasks);
+                        }
+                    }
+                );
+        } catch (Exception e) {
+            // The rollups are an optimisation over the per-index path, which is always correct.
+            org.apache.logging.log4j.LogManager.getLogger(SearchHandler.class)
+                .warn("could not read the digest rollups for [" + prefix + "*]; searching without them", e);
+            return java.util.Set.of();
+        }
+        final java.util.Set<String> ruledOut = new java.util.LinkedHashSet<>();
+        String kept = null;
+        for (String name : matched) {
+            final org.opensearch.serverless.metadata.DigestRollups.Entry entry = entries.get(name);
+            if (entry != null && entry.rulesOut(source.query(), nowMillis)) {
+                ruledOut.add(name);
+                rolledUp.put(name, entry);
+            } else {
+                if (entry != null && entry.judgedMatchable(source.query(), nowMillis)) {
+                    judged.add(name);
+                }
+                if (kept == null) {
+                    kept = name;
+                }
+            }
+        }
+        if (kept == null && ruledOut.isEmpty() == false) {
+            // Everything ruled out: one is searched anyway, so the answer has its aggregations' shape.
+            final String first = ruledOut.iterator().next();
+            ruledOut.remove(first);
+            rolledUp.remove(first);
+        }
+        return ruledOut;
     }
 
     /** Resolves many names concurrently; a name whose read failed is left for the caller to read and fail on. */

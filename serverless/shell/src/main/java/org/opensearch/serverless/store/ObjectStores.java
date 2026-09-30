@@ -435,6 +435,90 @@ public final class ObjectStores {
             }
 
             @Override
+            public org.opensearch.common.blobstore.InputStreamWithMetadata readBlobWithMetadata(String blobName)
+                throws java.io.IOException {
+                return count(blobReads, () -> inner.readBlobWithMetadata(blobName));
+            }
+
+            @Override
+            public void writeBlobWithMetadata(
+                String blobName,
+                java.io.InputStream inputStream,
+                long blobSize,
+                boolean failIfAlreadyExists,
+                java.util.Map<String, String> metadata
+            ) throws java.io.IOException {
+                bytesWritten.addAndGet(Math.max(0L, blobSize));
+                count(blobWrites, () -> {
+                    inner.writeBlobWithMetadata(blobName, inputStream, blobSize, failIfAlreadyExists, metadata);
+                    return null;
+                });
+            }
+
+            @Override
+            public void writeBlobWithMetadata(
+                String blobName,
+                java.io.InputStream inputStream,
+                long blobSize,
+                boolean failIfAlreadyExists,
+                java.util.Map<String, String> metadata,
+                org.opensearch.cluster.metadata.CryptoMetadata cryptoMetadata
+            ) throws java.io.IOException {
+                bytesWritten.addAndGet(Math.max(0L, blobSize));
+                count(blobWrites, () -> {
+                    inner.writeBlobWithMetadata(blobName, inputStream, blobSize, failIfAlreadyExists, metadata, cryptoMetadata);
+                    return null;
+                });
+            }
+
+            @Override
+            public void writeBlobAtomicWithMetadata(
+                String blobName,
+                java.io.InputStream inputStream,
+                java.util.Map<String, String> metadata,
+                long blobSize,
+                boolean failIfAlreadyExists
+            ) throws java.io.IOException {
+                bytesWritten.addAndGet(Math.max(0L, blobSize));
+                count(blobWrites, () -> {
+                    inner.writeBlobAtomicWithMetadata(blobName, inputStream, metadata, blobSize, failIfAlreadyExists);
+                    return null;
+                });
+            }
+
+            @Override
+            public boolean isConditionalWriteSupported() {
+                return inner.isConditionalWriteSupported();
+            }
+
+            @Override
+            public org.opensearch.common.blobstore.VersionedBlob readBlobWithVersion(String blobName) throws java.io.IOException {
+                return count(blobReads, () -> inner.readBlobWithVersion(blobName));
+            }
+
+            @Override
+            public String writeBlobConditionally(
+                String blobName,
+                java.io.InputStream inputStream,
+                long blobSize,
+                String expectedVersionToken
+            ) throws java.io.IOException {
+                bytesWritten.addAndGet(Math.max(0L, blobSize));
+                return count(blobWrites, () -> inner.writeBlobConditionally(blobName, inputStream, blobSize, expectedVersionToken));
+            }
+
+            @Override
+            public void listBlobsByPrefixInSortedOrder(
+                String blobNamePrefix,
+                int limit,
+                BlobNameSortOrder blobNameSortOrder,
+                org.opensearch.core.action.ActionListener<java.util.List<BlobMetadata>> listener
+            ) {
+                listings.incrementAndGet();
+                inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, blobNameSortOrder, listener);
+            }
+
+            @Override
             public java.util.Optional<BlobRegister> readRegister(String blobName) throws java.io.IOException {
                 return count(registerReads, () -> inner.readRegister(blobName));
             }

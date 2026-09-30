@@ -87,9 +87,16 @@ public final class PruningDigest {
     public record FieldRange(String type, Number min, Number max, String format, String locale) {
         /** Bounds held as Long, or Double for a floating type, however they were read. */
         public FieldRange {
-            final boolean floating = "double".equals(type) || "float".equals(type);
-            min = floating ? Double.valueOf(min.doubleValue()) : Long.valueOf(min.longValue());
-            max = floating ? Double.valueOf(max.doubleValue()) : Long.valueOf(max.longValue());
+            // Branches, not a conditional expression: {@code c ? Double : Long} is numeric promotion, which
+            // unboxes both to double -- and a long above 2^53 rounded to a double can land below its true value,
+            // narrowing a range the digest must only ever state wide.
+            if ("double".equals(type) || "float".equals(type)) {
+                min = Double.valueOf(min.doubleValue());
+                max = Double.valueOf(max.doubleValue());
+            } else {
+                min = Long.valueOf(min.longValue());
+                max = Long.valueOf(max.longValue());
+            }
         }
     }
 
@@ -191,6 +198,87 @@ public final class PruningDigest {
             }
         }
         return null;
+    }
+
+    /**
+     * A digest covering everything either covers: only the fields both digest, each over the union of the two
+     * ranges. A field one side does not digest is one it cannot judge, so the union cannot judge it either.
+     *
+     * @param other the other digest
+     * @return the union
+     */
+    public PruningDigest union(PruningDigest other) {
+        final Map<String, FieldRange> merged = new LinkedHashMap<>();
+        for (Map.Entry<String, FieldRange> field : fields.entrySet()) {
+            final FieldRange mine = field.getValue();
+            final FieldRange theirs = other.fields.get(field.getKey());
+            if (theirs == null || mine.type().equals(theirs.type()) == false) {
+                continue;
+            }
+            final Number min;
+            final Number max;
+            if (mine.min() instanceof Double) {
+                min = Math.min(mine.min().doubleValue(), theirs.min().doubleValue());
+                max = Math.max(mine.max().doubleValue(), theirs.max().doubleValue());
+            } else {
+                min = Math.min(mine.min().longValue(), theirs.min().longValue());
+                max = Math.max(mine.max().longValue(), theirs.max().longValue());
+            }
+            merged.put(field.getKey(), new FieldRange(mine.type(), min, max, mine.format(), mine.locale()));
+        }
+        return new PruningDigest(merged);
+    }
+
+    /**
+     * This digest widened outward to coarse boundaries -- dates to whole hours, integers to about a sixteenth of
+     * their magnitude -- so a shard whose values creep upward publish by publish lands inside what was already
+     * recorded, and the record rarely has to change. Only ever wider, so only ever as safe.
+     *
+     * @return the coarsened digest
+     */
+    public PruningDigest coarsened() {
+        final Map<String, FieldRange> coarse = new LinkedHashMap<>();
+        for (Map.Entry<String, FieldRange> field : fields.entrySet()) {
+            final FieldRange range = field.getValue();
+            if (range.min() instanceof Double) {
+                coarse.put(field.getKey(), range);
+                continue;
+            }
+            final long step;
+            if ("date".equals(range.type())) {
+                step = 3_600_000L;
+            } else if ("date_nanos".equals(range.type())) {
+                step = 3_600_000_000_000L;
+            } else {
+                step = Math.max(
+                    1L,
+                    Long.highestOneBit(Math.max(Math.abs(range.min().longValue()), Math.abs(range.max().longValue()))) >> 4
+                );
+            }
+            coarse.put(
+                field.getKey(),
+                new FieldRange(
+                    range.type(),
+                    floorTo(range.min().longValue(), step),
+                    ceilTo(range.max().longValue(), step),
+                    range.format(),
+                    range.locale()
+                )
+            );
+        }
+        return new PruningDigest(coarse);
+    }
+
+    private static long floorTo(long value, long step) {
+        final long floored = Math.floorDiv(value, step) * step;
+        // Near the bottom of the range the product can wrap; wider is the only safe answer.
+        return floored > value ? Long.MIN_VALUE : floored;
+    }
+
+    private static long ceilTo(long value, long step) {
+        final long floored = floorTo(value, step);
+        final long last = floored + (step - 1);
+        return last < floored ? Long.MAX_VALUE : Math.max(value, last);
     }
 
     /**
