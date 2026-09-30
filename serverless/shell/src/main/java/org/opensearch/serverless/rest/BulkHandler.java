@@ -454,8 +454,10 @@ public final class BulkHandler extends BaseRestHandler {
             return;
         }
         if (owner.equals(serving.localNode().getId())) {
-            // The head names this node and the shard is not open here: the activation window, which is
-            // brief and self-resolving. Forwarding would send the batch to ourselves and be refused.
+            // The head names this node and the shard is not open here: the activation window, brief and
+            // self-resolving -- provided an activation is running, which the doubt makes sure of. Forwarding
+            // would send the batch to ourselves and be refused.
+            serving.signals().ownershipDoubted(index, shard);
             failGroup(
                 group,
                 RestStatus.SERVICE_UNAVAILABLE,

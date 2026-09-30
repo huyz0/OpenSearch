@@ -481,6 +481,10 @@ public final class ShardOperations {
             return new NotHereException("no node currently owns shard " + placement.shard() + " of " + index, null, false);
         }
         if (placement.owner().equals(node.localNode().getId())) {
+            // Brief only if an activation is actually running. A head naming this node with nothing open and
+            // nothing opening is a wedge -- every peer forwards here and gets this answer -- so the doubt goes
+            // up either way: it joins an activation in flight, or starts the one that re-takes and replays.
+            node.signals().ownershipDoubted(index, placement.shard());
             return new NotHereException(
                 "this node is acquiring shard " + placement.shard() + " of " + index + "; retry",
                 placement.owner(),

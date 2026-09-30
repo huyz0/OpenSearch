@@ -1715,6 +1715,17 @@ public final class ServerlessNode implements Closeable {
     private final java.util.Set<String> openingShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /**
+     * Reader opens in flight, by index and number, so concurrent callers for one shard share one open.
+     *
+     * <p>Every item of a multi-get over a shard nobody owns needs the same reader, and they arrive together.
+     * Each used to open it for itself: one won the shard lock and the rest failed "failed to obtain in-memory
+     * shard lock", which a client reads as documents missing. The fleet run found it as acknowledged writes
+     * that were absent on first read-back and present on the second.
+     */
+    private final Map<String, java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId>> readerOpens =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
      * Serialises projecting a view with applying it, so views are applied in the order they were computed
      * and each one includes everything recorded before it -- two opens projecting at once could otherwise
      * apply an older view last and take away an index the newer one had just added.
@@ -2713,18 +2724,37 @@ public final class ServerlessNode implements Closeable {
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
-        final long describedAt = System.nanoTime();
-        final IndexDescriptor descriptor = plane.describe(indexName)
-            .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
         final String openingKey = indexName + "#" + shardNumber;
+        final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> mine =
+            new java.util.concurrent.CompletableFuture<>();
+        final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> running = readerOpens.putIfAbsent(
+            openingKey,
+            mine
+        );
+        if (running != null) {
+            // Someone is opening it already: their answer is this one's, success or failure.
+            try {
+                return running.get();
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw e.getCause() instanceof Exception cause ? cause : e;
+            }
+        }
+        final long describedAt = System.nanoTime();
         openingShards.add(openingKey);
         try {
+            final IndexDescriptor descriptor = plane.describe(indexName)
+                .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
             final org.opensearch.core.index.shard.ShardId opened = openReader(plane, indexName, shardNumber, descriptor, openingKey);
             // The read above confirmed the incarnation, so the query this open serves need not read it again.
             confirmIncarnation(descriptor.uuid(), describedAt);
+            mine.complete(opened);
             return opened;
+        } catch (Exception e) {
+            mine.completeExceptionally(e);
+            throw e;
         } finally {
             openingShards.remove(openingKey);
+            readerOpens.remove(openingKey, mine);
         }
     }
 

@@ -442,6 +442,8 @@ public final class DocumentHandler extends BaseRestHandler {
                                 return;
                             }
                             if (fresh.equals(serving.localNode().getId())) {
+                                // Named here with nothing open: see ShardOperations#notHere for why this doubts.
+                                serving.signals().ownershipDoubted(writtenIndex, shard);
                                 channel.sendResponse(activationInProgress(channel, writtenIndex, shard));
                                 return;
                             }
