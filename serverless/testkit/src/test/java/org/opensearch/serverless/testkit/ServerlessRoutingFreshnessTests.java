@@ -134,6 +134,11 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
                 "uuid-alpha-00000000",
                 mine.writeTarget("alpha").orElseThrow().index().uuid()
             );
+            // The other node's delete answered after the settle window; that wait is what this stands for.
+            // Without it, the confirmation the activation above took -- a second ago, and true then -- still
+            // licenses an answer, which is the fence working as designed: a write inside that second is
+            // concurrent with a delete that has not yet returned.
+            node.setIncarnationFenceMillis(0L);
 
             // But the shard it would route to no longer answers for that name, so the write is refused.
             // place() matches an open shard on uuid, and the recreated index's shard is a different one.

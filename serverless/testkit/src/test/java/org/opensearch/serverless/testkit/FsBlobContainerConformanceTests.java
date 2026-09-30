@@ -25,9 +25,17 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
  */
 public class FsBlobContainerConformanceTests extends BlobContainerConformanceTestCase {
 
+    private FsBlobStore store;
+
     @Override
     protected BlobContainer newContainer() throws Exception {
         final java.nio.file.Path dir = createTempDir();
-        return new FsBlobStore(1024, dir, false).blobContainer(BlobPath.cleanPath());
+        store = new FsBlobStore(1024, dir, false);
+        return store.blobContainer(BlobPath.cleanPath());
+    }
+
+    @Override
+    protected org.opensearch.common.blobstore.BlobStore store() {
+        return store;
     }
 }

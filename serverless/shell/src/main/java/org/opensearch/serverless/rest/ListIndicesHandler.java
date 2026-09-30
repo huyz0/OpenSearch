@@ -29,23 +29,27 @@ import java.util.function.Supplier;
  * <em>is</em> a page at a time. Serving that contract involves no lying; serving {@code _cat/indices} at this
  * design's scale would.
  *
- * <p><b>Why a pattern is required.</b> {@code namesWithPrefix} resolves through one
- * {@code listBlobsByPrefixInSortedOrder} call with a cap — genuinely bounded, and it <em>refuses</em> past the
- * cap rather than truncating, which is the rule search wildcards already follow. The unscoped form has no such
- * bound. {@code DescriptorStore#listPage} looks like it provides one and does not: it lists every blob, sorts
- * in memory, and slices, so walking N indices costs N full listings. A cursor whose every page is a full scan
- * is a cursor in shape only, and offering it here would be selling that shape to a caller.
+ * <p><b>{@code _list/indices} pages; {@code _cat/indices} refuses.</b> A prefix pattern, or the bare form
+ * meaning every index, is walked with core's contract: {@code size} rows per page (500 by default, 5000 at
+ * most) and a {@code next_token} to resume, null on the last page. The walk resumes in the store's own
+ * listing ({@code StartAfter} on S3), so page N costs what page 1 did: one listing per thousand names plus
+ * one descriptor read per row. {@code _cat/indices}, whose contract is the whole answer, still resolves
+ * under the pattern cap and refuses past it rather than truncating.
  *
- * <p><b>What a real cursor needs, stated so it is not mistaken for a design choice.</b> S3 supports
- * {@code start-after} natively. Core's {@code BlobContainer} exposes {@code listBlobs},
- * {@code listBlobsByPrefix} and {@code listBlobsByPrefixInSortedOrder} — none of them resumable. Until that
- * interface grows a cursor, {@code next_token} here is refused when given, and never rendered: the answer is
- * a table, and a table with no cursor row is one page that is the whole answer.
+ * <p><b>What a walk promises, and what it does not.</b> It is not a snapshot. An index created or deleted
+ * behind the cursor is not seen by the rest of the walk; one created or deleted ahead of it is seen or not
+ * depending on when its page is read. Every index that exists for the whole walk appears exactly once, in
+ * name order. Core's {@code _list/indices} sorts by creation time; there is no creation-ordered index over
+ * a hundred million names here, so {@code sort} is accepted and the order is by name.
+ *
+ * <p><b>The token.</b> Opaque to a caller: the prefix and the last name, base64url-encoded. A token for one
+ * prefix presented with another, or one that does not decode, is refused as tainted -- core's wording --
+ * rather than restarting the walk, which for a caller paginating a large deployment would mean never
+ * finishing and never being told why.
  *
  * <p><b>What is reported, and what is not.</b> {@code _list/indices} carries {@code docs.count} and
  * {@code store.size} in OpenSearch. Those are shard-level facts and this reads only descriptors, so they are
  * omitted rather than reported as zero — zero is a claim, and the true answer is that they were not measured.
- * {@code complete} says which, borrowing the field search responses already use.
  */
 public final class ListIndicesHandler extends BaseRestHandler {
 
@@ -117,33 +121,23 @@ public final class ListIndicesHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_cat_parameter", unsupportedCat)
             );
         }
-        if (size != null) {
-            // Refused for the reason next_token is. A page size is the other half of a paginated walk, and
-            // this used to consume it and answer with everything -- so a caller asking for ten and getting
-            // four hundred could not tell whether the parameter was honoured, ignored or misspelt.
+        final boolean listing = request.path().startsWith("/_list/");
+        if (listing == false && (size != null || nextToken != null)) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_parameter",
-                    "size is not supported: this listing is not paginated. A prefix narrow enough to fit under "
-                        + "the pattern cap returns in one page, and one too broad is refused rather than truncated"
+                    RestStatus.BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "_cat/indices is not paginated; _list/indices takes size and next_token"
                 )
             );
         }
-        if (nextToken != null) {
-            // Refused rather than ignored. A caller passing a token is resuming a walk, and answering from
-            // the beginning while accepting the token would silently restart it -- which for a caller
-            // paginating through a large deployment means never finishing and never being told why.
+        final Paging paging;
+        try {
+            paging = listing ? Paging.of(index, size, nextToken) : null;
+        } catch (IllegalArgumentException e) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_parameter",
-                    "next_token is not supported: resuming a listing needs a start-after cursor, which core's "
-                        + "BlobContainer does not expose. A prefix narrow enough to fit under the pattern cap "
-                        + "returns in one page, and one too broad is refused rather than truncated"
-                )
+                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage())
             );
         }
 
@@ -162,7 +156,11 @@ public final class ListIndicesHandler extends BaseRestHandler {
                     org.opensearch.action.admin.indices.get.GetIndexAction.NAME,
                     new org.opensearch.action.admin.indices.get.GetIndexRequest().indices(index),
                     () -> {
-                        answer(channel, request, metadata, serving, index);
+                        if (paging != null && paging.prefix() != null) {
+                            page(channel, request, metadata, serving, paging);
+                        } else {
+                            answer(channel, request, metadata, serving, index, paging != null);
+                        }
                         return null;
                     }
                 );
@@ -185,7 +183,8 @@ public final class ListIndicesHandler extends BaseRestHandler {
         RestRequest request,
         MetadataPlane metadata,
         org.opensearch.serverless.shell.ServerlessNode serving,
-        String index
+        String index,
+        boolean asPage
     ) throws Exception {
         final List<String> names = new java.util.ArrayList<>(IndexPatterns.expand(metadata, index, serving.patternCap()));
         names.removeIf(serving::isSystemIndex);
@@ -210,7 +209,101 @@ public final class ListIndicesHandler extends BaseRestHandler {
                 descriptor.get().mappingVersion()
             );
         }
-        table.send(channel, request);
+        if (asPage) {
+            // Named indices are one page that is the whole answer.
+            table.sendPage(channel, request, "indices", null);
+        } else {
+            table.send(channel, request);
+        }
+    }
+
+    /** One page of a prefix walk. */
+    private void page(
+        org.opensearch.rest.RestChannel channel,
+        RestRequest request,
+        MetadataPlane metadata,
+        org.opensearch.serverless.shell.ServerlessNode serving,
+        Paging paging
+    ) throws Exception {
+        final java.util.concurrent.Executor pool = serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC);
+        final var page = metadata.descriptors()
+            .listPage(paging.prefix(), paging.after(), paging.size(), new org.opensearch.serverless.metadata.DescriptorStore.Reads() {
+                @Override
+                public <T> List<T> runAll(List<java.util.concurrent.Callable<T>> tasks) throws InterruptedException {
+                    return Fanout.run(pool, serving.searchFanoutConcurrency(), tasks);
+                }
+            });
+        final CatTable table = new CatTable("index", "uuid", "pri", "rep", "status", "mapping_version");
+        for (IndexDescriptor descriptor : page.descriptors().values()) {
+            if (serving.isSystemIndex(descriptor.name())) {
+                continue;
+            }
+            table.row(descriptor.name(), descriptor.uuid(), descriptor.numberOfShards(), 0, "open", descriptor.mappingVersion());
+        }
+        table.sendPage(channel, request, "indices", page.hasMore() ? Paging.token(paging.prefix(), page.nextAfter()) : null);
+    }
+
+    /**
+     * What a {@code _list/indices} request asks for: a prefix walk when the expression is one prefix pattern,
+     * otherwise named indices answered in one page.
+     *
+     * @param prefix the prefix walked, or null for named indices
+     * @param after the name to resume after, or null for the first page
+     * @param size rows per page
+     */
+    record Paging(String prefix, String after, int size) {
+
+        static final int DEFAULT_SIZE = 500;
+        static final int MAX_SIZE = 5000;
+
+        static Paging of(String index, String size, String nextToken) {
+            final int pageSize;
+            try {
+                pageSize = size == null ? DEFAULT_SIZE : Integer.parseInt(size);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("size must be a number, got [" + size + "]");
+            }
+            if (pageSize < 1 || pageSize > MAX_SIZE) {
+                throw new IllegalArgumentException("size must be between 1 and [" + MAX_SIZE + "], got [" + pageSize + "]");
+            }
+            final String expression = index.trim();
+            final boolean onePrefix = expression.indexOf(',') < 0 && IndexPatterns.isPrefixPattern(expression);
+            if (onePrefix == false) {
+                if (nextToken != null) {
+                    throw new IllegalArgumentException("next_token resumes a walk over one prefix pattern, and [" + index + "] is not one");
+                }
+                return new Paging(null, null, pageSize);
+            }
+            final String prefix = expression.substring(0, expression.length() - 1);
+            if (nextToken == null) {
+                return new Paging(prefix, null, pageSize);
+            }
+            final String decoded;
+            try {
+                decoded = new String(java.util.Base64.getUrlDecoder().decode(nextToken), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException e) {
+                throw tainted();
+            }
+            final int split = decoded.startsWith(TOKEN_VERSION) ? decoded.indexOf('\n', TOKEN_VERSION.length()) : -1;
+            if (split < 0 || decoded.substring(TOKEN_VERSION.length(), split).equals(prefix) == false) {
+                throw tainted();
+            }
+            return new Paging(prefix, decoded.substring(split + 1), pageSize);
+        }
+
+        private static final String TOKEN_VERSION = "1\n";
+
+        static String token(String prefix, String after) {
+            return java.util.Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString((TOKEN_VERSION + prefix + "\n" + after).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+
+        private static IllegalArgumentException tainted() {
+            return new IllegalArgumentException(
+                "Parameter [next_token] has been tainted and is incorrect. Please provide a valid [next_token]."
+            );
+        }
     }
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {

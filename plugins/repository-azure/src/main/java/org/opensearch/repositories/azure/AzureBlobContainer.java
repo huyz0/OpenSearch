@@ -222,9 +222,34 @@ public class AzureBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
+    public List<BlobMetadata> listBlobsByPrefix(@Nullable String prefix, @Nullable String startAfter, int limit) throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        try {
+            return blobStore.listBlobsByPrefix(keyPath, prefix, startAfter, limit);
+        } catch (URISyntaxException | BlobStorageException e) {
+            logger.warn("can not list [{}] after [{}] in container {{}}: {}", prefix, startAfter, blobStore, e.getMessage());
+            throw new IOException(e);
+        }
+    }
+
+    @Override
     public Map<String, BlobMetadata> listBlobs() throws IOException {
         logger.trace("listBlobs()");
         return listBlobsByPrefix(null);
+    }
+
+    @Override
+    public Map<String, BlobContainer> children(@Nullable String startAfter, int limit) throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        try {
+            return blobStore.children(path(), startAfter, limit);
+        } catch (URISyntaxException | BlobStorageException e) {
+            throw new IOException("Failed to list children in path [" + path().buildAsString() + "] after [" + startAfter + "].", e);
+        }
     }
 
     @Override

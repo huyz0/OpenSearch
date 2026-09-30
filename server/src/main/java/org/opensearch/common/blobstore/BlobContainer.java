@@ -423,6 +423,88 @@ public interface BlobContainer {
     }
 
     /**
+     * Lists one page of the blobs in this container whose names start with {@code blobNamePrefix} and sort
+     * strictly after {@code startAfter}, in lexicographic order, at most {@code limit} of them.
+     *
+     * <p>A listing that can be resumed: the last name of one page is the {@code startAfter} of the next, so a
+     * caller walks any number of blobs holding one page at a time, and can persist that name and pick up
+     * where it left off. The pages are not a snapshot. A blob created or deleted behind the cursor is not
+     * seen; one created or deleted ahead of it is, or is not, depending on when the page that would have held
+     * it is read. Every blob that exists for the whole walk is returned exactly once.
+     *
+     * <p>How far each backend gets without reading what it skips:
+     * <ul>
+     *   <li>S3: {@code StartAfter} and {@code MaxKeys} on the listing itself; a page is one request per
+     *   thousand names, and nothing before the cursor is read.</li>
+     *   <li>GCS: {@code startOffset} (inclusive, so the cursor itself is dropped) and a page size.</li>
+     *   <li>A filesystem: the directory is walked, but only {@code limit} names are ever held.</li>
+     *   <li>Azure: the service's continuation marker is opaque and cannot be built from a blob name, so a
+     *   page by name pages through the listing from the prefix, skipping names up to the cursor and stopping
+     *   once the page is full. Correct, and bounded in memory, but a late page costs the listing before it.</li>
+     *   <li>Anything else: this default, which lists every match and sorts.</li>
+     * </ul>
+     *
+     * @param blobNamePrefix the prefix names must start with; null or empty for all blobs
+     * @param startAfter the name every returned blob must sort after; null to start from the beginning
+     * @param limit the most names to return; the page is shorter only when there are no more
+     * @return the page, in lexicographic order of name
+     * @throws IOException if the listing failed
+     */
+    default List<BlobMetadata> listBlobsByPrefix(@Nullable String blobNamePrefix, @Nullable String startAfter, int limit)
+        throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        final List<BlobMetadata> blobs = new ArrayList<>();
+        for (BlobMetadata blob : listBlobsByPrefix(blobNamePrefix).values()) {
+            if (startAfter == null || blob.name().compareTo(startAfter) > 0) {
+                blobs.add(blob);
+            }
+        }
+        blobs.sort(BlobNameSortOrder.LEXICOGRAPHIC.comparator());
+        return new ArrayList<>(blobs.subList(0, Math.min(blobs.size(), limit)));
+    }
+
+    /**
+     * Lists one page of the child containers of this container that come after {@code startAfter}, at most
+     * {@code limit} of them: the paged form of {@link #children()}, with the same resumption and the same
+     * (non-snapshot) semantics as {@link #listBlobsByPrefix(String, String, int)}.
+     *
+     * <p><b>Ordered as a store lists them: by the child's name followed by {@code /}</b>, which is its key
+     * prefix. That is not the order of the names themselves -- {@code c-1/} and {@code c.x/} sort before
+     * {@code c/}, since {@code '-'} and {@code '.'} sort before {@code '/'} -- and a cursor compared by name
+     * against a listing in key order would skip them. "After the cursor" means after {@code startAfter + "/"}.
+     *
+     * <p>S3 resumes the delimited listing with {@code StartAfter} placed just past the cursor's subtree
+     * ({@code <name>0}, since {@code '0'} follows {@code '/'}), GCS with {@code startOffset}, a filesystem
+     * walks the directory holding one page, and Azure pages through its opaque markers skipping up to the
+     * cursor. This default lists every child and sorts.
+     *
+     * @param startAfter the name every returned child must sort after; null to start from the beginning
+     * @param limit the most children to return; the page is shorter only when there are no more
+     * @return the page, keyed by child name, iterating in key order
+     * @throws IOException if the listing failed
+     */
+    default Map<String, BlobContainer> children(@Nullable String startAfter, int limit) throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        final java.util.TreeMap<String, BlobContainer> sorted = new java.util.TreeMap<>(CHILD_KEY_ORDER);
+        sorted.putAll(children());
+        final Map<String, BlobContainer> page = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, BlobContainer> child : (startAfter == null ? sorted : sorted.tailMap(startAfter, false)).entrySet()) {
+            if (page.size() >= limit) {
+                break;
+            }
+            page.put(child.getKey(), child.getValue());
+        }
+        return page;
+    }
+
+    /** Child names in the order a store lists their key prefixes: by name followed by {@code /}. */
+    Comparator<String> CHILD_KEY_ORDER = Comparator.comparing(name -> name + "/");
+
+    /**
      * Reads the current value of a "register" blob &mdash; a small blob whose writes are
      * arbitrated by {@link #compareAndSwapRegister}, giving callers a generic optimistic-
      * concurrency primitive independent of which repository backend they run against.

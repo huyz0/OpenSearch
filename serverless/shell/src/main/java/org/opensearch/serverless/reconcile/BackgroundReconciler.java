@@ -97,11 +97,23 @@ public final class BackgroundReconciler implements Closeable {
     /** Set by a running {@link ReconcileScheduler}: the lease is renewed by its timer, so the backstop must not renew it again. */
     private volatile boolean renewalDrivenByTimer;
     /**
-     * One monitor for both activation passes. The renewal timer, the backstop and a failure-triggered
-     * pass can all reach {@link #activateWanted} or {@link #activateOnDemand} at once, and two of them
-     * activating the same shard is two acquisitions, two seals and two opens racing on one shard.
+     * The activations in flight, one per shard. The renewal timer, the backstop, a failure-triggered pass and
+     * a write waiting for its shard can all ask for the same shard at once; the first starts it and the rest
+     * wait on the same future, so one shard is never two acquisitions, two fences and two opens racing.
+     *
+     * <p>It replaced one monitor over both passes, which was the same guarantee bought by serialising every
+     * activation on the node: a node taking a hundred cold shards took them one after another, and a write
+     * waiting for one shard waited for all the shards ahead of it.
      */
-    private final Object activationLock = new Object();
+    private final Map<Map.Entry<String, Integer>, java.util.concurrent.CompletableFuture<Optional<ShardId>>> activating =
+        new ConcurrentHashMap<>();
+    /** Activations run at most this many at a time, on the generic pool; the rest queue. */
+    private volatile int activationConcurrency = DEFAULT_ACTIVATION_CONCURRENCY;
+    private final java.util.concurrent.ConcurrentLinkedQueue<Runnable> activationQueue = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.concurrent.atomic.AtomicInteger activationsRunning = new java.util.concurrent.atomic.AtomicInteger();
+    /** Guards the shard cap across concurrent on-demand activations, with the slots they have reserved. */
+    private final Object capLock = new Object();
+    private int capReserved;
     private volatile int maxShardsHeld = DEFAULT_MAX_SHARDS_HELD;
     private volatile long evictAfterMillis = DEFAULT_EVICT_AFTER_MILLIS;
     private volatile double evictHeadroomFraction = DEFAULT_EVICT_HEADROOM_FRACTION;
@@ -220,6 +232,12 @@ public final class BackgroundReconciler implements Closeable {
             final org.opensearch.cluster.node.DiscoveryNode self = node.localNode();
             if (reaps % TOMBSTONE_SWEEP_EVERY_REAPS == 0 && self != null) {
                 sweepTombstonesOffThePass(self.getId());
+            }
+            // And one slice of the orphaned-shard sweep, as rarely: a backstop for shard data whose index
+            // is gone and whose reclaim never ran. The cursor is shared, so every node's slices advance one
+            // cycle, and a slice costs its budget whatever the deployment's size.
+            if (reaps % ORPHAN_SLICE_EVERY_REAPS == ORPHAN_SLICE_EVERY_REAPS / 2 && orphanSliceBudget > 0) {
+                sliceOrphansOffThePass();
             }
             // And the deletes whose reclaim intents have fallen due, every reap: an intent is due minutes
             // after its delete, not hours, and the queue lists only the buckets that are.
@@ -566,6 +584,60 @@ public final class BackgroundReconciler implements Closeable {
             sweepingTombstones.set(false);
             logger.warn("could not start a tombstone sweep; the next pass that is due will try again", e);
         }
+    }
+
+    /** How many reaps between slices of the orphaned-shard sweep: about hourly at the defaults. */
+    public static final int ORPHAN_SLICE_EVERY_REAPS = 12;
+
+    /**
+     * How many shard containers one orphan slice visits by default. A slice costs about this many descriptor
+     * reads at worst, once an hour per node, which keeps the background's per-node cost flat.
+     */
+    public static final int DEFAULT_ORPHAN_SLICE_BUDGET = 100;
+
+    private volatile int orphanSliceBudget = DEFAULT_ORPHAN_SLICE_BUDGET;
+    private final java.util.concurrent.atomic.AtomicBoolean slicingOrphans = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile java.util.concurrent.Future<?> orphanSlice = java.util.concurrent.CompletableFuture.completedFuture(null);
+
+    /**
+     * Sets how many shard containers a background orphan slice visits; zero turns the background sweep off.
+     *
+     * @param budget containers per slice
+     */
+    public void setOrphanSliceBudget(int budget) {
+        this.orphanSliceBudget = Math.max(0, budget);
+    }
+
+    private void sliceOrphansOffThePass() {
+        if (slicingOrphans.compareAndSet(false, true) == false) {
+            return;
+        }
+        try {
+            orphanSlice = node.threadPool().generic().submit(() -> {
+                try {
+                    final GarbageCollector.OrphanSlice slice = collector.collectOrphanedShards(plane, orphanSliceBudget);
+                    if (slice.deleted().isEmpty() == false) {
+                        logger.info("the orphan sweep collected {} shard containers", slice.deleted().size());
+                    }
+                } catch (Exception e) {
+                    logger.warn("could not sweep a slice of orphaned shards; the cursor stays and the next slice retries", e);
+                } finally {
+                    slicingOrphans.set(false);
+                }
+            });
+        } catch (RuntimeException e) {
+            slicingOrphans.set(false);
+            logger.warn("could not start an orphan slice; the next one that is due will try again", e);
+        }
+    }
+
+    /**
+     * Returns the most recently started orphan slice, for a caller that needs to wait on it.
+     *
+     * @return the slice's future, complete if none is running
+     */
+    public java.util.concurrent.Future<?> orphanSlice() {
+        return orphanSlice;
     }
 
     private final java.util.concurrent.atomic.AtomicBoolean reclaiming = new java.util.concurrent.atomic.AtomicBoolean();
@@ -1078,29 +1150,13 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> activateWanted() throws Exception {
-        synchronized (activationLock) {
-            return activateWantedLocked();
-        }
-    }
-
-    private Set<ShardId> activateWantedLocked() throws Exception {
-        final Set<ShardId> activated = new LinkedHashSet<>();
+        final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
         for (Map.Entry<String, Integer> target : wanted) {
-            final boolean alreadyHeld = node.reconciler()
-                .openShards()
-                .stream()
-                .anyMatch(s -> s.getIndexName().equals(target.getKey()) && s.id() == target.getValue());
-            if (alreadyHeld) {
-                continue;
+            if (heldAsWriter(target.getKey(), target.getValue()) == false) {
+                pending.add(activate(target.getKey(), target.getValue(), false));
             }
-            node.activateWriter(plane, target.getKey(), target.getValue()).ifPresent(shardId -> {
-                activated.add(shardId);
-                // Its idle clock starts here, so a shard just taken is not immediately a candidate for
-                // being given straight back.
-                openedAt.put(shardId, plane.clock().getAsLong());
-            });
         }
-        return activated;
+        return settle(pending);
     }
 
     /**
@@ -1130,60 +1186,206 @@ public final class BackgroundReconciler implements Closeable {
         if (demandDriven == false) {
             return Set.of();
         }
-        synchronized (activationLock) {
-            return activateOnDemandLocked(candidates);
+        final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
+        for (Map.Entry<String, Integer> candidate : candidates) {
+            if (heldAsWriter(candidate.getKey(), candidate.getValue()) == false) {
+                pending.add(activate(candidate.getKey(), candidate.getValue(), true));
+            }
+        }
+        return settle(pending);
+    }
+
+    /** Whether the shard is open here as a writer: a pass reports only what it newly took. */
+    private boolean heldAsWriter(String indexName, int shard) {
+        return node.reconciler()
+            .openShards()
+            .stream()
+            .anyMatch(s -> s.getIndexName().equals(indexName) && s.id() == shard && node.reconciler().readerShards().contains(s) == false);
+    }
+
+    /**
+     * Takes one shard nobody owns because a request for it is waiting, and returns when it is open here --
+     * or when it is clear it will not be.
+     *
+     * <p>What a write to a dormant shard waits on, instead of being told 421 and retrying until some pass has
+     * taken the shard: the pass would start on the doubt the refusal raised, and the client's retries, each a
+     * head read, were most of the cost of a first write. Shares the single flight every other path uses.
+     *
+     * @param indexName the index
+     * @param shard the shard
+     * @return the shard once open here, or empty if this node did not take it: it neither wants the shard nor
+     *     runs demand-driven, the node is full, or another node won it
+     */
+    public java.util.concurrent.CompletableFuture<Optional<ShardId>> activateForRequest(String indexName, int shard) {
+        // A shard this node was told to want is taken whatever the policy, and without the cap -- exactly as
+        // the pass would take it; any other shard only under demand-driven activation.
+        if (wanted.contains(Map.entry(indexName, shard))) {
+            return activate(indexName, shard, false);
+        }
+        if (demandDriven == false) {
+            return java.util.concurrent.CompletableFuture.completedFuture(Optional.empty());
+        }
+        return activate(indexName, shard, true);
+    }
+
+    /** Waits for every activation of a pass and collects the shards it took; the first failure is rethrown. */
+    private static Set<ShardId> settle(java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending) throws Exception {
+        final Set<ShardId> taken = new LinkedHashSet<>();
+        Exception first = null;
+        for (java.util.concurrent.CompletableFuture<Optional<ShardId>> future : pending) {
+            try {
+                future.get().ifPresent(taken::add);
+            } catch (java.util.concurrent.ExecutionException e) {
+                final Exception cause = e.getCause() instanceof Exception ? (Exception) e.getCause() : e;
+                if (first == null) {
+                    first = cause;
+                } else {
+                    first.addSuppressed(cause);
+                }
+            }
+        }
+        if (first != null && taken.isEmpty()) {
+            throw first;
+        }
+        if (first != null) {
+            logger.warn("some activations of this pass failed; the next pass retries them", first);
+        }
+        return taken;
+    }
+
+    /**
+     * Starts one shard's activation unless it is already in flight, in which case the caller shares it.
+     * Taken into the map before it is queued, and out of it only by the task that ran it, so a finished
+     * activation is never handed to a later caller.
+     */
+    private java.util.concurrent.CompletableFuture<Optional<ShardId>> activate(String indexName, int shard, boolean onDemand) {
+        final Map.Entry<String, Integer> key = Map.entry(indexName, shard);
+        final java.util.concurrent.CompletableFuture<Optional<ShardId>> mine = new java.util.concurrent.CompletableFuture<>();
+        final java.util.concurrent.CompletableFuture<Optional<ShardId>> running = activating.putIfAbsent(key, mine);
+        if (running != null) {
+            return running;
+        }
+        activationQueue.add(() -> {
+            try {
+                mine.complete(activateNow(indexName, shard, onDemand));
+            } catch (Throwable t) {
+                mine.completeExceptionally(t);
+            } finally {
+                activating.remove(key, mine);
+            }
+        });
+        drainActivations();
+        return mine;
+    }
+
+    /** Starts queued activations while fewer than the bound are running; each one that ends starts the next. */
+    private void drainActivations() {
+        while (true) {
+            final int running = activationsRunning.get();
+            if (running >= activationConcurrency || activationQueue.isEmpty()) {
+                return;
+            }
+            if (activationsRunning.compareAndSet(running, running + 1) == false) {
+                continue;
+            }
+            final Runnable task = activationQueue.poll();
+            if (task == null) {
+                activationsRunning.decrementAndGet();
+                continue;
+            }
+            try {
+                node.threadPool().generic().execute(() -> {
+                    try {
+                        task.run();
+                    } finally {
+                        activationsRunning.decrementAndGet();
+                        drainActivations();
+                    }
+                });
+            } catch (RuntimeException e) {
+                // A pool that will not take work -- a node shutting down -- runs it here instead of losing it.
+                try {
+                    task.run();
+                } finally {
+                    activationsRunning.decrementAndGet();
+                }
+            }
         }
     }
 
-    private Set<ShardId> activateOnDemandLocked(Collection<Map.Entry<String, Integer>> candidates) throws Exception {
-        final Set<ShardId> taken = new LinkedHashSet<>();
-        for (Map.Entry<String, Integer> candidate : candidates) {
-            // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
-            // it counts against the bound. makeRoom only ever considers openShards, so counting one here
-            // can refuse an activation the node has no room for -- which is the point -- but can never
-            // take a view away from the caller holding it.
-            if (node.reconciler().heldShards().size() >= maxShardsHeld && makeRoom() == false) {
-                // Refusing is a routing outcome, not an error. Saying so is the difference between a
-                // node that is full and a node that is broken, and only one of them should page anyone.
-                //
-                // And it now means something stronger than it used to: the node is full *and* every shard
-                // it holds has been used recently. Before, a node that reached the cap stayed at it until
-                // the idle sweep came round, refusing new shards while holding ones nobody had touched for
-                // minutes -- a cap that behaved like a permanent ceiling rather than a working set.
-                logger.info(
-                    "not taking {}[{}] on demand: holding {} shards, the cap, and all of them are in use",
-                    candidate.getKey(),
-                    candidate.getValue(),
-                    maxShardsHeld
-                );
-                continue;
-            }
-            final ShardId open = node.reconciler()
-                .openShards()
-                .stream()
-                .filter(s -> s.getIndexName().equals(candidate.getKey()) && s.id() == candidate.getValue())
-                .findFirst()
-                .orElse(null);
-            if (open != null) {
-                if (node.reconciler().readerShards().contains(open) == false) {
-                    continue;
+    /** How many shards a node activates at once by default. */
+    public static final int DEFAULT_ACTIVATION_CONCURRENCY = 8;
+
+    /**
+     * Sets how many shards this node activates at once.
+     *
+     * @param concurrency the bound, at least one
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setActivationConcurrency(int concurrency) {
+        this.activationConcurrency = Math.max(1, concurrency);
+        drainActivations();
+        return this;
+    }
+
+    /** One shard's activation, run by exactly one caller at a time. */
+    private Optional<ShardId> activateNow(String indexName, int shard, boolean onDemand) throws Exception {
+        final ShardId open = node.reconciler()
+            .openShards()
+            .stream()
+            .filter(s -> s.getIndexName().equals(indexName) && s.id() == shard)
+            .findFirst()
+            .orElse(null);
+        if (open != null && node.reconciler().readerShards().contains(open) == false) {
+            return Optional.of(open);
+        }
+        boolean reserved = false;
+        if (onDemand) {
+            synchronized (capLock) {
+                // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
+                // it counts against the bound. makeRoom only ever considers openShards, so counting one here
+                // can refuse an activation the node has no room for -- which is the point -- but can never
+                // take a view away from the caller holding it. The slots other activations in flight have
+                // reserved count too, or a burst of them would each see room for one and all take it.
+                final boolean full = open == null && node.reconciler().heldShards().size() + capReserved >= maxShardsHeld;
+                // makeRoom answers for what is held, not for what is reserved, so the reservations are counted
+                // again after it: room it made may already be spoken for.
+                if (full && (makeRoom() == false || node.reconciler().heldShards().size() + capReserved >= maxShardsHeld)) {
+                    // Refusing is a routing outcome, not an error. Saying so is the difference between a
+                    // node that is full and a node that is broken, and only one of them should page anyone.
+                    logger.info(
+                        "not taking {}[{}] on demand: holding {} shards, the cap, and all of them are in use",
+                        indexName,
+                        shard,
+                        maxShardsHeld
+                    );
+                    return Optional.empty();
                 }
+                if (open == null) {
+                    capReserved++;
+                    reserved = true;
+                }
+            }
+        }
+        try {
+            if (open != null) {
                 // Held as a reader. That used to count as held, so a node that had searched a shard could
                 // never become its writer until idle release let the reader go. A reader holds no head
                 // and no unpublished write, so closing it costs nothing.
                 node.reconciler().releaseShard(open, "reopening as a writer");
             }
-            node.activateWriter(plane, candidate.getKey(), candidate.getValue()).ifPresent(shardId -> {
-                taken.add(shardId);
-                // Its idle clock starts here, exactly as it does for a shard this node was told to want.
-                // It did not, and that was invisible while the only thing reading openedAt was idle
-                // release -- which mostly had a lastUsed to go on, because the request that caused the
-                // activation stamped one. A shard taken on demand and then never touched again had no age
-                // at all, so it could be neither released for idleness nor evicted for room.
-                openedAt.put(shardId, plane.clock().getAsLong());
-            });
+            final Optional<ShardId> taken = node.activateWriter(plane, indexName, shard);
+            // Its idle clock starts here, so a shard just taken is not immediately a candidate for being
+            // given straight back -- whether it was wanted or taken on demand.
+            taken.ifPresent(shardId -> openedAt.put(shardId, plane.clock().getAsLong()));
+            return taken;
+        } finally {
+            if (reserved) {
+                synchronized (capLock) {
+                    capReserved--;
+                }
+            }
         }
-        return taken;
     }
 
     /**

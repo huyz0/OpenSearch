@@ -222,6 +222,126 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
         assertTrue("an unrelated blob must not appear under the prefix", listed.containsKey("other") == false);
     }
 
+    public void testAPagedListingWalksEveryBlobOnceInOrder() throws Exception {
+        final BlobContainer container = newContainer();
+        final java.util.TreeSet<String> written = new java.util.TreeSet<>();
+        for (int i = 0; i < 37; i++) {
+            final String name = "page-" + String.format(java.util.Locale.ROOT, "%03d", (i * 17) % 37);
+            final byte[] body = new byte[1 + i % 5];
+            container.writeBlob(name, new ByteArrayInputStream(body), body.length, false);
+            written.add(name);
+        }
+        container.writeBlob("pagf-after", new ByteArrayInputStream(new byte[1]), 1, false);
+        container.writeBlob("pagd-before", new ByteArrayInputStream(new byte[1]), 1, false);
+
+        final int pageSize = randomIntBetween(1, 10);
+        final java.util.List<String> walked = new java.util.ArrayList<>();
+        String cursor = null;
+        int pages = 0;
+        while (true) {
+            final var page = container.listBlobsByPrefix("page-", cursor, pageSize);
+            assertTrue("a page must not exceed its limit", page.size() <= pageSize);
+            for (var blob : page) {
+                assertEquals("the length of " + blob.name(), 1 + indexOf(blob.name()) % 5, blob.length());
+                walked.add(blob.name());
+            }
+            if (page.size() < pageSize) {
+                break;
+            }
+            cursor = page.get(page.size() - 1).name();
+            assertTrue("a walk this size cannot take this many pages", ++pages < 100);
+        }
+        assertEquals("a paged walk returns every blob once, in lexicographic order", new java.util.ArrayList<>(written), walked);
+        assertEquals("a cursor at the last name is an empty page", 0, container.listBlobsByPrefix("page-", written.last(), 5).size());
+        assertEquals(
+            "the cursor itself is never returned, and a cursor need not name a blob",
+            java.util.List.of("page-001", "page-002"),
+            container.listBlobsByPrefix("page-", "page-000", 2).stream().map(b -> b.name()).toList()
+        );
+        assertEquals(
+            java.util.List.of("page-011"),
+            container.listBlobsByPrefix("page-", "page-0105", 1).stream().map(b -> b.name()).toList()
+        );
+        assertEquals("a zero limit is an empty page", 0, container.listBlobsByPrefix("page-", null, 0).size());
+    }
+
+    private int indexOf(String name) {
+        final int n = Integer.parseInt(name.substring("page-".length()));
+        // name = (i * 17) % 37; 17 * 24 = 408 = 11 * 37 + 1, so i = 24 * n mod 37
+        return (24 * n) % 37;
+    }
+
+    /**
+     * A create or delete between two pages: ahead of the cursor it is seen, behind it it is not, and every blob
+     * that existed for the whole walk is returned exactly once. The pages are not a snapshot.
+     */
+    public void testAPagedWalkSeesChangesAheadOfTheCursorOnly() throws Exception {
+        final BlobContainer container = newContainer();
+        for (String name : java.util.List.of("walk-b", "walk-d", "walk-f", "walk-h")) {
+            container.writeBlob(name, new ByteArrayInputStream(new byte[1]), 1, false);
+        }
+        final var first = container.listBlobsByPrefix("walk-", null, 2);
+        assertEquals(java.util.List.of("walk-b", "walk-d"), first.stream().map(b -> b.name()).toList());
+
+        container.writeBlob("walk-a", new ByteArrayInputStream(new byte[1]), 1, false); // behind the cursor
+        container.writeBlob("walk-e", new ByteArrayInputStream(new byte[1]), 1, false); // ahead of it
+        container.deleteBlobsIgnoringIfNotExists(java.util.List.of("walk-b", "walk-h")); // one behind, one ahead
+
+        final var rest = container.listBlobsByPrefix("walk-", "walk-d", 10);
+        assertEquals(java.util.List.of("walk-e", "walk-f"), rest.stream().map(b -> b.name()).toList());
+    }
+
+    /**
+     * Child containers by page, in key order -- the name followed by {@code /}, which is how every store lists
+     * a prefix, so {@code c-1} and {@code c.x} come before {@code c}. The cursor's own subtree must be skipped
+     * whole -- a store resuming at the cursor's name would hand the same child back, since {@code c/} sorts
+     * after {@code c} -- and the children after it in key order must all come back. RustFS showed the first
+     * version of this, which ordered by name, losing {@code c-1} and {@code c.x} after a cursor at {@code c}.
+     */
+    public void testChildrenPageInOrderAndSkipTheCursorsSubtree() throws Exception {
+        final BlobContainer root = newContainer();
+        final java.util.List<String> names = java.util.List.of("c", "c-1", "c.x", "c0", "d", "e#uuid#0", "e#uuid#1", "f");
+        for (String name : names) {
+            final BlobContainer child = childOf(root, name);
+            child.writeBlob("x", new ByteArrayInputStream(new byte[1]), 1, false);
+            child.writeBlob("y", new ByteArrayInputStream(new byte[1]), 1, false);
+        }
+        root.writeBlob("c-blob", new ByteArrayInputStream(new byte[1]), 1, false); // a blob, never a child
+
+        final int pageSize = randomIntBetween(1, 4);
+        final java.util.List<String> walked = new java.util.ArrayList<>();
+        String cursor = null;
+        while (true) {
+            final java.util.List<String> page = new java.util.ArrayList<>(root.children(cursor, pageSize).keySet());
+            page.removeIf(n -> n.startsWith("extra"));
+            walked.addAll(page);
+            if (page.size() < pageSize) {
+                break;
+            }
+            cursor = page.get(page.size() - 1);
+        }
+        final java.util.List<String> keyOrder = new java.util.ArrayList<>(names);
+        keyOrder.sort(BlobContainer.CHILD_KEY_ORDER);
+        assertEquals(java.util.List.of("c-1", "c.x", "c", "c0", "d", "e#uuid#0", "e#uuid#1", "f"), keyOrder);
+        assertEquals("children walked by page, each once, in key order", keyOrder, walked);
+        final var afterC = root.children("c", 2);
+        assertEquals(java.util.List.of("c0", "d"), new java.util.ArrayList<>(afterC.keySet()));
+        final var afterDash = root.children("c-1", 2);
+        assertEquals(java.util.List.of("c.x", "c"), new java.util.ArrayList<>(afterDash.keySet()));
+        assertTrue("a paged child is a usable container", afterDash.get("c.x").blobExists("x"));
+    }
+
+    /** A child container of {@code root}; a subclass whose containers do not know their store overrides it. */
+    protected BlobContainer childOf(BlobContainer root, String name) throws Exception {
+        return store().blobContainer(root.path().add(name));
+    }
+
+    /** The store {@link #newContainer()} last bound. */
+    protected org.opensearch.common.blobstore.BlobStore store() {
+        assumeTrue("this target does not expose its store", false);
+        return null;
+    }
+
     public void testADeletedRegisterReadsAsAbsent() throws Exception {
         final BlobContainer container = newContainer();
         container.createRegisterIfAbsent("head", bytes("v1"));

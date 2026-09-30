@@ -81,8 +81,24 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
+    public Map<String, BlobContainer> children(String startAfter, int limit) throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        return blobStore.listChildren(path(), startAfter, limit);
+    }
+
+    @Override
     public Map<String, BlobMetadata> listBlobsByPrefix(String prefix) throws IOException {
         return blobStore.listBlobsByPrefix(path, prefix);
+    }
+
+    @Override
+    public List<BlobMetadata> listBlobsByPrefix(String prefix, String startAfter, int limit) throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        return blobStore.listBlobsByPrefix(path, prefix, startAfter, limit);
     }
 
     @Override

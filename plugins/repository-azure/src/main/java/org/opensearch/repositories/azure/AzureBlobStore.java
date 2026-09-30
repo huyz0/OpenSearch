@@ -88,6 +88,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -325,6 +326,73 @@ public class AzureBlobStore implements BlobStore {
         });
 
         return MapBuilder.newMapBuilder(blobsBuilder).immutableMap();
+    }
+
+    /**
+     * One page by name. Azure's continuation marker is opaque -- it cannot be built from a blob name -- so
+     * this pages through the listing from the prefix, skipping names up to the cursor, and stops as soon as
+     * the page is full. Azure returns names in lexicographic order, so what is skipped is exactly what sorts
+     * before the cursor: memory is bounded by the page, but a late page pays for the listing before it.
+     */
+    public List<BlobMetadata> listBlobsByPrefix(String keyPath, String prefix, String startAfter, int limit) throws URISyntaxException,
+        BlobStorageException {
+        final List<BlobMetadata> page = new ArrayList<>();
+        if (limit == 0) {
+            return page;
+        }
+        final Tuple<BlobServiceClient, Supplier<Context>> client = client();
+        final BlobContainerClient blobContainer = client.v1().getBlobContainerClient(container);
+        final ListBlobsOptions listBlobsOptions = new ListBlobsOptions().setPrefix(keyPath + (prefix == null ? "" : prefix))
+            .setMaxResultsPerPage(Math.min(Math.max(limit, 1), 5000));
+        AccessController.doPrivilegedChecked(() -> {
+            for (final BlobItem blobItem : blobContainer.listBlobsByHierarchy("/", listBlobsOptions, timeout())) {
+                if (blobItem.isPrefix() != null && blobItem.isPrefix()) {
+                    continue;
+                }
+                final String name = getBlobName(blobItem.getName(), container, keyPath);
+                if (startAfter != null && name.compareTo(startAfter) <= 0) {
+                    continue;
+                }
+                page.add(new PlainBlobMetadata(name, blobItem.getProperties().getContentLength()));
+                if (page.size() >= limit) {
+                    break;
+                }
+            }
+        });
+        return page;
+    }
+
+    /**
+     * One page of child containers by name, paging through the opaque markers from the start and skipping up
+     * to the cursor, as {@link #listBlobsByPrefix(String, String, String, int)} does for blobs.
+     */
+    public Map<String, BlobContainer> children(BlobPath path, String startAfter, int limit) throws URISyntaxException,
+        BlobStorageException {
+        final Map<String, BlobContainer> page = new java.util.LinkedHashMap<>();
+        if (limit == 0) {
+            return page;
+        }
+        final Tuple<BlobServiceClient, Supplier<Context>> client = client();
+        final BlobContainerClient blobContainer = client.v1().getBlobContainerClient(container);
+        final String keyPath = path.buildAsString();
+        final ListBlobsOptions listBlobsOptions = new ListBlobsOptions().setPrefix(keyPath)
+            .setMaxResultsPerPage(Math.min(Math.max(limit, 1), 5000));
+        AccessController.doPrivilegedChecked(() -> {
+            for (final BlobItem blobItem : blobContainer.listBlobsByHierarchy("/", listBlobsOptions, timeout())) {
+                if (blobItem.isPrefix() == null || blobItem.isPrefix() == false) {
+                    continue;
+                }
+                final String name = getBlobName(blobItem.getName(), container, keyPath).replaceAll("/$", "");
+                if (name.isEmpty() || (startAfter != null && BlobContainer.CHILD_KEY_ORDER.compare(name, startAfter) <= 0)) {
+                    continue;
+                }
+                page.put(name, new AzureBlobContainer(path.add(name), this, threadPool));
+                if (page.size() >= limit) {
+                    break;
+                }
+            }
+        });
+        return page;
     }
 
     public Map<String, BlobContainer> children(BlobPath path) throws URISyntaxException, BlobStorageException {

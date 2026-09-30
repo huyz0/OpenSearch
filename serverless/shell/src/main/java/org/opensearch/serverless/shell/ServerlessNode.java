@@ -1687,6 +1687,9 @@ public final class ServerlessNode implements Closeable {
     }
 
     private void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
+        // Stamped from when the renewal began: the lease is valid at least that long after it.
+        final long startedAt = plane.clock().getAsLong();
+        ownLeaseValidUntilMillis = 0L;
         plane.membership()
             .renew(
                 new org.opensearch.serverless.membership.NodeLease(
@@ -1699,6 +1702,37 @@ public final class ServerlessNode implements Closeable {
                     org.opensearch.Version.CURRENT.toString()
                 )
             );
+        ownLeaseValidUntilMillis = startedAt + plane.leaseTtlMillis();
+    }
+
+    /**
+     * Until when, by the plane's clock, this node's own lease is known valid: the start of its last successful
+     * renewal plus the TTL. Its own, not the membership's, which several nodes in one test share.
+     */
+    private volatile long ownLeaseValidUntilMillis = 0L;
+
+    /** Shards being opened right now, by index and number: no concurrent view may drop their bookkeeping. */
+    private final java.util.Set<String> openingShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Serialises projecting a view with applying it, so views are applied in the order they were computed
+     * and each one includes everything recorded before it -- two opens projecting at once could otherwise
+     * apply an older view last and take away an index the newer one had just added.
+     */
+    private final Object viewLock = new Object();
+
+    private ClusterState projectAndApply(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
+        throws Exception {
+        synchronized (viewLock) {
+            final ClusterState view = projectView(extra, opening);
+            applyLocalView(view, () -> 30_000L);
+            return view;
+        }
+    }
+
+    /** Records that an incarnation was read and found live at {@code startedAtNanos}, for the incarnation fence. */
+    private void confirmIncarnation(String uuid, long startedAtNanos) {
+        incarnationConfirmedAtNanos.merge(uuid, startedAtNanos, Math::max);
     }
 
     /**
@@ -1878,7 +1912,7 @@ public final class ServerlessNode implements Closeable {
      * The most indices a prefix pattern may match before the request is refused.
      *
      * <p>Configurable because it is a policy about how much fan-out a caller may ask for in one request,
-     * not a fact about the store — and because a default of five hundred is unreachable in a test, which
+     * not a fact about the store — and because a default of ten thousand is unreachable in a test, which
      * would leave the refusal path unexercised.
      *
      * @return the cap
@@ -1888,6 +1922,47 @@ public final class ServerlessNode implements Closeable {
             "serverless.search.pattern.max_indices",
             org.opensearch.serverless.metadata.MetadataPlane.DEFAULT_PATTERN_CAP
         );
+    }
+
+    /** How many shards a search works on at once by default. */
+    public static final int DEFAULT_SEARCH_FANOUT_CONCURRENCY = 16;
+
+    /**
+     * How many shards a search fans out to at once: the width of its sliding window.
+     *
+     * <p>A search waits on object-store round trips, not on CPU, so its width is set by how many requests in
+     * flight a coordinator should hold rather than by cores. Configurable because that depends on the store.
+     *
+     * @return the width, at least one
+     */
+    public int searchFanoutConcurrency() {
+        return Math.max(1, settings.getAsInt("serverless.search.fanout.concurrency", DEFAULT_SEARCH_FANOUT_CONCURRENCY));
+    }
+
+    /** How many cold shards one search may activate by default. */
+    public static final int DEFAULT_SEARCH_ACTIVATION_BUDGET = 1024;
+
+    /**
+     * How many shards not open on this node one search may ask for: each may cost a cold open somewhere.
+     *
+     * <p>A search past it is refused, or with {@code allow_partial_activation} answered from the first shards
+     * within it. What the pruning digest skips does not count, so the budget bounds what a query actually
+     * wakes, not how many indices its pattern names.
+     *
+     * @return the budget, at least one
+     */
+    public int searchActivationBudget() {
+        return Math.max(1, settings.getAsInt("serverless.search.max_activations_per_query", DEFAULT_SEARCH_ACTIVATION_BUDGET));
+    }
+
+    /**
+     * Whether a search skips the shards whose pruning digest rules the query out. On unless
+     * {@code serverless.search.prune} says otherwise, which exists to measure what pruning saves.
+     *
+     * @return true when pruning is on
+     */
+    public boolean searchPruning() {
+        return settings.getAsBoolean("serverless.search.prune", true);
     }
 
     /**
@@ -1911,7 +1986,9 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setWalStores(
+            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
+        );
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final IndexDescriptor descriptor = plane.describe(pit.index())
             .orElseThrow(() -> new IllegalArgumentException("no such index: " + pit.index()));
@@ -1963,8 +2040,7 @@ public final class ServerlessNode implements Closeable {
         for (ShardAssignment assignment : owned) {
             writerAssignments.put(shardKey(assignment.indexName(), assignment.shardId()), assignment);
         }
-        final ClusterState view = projectView(java.util.List.of(), owned);
-        applyLocalView(view, () -> 30_000L);
+        final ClusterState view = projectAndApply(java.util.List.of(), owned);
         return reconciler.ensureOpen(view, owned);
     }
 
@@ -1984,7 +2060,9 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setWalStores(
+            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
+        );
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId(), localNode.getEphemeralId());
 
@@ -2048,7 +2126,9 @@ public final class ServerlessNode implements Closeable {
         }
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setWalStores(
+            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
+        );
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         {
             // The lease first, and it has to be first. Under batched liveness a shard-head is not
@@ -2063,10 +2143,19 @@ public final class ServerlessNode implements Closeable {
             // And with the lapsed-lease guard, the same one the heartbeat applies: a node whose lease
             // lapsed lets go of every writer shard before it renews, or this renewal would reopen the
             // write path on shards a successor may already have sealed.
-            renewLease(plane);
+            //
+            // Unless the lease was renewed recently enough that it will outlive this activation by a wide
+            // margin: renewing then costs a write on every activation and proves nothing the last renewal did
+            // not. Half the TTL left, less the skew margin, is the bar -- the renewal timer runs at a third.
+            final long now = plane.clock().getAsLong();
+            if (now + plane.leaseTtlMillis() / 2 >= ownLeaseValidUntilMillis - plane.membership().skewMarginMillis()) {
+                renewLease(plane);
+            }
         }
         // The incarnation being activated, so a head left by a deleted index of the same name is not
-        // mistaken for a live owner of this one.
+        // mistaken for a live owner of this one. The read confirms the incarnation too, for the fence the
+        // first write after the open would otherwise pay again.
+        final long describedAt = System.nanoTime();
         final java.util.Optional<IndexDescriptor> described = plane.describe(indexName);
         if (described.isEmpty()) {
             return java.util.Optional.empty();
@@ -2090,11 +2179,15 @@ public final class ServerlessNode implements Closeable {
         // that. The full sync still runs from the backstop, rarely, for what only it can find.
         final ShardAssignment assignment = new ShardAssignment(indexName, shardNumber, acquisition.head().term());
         hosted.put(indexName, described.get());
-        writerAssignments.put(shardKey(indexName, shardNumber), assignment);
+        final String openingKey = shardKey(indexName, shardNumber);
+        writerAssignments.put(openingKey, assignment);
+        openingShards.add(openingKey);
+        // The takeover fenced every older term at the swap, so the open need not list them again.
+        reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
         try {
-            final ClusterState view = projectView(java.util.List.of(described.get()), java.util.List.of(assignment));
-            applyLocalView(view, () -> 30_000L);
+            final ClusterState view = projectAndApply(java.util.List.of(described.get()), java.util.List.of(assignment));
             reconciler.ensureOpen(view, java.util.List.of(assignment));
+            confirmIncarnation(described.get().uuid(), describedAt);
         } catch (Exception e) {
             // The head was won and the shard could not be opened. Held and unserved, that head would
             // refuse every other node's acquisition for as long as this node's lease lives, and nothing
@@ -2108,6 +2201,8 @@ public final class ServerlessNode implements Closeable {
                 e.addSuppressed(giveBack);
             }
             throw e;
+        } finally {
+            openingShards.remove(openingKey);
         }
         final IndexMetadata metadata = clusterService.state().metadata().index(indexName);
         return metadata == null
@@ -2586,11 +2681,32 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        reconciler.setWalStores(id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setWalStores(
+            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
+        );
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
+        final long describedAt = System.nanoTime();
         final IndexDescriptor descriptor = plane.describe(indexName)
             .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
+        final String openingKey = indexName + "#" + shardNumber;
+        openingShards.add(openingKey);
+        try {
+            final org.opensearch.core.index.shard.ShardId opened = openReader(plane, indexName, shardNumber, descriptor, openingKey);
+            // The read above confirmed the incarnation, so the query this open serves need not read it again.
+            confirmIncarnation(descriptor.uuid(), describedAt);
+            return opened;
+        } finally {
+            openingShards.remove(openingKey);
+        }
+    }
 
+    private org.opensearch.core.index.shard.ShardId openReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        IndexDescriptor descriptor,
+        String openingKey
+    ) throws Exception {
         // Readers this node has since let go of are dropped from the record before this one is added,
         // or a search node that cycles through many distinct readers carries every one it ever opened
         // into every reader open for the rest of its life: the N-th open cost O(N) and descriptors of
@@ -2618,18 +2734,21 @@ public final class ServerlessNode implements Closeable {
         // One manifest read: the shard being opened. Every other reader's term is what was read when it
         // was opened. This used to re-read every held reader's manifest on every open -- the 500th reader
         // cost 500 reads before its own.
-        final String openingKey = indexName + "#" + shardNumber;
+        //
         // Read once, and handed on: the reconciler and the directory factory each used to read the same
-        // register again, so one reader open was three to four reads of one manifest.
-        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> manifest = plane.segmentPublisher(indexName, shardNumber)
-            .readManifest();
+        // register again, so one reader open was three to four reads of one manifest. By the uuid already in
+        // hand: the two-argument form resolves it with another descriptor read.
+        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> manifest = plane.segmentPublisher(
+            indexName,
+            descriptor.uuid(),
+            shardNumber
+        ).readManifest();
         readerTerms.put(openingKey, manifest.map(org.opensearch.serverless.store.CommitManifest::term).orElse(1L));
         // The union of what this node serves and what it hosts, plus the reader being opened: a view
         // that described only the readers used to drop every writer index from the applied state on a
         // dual-role node.
         final ShardAssignment opening = new ShardAssignment(indexName, shardNumber, readerTerms.getOrDefault(openingKey, 1L));
-        final ClusterState view = projectView(java.util.List.of(descriptor), java.util.List.of(opening));
-        applyLocalView(view, () -> 30_000L);
+        final ClusterState view = projectAndApply(java.util.List.of(descriptor), java.util.List.of(opening));
         return reconciler.openReader(view, indexName, shardNumber, manifest.orElse(null));
     }
 
@@ -2653,7 +2772,7 @@ public final class ServerlessNode implements Closeable {
         }
         for (Map.Entry<String, Integer> entry : new java.util.ArrayList<>(readerShards)) {
             final String key = shardKey(entry.getKey(), entry.getValue());
-            if (openReaderKeys.contains(key) == false) {
+            if (openReaderKeys.contains(key) == false && openingShards.contains(key) == false) {
                 readerShards.remove(entry);
                 readerTerms.remove(key);
             }
@@ -5042,9 +5161,10 @@ public final class ServerlessNode implements Closeable {
             final org.opensearch.core.index.shard.ShardId open = openByKey.get(entry.getKey());
             if (open != null && readers.contains(open) == false) {
                 assignments.put(entry.getKey(), entry.getValue());
-            } else if (opening.stream().noneMatch(a -> shardKey(a.indexName(), a.shardId()).equals(entry.getKey()))) {
-                writerAssignments.remove(entry.getKey(), entry.getValue());
-            }
+            } else if (openingShards.contains(entry.getKey()) == false
+                && opening.stream().noneMatch(a -> shardKey(a.indexName(), a.shardId()).equals(entry.getKey()))) {
+                    writerAssignments.remove(entry.getKey(), entry.getValue());
+                }
         }
         for (ShardAssignment assignment : opening) {
             assignments.put(shardKey(assignment.indexName(), assignment.shardId()), assignment);

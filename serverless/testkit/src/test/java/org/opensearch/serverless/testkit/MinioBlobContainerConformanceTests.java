@@ -87,7 +87,15 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
         final String bucket = "r11-" + randomAlphaOfLength(12).toLowerCase(java.util.Locale.ROOT);
         final var store = MinioBlobStores.create(endpoint, accessKey(), secretKey(), bucket, createTempDir());
         created.add(bucket);
+        lastStore = store;
         return store.blobContainer(BlobPath.cleanPath().add("conformance"));
+    }
+
+    private org.opensearch.common.blobstore.BlobStore lastStore;
+
+    @Override
+    protected org.opensearch.common.blobstore.BlobStore store() {
+        return lastStore;
     }
 
     private Boolean honours;

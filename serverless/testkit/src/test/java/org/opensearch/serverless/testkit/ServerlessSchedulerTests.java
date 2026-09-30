@@ -357,17 +357,11 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 final var http = node.boundHttpAddress().publishAddress();
                 assertTrue("nobody owns the shard yet", node.reconciler().openShards().isEmpty());
 
-                final Response refused = send(http, "PUT", "/alpha/_doc/1", "{\"msg\":\"first\",\"n\":1}");
-                assertEquals("a write to an unowned shard must be refused, not silently dropped", 421, refused.status());
-
-                assertBusy(
-                    () -> assertFalse(
-                        "the refused write should have caused somebody to take the shard",
-                        node.reconciler().openShards().isEmpty()
-                    ),
-                    10,
-                    java.util.concurrent.TimeUnit.SECONDS
-                );
+                // A node that wants the shard takes it for the write that arrived, and the write waits for
+                // that rather than being refused -- it used to be a 421 that only then raised the doubt.
+                final Response first = send(http, "PUT", "/alpha/_doc/1", "{\"msg\":\"first\",\"n\":1}");
+                assertEquals("a write to an unowned shard this node wants lands: " + first.body(), 201, first.status());
+                assertFalse("the write caused this node to take the shard", node.reconciler().openShards().isEmpty());
 
                 final Response accepted = send(http, "PUT", "/alpha/_doc/2?refresh=true", "{\"msg\":\"second\",\"n\":2}");
                 assertEquals("the write after activation must succeed: " + accepted.body(), 201, accepted.status());
@@ -483,15 +477,9 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 node.setSignals(scheduler);
                 final var http = node.boundHttpAddress().publishAddress();
 
-                assertEquals(421, send(http, "PUT", "/alpha/_doc/1", "{\"msg\":\"first\",\"n\":1}").status());
-                assertBusy(
-                    () -> assertFalse(
-                        "the refused write should have caused this node to take it",
-                        node.reconciler().openShards().isEmpty()
-                    ),
-                    10,
-                    java.util.concurrent.TimeUnit.SECONDS
-                );
+                final Response first = send(http, "PUT", "/alpha/_doc/1", "{\"msg\":\"first\",\"n\":1}");
+                assertEquals("the first write waits for the shard it causes this node to take: " + first.body(), 201, first.status());
+                assertFalse("this node took it", node.reconciler().openShards().isEmpty());
 
                 final Response accepted = send(http, "PUT", "/alpha/_doc/2?refresh=true", "{\"msg\":\"second\",\"n\":2}");
                 assertEquals("the next write must succeed: " + accepted.body(), 201, accepted.status());

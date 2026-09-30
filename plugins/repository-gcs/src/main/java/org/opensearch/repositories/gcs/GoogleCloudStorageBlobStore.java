@@ -185,6 +185,75 @@ class GoogleCloudStorageBlobStore implements BlobStore {
         return mapBuilder.immutableMap();
     }
 
+    /**
+     * One page of the blobs under {@code path} starting with {@code prefix} and sorting after {@code startAfter}.
+     * GCS lists in lexicographic order and takes a {@code startOffset}, inclusive, so the cursor itself is
+     * dropped; pages are fetched lazily and the walk stops once {@code limit} names are in hand.
+     */
+    List<BlobMetadata> listBlobsByPrefix(String path, String prefix, String startAfter, int limit) throws IOException {
+        final String pathPrefix = buildKey(path, prefix == null ? "" : prefix);
+        final List<BlobMetadata> page = new ArrayList<>();
+        if (limit == 0) {
+            return page;
+        }
+        final List<BlobListOption> options = new ArrayList<>();
+        options.add(BlobListOption.currentDirectory());
+        options.add(BlobListOption.prefix(pathPrefix));
+        options.add(BlobListOption.pageSize(Math.min(limit + 1, 1000)));
+        if (startAfter != null) {
+            options.add(BlobListOption.startOffset(buildKey(path, startAfter)));
+        }
+        AccessController.doPrivilegedChecked(() -> {
+            for (Blob blob : client().list(bucketName, options.toArray(new BlobListOption[0])).iterateAll()) {
+                if (blob.isDirectory()) {
+                    continue;
+                }
+                final String suffixName = blob.getName().substring(path.length());
+                if (startAfter != null && suffixName.compareTo(startAfter) <= 0) {
+                    continue;
+                }
+                page.add(new PlainBlobMetadata(suffixName, blob.getSize()));
+                if (page.size() >= limit) {
+                    break;
+                }
+            }
+        });
+        return page;
+    }
+
+    /** One page of the child containers under {@code path} sorting after {@code startAfter}. */
+    Map<String, BlobContainer> listChildren(BlobPath path, String startAfter, int limit) throws IOException {
+        final String pathStr = path.buildAsString();
+        final Map<String, BlobContainer> page = new java.util.LinkedHashMap<>();
+        if (limit == 0) {
+            return page;
+        }
+        final List<BlobListOption> options = new ArrayList<>();
+        options.add(BlobListOption.currentDirectory());
+        options.add(BlobListOption.prefix(pathStr));
+        options.add(BlobListOption.pageSize(Math.min(limit + 1, 1000)));
+        if (startAfter != null) {
+            // Past the cursor's own subtree: '0' follows '/'.
+            options.add(BlobListOption.startOffset(pathStr + startAfter + "0"));
+        }
+        AccessController.doPrivilegedChecked(() -> {
+            for (Blob blob : client().list(bucketName, options.toArray(new BlobListOption[0])).iterateAll()) {
+                if (blob.isDirectory() == false) {
+                    continue;
+                }
+                final String name = blob.getName().substring(pathStr.length(), blob.getName().length() - 1);
+                if (name.isEmpty() || (startAfter != null && BlobContainer.CHILD_KEY_ORDER.compare(name, startAfter) <= 0)) {
+                    continue;
+                }
+                page.put(name, new GoogleCloudStorageBlobContainer(path.add(name), this));
+                if (page.size() >= limit) {
+                    break;
+                }
+            }
+        });
+        return page;
+    }
+
     Map<String, BlobContainer> listChildren(BlobPath path) throws IOException {
         final String pathStr = path.buildAsString();
         final MapBuilder<String, BlobContainer> mapBuilder = MapBuilder.newMapBuilder();

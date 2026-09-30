@@ -590,12 +590,11 @@ public final class GarbageCollector {
      * {@code index#uuid#shard} was not written by this system, and a sweep that deletes what it cannot
      * parse is a sweep that eventually deletes somebody else's bucket.
      *
-     * <p><b>This lists every shard container in the deployment</b>, which is proportional to the population
+     * <p><b>This visits every shard container in the deployment</b>, which is proportional to the population
      * and is the thing §6.3 forbids on a request path. It is allowed here for the same reason
-     * {@link #collectAll} is: a sweep genuinely intends to visit everything, and nothing waits on it. What
-     * it is not is resumable, unlike the per-shard sweep — the object-store listing API this is built on
-     * offers children, not pages of them, so a deployment large enough for that to matter needs a listing
-     * that can be sliced before this can be.
+     * {@link #collectAll} is: a sweep genuinely intends to visit everything, and nothing waits on it. It walks
+     * the containers a thousand at a time, so its memory is a page; the background runs the resumable form,
+     * {@link #collectOrphanedShards(MetadataPlane, int)}, a slice at a time.
      *
      * @param plane the metadata plane
      * @return the container names deleted
@@ -620,40 +619,160 @@ public final class GarbageCollector {
         // differently. Absent is memoised too -- that is the answer that decides a collection, and re-reading
         // it per shard is how one index's shards could be half swept.
         final Map<String, Optional<IndexDescriptor>> described = new java.util.HashMap<>();
-        for (Map.Entry<String, BlobContainer> child : segments.children().entrySet()) {
-            final String container = child.getKey();
-            // index#uuid#shard, split from the right, because an index name may contain the separator in
-            // no version of this system but the uuid and shard cannot.
-            final int lastSeparator = container.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
-            final int uuidSeparator = lastSeparator < 0 ? -1 : container.lastIndexOf(RegisterMap.SHARD_SEPARATOR, lastSeparator - 1);
-            if (uuidSeparator <= 0) {
-                continue;
+        String cursor = null;
+        while (true) {
+            final Map<String, BlobContainer> page = segments.children(cursor, ORPHAN_LIST_PAGE);
+            for (Map.Entry<String, BlobContainer> child : page.entrySet()) {
+                if (collectIfOrphaned(plane, child.getKey(), child.getValue(), snapshots, views, described)) {
+                    deleted.add(child.getKey());
+                }
+                cursor = child.getKey();
             }
-            final String indexName = container.substring(0, uuidSeparator);
-            final String uuid = container.substring(uuidSeparator + 1, lastSeparator);
-            final int shard;
-            try {
-                shard = Integer.parseInt(container.substring(lastSeparator + 1));
-            } catch (NumberFormatException e) {
-                continue;
+            if (page.size() < ORPHAN_LIST_PAGE) {
+                return deleted;
             }
-
-            Optional<IndexDescriptor> descriptor = described.get(indexName);
-            if (descriptor == null) {
-                descriptor = plane.describe(indexName);
-                described.put(indexName, descriptor);
-            }
-            if (descriptor.isPresent() && descriptor.get().uuid().equals(uuid)) {
-                continue;
-            }
-            if (pinnedBySnapshot(snapshots, uuid, shard) || pinnedByView(views, indexName, uuid, shard)) {
-                logger.info("leaving {} in place: a live snapshot or point in time still names its blobs", container);
-                continue;
-            }
-            child.getValue().delete();
-            deleted.add(container);
         }
-        return deleted;
+    }
+
+    /** Where the resumable orphan sweep has got to: a register under the deployment's {@code gc} path. */
+    public static final String ORPHAN_CURSOR = "orphan-sweep-cursor";
+
+    private static final int ORPHAN_LIST_PAGE = 1000;
+
+    /**
+     * What one slice of the resumable orphan sweep did.
+     *
+     * @param deleted the shard containers deleted
+     * @param visited how many containers the slice looked at
+     * @param cursor where the next slice starts; empty when this slice reached the end and the next starts over
+     * @param advanced whether this slice claimed its containers by moving the shared cursor, or lost that race
+     *     to another node's slice and did nothing
+     */
+    public record OrphanSlice(List<String> deleted, int visited, String cursor, boolean advanced) {
+
+        /**
+         * Whether this slice finished a cycle over the deployment.
+         *
+         * @return true when the next slice starts from the beginning
+         */
+        public boolean wrapped() {
+            return cursor.isEmpty();
+        }
+    }
+
+    /**
+     * One slice of the orphan sweep: at most {@code budget} shard containers after the persisted cursor, then
+     * the cursor moved past them.
+     *
+     * <p><b>Resumable, and shared.</b> The cursor is a register, so a sweep interrupted by a restart picks up
+     * where the last slice stopped rather than at the first container, and every node's slices advance the one
+     * cycle rather than each walking its own. A slice claims its containers by moving the cursor past them
+     * <em>before</em> judging any: of two slices racing from one cursor, the one whose compare-and-swap lands
+     * does the work and the other stops, so no container is judged twice in a cycle. A slice that fails after
+     * its claim leaves the rest of its containers to the next cycle -- this is a backstop, and a cycle later is
+     * a delay, not a leak. One that fails before it leaves the cursor where it was.
+     *
+     * <p><b>The cost is the budget.</b> One cursor read, one listing, a descriptor read per index among the
+     * containers visited, and one cursor write: nothing proportional to the deployment. A cycle over N shard
+     * containers takes N / budget slices, spread over however many nodes run them.
+     *
+     * <p><b>What a cycle promises.</b> A container orphaned before a cycle began, and still there, is visited
+     * and collected by the time the cycle ends; one created or orphaned behind the cursor waits for the next.
+     *
+     * @param plane the metadata plane
+     * @param budget the most containers this slice visits
+     * @return what the slice did
+     * @throws IOException if listing, reading or deleting fails
+     */
+    public OrphanSlice collectOrphanedShards(MetadataPlane plane, int budget) throws IOException {
+        if (budget < 1) {
+            throw new IllegalArgumentException("budget must be positive, got " + budget);
+        }
+        final BlobContainer gc = blobStore.blobContainer(base.add("gc"));
+        final Optional<org.opensearch.common.blobstore.BlobRegister> stored = gc.readRegister(ORPHAN_CURSOR);
+        final String from = stored.map(r -> r.value().utf8ToString()).orElse("");
+
+        final List<SnapshotRecord> snapshots = plane.liveSnapshots();
+        final List<PointInTime> views = plane.livePointsInTime(plane.clock().getAsLong());
+        for (PointInTime pit : views) {
+            if (pit.isPlaceholder()) {
+                logger.warn("not sweeping orphaned shards: the point in time [{}] could not be read and may hold any of them", pit.id());
+                return new OrphanSlice(List.of(), 0, from, false);
+            }
+        }
+
+        final BlobContainer segments = blobStore.blobContainer(base.add("segments"));
+        final Map<String, BlobContainer> page = segments.children(from.isEmpty() ? null : from, budget);
+        String last = from;
+        for (String name : page.keySet()) {
+            last = name;
+        }
+        final String next = page.size() < budget ? "" : last;
+        // Claimed before it is worked: the slice whose compare-and-swap moves the cursor owns these
+        // containers, and a racing slice that loses stops here having read one register and one listing.
+        final org.opensearch.core.common.bytes.BytesReference value = new org.opensearch.core.common.bytes.BytesArray(
+            next.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        );
+        final boolean claimed = stored.isPresent()
+            ? gc.compareAndSwapRegister(ORPHAN_CURSOR, stored.get().generation(), value).applied()
+            : gc.createRegisterIfAbsent(ORPHAN_CURSOR, value).applied();
+        if (claimed == false) {
+            return new OrphanSlice(List.of(), 0, from, false);
+        }
+        final Map<String, Optional<IndexDescriptor>> described = new java.util.HashMap<>();
+        final List<String> deleted = new ArrayList<>();
+        for (Map.Entry<String, BlobContainer> child : page.entrySet()) {
+            if (collectIfOrphaned(plane, child.getKey(), child.getValue(), snapshots, views, described)) {
+                deleted.add(child.getKey());
+            }
+        }
+        return new OrphanSlice(deleted, page.size(), next, true);
+    }
+
+    /** Judges one shard container and deletes it if its index is gone and nothing pins it. */
+    private boolean collectIfOrphaned(
+        MetadataPlane plane,
+        String container,
+        BlobContainer blobs,
+        List<SnapshotRecord> snapshots,
+        List<PointInTime> views,
+        Map<String, Optional<IndexDescriptor>> described
+    ) throws IOException {
+        // index#uuid#shard, split from the right, because an index name may contain the separator in
+        // no version of this system but the uuid and shard cannot.
+        final int lastSeparator = container.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
+        final int uuidSeparator = lastSeparator < 0 ? -1 : container.lastIndexOf(RegisterMap.SHARD_SEPARATOR, lastSeparator - 1);
+        if (uuidSeparator <= 0) {
+            return false;
+        }
+        final String indexName = container.substring(0, uuidSeparator);
+        final String uuid = container.substring(uuidSeparator + 1, lastSeparator);
+        final int shard;
+        try {
+            shard = Integer.parseInt(container.substring(lastSeparator + 1));
+        } catch (NumberFormatException e) {
+            return false;
+        }
+
+        Optional<IndexDescriptor> descriptor = described.get(indexName);
+        if (descriptor == null) {
+            descriptor = plane.describe(indexName);
+            described.put(indexName, descriptor);
+        }
+        if (descriptor.isPresent() && descriptor.get().uuid().equals(uuid)) {
+            return false;
+        }
+        if (pinnedBySnapshot(snapshots, uuid, shard) || pinnedByView(views, indexName, uuid, shard)) {
+            logger.info("leaving {} in place: a live snapshot or point in time still names its blobs", container);
+            return false;
+        }
+        try {
+            blobs.delete();
+        } catch (java.nio.file.NoSuchFileException e) {
+            // Collected by a racing slice: gone either way.
+            return false;
+        }
+        return true;
     }
 
     private static boolean pinnedBySnapshot(List<SnapshotRecord> snapshots, String uuid, int shard) {

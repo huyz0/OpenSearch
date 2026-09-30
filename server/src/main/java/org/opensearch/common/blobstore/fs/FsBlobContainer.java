@@ -69,12 +69,16 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.PriorityQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -152,6 +156,41 @@ public class FsBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
+    public Map<String, BlobContainer> children(String startAfter, int limit) throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        // In key order, as every store lists child prefixes; see BlobContainer#children(String, int).
+        final Comparator<String> order = CHILD_KEY_ORDER;
+        final PriorityQueue<String> page = new PriorityQueue<>(Math.max(1, Math.min(limit, 1024)), order.reversed());
+        if (limit > 0) {
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
+                for (Path file : stream) {
+                    final String name = file.getFileName().toString();
+                    if ((startAfter != null && order.compare(name, startAfter) <= 0)
+                        || (page.size() == limit && order.compare(name, page.peek()) >= 0)
+                        || Files.isDirectory(file) == false) {
+                        continue;
+                    }
+                    page.add(name);
+                    if (page.size() > limit) {
+                        page.poll();
+                    }
+                }
+            } catch (NoSuchFileException e) {
+                return new LinkedHashMap<>();
+            }
+        }
+        final List<String> names = new ArrayList<>(page);
+        names.sort(order);
+        final Map<String, BlobContainer> children = new LinkedHashMap<>();
+        for (String name : names) {
+            children.put(name, new FsBlobContainer(blobStore, path().add(name), path.resolve(name)));
+        }
+        return children;
+    }
+
+    @Override
     public Map<String, BlobMetadata> listBlobsByPrefix(String blobNamePrefix) throws IOException {
         Map<String, BlobMetadata> builder = new HashMap<>();
 
@@ -171,6 +210,54 @@ public class FsBlobContainer extends AbstractBlobContainer {
             }
         }
         return unmodifiableMap(builder);
+    }
+
+    /**
+     * A sorted walk of the directory that only ever holds {@code limit} names: the smallest names after the
+     * cursor, kept in a bounded heap as the directory streams past.
+     */
+    @Override
+    public List<BlobMetadata> listBlobsByPrefix(String blobNamePrefix, String startAfter, int limit) throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        final String prefix = blobNamePrefix == null ? "" : blobNamePrefix;
+        // The largest kept name at the head, so a smaller one can displace it.
+        final PriorityQueue<BlobMetadata> page = new PriorityQueue<>(
+            Math.max(1, Math.min(limit, 1024)),
+            BlobNameSortOrder.LEXICOGRAPHIC.comparator().reversed()
+        );
+        if (limit == 0) {
+            return new ArrayList<>();
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
+            for (Path file : stream) {
+                final String name = file.getFileName().toString();
+                if (name.startsWith(prefix) == false || (startAfter != null && name.compareTo(startAfter) <= 0)) {
+                    continue;
+                }
+                if (page.size() == limit && name.compareTo(page.peek().name()) >= 0) {
+                    continue;
+                }
+                final BasicFileAttributes attrs;
+                try {
+                    attrs = Files.readAttributes(file, BasicFileAttributes.class);
+                } catch (FileNotFoundException | NoSuchFileException e) {
+                    continue;
+                }
+                if (attrs.isRegularFile()) {
+                    page.add(new PlainBlobMetadata(name, attrs.size()));
+                    if (page.size() > limit) {
+                        page.poll();
+                    }
+                }
+            }
+        } catch (NoSuchFileException e) {
+            return new ArrayList<>();
+        }
+        final List<BlobMetadata> sorted = new ArrayList<>(page);
+        sorted.sort(BlobNameSortOrder.LEXICOGRAPHIC.comparator());
+        return sorted;
     }
 
     @Override

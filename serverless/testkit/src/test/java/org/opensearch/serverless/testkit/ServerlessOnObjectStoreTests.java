@@ -107,15 +107,10 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             final var http = boot.node().boundHttpAddress().publishAddress();
 
             assertEquals("index creation must reach the bucket", 200, send(http, "PUT", "/alpha?shards=1", MAPPING).status());
-            assertEquals(421, send(http, "PUT", "/alpha/_doc/1", "{\"msg\":\"in-a-bucket\",\"n\":1}").status());
-            assertBusy(
-                () -> assertFalse("the node should take the shard on its own", boot.node().reconciler().openShards().isEmpty()),
-                30,
-                TimeUnit.SECONDS
-            );
-
+            // No node owns the shard: this one takes it, and the first write waits for that and lands.
             final Response written = send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"in-a-bucket\",\"n\":1}");
             assertEquals("the write must succeed: " + written.body(), 201, written.status());
+            assertFalse("the node took the shard on its own", boot.node().reconciler().openShards().isEmpty());
 
             final Response found = send(http, "GET", "/alpha/_search?q=msg:in-a-bucket", null);
             assertEquals(200, found.status());
@@ -151,8 +146,9 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             final ShardId shardId;
             final var http = first.node().boundHttpAddress().publishAddress();
             assertEquals(200, send(http, "PUT", "/alpha?shards=1", MAPPING).status());
-            assertEquals(421, send(http, "PUT", "/alpha/_doc/warm", "{\"msg\":\"survives\",\"n\":0}").status());
-            assertBusy(() -> assertFalse(first.node().reconciler().openShards().isEmpty()), 30, TimeUnit.SECONDS);
+            // The first write waits for the shard it causes this node to take, and is acknowledged.
+            assertEquals(201, send(http, "PUT", "/alpha/_doc/warm", "{\"msg\":\"survives\",\"n\":0}").status());
+            assertFalse(first.node().reconciler().openShards().isEmpty());
             shardId = first.node().reconciler().openShards().iterator().next();
 
             for (int i = 1; i <= 8; i++) {
@@ -220,14 +216,12 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             }
             logger.info("s3 failover: successor recovered {} documents from the bucket", hits);
 
-            // Twelve, not thirteen. The "warm" write was refused with a 421 because no node owned the
-            // shard yet, so it was never acknowledged -- and a write nobody was told succeeded must not
-            // reappear. Durability is a promise about acknowledged writes in both directions, and the
-            // first version of this assertion expected thirteen and was simply wrong about which writes
-            // the system had promised.
-            assertEquals("every acknowledged write must be recoverable from the bucket alone: " + found.body(), 12, hits);
-            assertFalse(
-                "a write that was refused must not come back from the dead: " + found.body(),
+            // Thirteen. The "warm" write used to be refused with a 421 because no node owned the shard yet,
+            // and this counted twelve, since a write nobody was told succeeded must not reappear. It now waits
+            // for the activation it caused and is acknowledged, so it must come back like every other.
+            assertEquals("every acknowledged write must be recoverable from the bucket alone: " + found.body(), 13, hits);
+            assertTrue(
+                "the first write, acknowledged after waiting for its shard, survives too: " + found.body(),
                 found.body().contains("\"_id\":\"warm\"")
             );
         }

@@ -38,6 +38,7 @@ public final class CommitManifest {
     private final Map<String, String> files;
     private final String writer;
     private final Map<String, Long> lengths;
+    private final PruningDigest digest;
 
     /**
      * Creates a manifest whose writer is not recorded.
@@ -75,10 +76,38 @@ public final class CommitManifest {
      * @param lengths file name to length, for whichever files are known
      */
     public CommitManifest(long term, Map<String, String> files, String writer, Map<String, Long> lengths) {
+        this(term, files, writer, lengths, PruningDigest.EMPTY);
+    }
+
+    /**
+     * Creates a manifest that also carries the commit's pruning digest.
+     *
+     * <p>The digest rides in the register the manifest already is, so a coordinator that reads it to route
+     * a search learns, in the same read, whether the search can match anything here at all. Written last in
+     * the JSON: a node from before digests reads term, files and lengths first and stops at the digest's
+     * first closing brace, having read everything it knows.
+     *
+     * @param term the writer's term
+     * @param files file name to the term container holding it
+     * @param writer the writer's node id, or null
+     * @param lengths file name to length, for whichever files are known
+     * @param digest the commit's pruning digest, {@link PruningDigest#EMPTY} if none
+     */
+    public CommitManifest(long term, Map<String, String> files, String writer, Map<String, Long> lengths, PruningDigest digest) {
         this.term = term;
         this.files = Map.copyOf(files);
         this.writer = writer;
         this.lengths = Map.copyOf(lengths);
+        this.digest = digest == null ? PruningDigest.EMPTY : digest;
+    }
+
+    /**
+     * Returns the commit's pruning digest.
+     *
+     * @return the digest; empty for a manifest published without one
+     */
+    public PruningDigest digest() {
+        return digest;
     }
 
     /**
@@ -161,6 +190,11 @@ public final class CommitManifest {
                 }
                 builder.endObject();
             }
+            if (digest.isEmpty() == false) {
+                // Last, always: see the constructor.
+                builder.field("digest");
+                digest.toXContent(builder);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -182,6 +216,7 @@ public final class CommitManifest {
             String writer = null;
             final Map<String, String> files = new LinkedHashMap<>();
             final Map<String, Long> lengths = new LinkedHashMap<>();
+            PruningDigest digest = PruningDigest.EMPTY;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
@@ -207,6 +242,12 @@ public final class CommitManifest {
                             files.put(fileName, parser.text());
                         }
                     }
+                } else if (token == XContentParser.Token.START_OBJECT && "digest".equals(field)) {
+                    digest = PruningDigest.parse(parser);
+                } else if (field != null && (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY)) {
+                    // Something a later version added: skipped whole, so its closing brace is not mistaken
+                    // for the manifest's own.
+                    parser.skipChildren();
                 } else if (token.isValue() && "term".equals(field)) {
                     term = parser.longValue();
                 } else if (token.isValue() && "writer".equals(field)) {
@@ -216,7 +257,7 @@ public final class CommitManifest {
             if (term < 0) {
                 throw new IOException("malformed commit manifest: no term");
             }
-            return new CommitManifest(term, files, writer, lengths);
+            return new CommitManifest(term, files, writer, lengths, digest);
         }
     }
 
@@ -246,6 +287,8 @@ public final class CommitManifest {
             readLengths.put(in.readString(), in.readVLong());
         }
         this.lengths = Map.copyOf(readLengths);
+        // Not carried on the wire: a forwarded frozen search has already been routed.
+        this.digest = PruningDigest.EMPTY;
     }
 
     /**

@@ -52,10 +52,14 @@ cannot yet; an unowned shard is served from its published commit, so a get works
 scaled to zero.
 
 **Search.** The full query DSL, sorting, aggregations, `search_after`, `_source` filtering, several
-indices named in one request, and **prefix patterns** (`logs-*`) — resolved by one bounded listing whose
-cost is set by a cap rather than by the population, measured at 1 object-store request against 3 indices
-and 1 against 63, on a filesystem and on S3 alike. A pattern matching more than the cap is refused rather
-than truncated, because an answer that stopped at a limit looks exactly like a complete one. Shards fan out concurrently; the window is cut once over everything; coverage
+indices named in one request, and **prefix patterns** (`logs-*`) — resolved by a paged listing, a thousand
+names per request, each page resuming where the last stopped, so its cost is set by a cap (10,000 by default)
+rather than by the population. A pattern matching more than the cap is refused rather
+than truncated, because an answer that stopped at a limit looks exactly like a complete one. Shards fan out
+in a sliding window (`serverless.search.fanout.concurrency`, 16); a shard with no owner whose published
+**pruning digest** rules the query out is skipped (`_shards.skipped`); and a search that would open more cold
+shards than `serverless.search.max_activations_per_query` (1,024) is refused unless it passes
+`allow_partial_activation=true`. The window is cut once over everything; coverage
 (`_shards` and `complete`) is reported on every answer, and a search *no* shard could answer is an error
 rather than an empty result. `ignore_unavailable` turns a named index that cannot be reached into a
 `skipped` entry rather than a failure, and only when the caller asked for that.
@@ -205,9 +209,12 @@ not shard work (`m55-analyze-msearch-notes.md` (on `feature/serverlessnode`)).
 **Discovery.** `GET /{index}/_field_caps` reports what a client can query — field types, and whether each is
 searchable and aggregatable — read from the mapping rather than from a shard, so it answers for an index whose
 shards are all dormant. Where two indices map a field differently both types come back, each attributed to the
-indices using it. `GET /_list/indices/{prefix}*` lists indices through one bounded listing and **refuses a
-prefix matching more than the cap rather than truncating**, which is why it is `_list` and not `_cat`:
-OpenSearch added `_list` for exactly this reason (`m53-discovery-notes.md` (on `feature/serverlessnode`)).
+indices using it. `GET /_list/indices/{prefix}*` (and the bare form, meaning every index) **pages**, with
+core's `size` (500 by default, 5,000 at most) and `next_token`; each page resumes in the store's own listing,
+so page two hundred costs what page one did. `_cat/indices`, whose contract is the whole answer, still
+**refuses a prefix matching more than the cap rather than truncating** -- which is why the walk is `_list`
+and not `_cat`: OpenSearch added `_list` for exactly this reason (`m53-discovery-notes.md` (on
+`feature/serverlessnode`)).
 
 **Ingest pipelines, and dynamic mapping.** `_ingest/pipeline/{id}` stores a pipeline in a register and
 compiles it at `PUT`, so one naming a processor this deployment does not have is refused where the operator is
@@ -311,7 +318,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 | Refused | Because |
 | --- | --- |
 | Alias options: `filter`, `routing`, `index_routing`, `search_routing`, `is_write_index`, `is_hidden` | An alias here names indices and nothing else. Refused on all three doors -- the index-scoped spelling, the alias-scoped one, and an action inside `POST /_aliases` -- and pinned by a canaried test. This was once the last place something was accepted and not honoured: a filtered alias was created unfiltered and answered `{"acknowledged": true}`. |
-| Enumerating indices past the pattern cap | `GET /_list/indices` and `GET /_cat/indices` are served now, as the empty prefix under the same bounded listing every other prefix takes -- one capped `listBlobsByPrefixInSortedOrder`. Past the cap they are refused rather than truncated, which is the point: a page that looks complete and is not is worse than a refusal. |
+| `_cat/indices` past the pattern cap | `GET /_cat/indices` is served as the empty prefix under the same capped resolution every pattern takes, and refused past the cap rather than truncated: its contract is the whole answer, and a page that looks complete and is not is worse than a refusal. `GET /_list/indices` walks any number of indices by `next_token` instead. |
 | `POST /_data_stream/_modify` | A data stream here is an alias with a generation, so its backing indices are the alias's members and change by rolling it over, not by being reassigned underneath it. |
 | Patterns that are not a prefix (`*-2026`, `lo*s-a`, `logs-?`) | A prefix can be answered by one bounded listing; these cannot be answered by a listing at all, only by reading every index name in the deployment and matching each. Supporting a wildcard syntax whose cost depends on where the caller put the star would be worse than the split. |
 | Enumerating indices (`/_serverless/indices`) | An inventory operation, not a serving one — it is asked to return everything, where a pattern is capped and refuses when the cap is exceeded. Look an index up by name, or run an offline inventory. |
@@ -383,9 +390,11 @@ These are decisions, not gaps. Each answers 501 with a reason.
 - Static index settings cannot be changed at all, by any route. Classic OpenSearch offers close-change-open
   and there is no close here, so the only way to change one is to create a new index. Dynamic settings change
   freely (M54).
-- There is no cursor over indices. `GET /_list/indices/{prefix}*` answers in one bounded page or refuses;
-  paginating a deployment whose indices fit under no usable prefix is not possible, because resuming a listing
-  needs `start-after` and core's `BlobContainer` does not expose it.
+- A walk over indices is not a snapshot. `GET /_list/indices` by `next_token` returns every index that
+  exists for the whole walk exactly once, in name order; one created or deleted behind the cursor is not
+  seen, one ahead of it is seen or not depending on when its page is read. Core sorts `_list/indices` by
+  creation time; there is no creation-ordered index over a hundred million names here, so `sort` is accepted
+  and the order is by name.
 - A freeze and the sweep no longer race. Freezing reads one manifest per shard and only then wrote the
   record, so files the early shards froze could stop being referenced and be swept before the record
   naming them existed. The wall-clock floor on unreferenced blobs makes a *short* freeze safe and only a
@@ -744,6 +753,146 @@ residual every lease-timed write here carries. Tombstones written before markers
 never swept. Pinned by `ServerlessTombstoneSweepTests`: register reads equal at populations of 10 and 200,
 and each of the claim, the deadline, the create's refusal, the marker and bucket ownership has a planted
 defect that fails a test.
+
+**Cold activation: the first write waits for its shard, and the activation stopped repeating itself.**
+Measured on RustFS 1.0.0 with a fixed delay injected before every object-store request
+(`ServerlessColdActivationMeasurementTests`, in `s3Test`): a dormant 1-shard index -- published and let go
+by a node that has since gone -- takes its first write and its first search on a fresh node, ten samples
+each. The "before" is the same harness on `7bfec04d070`.
+
+| delay | first write, before | first write, after | first search, before | first search, after |
+| ---: | --- | --- | --- | --- |
+| 20 ms | p50 1,008 ms, p99 1,049 ms; 79 requests; ~30 client attempts | p50 720 ms, p99 894 ms; 26 requests; 1 attempt | p50 232 ms, p99 361 ms; 9 requests | p50 247 ms, p99 992 ms; 7 requests |
+| 100 ms | p50 4,473 ms, p99 4,742 ms; 85 requests; ~34 client attempts | p50 2,594 ms, p99 2,677 ms; 27 requests; 1 attempt | p50 1,082 ms, p99 1,552 ms; 10 requests | p50 797 ms, p99 935 ms; 7 requests |
+
+What the recorded sequence showed, and what changed:
+
+- The first write was answered 421, and the client retried until some pass had taken the shard. Each retry
+  read the head again: about fifty of the 79 requests, and most of the wait. A write to a shard nobody owns
+  now waits (up to 30 s) on the activation it causes and is written once the shard is open, into the
+  incarnation it was routed for; one request, one attempt. The same holds for a shard whose head already
+  names this node but which is still opening.
+- One global `activationLock` became a single flight per shard -- every path that asks for a shard (the
+  pass, a doubt, a waiting write) shares the one activation in flight -- on a bounded pool (8 by default,
+  run on the generic pool's threads). A node taking a hundred cold shards no longer takes them one after
+  another, and a write waiting for one shard no longer waits behind the rest. The shard cap is kept by
+  reservation, so concurrent on-demand activations cannot overshoot it. Views are projected and applied
+  under one lock, and a shard being opened is protected from a concurrent view's pruning.
+- The takeover's fence reused none of the listing it had just made; now its first put-if-absent uses it.
+  The open fenced every older term again, listing the log a second time; after a takeover at the same term
+  it no longer does. The replay read the whole log twice -- once in recovery, once for records without
+  sequence identity -- and now reads it once; its record reads run concurrently (8 at a time, the caller
+  reading too); and the legacy seals directory is listed only when the log's root listing shows one.
+- The lease was renewed on every activation. It is now renewed when less than half its TTL remains.
+- A reader open resolved the index's uuid twice (the two-argument manifest lookup describes again), and
+  the query it served read the descriptor a third time for the incarnation fence. The read the open makes
+  now confirms the incarnation, as does activation's.
+
+Pinned by `ServerlessActivationTests`: the first write is 201 on its first attempt; eight concurrent writes to
+one cold shard cause one compare-and-swap of its head; two shards' activations are in flight together (each
+one's head write waits for the other's to begin, so serialised activation deadlocks and fails); and **the
+canary -- two nodes racing for the same six cold shards leave exactly one owner of each, and the loser holds
+nothing**. `ServerlessSchedulerTests#testOnDemandActivationStopsAtTheCap` caught the first version of the
+reservation overshooting the cap.
+
+**Wide searches: a sliding window, a pruning digest, and an activation budget.**
+
+- The fan-out handed the pool a chunk of shards and waited for the whole chunk before the next, so every
+  chunk was as slow as its slowest member. It is now a sliding window: `concurrency - 1` pool workers and
+  the caller each take the next shard the moment they finish one (`serverless.search.fanout.concurrency`,
+  16). `FanoutTests` pins it with a first task that can finish only after the last one has started -- a
+  chunk barrier deadlocks on it.
+- Every publish writes a **pruning digest** into the manifest register it already writes: per point field,
+  the minimum and maximum any document in the commit holds, read from the BKD roots
+  (`PointValues#getMinPackedValue`). No Lucene change was needed. The digest rides last in the JSON, so a
+  node from before it reads everything it knows and stops; the parser now skips any object it does not know.
+- A search over more than one shard first asks, concurrently, which shards it can skip: a shard not open
+  here as a writer, whose head names no owner -- so its published commit is everything it holds -- and whose
+  digest rules the query out. A digest rules out only range and term queries on a digested numeric or date
+  field, reached through `bool` `must`/`filter` and `constant_score`, and only when the query lies strictly
+  outside `[min, max]` with both ends taken as inclusive; dates are parsed as the field parses them, with
+  the request's single `now`. Anything else is a "maybe". Skipped shards are reported in `_shards.skipped`
+  and counted as successful, as core's `can_match` counts them; if every shard would be skipped one is
+  searched anyway, so aggregations have their shape. A query with nothing a digest could judge, a `global`
+  aggregation or a suggester skips the phase entirely.
+- A search that would open more shards not held here than `serverless.search.max_activations_per_query`
+  (1,024) is refused with a 400 before any is opened, unless it passes `allow_partial_activation=true` --
+  then the first ones within the budget are searched and the rest reported as failed shards. What the
+  digest skipped does not count.
+- The pattern cap went from 500 to 10,000: resolution now pages a thousand names per listing request, and
+  the names' descriptors are read concurrently rather than one after another, which for five thousand names
+  was five thousand round trips before the first shard was asked.
+
+Measured on RustFS 1.0.0 (`ServerlessWideSearchMeasurementTests`): 5,000 hourly indices, each four
+documents inside its hour, all published and let go; a `logs-*` search for a 250-hour window, no injected
+delay. **4,749 of 5,000 shards pruned (94%)**, and the total exactly the window's 1,000 documents -- the
+canary at scale, since a digest that skipped one shard too many is a wrong total.
+
+| pass | latency | requests | of which |
+| --- | ---: | ---: | --- |
+| cold (no reader open) | 5.5 s | 16,513 | 6 listings resolving the pattern; 5,000 descriptor, 5,000 head and 5,000 manifest reads; 251 reader opens (~1,000 ranged reads) |
+| warm (the window's readers open) | 4.9 s | 15,258 | the same resolution and pruning reads; no opens |
+
+Without pruning the same search asks for 5,000 cold shards: past the budget, and past the node's shard cap of
+1,000, so it is refused; with the budget raised it would be 5,000 reader opens. **What it still costs:** three
+register reads per index per search, all of them repeated by the next search -- the routing cache holds a
+descriptor for one second, and a digest is re-read every time because its shard could have been published
+since. A digest cached against the manifest's generation, and descriptors held across queries for indices
+that no longer change, are the next step; neither is needed for correctness.
+
+Pinned by `PruningDigestTests` (the rules one at a time, forward-compatible parsing, and a simulation of
+the old parser reading a manifest with a digest) and `ServerlessPruningTests`: the digest a publish writes;
+six of eight daily indices skipped by a two-day range, with totals and aggregations identical to the same
+search with pruning off; an owned shard never skipped, whatever its digest; the budget refusing, then
+answering partially on request; and **the canary -- forty random ranges, inclusive and exclusive, on
+boundaries and off, as numbers and as date strings, over random data, each total checked against brute
+force.** A digest that skipped one shard it should not have is a wrong total.
+
+**Paged listing.** `BlobContainer#listBlobsByPrefix(prefix, startAfter, limit)` lists one page of names after a
+cursor, and `BlobContainer#children(startAfter, limit)` does the same for child containers:
+
+| backend | how a page after a cursor is read |
+| --- | --- |
+| S3 | `StartAfter` and `MaxKeys` on `ListObjectsV2`; children resume at `<name>0`, just past the cursor's subtree |
+| GCS | `startOffset` (inclusive, so the cursor is dropped) and a page size |
+| filesystem | a directory walk holding only `limit` names in a bounded heap |
+| Azure | the continuation marker is opaque and cannot be built from a name, so a page pages through from the prefix, skipping up to the cursor and stopping when full: bounded in memory, but a late page pays for the listing before it |
+| anything else | the default: list every match and sort |
+
+The production store wrapper (`ObjectStores.Metered`) had silently dropped every listing method it did not
+override -- including `listBlobsByPrefixInSortedOrder`, so the capped pattern listing was never capped in
+production -- and `deleteRegisterIfUnchanged`, so **the conditional-delete path of the last round never ran
+in production**: the probe failed on the wrapper's `UnsupportedOperationException` and every node stayed on
+tombstones. Both are delegated now.
+
+Uses: `_list/indices` pages with `size` and `next_token` (core's contract and response shape); prefix
+patterns resolve past one page; `DescriptorStore#listPage` resumes in the listing instead of listing the
+whole container per page; and the orphaned-shard sweep became resumable -- a slice claims up to a budget of
+shard containers by moving a cursor register past them *before* judging any, so racing slices do not
+duplicate work and a restart resumes where the last slice stopped. The background runs one slice of 100
+hourly per node, off the pass. The conformance suite gained the paged walk (every blob once, in order,
+cursor excluded), changes between pages (seen only ahead of the cursor), and paged children skipping the
+cursor's subtree; all pass on the filesystem and on RustFS.
+
+Measured on RustFS 1.0.0 (`ServerlessListingMeasurementTests`), a `_list/indices` walk of **100,000
+indices** in pages of 5,000, end to end through REST: 20 pages, **every page 6 listings and 5,000 GETs**,
+the first and the last alike; p50 2.4 s and max 3.3 s per page. Between two pages a third of the way in, the
+canary created and deleted an index on each side of the cursor: the walk returned every index that existed
+throughout exactly once, the one created ahead of the cursor, and neither the one created behind it nor
+the one deleted ahead of it -- the documented semantics. A walk is not a snapshot.
+
+**Found failing before this work, and still failing.** `ServerlessCostTests#testWhatASearchCosts` (its cold
+search is answered 500, "no node is serving them"; the cause is not yet diagnosed)
+and `#testWhatAGetCosts` (the filesystem's batched-read bound) fail identically on `7bfec04d070`, on the
+filesystem and on MinIO; `ServerlessInstalledPluginTests` fails on Windows because a plugin jar is still open
+when the test directory is removed. None of the three was changed here.
+
+**What it adds to the flat background cost.** The orphan slice, hourly per node: a cursor read and write,
+the pins' two listings, one child listing and at most a descriptor read per index among 100 containers --
+about 105 requests per node-hour at worst, independent of the population. Measured with
+`ServerlessScaleMeasurementTests` on RustFS 1.0.0 after this work: **1,016 requests per node-hour at both
+10,000 and 100,000 indices** (1,007 before), the nine extra being the slice over the test's eight shard
+containers.
 
 **Still open, in the order the cost model ranks them:** the per-shard head poll above, which needs a signal
 carrying evidence of ownership rather than a cheaper timer; and the sweeps that still walk the whole

@@ -630,6 +630,35 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         }
     }
 
+    /**
+     * {@code StartAfter} and {@code MaxKeys} on the listing itself: nothing before the cursor is read, and a
+     * page of up to a thousand names is one request.
+     */
+    @Override
+    public List<BlobMetadata> listBlobsByPrefix(@Nullable String blobNamePrefix, @Nullable String startAfter, int limit)
+        throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        if (limit == 0) {
+            return new ArrayList<>();
+        }
+        final String prefix = blobNamePrefix == null ? keyPath : buildKey(blobNamePrefix);
+        ListObjectsV2Request request = listObjectsRequest(prefix, limit);
+        if (startAfter != null) {
+            request = request.toBuilder().startAfter(buildKey(startAfter)).build();
+        }
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            final List<BlobMetadata> blobs = executeListing(clientReference, request, limit).stream()
+                .flatMap(listing -> listing.contents().stream())
+                .map(s3Object -> (BlobMetadata) new PlainBlobMetadata(s3Object.key().substring(keyPath.length()), s3Object.size()))
+                .collect(Collectors.toList());
+            return new ArrayList<>(blobs.subList(0, Math.min(limit, blobs.size())));
+        } catch (final Exception e) {
+            throw new IOException("Exception when listing blobs by prefix [" + prefix + "] after [" + startAfter + "]", e);
+        }
+    }
+
     @Override
     public Map<String, BlobMetadata> listBlobsByPrefix(@Nullable String blobNamePrefix) throws IOException {
         String prefix = blobNamePrefix == null ? keyPath : buildKey(blobNamePrefix);
@@ -669,6 +698,46 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 .collect(Collectors.toMap(Function.identity(), name -> blobStore.blobContainer(path().add(name))));
         } catch (final SdkException e) {
             throw new IOException("Exception when listing children of [" + path().buildAsString() + ']', e);
+        }
+    }
+
+    /**
+     * The delimited listing resumed with {@code StartAfter} just past the cursor's subtree: every key under
+     * {@code <name>/} sorts before {@code <name>0}, since {@code '0'} follows {@code '/'}, and every later
+     * child's prefix sorts after it.
+     */
+    @Override
+    public Map<String, BlobContainer> children(@Nullable String startAfter, int limit) throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit should not be a negative value");
+        }
+        final Map<String, BlobContainer> page = new java.util.LinkedHashMap<>();
+        if (limit == 0) {
+            return page;
+        }
+        ListObjectsV2Request request = listObjectsRequest(keyPath).toBuilder().maxKeys(Math.min(limit, 1000)).build();
+        if (startAfter != null) {
+            request = request.toBuilder().startAfter(keyPath + startAfter + "0").build();
+        }
+        final ListObjectsV2Request listing = request;
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            AccessController.doPrivileged(() -> {
+                for (ListObjectsV2Response response : clientReference.get().listObjectsV2Paginator(listing)) {
+                    for (CommonPrefix commonPrefix : response.commonPrefixes()) {
+                        final String name = commonPrefix.prefix().substring(keyPath.length(), commonPrefix.prefix().length() - 1);
+                        if (name.isEmpty()) {
+                            continue;
+                        }
+                        page.put(name, blobStore.blobContainer(path().add(name)));
+                        if (page.size() >= limit) {
+                            return;
+                        }
+                    }
+                }
+            });
+            return page;
+        } catch (final SdkException e) {
+            throw new IOException("Exception when listing children of [" + path().buildAsString() + "] after [" + startAfter + "]", e);
         }
     }
 

@@ -132,6 +132,7 @@ public final class SearchHandler extends BaseRestHandler {
         // Read here as well as in plan(): plan runs after this method returns, and BaseRestHandler checks
         // for unread parameters in between.
         request.param("pit");
+        request.param("allow_partial_activation");
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
@@ -272,6 +273,9 @@ public final class SearchHandler extends BaseRestHandler {
             );
         }
         final boolean failOnPartial = Boolean.FALSE.equals(searchRequest.allowPartialSearchResults());
+        // Its own opt-in, not allow_partial_search_results: that defaults to true, and a search wider than
+        // the activation budget must be refused unless the caller asked, in so many words, for part of it.
+        final SearchFanout.Options fanoutOptions = new SearchFanout.Options(request.paramAsBoolean("allow_partial_activation", false));
         // Two more core parses into the request and nothing here reads: cancel_after_time_interval cancels
         // a task, and a search here is not a task -- each shard's query is bounded by the request's own
         // timeout and the fan-out's own deadline, which are the bounds that exist; phase_took asks for
@@ -477,7 +481,8 @@ public final class SearchHandler extends BaseRestHandler {
                     counting,
                     request,
                     failOnPartial,
-                    postProcess
+                    postProcess,
+                    fanoutOptions
                 );
             } catch (Exception e) {
                 try {
@@ -615,7 +620,9 @@ public final class SearchHandler extends BaseRestHandler {
         // What each pattern matched, so a name that came from a pattern can be told from one the caller
         // typed. The distinction decides what a missing index means: a named index that is not there is a
         // mistake, and a pattern is a filter over what exists rather than an assertion that anything does.
-        final java.util.List<String> names = new java.util.ArrayList<>();
+        // Ordered and de-duplicated in one structure: a list's contains() made a five-thousand-name pattern
+        // quadratic before a single register was read.
+        final java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
         final java.util.Set<String> fromPattern = new java.util.HashSet<>();
         for (String name : requested) {
             if (isPrefixPattern(name) == false) {
@@ -630,9 +637,7 @@ public final class SearchHandler extends BaseRestHandler {
                 return Resolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             }
             for (String match : matched) {
-                if (names.contains(match) == false) {
-                    names.add(match);
-                }
+                names.add(match);
                 fromPattern.add(match);
             }
         }
@@ -659,6 +664,14 @@ public final class SearchHandler extends BaseRestHandler {
                 return Resolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + name + "]");
             }
         }
+        // Every name's resolution at once, through the fan-out, before the loop below reads them in order: one
+        // register read per name was a serial chain as long as the pattern was wide -- five thousand round trips
+        // before the first shard was asked. Each read lands in the routing cache the loop then reads from.
+        final java.util.Map<String, org.opensearch.serverless.metadata.DescriptorStore.Resolution> prefetched = prefetch(
+            serving,
+            metadata,
+            names
+        );
         final java.util.LinkedHashMap<String, IndexDescriptor> indices = new java.util.LinkedHashMap<>();
         final java.util.List<String> skipped = new java.util.ArrayList<>();
         // Pattern matches that belong to a plugin, left out of the answer and out of every message.
@@ -671,7 +684,8 @@ public final class SearchHandler extends BaseRestHandler {
             // Through the routing cache: this was a register read per named index on every search. A stale
             // resolution routes to a shard that refuses to answer for a deleted incarnation; see
             // MetadataPlane#resolveForRouting.
-            final var resolved = metadata.resolveForRouting(name);
+            final org.opensearch.serverless.metadata.DescriptorStore.Resolution early = prefetched.get(name);
+            final var resolved = early != null ? early : metadata.resolveForRouting(name);
             if (resolved.absent()) {
                 if (fromPattern.contains(name)) {
                     // A name the listing returned and the register does not describe: a tombstone left by
@@ -1007,6 +1021,32 @@ public final class SearchHandler extends BaseRestHandler {
         );
     }
 
+    /** Resolves many names concurrently; a name whose read failed is left for the caller to read and fail on. */
+    private static java.util.Map<String, org.opensearch.serverless.metadata.DescriptorStore.Resolution> prefetch(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        java.util.Collection<String> names
+    ) {
+        final java.util.Map<String, org.opensearch.serverless.metadata.DescriptorStore.Resolution> resolved =
+            new java.util.concurrent.ConcurrentHashMap<>();
+        if (names.size() < 2) {
+            return resolved;
+        }
+        final java.util.List<java.util.concurrent.Callable<Void>> reads = new java.util.ArrayList<>();
+        for (String name : names) {
+            reads.add(() -> {
+                resolved.put(name, metadata.resolveForRouting(name));
+                return null;
+            });
+        }
+        try {
+            Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchFanoutConcurrency(), reads);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return resolved;
+    }
+
     private void respond(
         org.opensearch.rest.RestChannel channel,
         ServerlessNode serving,
@@ -1017,12 +1057,18 @@ public final class SearchHandler extends BaseRestHandler {
         boolean counting,
         org.opensearch.core.xcontent.ToXContent.Params params,
         boolean failOnPartial,
-        java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess
+        java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess,
+        SearchFanout.Options fanoutOptions
     ) throws IOException {
         final long startNanos = System.nanoTime();
         // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
         // fan-out rather than going through ShardOperations, so the gate has to meet it where it works.
-        final var outcome = gated(serving, indices.keySet(), source, admitted -> SearchFanout.run(serving, metadata, indices, admitted));
+        final var outcome = gated(
+            serving,
+            indices.keySet(),
+            source,
+            admitted -> SearchFanout.run(serving, metadata, indices, admitted, fanoutOptions)
+        );
         render(channel, skipped, outcome, source, tookMillis(startNanos), counting, null, params, failOnPartial, postProcess);
     }
 
@@ -1087,7 +1133,7 @@ public final class SearchHandler extends BaseRestHandler {
             null,
             outcome.shards(),
             outcome.answered(),
-            0,
+            outcome.skipped(),
             tookMillis,
             outcome.failures().toArray(new org.opensearch.action.search.ShardSearchFailure[0]),
             org.opensearch.action.search.SearchResponse.Clusters.EMPTY,

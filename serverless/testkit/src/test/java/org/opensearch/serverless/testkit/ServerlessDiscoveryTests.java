@@ -141,7 +141,7 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
     }
 
     /**
-     * The bare forms answer under the cap and are refused past it, rather than truncating.
+     * The bare forms answer under the cap; past it {@code _cat/indices} is refused and {@code _list/indices} pages.
      *
      * <p>They used to be refused outright as enumeration. That was stricter than the machinery needed:
      * an empty prefix is the same one bounded listing every other prefix takes, capped and refusing past
@@ -175,22 +175,74 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
             call("PUT", "/logs-b", "{\"settings\":{\"number_of_shards\":1}}");
             call("PUT", "/other", "{\"settings\":{\"number_of_shards\":1}}");
 
-            for (String path : new String[] { "/_list/indices", "/_cat/indices" }) {
-                final Answer refused = call("GET", path + "?format=json", null);
-                assertEquals(path + " must refuse past the cap: " + refused.body(), 400, refused.status());
-                assertFalse("and must not answer partially: " + refused.body(), refused.has("logs-a"));
-            }
+            final Answer refused = call("GET", "/_cat/indices?format=json", null);
+            assertEquals("_cat/indices must refuse past the cap: " + refused.body(), 400, refused.status());
+            assertFalse("and must not answer partially: " + refused.body(), refused.has("logs-a"));
+
+            // _list/indices is a walk, so the cap does not bound it: two pages of two.
+            final Answer first = call("GET", "/_list/indices?format=json&size=2", null);
+            assertEquals(first.body(), 200, first.status());
+            assertTrue(first.body(), first.has("logs-a") && first.has("logs-b") && first.has("other") == false);
+            final String token = nextToken(first.body());
+            assertNotNull("a full page carries a token: " + first.body(), token);
+            final Answer second = call("GET", "/_list/indices?format=json&size=2&next_token=" + token, null);
+            assertEquals(second.body(), 200, second.status());
+            assertTrue(second.body(), second.has("other") && second.has("logs-a") == false);
+            assertNull("the last page carries none: " + second.body(), nextToken(second.body()));
         }
     }
 
-    /** A cursor is still refused, and still names the primitive core does not expose. */
-    public void testACursorIsRefusedRatherThanSilentlyRestartingTheWalk() throws Exception {
+    private static String nextToken(String json) {
+        final java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"next_token\":\"([^\"]+)\"").matcher(json);
+        return m.find() ? m.group(1) : null;
+    }
+
+    /**
+     * A walk by {@code next_token}: every index once, in name order, and a token that is not this walk's is
+     * refused rather than silently restarting it.
+     */
+    public void testListIndicesWalksAPrefixByToken() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = running(plane(clock, createTempDir()), "list-cursor")) {
             assertNotNull(node);
-            final Answer token = call("GET", "/_list/indices/logs-*?next_token=abc", null);
-            assertEquals(token.body(), 501, token.status());
-            assertTrue("naming the missing primitive: " + token.body(), token.has("start-after"));
+            for (String name : new String[] { "logs-c", "logs-d", "logs-e" }) {
+                call("PUT", "/" + name, "{\"settings\":{\"number_of_shards\":1}}");
+            }
+            final java.util.List<String> walked = new java.util.ArrayList<>();
+            String token = null;
+            int pages = 0;
+            do {
+                final Answer page = call(
+                    "GET",
+                    "/_list/indices/logs-*?format=json&size=2" + (token == null ? "" : "&next_token=" + token),
+                    null
+                );
+                assertEquals(page.body(), 200, page.status());
+                final java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"index\":\"([^\"]+)\"").matcher(page.body());
+                while (m.find()) {
+                    walked.add(m.group(1));
+                }
+                token = nextToken(page.body());
+                assertTrue("five indices cannot take this many pages", ++pages <= 3);
+            } while (token != null);
+            assertEquals(java.util.List.of("logs-a", "logs-b", "logs-c", "logs-d", "logs-e"), walked);
+
+            // Text carries the token as core does, on a trailing line.
+            final Answer text = call("GET", "/_list/indices/logs-*?size=2", null);
+            assertTrue(text.body(), text.has("next_token "));
+
+            final Answer tainted = call("GET", "/_list/indices/logs-*?next_token=not-a-token", null);
+            assertEquals(tainted.body(), 400, tainted.status());
+            assertTrue(tainted.body(), tainted.has("tainted"));
+
+            // A token from one prefix is not a cursor into another.
+            final String logsToken = nextToken(call("GET", "/_list/indices/logs-*?format=json&size=1", null).body());
+            final Answer crossed = call("GET", "/_list/indices/other*?next_token=" + logsToken, null);
+            assertEquals(crossed.body(), 400, crossed.status());
+
+            assertEquals(400, call("GET", "/_list/indices/logs-*?size=0", null).status());
+            assertEquals(400, call("GET", "/_list/indices/logs-*?size=5001", null).status());
+            assertEquals("_cat/indices is not a walk", 400, call("GET", "/_cat/indices/logs-*?next_token=" + logsToken, null).status());
         }
     }
 
@@ -214,7 +266,7 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
                 call("PUT", "/" + name, "{\"settings\":{\"number_of_shards\":1}}");
             }
 
-            final Answer refused = call("GET", "/_list/indices/logs-*", null);
+            final Answer refused = call("GET", "/_cat/indices/logs-*", null);
             assertEquals("three matches against a cap of two must refuse: " + refused.body(), 400, refused.status());
             assertTrue("as too_many_indices: " + refused.body(), refused.has("too_many_indices"));
 
@@ -225,7 +277,7 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
 
             // A prefix inside the cap still answers, which is what makes the refusal a bound rather than a
             // blanket rejection of patterns.
-            final Answer narrow = call("GET", "/_list/indices/logs-a*?format=json", null);
+            final Answer narrow = call("GET", "/_cat/indices/logs-a*?format=json", null);
             assertEquals(narrow.body(), 200, narrow.status());
             assertTrue(narrow.body(), narrow.has("logs-a"));
         }

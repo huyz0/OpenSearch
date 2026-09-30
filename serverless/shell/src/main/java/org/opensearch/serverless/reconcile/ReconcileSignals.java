@@ -70,4 +70,19 @@ public interface ReconcileSignals {
      * @param shardNumber the shard
      */
     void ownershipDoubted(String indexName, int shardNumber);
+
+    /**
+     * Asks for a shard nobody owns to be taken by this node now, because a request for it is waiting.
+     *
+     * <p>Where a scheduler is running this is the same single-flight activation every pass uses, and the
+     * caller may wait on it; without one, it is only the doubt, and the answer is that nothing was taken.
+     *
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @return the shard once open here, or empty if this node did not take it
+     */
+    default java.util.concurrent.CompletableFuture<java.util.Optional<ShardId>> activate(String indexName, int shardNumber) {
+        ownershipDoubted(indexName, shardNumber);
+        return java.util.concurrent.CompletableFuture.completedFuture(java.util.Optional.empty());
+    }
 }

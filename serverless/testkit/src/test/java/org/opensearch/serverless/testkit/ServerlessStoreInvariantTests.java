@@ -157,6 +157,116 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
     }
 
     /**
+     * The orphan sweep in slices: each slice resumes from the persisted cursor -- across a restart, since the
+     * cursor is a register and not the collector's memory -- a cycle collects every orphan and nothing live,
+     * and the cursor then starts over.
+     */
+    public void testTheOrphanSweepResumesFromItsCursorAcrossARestartAndCompletesACycle() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final BlobPath base = BlobPath.cleanPath();
+        final MetadataPlane plane = planeOver(store, clock);
+        final java.util.Set<String> live = new java.util.TreeSet<>();
+        final java.util.Set<String> orphans = new java.util.TreeSet<>();
+        for (int i = 0; i < 7; i++) {
+            final String name = "idx-" + i;
+            final String uuid = "uuid-" + name + "-current";
+            plane.createIndex(new IndexDescriptor(name, uuid, 1, MAPPING, null));
+            write(store.blobContainer(RegisterMap.shardData(base, name, uuid, 0).add("t=1")), "_0.cfs", "live");
+            live.add(name + "#" + uuid + "#0");
+            // And a leftover of an earlier incarnation of the same name.
+            final String old = "uuid-" + name + "-previous";
+            write(store.blobContainer(RegisterMap.shardData(base, name, old, 0).add("t=1")), "_0.cfs", "orphaned");
+            orphans.add(name + "#" + old + "#0");
+        }
+
+        final int budget = randomIntBetween(1, 5);
+        final java.util.Set<String> collected = new java.util.TreeSet<>();
+        int slices = 0;
+        GarbageCollector.OrphanSlice slice;
+        do {
+            // A fresh collector every slice: what it resumes from is the store's, not its own.
+            slice = new GarbageCollector(store, base).collectOrphanedShards(plane, budget);
+            assertTrue("a slice visits at most its budget", slice.visited() <= budget);
+            assertTrue("an uncontended slice moves the cursor", slice.advanced());
+            collected.addAll(slice.deleted());
+            assertTrue("fourteen containers cannot take this many slices", ++slices <= 20);
+        } while (slice.wrapped() == false);
+
+        assertEquals("one cycle collects every orphan", orphans, collected);
+        for (String container : live) {
+            final String[] parts = container.split("#");
+            assertTrue(
+                "and leaves every live shard: " + container,
+                store.blobContainer(RegisterMap.shardData(base, parts[0], parts[1], 0).add("t=1")).blobExists("_0.cfs")
+            );
+        }
+        final GarbageCollector.OrphanSlice next = new GarbageCollector(store, base).collectOrphanedShards(plane, budget);
+        assertTrue("the next cycle starts over, finding nothing left to collect", next.deleted().isEmpty());
+        assertTrue("from the beginning", next.visited() > 0);
+    }
+
+    /**
+     * Two slices racing over one cursor: both read it, one claims the slice by moving it, and only that one
+     * judges and deletes. The loser does nothing, and the next slice starts where the winner's stopped.
+     */
+    public void testRacingOrphanSlicesMoveTheCursorOnce() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore fs = new FsBlobStore(1024, createTempDir(), false);
+        final BlobPath base = BlobPath.cleanPath();
+        final MetadataPlane plane = planeOver(fs, clock);
+        for (int i = 0; i < 4; i++) {
+            write(fs.blobContainer(RegisterMap.shardData(base, "a-gone-" + i, "uuid-gone-" + i, 0).add("t=1")), "_0.cfs", "orphaned");
+        }
+        // Both slices have read the cursor before either writes it.
+        final java.util.concurrent.CyclicBarrier bothRead = new java.util.concurrent.CyclicBarrier(2);
+        final org.opensearch.common.blobstore.BlobStore gated = new org.opensearch.common.blobstore.BlobStore() {
+            @Override
+            public org.opensearch.common.blobstore.BlobContainer blobContainer(BlobPath path) {
+                final org.opensearch.common.blobstore.BlobContainer inner = fs.blobContainer(path);
+                return new DelegatingBlobContainer(inner) {
+                    @Override
+                    public java.util.Optional<org.opensearch.common.blobstore.BlobRegister> readRegister(String blobName)
+                        throws java.io.IOException {
+                        final var read = super.readRegister(blobName);
+                        if (GarbageCollector.ORPHAN_CURSOR.equals(blobName)) {
+                            try {
+                                bothRead.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                            } catch (Exception e) {
+                                throw new AssertionError(e);
+                            }
+                        }
+                        return read;
+                    }
+                };
+            }
+
+            @Override
+            public void close() {}
+        };
+        final java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            final var a = pool.submit(() -> new GarbageCollector(gated, base).collectOrphanedShards(plane, 2));
+            final var b = pool.submit(() -> new GarbageCollector(gated, base).collectOrphanedShards(plane, 2));
+            final GarbageCollector.OrphanSlice first = a.get(30, java.util.concurrent.TimeUnit.SECONDS);
+            final GarbageCollector.OrphanSlice second = b.get(30, java.util.concurrent.TimeUnit.SECONDS);
+            assertTrue("exactly one slice moves the cursor", first.advanced() ^ second.advanced());
+            final GarbageCollector.OrphanSlice winner = first.advanced() ? first : second;
+            final GarbageCollector.OrphanSlice loser = first.advanced() ? second : first;
+            assertEquals(List.of("a-gone-0#uuid-gone-0#0", "a-gone-1#uuid-gone-1#0"), winner.deleted());
+            assertTrue("the loser judges nothing", loser.deleted().isEmpty() && loser.visited() == 0);
+        } finally {
+            pool.shutdownNow();
+        }
+        final GarbageCollector.OrphanSlice rest = new GarbageCollector(fs, base).collectOrphanedShards(plane, 2);
+        assertEquals(
+            "the next slice starts where the winner stopped",
+            List.of("a-gone-2#uuid-gone-2#0", "a-gone-3#uuid-gone-3#0"),
+            rest.deleted()
+        );
+    }
+
+    /**
      * A freeze in progress stops the sweep, so the commit it is about to freeze cannot be swept first.
      *
      * <p><b>The window.</b> Freezing reads one manifest per shard and only then writes the record. Until
