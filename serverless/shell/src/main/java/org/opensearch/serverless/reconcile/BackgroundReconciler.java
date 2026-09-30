@@ -10,6 +10,7 @@ package org.opensearch.serverless.reconcile;
 
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
 
 import java.io.Closeable;
@@ -316,8 +317,9 @@ public final class BackgroundReconciler implements Closeable {
                     // most likely -- but a manifest read that came back empty is not proof of that on its
                     // own, so the descriptor decides: gone too, and the reader is let go with the records
                     // this node kept of it; still there, and the next search will say what is true.
-                    if (plane.describe(shardId.getIndexName()).isEmpty()) {
-                        node.reconciler().releaseShard(shardId, "its index has been deleted");
+                    if (plane.describe(shardId.getIndexName()).isEmpty()
+                        && node.reconciler()
+                            .releaseReader(shardId, opened.get(), "its index has been deleted") == ShardReconciler.ReaderRelease.RELEASED) {
                         node.forgetReader(shardId);
                         stale.add(shardId);
                     }
@@ -326,7 +328,17 @@ public final class BackgroundReconciler implements Closeable {
                 if (sameCommit(opened.get(), current.get())) {
                     continue;
                 }
-                node.reconciler().releaseShard(shardId, "the commit it was serving has been superseded");
+                // Only if it is still the reader judged above. The manifest read is a round trip, and a write during
+                // it can make this node the shard's writer under the same id: closing that would leave its head
+                // naming a node with nothing open, answering "retry" for as long as the node lives.
+                if (node.reconciler()
+                    .releaseReader(
+                        shardId,
+                        opened.get(),
+                        "the commit it was serving has been superseded"
+                    ) != ShardReconciler.ReaderRelease.RELEASED) {
+                    continue;
+                }
                 // And the node's own record of serving it, or a search node that cycles through readers
                 // carries every one it ever opened into every reader open for the rest of its life.
                 node.forgetReader(shardId);
@@ -993,11 +1005,20 @@ public final class BackgroundReconciler implements Closeable {
      */
     private boolean letGo(ShardId shardId, String reason) {
         try {
-            if (node.reconciler().readerShards().contains(shardId)) {
-                // A reader holds no head and no claim on anything. Closing it loses nothing at all.
-                node.reconciler().releaseShard(shardId, reason);
-                node.forgetReader(shardId);
-                return true;
+            // A reader holds no head and no claim on anything, so closing it loses nothing -- decided and done in one
+            // step, because a reader that has become this node's writer since the caller chose it holds a head and
+            // must go the writer's way below.
+            switch (node.reconciler().releaseReader(shardId, null, reason)) {
+                case RELEASED -> {
+                    node.forgetReader(shardId);
+                    return true;
+                }
+                case BUSY -> {
+                    return false;
+                }
+                case NOT_A_READER -> {
+                    // A writer: below.
+                }
             }
             // Under the shard's fence, from before the publish until after the close. A write that has
             // applied to the engine and is about to append to the log holds the other side of that fence;
@@ -1034,7 +1055,8 @@ public final class BackgroundReconciler implements Closeable {
         // And never for a shard whose log could not be appended to: its engine holds an operation the
         // log does not, and publishing would make the refusal the caller was given a lie. A successor
         // rebuilds it from the log, which is the state the caller was told about.
-        final boolean unchanged = maxSeqNo < 0 || maxSeqNo == lastPublishedMaxSeqNo.getOrDefault(shardId, -1L);
+        // Unchanged only if the last publish's commit covered every operation this shard has: see #publish.
+        final boolean unchanged = maxSeqNo < 0 || maxSeqNo <= lastPublishedMaxSeqNo.getOrDefault(shardId, -1L);
         if (unchanged == false && node.isWriteFenced(shardId) == false) {
             synchronized (publishLock(shardId)) {
                 node.publishShard(shardId, head.get().term());
@@ -1320,6 +1342,26 @@ public final class BackgroundReconciler implements Closeable {
         }
     }
 
+    /**
+     * Whether the shard's head already names this node, for a shard it does not have open.
+     *
+     * <p>Such a shard is not a new one competing for room: it is this node's already, every peer forwards to it,
+     * and nobody else can take it while this node's lease is live. Refusing it at the cap left it answering
+     * "acquiring, retry" for as long as the node lived -- the fleet run found one holding an acknowledged write
+     * nobody replayed. Giving the head back instead would free it with its published commit behind its log, and a
+     * shard nobody owns is read from that commit. So it is opened, over the cap if it must be; the next eviction
+     * brings the node back under it the proper way, publishing before it lets go.
+     */
+    private boolean headNamesThisNode(String indexName, int shard) {
+        try {
+            final var head = plane.heads().read(indexName, shard);
+            return head.isPresent() && node.localNode().getId().equals(head.get().ownerNodeId());
+        } catch (Exception e) {
+            logger.warn("could not read the head of " + indexName + "[" + shard + "] at the cap; treating it as not ours", e);
+            return false;
+        }
+    }
+
     /** How many shards a node activates at once by default. */
     public static final int DEFAULT_ACTIVATION_CONCURRENCY = 8;
 
@@ -1357,7 +1399,9 @@ public final class BackgroundReconciler implements Closeable {
                 final boolean full = open == null && node.reconciler().heldShards().size() + capReserved >= maxShardsHeld;
                 // makeRoom answers for what is held, not for what is reserved, so the reservations are counted
                 // again after it: room it made may already be spoken for.
-                if (full && (makeRoom() == false || node.reconciler().heldShards().size() + capReserved >= maxShardsHeld)) {
+                if (full
+                    && (makeRoom() == false || node.reconciler().heldShards().size() + capReserved >= maxShardsHeld)
+                    && headNamesThisNode(indexName, shard) == false) {
                     // Refusing is a routing outcome, not an error. Saying so is the difference between a
                     // node that is full and a node that is broken, and only one of them should page anyone.
                     logger.info(
@@ -1469,7 +1513,13 @@ public final class BackgroundReconciler implements Closeable {
                 continue;
             }
             final long maxSeqNo = shard.seqNoStats().getMaxSeqNo();
-            if (maxSeqNo < 0 || maxSeqNo == lastPublishedMaxSeqNo.getOrDefault(shardId, -1L)) {
+            // What the commit about to be flushed is certain to hold: every operation at or below the processed
+            // checkpoint, read before the flush. Not the highest sequence number assigned -- an operation can be
+            // assigned one and still be on its way into the index when the flush commits, and recording its
+            // number as published let a later release skip the publish that would have carried it, leaving an
+            // acknowledged write readable only after someone replayed the log.
+            final long covered = shard.seqNoStats().getLocalCheckpoint();
+            if (maxSeqNo < 0 || maxSeqNo <= lastPublishedMaxSeqNo.getOrDefault(shardId, -1L)) {
                 // Nothing new. Publishing anyway would flush a fresh commit and upload it every tick,
                 // forever, on an idle shard -- an object-store bill for saying nothing happened. This
                 // guard stays on the edge path too: a spurious mark must not become an upload.
@@ -1517,18 +1567,18 @@ public final class BackgroundReconciler implements Closeable {
                 dirty.add(shardId);
                 continue;
             }
-            lastPublishedMaxSeqNo.put(shardId, maxSeqNo);
+            lastPublishedMaxSeqNo.put(shardId, covered);
             published.add(shardId);
         }
         return published;
     }
 
     /**
-     * Returns the highest sequence number this node has published for a shard, for the stats endpoint's
-     * publish-lag figure.
+     * Returns the sequence number up to which this node's last publish of a shard is certain to have carried
+     * every operation, for the stats endpoint's publish-lag figure.
      *
      * @param shardId the shard
-     * @return the sequence number the last publish from this node covered, or empty if it has never
+     * @return the processed checkpoint read before the last publish's flush, or empty if this node has never
      *         published the shard
      */
     public java.util.OptionalLong lastPublishedMaxSeqNo(ShardId shardId) {

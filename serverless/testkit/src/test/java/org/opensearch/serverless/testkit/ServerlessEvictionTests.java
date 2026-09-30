@@ -90,6 +90,54 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A full node that the head already names, for a shard it has not opened, opens it anyway.
+     *
+     * <p>That head is the one state nobody else can resolve: the owner's lease is live, so every peer forwards to
+     * it, and it answered "acquiring, retry" -- refused at the cap for as long as the node lived. The fleet run found
+     * one holding an acknowledged write in the log that nobody replayed. Giving the head back would free the shard
+     * with its commit behind its log, and a shard nobody owns is read from that commit; so the node serves it, over
+     * the cap if need be, and lets the next eviction bring it back under the proper way.
+     */
+    public void testAFullNodeServesAHeadThatAlreadyNamesIt() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("busy", "uuid-busy-0000000000", 1, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("named", "uuid-named-000000000", 1, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("other", "uuid-other-000000000", 1, MAPPING, null));
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-unserved"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
+                .setMaxShardsHeld(1)
+                .setEvictAfterMillis(30_000L);
+            loop.activateOnDemand(List.of(Map.entry("busy", 0)));
+            assertTrue("the fixture needs the node full with a shard in use", holds(node, "busy"));
+
+            // A shard nobody names is still refused: the cap still means something.
+            assertTrue("a new shard is refused at the cap", loop.activateForRequest("other", 0).get().isEmpty());
+
+            // The head names this node for a shard it does not have open: what a writer closed without its head
+            // leaves behind.
+            final long named = plane.activate(
+                "named",
+                0,
+                node.localNode().getId(),
+                node.localNode().getEphemeralId(),
+                "uuid-named-000000000"
+            ).head().term();
+            assertFalse(holds(node, "named"));
+
+            assertTrue("a shard whose head names this node is served, cap or not", loop.activateForRequest("named", 0).get().isPresent());
+            assertTrue(holds(node, "named"));
+            assertTrue("without giving up what it had", holds(node, "busy"));
+            final var head = plane.heads().read("named", 0).orElseThrow();
+            assertEquals("still this node's", node.localNode().getId(), head.ownerNodeId());
+            assertTrue("re-taken at a higher term, which fences whatever closed it and replays its log", head.term() > named);
+        }
+    }
+
     /** A node whose shards are all in use refuses, which is a capacity signal rather than thrash. */
     public void testAFullNodeOfBusyShardsRefusesRatherThanThrashing() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000_000L);

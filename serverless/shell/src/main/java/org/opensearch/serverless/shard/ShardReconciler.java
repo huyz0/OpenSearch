@@ -770,13 +770,73 @@ public final class ShardReconciler {
                 );
         // Readers read blocks; they do not download segments. The store type is set here rather than in
         // the descriptor because it is a property of how this node is serving the shard, not of the index.
-        openAndStart(onBlockCache(indexMetadata), shardId, manifest.term(), view.nodes(), false, manifest);
-        readers.add(shardId);
-        // What it is a cache of. A reader never changes commit while it is open -- a ReadOnlyEngine is
-        // opened on one and core offers no way to move it -- so the only way to notice the commit has
-        // moved on is to remember which one this is and compare.
-        readerCommits.put(shardId, manifest);
+        final IndexShard opened = openAndStart(onBlockCache(indexMetadata), shardId, manifest.term(), view.nodes(), false, manifest);
+        synchronized (lifecycle(shardId)) {
+            // Recorded as a reader only if it is still the shard open under this id. A write can take the shard
+            // for this node's writer between the open and here, and a writer recorded as a reader is closed as
+            // one -- by a pass that believes it holds no head -- while its head stays behind.
+            if (open.get(shardId) == opened) {
+                readers.add(shardId);
+                // What it is a cache of. A reader never changes commit while it is open -- a ReadOnlyEngine is
+                // opened on one and core offers no way to move it -- so the only way to notice the commit has
+                // moved on is to remember which one this is and compare.
+                readerCommits.put(shardId, manifest);
+            }
+        }
         return shardId;
+    }
+
+    /** What {@link #releaseReader} did. */
+    public enum ReaderRelease {
+        /** It was a reader, and it is closed. */
+        RELEASED,
+        /** It is a reader and a query is running against it; left open. */
+        BUSY,
+        /** It is not a reader, or not the one the caller judged: nothing was touched. */
+        NOT_A_READER
+    }
+
+    /**
+     * Closes a shard only if it is still the reader the caller judged it to be.
+     *
+     * <p><b>Why a reader has a release of its own.</b> A reader and the writer that replaces it on this node share
+     * a {@code ShardId}. A pass that decides a shard is a reader, goes to the store, and then releases by id closes
+     * whatever is open under that id by then -- and a write in between makes that the writer. A writer closed as a
+     * reader keeps its head: the fleet run found one answering "acquiring, retry" for as long as the node lived,
+     * with an acknowledged write in its log that nobody would replay. So the check and the close are one step,
+     * under the lock that registering a reader and every other release take.
+     *
+     * @param shardId the shard
+     * @param servingCommit the commit the caller saw the reader serving, or null for any reader
+     * @param reason why, for the log
+     * @return what happened
+     */
+    public ReaderRelease releaseReader(ShardId shardId, CommitManifest servingCommit, String reason) {
+        synchronized (lifecycle(shardId)) {
+            if (readers.contains(shardId) == false || (servingCommit != null && readerCommits.get(shardId) != servingCommit)) {
+                return ReaderRelease.NOT_A_READER;
+            }
+            return releaseShardLocked(shardId, reason, false) ? ReaderRelease.RELEASED : ReaderRelease.BUSY;
+        }
+    }
+
+    /**
+     * Striped monitors over registering a shard as a reader and releasing it, so "is it a reader" and "close it"
+     * cannot be split by a writer taking its place. Striped rather than one per shard, so a node that has cycled
+     * through a million shards holds 64 objects rather than a million.
+     */
+    private final Object[] lifecycleStripes = newStripes(64);
+
+    private static Object[] newStripes(int count) {
+        final Object[] stripes = new Object[count];
+        for (int i = 0; i < count; i++) {
+            stripes[i] = new Object();
+        }
+        return stripes;
+    }
+
+    private Object lifecycle(ShardId shardId) {
+        return lifecycleStripes[Math.floorMod(shardId.hashCode(), lifecycleStripes.length)];
     }
 
     /** The commit each reader was opened at, so a pass can tell when it has gone stale. */
@@ -1037,6 +1097,12 @@ public final class ShardReconciler {
 
     /** @return true if the shard was released; false if a query is running against it and it was left */
     private boolean releaseShard(ShardId shardId, String reason, boolean deleteStore) {
+        synchronized (lifecycle(shardId)) {
+            return releaseShardLocked(shardId, reason, deleteStore);
+        }
+    }
+
+    private boolean releaseShardLocked(ShardId shardId, String reason, boolean deleteStore) {
         final int busy = inFlight(shardId);
         // Readers only. A writer being released has lost its head, or is about to give it up, and a
         // writer that stays open past that point would go on acknowledging writes nobody will replay; a

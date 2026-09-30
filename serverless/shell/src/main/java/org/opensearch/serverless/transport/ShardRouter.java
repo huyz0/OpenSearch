@@ -492,9 +492,19 @@ public final class ShardRouter {
         return metadata == null ? DEFAULT_FORWARD_TIMEOUT_MILLIS : Math.max(1_000L, metadata.leaseTtlMillis());
     }
 
-    /** Says what this node holds instead of the writer a forward asked for, for the refusal's message. */
+    /**
+     * Says what this node holds instead of the writer a forward asked for, for the refusal's message.
+     *
+     * <p>And doubts its own ownership when it holds no writer at all. The forward came because a head named this
+     * node; if it still does, nothing else will ever open the shard -- peers forward here while this node's lease
+     * is live -- so the doubt's activation re-takes it and replays its log. If the head names someone else, the
+     * activation finds that out and does nothing.
+     */
     private String whyNotHeld(String index, int shard, String indexUuid) {
         final ShardId open = localShard(index, shard);
+        if (open == null || node.reconciler().readerShards().contains(open)) {
+            node.signals().ownershipDoubted(index, shard);
+        }
         if (open == null) {
             return "the shard is not open here";
         }

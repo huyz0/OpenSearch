@@ -169,6 +169,52 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A multi-get over a shard nobody owns answers every item from the published commit.
+     *
+     * <p>Every item of the request needs the same reader, and none is open yet, so they all arrive at an
+     * unopened shard at once. The fleet run found that only one of them opened it: the rest failed
+     * {@code read_failed}, and a client checking its acknowledged writes read that as documents missing.
+     */
+    public void testAMultiGetOverAReleasedShardReadsEveryItem() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("cold", "uuid-cold-0000000000", 1, MAPPING, null));
+        final int documents = 40;
+
+        try (
+            ServerlessNode writer = new ServerlessNode(nodeSettings("mget-writer"));
+            ServerlessNode reader = new ServerlessNode(nodeSettings("mget-reader"))
+        ) {
+            writer.start();
+            reader.start();
+            writer.setMetadataPlane(plane);
+            reader.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
+            loop.want("cold", 0);
+            loop.tick(clock.get());
+            final StringBuilder ids = new StringBuilder("{\"ids\":[");
+            for (int i = 0; i < documents; i++) {
+                assertEquals(201, send(writer, "PUT", "/cold/_doc/d" + i, "{\"msg\":\"doc" + i + "\"}").status());
+                ids.append(i == 0 ? "" : ",").append("\"d").append(i).append('"');
+            }
+            ids.append("]}");
+            loop.stopWanting("cold", 0);
+            loop.publishAll();
+            loop.setIdleAfterMillis(1);
+            // Idleness is judged on the wall clock the node stamps its last use with.
+            assertEquals("the fixture needs the shard let go of", 1, loop.releaseIdle(System.currentTimeMillis() + 60_000L).size());
+            assertNull("and nobody owning it", plane.heads().read("cold", 0).orElseThrow().ownerNodeId());
+
+            final Response got = send(reader, "POST", "/cold/_mget?_source=false", ids.toString());
+            assertEquals(got.body(), 200, got.status());
+            assertFalse("no item may fail for want of a reader another item is opening: " + got.body(), got.body().contains("\"error\""));
+            final List<Boolean> found = foundIn(got.body());
+            assertEquals(got.body(), documents, found.size());
+            assertFalse("every published document is found: " + got.body(), found.contains(false));
+        }
+    }
+
     private MetadataPlane plane(AtomicLong clock) throws java.io.IOException {
         return new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
     }
