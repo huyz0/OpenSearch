@@ -470,10 +470,13 @@ final class FleetLoad implements Closeable {
         return m.find() ? Long.parseLong(m.group(1)) : -1L;
     }
 
+    /** The error types whose reason tells their causes apart: a failed forward, and a 429 from a full queue or budget. */
+    private static final java.util.Set<String> REASONED_TYPES = java.util.Set.of("forward_failed", "rejected_execution_exception");
+
     private static final Pattern ERROR_REASON = Pattern.compile("\"reason\"\\s*:\\s*\"([^\"]{0,400})");
 
     /**
-     * The error's type, and for a failed forward what the forward said, with names and numbers taken out so the
+     * The error's type, and for a failed forward or a 429 what it said, with names and numbers taken out so the
      * reasons group: a type alone was a seventh of all writes in one line, with nothing to tell its causes apart.
      */
     private static String errorType(String body) {
@@ -482,7 +485,7 @@ final class FleetLoad implements Closeable {
             return null;
         }
         final String type = m.group(1);
-        if ("forward_failed".equals(type) == false) {
+        if (REASONED_TYPES.contains(type) == false) {
             return type;
         }
         final Matcher reason = ERROR_REASON.matcher(body);
