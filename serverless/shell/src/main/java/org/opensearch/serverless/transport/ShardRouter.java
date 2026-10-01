@@ -91,19 +91,20 @@ public final class ShardRouter {
     public void registerHandlers() {
         transportService.registerRequestHandler(
             ForwardedIndexRequest.ACTION,
-            ThreadPool.Names.WRITE,
+            // Not WRITE: see FORWARDED_WRITE_POOL for the deadlock that was.
+            org.opensearch.serverless.shell.ServerlessNode.FORWARDED_WRITE_POOL,
             ForwardedIndexRequest::new,
             this::handleIndex
         );
         transportService.registerRequestHandler(
             ForwardedBulkRequest.ACTION,
-            ThreadPool.Names.WRITE,
+            org.opensearch.serverless.shell.ServerlessNode.FORWARDED_WRITE_POOL,
             ForwardedBulkRequest::new,
             this::handleBulk
         );
         transportService.registerRequestHandler(
             ForwardedGetRequest.ACTION,
-            ThreadPool.Names.GET,
+            org.opensearch.serverless.shell.ServerlessNode.FORWARDED_READ_POOL,
             ForwardedGetRequest::new,
             this::handleGet
         );
