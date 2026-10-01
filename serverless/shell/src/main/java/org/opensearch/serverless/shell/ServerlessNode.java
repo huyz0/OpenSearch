@@ -111,6 +111,15 @@ public final class ServerlessNode implements Closeable {
      */
     public static final String FORWARDED_WRITE_POOL = "serverless_forwarded_write";
 
+    /**
+     * The thread a node renews its lease on, and nothing else does.
+     *
+     * <p>A lease that is not renewed in time is a node its peers may take everything from, so renewal cannot wait behind
+     * other work. It ran on GENERIC, and under a burst of activations -- each a few object-store round trips -- renewals
+     * ran late, leases ran out, peers revoked them, and a busy node became a dead one, which made the burst bigger.
+     */
+    public static final String LEASE_POOL = "serverless_lease";
+
     /** The pool a forwarded get is answered on, at its owner: not GET, for the reason {@link #FORWARDED_WRITE_POOL} is not WRITE. */
     public static final String FORWARDED_READ_POOL = "serverless_forwarded_read";
 
@@ -355,6 +364,7 @@ public final class ServerlessNode implements Closeable {
                 10_000,
                 "thread_pool." + FORWARDED_WRITE_POOL
             ),
+            new org.opensearch.threadpool.FixedExecutorBuilder(settings, LEASE_POOL, 1, 16, "thread_pool." + LEASE_POOL),
             new org.opensearch.threadpool.FixedExecutorBuilder(
                 settings,
                 FORWARDED_READ_POOL,
