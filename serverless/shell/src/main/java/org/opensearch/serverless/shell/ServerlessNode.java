@@ -1992,6 +1992,28 @@ public final class ServerlessNode implements Closeable {
     /** How many indices a prefix pattern must match before a search reads its group's digest rollups. */
     public static final int DEFAULT_ROLLUP_MIN_INDICES = 32;
 
+    /**
+     * Whether a prefix pattern long enough to name one rollup group is resolved from the group's entries rather
+     * than by listing every name under the prefix. On by default: a listing costs a page per thousand names, and a
+     * store holding a million under one prefix times out before the first page.
+     *
+     * @return true to resolve from the rollups
+     */
+    public boolean resolveFromRollups() {
+        return settings.getAsBoolean("serverless.search.resolve_from_rollups", true);
+    }
+
+    /**
+     * How old this node's copy of a rollup group may be and still resolve a pattern. Zero by default -- the group
+     * is read for every search -- because a copy that predates an index's activation leaves the index off the
+     * search, and a search on its owner would otherwise have seen its refreshed documents. A deployment that
+     * accepts that window for fewer reads can set it.
+     *
+     * @return the age in milliseconds; zero to read the group every time
+     */
+    public long rollupCacheMillis() {
+        return Math.max(0L, settings.getAsLong("serverless.search.rollup.cache_millis", 0L));
+    }
 
     /**
      * How many indices a pattern must match before the digest rollups are consulted: below it, the per-index

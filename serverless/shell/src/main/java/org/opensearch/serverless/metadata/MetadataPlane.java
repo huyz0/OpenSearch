@@ -552,6 +552,8 @@ public final class MetadataPlane {
         org.opensearch.serverless.cluster.AliasRecord alias,
         long expectedGeneration
     ) throws IOException {
+        // An alias created before aliases were entered gains its entry on its next update.
+        rollups.markAlias(alias.name());
         // Which indices this alias named before, so the ones it stops naming can be told.
         final java.util.List<String> previously = before == null ? java.util.List.of() : before.indices();
         for (String index : alias.indices()) {
@@ -584,6 +586,9 @@ public final class MetadataPlane {
      * @throws IOException if a descriptor or the alias register cannot be written
      */
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
+        // Entered first: a pattern resolved from the rollups finds the alias, and a crash between the two writes
+        // leaves an entry with no alias behind it, which costs a search one absent read and nothing else.
+        rollups.markAlias(alias.name());
         // The hint before the truth: an index that lists an alias which was never created over-approximates
         // and is filtered on read; an alias that exists and is listed nowhere would be invisible to the
         // reverse question, which is the failure this ordering prevents.

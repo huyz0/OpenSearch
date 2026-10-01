@@ -280,6 +280,10 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
             assertEquals("three indices with a cap of three must be searched: " + atTheCap.body(), 200, atTheCap.status());
 
             plane.createIndex(new IndexDescriptor("logs-d", "uuid-logs-d-0000000", 1, MAPPING, null));
+            // Written to, so it can hold something a search must find: an index nobody has written holds nothing,
+            // and a pattern resolved from the rollups does not count it.
+            hold(node, plane, clock, 1, "logs-d");
+            assertEquals(201, send(node, "PUT", "/logs-d/_doc/1?refresh=true", "{\"msg\":\"other\",\"rank\":2}").status());
 
             final Response overTheCap = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match\":{\"msg\":\"shared\"}}}");
             assertEquals("one more than the cap must be refused: " + overTheCap.body(), 400, overTheCap.status());
