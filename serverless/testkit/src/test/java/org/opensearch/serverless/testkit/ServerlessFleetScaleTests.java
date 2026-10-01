@@ -161,8 +161,11 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         load = new FleetLoad(() -> List.copyOf(fleet), ledger, steady, runId);
         try {
             load.start();
-            // Warm: the active set taken, before anything is measured.
-            sleepSeconds(Math.min(60, seconds));
+            // Warm: the active set taken, before anything is measured. Longer on a bucket a crashed run left behind,
+            // whose every active shard names a dead node and is taken with a replay of its whole log.
+            final int warmup = Integer.parseInt(prop("warmup_seconds", Integer.toString(Math.min(60, seconds))));
+            line("- warm-up: " + warmup + " s of load before the first scenario");
+            sleepSeconds(warmup);
             for (String scenario : scenarios) {
                 final long started = System.nanoTime();
                 final int ledgerMark = ledger.writes().size();
@@ -301,7 +304,10 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         final Map<String, String[]> shapes = new LinkedHashMap<>();
         shapes.put("logs-* nothing in range", new String[] { "/logs-*/_search", rangeFrom(now + TimeUnit.DAYS.toMillis(30)) });
         shapes.put("logs-* last minute", new String[] { "/logs-*/_search?allow_partial_activation=true", rangeFrom(now - 60_000L) });
-        shapes.put("logs-00000* last minute", new String[] { "/logs-00000*/_search?allow_partial_activation=true", rangeFrom(now - 60_000L) });
+        shapes.put(
+            "logs-00000* last minute",
+            new String[] { "/logs-00000*/_search?allow_partial_activation=true", rangeFrom(now - 60_000L) }
+        );
         try (
             java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build()
         ) {
@@ -783,7 +789,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                         final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(4 * ttlMillis + 30_000L);
                         List<FleetLedger.Write> still = index.getValue();
                         while (still.isEmpty() == false && System.nanoTime() < deadline) {
-                            load.write(fleet.get(0), index.getKey());
+                            load.write(coordinatorFor(index.getKey()), index.getKey());
                             sleepSeconds(2);
                             still = missingOf(index.getKey(), still, true);
                         }
@@ -804,6 +810,18 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         }
         load.start();
         return new FleetLedger.Verdict(acked, acked - excused, refused, unknown, lost, refusedButVisible, excused);
+    }
+
+    /**
+     * The node the read-back asks about an index, the same one each time and spread over the fleet by name.
+     *
+     * <p>A write to a shard nobody owns is taken by the node it was sent to, so the read-back sending every retry to
+     * one node made that node take every shard being retried: twelve hundred of them, against a cap of four hundred,
+     * and the rest went unread until the budget ran out.
+     */
+    private NodeProcess coordinatorFor(String index) {
+        final List<NodeProcess> nodes = load.inRotation();
+        return nodes.get(Math.floorMod(index.hashCode(), nodes.size()));
     }
 
     private static final Pattern DOC = Pattern.compile("\"_id\":\"([^\"]+)\"[^{}]*?\"found\":(true|false)");
@@ -827,7 +845,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             final Map<String, Boolean> found = new HashMap<>();
             String answer;
             try {
-                answer = load.requestBody(fleet.get(0), "POST", "/" + index + "/_mget?_source=false", body.toString());
+                answer = load.requestBody(coordinatorFor(index), "POST", "/" + index + "/_mget?_source=false", body.toString());
             } catch (IllegalStateException e) {
                 // An index that no longer exists holds none of them.
                 if (e.getMessage().contains("index_not_found")) {
