@@ -97,6 +97,39 @@ public class ServerlessProactiveTakeoverTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A node that has dropped out of a peer's membership view but whose lease is live keeps its shards.
+     *
+     * <p>A view loses a member whose lease read failed or came back late, not only one that died. A fleet run had a
+     * node that had just started hear all five of its live peers "leave", and take their shards.
+     */
+    public void testALiveNodeHeardToLeaveKeepsItsShards() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-0000000000", 1, MAPPING, null));
+        try (
+            ServerlessNode owner = new ServerlessNode(nodeSettings("takeover-live-owner"));
+            ServerlessNode peer = new ServerlessNode(nodeSettings("takeover-live-peer"))
+        ) {
+            owner.start();
+            peer.start();
+            owner.setMetadataPlane(plane);
+            peer.setMetadataPlane(plane);
+            owner.renewLease(plane);
+            peer.renewLease(plane);
+            final BackgroundReconciler ownerLoop = new BackgroundReconciler(owner, plane).setDemandDrivenActivation(true);
+            ownerLoop.activateOnDemand(List.of(Map.entry("alpha", 0)));
+            assertEquals(owner.localNode().getId(), plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
+
+            final BackgroundReconciler loop = new BackgroundReconciler(peer, plane).setDemandDrivenActivation(true);
+            assertTrue("a live lease is reported as live", loop.leaseLiveUntil(owner.localNode().getId()).isPresent());
+            assertTrue("nothing left for later either", loop.takeOverFrom(owner.localNode().getId()).isEmpty());
+            assertTrue("nothing taken from a live node", peer.reconciler().openShards().isEmpty());
+            assertEquals(owner.localNode().getId(), plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
+            assertEquals(1, owner.reconciler().openShards().size());
+        }
+    }
+
     /** A node that left cleanly released its heads: its shards stay dormant rather than being taken by everyone. */
     public void testShardsReleasedCleanlyAreLeftAlone() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

@@ -1385,6 +1385,22 @@ public final class BackgroundReconciler implements Closeable {
         if (demandDriven == false || deadNodeId.equals(node.localNode().getId())) {
             return List.of();
         }
+        // Gone from this node's view is not gone: a view loses a member whose lease read failed, or that it read
+        // late. A fleet run had a node that had just started take shards from all five of its live peers.
+        try {
+            final java.util.OptionalLong liveUntil = leaseLiveUntil(deadNodeId);
+            if (liveUntil.isPresent()) {
+                logger.info(
+                    "node {} left this node's view, but its lease runs {} ms more: its shards stay with it",
+                    deadNodeId,
+                    liveUntil.getAsLong() - plane.clock().getAsLong()
+                );
+                return List.of();
+            }
+        } catch (Exception e) {
+            logger.warn("could not read the lease of departed node " + deadNodeId + "; its shards wait for requests", e);
+            return List.of();
+        }
         final List<Map.Entry<String, Integer>> claims;
         try {
             claims = plane.claimsOf(deadNodeId);
@@ -1422,6 +1438,21 @@ public final class BackgroundReconciler implements Closeable {
             later.size()
         );
         return later;
+    }
+
+    /**
+     * When a node's lease runs out, read from the store rather than from the membership view.
+     *
+     * @param nodeId the node
+     * @return its lease's expiry if the lease exists and has not run out, empty if it is gone or expired
+     * @throws java.io.IOException if the lease cannot be read
+     */
+    public java.util.OptionalLong leaseLiveUntil(String nodeId) throws java.io.IOException {
+        final var lease = plane.membership().read(nodeId);
+        if (lease.isEmpty() || lease.get().isExpiredAt(plane.clock().getAsLong())) {
+            return java.util.OptionalLong.empty();
+        }
+        return java.util.OptionalLong.of(lease.get().expiresAtMillis());
     }
 
     /**
