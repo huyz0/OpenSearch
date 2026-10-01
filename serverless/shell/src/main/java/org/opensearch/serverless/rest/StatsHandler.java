@@ -438,6 +438,16 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("publishes", counts.publishes());
             builder.field("activations", counts.activations());
             builder.field("backstops", counts.backstops());
+            final var queue = scheduler.activationStats();
+            builder.startObject("activation_queue");
+            builder.field("queued", queue.queued());
+            builder.field("running", queue.running());
+            builder.field("done", queue.done());
+            builder.field("wait_millis", queue.waitMillis());
+            builder.field("run_millis", queue.runMillis());
+            builder.field("max_wait_millis", queue.maxWaitMillis());
+            builder.field("max_run_millis", queue.maxRunMillis());
+            builder.endObject();
             builder.endObject();
         }
     }

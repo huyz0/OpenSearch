@@ -1295,17 +1295,63 @@ public final class BackgroundReconciler implements Closeable {
         if (running != null) {
             return running;
         }
+        final long queuedAt = System.nanoTime();
         activationQueue.add(() -> {
+            final long startedAt = System.nanoTime();
+            activationWaitMax.accumulateAndGet(startedAt - queuedAt, Math::max);
             try {
                 mine.complete(activateNow(indexName, shard, onDemand));
             } catch (Throwable t) {
                 mine.completeExceptionally(t);
             } finally {
                 activating.remove(key, mine);
+                final long endedAt = System.nanoTime();
+                activationsDone.incrementAndGet();
+                activationWaitNanos.addAndGet(startedAt - queuedAt);
+                activationRunNanos.addAndGet(endedAt - startedAt);
+                activationRunMax.accumulateAndGet(endedAt - startedAt, Math::max);
             }
         });
         drainActivations();
         return mine;
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong activationsDone = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong activationWaitNanos = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong activationRunNanos = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong activationWaitMax = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong activationRunMax = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * What the activation queue is doing: how many wait, how many run, and how long they have waited and run.
+     *
+     * @param queued activations waiting for a slot
+     * @param running activations running
+     * @param done activations finished since the node started
+     * @param waitMillis their total time in the queue
+     * @param runMillis their total time running
+     * @param maxWaitMillis the longest wait since the last time these were read
+     * @param maxRunMillis the longest run since the last time these were read
+     */
+    public record ActivationStats(int queued, int running, long done, long waitMillis, long runMillis, long maxWaitMillis,
+        long maxRunMillis) {
+    }
+
+    /**
+     * Returns the activation queue's figures, and starts the maxima over.
+     *
+     * @return the figures
+     */
+    public ActivationStats activationStats() {
+        return new ActivationStats(
+            activationQueue.size(),
+            activationsRunning.get(),
+            activationsDone.get(),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationWaitNanos.get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationRunNanos.get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationWaitMax.getAndSet(0L)),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationRunMax.getAndSet(0L))
+        );
     }
 
     /** Starts queued activations while fewer than the bound are running; each one that ends starts the next. */
@@ -1324,7 +1370,8 @@ public final class BackgroundReconciler implements Closeable {
                 continue;
             }
             try {
-                node.threadPool().generic().execute(() -> {
+                // Never GENERIC: what waits for an activation waits there. See ServerlessNode#ACTIVATION_POOL.
+                node.threadPool().executor(org.opensearch.serverless.shell.ServerlessNode.ACTIVATION_POOL).execute(() -> {
                     try {
                         task.run();
                     } finally {
