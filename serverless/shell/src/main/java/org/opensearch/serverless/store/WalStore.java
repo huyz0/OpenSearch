@@ -757,6 +757,27 @@ public final class WalStore {
         return false;
     }
 
+    /**
+     * The highest sequence number of any record in a term or later, or -1 if there is none.
+     *
+     * <p>For a commit that does not record how far into the log it reaches -- one published before that was recorded
+     * -- the precise question costs reading the records rather than listing them: the log keeps the highest record
+     * of a term after a publish, so a listing alone cannot tell a covered record from an uncovered one.
+     *
+     * @param term the commit's term
+     * @return the highest sequence number logged in that term or a later one
+     * @throws IOException if the log cannot be read
+     */
+    public long maxSeqNoFromTerm(long term) throws IOException {
+        final Map<Long, BlobContainer> terms = new TreeMap<>(termsInOrder());
+        terms.keySet().removeIf(t -> t < term);
+        long max = -1L;
+        for (WalRecord record : replayable(null, terms)) {
+            max = Math.max(max, record.seqNo());
+        }
+        return max;
+    }
+
     private Map<Long, BlobContainer> termsInOrder() throws IOException {
         return termsIn(blobStore.blobContainer(shardBase.add("wal")).children());
     }

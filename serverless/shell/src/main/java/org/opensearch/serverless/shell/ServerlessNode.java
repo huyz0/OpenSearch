@@ -2898,9 +2898,20 @@ public final class ServerlessNode implements Closeable {
         }
         // Nobody is writing it -- no owner, a dead one, or this node named with nothing open. The commit has to
         // cover the log on its own. One that does not say how far it reaches covers none of its own term.
-        final long coveredOrdinal = Math.max(0L, commit.walOrdinal());
         final var log = plane.walStore(indexName, shardId.getIndex().getUUID(), shardNumber);
-        if (log.landedPast(commit.term(), coveredOrdinal)) {
+        final boolean behind;
+        if (commit.walOrdinal() >= 0L) {
+            // How far the commit reaches is recorded: a listing answers.
+            behind = log.landedPast(commit.term(), commit.walOrdinal());
+        } else {
+            // Published before that was recorded. Treating such a commit as covering none of its term made every
+            // one ever written look behind -- the log keeps a term's highest record after a publish -- and a fleet
+            // reopened on old manifests took over its whole population on the first searches. The records say.
+            final org.opensearch.index.shard.IndexShard opened = reconciler.shard(shardId);
+            final long committed = opened == null ? -1L : opened.seqNoStats().getMaxSeqNo();
+            behind = log.maxSeqNoFromTerm(commit.term()) > committed;
+        }
+        if (behind) {
             readerChecks.remove(key);
             signals().ownershipDoubted(indexName, shardNumber);
             throw new ShardBehindLogException(indexName, shardNumber);
