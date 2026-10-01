@@ -142,6 +142,63 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A commit published before commits recorded how far into the log they reach is served when the log holds
+     * nothing it lacks. Treating such a commit as covering none of its term made every shard ever written look
+     * behind -- a term's highest record stays in the log after a publish -- and a fleet reopened on old manifests
+     * took over its whole population on the first searches.
+     */
+    public void testAnOldCommitThatCoversItsLogIsServed() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final org.opensearch.common.blobstore.BlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode writer = new ServerlessNode(nodeSettings("legacy-writer", "ingest"));
+            ServerlessNode reader = new ServerlessNode(nodeSettings("legacy-reader", "search"))
+        ) {
+            writer.start();
+            reader.start();
+            writer.setMetadataPlane(plane);
+            reader.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            for (int i = 0; i < 3; i++) {
+                assertEquals(201, send(writer, "PUT", "/alpha/_doc/d" + i, "{\"msg\":\"needle\",\"n\":" + i + "}").status());
+            }
+            loop.publishAll();
+            // The manifest as it was written before it recorded its reach.
+            final var publisher = plane.segmentPublisher("alpha", 0);
+            final var current = publisher.readManifest().orElseThrow();
+            final var legacy = new org.opensearch.serverless.store.CommitManifest(
+                current.term(),
+                current.files(),
+                current.writer(),
+                current.lengths(),
+                current.digest()
+            );
+            final var container = store.blobContainer(
+                org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), "alpha", "uuid-alpha-00000000", 0)
+            );
+            final var register = container.readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST).orElseThrow();
+            assertTrue(
+                container.compareAndSwapRegister(
+                    org.opensearch.serverless.store.SegmentPublisher.MANIFEST,
+                    register.generation(),
+                    legacy.toBytes()
+                ).applied()
+            );
+            assertTrue(plane.heads().release("alpha", 0, writer.localNode().getId()));
+
+            final Response found = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
+            assertEquals(found.body(), 200, found.status());
+            assertEquals("served, not refused as behind: " + found.body(), 0L, number(found.body(), "failed"));
+            assertEquals(found.body(), 3L, number(found.body(), "value"));
+        }
+    }
+
     /** The first occurrence of a numeric field in a JSON body. */
     private static long number(String body, String field) {
         final Matcher matcher = Pattern.compile("\"" + field + "\":(-?\\d+)").matcher(body);
