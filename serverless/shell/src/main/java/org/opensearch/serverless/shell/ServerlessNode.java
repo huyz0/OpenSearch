@@ -99,6 +99,21 @@ public final class ServerlessNode implements Closeable {
      */
     public static final String FANOUT_POOL = "serverless_fanout";
 
+    /**
+     * The pool a forwarded write is applied on, at its owner.
+     *
+     * <p>Not WRITE. A write that arrives at a node that does not own its shard is forwarded, and the WRITE thread
+     * that took it waits for the owner's answer; when the owner applied forwarded writes on WRITE too, every node's
+     * WRITE threads could end up waiting on every other node's, and none was free to apply what the others were
+     * waiting for. A fleet of six under a few hundred writes a second stopped acknowledging almost entirely until
+     * the forwards timed out. A forwarded write is applied locally and forwards nothing further, so this pool waits
+     * on nothing that runs on a pool a forward waits on.
+     */
+    public static final String FORWARDED_WRITE_POOL = "serverless_forwarded_write";
+
+    /** The pool a forwarded get is answered on, at its owner: not GET, for the reason {@link #FORWARDED_WRITE_POOL} is not WRITE. */
+    public static final String FORWARDED_READ_POOL = "serverless_forwarded_read";
+
     private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(ServerlessNode.class);
 
     /** Accepts writer activation: takes ownership of shards and indexes into them. */
@@ -314,13 +329,29 @@ public final class ServerlessNode implements Closeable {
         // thread waiting for tasks no thread was free to run. A forwarded search handler ran on SEARCH and
         // blocked on the query phase forked to SEARCH, with the same shape. Both now run here, and this
         // pool waits on nothing that runs on it.
+        final int processors = org.opensearch.common.util.concurrent.OpenSearchExecutors.allocatedProcessors(settings);
         this.threadPool = new ThreadPool(
             settings,
             new org.opensearch.threadpool.ScalingExecutorBuilder(
                 FANOUT_POOL,
                 1,
-                Math.max(8, 4 * org.opensearch.common.util.concurrent.OpenSearchExecutors.allocatedProcessors(settings)),
+                Math.max(8, 4 * processors),
                 org.opensearch.common.unit.TimeValue.timeValueSeconds(30)
+            ),
+            // Sized and queued like WRITE and GET, whose work they take over for requests that were forwarded.
+            new org.opensearch.threadpool.FixedExecutorBuilder(
+                settings,
+                FORWARDED_WRITE_POOL,
+                processors,
+                10_000,
+                "thread_pool." + FORWARDED_WRITE_POOL
+            ),
+            new org.opensearch.threadpool.FixedExecutorBuilder(
+                settings,
+                FORWARDED_READ_POOL,
+                Math.max(4, processors),
+                1_000,
+                "thread_pool." + FORWARDED_READ_POOL
             )
         );
         boolean success = false;

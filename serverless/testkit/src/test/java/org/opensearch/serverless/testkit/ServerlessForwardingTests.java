@@ -100,6 +100,53 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
     }
 
     /**
+     * Two nodes forwarding writes to each other at once do not wait on each other's write pools.
+     *
+     * <p>The thread that takes a write waits for the owner's answer when it forwards. The owner applied forwarded
+     * writes on its WRITE pool, so with each node's WRITE threads all waiting on the other's, neither had a thread
+     * free to apply what the other was waiting for: a fleet of six under a few hundred writes a second stopped
+     * acknowledging almost entirely until the forwards timed out. One WRITE thread each makes the cycle certain.
+     */
+    public void testNodesForwardingWritesToEachOtherDoNotDeadlock() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 2, MAPPING, null));
+        final Settings oneWriteThread = Settings.builder().put("thread_pool.write.size", 1).build();
+
+        try (
+            Pair pair = new Pair(
+                new ServerlessNode(Settings.builder().put(nodeSettings("fwd-cycle-a")).put(oneWriteThread).build()),
+                new ServerlessNode(Settings.builder().put(nodeSettings("fwd-cycle-b")).put(oneWriteThread).build()),
+                plane,
+                clock
+            )
+        ) {
+            final int perNode = 16;
+            final java.util.concurrent.ExecutorService clients = java.util.concurrent.Executors.newFixedThreadPool(2 * perNode);
+            try {
+                final List<java.util.concurrent.Future<Response>> sent = new java.util.ArrayList<>();
+                for (int i = 0; i < perNode; i++) {
+                    for (ServerlessNode via : List.of(pair.a, pair.b)) {
+                        final String id = via.localNode().getName() + "-" + i;
+                        sent.add(clients.submit(() -> send(via, "PUT", "/alpha/_doc/" + id, "{\"msg\":\"cycle\",\"n\":1}")));
+                    }
+                }
+                // Well inside the forward timeout, which is a lease: deadlocked writes answer only when it fires.
+                final long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(15);
+                for (java.util.concurrent.Future<Response> each : sent) {
+                    final Response response = each.get(
+                        Math.max(1, deadline - System.nanoTime()),
+                        java.util.concurrent.TimeUnit.NANOSECONDS
+                    );
+                    assertEquals("every write is acknowledged: " + response.body(), 201, response.status());
+                }
+            } finally {
+                clients.shutdownNow();
+            }
+        }
+    }
+
+    /**
      * A {@code create} of an id that exists, forwarded, is a 409 -- the same 409 the owner answers.
      *
      * <p>The owner always knew: its outcome carried the conflict flag. The flag simply did not travel, so
