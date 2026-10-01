@@ -63,6 +63,8 @@ final class FaultProxy implements Closeable {
     private volatile boolean partitioned;
 
     private final Map<String, AtomicLong> requests = new ConcurrentHashMap<>();
+    /** The same requests by operation and by what they touch -- descriptors, heads, the log -- for a cost breakdown. */
+    private final Map<String, AtomicLong> byArea = new ConcurrentHashMap<>();
     private final AtomicLong injected = new AtomicLong();
     private final AtomicLong refused = new AtomicLong();
 
@@ -107,6 +109,13 @@ final class FaultProxy implements Closeable {
         return snapshot;
     }
 
+    /** Requests forwarded, by operation and area, since the last {@link #resetCounts}. */
+    Map<String, Long> countsByArea() {
+        final Map<String, Long> snapshot = new TreeMap<>();
+        byArea.forEach((op, n) -> snapshot.put(op, n.get()));
+        return snapshot;
+    }
+
     long injected() {
         return injected.get();
     }
@@ -117,6 +126,7 @@ final class FaultProxy implements Closeable {
 
     void resetCounts() {
         requests.clear();
+        byArea.clear();
         injected.set(0);
         refused.set(0);
     }
@@ -160,6 +170,7 @@ final class FaultProxy implements Closeable {
                     return;
                 }
                 final String op = classify(request);
+                byArea.computeIfAbsent(op + " " + area(request.target()), k -> new AtomicLong()).incrementAndGet();
                 final long delay = latencyMillis;
                 if (delay > 0) {
                     LockSupport.parkNanos(delay * 1_000_000L);
@@ -332,6 +343,40 @@ final class FaultProxy implements Closeable {
             return "DELETE_BATCH";
         }
         return method;
+    }
+
+    /**
+     * What a request touches, from its key or its listing prefix: the first segment of the key under the bucket,
+     * and for a shard's segments whether it is the manifest, the log or segment data.
+     */
+    static String area(String target) {
+        String key;
+        final int query = target.indexOf('?');
+        final String path = query < 0 ? target : target.substring(0, query);
+        final java.util.regex.Matcher prefix = java.util.regex.Pattern.compile("[?&]prefix=([^&]*)").matcher(target);
+        if (prefix.find()) {
+            key = java.net.URLDecoder.decode(prefix.group(1), StandardCharsets.UTF_8);
+        } else {
+            // Path style: /bucket/key...
+            final String trimmed = path.startsWith("/") ? path.substring(1) : path;
+            final int slash = trimmed.indexOf('/');
+            key = slash < 0 ? "" : java.net.URLDecoder.decode(trimmed.substring(slash + 1), StandardCharsets.UTF_8);
+        }
+        final String[] parts = key.split("/");
+        final String top = parts.length == 0 || parts[0].isEmpty() ? "(bucket)" : parts[0];
+        if ("segments".equals(top) && parts.length > 2) {
+            if ("manifest".equals(parts[2])) {
+                return "segments/manifest";
+            }
+            if ("wal".equals(parts[2])) {
+                return "segments/wal";
+            }
+            return "segments/data";
+        }
+        if ("cluster".equals(top) && parts.length > 1) {
+            return "cluster/" + parts[1];
+        }
+        return top;
     }
 
     private static void closeQuietly(Socket socket) {

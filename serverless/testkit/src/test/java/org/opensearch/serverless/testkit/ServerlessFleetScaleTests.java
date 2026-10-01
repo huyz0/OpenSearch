@@ -243,6 +243,16 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             perNodeHour.put("n" + i, String.format(Locale.ROOT, "%.0f", sum * 3600 / idleElapsed));
         }
         line("- background with the load stopped, requests per node-hour: " + perNodeHour + " (over " + idle + " s idle)");
+        // And what it is spent on, averaged over the nodes: the line items an idle-cost change has to move.
+        final Map<String, Long> byArea = new TreeMap<>();
+        for (FaultProxy proxy : proxies) {
+            proxy.countsByArea().forEach((area, n) -> byArea.merge(area, n, Long::sum));
+        }
+        final Map<String, String> perNodeHourByArea = new TreeMap<>();
+        byArea.forEach(
+            (area, n) -> perNodeHourByArea.put(area, String.format(Locale.ROOT, "%.0f", n * 3600 / idleElapsed / proxies.size()))
+        );
+        line("- idle requests per node-hour by operation and area: " + perNodeHourByArea);
         load.start();
     }
 
@@ -252,11 +262,27 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         final NodeProcess node = fleet.get(victim);
         final List<String> owned = shardsOwnedBy(node.nodeId());
         line("- killing " + node.name() + ", which owned " + owned.size() + " shards; lease TTL " + ttlMillis + " ms");
+        final long leaseExpiresAt = plane.membership().read(node.nodeId()).map(l -> l.expiresAtMillis()).orElse(-1L);
+        final long killedAtMillis = System.currentTimeMillis();
         final long killedAt = System.nanoTime();
         fleet.remove(node);
         node.killHard();
-        final Map<String, Long> takeover = probeUntilWritable(owned, killedAt, Math.max(seconds, (int) (6 * ttlMillis / 1000)));
+        acquiredAfter.clear();
+        final Map<String, Long> takeover = probeUntilWritable(
+            owned,
+            killedAt,
+            Math.max(seconds, (int) (6 * ttlMillis / 1000)),
+            node.nodeId()
+        );
         line("- takeover, kill to first acknowledged write on each of its shards: " + summarise(takeover, owned.size()));
+        line(
+            "- where the time went: the lease ran out "
+                + (leaseExpiresAt < 0 ? "?" : Long.toString(leaseExpiresAt - killedAtMillis))
+                + " ms after the kill; a survivor held the head: "
+                + summarise(acquiredAfter, owned.size())
+                + "; head to first acknowledged write: "
+                + summarise(gaps(acquiredAfter, takeover), owned.size())
+        );
         line("- writes from the kill until every shard was back: " + load.window("write", killedAt, killedAt + maxOr(takeover, 0L)));
         sleepSeconds(Math.max(0, seconds - (int) TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - killedAt)));
         fleet.add(victim, startNode(victim));
@@ -280,7 +306,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             // stops sending it requests; until then clients keep arriving at the frozen process.
             sleepSeconds(HEALTH_CHECK_SECONDS);
             load.takeOutOfRotation(node.name());
-            takeover = probeUntilWritable(owned, pausedAt, (int) (pauseMillis / 1000));
+            takeover = probeUntilWritable(owned, pausedAt, (int) (pauseMillis / 1000), node.nodeId());
         } finally {
             node.resume();
             load.putBackInRotation(node.name());
@@ -300,7 +326,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         proxies.get(victim).partition();
         final Map<String, Long> takeover;
         try {
-            takeover = probeUntilWritable(owned, cutAt, (int) (partitionMillis / 1000));
+            takeover = probeUntilWritable(owned, cutAt, (int) (partitionMillis / 1000), node.nodeId());
             final FleetLoad.Window viaVictim = windowFor(node.name(), cutAt + TimeUnit.MILLISECONDS.toNanos(ttlMillis), System.nanoTime());
             line("- writes sent to " + node.name() + " once its lease had run out: " + viaVictim);
         } finally {
@@ -892,10 +918,51 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
     }
 
     /** Writes to each index, through the live nodes, until each acknowledges one; per index, how long that took. */
-    private Map<String, Long> probeUntilWritable(List<String> indices, long fromNanos, int budgetSeconds) throws Exception {
+    /** When a survivor first held each probed shard's head, in milliseconds from the fault; filled by the last probe. */
+    private final Map<String, Long> acquiredAfter = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static Map<String, Long> gaps(Map<String, Long> acquired, Map<String, Long> writable) {
+        final Map<String, Long> gaps = new TreeMap<>();
+        writable.forEach((index, at) -> {
+            final Long held = acquired.get(index);
+            if (held != null) {
+                gaps.put(index, Math.max(0L, at - held));
+            }
+        });
+        return gaps;
+    }
+
+    private Map<String, Long> probeUntilWritable(List<String> indices, long fromNanos, int budgetSeconds, String victimNodeId)
+        throws Exception {
         final Map<String, Long> writableAfter = new java.util.concurrent.ConcurrentHashMap<>();
         final long deadline = fromNanos + TimeUnit.SECONDS.toNanos(Math.max(budgetSeconds, 1));
-        final ExecutorService probes = Executors.newFixedThreadPool(Math.max(1, Math.min(16, indices.size())));
+        acquiredAfter.clear();
+        // Which survivor held each head, and when: once a second, every shard not yet seen held by someone else.
+        final Thread headWatch = new Thread(() -> {
+            while (System.nanoTime() < deadline && acquiredAfter.size() < indices.size()) {
+                for (String index : indices) {
+                    if (acquiredAfter.containsKey(index)) {
+                        continue;
+                    }
+                    try {
+                        final var head = plane.heads().read(index, 0);
+                        if (head.isPresent()
+                            && head.get().ownerNodeId() != null
+                            && victimNodeId.equals(head.get().ownerNodeId()) == false) {
+                            acquiredAfter.put(index, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - fromNanos));
+                        }
+                    } catch (Exception e) {
+                        // Read again next round.
+                    }
+                }
+                LockSupport.parkNanos(TimeUnit.SECONDS.toNanos(1));
+            }
+        }, "fleet-head-watch");
+        headWatch.setDaemon(true);
+        headWatch.start();
+        // Every shard probed at once. A pool of sixteen probed the first sixteen and queued the rest, so a shard
+        // writable at thirty seconds was measured when its probe got a thread -- the harness's queue, not the fleet.
+        final ExecutorService probes = Executors.newVirtualThreadPerTaskExecutor();
         try {
             final List<Future<?>> pending = new ArrayList<>();
             for (String index : indices) {
