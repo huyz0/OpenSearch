@@ -1845,6 +1845,14 @@ public final class ServerlessNode implements Closeable {
         // not final until the transport has bound and told us the address it got.
         projector = new LocalViewProjector(ClusterName.CLUSTER_NAME_SETTING.get(settings), localNode);
         reconciler = new ShardReconciler(indicesService, localNode);
+        reconciler.setOnShardFailed((failed, cause) -> {
+            // Off the failing thread, which may hold engine locks the release needs.
+            try {
+                threadPool.generic().execute(() -> onShardFailed(failed, cause));
+            } catch (Exception rejected) {
+                logger.warn("could not schedule the release of failed shard " + failed, rejected);
+            }
+        });
         started = true;
 
         // Last, and after `started`, because a plugin's createComponents may use the client -- which
@@ -1983,6 +1991,7 @@ public final class ServerlessNode implements Closeable {
 
     /** How many indices a prefix pattern must match before a search reads its group's digest rollups. */
     public static final int DEFAULT_ROLLUP_MIN_INDICES = 32;
+
 
     /**
      * How many indices a pattern must match before the digest rollups are consulted: below it, the per-index
@@ -2721,6 +2730,39 @@ public final class ServerlessNode implements Closeable {
                 logger.warn("could not forget the claim on " + shardId + "; it costs one head read per resync until it is", e);
             }
         }
+    }
+
+    /**
+     * Closes a shard whose engine has failed, and has it taken again from the object store.
+     *
+     * <p><b>Why a failed writer must not stay.</b> The shard still counted as open, so this node kept the head with a
+     * live lease: every peer forwarded to it, every activation found it already held, and every request was told
+     * "engine is closed". A fleet run stranded acknowledged writes behind one -- durable in the log, and readable
+     * by nobody, because nobody would take the shard. The engine's state is gone, but nothing acknowledged was ever
+     * only there: the published commit and the log behind it hold every acknowledged write.
+     *
+     * <p>So the writer is closed under its fence and the head left as it is, still naming this node -- given back
+     * unpublished it would be read from a commit behind its log -- and its ownership doubted. The doubt's activation
+     * takes the shard at a higher term, which fences whatever the failed engine might still append, opens it from
+     * the published commit and replays the log. A failed reader holds no head and is simply closed.
+     */
+    private void onShardFailed(org.opensearch.core.index.shard.ShardId shardId, Exception cause) {
+        final var plane = metadataPlane;
+        logger.warn("shard " + shardId + " failed; closing it and taking it again from its published commit and log", cause);
+        try {
+            if (reconciler.readerShards().contains(shardId)) {
+                reconciler.releaseShard(shardId, "its engine failed");
+                forgetReader(shardId);
+                return;
+            }
+            if (reconciler.shard(shardId) == null || plane == null) {
+                return;
+            }
+            releaseLost(plane, shardId, "its engine failed: " + (cause == null ? "unknown" : cause.getMessage()), false);
+        } catch (Exception e) {
+            logger.warn("could not close failed shard " + shardId, e);
+        }
+        signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
     }
 
     /**

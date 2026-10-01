@@ -217,6 +217,7 @@ public final class ShardReconciler {
             // writing compares it with what has landed, so a commit behind an acknowledged write is never served
             // as though it were current.
             walOrdinal = log == null ? -1L : log.appendedThrough(term);
+            advanceGlobalCheckpoint(shard);
             shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
         } finally {
             exclusive.unlock();
@@ -245,6 +246,36 @@ public final class ShardReconciler {
             walForPublish.onPublished(term);
         }
         return manifest;
+    }
+
+    /**
+     * Moves a writer's global checkpoint to its local checkpoint, before a flush.
+     *
+     * <p>A shard here has no replicas: every acknowledged operation is in the object store's log before it is
+     * acknowledged, and that log, not a replica, is what recovery reads. So everything this copy has processed is as
+     * safe as it will ever be, which is what the global checkpoint means -- but nothing moved it, because nothing here
+     * runs the replication actions that would. It stayed where the shard opened, and the engine's deletion policy,
+     * which keeps every commit from the newest one at or below the global checkpoint, kept every commit since the
+     * shard opened: local disk that never came back, and the opening commit's list of files inherited from the
+     * previous term, which it read back on every new commit. When the newest manifest stopped naming those files the
+     * collector deleted them, as it should, and the writer's next commit failed its engine.
+     *
+     * <p>Called with the write guard held, where no operation sits between apply and append, so the local
+     * checkpoint is every operation the flush that follows commits.
+     */
+    private static void advanceGlobalCheckpoint(IndexShard shard) {
+        shard.updateLocalCheckpointForShard(shard.routingEntry().allocationId().getId(), shard.getLocalCheckpoint());
+    }
+
+    private volatile java.util.function.BiConsumer<ShardId, Exception> onShardFailed;
+
+    /**
+     * Sets what happens when an open shard's engine fails: told the shard and the cause, on the thread that failed it.
+     *
+     * @param onShardFailed the listener, or null for none
+     */
+    public void setOnShardFailed(java.util.function.BiConsumer<ShardId, Exception> onShardFailed) {
+        this.onShardFailed = onShardFailed;
     }
 
     /** What must happen before a commit's manifest is written, given the commit's digest. */
@@ -517,6 +548,14 @@ public final class ShardReconciler {
             } finally {
                 pendingManifests.remove(shardId);
             }
+            // A failed engine is reported, not just left in place: a shard whose engine has failed still counts as
+            // open, and a writer's head kept naming a node that answered "engine is closed" to everything.
+            shard.addShardFailureCallback(failure -> {
+                final java.util.function.BiConsumer<ShardId, Exception> listener = onShardFailed;
+                if (listener != null) {
+                    listener.accept(shardId, failure.cause);
+                }
+            });
 
             // From here the IndexService holds a shard that is not yet ours. Anything that fails before
             // it is must take the shard back out, or the next attempt is refused with "already exists"
