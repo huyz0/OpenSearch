@@ -215,4 +215,48 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             assertEquals(0L, markedTerm(plane, "leaked"));
         }
     }
+
+    /**
+     * A dead fleet's stale claims do not starve the marks. A fleet run's janitor spent every pass forgetting claims of
+     * nodes long gone -- thousands of them -- and the marks that make wide searches slow were never reached.
+     */
+    public void testStaleClaimsDoNotStarveTheMarks() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final BlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = plane(store, clock);
+        plane.createIndex(descriptor("leaked"));
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("janitor-claims"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            node.renewLease(plane);
+            plane.membership().refresh();
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(List.of(Map.entry("leaked", 0)));
+            final ShardId shardId = node.reconciler().openShards().iterator().next();
+            loop.publishAll();
+            final long term = plane.heads().read("leaked", 0).orElseThrow().term();
+            node.reconciler().releaseShard(shardId, "test: released without clearing its mark");
+            assertTrue(plane.heads().release("leaked", 0, node.localNode().getId(), term));
+
+            // More claims of a node long gone than every pass could look at in a full turn of the buckets.
+            final int budget = 10;
+            final int slots = plane.rollups().groups().size() * DigestRollups.BUCKETS;
+            final var ghost = store.blobContainer(BlobPath.cleanPath().add("assignments").add("ghost-node"));
+            for (int i = 0; i < slots * budget + 1; i++) {
+                ghost.writeBlob(
+                    org.opensearch.serverless.metadata.RegisterMap.assignmentBlob("gone-" + i, 0),
+                    new java.io.ByteArrayInputStream(new byte[0]),
+                    0L,
+                    false
+                );
+            }
+
+            int released = 0;
+            for (int i = 0; i < slots; i++) {
+                released += loop.sweepAbandoned(budget, 0).released();
+            }
+            assertEquals("the mark is reached despite the claims", 1, released);
+            assertEquals(0L, markedTerm(plane, "leaked"));
+        }
+    }
 }

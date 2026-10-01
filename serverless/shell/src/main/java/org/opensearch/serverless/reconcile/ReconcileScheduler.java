@@ -141,6 +141,19 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         return this;
     }
 
+    /** How soon a janitor pass follows one that used its whole budget: a backlog is worked through, not trickled. */
+    static final TimeValue JANITOR_BACKLOG_DELAY = TimeValue.timeValueSeconds(5);
+
+    private void scheduleJanitor(TimeValue delay) {
+        if (closed) {
+            return;
+        }
+        janitorTask = threadPool.schedule(() -> {
+            final BackgroundReconciler.JanitorPass pass = janitorNow();
+            scheduleJanitor(pass != null && pass.full() ? JANITOR_BACKLOG_DELAY : janitorInterval);
+        }, delay, ThreadPool.Names.GENERIC);
+    }
+
     /**
      * Runs one janitor pass, now; see {@link BackgroundReconciler#sweepAbandoned}.
      *
@@ -259,7 +272,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             backstopTask = threadPool.scheduleWithFixedDelay(this::backstopNow, backstopInterval, ThreadPool.Names.GENERIC);
         }
         if (janitorInterval != null) {
-            janitorTask = threadPool.scheduleWithFixedDelay(this::janitorNow, janitorInterval, ThreadPool.Names.GENERIC);
+            scheduleJanitor(janitorInterval);
         }
         logger.info(
             "reconcile scheduler started: renewal every {}, publish debounce {}, backstop {}",
