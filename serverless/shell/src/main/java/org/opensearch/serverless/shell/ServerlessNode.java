@@ -1718,6 +1718,27 @@ public final class ServerlessNode implements Closeable {
         }
     }
 
+    /**
+     * Applies a descriptor some other read found -- one routing a request, say -- if it is newer than what this node's
+     * shards carry. Newer, not merely different: such a read can be older than the one the fence last applied.
+     */
+    private void applyIfNewer(String indexName, IndexDescriptor descriptor, long readStartedNanos) {
+        final long[] applied = appliedDescriptorVersions.get(indexName);
+        if (applied != null) {
+            synchronized (applied) {
+                if (descriptor.mappingVersion() <= applied[0] && descriptor.settingsVersion() <= applied[1]) {
+                    return;
+                }
+            }
+        }
+        try {
+            applyDescriptor(indexName, descriptor);
+            descriptorReadAtNanos.merge(indexName, readStartedNanos, Math::max);
+        } catch (Exception e) {
+            logger.warn("could not apply the descriptor of " + indexName + " read while routing", e);
+        }
+    }
+
     /** When each open index's descriptor was last read, by the refresh or by the fence, in {@link System#nanoTime} terms. */
     private final java.util.Map<String, Long> descriptorReadAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -3282,6 +3303,10 @@ public final class ServerlessNode implements Closeable {
             throw new java.io.IOException("cannot index into " + shardId + ": it is open as a reader");
         }
         refuseIfWriteFenced(shardId);
+        // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
+        // and settings up to the descriptor, so a change made on another node is in force for the first operation
+        // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
+        ensureIncarnationLive(shardId);
         markUsed(shardId);
         // Apply first, then log. This is the reverse of what this path used to do, and the reason is the
         // whole point of carrying sequence numbers: the engine assigns one, so there is nothing worth
@@ -3505,9 +3530,12 @@ public final class ServerlessNode implements Closeable {
         // incarnation, and a read is a read whoever made it: stamped with when it began, it confirms exactly
         // what the fence's own read would. A wide search used to read every descriptor twice, once to route
         // and once here.
-        final java.util.OptionalLong routed = plane.readConfirmingIncarnation(shardId.getIndexName(), uuid);
-        if (routed.isPresent() && System.nanoTime() - routed.getAsLong() <= window) {
-            confirmIncarnation(uuid, routed.getAsLong());
+        final var routed = plane.readConfirmingIncarnation(shardId.getIndexName(), uuid);
+        if (routed.isPresent() && System.nanoTime() - routed.get().readStartedNanos() <= window) {
+            confirmIncarnation(uuid, routed.get().readStartedNanos());
+            // And it is a read of the mapping and settings like any other: a change made on another node reaches
+            // this one's shards through whichever read sees it first, so the periodic refresh is only a backstop.
+            applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
             return;
         }
         synchronized (incarnationLocks[Math.floorMod(uuid.hashCode(), incarnationLocks.length)]) {
@@ -3625,6 +3653,10 @@ public final class ServerlessNode implements Closeable {
             }
             try {
                 growMappingBy(plane, indexName, batch);
+            } catch (MappingConflictException e) {
+                // Not back on the queue: an addition that conflicts with the descriptor conflicts with every
+                // later one too, and queued it failed every growth of this index on this node after it.
+                throw e;
             } catch (Exception e) {
                 // Whatever this leader was carrying for others goes back on the queue, so the next
                 // thread in tries again rather than every waiter returning as though it had succeeded.
@@ -3677,7 +3709,15 @@ public final class ServerlessNode implements Closeable {
                 }
                 merged = unwrapMappingType(grown.mappingSource().string());
             } catch (Exception e) {
-                throw new java.io.IOException("could not grow the mapping of " + indexName + " to fit the document", e);
+                // Most likely this shard is behind the descriptor -- it mapped the field dynamically because a
+                // mapping declaring it had not reached it yet. Brought up to it, the client's retry indexes the
+                // document with the declared mapping instead of failing the same way.
+                try {
+                    applyDescriptor(indexName, current.get());
+                } catch (Exception nested) {
+                    e.addSuppressed(nested);
+                }
+                throw new MappingConflictException("could not grow the mapping of " + indexName + " to fit the document", e);
             } finally {
                 mapperService.close();
             }
@@ -3696,6 +3736,13 @@ public final class ServerlessNode implements Closeable {
             }
         }
         throw new java.io.IOException("the mapping of " + indexName + " is being changed concurrently; retry the write");
+    }
+
+    /** A document's dynamic mapping addition that the index's mapping refuses: the write fails, and retrying it as is cannot help. */
+    private static final class MappingConflictException extends java.io.IOException {
+        MappingConflictException(String message, Exception cause) {
+            super(message, cause);
+        }
     }
 
     /** Strips the single mapping type core wraps a merged mapping in, as MappingUpdateHandler does. */
@@ -3835,6 +3882,10 @@ public final class ServerlessNode implements Closeable {
             throw new java.io.IOException("cannot delete from " + shardId + ": it is open as a reader");
         }
         refuseIfWriteFenced(shardId);
+        // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
+        // and settings up to the descriptor, so a change made on another node is in force for the first operation
+        // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
+        ensureIncarnationLive(shardId);
         markUsed(shardId);
         // Apply, then log -- the same reordering, for the same reason, as the index path above.
         final var result = shard.applyDeleteOperationOnPrimary(
@@ -4015,6 +4066,10 @@ public final class ServerlessNode implements Closeable {
             return java.util.List.of();
         }
         refuseIfWriteFenced(shardId);
+        // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
+        // and settings up to the descriptor, so a change made on another node is in force for the first operation
+        // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
+        ensureIncarnationLive(shardId);
         markUsed(shardId);
 
         // Applied first, then logged once for the whole batch -- the same reordering the single-document
@@ -4879,6 +4934,7 @@ public final class ServerlessNode implements Closeable {
             throw new java.io.IOException("cannot read from " + shardId + ": not open on " + nodeName);
         }
         markUsed(shardId);
+        ensureIncarnationLive(shardId);
         final var result = shard.getService()
             .get(
                 id,
