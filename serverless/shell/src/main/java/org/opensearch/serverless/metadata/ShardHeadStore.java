@@ -282,6 +282,49 @@ public final class ShardHeadStore {
         return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied();
     }
 
+    /** A dead owner's head given back: the head as the owner left it, and the unowned one that replaced it. */
+    public record Abandoned(ShardHead previous, ShardHead released) {
+    }
+
+    /**
+     * Gives back a shard whose owner is dead, on the owner's behalf, without taking it.
+     *
+     * <p>The same checks and the same fence as {@link #acquire}: the owner must not be live, its lease is revoked
+     * first, and the head moves to the next term -- so a writer that was not as dead as it looked can no longer have
+     * its appends replayed as history once the caller seals the older terms. The head is left with no owner, for
+     * whoever next needs the shard.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param deadNodeId the owner the head must still name
+     * @return the heads before and after, or empty if the head no longer names that node, it is live, or another
+     *     swap got there first
+     * @throws IOException if the register cannot be read or written
+     */
+    public Optional<Abandoned> releaseAbandoned(String indexName, int shardId, String deadNodeId) throws IOException {
+        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final long now = clock.getAsLong();
+        final Optional<BlobRegister> existing = container.readRegister(name);
+        if (existing.isEmpty()) {
+            return Optional.empty();
+        }
+        final ShardHead current;
+        try (InputStream in = existing.get().value().streamInput()) {
+            current = ShardHead.fromStream(in);
+        }
+        if (deadNodeId.equals(current.ownerNodeId()) == false || isHeld(current, now)) {
+            return Optional.empty();
+        }
+        if (oracle.revoke(current.ownerNodeId(), current.ownerEphemeralId()) == false) {
+            return Optional.empty();
+        }
+        final ShardHead released = new ShardHead(indexName, shardId, current.term() + 1, null, null, 0L, current.indexUuid());
+        if (container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied() == false) {
+            return Optional.empty();
+        }
+        return Optional.of(new Abandoned(current, released));
+    }
+
     /**
      * Removes every head belonging to an index, for delete-index.
      *

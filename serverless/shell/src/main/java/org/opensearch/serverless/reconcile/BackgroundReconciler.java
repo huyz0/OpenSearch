@@ -9,6 +9,7 @@
 package org.opensearch.serverless.reconcile;
 
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.metadata.DigestRollups;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
@@ -1464,6 +1465,7 @@ public final class BackgroundReconciler implements Closeable {
         java.util.Collections.sort(live);
         final int rank = live.indexOf(node.localNode().getId());
         final List<Map.Entry<String, Integer>> later = new java.util.ArrayList<>();
+        final long settledBefore = settledClean.get();
         int taking = 0;
         for (Map.Entry<String, Integer> claim : claims) {
             final int mine = live.isEmpty() || rank < 0
@@ -1478,10 +1480,11 @@ public final class BackgroundReconciler implements Closeable {
             }
         }
         logger.info(
-            "node {} left: taking {} of its {} claimed shards, {} more if still unclaimed later",
+            "node {} left: taking {} of its {} claimed shards and giving back {} fully published, {} more if still unclaimed later",
             deadNodeId,
             taking,
             claims.size(),
+            settledClean.get() - settledBefore,
             later.size()
         );
         return later;
@@ -1526,11 +1529,202 @@ public final class BackgroundReconciler implements Closeable {
             if (head.isEmpty() || deadNodeId.equals(head.get().ownerNodeId()) == false) {
                 return false;
             }
+            // Given back rather than taken when everything the dead node acknowledged is published: most of what a
+            // node holds is idle, and taking all of it put a dead node's shards on survivors already near their cap.
+            // Only a shard whose log is ahead of its commit needs a writer, to replay and publish it.
+            final MetadataPlane.Settled settled = plane.settleAbandoned(claim.getKey(), claim.getValue(), deadNodeId);
+            if (settled == MetadataPlane.Settled.RELEASED_CLEAN) {
+                settledClean.incrementAndGet();
+                return false;
+            }
+            if (settled == MetadataPlane.Settled.NOT_ABANDONED) {
+                return false;
+            }
         } catch (Exception e) {
+            logger.debug("could not settle " + claim + " of departed node " + deadNodeId + "; it waits for a request", e);
             return false;
         }
         activate(claim.getKey(), claim.getValue(), true);
         return true;
+    }
+
+    /**
+     * What one janitor pass did.
+     *
+     * @param examined shards looked at
+     * @param released dead owners' shards given back with everything published, or released marks cleared
+     * @param replays shards whose log was ahead of their commit, taken here to be replayed and published
+     * @param claimsForgotten dead nodes' claims on shards whose head had moved on
+     * @param bucket the rollup bucket read this pass, as group/bucket, or null if none was due here
+     */
+    public record JanitorPass(int examined, int released, int replays, int claimsForgotten, String bucket) {
+    }
+
+    /** How many shards a janitor pass looks at, at most. */
+    public static final int DEFAULT_JANITOR_BUDGET = 200;
+
+    /** How many shards a janitor pass takes to replay, at most: each is a real activation, and survivors have caps. */
+    public static final int DEFAULT_JANITOR_REPLAYS = 8;
+
+    private final java.util.concurrent.atomic.AtomicLong janitorCursor = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Cleans up after crashed nodes, a bounded amount at a time.
+     *
+     * <p>A crash leaves three things naming the dead node: shard heads, claims, and rollup marks that keep its shards
+     * from being ruled out of a wide search. A departure noticed live is cleaned up by {@link #takeOverFrom}; this is
+     * for everything else -- a fleet that crashed as a whole, a departure nobody heard, a mark whose owner released
+     * its head and could not clear it. Each pass lists the claim directories once and reads one rollup bucket,
+     * rotating, and the work is split between live nodes by hash, so the steady cost is a few reads a pass.
+     *
+     * @param budget how many shards to look at, at most
+     * @param replays how many shards to take for replay, at most
+     * @return what the pass did
+     * @throws IOException if the store cannot be listed
+     */
+    public JanitorPass sweepAbandoned(int budget, int replays) throws IOException {
+        final long now = plane.clock().getAsLong();
+        final List<String> live = new java.util.ArrayList<>();
+        for (var lease : plane.membership().current()) {
+            if (lease.isExpiredAt(now) == false) {
+                live.add(lease.nodeId());
+            }
+        }
+        java.util.Collections.sort(live);
+        final int rank = live.indexOf(node.localNode().getId());
+        if (rank < 0) {
+            return new JanitorPass(0, 0, 0, 0, null);
+        }
+        final int[] counts = new int[4]; // examined, released, replays, forgotten
+        final int[] replaysLeft = { replays };
+
+        // Claims of nodes dead for longer than a live departure takes to be handled.
+        final long settledAfter = ReconcileScheduler.RECENT_DEPARTURE_TTLS * plane.leaseTtlMillis();
+        for (String nodeId : plane.nodesWithClaims()) {
+            if (counts[0] >= budget) {
+                break;
+            }
+            if (live.contains(nodeId)) {
+                continue;
+            }
+            final var lease = plane.membership().read(nodeId);
+            if (lease.isPresent() && now - lease.get().expiresAtMillis() < settledAfter) {
+                continue;
+            }
+            for (Map.Entry<String, Integer> claim : plane.claimsOf(nodeId)) {
+                if (counts[0] >= budget) {
+                    break;
+                }
+                if (Math.floorMod((claim.getKey() + "#" + claim.getValue()).hashCode(), live.size()) != rank) {
+                    continue;
+                }
+                counts[0]++;
+                try {
+                    settleForJanitor(claim.getKey(), claim.getValue(), nodeId, -1L, counts, replaysLeft);
+                } catch (Exception e) {
+                    logger.debug("janitor could not settle " + claim + " of " + nodeId, e);
+                }
+            }
+        }
+
+        // One rollup bucket, rotating through every group's buckets; this node reads the ones that hash to it.
+        final List<String> groups = plane.rollups().groups();
+        java.util.Collections.sort(groups);
+        String read = null;
+        final int slots = groups.size() * DigestRollups.BUCKETS;
+        // This node's slots are every live-size-th one from its rank; the cursor counts through them, and stays on a
+        // bucket until a pass gets through it within the budget -- a crashed fleet leaves hundreds of marks in one.
+        final int mine = slots <= rank ? 0 : (slots - rank + live.size() - 1) / live.size();
+        if (mine > 0) {
+            final long slot = rank + (long) live.size() * Math.floorMod(janitorCursor.get(), (long) mine);
+            final String group = groups.get((int) (slot / DigestRollups.BUCKETS));
+            final int bucket = (int) (slot % DigestRollups.BUCKETS);
+            read = group + "/" + bucket;
+            for (Map.Entry<String, DigestRollups.Entry> entry : plane.rollups().readBucket(group, bucket).entrySet()) {
+                if (entry.getValue().alias()) {
+                    continue;
+                }
+                final List<DigestRollups.ShardState> states = entry.getValue().states();
+                for (int shard = 0; shard < states.size() && counts[0] < budget; shard++) {
+                    final long marked = states.get(shard).ownerTerm();
+                    if (marked == 0L) {
+                        continue;
+                    }
+                    counts[0]++;
+                    try {
+                        final var head = plane.heads().read(entry.getKey(), shard);
+                        if (head.isEmpty()) {
+                            continue;
+                        }
+                        final String owner = head.get().ownerNodeId();
+                        if (owner == null) {
+                            settleForJanitor(entry.getKey(), shard, null, marked, counts, replaysLeft);
+                        } else if (owner.equals(node.localNode().getId()) == false && leaseLiveUntil(owner).isEmpty()) {
+                            settleForJanitor(entry.getKey(), shard, owner, -1L, counts, replaysLeft);
+                        }
+                    } catch (Exception e) {
+                        logger.debug("janitor could not settle the mark on " + entry.getKey() + "[" + shard + "]", e);
+                    }
+                }
+            }
+            if (counts[0] < budget) {
+                // Got through it: the next pass reads the next bucket.
+                janitorCursor.incrementAndGet();
+            }
+        }
+        final JanitorPass pass = new JanitorPass(counts[0], counts[1], counts[2], counts[3], read);
+        if (pass.released() + pass.replays() + pass.claimsForgotten() > 0) {
+            logger.info(
+                "janitor: looked at {} shards, gave back {} fully published, took {} to replay, forgot {} stale claims",
+                pass.examined(),
+                pass.released(),
+                pass.replays(),
+                pass.claimsForgotten()
+            );
+        }
+        return pass;
+    }
+
+    /** One shard: given back clean, taken to replay within the budget, or -- a claim whose head moved on -- forgotten. */
+    private void settleForJanitor(String index, int shard, String deadOwner, long markedTerm, int[] counts, int[] replaysLeft)
+        throws IOException {
+        final MetadataPlane.Settled settled = deadOwner == null
+            ? plane.settleReleased(index, shard, markedTerm)
+            : plane.settleAbandoned(index, shard, deadOwner);
+        switch (settled) {
+            case RELEASED_CLEAN -> counts[1]++;
+            case NEEDS_REPLAY -> {
+                if (deadOwner != null) {
+                    plane.forgetAssignment(deadOwner, index, shard);
+                }
+                if (replaysLeft[0] > 0) {
+                    replaysLeft[0]--;
+                    counts[2]++;
+                    activate(index, shard, true);
+                }
+            }
+            case NOT_ABANDONED -> {
+                if (deadOwner != null && markedTerm < 0L) {
+                    final var head = plane.heads().read(index, shard);
+                    if (head.isEmpty() || deadOwner.equals(head.get().ownerNodeId()) == false) {
+                        plane.forgetAssignment(deadOwner, index, shard);
+                        counts[3]++;
+                    }
+                }
+            }
+        }
+    }
+
+    /** Dead owners' shards given back without being taken, since this node started. */
+    private final java.util.concurrent.atomic.AtomicLong settledClean = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Returns how many dead owners' shards this node has given back without taking them.
+     *
+     * @return the count
+     */
+    public long settledClean() {
+        return settledClean.get();
     }
 
     /**

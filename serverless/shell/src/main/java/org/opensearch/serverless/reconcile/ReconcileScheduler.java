@@ -125,6 +125,37 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     private volatile Scheduler.ScheduledCancellable renewalTask;
     private volatile Scheduler.Cancellable backstopTask;
+    private volatile Scheduler.Cancellable janitorTask;
+    private volatile TimeValue janitorInterval;
+    private final AtomicLong janitorPasses = new AtomicLong();
+
+    /**
+     * Sets how often the janitor cleans up after crashed nodes; null, the default, runs none. Takes effect at
+     * {@link #start}.
+     *
+     * @param interval the interval, or null
+     * @return this, for chaining
+     */
+    public ReconcileScheduler setJanitorInterval(TimeValue interval) {
+        this.janitorInterval = interval;
+        return this;
+    }
+
+    /**
+     * Runs one janitor pass, now; see {@link BackgroundReconciler#sweepAbandoned}.
+     *
+     * @return what it did, or null if it failed
+     */
+    public BackgroundReconciler.JanitorPass janitorNow() {
+        janitorPasses.incrementAndGet();
+        try {
+            return loop.sweepAbandoned(BackgroundReconciler.DEFAULT_JANITOR_BUDGET, BackgroundReconciler.DEFAULT_JANITOR_REPLAYS);
+        } catch (Exception e) {
+            logger.warn("janitor pass failed; the next one will try again", e);
+            return null;
+        }
+    }
+
     private volatile boolean closed;
 
     /**
@@ -226,6 +257,9 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         scheduleNextRenewal();
         if (backstopInterval != null) {
             backstopTask = threadPool.scheduleWithFixedDelay(this::backstopNow, backstopInterval, ThreadPool.Names.GENERIC);
+        }
+        if (janitorInterval != null) {
+            janitorTask = threadPool.scheduleWithFixedDelay(this::janitorNow, janitorInterval, ThreadPool.Names.GENERIC);
         }
         logger.info(
             "reconcile scheduler started: renewal every {}, publish debounce {}, backstop {}",
@@ -536,6 +570,9 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         }
         if (backstopTask != null) {
             backstopTask.cancel();
+        }
+        if (janitorTask != null) {
+            janitorTask.cancel();
         }
     }
 

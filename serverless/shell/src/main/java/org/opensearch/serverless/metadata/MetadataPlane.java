@@ -1424,6 +1424,119 @@ public final class MetadataPlane {
         return truthFor(nodeId, null);
     }
 
+    /** What became of a dead owner's shard when a survivor looked at it. */
+    public enum Settled {
+        /** The head no longer names that node, the node is live, or the index is gone: nothing was done. */
+        NOT_ABANDONED,
+        /** Given back with nothing unpublished: unowned, its owned mark and the dead node's claim cleared. */
+        RELEASED_CLEAN,
+        /** Given back, but its log holds writes past its published commit: it needs a writer to replay and publish. */
+        NEEDS_REPLAY
+    }
+
+    /**
+     * Cleans up after a dead owner of one shard without taking the shard, when nothing it wrote is unpublished.
+     *
+     * <p><b>Why.</b> A node that crashes leaves every shard it held named to it: the head, its claim, and a rollup mark
+     * that keeps the shard from ever being ruled out of a wide search. The only cleanup there was, was a takeover --
+     * open the shard, replay its log, hold it -- which put a dead node's few hundred shards, most of them idle and
+     * fully published, on survivors already near their cap, and left the marks of anything nobody took forever. A
+     * fleet that had crashed a few times could not rule 47,000 indices out of a search for next month.
+     *
+     * <p><b>How, safely.</b> The head is given back on the owner's behalf the way a takeover takes it -- the owner must
+     * not be live, its lease is revoked, the term moves on -- and the older terms are sealed, so a writer that was
+     * not as dead as it looked can no longer add history. Only then is the log compared with the published commit:
+     * if nothing landed past what the commit covers, every acknowledged write is published, and the mark and the claim
+     * go. Otherwise the shard is left unowned and marked, and the caller should have it taken and replayed. A commit
+     * published before commits recorded how far into the log they reach cannot be judged by a listing, and counts as
+     * needing a replay.
+     *
+     * @param indexName the index
+     * @param shard the shard number
+     * @param deadNodeId the owner believed dead
+     * @return what was done
+     * @throws IOException if the store cannot be read or written
+     */
+    public Settled settleAbandoned(String indexName, int shard, String deadNodeId) throws IOException {
+        final Optional<IndexDescriptor> descriptor = describe(indexName);
+        if (descriptor.isEmpty()) {
+            return Settled.NOT_ABANDONED;
+        }
+        final String uuid = descriptor.get().uuid();
+        final Optional<ShardHeadStore.Abandoned> abandoned = heads.releaseAbandoned(indexName, shard, deadNodeId);
+        if (abandoned.isEmpty()) {
+            return Settled.NOT_ABANDONED;
+        }
+        final ShardHead previous = abandoned.get().previous();
+        if (previous.indexUuid() != null && previous.indexUuid().equals(uuid) == false) {
+            // A head left by a deleted incarnation: nothing of this one to settle, and the old one's bytes are the
+            // sweep's. Given back is all it needed.
+            forgetAssignment(deadNodeId, indexName, shard);
+            return Settled.RELEASED_CLEAN;
+        }
+        final org.opensearch.serverless.store.WalStore log = walStore(indexName, uuid, shard);
+        log.fenceOlderTerms(abandoned.get().released().term());
+        if (unpublished(indexName, uuid, shard, log)) {
+            return Settled.NEEDS_REPLAY;
+        }
+        rollups().clearOwned(indexName, uuid, shard, previous.term());
+        forgetAssignment(deadNodeId, indexName, shard);
+        return Settled.RELEASED_CLEAN;
+    }
+
+    /**
+     * Clears the owned mark of a shard nobody owns any more, when everything it holds is published.
+     *
+     * <p>For a mark its owner gave back the head under but could not clear -- the clear failed, or the owner's lease
+     * lapsed and it released without publishing. Nothing is fenced: a head with no owner has no writer to fence.
+     *
+     * @param indexName the index
+     * @param shard the shard number
+     * @param markedTerm the term the mark records
+     * @return {@link Settled#RELEASED_CLEAN} if the mark was cleared, {@link Settled#NEEDS_REPLAY} if the log is ahead
+     *     of the commit, {@link Settled#NOT_ABANDONED} if the shard has an owner or the index is gone
+     * @throws IOException if the store cannot be read or written
+     */
+    public Settled settleReleased(String indexName, int shard, long markedTerm) throws IOException {
+        final Optional<IndexDescriptor> descriptor = describe(indexName);
+        if (descriptor.isEmpty()) {
+            return Settled.NOT_ABANDONED;
+        }
+        final Optional<ShardHead> head = heads.read(indexName, shard);
+        if (head.isEmpty() || head.get().ownerNodeId() != null) {
+            return Settled.NOT_ABANDONED;
+        }
+        final String uuid = descriptor.get().uuid();
+        if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))) {
+            return Settled.NEEDS_REPLAY;
+        }
+        // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone.
+        rollups().clearOwned(indexName, uuid, shard, markedTerm);
+        return Settled.RELEASED_CLEAN;
+    }
+
+    /** Whether the shard's log holds a write its published commit does not cover; a commit that cannot say counts as behind. */
+    private boolean unpublished(String indexName, String uuid, int shard, org.opensearch.serverless.store.WalStore log) throws IOException {
+        final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
+        if (commit.isEmpty()) {
+            return log.landedPast(0L, -1L);
+        }
+        if (commit.get().walOrdinal() >= 0L) {
+            return log.landedPast(commit.get().term(), commit.get().walOrdinal());
+        }
+        return true;
+    }
+
+    /**
+     * Lists every node that has, or once had, claims on shards -- live or long gone.
+     *
+     * @return node ids
+     * @throws IOException if the store cannot be listed
+     */
+    public List<String> nodesWithClaims() throws IOException {
+        return new ArrayList<>(blobStore.blobContainer(base.add("assignments")).children().keySet());
+    }
+
     /**
      * Lists the shards a node has claimed -- one listing, no head reads. A claim is only a hint: the head decides,
      * and a caller acting on one reads the head first.
