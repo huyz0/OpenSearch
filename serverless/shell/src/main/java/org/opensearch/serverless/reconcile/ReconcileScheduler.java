@@ -218,9 +218,8 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 // are dormant -- or to a fleet replaced wholesale, whose every shard taken at once would be a storm --
                 // and those are taken as requests ask for them. Once per incarnation: a departure can be heard again.
                 final long sinceExpiry = clock.getAsLong() - left.expiresAtMillis();
-                final String incarnation = left.nodeId() + "/" + left.ephemeralId();
-                if (closed == false && sinceExpiry <= RECENT_DEPARTURE_TTLS * leaseTtlMillis() && takenOver.add(incarnation)) {
-                    threadPool.generic().execute(() -> takeOver(left.nodeId()));
+                if (closed == false && sinceExpiry <= RECENT_DEPARTURE_TTLS * leaseTtlMillis()) {
+                    threadPool.generic().execute(() -> takeOverIfGone(left, 0));
                 }
             }
         });
@@ -307,6 +306,43 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     private long leaseTtlMillis() {
         return Math.max(1L, renewalInterval.millis() * RENEWALS_PER_TTL);
+    }
+
+    /** How many times a departure whose lease was still live is looked at again, just after that lease would run out. */
+    static final int DEPARTURE_RECHECKS = 2;
+
+    /**
+     * Takes a departed node's shards once its lease, read from the store, has run out.
+     *
+     * <p>A node leaves the membership view when its lease read fails or comes back late, as well as when it dies, and a
+     * live node's shards taken on that evidence is a storm of contested activations. So the lease is read first; a
+     * live one is looked at again just after it would expire, which is when a dead node's departure is real. The
+     * incarnation is marked taken over only when the takeover happens, so a false departure does not use up the one
+     * proactive takeover a real death of that incarnation gets.
+     */
+    private void takeOverIfGone(org.opensearch.serverless.membership.NodeLease left, int rechecks) {
+        final String incarnation = left.nodeId() + "/" + left.ephemeralId();
+        if (closed || takenOver.contains(incarnation)) {
+            return;
+        }
+        long liveUntil;
+        try {
+            liveUntil = loop.leaseLiveUntil(left.nodeId()).orElse(Long.MIN_VALUE);
+        } catch (Exception e) {
+            // Unknown, not gone: look again shortly.
+            liveUntil = clock.getAsLong();
+        }
+        if (liveUntil == Long.MIN_VALUE) {
+            if (takenOver.add(incarnation)) {
+                takeOver(left.nodeId());
+            }
+            return;
+        }
+        if (rechecks >= DEPARTURE_RECHECKS) {
+            return;
+        }
+        final long delay = Math.max(0L, liveUntil - clock.getAsLong()) + renewalInterval.millis();
+        threadPool.schedule(() -> takeOverIfGone(left, rechecks + 1), TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
     }
 
     /** The two looks at a departed node's shards; see BackgroundReconciler#takeOverFrom. */
