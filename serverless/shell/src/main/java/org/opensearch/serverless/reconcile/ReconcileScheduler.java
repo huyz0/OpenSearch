@@ -209,6 +209,16 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         // The backstop must not renew the lease as well: with the timer running, a fourth renewal per
         // TTL bought nothing but a third more lease writes. The backstop still verifies heads.
         loop.setRenewalDrivenByTimer(true);
+        // A departure -- a lease that ran out -- is when a dead node's shards should be taken, not when a request
+        // for each happens to find it. The membership view is refreshed on the renewal timer, so one is noticed
+        // within a renewal interval of the lease running out.
+        loop.membership().subscribe(delta -> {
+            for (org.opensearch.serverless.membership.NodeLease left : delta.left()) {
+                if (closed == false) {
+                    threadPool.generic().execute(() -> takeOver(left.nodeId()));
+                }
+            }
+        });
         scheduleNextRenewal();
         if (backstopInterval != null) {
             backstopTask = threadPool.scheduleWithFixedDelay(this::backstopNow, backstopInterval, ThreadPool.Names.GENERIC);
@@ -276,8 +286,25 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      *
      * @return the shards released because the lease had lapsed before it could be renewed
      */
+    /** The two looks at a departed node's shards; see BackgroundReconciler#takeOverFrom. */
+    private void takeOver(String deadNodeId) {
+        try {
+            final java.util.List<Map.Entry<String, Integer>> later = loop.takeOverFrom(deadNodeId);
+            if (later.isEmpty() == false && closed == false) {
+                threadPool.schedule(() -> loop.takeOverRemaining(deadNodeId, later), renewalInterval, ThreadPool.Names.GENERIC);
+            }
+        } catch (Exception e) {
+            logger.warn("could not take over the shards of departed node " + deadNodeId, e);
+        }
+    }
+
     private java.util.Set<ShardId> renewLeaseNow() {
         renewals.incrementAndGet();
+        try {
+            loop.refreshMembership(renewalInterval.millis());
+        } catch (Exception e) {
+            logger.warn("could not refresh the membership view; departures are noticed late", e);
+        }
         try {
             return loop.renewLease();
         } catch (Exception e) {

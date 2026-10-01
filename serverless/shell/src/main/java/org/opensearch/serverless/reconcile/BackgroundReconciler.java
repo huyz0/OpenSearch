@@ -17,6 +17,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -1360,6 +1361,118 @@ public final class BackgroundReconciler implements Closeable {
             logger.warn("could not read the head of " + indexName + "[" + shard + "] at the cap; treating it as not ours", e);
             return false;
         }
+    }
+
+    /**
+     * Takes over the shards a node held when its lease ran out, rather than waiting for a request to find each one.
+     *
+     * <p>Without this a dead node's shard was taken only when a write or a get for it arrived, failed to reach the
+     * dead owner, and raised a doubt -- so takeover time was the lease plus however long the next request for the
+     * shard took to come, and a dormant shard with acknowledged writes in its log waited for its first reader.
+     *
+     * <p><b>Split, not raced.</b> Every survivor hears the departure. Each takes at once the shards that hash to it
+     * among the live nodes, and returns the rest for a second look after {@code later} -- by when the survivor they
+     * hash to has taken them, unless it is full or slow, in which case anyone may. The head's compare-and-swap
+     * decides any race; the split only keeps every survivor from activating every shard at the same moment.
+     *
+     * <p>Only shards whose head still names the dead node. A node that shut down cleanly released its heads, and
+     * those shards stay dormant until something asks for them.
+     *
+     * @param deadNodeId the node whose lease ran out
+     * @return the claims left for the second look
+     */
+    public List<Map.Entry<String, Integer>> takeOverFrom(String deadNodeId) {
+        if (demandDriven == false || deadNodeId.equals(node.localNode().getId())) {
+            return List.of();
+        }
+        final List<Map.Entry<String, Integer>> claims;
+        try {
+            claims = plane.claimsOf(deadNodeId);
+        } catch (Exception e) {
+            logger.warn("could not list the claims of departed node " + deadNodeId + "; its shards wait for requests", e);
+            return List.of();
+        }
+        final List<String> live = new java.util.ArrayList<>();
+        for (var lease : plane.membership().current()) {
+            if (lease.nodeId().equals(deadNodeId) == false && lease.isExpiredAt(plane.clock().getAsLong()) == false) {
+                live.add(lease.nodeId());
+            }
+        }
+        java.util.Collections.sort(live);
+        final int rank = live.indexOf(node.localNode().getId());
+        final List<Map.Entry<String, Integer>> later = new java.util.ArrayList<>();
+        int taking = 0;
+        for (Map.Entry<String, Integer> claim : claims) {
+            final int mine = live.isEmpty() || rank < 0
+                ? 0
+                : Math.floorMod((claim.getKey() + "#" + claim.getValue()).hashCode(), live.size());
+            if (rank < 0 || mine == rank) {
+                if (takeIfStillHeldBy(deadNodeId, claim)) {
+                    taking++;
+                }
+            } else {
+                later.add(claim);
+            }
+        }
+        logger.info(
+            "node {} left: taking {} of its {} claimed shards, {} more if still unclaimed later",
+            deadNodeId,
+            taking,
+            claims.size(),
+            later.size()
+        );
+        return later;
+    }
+
+    /**
+     * The second look at a departed node's shards: any still named to it are taken now.
+     *
+     * @param deadNodeId the node whose lease ran out
+     * @param claims the claims {@link #takeOverFrom} left for later
+     */
+    public void takeOverRemaining(String deadNodeId, List<Map.Entry<String, Integer>> claims) {
+        int taking = 0;
+        for (Map.Entry<String, Integer> claim : claims) {
+            if (takeIfStillHeldBy(deadNodeId, claim)) {
+                taking++;
+            }
+        }
+        if (taking > 0) {
+            logger.info("node {} left: took {} more of its shards that no other survivor had", deadNodeId, taking);
+        }
+    }
+
+    private boolean takeIfStillHeldBy(String deadNodeId, Map.Entry<String, Integer> claim) {
+        try {
+            final var head = plane.heads().read(claim.getKey(), claim.getValue());
+            if (head.isEmpty() || deadNodeId.equals(head.get().ownerNodeId()) == false) {
+                return false;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        activate(claim.getKey(), claim.getValue(), true);
+        return true;
+    }
+
+    /**
+     * The membership this loop's plane consults, for the scheduler to hear departures from.
+     *
+     * @return the membership
+     */
+    public org.opensearch.serverless.membership.MembershipSource membership() {
+        return plane.membership();
+    }
+
+    /**
+     * Refreshes the membership view if it is older than {@code maxAgeMillis}: one register read, and a lease read
+     * per member whose last-read lease has run out -- which is how a departure is noticed.
+     *
+     * @param maxAgeMillis how old the view may be
+     * @throws IOException if the view cannot be read
+     */
+    public void refreshMembership(long maxAgeMillis) throws IOException {
+        plane.membership().refreshIfOlderThan(maxAgeMillis);
     }
 
     /** How many shards a node activates at once by default. */
