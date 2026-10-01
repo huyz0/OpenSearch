@@ -74,6 +74,17 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
     private static final String MAPPING = "{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"n\":{\"type\":\"long\"},"
         + "\"msg\":{\"type\":\"text\"}}}";
 
+    @SuppressForbidden(reason = "the harness's own -Dtests.fleet.setting.* overrides, read once at start")
+    private static Map<String, String> settingOverrides() {
+        final Map<String, String> overrides = new TreeMap<>();
+        for (String key : System.getProperties().stringPropertyNames()) {
+            if (key.startsWith("tests.fleet.setting.")) {
+                overrides.put(key.substring("tests.fleet.setting.".length()), System.getProperty(key));
+            }
+        }
+        return overrides;
+    }
+
     private static String prop(String key, String fallback) {
         return System.getProperty("tests.fleet." + key, fallback);
     }
@@ -137,6 +148,8 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         nodeSettings.put(ServerlessBootstrap.LEASE_TTL, Long.toString(ttlMillis));
         nodeSettings.put(ServerlessBootstrap.MAX_SHARDS, prop("max_shards", "100"));
         nodeSettings.put("serverless.roles", "ingest,search");
+        // Any node setting, as tests.fleet.setting.<name>: what an A/B run changes without a code change.
+        nodeSettings.putAll(settingOverrides());
         for (int i = 0; i < nodes; i++) {
             proxies.add(new FaultProxy("n" + i, store.getHost(), store.getPort()));
             final Path home = results.resolve("nodes").resolve("n" + i);
@@ -171,6 +184,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 final long started = System.nanoTime();
                 final int ledgerMark = ledger.writes().size();
                 final long shedMark = load.shed();
+                final Map<String, Long> termsBefore = activeTerms(steady.activeIndices());
                 line("\n## " + scenario + "\n");
                 switch (scenario.trim()) {
                     case "steady" -> steady(seconds);
@@ -191,7 +205,13 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 line("- writes shed by the client, " + FleetLoad.MAX_IN_FLIGHT + " already in flight: " + (load.shed() - shedMark));
                 line("- store requests per node: " + storeCounts());
                 line("- " + unprunable());
+                final Map<String, Long> termsAfter = activeTerms(steady.activeIndices());
+                line("- ownership churn on the active set during the scenario: " + termChurn(termsBefore, termsAfter));
                 final FleetLedger.Verdict verdict = verify(ledgerMark);
+                line(
+                    "- ownership churn on the active set during the read-back: "
+                        + termChurn(termsAfter, activeTerms(steady.activeIndices()))
+                );
                 line("- **ledger: " + verdict + "**");
                 writeReport();
                 if (verdict.clean() == false) {
@@ -369,6 +389,60 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         }
         final Matcher m = CANDIDATES.matcher(answer);
         return "logs-* for next month: " + (m.find() ? m.group(1) + " indices could not be ruled out" : searchSummary(answer));
+    }
+
+    /** The head term of each active index's shard, read from the store. */
+    private Map<String, Long> activeTerms(int active) {
+        final Map<String, Long> terms = new java.util.concurrent.ConcurrentHashMap<>();
+        final ExecutorService readers = Executors.newFixedThreadPool(16);
+        try {
+            final List<Future<?>> pending = new ArrayList<>();
+            for (int i = 0; i < active; i++) {
+                final String index = FleetLoad.populationName(i);
+                pending.add(readers.submit(() -> {
+                    plane.heads().read(index, 0).ifPresent(head -> terms.put(index, head.term()));
+                    return null;
+                }));
+            }
+            for (Future<?> f : pending) {
+                try {
+                    f.get();
+                } catch (Exception e) {
+                    // One unreadable head is one index missing from the figure.
+                }
+            }
+        } finally {
+            readers.shutdown();
+        }
+        return terms;
+    }
+
+    /**
+     * How far the active shards' terms moved: every move is an ownership change, so a hot shard whose term races is
+     * changing hands rather than serving.
+     */
+    private static String termChurn(Map<String, Long> before, Map<String, Long> after) {
+        final List<Long> moved = new ArrayList<>();
+        before.forEach((index, term) -> {
+            final Long now = after.get(index);
+            if (now != null) {
+                moved.add(now - term);
+            }
+        });
+        if (moved.isEmpty()) {
+            return "no heads read";
+        }
+        Collections.sort(moved);
+        final long total = moved.stream().mapToLong(Long::longValue).sum();
+        return String.format(
+            Locale.ROOT,
+            "%d term changes over %d shards; per shard p50 %d, p99 %d, max %d",
+            total,
+            moved.size(),
+            moved.get(moved.size() / 2),
+            moved.get(Math.min(moved.size() - 1, (int) Math.ceil(moved.size() * 0.99) - 1)),
+            moved.get(moved.size() - 1)
+        );
     }
 
     private static String rangeFrom(long gteMillis) {
