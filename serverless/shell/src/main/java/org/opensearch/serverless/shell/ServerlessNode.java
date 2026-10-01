@@ -167,6 +167,9 @@ public final class ServerlessNode implements Closeable {
      * per document.
      */
     private final org.opensearch.serverless.store.WalGroupCommitter walCommitter;
+
+    /** How many writes may wait on the object store at once; see WriteBackpressure. */
+    private final org.opensearch.serverless.store.WriteBackpressure writeBackpressure;
     /**
      * Writer shards whose log could not be appended to. Still open and still readable; refusing writes;
      * reopened from the log by the next heartbeat that reaches the store. See {@link #appendOrRelease}.
@@ -312,6 +315,12 @@ public final class ServerlessNode implements Closeable {
         // Group commit for the log. Batching only ever happens while a PUT for the same shard is already
         // in flight, so these bound the size of a group rather than schedule one -- there is no window to
         // configure. Setting max_records to 1 restores one PUT per write, which is what this replaced.
+        this.writeBackpressure = new org.opensearch.serverless.store.WriteBackpressure(
+            settings.getAsLong("serverless.write.backpressure.target_millis", 1_000L),
+            settings.getAsLong("serverless.write.backpressure.budget_millis", 5_000L),
+            settings.getAsInt("serverless.write.backpressure.min_in_flight", 4),
+            settings.getAsInt("serverless.write.backpressure.max_in_flight", 1_024)
+        );
         this.walCommitter = new org.opensearch.serverless.store.WalGroupCommitter(
             settings.getAsInt(
                 "serverless.wal.group_commit.max_records",
@@ -2940,6 +2949,15 @@ public final class ServerlessNode implements Closeable {
         validateReader(plane, indexName, shardNumber, shardId);
     }
 
+    /**
+     * Returns what the write back-pressure is doing: its limit, writes in flight, append time and refusals.
+     *
+     * @return the stats
+     */
+    public org.opensearch.serverless.store.WriteBackpressure.Stats writeBackpressure() {
+        return writeBackpressure.stats();
+    }
+
     /** Counts departures from the membership this node consults, once per plane. */
     private void watchDepartures(org.opensearch.serverless.metadata.MetadataPlane plane) {
         if (watchingDepartures.compareAndSet(false, true)) {
@@ -3224,13 +3242,16 @@ public final class ServerlessNode implements Closeable {
         boolean mayGrowMapping
     ) throws java.io.IOException {
         ensureStarted();
-        // Under the shard's fence from before the engine applies the operation until after it is
-        // acknowledged. See appendOrRelease for the interleaving this closes.
-        final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
-        try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
-            return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
-        } finally {
-            fence.unlock();
+        // Admitted before anything is applied, so a write refused for back-pressure is in neither the engine nor the log.
+        try (org.opensearch.common.lease.Releasable admitted = writeBackpressure.admit()) {
+            // Under the shard's fence from before the engine applies the operation until after it is
+            // acknowledged. See appendOrRelease for the interleaving this closes.
+            final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
+            try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
+                return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
+            } finally {
+                fence.unlock();
+            }
         }
     }
 
@@ -3368,13 +3389,16 @@ public final class ServerlessNode implements Closeable {
             return;
         }
         ensureOwnLeaseIsStillValid(shardId);
+        final long appendStarted = System.nanoTime();
         try {
             // Through the group committer rather than straight to the log: concurrent writes to this shard
             // share one PUT, and this caller returns only once the blob carrying its own records has
             // landed. The two lease checks around this call are unchanged and remain per-caller, so every
             // member of a group independently establishes that its record sits ahead of any seal.
             walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
+            writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
         } catch (Exception e) {
+            writeBackpressure.onAppend(System.nanoTime() - appendStarted, false);
             writeFenced.add(shardId);
             throw new java.io.IOException(
                 "could not log "
@@ -3781,11 +3805,13 @@ public final class ServerlessNode implements Closeable {
     public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm)
         throws java.io.IOException {
         ensureStarted();
-        final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
-        try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
-            return deleteUnderFence(shardId, id, ifSeqNo, ifPrimaryTerm);
-        } finally {
-            fence.unlock();
+        try (org.opensearch.common.lease.Releasable admitted = writeBackpressure.admit()) {
+            final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
+            try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
+                return deleteUnderFence(shardId, id, ifSeqNo, ifPrimaryTerm);
+            } finally {
+                fence.unlock();
+            }
         }
     }
 
@@ -3954,11 +3980,13 @@ public final class ServerlessNode implements Closeable {
     public java.util.List<BulkOutcome> bulkOperations(org.opensearch.core.index.shard.ShardId shardId, java.util.List<BulkOperation> batch)
         throws java.io.IOException {
         ensureStarted();
-        final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
-        try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
-            return bulkOperationsUnderFence(shardId, batch);
-        } finally {
-            fence.unlock();
+        try (org.opensearch.common.lease.Releasable admitted = writeBackpressure.admit()) {
+            final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
+            try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
+                return bulkOperationsUnderFence(shardId, batch);
+            } finally {
+                fence.unlock();
+            }
         }
     }
 
