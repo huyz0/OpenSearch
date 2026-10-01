@@ -41,6 +41,27 @@ public final class HookedBlobStore implements BlobStore {
     private final BlobStore delegate;
     private final AtomicReference<Hook> armed = new AtomicReference<>();
     private volatile boolean fired;
+    private volatile String failListingsUnder;
+    private volatile String failRegisterWritesUnder;
+
+    /**
+     * Fails every listing of a container whose path contains a fragment -- a store that cannot list a prefix, as one
+     * holding a million names under it cannot within a request.
+     *
+     * @param pathContains the fragment, or null to list normally again
+     */
+    public void failListingsUnder(String pathContains) {
+        failListingsUnder = pathContains;
+    }
+
+    /**
+     * Fails every register write in a container whose path contains a fragment.
+     *
+     * @param pathContains the fragment, or null to write normally again
+     */
+    public void failRegisterWritesUnder(String pathContains) {
+        failRegisterWritesUnder = pathContains;
+    }
 
     /**
      * Wraps a store.
@@ -91,6 +112,20 @@ public final class HookedBlobStore implements BlobStore {
             this.inner = inner;
         }
 
+        private void listing() throws IOException {
+            final String fragment = failListingsUnder;
+            if (fragment != null && inner.path().buildAsString().contains(fragment)) {
+                throw new IOException("listing refused under [" + fragment + "]");
+            }
+        }
+
+        private void registerWrite() throws IOException {
+            final String fragment = failRegisterWritesUnder;
+            if (fragment != null && inner.path().buildAsString().contains(fragment)) {
+                throw new IOException("register write refused under [" + fragment + "]");
+            }
+        }
+
         @Override
         public BlobPath path() {
             return inner.path();
@@ -134,6 +169,7 @@ public final class HookedBlobStore implements BlobStore {
 
         @Override
         public Map<String, BlobMetadata> listBlobs() throws IOException {
+            listing();
             return inner.listBlobs();
         }
 
@@ -144,11 +180,13 @@ public final class HookedBlobStore implements BlobStore {
 
         @Override
         public Map<String, BlobMetadata> listBlobsByPrefix(String blobNamePrefix) throws IOException {
+            listing();
             return inner.listBlobsByPrefix(blobNamePrefix);
         }
 
         @Override
         public List<BlobMetadata> listBlobsByPrefix(String blobNamePrefix, String startAfter, int limit) throws IOException {
+            listing();
             return inner.listBlobsByPrefix(blobNamePrefix, startAfter, limit);
         }
 
@@ -164,6 +202,7 @@ public final class HookedBlobStore implements BlobStore {
         @Override
         public List<BlobMetadata> listBlobsByPrefixInSortedOrder(String blobNamePrefix, int limit, BlobNameSortOrder order)
             throws IOException {
+            listing();
             return inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, order);
         }
 
@@ -189,6 +228,7 @@ public final class HookedBlobStore implements BlobStore {
         @Override
         public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
             throws IOException {
+            registerWrite();
             return inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
     }

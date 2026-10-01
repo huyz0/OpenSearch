@@ -66,8 +66,16 @@ import java.util.concurrent.ConcurrentHashMap;
  * about once an hour rather than on every publish. An entry wider than its shard costs a search a per-index
  * check; one narrower would lose documents, and nothing here can make one.
  *
- * <p><b>What it does not bound.</b> A group's registers grow with the indices in it: at 100,000 indices a
- * bucket holds about 1,500 entries. Entries of deleted indices stay until the name is reused.
+ * <p><b>The same invariant makes the rollups a group's name list.</b> Every way an incarnation of an index comes
+ * to hold a document writes an entry for that incarnation first: a writer's mark before the shard opens, and a
+ * restore's empty digest before its manifest lands. So an index with no entry has nothing to find, and a prefix
+ * pattern is resolved from the group's entries rather than by listing every name under the prefix -- which a store
+ * holding a million names cannot do within a request. Aliases are entered too, before the alias record is written,
+ * and are never ruled out. An entry left by a deleted index or alias costs a search one descriptor read that comes
+ * back absent; a name missing from the rollups would be a wrong answer, and nothing that holds data can be missing.
+ *
+ * <p><b>What it does not bound.</b> A group's registers grow with the indices ever written in it: at 100,000 such
+ * indices a bucket holds about 1,500 entries. Entries of deleted indices stay until the name is reused.
  */
 public final class DigestRollups {
 
@@ -106,7 +114,18 @@ public final class DigestRollups {
      * @param shards the incarnation's shard count
      * @param states one per shard
      */
-    public record Entry(String uuid, int shards, List<ShardState> states) {
+    public record Entry(String uuid, int shards, List<ShardState> states, boolean alias) {
+
+        /**
+         * An index's entry.
+         *
+         * @param uuid the incarnation the entry was written for
+         * @param shards the incarnation's shard count
+         * @param states one per shard
+         */
+        public Entry(String uuid, int shards, List<ShardState> states) {
+            this(uuid, shards, states, false);
+        }
 
         /**
          * Whether this entry settles that the index may match: every shard unowned and published, and not all of
@@ -118,7 +137,7 @@ public final class DigestRollups {
          * @return true when the entry alone has decided the index is to be searched
          */
         public boolean judgedMatchable(QueryBuilder query, long nowMillis) {
-            if (states.size() != shards) {
+            if (alias || states.size() != shards) {
                 return false;
             }
             for (ShardState state : states) {
@@ -137,7 +156,8 @@ public final class DigestRollups {
          * @return true only when every shard is unowned, published and ruled out by its digest
          */
         public boolean rulesOut(QueryBuilder query, long nowMillis) {
-            if (states.size() != shards) {
+            // An alias resolves to indices the pattern may not name; what they hold is not here to judge.
+            if (alias || states.size() != shards) {
                 return false;
             }
             for (ShardState state : states) {
@@ -238,7 +258,7 @@ public final class DigestRollups {
      */
     public void clearOwned(String name, String uuid, int shard, long term) throws IOException {
         update(name, entry -> {
-            if (entry == null || entry.uuid().equals(uuid) == false || shard >= entry.states().size()) {
+            if (entry == null || entry.alias() || entry.uuid().equals(uuid) == false || shard >= entry.states().size()) {
                 return null;
             }
             final ShardState was = entry.states().get(shard);
@@ -247,6 +267,52 @@ public final class DigestRollups {
             }
             return with(entry, shard, new ShardState(0L, was.digest()));
         });
+    }
+
+    /** The uuid an alias's entry carries: never an index's, so an index's first event replaces it. */
+    static final String ALIAS_UUID = "_alias";
+
+    /**
+     * Enters an alias's name, before the alias record is written: a pattern resolved from the rollups must find it,
+     * and an entry a deleted index left under the same name must not rule it out.
+     *
+     * @param name the alias
+     * @throws IOException if the register cannot be updated; the caller must not write the alias
+     */
+    public void markAlias(String name) throws IOException {
+        update(name, entry -> entry != null && entry.alias() ? null : new Entry(ALIAS_UUID, 0, List.of(), true));
+    }
+
+    /** One group's entries as this node last read them, and when. */
+    private record Snapshot(Map<String, Entry> entries, long readAtNanos) {
+    }
+
+    private final Map<String, Snapshot> groups = new ConcurrentHashMap<>();
+
+    /**
+     * Reads a group, reusing what this node read of it within {@code maxAgeMillis}.
+     *
+     * <p>A copy that young misses at most what was entered within it: an index activated in that window. Its
+     * readers could not have served those documents yet, but its owner could, so the window is a lag a deployment
+     * opts into ({@code serverless.search.rollup.cache_millis}); by default every search reads the group.
+     *
+     * @param group the group
+     * @param reads how the register reads are run
+     * @param maxAgeMillis how old a copy may be and still be used
+     * @return entries by index name
+     * @throws IOException if a register cannot be read
+     */
+    public Map<String, Entry> readGroup(String group, DescriptorStore.Reads reads, long maxAgeMillis) throws IOException {
+        final Snapshot cached = groups.get(group);
+        final long now = System.nanoTime();
+        if (cached != null
+            && maxAgeMillis > 0
+            && now - cached.readAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(maxAgeMillis)) {
+            return cached.entries();
+        }
+        final Map<String, Entry> read = java.util.Collections.unmodifiableMap(readGroup(group, reads));
+        groups.put(group, new Snapshot(read, now));
+        return read;
     }
 
     /**
@@ -336,7 +402,7 @@ public final class DigestRollups {
     private static Entry with(Entry entry, int shard, ShardState state) {
         final List<ShardState> states = new ArrayList<>(entry.states());
         states.set(shard, state);
-        return new Entry(entry.uuid(), entry.shards(), java.util.Collections.unmodifiableList(states));
+        return new Entry(entry.uuid(), entry.shards(), java.util.Collections.unmodifiableList(states), entry.alias());
     }
 
     static BytesReference encode(Map<String, Entry> entries) throws IOException {
@@ -345,6 +411,9 @@ public final class DigestRollups {
             builder.startObject("entries");
             for (Map.Entry<String, Entry> e : entries.entrySet()) {
                 builder.startObject(e.getKey());
+                if (e.getValue().alias()) {
+                    builder.field("alias", true);
+                }
                 builder.field("uuid", e.getValue().uuid());
                 builder.field("shards", e.getValue().shards());
                 builder.startArray("states");
@@ -394,6 +463,7 @@ public final class DigestRollups {
     private static Entry parseEntry(XContentParser parser) throws IOException {
         String uuid = null;
         int shards = 0;
+        boolean alias = false;
         final List<ShardState> states = new ArrayList<>();
         String field = null;
         XContentParser.Token token;
@@ -425,9 +495,11 @@ public final class DigestRollups {
                 uuid = parser.text();
             } else if ("shards".equals(field)) {
                 shards = parser.intValue();
+            } else if ("alias".equals(field)) {
+                alias = parser.booleanValue();
             }
         }
-        return new Entry(uuid, shards, java.util.Collections.unmodifiableList(states));
+        return new Entry(uuid, shards, java.util.Collections.unmodifiableList(states), alias);
     }
 
     /**

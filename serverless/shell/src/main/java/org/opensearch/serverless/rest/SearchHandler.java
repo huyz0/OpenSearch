@@ -697,10 +697,34 @@ public final class SearchHandler extends BaseRestHandler {
             }
             final String prefix = name.substring(0, name.length() - 1);
             final java.util.List<String> matched;
-            try {
-                matched = metadata.namesWithPrefix(prefix, serving.patternCap());
-            } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
-                return Resolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
+            java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> groupEntries = null;
+            if (serving.resolveFromRollups() && org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix)) {
+                // The group's entries are its name list: every index that can hold a document has one, so the
+                // names the listing would add are indices with nothing to find. See DigestRollups.
+                try {
+                    groupEntries = readRollups(metadata, serving, prefix);
+                } catch (Exception e) {
+                    // Not answered from a partial list: a name missing from it would be a wrong answer.
+                    return Resolution.refuse(
+                        RestStatus.SERVICE_UNAVAILABLE,
+                        "rollups_unavailable",
+                        "could not read the index names of [" + prefix + "*]: " + e.getMessage()
+                    );
+                }
+                final java.util.List<String> fromRollups = new java.util.ArrayList<>();
+                for (String entryName : groupEntries.keySet()) {
+                    if (entryName.startsWith(prefix)) {
+                        fromRollups.add(entryName);
+                    }
+                }
+                java.util.Collections.sort(fromRollups);
+                matched = fromRollups;
+            } else {
+                try {
+                    matched = metadata.namesWithPrefix(prefix, serving.patternCap());
+                } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
+                    return Resolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
+                }
             }
             final java.util.Set<String> ruledOut = ruledOutByRollups(
                 metadata,
@@ -710,8 +734,26 @@ public final class SearchHandler extends BaseRestHandler {
                 source,
                 nowMillis,
                 rolledUp,
-                judged
+                judged,
+                groupEntries
             );
+            if (groupEntries != null && matched.size() - ruledOut.size() > serving.patternCap()) {
+                // The cap bounds the work a search fans out to, so it counts what is left to search, not names a
+                // digest has already ruled out.
+                return Resolution.refuse(
+                    RestStatus.BAD_REQUEST,
+                    "too_many_indices",
+                    "more than "
+                        + serving.patternCap()
+                        + " indices begin with ["
+                        + prefix
+                        + "] and could match this query ("
+                        + (matched.size() - ruledOut.size())
+                        + "). Narrowing the pattern or naming the indices is the answer; returning the first "
+                        + serving.patternCap()
+                        + " would be a partial result that looks complete."
+                );
+            }
             for (String match : matched) {
                 fromPattern.add(match);
                 if (ruledOut.contains(match)) {
@@ -1114,7 +1156,8 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         long nowMillis,
         java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> rolledUp,
-        java.util.Set<String> judged
+        java.util.Set<String> judged,
+        java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> alreadyRead
     ) {
         if (source == null
             || serving.searchPruning() == false
@@ -1127,18 +1170,7 @@ public final class SearchHandler extends BaseRestHandler {
         }
         final java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> entries;
         try {
-            final java.util.concurrent.Executor pool = serving.threadPool().executor(ThreadPool.Names.GENERIC);
-            entries = metadata.rollups()
-                .readGroup(
-                    org.opensearch.serverless.metadata.DigestRollups.group(prefix),
-                    new org.opensearch.serverless.metadata.DescriptorStore.Reads() {
-                        @Override
-                        public <T> java.util.List<T> runAll(java.util.List<java.util.concurrent.Callable<T>> tasks)
-                            throws InterruptedException {
-                            return Fanout.run(pool, serving.searchFanoutConcurrency(), tasks);
-                        }
-                    }
-                );
+            entries = alreadyRead != null ? alreadyRead : readRollups(metadata, serving, prefix);
         } catch (Exception e) {
             // The rollups are an optimisation over the per-index path, which is always correct.
             org.apache.logging.log4j.LogManager.getLogger(SearchHandler.class)
@@ -1168,6 +1200,27 @@ public final class SearchHandler extends BaseRestHandler {
             rolledUp.remove(first);
         }
         return ruledOut;
+    }
+
+    /** Reads a prefix's rollup group on GENERIC, reusing this node's copy within the routing cache's window. */
+    private static java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> readRollups(
+        MetadataPlane metadata,
+        ServerlessNode serving,
+        String prefix
+    ) throws java.io.IOException {
+        final java.util.concurrent.Executor pool = serving.threadPool().executor(ThreadPool.Names.GENERIC);
+        return metadata.rollups()
+            .readGroup(
+                org.opensearch.serverless.metadata.DigestRollups.group(prefix),
+                new org.opensearch.serverless.metadata.DescriptorStore.Reads() {
+                    @Override
+                    public <T> java.util.List<T> runAll(java.util.List<java.util.concurrent.Callable<T>> tasks)
+                        throws InterruptedException {
+                        return Fanout.run(pool, serving.searchFanoutConcurrency(), tasks);
+                    }
+                },
+                serving.rollupCacheMillis()
+            );
     }
 
     /** Resolves many names concurrently; a name whose read failed is left for the caller to read and fail on. */

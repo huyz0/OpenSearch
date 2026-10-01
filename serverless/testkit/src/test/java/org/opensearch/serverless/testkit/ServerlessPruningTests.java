@@ -346,6 +346,157 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         }
     }
 
+    private static final String DAY_TWO = "{\"size\":0,\"track_total_hits\":true,\"query\":{\"range\":{\"@timestamp\":"
+        + "{\"gte\":\"2026-09-02\",\"lt\":\"2026-09-03\"}}}}";
+
+    private static org.opensearch.serverless.metadata.DigestRollups.Entry staleEntry(String uuid, int day) {
+        return new org.opensearch.serverless.metadata.DigestRollups.Entry(
+            uuid,
+            1,
+            List.of(
+                new org.opensearch.serverless.metadata.DigestRollups.ShardState(
+                    0L,
+                    new PruningDigest(
+                        Map.of(
+                            "@timestamp",
+                            new PruningDigest.FieldRange("date", at(day, 0), at(day, 3), "strict_date_optional_time||epoch_millis", "und")
+                        )
+                    )
+                )
+            )
+        );
+    }
+
+    /**
+     * A restore into a name a deleted index used is searched, whatever the deleted incarnation's entry said.
+     *
+     * <p>A restore publishes manifests no writer marked, so the entry an earlier incarnation left stayed in place, and
+     * matched by name it ruled the restored documents out. A restore now enters each shard before its manifest lands.
+     */
+    public void testARestoreIntoAReusedNameIsNotRuledOutByAnEarlierEntry() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("restore-reuse", ROLLUPS_ALWAYS))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            seed(node, plane, clock, days(3));
+            assertEquals(4L, first(TOTAL, send(node, "POST", "/logs-*/_search", DAY_TWO).body()));
+            assertEquals(200, send(node, "PUT", "/_snapshot/backups", null).status());
+            final Response snapshot = send(node, "PUT", "/_snapshot/backups/before", "{\"indices\":\"" + day(2) + "\"}");
+            assertEquals(snapshot.body(), 200, snapshot.status());
+
+            // The name is reused by an index holding only the 25th, then deleted again: its entry says "the 25th".
+            assertTrue(plane.deleteIndex(day(2)));
+            seedAgain(node, plane, clock, Map.of(day(2), List.of(new long[] { at(25, 5), 2_505L })));
+            assertTrue(plane.deleteIndex(day(2)));
+
+            final Response restored = send(node, "POST", "/_snapshot/backups/before/_restore?wait_for_completion=true", null);
+            assertEquals(restored.body(), 200, restored.status());
+            final Response answer = send(node, "POST", "/logs-*/_search", DAY_TWO);
+            assertEquals(answer.body(), 200, answer.status());
+            assertEquals("the restored documents are found: " + answer.body(), 4L, first(TOTAL, answer.body()));
+        }
+    }
+
+    /**
+     * An alias that takes a deleted index's name is searched through its targets. Its name is entered when it is
+     * created, replacing the entry the index left, and an alias's entry is never ruled out.
+     */
+    public void testAnAliasOverAStaleEntryIsSearchedThroughItsTargets() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-stale", ROLLUPS_ALWAYS))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final Map<String, List<long[]>> docs = days(3);
+            docs.put("other-index", days(2).get(day(2)));
+            seed(node, plane, clock, docs);
+            // What a deleted index named logs-zalias, holding only the 25th, left behind.
+            plane.rollups().plantForTest("logs-zalias", staleEntry("uuid-gone", 25));
+
+            final Response aliased = send(
+                node,
+                "POST",
+                "/_aliases",
+                "{\"actions\":[{\"add\":{\"index\":\"other-index\",\"alias\":\"logs-zalias\"}}]}"
+            );
+            assertEquals(aliased.body(), 200, aliased.status());
+            final Response answer = send(node, "POST", "/logs-*/_search", DAY_TWO);
+            assertEquals(answer.body(), 200, answer.status());
+            assertEquals("day 2's own four, and other-index's four through the alias: " + answer.body(), 8L, first(TOTAL, answer.body()));
+        }
+    }
+
+    /**
+     * A prefix pattern is resolved without listing the names under it -- which a store holding a million of them
+     * cannot do within a request -- and still finds every index that holds a document.
+     */
+    public void testAPatternIsResolvedWithoutListingItsNames() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("no-listing", ROLLUPS_ALWAYS))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            seed(node, plane, clock, days(3));
+            // Created and never written: nothing in it to find, and no entry.
+            plane.createIndex(new IndexDescriptor("logs-2026.09.30", "uuid-empty", 1, MAPPING, null));
+            store.failListingsUnder("indices");
+            final Response answer = send(node, "POST", "/logs-*/_search", DAY_TWO);
+            assertEquals(answer.body(), 200, answer.status());
+            assertEquals(answer.body(), 4L, first(TOTAL, answer.body()));
+            final Response all = send(node, "POST", "/logs-*/_search", "{\"size\":0,\"track_total_hits\":true}");
+            assertEquals(all.body(), 200, all.status());
+            assertEquals("every document of every index, the empty one contributing none: " + all.body(), 12L, first(TOTAL, all.body()));
+        }
+    }
+
+    /**
+     * An entry with no index behind it -- an alias entered and never written, a crash between the two -- costs a
+     * search one absent read and changes nothing it answers.
+     */
+    public void testAnEntryWithNothingBehindItIsHarmless() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("ghost-entry", ROLLUPS_ALWAYS))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            seed(node, plane, clock, days(3));
+            plane.rollups().markAlias("logs-ghost");
+            final Response answer = send(node, "POST", "/logs-*/_search", DAY_TWO);
+            assertEquals(answer.body(), 200, answer.status());
+            assertEquals(answer.body(), 4L, first(TOTAL, answer.body()));
+        }
+    }
+
+    /**
+     * A document cannot become searchable without its index's entry: a writer that cannot write the entry does not
+     * open the shard, and the write is not acknowledged. The reverse of the harmless case, and the one that must be
+     * impossible -- a name missing from the rollups is an index a pattern silently skips.
+     */
+    public void testAWriteCannotLandWithoutItsIndexsEntry() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("no-entry", ROLLUPS_ALWAYS))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            seed(node, plane, clock, days(1));
+            plane.createIndex(new IndexDescriptor(day(2), "uuid-" + day(2), 1, MAPPING, null));
+            store.failRegisterWritesUnder("rollups");
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want(day(2), 0);
+            try {
+                loop.tick(clock.get());
+            } catch (Exception expected) {
+                // The activation refused: the shard is not opened without its entry.
+            }
+            assertTrue("the shard must not be open without its entry", node.reconciler().openShards().isEmpty());
+            final Response put = send(node, "PUT", "/" + day(2) + "/_doc/1", "{\"@timestamp\":" + at(2, 1) + ",\"n\":1}");
+            assertNotEquals("a write with no entry must not be acknowledged: " + put.body(), 201, put.status());
+        }
+    }
+
     /** Writes more documents into indices that may exist already, publishes and lets go. */
     private void seedAgain(ServerlessNode node, MetadataPlane plane, AtomicLong clock, Map<String, List<long[]>> docs) throws Exception {
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);

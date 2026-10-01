@@ -233,7 +233,10 @@ public final class ShardReconciler {
             // Recorded where a coordinator looks for it before the commit is published, never after: a publish
             // that fails in between leaves the record wider than what is searchable, never narrower.
             final BeforePublish hook = beforePublish;
-            if (hook != null && digest.isEmpty() == false) {
+            // Even for an empty digest -- no digested fields, or one that could not be computed. Skipping it left an
+            // entry holding an earlier, narrower digest while the commit grew past it; an empty one widens the entry
+            // to rule nothing out.
+            if (hook != null) {
                 hook.accept(shardId, shard.indexSettings().getNumberOfShards(), digest);
             }
             manifest = publisherCache.computeIfAbsent(shardId, publishers)

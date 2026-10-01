@@ -800,6 +800,17 @@ public final class SnapshotHandler extends BaseRestHandler {
                         : RegisterMap.snapshotShardData(metadata.basePath(), repo, snapshot, restoring.getKey(), shard.getKey());
                     final BlobPath destBase = RegisterMap.shardData(metadata.basePath(), restoring.getValue(), newUuid, shard.getKey());
                     final CommitManifest restored = copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue());
+                    // Entered before the manifest lands, with a digest that rules nothing out: a restored index holds
+                    // documents no writer marked, and an entry a deleted index left under the name would otherwise
+                    // let a search rule the restored documents out -- or leave the index off a pattern's name list.
+                    metadata.rollups()
+                        .widen(
+                            restoring.getValue(),
+                            newUuid,
+                            capturedIndex.numberOfShards(),
+                            shard.getKey(),
+                            org.opensearch.serverless.store.PruningDigest.EMPTY
+                        );
                     // The manifest lands only if nothing has published on the new index yet. A writer that
                     // activated the shard between the descriptor's creation and this swap has already
                     // published a commit of its own, and the restored commit must not be reported as in
