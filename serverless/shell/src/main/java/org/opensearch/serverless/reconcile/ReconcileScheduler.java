@@ -345,6 +345,15 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         threadPool.schedule(() -> takeOverIfGone(left, rechecks + 1), TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
     }
 
+    /**
+     * Returns the activation queue's figures; see {@link BackgroundReconciler#activationStats}.
+     *
+     * @return the figures
+     */
+    public BackgroundReconciler.ActivationStats activationStats() {
+        return loop.activationStats();
+    }
+
     /** The two looks at a departed node's shards; see BackgroundReconciler#takeOverFrom. */
     private void takeOver(String deadNodeId) {
         try {

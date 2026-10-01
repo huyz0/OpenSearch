@@ -120,6 +120,17 @@ public final class ServerlessNode implements Closeable {
      */
     public static final String LEASE_POOL = "serverless_lease";
 
+    /**
+     * The threads shard activations run on, and nothing else does.
+     *
+     * <p>They ran on GENERIC, which is also where a write waits for the activation of the shard it is for, and where
+     * an activation pass waits for all of its own. A fleet run filled all 128 GENERIC threads with such waiters: the
+     * activations they waited for sat in GENERIC's queue behind them, one starting only when a waiting write timed out
+     * and gave its thread back. A shard whose owner had closed it locally waited ten minutes and more to be re-taken,
+     * answering every forwarded write "not open here" meanwhile.
+     */
+    public static final String ACTIVATION_POOL = "serverless_activation";
+
     /** The pool a forwarded get is answered on, at its owner: not GET, for the reason {@link #FORWARDED_WRITE_POOL} is not WRITE. */
     public static final String FORWARDED_READ_POOL = "serverless_forwarded_read";
 
@@ -365,6 +376,9 @@ public final class ServerlessNode implements Closeable {
                 "thread_pool." + FORWARDED_WRITE_POOL
             ),
             new org.opensearch.threadpool.FixedExecutorBuilder(settings, LEASE_POOL, 1, 16, "thread_pool." + LEASE_POOL),
+            // Sized past the default activation concurrency, which is what bounds how many are submitted at once;
+            // the queue only absorbs a concurrency raised beyond the pool.
+            new org.opensearch.threadpool.FixedExecutorBuilder(settings, ACTIVATION_POOL, 16, 1000, "thread_pool." + ACTIVATION_POOL),
             new org.opensearch.threadpool.FixedExecutorBuilder(
                 settings,
                 FORWARDED_READ_POOL,
