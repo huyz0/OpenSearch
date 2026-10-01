@@ -1564,8 +1564,11 @@ public final class BackgroundReconciler implements Closeable {
     /** How many shards a janitor pass looks at, at most. */
     public static final int DEFAULT_JANITOR_BUDGET = 200;
 
-    /** How many shards a janitor pass takes to replay, at most: each is a real activation, and survivors have caps. */
-    public static final int DEFAULT_JANITOR_REPLAYS = 8;
+    /**
+     * How many shards a janitor pass takes to replay, at most: each is a real activation on this node's activation
+     * threads, though it holds a cap slot only until it is published and given back.
+     */
+    public static final int DEFAULT_JANITOR_REPLAYS = 32;
 
     private final java.util.concurrent.atomic.AtomicLong janitorCursor = new java.util.concurrent.atomic.AtomicLong();
 
@@ -1703,7 +1706,7 @@ public final class BackgroundReconciler implements Closeable {
                 if (replaysLeft[0] > 0) {
                     replaysLeft[0]--;
                     counts[2]++;
-                    activate(index, shard, true);
+                    replayAndRelease(index, shard);
                 }
             }
             case NOT_ABANDONED -> {
@@ -1716,6 +1719,29 @@ public final class BackgroundReconciler implements Closeable {
                 }
             }
         }
+    }
+
+    /**
+     * Takes a shard left behind its log, replays and publishes it, and gives it straight back.
+     *
+     * <p>Held after the replay, every such shard sat on this node's cap until idle release: a pass could afford to
+     * replay only a few, and a crashed fleet leaves thousands -- every shard whose commit predates commits recording
+     * how far into the log they reach looks behind until replayed once. Given back as soon as it is published, a
+     * replay costs a slot for seconds. A shard somebody used meanwhile is kept, for the idle release to judge.
+     */
+    private void replayAndRelease(String index, int shard) {
+        activate(index, shard, true).whenComplete((taken, failure) -> {
+            if (failure != null || taken.isEmpty()) {
+                return;
+            }
+            final ShardId shardId = taken.get();
+            final Long opened = openedAt.get(shardId);
+            final java.util.OptionalLong used = node.reconciler().lastUsed(shardId);
+            if (opened != null && used.isPresent() && used.getAsLong() > opened) {
+                return;
+            }
+            letGo(shardId, "replayed and published by the janitor; nobody is using it");
+        });
     }
 
     /** Dead owners' shards given back without being taken, since this node started. */

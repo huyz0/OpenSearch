@@ -170,9 +170,14 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             assertEquals("the published shard is given back: " + pass, 1, pass.released());
             assertEquals("the other is taken to be replayed: " + pass, 1, pass.replays());
 
-            assertBusy(() -> assertEquals(1, later.reconciler().openShards().size()), 30, TimeUnit.SECONDS);
+            // Replayed, published and given straight back: nothing held, nothing marked.
+            assertBusy(() -> {
+                assertTrue("given back once published: " + later.reconciler().openShards(), later.reconciler().openShards().isEmpty());
+                assertNull(plane.heads().read("unpublished", 0).orElseThrow().ownerNodeId());
+                assertEquals(0L, markedTerm(plane, "unpublished"));
+            }, 30, TimeUnit.SECONDS);
+            loop.activateOnDemand(List.of(Map.entry("unpublished", 0)));
             final ShardId taken = later.reconciler().openShards().iterator().next();
-            assertEquals("unpublished", taken.getIndexName());
             assertTrue("what the dead node acknowledged is there", later.get(taken, "second").found());
             assertNull(plane.heads().read("published", 0).orElseThrow().ownerNodeId());
             assertEquals(0L, markedTerm(plane, "published"));
