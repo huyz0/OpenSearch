@@ -1556,8 +1556,9 @@ public final class BackgroundReconciler implements Closeable {
      * @param replays shards whose log was ahead of their commit, taken here to be replayed and published
      * @param claimsForgotten dead nodes' claims on shards whose head had moved on
      * @param bucket the rollup bucket read this pass, as group/bucket, or null if none was due here
+     * @param full whether the pass used its whole budget, so more is waiting
      */
-    public record JanitorPass(int examined, int released, int replays, int claimsForgotten, String bucket) {
+    public record JanitorPass(int examined, int released, int replays, int claimsForgotten, String bucket, boolean full) {
     }
 
     /** How many shards a janitor pass looks at, at most. */
@@ -1593,15 +1594,17 @@ public final class BackgroundReconciler implements Closeable {
         java.util.Collections.sort(live);
         final int rank = live.indexOf(node.localNode().getId());
         if (rank < 0) {
-            return new JanitorPass(0, 0, 0, 0, null);
+            return new JanitorPass(0, 0, 0, 0, null, false);
         }
         final int[] counts = new int[4]; // examined, released, replays, forgotten
         final int[] replaysLeft = { replays };
 
-        // Claims of nodes dead for longer than a live departure takes to be handled.
+        // Claims of nodes dead for longer than a live departure takes to be handled -- at most half the budget, or a
+        // crashed fleet's thousands of stale claims starve the marks, which are what make a wide search slow.
+        final int claimsBudget = Math.max(1, budget / 2);
         final long settledAfter = ReconcileScheduler.RECENT_DEPARTURE_TTLS * plane.leaseTtlMillis();
         for (String nodeId : plane.nodesWithClaims()) {
-            if (counts[0] >= budget) {
+            if (counts[0] >= claimsBudget) {
                 break;
             }
             if (live.contains(nodeId)) {
@@ -1612,7 +1615,7 @@ public final class BackgroundReconciler implements Closeable {
                 continue;
             }
             for (Map.Entry<String, Integer> claim : plane.claimsOf(nodeId)) {
-                if (counts[0] >= budget) {
+                if (counts[0] >= claimsBudget) {
                     break;
                 }
                 if (Math.floorMod((claim.getKey() + "#" + claim.getValue()).hashCode(), live.size()) != rank) {
@@ -1672,7 +1675,7 @@ public final class BackgroundReconciler implements Closeable {
                 janitorCursor.incrementAndGet();
             }
         }
-        final JanitorPass pass = new JanitorPass(counts[0], counts[1], counts[2], counts[3], read);
+        final JanitorPass pass = new JanitorPass(counts[0], counts[1], counts[2], counts[3], read, counts[0] >= budget);
         if (pass.released() + pass.replays() + pass.claimsForgotten() > 0) {
             logger.info(
                 "janitor: looked at {} shards, gave back {} fully published, took {} to replay, forgot {} stale claims",
