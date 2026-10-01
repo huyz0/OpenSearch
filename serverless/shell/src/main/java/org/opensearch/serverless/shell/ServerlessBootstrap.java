@@ -101,6 +101,16 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static final String DESCRIPTOR_REFRESH_INTERVAL = "serverless.descriptors.refresh_interval_millis";
 
+    /**
+     * How often each node cleans up after crashed nodes: a dead owner's fully published shards given back, the rollup
+     * marks and claims it left cleared, and shards it left behind its log taken to be replayed, a bounded number a
+     * pass. Zero runs no janitor.
+     */
+    public static final String JANITOR_INTERVAL = "serverless.janitor.interval_millis";
+
+    /** The production janitor interval; see {@link #JANITOR_INTERVAL}. */
+    public static final long DEFAULT_JANITOR_INTERVAL_MILLIS = 60_000L;
+
     /** The production descriptor refresh interval; see {@link #DESCRIPTOR_REFRESH_INTERVAL}. */
     public static final long DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS = 300_000L;
     /**
@@ -262,6 +272,10 @@ public final class ServerlessBootstrap implements Closeable {
             ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
         );
         node.setSignals(scheduler);
+        final long janitorMillis = complete.getAsLong(JANITOR_INTERVAL, DEFAULT_JANITOR_INTERVAL_MILLIS);
+        if (janitorMillis > 0) {
+            scheduler.setJanitorInterval(org.opensearch.common.unit.TimeValue.timeValueMillis(janitorMillis));
+        }
         scheduler.start();
 
         logger.info(

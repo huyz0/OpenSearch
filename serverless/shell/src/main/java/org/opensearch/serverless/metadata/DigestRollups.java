@@ -257,7 +257,9 @@ public final class DigestRollups {
      * @throws IOException if the register cannot be updated
      */
     public void clearOwned(String name, String uuid, int shard, long term) throws IOException {
-        update(name, entry -> {
+        // Always against the register: this node's copy may predate another node's write, and a clear skipped on a
+        // stale copy left the shard marked for good -- never ruled out of a wide search again.
+        update(name, false, entry -> {
             if (entry == null || entry.alias() || entry.uuid().equals(uuid) == false || shard >= entry.states().size()) {
                 return null;
             }
@@ -350,6 +352,29 @@ public final class DigestRollups {
         return all;
     }
 
+    /**
+     * Lists the groups that have rollups.
+     *
+     * @return the group names
+     * @throws IOException if the store cannot be listed
+     */
+    public List<String> groups() throws IOException {
+        return new ArrayList<>(blobStore.blobContainer(base).children().keySet());
+    }
+
+    /**
+     * Reads one register of a group: the entries of the names that hash to that bucket.
+     *
+     * @param group the group
+     * @param bucket the bucket, below {@value #BUCKETS}
+     * @return entries by index name
+     * @throws IOException if the register cannot be read
+     */
+    public Map<String, Entry> readBucket(String group, int bucket) throws IOException {
+        final Optional<BlobRegister> register = container(group).readRegister(blob(bucket));
+        return register.isEmpty() ? Map.of() : parse(register.get().value());
+    }
+
     @FunctionalInterface
     private interface Change {
         /** The new entry, or null to leave the register as it is. */
@@ -358,12 +383,16 @@ public final class DigestRollups {
 
     /** A read-change-swap loop on the name's bucket, skipping the read when this node's last copy says nothing changes. */
     private void update(String name, Change change) throws IOException {
+        update(name, true, change);
+    }
+
+    private void update(String name, boolean trustRemembered, Change change) throws IOException {
         final String group = group(name);
         final int bucket = bucket(name);
         final String key = group + "/" + blob(bucket);
         final BlobContainer container = container(group);
         final Map<String, Entry> remembered = known.get(key);
-        if (remembered != null && change.apply(remembered.get(name)) == null) {
+        if (trustRemembered && remembered != null && change.apply(remembered.get(name)) == null) {
             // Nothing this node knows of would change. The copy may be stale, but a register only ever widens
             // within an incarnation, so if the stale copy already covers the change the current one does too.
             return;
