@@ -967,9 +967,12 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             final List<Future<?>> pending = new ArrayList<>();
             for (String index : indices) {
                 pending.add(probes.submit(() -> {
+                    // Round the nodes in rotation by attempt: these are virtual threads, where the test framework's
+                    // randomness is not reachable.
+                    int attempt = Math.floorMod(index.hashCode(), 1 << 16);
                     while (System.nanoTime() < deadline) {
                         final List<NodeProcess> live = load.inRotation();
-                        final FleetLedger.Write write = load.write(live.get(randomIntBetween(0, live.size() - 1)), index);
+                        final FleetLedger.Write write = load.write(live.get(Math.floorMod(attempt++, live.size())), index);
                         if (write.outcome() == FleetLedger.Outcome.ACKED) {
                             writableAfter.put(index, TimeUnit.NANOSECONDS.toMillis(write.endedNanos() - fromNanos));
                             return null;
