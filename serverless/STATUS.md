@@ -1023,12 +1023,51 @@ surfaced as "the object store is broken" rather than "someone else owns this now
 did not happen, so all three are now conflicts. The conformance endpoints do not produce 409 or 404 for
 these races, which is exactly why the specification was worth reading.
 
+## What a fleet run under failure found
+
+Six shell JVMs against RustFS 1.0.0 with a million indices, 200 writes a second, and seven ten-minute scenarios
+of deliberate failure, every write attempt recorded in a client ledger and every acknowledged one read back
+afterwards (`:serverless:testkit:fleetTest`; the method and every figure are in
+[`scale-test-results.md`](scale-test-results.md)).
+
+| scenario | acked | lost | refused but visible | takeover against the 30 s TTL |
+| --- | ---: | ---: | ---: | --- |
+| steady | 102,331 | 0 | 0 | |
+| kill -9 of the busiest node | 99,719 | 0 | 0 | 267 of 267; p50 59.4 s, p99 120.6 s |
+| pause past the lease | 93,573 | 0 | 0 | 209 of 250 while frozen; p50 44.0 s; the zombie acknowledged nothing |
+| partition from the store | 95,407 | 0 | 0 | 0 of 2,120 writes acknowledged after its lease ran out |
+| 503 SlowDown, 60 s | 5,033 | 0 | 0 | recovered 20 s after the burst |
+| rolling restart | 66,102 | 0 | 0 | each node back in 5-12 s |
+| delete/recreate storm | 77,807 | 0 | 0 | 32,335 writes to deleted names refused, none visible |
+
+**No acknowledged write was lost.** The runs found five defects first, and each was fixed with a canary that fails
+without it:
+
+- **A shard could wedge with a head and no writer**, its acknowledged writes in the log and unreadable for as long
+  as the owning node lived. A reader and its replacing writer share a `ShardId`, and the stale-reader pass closed
+  by id after a store round trip in which a write had made the shard a writer. Reader releases now check and close
+  in one step, and a node named owner with nothing open re-takes the shard instead of answering "retry" or refusing
+  it at the shard cap (`ServerlessReaderBecomesWriterTests`, `ServerlessEvictionTests`).
+- **Forwarded writes deadlocked across nodes**: coordinators' WRITE threads waited on owners that applied forwarded
+  writes on WRITE. Owners now use pools that forward nothing further (`ServerlessForwardingTests`).
+- **One mget's items raced to open one reader** and all but one failed; reader opens are single-flight.
+- **A filesystem store listed half-written blobs**, which the log's fencing took for fences; exclusive writes now
+  publish by hard link (`FsBlobContainerTests`, and `FsLogFencingTests`, which had been failing about one run in ten).
+- **A release could skip its publish** for an operation still in flight at the previous flush.
+
+**What it measured that is still open.** A wide `logs-*` search fails outright at a million indices: RustFS cannot
+list a million names under one prefix, so the listing the resolution depends on times out server-side. Idle, a node
+costs about 190 store requests per held shard per hour, most of them the 30-second descriptor refresh. A shard
+nobody owns can briefly be read from a commit behind its log after a lapsed owner gives back its head unpublished;
+every such read in these runs resolved once the shard was taken. And a fleet-wide SlowDown stalls writes for the
+client's whole timeout rather than shedding them early.
+
 ## How it is tested
 
-574 tests in `:serverless:testkit:test` and 37 in `s3Test`, plus `pluginTest` (a real plugin installed from its
-assembled zip), `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off)
-and `s3Test` (against live MinIO and SeaweedFS endpoints, which assume-skips with no endpoint
-reachable).
+671 tests in `:serverless:testkit:test` and 37 in `s3Test`, plus `pluginTest` (a real plugin installed from its
+assembled zip), `processTest` (forked JVMs), `tlsTest` (a real TLS handshake, security manager off),
+`s3Test` (against live MinIO and SeaweedFS endpoints, which assume-skips with no endpoint
+reachable) and `fleetTest` (a fleet under load and failure against a real store; see above).
 
 Core's own suite passes on this base too: `:server:test` is 20,643 tests, 0 failures. That matters
 here because the 364 lines this branch adds to `server/` are additive, and this is the evidence

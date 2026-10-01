@@ -147,7 +147,9 @@ final class NodeProcess implements Closeable {
         drain.start();
 
         String readyLine = null;
-        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+        // Generous: a node restarted on a machine already running a loaded fleet and its store can take minutes,
+        // and a start abandoned early fails a scenario for the harness's impatience rather than the node's.
+        final long deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(5);
         while (System.nanoTime() < deadline) {
             if (java.nio.file.Files.exists(readyFile)) {
                 final String contents = java.nio.file.Files.readString(readyFile).strip();

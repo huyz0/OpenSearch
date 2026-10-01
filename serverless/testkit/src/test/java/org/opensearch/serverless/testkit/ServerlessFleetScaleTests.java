@@ -115,11 +115,17 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
         header(nodes, population, activePerNode, seconds, endpoint, bucket);
 
-        // The deployment: the population's descriptors, written straight to the store.
-        final long populatingSince = System.nanoTime();
-        populate(population);
-        final long populatingSeconds = TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - populatingSince);
-        line("Population: " + population + " indices created in " + populatingSeconds + " s.\n");
+        // The deployment: the population's descriptors, written straight to the store. A bucket kept from an earlier
+        // run that already holds the whole population is reused as it is: creating a million descriptors takes a
+        // quarter of an hour, and doing it again would only fail a million times.
+        if (plane.describe(FleetLoad.populationName(population - 1)).isPresent()) {
+            line("Population: " + population + " indices, reused from the bucket.\n");
+        } else {
+            final long populatingSince = System.nanoTime();
+            populate(population);
+            final long populatingSeconds = TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - populatingSince);
+            line("Population: " + population + " indices created in " + populatingSeconds + " s.\n");
+        }
 
         // The fleet, each node behind its own proxy.
         final URI store = URI.create(endpoint);
@@ -202,6 +208,11 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             }
             for (NodeProcess node : fleet) {
                 Files.write(results.resolve(node.name() + ".log"), node.output(), StandardCharsets.UTF_8);
+            }
+            // The nodes' local data is a cache of the store, gigabytes of it at scale, and it sits under the project's
+            // build directory where every file-tree task would walk it. The logs, the ledger and the report stay.
+            for (Path home : homes) {
+                org.opensearch.common.util.io.IOUtils.rm(home.resolve("data"));
             }
             if (keepBucket == false && Boolean.parseBoolean(prop("keep_bucket", "false")) == false) {
                 org.opensearch.repositories.s3.MinioBlobStores.deleteBucket(endpoint, access, secret, bucket, createTempDir());
@@ -625,7 +636,9 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             null,
             homes.get(i),
             settings,
-            List.of("-Xmx" + prop("heap", "2g"), "-Xms" + prop("heap", "2g"), "-Dlog4j.configurationFile=" + logConfig(homes.get(i)))
+            // The maximum only. Committing the whole heap at start made a node restarted mid-run, on a machine whose
+            // memory the fleet and the store already had, page for longer than the harness would wait.
+            List.of("-Xmx" + prop("heap", "2g"), "-Xms256m", "-Dlog4j.configurationFile=" + logConfig(homes.get(i)))
         );
     }
 

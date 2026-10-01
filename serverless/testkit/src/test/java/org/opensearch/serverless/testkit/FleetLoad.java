@@ -95,7 +95,8 @@ final class FleetLoad implements Closeable {
         this.ledger = ledger;
         this.shape = shape;
         this.runId = runId;
-        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+        // HTTP/1.1, what a node speaks: the client's default asks every new connection to upgrade to HTTP/2 first.
+        this.http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(5)).build();
     }
 
     void reshape(Shape shape) {
@@ -279,7 +280,7 @@ final class FleetLoad implements Closeable {
                 -1,
                 -1,
                 FleetLedger.Outcome.UNKNOWN,
-                e.getClass().getSimpleName()
+                describe(e)
             );
         }
         ledger.record(write);
@@ -394,6 +395,12 @@ final class FleetLoad implements Closeable {
             throw new IllegalStateException(method + " " + path + " answered " + response.statusCode() + ": " + response.body());
         }
         return response.body();
+    }
+
+    /** A failure's class and the gist of its message, numbers folded, so failures of one kind group together. */
+    private static String describe(Exception e) {
+        final String message = e.getMessage() == null ? "" : e.getMessage().replaceAll("[0-9]+", "N");
+        return e.getClass().getSimpleName() + (message.isEmpty() ? "" : " " + message.substring(0, Math.min(60, message.length())));
     }
 
     /** Latency and outcomes of one kind of request that ended within a window. */
