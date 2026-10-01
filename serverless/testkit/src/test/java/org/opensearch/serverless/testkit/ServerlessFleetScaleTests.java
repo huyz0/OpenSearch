@@ -159,6 +159,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             Double.parseDouble(prop("churn_per_second", "5"))
         );
         load = new FleetLoad(() -> List.copyOf(fleet), ledger, steady, runId);
+        final Thread sampler = startActivationSampler();
         try {
             load.start();
             // Warm: the active set taken, before anything is measured. Longer on a bucket a crashed run left behind,
@@ -199,6 +200,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 }
             }
         } finally {
+            sampler.interrupt();
             load.close();
             load.stop();
             ledger.flush();
@@ -1002,6 +1004,78 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
     private static final int IDLE_SETTLE_SECONDS = 75;
 
     private static final Pattern HELD_SHARD = Pattern.compile("\"kind\"\\s*:\\s*\"(writer|reader|frozen_view)\"");
+
+    private static final Pattern QUEUE_FIELD = Pattern.compile(
+        "\"(queued|running|done|wait_millis|run_millis|max_wait_millis|max_run_millis)\"\\s*:\\s*(\\d+)"
+    );
+
+    /**
+     * Every node's activation queue and held shards, every fifteen seconds, to activation.csv: how long a take waited
+     * for its turn, which a node's own counters are the only record of.
+     */
+    private Thread startActivationSampler() throws java.io.IOException {
+        final Path csv = results.resolve("activation.csv");
+        Files.writeString(csv, "epoch_ms,node,held,queued,running,done,wait_millis,run_millis,max_wait_millis,max_run_millis\n");
+        final Thread thread = new Thread(() -> {
+            try (
+                java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                    .connectTimeout(java.time.Duration.ofSeconds(5))
+                    .build()
+            ) {
+                while (Thread.currentThread().isInterrupted() == false) {
+                    final StringBuilder rows = new StringBuilder();
+                    for (NodeProcess node : List.copyOf(fleet)) {
+                        try {
+                            final String body = client.send(
+                                java.net.http.HttpRequest.newBuilder()
+                                    .uri(URI.create("http://" + node.http() + "/_serverless/stats"))
+                                    .timeout(java.time.Duration.ofSeconds(10))
+                                    .GET()
+                                    .build(),
+                                java.net.http.HttpResponse.BodyHandlers.ofString()
+                            ).body();
+                            final Map<String, String> fields = new HashMap<>();
+                            final Matcher m = QUEUE_FIELD.matcher(body);
+                            while (m.find()) {
+                                fields.putIfAbsent(m.group(1), m.group(2));
+                            }
+                            int held = 0;
+                            final Matcher h = HELD_SHARD.matcher(body);
+                            while (h.find()) {
+                                held++;
+                            }
+                            rows.append(System.currentTimeMillis()).append(',').append(node.name()).append(',').append(held);
+                            for (String f : new String[] {
+                                "queued",
+                                "running",
+                                "done",
+                                "wait_millis",
+                                "run_millis",
+                                "max_wait_millis",
+                                "max_run_millis" }) {
+                                rows.append(',').append(fields.getOrDefault(f, ""));
+                            }
+                            rows.append('\n');
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        } catch (Exception e) {
+                            rows.append(System.currentTimeMillis()).append(',').append(node.name()).append(",,,,,,,,\n");
+                        }
+                    }
+                    Files.writeString(csv, rows, StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.APPEND);
+                    Thread.sleep(15_000L);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                logger.warn("the activation sampler stopped", e);
+            }
+        }, "fleet-activation-sampler");
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
+    }
 
     /** How many shards each live node holds open, as it reports itself; a node that does not answer is left out. */
     private Map<String, Integer> heldShardsPerNode() {
