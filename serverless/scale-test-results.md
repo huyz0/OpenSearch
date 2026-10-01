@@ -34,6 +34,110 @@ could make acknowledged writes unreadable and one of which made the fleet stop a
 | idle background | ~77,000 store requests per node-hour holding ~400 shards: 190 per held shard per hour |
 | wide `logs-*` search | **fails at this population**: the store cannot list a million names under one prefix |
 
+## Goal 9: the five open items, and what a starved pool had been hiding
+
+Goal 9 took the five items the first full-scale runs left open, correctness first, and re-ran the fleet at a million
+indices after each change. The final run is `run1790863291492`: the same fleet, population and load as above, five
+scenarios of five minutes each after a two-minute warm-up, on the bucket the earlier runs left behind.
+
+**Correctness held throughout: 0 acknowledged writes lost and 0 refused writes visible in every scenario of every
+run, and 0 searches silently answering from a commit behind the log.** The new stale-read check searched up to 5,991
+indices after each scenario; every one with no live writer answered with all of its acknowledged documents or
+reported itself as not answering.
+
+| | before (Goal 8) | after (Goal 9) | target |
+| --- | --- | --- | --- |
+| lost / refused but visible | 0 / 0 | **0 / 0**, all five scenarios | 0 / 0 |
+| stale reads of an unowned shard | possible, unmeasured | **0 silently behind**; up to 3,894 per scenario reported as not answering | 0 |
+| kill -9 takeover, p50 / p99 | 59.4 s / 120.6 s | **35.3 s / 43.2 s** (109 of 109 shards) | ≤ 45 s / ≤ 60 s |
+| idle store requests, per held shard-hour | 190 | 86-106 on the nodes that kept their shards; 227 across the fleet while it released shards | 5× lower, flat |
+| SlowDown burst | writes stalled to the client timeout, p50 30 s; back in 20 s | 939 refused early with 429 + `Retry-After`; accepted p50 16.9 s, p99 39.5 s; back to baseline in 116 s | early 429s, quick recovery |
+| wide `logs-*` at 1M | listing failed server-side | resolved from rollups without listing in **0.17-0.23 s**, cold or warm, then refused at the 10,000-index cap | resolve without listing |
+
+### Part 1: a shard nobody owns cannot be read behind its log
+
+A node whose lease lapses gives back its heads unpublished, and a get of such a shard answered from the published
+commit. Each published `CommitManifest` now records how far into the shard's log it reaches (`wal_ordinal`). A reader
+whose shard has no live writer checks whether any record landed past that point; if one did, a get takes the shard
+and answers from its writer, and a search reports the shard as not answering (`shard_behind_log`) rather than
+answering short. Manifests written before this carry no ordinal and are judged by comparing sequence numbers.
+
+Validating it found a durability-adjacent bug: the shell never advanced the global checkpoint, so the engine's safe
+commit stayed the one it opened from, which named files the collector had since deleted; the engine failed, and a
+failed engine kept its head. Publishing now advances the global checkpoint, and a failed writer is closed and its
+shard re-taken from the published commit and log (`ServerlessCommitRetentionTests`, `ServerlessFailedEngineTests`).
+
+### Part 2: wide searches resolve without listing
+
+A pattern whose prefix is covered by a rollup group is resolved from the group's rollups instead of listing the
+store. A name created after a crash before its rollup entry, or an alias, can never be ruled out: an alias entry
+rules nothing out, a restore widens the rollup before it publishes, and a missing entry costs one descriptor read
+rather than a wrong answer (`ServerlessPruningTests`). At a million indices `logs-*` now resolves in about 0.2 s; it is
+then refused, correctly, because 40,000 to 48,000 indices could match -- see "Still open".
+
+### Part 3: takeover after kill -9
+
+Before, every shard of a dead node waited for a request to find it unowned. Now each survivor hears the departure
+and takes the shards that hash to it, once the departed node's lease, read from the store, has run out. Renewal moved
+to its own thread so a burst of activations cannot make a busy node look dead. In the final run the lease ran out 26 s
+after the kill, survivors held all 109 heads by p50 35.3 s, and the first write was acknowledged a median 7.9 s after
+that.
+
+### Part 4: idle cost
+
+Every open index's descriptor was re-read every 30 s, 120 reads an hour per index and most of an idle node's
+traffic. Every operation now passes the incarnation fence before as well as after it runs, and the fence applies the
+descriptor it reads, so a mapping or settings change made through another node is in force for the first operation
+after it; the periodic re-read is a five-minute backstop (`ServerlessDescriptorPropagationTests`, which also found
+that such a change used to fail the owner's next write with a 500).
+
+Measured over 180 s with the load stopped, after 75 s for in-flight writes to drain, the two nodes that kept their
+~390 shards cost 33,000 and 41,000 requests an hour, **86 and 106 per held shard-hour against 190 before**: about
+2× lower, not the 5× asked for. The fleet-wide figure, 227, is dominated by the other four nodes releasing 80 to 160
+shards each during the window -- the publishes and sweeps of going idle, not steady background. What remains per
+held shard is head verification, reader staleness checks and the descriptor backstop; separating those from the
+release traffic is the next measurement.
+
+### Part 5: SlowDown is shed early
+
+A node now limits the writes waiting on the store with additive increase and multiplicative decrease on log-append
+time, and refuses past the limit with `429` and a `Retry-After`, before applying anything, so every refusal is
+honest (`ServerlessWriteBackpressureTests`). During a minute of SlowDown on half of all requests (13,828 injected),
+939 writes were refused at once instead of timing out; the limiter was back to baseline 116 s after the burst.
+Without any injected throttling it also sheds load when this single-drive store is simply slow: about 26,000 of
+steady's refusals said "the object store is slow to take writes". That is the store being the bottleneck, reported
+honestly; whether the one-second target suits this store is open.
+
+### What the runs found along the way
+
+- **Shard activations starved the GENERIC pool they ran on.** Writes wait on GENERIC for their shard's activation,
+  and activation passes wait there for their own. Under load all 128 threads were such waiters and the activations
+  sat in the queue behind them, each starting only when a waiter timed out: nodes showed 300 activations queued
+  with eight slots "running" and nothing running, and shards closed locally went unserved for 10 to 20 minutes,
+  every forwarded write answered "not open here". This was most of every earlier run's steady-state errors (22% to
+  75% of writes). Activations now run on `serverless_activation` (`ServerlessActivationStarvationTests`): the queue
+  wait fell from 3 minutes to under 20 s, "not open here" from 14,734 to 3 per steady scenario, and acknowledged
+  steady writes rose from 14,960 to 35,450 in the steady-only rerun.
+- **A dynamic mapping addition that conflicted with the mapping poisoned the node's growth queue** for that index,
+  failing every later write that added a field. Fixed with the descriptor propagation above.
+- **Proactive takeover trusted the membership view**, which loses a member whose lease read failed. Live peers'
+  shards were never taken -- the head's own liveness check refused -- but each attempt cost store reads. It now
+  reads the lease first.
+- **The harness misreported twice.** A delete whose outcome the client never learned, applied 160 s later, was
+  counted as 23 lost writes; and the read-back retried every unread shard through one node, which had to take 1,200
+  shards against a cap of 400 and reported 16 writes as lost that forensics found on every node. Both fixed; neither
+  was data loss.
+
+### Still open
+
+- **Rollup "owned" marks outlive crashed owners.** A shard marked owned is never ruled out of a wide search, and the
+  mark is cleared only on a clean release, so every crashed run leaves its shards' marks behind. A `logs-*` search
+  for a range thirty days in the future still found about 47,700 candidates.
+- **Survivors at their cap take a frozen node's shards slowly.** With every node near 400 shards, the pause scenario
+  re-took 44 of 376 while the owner was frozen (p50 55.8 s); taking needs evicting first.
+- **The idle measurement includes going idle.** See part 4.
+- **The write limiter's target** against this store, and SlowDown recovery in 116 s rather than 20 s; see part 5.
+
 
 ## Method
 
@@ -233,7 +337,7 @@ by then near the end of its memory: six 3 GB nodes, the harness, and the store's
 A node starting with its whole heap committed paged for longer than the harness waited. The harness now starts
 nodes with a small initial heap and waits five minutes; on the rerun every node restarted in 5 to 12 s.
 
-### Open
+### Open (closed by Goal 9; see above)
 
 - **A shard nobody owns can be read from a commit behind its log.** A node whose lease lapses gives back the heads
   it held without publishing (it cannot: it has lost the right to), and a release at a failed open or a failed
