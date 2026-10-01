@@ -315,6 +315,23 @@ public final class BlobLeaseMembership implements MembershipSource {
      *     not be read -- refusing the takeover is the safe answer to both
      */
     public boolean revoke(String nodeId, String ephemeralId) {
+        // Read again after a lost swap, and decide on what is there then. Concurrent takeovers of a dead node's
+        // shards all read the same unrevoked lease; the first swap revoked it and every other one lost -- and was
+        // answered "alive after all", so all but one of the dead node's shards waited for a later request to try
+        // again. A lost swap means the lease moved: to revoked, which is the answer wanted, or to a renewal.
+        for (int attempt = 0; attempt < REVOKE_ATTEMPTS; attempt++) {
+            final Boolean decided = revokeOnce(nodeId, ephemeralId);
+            if (decided != null) {
+                return decided;
+            }
+        }
+        return false;
+    }
+
+    private static final int REVOKE_ATTEMPTS = 8;
+
+    /** One read and swap; null when the swap lost and the lease must be read again. */
+    private Boolean revokeOnce(String nodeId, String ephemeralId) {
         final String name = LEASE_PREFIX + nodeId;
         try {
             final Optional<BlobRegister> register = container.readRegister(name);
@@ -339,7 +356,9 @@ public final class BlobLeaseMembership implements MembershipSource {
             if (lease.isExpiredAt(clock.getAsLong()) == false) {
                 return false;
             }
-            return container.compareAndSwapRegister(name, register.get().generation(), lease.revokedCopy().toBytes()).applied();
+            return container.compareAndSwapRegister(name, register.get().generation(), lease.revokedCopy().toBytes()).applied()
+                ? true
+                : null;
         } catch (Exception e) {
             return false;
         }

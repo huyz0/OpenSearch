@@ -1416,6 +1416,34 @@ public final class MetadataPlane {
     }
 
     /**
+     * Lists the shards a node has claimed -- one listing, no head reads. A claim is only a hint: the head decides,
+     * and a caller acting on one reads the head first.
+     *
+     * @param nodeId the node
+     * @return index and shard number of each claim
+     * @throws IOException if the claims cannot be listed
+     */
+    public List<Map.Entry<String, Integer>> claimsOf(String nodeId) throws IOException {
+        final List<Map.Entry<String, Integer>> claims = new ArrayList<>();
+        for (String claim : blobStore.blobContainer(RegisterMap.assignments(base, nodeId)).listBlobs().keySet()) {
+            final int separator = claim.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
+            if (separator < 0) {
+                continue;
+            }
+            try {
+                final String indexName = claim.substring(0, separator);
+                final int shard = Integer.parseInt(claim.substring(separator + RegisterMap.SHARD_SEPARATOR.length()));
+                if (Names.isValidIndexOrAlias(indexName)) {
+                    claims.add(Map.entry(indexName, shard));
+                }
+            } catch (NumberFormatException e) {
+                // Not a claim this system writes.
+            }
+        }
+        return claims;
+    }
+
+    /**
      * Reads what one incarnation of a node owns, as the heads say.
      *
      * <p>A head is inherited only when its owner's ephemeral id is this incarnation's. A node restarted

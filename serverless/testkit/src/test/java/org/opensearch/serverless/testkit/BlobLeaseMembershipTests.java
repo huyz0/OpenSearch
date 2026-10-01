@@ -43,6 +43,35 @@ public class BlobLeaseMembershipTests extends OpenSearchTestCase {
         return new NodeLease(id, id + "-eph", "127.0.0.1:9300", Set.of(roles), 0L);
     }
 
+    /**
+     * Two takers revoking one dead node's lease at once are both told it is revoked.
+     *
+     * <p>Every survivor taking a dead node's shards revokes its lease first, and they all read the same unrevoked
+     * lease. The first swap lands; every other one lost the swap and was answered "alive after all" -- so all but one
+     * of the dead node's shards were refused and waited for a later request. The hook runs one taker's whole
+     * revocation inside the other's read, so the second swap loses every time.
+     */
+    public void testAConcurrentRevocationOfADeadLeaseIsNotMistakenForALiveOne() throws Exception {
+        final AtomicLong now = new AtomicLong(1_000L);
+        final HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final BlobLeaseMembership owner = new BlobLeaseMembership(store.blobContainer(BlobPath.cleanPath()), now::get, TTL);
+        owner.renew(lease("dying"));
+        now.addAndGet(2 * TTL);
+
+        final BlobLeaseMembership first = new BlobLeaseMembership(store.blobContainer(BlobPath.cleanPath()), now::get, TTL);
+        final BlobLeaseMembership second = new BlobLeaseMembership(store.blobContainer(BlobPath.cleanPath()), now::get, TTL);
+        final java.util.concurrent.atomic.AtomicBoolean firstRevoked = new java.util.concurrent.atomic.AtomicBoolean();
+        store.onNextRegisterRead(
+            "",
+            BlobLeaseMembership.LEASE_PREFIX + "dying",
+            () -> firstRevoked.set(first.revoke("dying", "dying-eph"))
+        );
+
+        assertTrue("the second taker: the lease is revoked, by whoever got there first", second.revoke("dying", "dying-eph"));
+        assertTrue("the hook ran the first taker inside the second's read", store.fired());
+        assertTrue("and the first taker revoked it", firstRevoked.get());
+    }
+
     public void testRenewMakesANodeVisible() throws Exception {
         final AtomicLong now = new AtomicLong(1_000L);
         final BlobLeaseMembership membership = new BlobLeaseMembership(container(createTempDir()), now::get, TTL);
