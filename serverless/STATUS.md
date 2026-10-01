@@ -1062,6 +1062,33 @@ nobody owns can briefly be read from a commit behind its log after a lapsed owne
 every such read in these runs resolved once the shard was taken. And a fleet-wide SlowDown stalls writes for the
 client's whole timeout rather than shedding them early.
 
+### Goal 9: those items, and a starved pool
+
+Goal 9 closed or measured each of them, re-running the fleet at a million indices after each change; the detail
+is in [`scale-test-results.md`](scale-test-results.md#goal-9-the-five-open-items-and-what-a-starved-pool-had-been-hiding).
+**Every run kept 0 lost and 0 refused-but-visible, and a new stale-read check found 0 searches answering from a
+commit behind the log.**
+
+| | before | after |
+| --- | --- | --- |
+| a shard nobody owns, read behind its log | possible | refused: manifests record the log position they cover (`shard_behind_log`) |
+| kill -9 takeover p50 / p99 | 59.4 s / 120.6 s | **35.3 s / 43.2 s**: survivors take a dead node's shards when its lease runs out |
+| wide `logs-*` at a million indices | the store listing failed | resolved from rollups in about 0.2 s, no listing |
+| idle requests per held shard-hour | 190 | 86-106 where shards stayed held; the 30 s descriptor re-read is a five-minute backstop, and changes arrive through the fence every operation passes |
+| SlowDown | writes stalled to the timeout | refused early with 429 and `Retry-After`, never applied |
+
+The runs also found that **shard activations starved the GENERIC pool**: writes waiting for an activation filled
+every thread, and the activations they waited for queued behind them for minutes. That was most of every earlier
+run's steady-state errors; activations now have their own pool (`serverless_activation`). Fixed besides: the global
+checkpoint never advanced, so a writer's safe commit could name deleted files and fail its engine; a failed writer
+kept its head; a mapping change made through another node failed the owner's next write; a conflicting dynamic
+mapping addition blocked every later one on that node.
+
+Still open: rollup "owned" marks left by crashed owners are never cleared, so a wide search cannot rule those shards
+out; survivors at their shard cap re-take a frozen node's shards slowly; the idle figure still mixes in the cost of
+going idle, so the 5× target is not yet shown; and the write limiter sheds load on this single-drive store even
+without injected throttling, and took 116 s to recover from a SlowDown burst.
+
 ## How it is tested
 
 671 tests in `:serverless:testkit:test` and 37 in `s3Test`, plus `pluginTest` (a real plugin installed from its
