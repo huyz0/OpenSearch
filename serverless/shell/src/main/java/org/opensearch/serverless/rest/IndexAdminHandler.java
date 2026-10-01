@@ -1000,6 +1000,12 @@ public final class IndexAdminHandler extends BaseRestHandler {
 
     static BytesRestResponse failure(org.opensearch.rest.RestChannel channel, Exception e) throws IOException {
         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.opensearch.serverless.store.WriteBackpressure.ThrottledException throttled) {
+                // Refused before anything was applied: an honest "not now", with when to come back.
+                final BytesRestResponse response = new BytesRestResponse(channel, e);
+                response.addHeader("Retry-After", Integer.toString(throttled.retryAfterSeconds()));
+                return response;
+            }
             if (cause instanceof org.opensearch.serverless.shell.StaleIncarnationException) {
                 // Routed by a resolution that has since gone stale; resolving again is the whole remedy.
                 return error(channel, RestStatus.SERVICE_UNAVAILABLE, "index_recreated", cause.getMessage());

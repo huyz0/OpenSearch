@@ -43,6 +43,20 @@ public final class HookedBlobStore implements BlobStore {
     private volatile boolean fired;
     private volatile String failListingsUnder;
     private volatile String failRegisterWritesUnder;
+    private volatile String delayWritesUnder;
+    private volatile long delayMillis;
+
+    /**
+     * Delays every blob write in a container whose path contains a fragment -- a store that is slow to take writes
+     * there, as a throttled one is.
+     *
+     * @param pathContains the fragment, or null to write at full speed again
+     * @param millis how long each such write takes at least
+     */
+    public void delayWritesUnder(String pathContains, long millis) {
+        delayMillis = millis;
+        delayWritesUnder = pathContains;
+    }
 
     /**
      * Fails every listing of a container whose path contains a fragment -- a store that cannot list a prefix, as one
@@ -148,6 +162,10 @@ public final class HookedBlobStore implements BlobStore {
 
         @Override
         public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
+            final String fragment = delayWritesUnder;
+            if (fragment != null && inner.path().buildAsString().contains(fragment)) {
+                java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(delayMillis));
+            }
             inner.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
         }
 
