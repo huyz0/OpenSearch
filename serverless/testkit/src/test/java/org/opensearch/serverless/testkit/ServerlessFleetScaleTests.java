@@ -190,6 +190,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 line("- not acknowledged, by reason: " + load.refusalReasons(started, ended));
                 line("- writes shed by the client, " + FleetLoad.MAX_IN_FLIGHT + " already in flight: " + (load.shed() - shedMark));
                 line("- store requests per node: " + storeCounts());
+                line("- " + unprunable());
                 final FleetLedger.Verdict verdict = verify(ledgerMark);
                 line("- **ledger: " + verdict + "**");
                 writeReport();
@@ -349,6 +350,25 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 line("- wide search, " + shape + ": " + String.join("; ", outcomes));
             });
         }
+    }
+
+    private static final Pattern CANDIDATES = Pattern.compile("could match this query \\((\\d+)\\)");
+
+    /**
+     * How many indices a search for a range no index can hold still cannot rule out: those whose rollup marks a
+     * writer, live or left behind by a crash, plus any refused for another reason. The janitor drives it down.
+     */
+    private String unprunable() {
+        final String body = rangeFrom(System.currentTimeMillis() + TimeUnit.DAYS.toMillis(30));
+        String answer;
+        try {
+            answer = load.requestBody(load.inRotation().get(0), "POST", "/logs-*/_search", body);
+        } catch (Exception e) {
+            // A refusal at the cap is the usual answer, and it names the count.
+            answer = String.valueOf(e.getMessage());
+        }
+        final Matcher m = CANDIDATES.matcher(answer);
+        return "logs-* for next month: " + (m.find() ? m.group(1) + " indices could not be ruled out" : searchSummary(answer));
     }
 
     private static String rangeFrom(long gteMillis) {
