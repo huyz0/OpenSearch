@@ -214,7 +214,12 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         // within a renewal interval of the lease running out.
         loop.membership().subscribe(delta -> {
             for (org.opensearch.serverless.membership.NodeLease left : delta.left()) {
-                if (closed == false) {
+                // Only a departure that just happened. A lease that ran out long ago belongs to a node whose shards
+                // are dormant -- or to a fleet replaced wholesale, whose every shard taken at once would be a storm --
+                // and those are taken as requests ask for them. Once per incarnation: a departure can be heard again.
+                final long sinceExpiry = clock.getAsLong() - left.expiresAtMillis();
+                final String incarnation = left.nodeId() + "/" + left.ephemeralId();
+                if (closed == false && sinceExpiry <= RECENT_DEPARTURE_TTLS * leaseTtlMillis() && takenOver.add(incarnation)) {
                     threadPool.generic().execute(() -> takeOver(left.nodeId()));
                 }
             }
@@ -265,6 +270,12 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             java.util.Set<ShardId> released;
             try {
                 released = renewLeaseNow();
+                // After the renewal, never before it: reading the membership is I/O the lease must not wait for.
+                try {
+                    loop.refreshMembership(renewalInterval.millis());
+                } catch (Exception e) {
+                    logger.warn("could not refresh the membership view; departures are noticed late", e);
+                }
             } finally {
                 // In a finally, and renewLeaseNow never throws: a renewal loop that stops rescheduling
                 // because one pass failed is a node that looks alive until its lease lapses.
@@ -277,8 +288,10 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 // the pass is allowed to hold it up.
                 scheduleNextRenewal();
             }
-            verifyNow(released);
-        }, nextRenewalDelay(), ThreadPool.Names.GENERIC);
+            // The scan reads a head per held shard and is not what keeps the lease alive: back to GENERIC with it.
+            final java.util.Set<ShardId> releasedByRenewal = released;
+            threadPool.generic().execute(() -> verifyNow(releasedByRenewal));
+        }, nextRenewalDelay(), org.opensearch.serverless.shell.ServerlessNode.LEASE_POOL);
     }
 
     /**
@@ -286,6 +299,16 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      *
      * @return the shards released because the lease had lapsed before it could be renewed
      */
+    /** How long ago a lease may have run out and still be a departure whose shards are taken at once, in TTLs. */
+    static final int RECENT_DEPARTURE_TTLS = 3;
+
+    /** The departed incarnations already taken over from, so a departure heard twice is acted on once. */
+    private final java.util.Set<String> takenOver = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private long leaseTtlMillis() {
+        return Math.max(1L, renewalInterval.millis() * RENEWALS_PER_TTL);
+    }
+
     /** The two looks at a departed node's shards; see BackgroundReconciler#takeOverFrom. */
     private void takeOver(String deadNodeId) {
         try {
@@ -300,11 +323,6 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     private java.util.Set<ShardId> renewLeaseNow() {
         renewals.incrementAndGet();
-        try {
-            loop.refreshMembership(renewalInterval.millis());
-        } catch (Exception e) {
-            logger.warn("could not refresh the membership view; departures are noticed late", e);
-        }
         try {
             return loop.renewLease();
         } catch (Exception e) {
