@@ -434,9 +434,150 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         line("- dumped threads and logs (" + why + ") to " + results);
     }
 
+    /** What the stale-read check found. */
+    private record StaleCheck(int indices, int withoutWriter, int complete, int reportedBehind, int lagging, int inconclusive, List<
+        String> violations) {
+        @Override
+        public String toString() {
+            return indices
+                + " indices searched; "
+                + withoutWriter
+                + " with no live writer: "
+                + complete
+                + " complete, "
+                + reportedBehind
+                + " reported as not answering, "
+                + violations.size()
+                + " SILENTLY BEHIND; "
+                + lagging
+                + " with a live writer behind by the publish window; "
+                + inconclusive
+                + " changed owner during the check";
+        }
+    }
+
+    /**
+     * Searches every index written so far and holds each one with no live writer to the guarantee: it answers with at
+     * least every acknowledged document, or reports the shard as not answering. One that does neither served a
+     * commit behind the log as though it were current.
+     *
+     * <p>A shard with a live writer is read from its last published commit by design, so falling short there is
+     * the publish window and only counted. An owner that changes between the head read and the search makes the
+     * answer inconclusive rather than wrong, and is counted as that.
+     */
+    private StaleCheck staleReadCheck() throws Exception {
+        final Map<String, java.util.Set<String>> ackedIds = new TreeMap<>();
+        for (FleetLedger.Write write : new ArrayList<>(ledger.writes())) {
+            if (write.outcome() == FleetLedger.Outcome.ACKED && write.index().startsWith("logs-") && ledger.mustBePresent(write)) {
+                ackedIds.computeIfAbsent(write.index(), k -> new java.util.HashSet<>()).add(write.id());
+            }
+        }
+        final java.util.concurrent.atomic.AtomicInteger withoutWriter = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger complete = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger reportedBehind = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger lagging = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger inconclusive = new java.util.concurrent.atomic.AtomicInteger();
+        final List<String> violations = java.util.Collections.synchronizedList(new ArrayList<>());
+        final ExecutorService searchers = Executors.newFixedThreadPool(16);
+        try {
+            final List<Future<?>> pending = new ArrayList<>();
+            for (Map.Entry<String, java.util.Set<String>> index : ackedIds.entrySet()) {
+                pending.add(searchers.submit(() -> {
+                    final var before = plane.heads().read(index.getKey(), 0);
+                    final boolean writerLive = before.isPresent() && liveOwner(before.get().ownerNodeId());
+                    final List<NodeProcess> nodes = load.inRotation();
+                    final String body = load.requestBody(
+                        nodes.get(randomIntBetween(0, nodes.size() - 1)),
+                        "POST",
+                        "/" + index.getKey() + "/_search?size=0&track_total_hits=true",
+                        "{\"query\":{\"match_all\":{}}}"
+                    );
+                    final var after = plane.heads().read(index.getKey(), 0);
+                    final long total = firstNumber(body, "value");
+                    final long failed = firstNumber(body, "failed");
+                    final int expected = index.getValue().size();
+                    if (before.map(h -> h.term()).orElse(0L).equals(after.map(h -> h.term()).orElse(0L)) == false) {
+                        inconclusive.incrementAndGet();
+                    } else if (writerLive) {
+                        if (total < expected) {
+                            lagging.incrementAndGet();
+                        }
+                    } else {
+                        withoutWriter.incrementAndGet();
+                        if (failed > 0) {
+                            reportedBehind.incrementAndGet();
+                        } else if (total >= expected) {
+                            complete.incrementAndGet();
+                        } else {
+                            violations.add(index.getKey() + ": " + total + " of " + expected + " acknowledged, no failure; head " + after);
+                        }
+                    }
+                    return null;
+                }));
+            }
+            for (Future<?> each : pending) {
+                try {
+                    each.get();
+                } catch (java.util.concurrent.ExecutionException e) {
+                    // A search that failed outright said so; it is not a silent answer.
+                    reportedBehind.incrementAndGet();
+                }
+            }
+        } finally {
+            searchers.shutdownNow();
+        }
+        return new StaleCheck(
+            ackedIds.size(),
+            withoutWriter.get(),
+            complete.get(),
+            reportedBehind.get(),
+            lagging.get(),
+            inconclusive.get(),
+            List.copyOf(violations)
+        );
+    }
+
+    /** Whether a node holds an unexpired lease, read from the store. */
+    private boolean liveOwner(String nodeId) throws java.io.IOException {
+        if (nodeId == null) {
+            return false;
+        }
+        return plane.membership().read(nodeId).map(lease -> lease.isExpiredAt(System.currentTimeMillis()) == false).orElse(false);
+    }
+
+    private static long firstNumber(String body, String field) {
+        final Matcher m = Pattern.compile("\"" + field + "\":(-?\\d+)").matcher(body);
+        return m.find() ? Long.parseLong(m.group(1)) : -1L;
+    }
+
+    /** Appends findings of one kind to the forensics file. */
+    private void forensicsLines(String kind, List<String> findings) throws java.io.IOException {
+        final StringBuilder out = new StringBuilder();
+        for (String finding : findings) {
+            out.append(kind).append(' ').append(finding).append('\n');
+        }
+        Files.writeString(
+            results.resolve("forensics.txt"),
+            out.toString(),
+            StandardCharsets.UTF_8,
+            java.nio.file.StandardOpenOption.CREATE,
+            java.nio.file.StandardOpenOption.APPEND
+        );
+    }
+
     private FleetLedger.Verdict verifyChecked(int mark) throws Exception {
         load.stop();
         ledger.flush();
+        // Before the read-back, which takes over every shard it finds behind and so would hide what is checked here.
+        final StaleCheck stale = staleReadCheck();
+        line("- stale-read check: " + stale);
+        if (stale.violations().isEmpty() == false) {
+            forensicsLines("STALE", stale.violations());
+            keepBucket = true;
+            fail(
+                "a search answered from a commit behind acknowledged writes, with no writer and no failure: " + stale + "; see " + results
+            );
+        }
         final List<FleetLedger.Write> writes = new ArrayList<>(ledger.writes()).subList(mark, ledger.writes().size());
         long acked = 0;
         long refused = 0;

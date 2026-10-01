@@ -149,6 +149,29 @@ public final class SegmentPublisher {
      */
     public CommitManifest publish(Store store, org.apache.lucene.index.IndexCommit commit, long term, String writerId, PruningDigest digest)
         throws IOException {
+        return publish(store, commit, term, writerId, digest, -1L);
+    }
+
+    /**
+     * Publishes a commit with its pruning digest and the part of the write-ahead log it covers.
+     *
+     * @param store the shard's store, already flushed to a commit
+     * @param commit the commit to publish, pinned by the caller; null to publish whatever is latest
+     * @param term the publishing writer's term
+     * @param writerId the publishing node, or null to skip the writer check
+     * @param digest the commit's pruning digest
+     * @param walOrdinal the highest log ordinal of {@code term} whose records the commit holds; negative for unknown
+     * @return the manifest as published
+     * @throws IOException if upload fails
+     */
+    public CommitManifest publish(
+        Store store,
+        org.apache.lucene.index.IndexCommit commit,
+        long term,
+        String writerId,
+        PruningDigest digest,
+        long walOrdinal
+    ) throws IOException {
         // What this instance published last, if it has: the swap below is conditioned on that generation,
         // and a swap that fails re-reads. Reading before every publish was one register read per publish
         // per shard, paid to learn what this writer already knew.
@@ -217,7 +240,7 @@ public final class SegmentPublisher {
             store.decRef();
         }
 
-        final CommitManifest manifest = new CommitManifest(term, published, writerId, lengths, digest);
+        final CommitManifest manifest = new CommitManifest(term, published, writerId, lengths, digest, walOrdinal);
         final long expected = remembered != null && rememberedGeneration != BlobRegister.ABSENT_GENERATION
             ? rememberedGeneration
             : existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);

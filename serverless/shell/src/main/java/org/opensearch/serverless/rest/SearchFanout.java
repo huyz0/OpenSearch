@@ -930,6 +930,9 @@ public final class SearchFanout {
         if (local != null) {
             serving.markUsed(local);
             try {
+                // A reader here is asked first whether its commit may be behind an acknowledged write nobody is
+                // writing; one that is answers for no document, and the next copy is tried.
+                serving.ensureReaderCurrent(metadata, index, shard, local);
                 return new ShardAnswer(queryHere(serving, local, perShard, nowInMillis));
             } catch (Exception e) {
                 if (copyUnusable(e) == false) {
@@ -1034,7 +1037,8 @@ public final class SearchFanout {
      */
     private static boolean copyUnusable(Throwable e) {
         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
-            if (cause instanceof org.apache.lucene.store.AlreadyClosedException
+            if (cause instanceof org.opensearch.serverless.shell.ShardBehindLogException
+                || cause instanceof org.apache.lucene.store.AlreadyClosedException
                 || cause instanceof org.opensearch.index.shard.IndexShardClosedException
                 || cause instanceof org.opensearch.index.shard.ShardNotFoundException
                 || cause instanceof org.opensearch.index.IndexNotFoundException) {

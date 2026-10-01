@@ -94,11 +94,49 @@ public final class CommitManifest {
      * @param digest the commit's pruning digest, {@link PruningDigest#EMPTY} if none
      */
     public CommitManifest(long term, Map<String, String> files, String writer, Map<String, Long> lengths, PruningDigest digest) {
+        this(term, files, writer, lengths, digest, -1L);
+    }
+
+    /**
+     * Creates a manifest that records how far into the write-ahead log its commit reaches.
+     *
+     * @param term the publishing writer's term
+     * @param files segment file name to blob name
+     * @param writer the publishing node, or null if unknown
+     * @param lengths file lengths, possibly fewer than files
+     * @param digest the commit's pruning digest
+     * @param walOrdinal the highest log ordinal of {@code term} the commit holds; negative for unknown
+     */
+    public CommitManifest(
+        long term,
+        Map<String, String> files,
+        String writer,
+        Map<String, Long> lengths,
+        PruningDigest digest,
+        long walOrdinal
+    ) {
         this.term = term;
         this.files = Map.copyOf(files);
         this.writer = writer;
         this.lengths = Map.copyOf(lengths);
         this.digest = digest == null ? PruningDigest.EMPTY : digest;
+        this.walOrdinal = walOrdinal;
+    }
+
+    /**
+     * How far into the write-ahead log this commit reaches: the highest ordinal of its own term whose records it
+     * holds, every older term included. Negative when unknown -- a manifest published before this was recorded,
+     * or one carried on the wire -- which a reader treats as covering none of its term.
+     */
+    private final long walOrdinal;
+
+    /**
+     * Returns the highest log ordinal of this commit's term that the commit holds.
+     *
+     * @return the ordinal, or a negative number if this manifest does not record it
+     */
+    public long walOrdinal() {
+        return walOrdinal;
     }
 
     /**
@@ -190,6 +228,10 @@ public final class CommitManifest {
                 }
                 builder.endObject();
             }
+            if (walOrdinal >= 0L) {
+                // Scalars, which every older parser skips: a field it does not know is ignored, not a failure.
+                builder.field("wal_ordinal", walOrdinal);
+            }
             if (digest.isEmpty() == false) {
                 // Last, always: see the constructor.
                 builder.field("digest");
@@ -217,6 +259,7 @@ public final class CommitManifest {
             final Map<String, String> files = new LinkedHashMap<>();
             final Map<String, Long> lengths = new LinkedHashMap<>();
             PruningDigest digest = PruningDigest.EMPTY;
+            long walOrdinal = -1L;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
@@ -252,12 +295,14 @@ public final class CommitManifest {
                     term = parser.longValue();
                 } else if (token.isValue() && "writer".equals(field)) {
                     writer = parser.text();
+                } else if (token.isValue() && "wal_ordinal".equals(field)) {
+                    walOrdinal = parser.longValue();
                 }
             }
             if (term < 0) {
                 throw new IOException("malformed commit manifest: no term");
             }
-            return new CommitManifest(term, files, writer, lengths, digest);
+            return new CommitManifest(term, files, writer, lengths, digest, walOrdinal);
         }
     }
 
@@ -289,6 +334,8 @@ public final class CommitManifest {
         this.lengths = Map.copyOf(readLengths);
         // Not carried on the wire: a forwarded frozen search has already been routed.
         this.digest = PruningDigest.EMPTY;
+        // Nor this: a frozen view serves the commit it froze on purpose, however far the log has moved since.
+        this.walOrdinal = -1L;
     }
 
     /**

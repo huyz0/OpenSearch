@@ -308,6 +308,9 @@ public final class ShardRouter {
             if (request.indexUuid() != null && request.indexUuid().equals(shardId.getIndex().getUUID()) == false) {
                 throw new IllegalStateException("index [" + request.index() + "] was recreated while this search was in flight");
             }
+        } else {
+            // Open already, perhaps as a reader whose writer has since died: checked like a fresh one.
+            node.ensureReaderCurrent(plane.get(), request.index(), request.shard(), shardId);
         }
         node.markUsed(shardId);
         // The coordinator's instant for "now", so this shard scores against the same clock as every other
