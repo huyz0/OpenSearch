@@ -470,9 +470,31 @@ final class FleetLoad implements Closeable {
         return m.find() ? Long.parseLong(m.group(1)) : -1L;
     }
 
+    private static final Pattern ERROR_REASON = Pattern.compile("\"reason\"\\s*:\\s*\"([^\"]{0,400})");
+
+    /**
+     * The error's type, and for a failed forward what the forward said, with names and numbers taken out so the
+     * reasons group: a type alone was a seventh of all writes in one line, with nothing to tell its causes apart.
+     */
     private static String errorType(String body) {
         final Matcher m = ERROR_TYPE.matcher(body);
-        return m.find() ? m.group(1) : null;
+        if (m.find() == false) {
+            return null;
+        }
+        final String type = m.group(1);
+        if ("forward_failed".equals(type) == false) {
+            return type;
+        }
+        final Matcher reason = ERROR_REASON.matcher(body);
+        if (reason.find() == false) {
+            return type;
+        }
+        final String general = reason.group(1)
+            .replaceAll("(logs|churn)-\\d+", "IDX")
+            .replaceAll("[A-Za-z0-9_-]{20,}", "ID")
+            .replaceAll("\\d+", "N")
+            .replace(',', ';');
+        return type + " (" + general.substring(0, Math.min(160, general.length())) + ")";
     }
 
     @Override

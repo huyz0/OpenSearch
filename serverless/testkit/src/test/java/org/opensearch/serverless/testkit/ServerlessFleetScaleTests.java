@@ -232,17 +232,48 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         line("- store requests per second under load, fleet-wide, by type: " + perSecond(total, elapsed));
 
         load.stop();
-        final int idle = Math.max(60, seconds / 2);
+        // Past the client's timeout before counting: a write the load sent last is still being appended, forwarded
+        // and published for up to that long, and a window opened at once counted that tail as background.
+        sleepSeconds(IDLE_SETTLE_SECONDS);
+        final int idle = Math.max(180, seconds / 2);
+        final Map<String, Integer> heldBefore = heldShardsPerNode();
         resetStoreCounts();
         final long idleStarted = System.nanoTime();
         sleepSeconds(idle);
         final double idleElapsed = (System.nanoTime() - idleStarted) / 1e9;
+        final Map<String, Integer> heldAfter = heldShardsPerNode();
         final Map<String, String> perNodeHour = new TreeMap<>();
+        long fleetRequests = 0;
+        double fleetHeld = 0;
         for (int i = 0; i < proxies.size(); i++) {
             final long sum = proxies.get(i).counts().values().stream().mapToLong(Long::longValue).sum();
-            perNodeHour.put("n" + i, String.format(Locale.ROOT, "%.0f", sum * 3600 / idleElapsed));
+            final String name = fleet.get(i).name();
+            final double held = (heldBefore.getOrDefault(name, 0) + heldAfter.getOrDefault(name, 0)) / 2d;
+            fleetRequests += sum;
+            fleetHeld += held;
+            perNodeHour.put(
+                name,
+                String.format(Locale.ROOT, "%.0f (holding %d->%d)", sum * 3600 / idleElapsed, heldBefore.get(name), heldAfter.get(name))
+            );
         }
-        line("- background with the load stopped, requests per node-hour: " + perNodeHour + " (over " + idle + " s idle)");
+        line(
+            "- background with the load stopped, requests per node-hour: "
+                + perNodeHour
+                + " (over "
+                + idle
+                + " s idle, after "
+                + IDLE_SETTLE_SECONDS
+                + " s to drain)"
+        );
+        line(
+            String.format(
+                Locale.ROOT,
+                "- idle cost: %.0f requests per node-hour on average, %.1f per held shard-hour (%.0f shards held per node)",
+                fleetRequests * 3600 / idleElapsed / proxies.size(),
+                fleetHeld == 0 ? 0d : fleetRequests * 3600 / idleElapsed / fleetHeld,
+                fleetHeld / proxies.size()
+            )
+        );
         // And what it is spent on, averaged over the nodes: the line items an idle-cost change has to move.
         final Map<String, Long> byArea = new TreeMap<>();
         for (FaultProxy proxy : proxies) {
@@ -253,7 +284,82 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             (area, n) -> perNodeHourByArea.put(area, String.format(Locale.ROOT, "%.0f", n * 3600 / idleElapsed / proxies.size()))
         );
         line("- idle requests per node-hour by operation and area: " + perNodeHourByArea);
+        wideSearchProbe();
         load.start();
+    }
+
+    /**
+     * Wide searches over the whole population, one at a time with nothing else running, each twice per node: the
+     * first is cold, the second warm.
+     *
+     * <p>Three shapes. A range no index can hold resolves a million names and rules every one out, which is the
+     * cost of resolution alone. The load's own query -- the last minute -- is what a dashboard sends. A narrower
+     * pattern shows how the cost scales with the names matched.
+     */
+    private void wideSearchProbe() {
+        final long now = System.currentTimeMillis();
+        final Map<String, String[]> shapes = new LinkedHashMap<>();
+        shapes.put("logs-* nothing in range", new String[] { "/logs-*/_search", rangeFrom(now + TimeUnit.DAYS.toMillis(30)) });
+        shapes.put("logs-* last minute", new String[] { "/logs-*/_search?allow_partial_activation=true", rangeFrom(now - 60_000L) });
+        shapes.put("logs-00000* last minute", new String[] { "/logs-00000*/_search?allow_partial_activation=true", rangeFrom(now - 60_000L) });
+        try (
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build()
+        ) {
+            shapes.forEach((shape, request) -> {
+                final List<String> outcomes = new ArrayList<>();
+                for (int i = 0; i < Math.min(3, fleet.size()); i++) {
+                    final NodeProcess node = fleet.get(i);
+                    for (String pass : new String[] { "cold", "warm" }) {
+                        final long started = System.nanoTime();
+                        String outcome;
+                        try {
+                            final var response = client.send(
+                                java.net.http.HttpRequest.newBuilder()
+                                    .uri(URI.create("http://" + node.http() + request[0]))
+                                    .header("Content-Type", "application/json")
+                                    .timeout(java.time.Duration.ofSeconds(120))
+                                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(request[1]))
+                                    .build(),
+                                java.net.http.HttpResponse.BodyHandlers.ofString()
+                            );
+                            outcome = response.statusCode() + " " + searchSummary(response.body());
+                        } catch (Exception e) {
+                            outcome = e.getClass().getSimpleName();
+                        }
+                        outcomes.add(
+                            String.format(
+                                Locale.ROOT,
+                                "%s %s %d ms: %s",
+                                node.name(),
+                                pass,
+                                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+                                outcome
+                            )
+                        );
+                    }
+                }
+                line("- wide search, " + shape + ": " + String.join("; ", outcomes));
+            });
+        }
+    }
+
+    private static String rangeFrom(long gteMillis) {
+        return "{\"size\":10,\"track_total_hits\":true,\"query\":{\"range\":{\"@timestamp\":{\"gte\":" + gteMillis + "}}}}";
+    }
+
+    private static final Pattern SHARDS_TOTAL = Pattern.compile("\"_shards\"\\s*:\\s*\\{\\s*\"total\"\\s*:\\s*(\\d+)");
+    private static final Pattern HITS_TOTAL = Pattern.compile("\"total\"\\s*:\\s*\\{\\s*\"value\"\\s*:\\s*(\\d+)");
+    private static final Pattern REASON = Pattern.compile("\"reason\"\\s*:\\s*\"([^\"]{0,240})");
+
+    /** Shards searched and hits for an answer, or the reason for a refusal, in a line. */
+    private static String searchSummary(String body) {
+        final Matcher shards = SHARDS_TOTAL.matcher(body);
+        final Matcher hits = HITS_TOTAL.matcher(body);
+        if (shards.find()) {
+            return "shards " + shards.group(1) + ", hits " + (hits.find() ? hits.group(1) : "?");
+        }
+        final Matcher reason = REASON.matcher(body);
+        return reason.find() ? reason.group(1) : body.substring(0, Math.min(240, body.length()));
     }
 
     /** kill -9 of the node holding the most shards, writes continuing; how long until each of its shards takes writes again. */
@@ -872,6 +978,41 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             creators.shutdown();
             assertTrue(creators.awaitTermination(10, TimeUnit.MINUTES));
         }
+    }
+
+    /** Longer than the load's request timeout, so the last writes sent have been answered one way or the other. */
+    private static final int IDLE_SETTLE_SECONDS = 75;
+
+    private static final Pattern HELD_SHARD = Pattern.compile("\"kind\"\\s*:\\s*\"(writer|reader|frozen_view)\"");
+
+    /** How many shards each live node holds open, as it reports itself; a node that does not answer is left out. */
+    private Map<String, Integer> heldShardsPerNode() {
+        final Map<String, Integer> held = new TreeMap<>();
+        try (
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build()
+        ) {
+            for (NodeProcess node : fleet) {
+                try {
+                    final var response = client.send(
+                        java.net.http.HttpRequest.newBuilder()
+                            .uri(URI.create("http://" + node.http() + "/_serverless/stats"))
+                            .timeout(java.time.Duration.ofSeconds(30))
+                            .GET()
+                            .build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString()
+                    );
+                    int count = 0;
+                    final Matcher m = HELD_SHARD.matcher(response.body());
+                    while (m.find()) {
+                        count++;
+                    }
+                    held.put(node.name(), count);
+                } catch (Exception e) {
+                    line("- could not read held shards from " + node.name() + ": " + e);
+                }
+            }
+        }
+        return held;
     }
 
     /** Index names whose single shard's head names this node, among those the load has written to. */

@@ -113,8 +113,9 @@ final class FleetLedger implements Closeable {
     }
 
     /**
-     * Whether an acked write must still be readable: false only if a delete of its index had not returned
-     * before the write began -- then the write may have gone to the incarnation that delete removed.
+     * Whether an acked write must still be readable: false if a delete of its index had not returned before the
+     * write began -- then the write may have gone to the incarnation that delete removed -- or if a delete the client
+     * never heard back about was sent before the write ended, since that one may take effect at any time after.
      */
     boolean mustBePresent(Write write) {
         final List<Delete> ofIndex = deletes.get(write.index());
@@ -124,6 +125,11 @@ final class FleetLedger implements Closeable {
         synchronized (ofIndex) {
             for (Delete delete : ofIndex) {
                 if (delete.endedNanos() >= write.startedNanos()) {
+                    return false;
+                }
+                // A delete the client never heard back about can take effect at any time after it was sent -- the
+                // client stopped waiting, the node did not. Writes after it may be removed by it, honestly.
+                if (delete.acked() == false && delete.startedNanos() <= write.endedNanos()) {
                     return false;
                 }
             }
