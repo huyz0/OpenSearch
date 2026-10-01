@@ -92,14 +92,17 @@ public final class ServerlessBootstrap implements Closeable {
      * How long a node goes between re-reading the descriptors of the indices it holds open, where nothing
      * else has read them meanwhile. Zero reads them on every pass, which is the library default.
      *
-     * <p>An index being used is re-read at most a second apart by the incarnation fence, which also
-     * applies what it read, so this only paces the idle ones -- whose shards the idle release lets go of in
-     * minutes anyway.
+     * <p>A backstop, not the way changes arrive. Every operation on a shard -- write, get, search -- first passes
+     * the incarnation fence, which reads the descriptor unless one was read within the last second and applies
+     * what it read, so a mapping or settings change made on another node is in force for the first operation
+     * after it. A shard nobody uses answers nothing, so nothing can see it behind; this pass only bounds how long
+     * it stays so. At thirty seconds it was most of an idle node's store requests: 120 reads an hour per open
+     * index, for shards nobody was asking anything of.
      */
     public static final String DESCRIPTOR_REFRESH_INTERVAL = "serverless.descriptors.refresh_interval_millis";
 
     /** The production descriptor refresh interval; see {@link #DESCRIPTOR_REFRESH_INTERVAL}. */
-    public static final long DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS = 30_000L;
+    public static final long DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS = 300_000L;
     /**
      * How long writes are gathered before one publish covers them all. Exposed because it is the knob
      * that decides how much a crashed node leaves for its successor to replay from the log.

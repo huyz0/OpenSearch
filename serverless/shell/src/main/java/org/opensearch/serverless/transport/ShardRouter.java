@@ -313,6 +313,8 @@ public final class ShardRouter {
             node.ensureReaderCurrent(plane.get(), request.index(), request.shard(), shardId);
         }
         node.markUsed(shardId);
+        // Before the query too, so it runs on the mapping in force now; see ServerlessNode#ensureIncarnationLive.
+        node.ensureIncarnationLive(shardId);
         // The coordinator's instant for "now", so this shard scores against the same clock as every other
         // shard of the same search. Entered and exited around the query so the reconciler cannot release
         // the reader from under a running query.

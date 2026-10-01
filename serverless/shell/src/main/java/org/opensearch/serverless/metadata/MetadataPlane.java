@@ -809,14 +809,23 @@ public final class MetadataPlane {
      *
      * @param indexName the index
      * @param uuid the incarnation
-     * @return when the read began, or empty if no cached read found this index at this uuid
+     * @return what the read found and when it began, or empty if no cached read found this index at this uuid
      */
-    public java.util.OptionalLong readConfirmingIncarnation(String indexName, String uuid) {
+    public java.util.Optional<ConfirmingRead> readConfirmingIncarnation(String indexName, String uuid) {
         final CachedResolution seen = routingCache.get(indexName);
         if (seen == null || seen.resolution().index() == null || uuid.equals(seen.resolution().index().uuid()) == false) {
-            return java.util.OptionalLong.empty();
+            return java.util.Optional.empty();
         }
-        return java.util.OptionalLong.of(seen.readStartedNanos());
+        return java.util.Optional.of(new ConfirmingRead(seen.resolution().index(), seen.readStartedNanos()));
+    }
+
+    /**
+     * A descriptor read from the store, and when that read began by {@link System#nanoTime}.
+     *
+     * @param descriptor what was read
+     * @param readStartedNanos when the read began
+     */
+    public record ConfirmingRead(IndexDescriptor descriptor, long readStartedNanos) {
     }
 
     /**

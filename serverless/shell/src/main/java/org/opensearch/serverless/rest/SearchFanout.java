@@ -1148,6 +1148,11 @@ public final class SearchFanout {
         SearchSourceBuilder perShard,
         long nowInMillis
     ) throws IOException {
+        final boolean frozen = serving.reconciler().frozenShards().contains(shardId);
+        if (frozen == false) {
+            // Before the query too, so it runs on the mapping in force now; see ServerlessNode#ensureIncarnationLive.
+            serving.ensureIncarnationLive(shardId);
+        }
         serving.reconciler().enter(shardId);
         final org.opensearch.serverless.shard.ShardQuery.Result result;
         try {
@@ -1158,7 +1163,7 @@ public final class SearchFanout {
         // An answer from a deleted incarnation is refused rather than merged; see ServerlessNode#INCARNATION_FENCE_MILLIS.
         // Not for a frozen view: it is keyed by its view's id rather than the index's uuid, and outliving
         // its index is what a point in time is for.
-        if (serving.reconciler().frozenShards().contains(shardId) == false) {
+        if (frozen == false) {
             serving.ensureIncarnationLive(shardId);
         }
         return result;
