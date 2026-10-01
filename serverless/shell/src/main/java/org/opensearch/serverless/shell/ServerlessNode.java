@@ -2756,6 +2756,165 @@ public final class ServerlessNode implements Closeable {
         );
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final String openingKey = indexName + "#" + shardNumber;
+        final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey);
+        validateReader(plane, indexName, shardNumber, served);
+        return served;
+    }
+
+    /**
+     * When nothing has happened since a reader was checked that could put its commit behind an acknowledged write.
+     *
+     * @param commit the commit the check was made against
+     * @param departures the {@link #departures} count at the check
+     * @param owner the live owner the check found, or null if nobody was writing the shard
+     */
+    private record ReaderCheck(org.opensearch.serverless.store.CommitManifest commit, long departures, String owner) {
+    }
+
+    /** The last check of each reader, by index and shard number. */
+    private final Map<String, ReaderCheck> readerChecks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * How many times a lease has been seen to leave the membership. A reader whose shard's writer may have died
+     * since it was checked is checked again, and nothing short of a departure can make that so: a writer that is
+     * still live publishes what it writes, and a reader that falls behind a live writer is the publish window,
+     * not a lie.
+     */
+    private final java.util.concurrent.atomic.AtomicLong departures = new java.util.concurrent.atomic.AtomicLong();
+
+    private final java.util.concurrent.atomic.AtomicBoolean watchingDepartures = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Refuses to let a reader serve a commit behind an acknowledged write while nobody is writing the shard.
+     *
+     * <p><b>What can make a commit fall behind.</b> Every write is logged before it is acknowledged, and its
+     * writer publishes it later. A writer that lets go of the shard publishes first. One that dies, or lapses past
+     * its lease and gives the shard back, does not -- and until another node takes the shard and replays the log,
+     * the published commit is all a reader has. A search or a get answered from it then misses acknowledged
+     * documents and says nothing.
+     *
+     * <p><b>What is checked, and when.</b> Each publish records how far into the log its commit reaches. A reader
+     * of a shard with no live writer lists the log for a record past that point; one found means the commit is
+     * behind, and the reader refuses -- {@link ShardBehindLogException}, retryable -- and doubts the shard's
+     * ownership, which is what makes a node take it, replay the log and publish. A shard with a live writer is
+     * not checked: its readers lag it by the publish window, which the search path accepts by design. The check
+     * runs when a reader is first served and again whenever a lease has left the membership since, so a cached
+     * reader costs nothing while nobody dies.
+     */
+    private void validateReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        org.opensearch.core.index.shard.ShardId shardId
+    ) throws java.io.IOException {
+        watchDepartures(plane);
+        final String key = shardKey(indexName, shardNumber);
+        final org.opensearch.serverless.store.CommitManifest commit = reconciler.readerCommit(shardId).orElse(null);
+        if (commit == null) {
+            // Not a reader -- the shard is open here as this node's writer, which is current by definition.
+            return;
+        }
+        final ReaderCheck last = readerChecks.get(key);
+        final long departed = departures.get();
+        if (last != null
+            && last.commit() == commit
+            && last.departures() == departed
+            && (last.owner() == null || liveLease(plane, last.owner()))) {
+            return;
+        }
+        final var head = plane.heads().read(indexName, shardNumber);
+        final String owner = head.map(org.opensearch.serverless.metadata.ShardHead::ownerNodeId).orElse(null);
+        if (owner != null
+            && owner.equals(localNode.getId()) == false
+            && liveLease(plane, owner)
+            && head.get().ownerEphemeralId() != null
+            && ownerIncarnationLive(plane, owner, head.get().ownerEphemeralId())) {
+            readerChecks.put(key, new ReaderCheck(commit, departed, owner));
+            return;
+        }
+        // Nobody is writing it -- no owner, a dead one, or this node named with nothing open. The commit has to
+        // cover the log on its own. One that does not say how far it reaches covers none of its own term.
+        final long coveredOrdinal = Math.max(0L, commit.walOrdinal());
+        final var log = plane.walStore(indexName, shardId.getIndex().getUUID(), shardNumber);
+        if (log.landedPast(commit.term(), coveredOrdinal)) {
+            readerChecks.remove(key);
+            signals().ownershipDoubted(indexName, shardNumber);
+            throw new ShardBehindLogException(indexName, shardNumber);
+        }
+        readerChecks.put(key, new ReaderCheck(commit, departed, null));
+    }
+
+    /**
+     * Checks a shard open here before it answers, if it is open as a reader; see {@link #validateReader}.
+     *
+     * <p>For the paths that find a reader already open and query it directly, without going through
+     * {@link #serveAsReader}: they would otherwise answer from a commit behind the log the moment its writer died.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @param shardId the shard open here
+     * @throws java.io.IOException {@link ShardBehindLogException} if it may not answer, or if the check could not run
+     */
+    public void ensureReaderCurrent(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        org.opensearch.core.index.shard.ShardId shardId
+    ) throws java.io.IOException {
+        validateReader(plane, indexName, shardNumber, shardId);
+    }
+
+    /** Counts departures from the membership this node consults, once per plane. */
+    private void watchDepartures(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        if (watchingDepartures.compareAndSet(false, true)) {
+            plane.membership().subscribe(delta -> {
+                if (delta.left().isEmpty() == false) {
+                    departures.incrementAndGet();
+                }
+            });
+        }
+    }
+
+    /** Whether a node holds a live lease: the membership snapshot first, the register only when it says no. */
+    private static boolean liveLease(org.opensearch.serverless.metadata.MetadataPlane plane, String nodeId) {
+        final long now = plane.clock().getAsLong();
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+            if (nodeId.equals(lease.nodeId()) && lease.isExpiredAt(now) == false) {
+                return true;
+            }
+        }
+        try {
+            return plane.membership().read(nodeId).map(lease -> lease.isExpiredAt(now) == false).orElse(false);
+        } catch (java.io.IOException e) {
+            // Unknown is not live: the check that follows is the safe side.
+            return false;
+        }
+    }
+
+    /** Whether the live lease of a node belongs to the process the head names, not a restart of it. */
+    private static boolean ownerIncarnationLive(org.opensearch.serverless.metadata.MetadataPlane plane, String nodeId, String ephemeralId) {
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+            if (nodeId.equals(lease.nodeId())) {
+                return lease.ephemeralId() == null || ephemeralId.equals(lease.ephemeralId());
+            }
+        }
+        try {
+            return plane.membership()
+                .read(nodeId)
+                .map(lease -> lease.ephemeralId() == null || ephemeralId.equals(lease.ephemeralId()))
+                .orElse(false);
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+
+    private org.opensearch.core.index.shard.ShardId openOrShareReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String openingKey
+    ) throws Exception {
         final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> mine =
             new java.util.concurrent.CompletableFuture<>();
         final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> running = readerOpens.putIfAbsent(

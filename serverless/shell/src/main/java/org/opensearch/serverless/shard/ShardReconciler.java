@@ -208,8 +208,15 @@ public final class ShardReconciler {
         // in the translog, which this does not upload. Under the write guard, so the commit cannot split
         // an apply from its append -- see writeGuard for the lie that would tell.
         final ReentrantReadWriteLock.WriteLock exclusive = guardFor(shardId).writeLock();
+        final var log = wal(shardId);
+        final long walOrdinal;
         exclusive.lock();
         try {
+            // How far into the log this commit reaches, read where no write is between its apply and its append:
+            // every record at or below it holds operations the flush below commits. A reader of a shard nobody is
+            // writing compares it with what has landed, so a commit behind an acknowledged write is never served
+            // as though it were current.
+            walOrdinal = log == null ? -1L : log.appendedThrough(term);
             shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
         } finally {
             exclusive.unlock();
@@ -229,9 +236,9 @@ public final class ShardReconciler {
                 hook.accept(shardId, shard.indexSettings().getNumberOfShards(), digest);
             }
             manifest = publisherCache.computeIfAbsent(shardId, publishers)
-                .publish(shard.store(), commit.get(), term, localNode.getId(), digest);
+                .publish(shard.store(), commit.get(), term, localNode.getId(), digest, walOrdinal);
         }
-        final var walForPublish = wal(shardId);
+        final var walForPublish = log;
         if (walForPublish != null) {
             // Only after the commit is durable in the object store. Truncation drops what the previous
             // publish saw, never what this one did -- see WalStore for why that gap is load-bearing.

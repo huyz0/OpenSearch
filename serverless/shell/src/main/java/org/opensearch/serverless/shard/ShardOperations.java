@@ -285,15 +285,29 @@ public final class ShardOperations {
 
         private final String owner;
         private final boolean retryable;
+        private final boolean behindLog;
 
         NotHereException(String message, String owner, boolean retryable) {
             this(message, owner, retryable, null);
         }
 
         NotHereException(String message, String owner, boolean retryable, Throwable cause) {
+            this(message, owner, retryable, cause, false);
+        }
+
+        private NotHereException(String message, String owner, boolean retryable, Throwable cause, boolean behindLog) {
             super(message, cause);
             this.owner = owner;
             this.retryable = retryable;
+            this.behindLog = behindLog;
+        }
+
+        /**
+         * A shard nobody is writing whose published commit is behind acknowledged writes, which nobody took over
+         * in time to answer from. Retryable: the refusal asked for the takeover that makes it current.
+         */
+        static NotHereException behindLog(org.opensearch.serverless.shell.ShardBehindLogException cause) {
+            return new NotHereException(cause.getMessage(), null, true, cause, true);
         }
 
         /**
@@ -328,6 +342,9 @@ public final class ShardOperations {
          * @return 421 when no node owns the shard, 503 for every self-resolving state
          */
         public org.opensearch.core.rest.RestStatus restStatus() {
+            if (behindLog) {
+                return org.opensearch.core.rest.RestStatus.SERVICE_UNAVAILABLE;
+            }
             return owner == null
                 ? org.opensearch.core.rest.RestStatus.MISDIRECTED_REQUEST
                 : org.opensearch.core.rest.RestStatus.SERVICE_UNAVAILABLE;
@@ -340,6 +357,9 @@ public final class ShardOperations {
          * @return the type
          */
         public String restType(String localNodeId) {
+            if (behindLog) {
+                return "shard_behind_log";
+            }
             if (owner == null) {
                 return "not_the_writer";
             }
@@ -665,6 +685,34 @@ public final class ShardOperations {
         }
     }
 
+    /** How long a get of a shard whose commit is behind its log waits for this node to take the shard. */
+    static final long BEHIND_LOG_WAIT_MILLIS = 10_000L;
+
+    /**
+     * Answers a get whose reader was behind the log by taking the shard here and reading from the writer.
+     *
+     * <p>The refusal already asked for the takeover; this waits for it, the way a write to a shard nobody holds
+     * does, so the caller is answered from the log rather than told to come back. The writer's answer is the
+     * realtime one. If the shard is not taken in time -- another node won it, or this one is full -- the caller is
+     * told to retry, which is true: the takeover is under way.
+     */
+    private Read readOnceTaken(String index, String id, int shard, org.opensearch.serverless.shell.ShardBehindLogException behind)
+        throws IOException {
+        java.util.Optional<org.opensearch.core.index.shard.ShardId> taken = java.util.Optional.empty();
+        try {
+            taken = node.signals().activate(index, shard).get(BEHIND_LOG_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException e) {
+            behind.addSuppressed(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            behind.addSuppressed(e);
+        }
+        if (taken.isPresent() && node.reconciler().readerShards().contains(taken.get()) == false) {
+            return new Read(node.get(taken.get(), id), node.localNode().getId(), true);
+        }
+        throw NotHereException.behindLog(behind);
+    }
+
     private Read doGet(String index, String id) throws IOException {
         final Placement placement = place(index, id);
         // Local only while the head agrees. A writer this node still holds after the head moved to another
@@ -688,6 +736,8 @@ public final class ShardOperations {
             try {
                 final var shardId = node.serveAsReader(plane, index, placement.shard());
                 return new Read(node.get(shardId, id), node.localNode().getId(), false);
+            } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
+                return readOnceTaken(index, id, placement.shard(), behind);
             } catch (IOException e) {
                 throw e;
             } catch (Exception e) {
@@ -790,6 +840,8 @@ public final class ShardOperations {
                 final var shardId = node.serveAsReader(plane, index, placement.shard());
                 final ShardExplain.Outcome outcome = ShardExplain.execute(node.searchService(), shardId, id, query);
                 return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), false);
+            } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
+                throw NotHereException.behindLog(behind);
             } catch (IOException e) {
                 throw e;
             } catch (Exception e) {

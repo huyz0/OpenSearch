@@ -713,6 +713,50 @@ public final class WalStore {
     }
 
     /** The log's term directories, lowest term first, which is replay order. */
+    /**
+     * The highest ordinal this instance has taken in a term, or zero if it has not written that term.
+     *
+     * <p>What a publish records as the part of the log its commit covers. Read under the shard's write guard,
+     * where no write sits between applying an operation and appending its record -- operations are applied first
+     * and logged after -- so every record at or below this ordinal holds operations the flush that follows
+     * commits, and none above it does.
+     *
+     * @param term the publishing writer's term
+     * @return the ordinal, or zero
+     */
+    public long appendedThrough(long term) {
+        return seededTerm == term ? ordinal.get() : 0L;
+    }
+
+    /**
+     * Whether any record has landed past a position: in a newer term, or in the same term at a higher ordinal.
+     *
+     * <p>What a reader asks before serving a commit nobody is writing ahead of: a record past the position the
+     * commit covers is an acknowledged write the commit does not hold. Fences are blobs of no bytes and are not
+     * records. Older terms are never past a position: a writer replays every older term before its first commit,
+     * and fences them so nothing lands there afterwards.
+     *
+     * @param term the term of the position
+     * @param ordinal the ordinal of the position within that term
+     * @return true if a record landed past it
+     * @throws IOException if the log cannot be listed
+     */
+    public boolean landedPast(long term, long ordinal) throws IOException {
+        for (Map.Entry<Long, BlobContainer> each : termsInOrder().entrySet()) {
+            if (each.getKey() < term) {
+                continue;
+            }
+            for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : each.getValue().listBlobs().entrySet()) {
+                if (RECORD_NAME.matcher(blob.getKey()).matches()
+                    && blob.getValue().length() > 0L
+                    && (each.getKey() > term || Long.parseLong(blob.getKey()) > ordinal)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private Map<Long, BlobContainer> termsInOrder() throws IOException {
         return termsIn(blobStore.blobContainer(shardBase.add("wal")).children());
     }
