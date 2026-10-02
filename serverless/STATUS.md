@@ -1089,6 +1089,18 @@ out; survivors at their shard cap re-take a frozen node's shards slowly; the idl
 going idle, so the 5× target is not yet shown; and the write limiter sheds load on this single-drive store even
 without injected throttling, and took 116 s to recover from a SlowDown burst.
 
+### Goal 11: a verdict that needs no forensics, measured clean
+
+The fleet ledger now decides what the read-back cannot reach from the store -- commit, then log -- and answers
+verified, lost with its evidence, or unreached, which is inconclusive rather than a loss; the 415 writes two earlier
+runs reported lost all verify, and canaries cover a planted loss, a handover mid-check and an unreadable store. On a
+fresh 1M-index bucket, drained first: 0 lost, 0 refused-but-visible, 0 unreached in every scenario; a one-month
+`logs-*` search fits under the 10,000-index cap (about 1,000 indices not ruled out); the write limiter, which had been
+cutting on single slow appends, settles at limits of 777-1,024 and refuses nothing in steady state; idle cost on nodes
+that kept their shards is 141 requests per held shard-hour (1.35x below Goal 8, short of 5x); the drained janitor
+costs about 1,750 requests per node-hour. Open: steady write p50 of 3-5 s now that nothing is refused, SlowDown
+recovery, kill -9 p99 of 63 s. Details in [`scale-test-results.md`](scale-test-results.md#goal-11-a-verdict-that-needs-no-forensics-measured-clean).
+
 ### Goal 10: cleaning up after a crash
 
 A crashed node left every shard it held named to it -- heads, claims, rollup entries -- and the only cleanup was a

@@ -212,6 +212,73 @@ what they give back empty, and the janitor for the 60,000 already there.
 - **Idle cost** in this milestone's runs includes the janitor's backlog and is not comparable to part 4's figures.
 - **About 35,000 indices** still could not be ruled out at the end of the run, falling by about 13,000 a scenario.
 
+## Goal 11: a verdict that needs no forensics, measured clean
+
+Goal 11 had three parts: make the ledger's verdict trustworthy on its own, re-measure what Goal 10 measured while the
+janitor drained, and stabilise the one flaky test. The old bucket was lost when Docker was reset mid-goal, so the clean
+measurements come from a fresh 1M-index bucket, `fleet-g11fresh` (`run1790942570739`): drained first -- of what an
+interrupted run on it had left -- then steady, kill and slowdown at the same fleet and load as before.
+
+**0 acknowledged writes lost, 0 refused writes visible and 0 unreached in every scenario.**
+
+| | before | Goal 11 |
+| --- | --- | --- |
+| ledger verdict | lost or found; two runs reported 16 and 399 losses that forensics found | **verified, lost with evidence, or unreached**; all 415 earlier false losses verify; in steady, 4 indices the fleet could not hand over in time were decided from the store and verified |
+| steady writes, nothing injected | 46% errors, 21,810 refused by the limiter (old bucket) | **6.5-6.8% errors, 0 refused**; p50 3.2-4.8 s, p99 11-19 s |
+| write limiter, nothing injected | limits 18-27 on appends of 300-600 ms | **limits 777-1,024 on appends of 78-138 ms** |
+| idle cost, nodes that kept their shards | 190 per held shard-hour (Goal 8) | **141**, 137 without the janitor -- 1.35x lower, not the 5x asked for |
+| janitor once drained | -- | ~1,750 store requests per node-hour; drained a killed run's leftovers in 6 min |
+| `logs-*` for next month at 1M | refused at the 10,000 cap (22,000-63,000 candidates) | **answered under the cap**: 966-1,110 indices not ruled out, ~17,500 shards skipped, ~2-2.5 s warm |
+| kill -9 takeover p50 / p99 | 28.9 s / 36.7 s (Goal 10) | 38.0 s / 63.3 s |
+| SlowDown burst | 939 refused early, back in 116 s (Goal 9) | 448 refused early, accepted p50 17.4 s, **not back within the window** |
+
+### Part 1: three verdicts
+
+What the read-back cannot reach through the fleet is decided from the store: the published commit, and the log a
+successor would replay, read in that order -- a publish writes its manifest before it truncates the log, so a record is
+in one or the other whatever happens in between, and a takeover mid-check cannot hide it (`DurabilityCheck`). A write is
+**verified** if it is in either; **lost** only if both were read and it is in neither, reported with the head, the
+commit's term and log ordinal and the log range read; **unreached** if the store could not be read in time, which fails
+a run as inconclusive, never as a loss. Canaries: a record removed after its write was acknowledged is lost; a write
+truncated from the log is found in the commit; a takeover during the check reads verified every time; an unreadable log
+is unreached (`ServerlessLedgerVerdictTests`). Run against the kept bucket, the 16 and 399 writes Goal 10's runs had
+reported lost all verified.
+
+### Part 2: what the drained numbers say
+
+- **The limiter was mistuned, not at the store's ceiling.** It cut by a third on any single append past its one-second
+  target; the odd slow append on a store answering in 300-600 ms held limits at 18-27. Cutting on the smoothed time
+  instead (`WriteBackpressure`), limits settle at 777-1,024 with appends of 78-138 ms and nothing refused. The cost:
+  writes that were refused at once now wait, and steady p50 is 3-5 s. Appends alone do not explain that -- the
+  slowdown scenario's unthrottled baseline in the same run was p50 246 ms -- and where the rest goes is open.
+- **SlowDown recovery got worse.** With the limiter reacting to the smoothed time, a burst of throttling is backed off
+  from later and released later; the run did not return to baseline within the window. A limiter that refuses early
+  under a burst without cutting on outliers in steady state needs both signals, and is open.
+- **Idle cost is 1.35x below Goal 8, not 5x.** Measured only on nodes that held the same shards through the window and
+  net of the janitor's own requests (attributed at the store), the remainder is per-shard background: head
+  verification, the descriptor backstop and reader checks. Reaching 5x needs those to be per node, not per shard.
+- **A one-month `logs-*` search now fits under the 10,000-index cap.** Two changes got there: an index that holds
+  nothing keeps no rollup entry (Goal 10), and an entry with data but no digest gets one -- from its commit, or a replay
+  whose publish computes it. What is left, about a thousand indices, is mostly the shards held at that moment -- a
+  writer's shard is never ruled out -- which sits right at the per-query activation budget of 1,024: two of the four
+  samples were refused by that budget rather than the index cap.
+- **The janitor is cheap once drained**: about 1,750 store requests per node-hour, and it found nothing more to do
+  within six minutes of the start.
+
+### Part 3: the flaky test
+
+`ServerlessBlockReadTests` failed only under full-suite load: background refreshes during its indexing loop cut more
+segments the slower the machine ran, and each costs a fixed amount to open. It force-merges to one segment now and
+asserts so; the full suite ran green three times but for the known Windows jar lock in `ServerlessInstalledPluginTests`.
+
+### Still open
+
+- Steady write latency of 3-5 s at p50 with the limiter no longer refusing, against a 246 ms unthrottled baseline.
+- SlowDown recovery: not within the window.
+- Kill -9 p99 63 s, over the 60 s target.
+- Idle cost: 5x needs per-node rather than per-shard background.
+- The unprunable remainder sits at the 1,024-shard activation budget.
+
 
 ## Method
 
