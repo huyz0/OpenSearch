@@ -131,6 +131,11 @@ public final class WriteBackpressure {
                 limit = Math.max(minLimit, limit * (2d / 3d));
                 lastDecreaseNanos = now;
             }
+        } else if (latencyNanos < targetNanos / 2) {
+            // Comfortably inside the target: grow geometrically. Additive growth alone takes a limit cut to its floor by
+            // a burst some 130,000 appends to climb back to a thousand -- an hour at a node's steady rate -- so a fleet
+            // that had shed a minute of SlowDown went on shedding long after the store had recovered.
+            limit = Math.min(maxLimit, limit * 1.02 + 0.5);
         } else {
             limit = Math.min(maxLimit, limit + 1d / Math.max(1d, limit) * 4d);
         }
