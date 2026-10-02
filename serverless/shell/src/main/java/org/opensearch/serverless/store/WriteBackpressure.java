@@ -123,7 +123,10 @@ public final class WriteBackpressure {
     public synchronized void onAppend(long elapsedNanos, boolean succeeded) {
         latencyNanos = latencyNanos == 0d ? elapsedNanos : 0.8 * latencyNanos + 0.2 * elapsedNanos;
         final long now = System.nanoTime();
-        if (succeeded == false || elapsedNanos > targetNanos) {
+        // On the smoothed time, not each sample: a store answering in 300 to 600 ms with the odd append past the target
+        // was cut by a third twice a second, and a fleet's limits sat at 18 to 27 -- refusing 22,000 writes in five
+        // minutes of steady load that the store was taking.
+        if (succeeded == false || latencyNanos > targetNanos) {
             if (lastDecreaseNanos == Long.MIN_VALUE || now - lastDecreaseNanos > TimeUnit.MILLISECONDS.toNanos(500)) {
                 limit = Math.max(minLimit, limit * (2d / 3d));
                 lastDecreaseNanos = now;

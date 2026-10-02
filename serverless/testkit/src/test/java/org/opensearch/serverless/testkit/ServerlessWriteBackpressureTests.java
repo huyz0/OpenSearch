@@ -71,6 +71,30 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
         assertEquals("fast appends bring it back", 16, limiter.stats().limit());
     }
 
+    /**
+     * One slow append among fast ones does not cut the limit; appends slow on average do. Cutting on every sample past
+     * the target kept a fleet's limits at 18 to 27 on a store answering in 300 to 600 ms, refusing writes it could take.
+     */
+    public void testAnOutlierDoesNotCutTheLimitButASlowStoreDoes() {
+        final WriteBackpressure limiter = new WriteBackpressure(1_000, 5_000, 4, 64);
+        for (int i = 0; i < 50; i++) {
+            limiter.onAppend(TimeUnit.MILLISECONDS.toNanos(400), true);
+        }
+        limiter.onAppend(TimeUnit.MILLISECONDS.toNanos(2_500), true);
+        for (int i = 0; i < 5; i++) {
+            limiter.onAppend(TimeUnit.MILLISECONDS.toNanos(400), true);
+        }
+        assertEquals("one slow append among fast ones changes nothing", 64, limiter.stats().limit());
+
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 10; j++) {
+                limiter.onAppend(TimeUnit.MILLISECONDS.toNanos(3_000), true);
+            }
+            sleepPastACut();
+        }
+        assertTrue("a store slow on average is backed off from: " + limiter.stats(), limiter.stats().limit() < 64);
+    }
+
     /** Appends averaging past the budget refuse new writes even under the limit. */
     public void testAppendsPastTheBudgetRefuseNewWrites() {
         final WriteBackpressure limiter = new WriteBackpressure(100, 500, 1, 64);
