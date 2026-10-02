@@ -217,7 +217,16 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 if (verdict.clean() == false) {
                     forensics(verdict);
                     keepBucket = true;
-                    fail("scenario " + scenario + " failed its ledger check: " + verdict + "; see " + results);
+                    fail(
+                        "scenario "
+                            + scenario
+                            + (verdict.lost().isEmpty() && verdict.refusedButVisible().isEmpty()
+                                ? " was INCONCLUSIVE: the store could not be read to settle every write, which is not a loss: "
+                                : " failed its ledger check: ")
+                            + verdict
+                            + "; see "
+                            + results
+                    );
                 }
             }
         } finally {
@@ -847,6 +856,9 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             }
         }
         final List<FleetLedger.Write> lost = java.util.Collections.synchronizedList(new ArrayList<>());
+        final List<FleetLedger.Write> unreached = java.util.Collections.synchronizedList(new ArrayList<>());
+        final List<String> lostEvidence = java.util.Collections.synchronizedList(new ArrayList<>());
+        final Map<String, List<FleetLedger.Write>> unsettled = new java.util.concurrent.ConcurrentHashMap<>();
         if (missing.isEmpty() == false) {
             line("- first read-back found " + missing.size() + " indices with absent acknowledged writes; retrying each");
             for (Map.Entry<String, List<FleetLedger.Write>> index : missing.entrySet()) {
@@ -889,7 +901,9 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                             sleepSeconds(2);
                             still = missingOf(index.getKey(), still, true);
                         }
-                        lost.addAll(still);
+                        if (still.isEmpty() == false) {
+                            unsettled.put(index.getKey(), still);
+                        }
                         return null;
                     }));
                 }
@@ -900,12 +914,52 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 retries.shutdown();
             }
         }
+        // What the fleet would not hand over in time is decided from the store: the commit and the log a successor
+        // would replay. A shard changing hands cannot hide a write from that, and one that cannot be read is
+        // unreached -- inconclusive -- never lost. See DurabilityCheck.
+        if (unsettled.isEmpty() == false) {
+            line("- read-back could not reach " + unsettled.size() + " indices through the fleet; deciding them from the store");
+            final DurabilityCheck check = new DurabilityCheck(plane, createTempDir());
+            final ExecutorService checkers = Executors.newFixedThreadPool(Math.min(8, unsettled.size()));
+            try {
+                final List<Future<?>> pending = new ArrayList<>();
+                for (Map.Entry<String, List<FleetLedger.Write>> index : unsettled.entrySet()) {
+                    pending.add(checkers.submit(() -> {
+                        final Map<String, FleetLedger.Write> byId = new LinkedHashMap<>();
+                        for (FleetLedger.Write write : index.getValue()) {
+                            byId.put(write.id(), write);
+                        }
+                        final var findings = check.check(index.getKey(), byId.keySet(), TimeUnit.MINUTES.toMillis(2));
+                        for (DurabilityCheck.Finding finding : findings.values()) {
+                            switch (finding.status()) {
+                                case LOST -> {
+                                    lost.add(byId.get(finding.id()));
+                                    lostEvidence.add(finding.index() + "/" + finding.id() + ": " + finding.evidence());
+                                }
+                                case UNREACHED -> unreached.add(byId.get(finding.id()));
+                                case VERIFIED -> {
+                                }
+                            }
+                        }
+                        return null;
+                    }));
+                }
+                for (Future<?> f : pending) {
+                    f.get();
+                }
+            } finally {
+                checkers.shutdown();
+            }
+            if (lostEvidence.isEmpty() == false) {
+                forensicsLines("LOST-EVIDENCE", lostEvidence);
+            }
+        }
         final List<FleetLedger.Write> refusedButVisible = new ArrayList<>();
         for (Map.Entry<String, List<FleetLedger.Write>> index : mustNotExist.entrySet()) {
             refusedButVisible.addAll(missingOf(index.getKey(), index.getValue(), false));
         }
         load.start();
-        return new FleetLedger.Verdict(acked, acked - excused, refused, unknown, lost, refusedButVisible, excused);
+        return new FleetLedger.Verdict(acked, acked - excused, refused, unknown, lost, refusedButVisible, excused, unreached);
     }
 
     /**

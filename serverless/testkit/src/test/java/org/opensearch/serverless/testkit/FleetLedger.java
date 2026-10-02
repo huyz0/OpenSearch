@@ -139,9 +139,10 @@ final class FleetLedger implements Closeable {
 
     /** What a check found. */
     record Verdict(long acked, long ackedChecked, long refused, long unknown, List<Write> lost, List<Write> refusedButVisible,
-        long ackedExcusedByDelete) {
+        long ackedExcusedByDelete, List<Write> unreached) {
+        /** Every acknowledged write settled and found, and no refused one visible. Unreached is not clean, nor lost. */
         boolean clean() {
-            return lost.isEmpty() && refusedButVisible.isEmpty();
+            return lost.isEmpty() && refusedButVisible.isEmpty() && unreached.isEmpty();
         }
 
         @Override
@@ -161,7 +162,10 @@ final class FleetLedger implements Closeable {
                 + (lost.isEmpty() ? "" : " e.g. " + lost.subList(0, Math.min(5, lost.size())))
                 + "; REFUSED-BUT-VISIBLE "
                 + refusedButVisible.size()
-                + (refusedButVisible.isEmpty() ? "" : " e.g. " + refusedButVisible.subList(0, Math.min(5, refusedButVisible.size())));
+                + (refusedButVisible.isEmpty() ? "" : " e.g. " + refusedButVisible.subList(0, Math.min(5, refusedButVisible.size())))
+                + "; UNREACHED "
+                + unreached.size()
+                + (unreached.isEmpty() ? "" : " e.g. " + unreached.subList(0, Math.min(5, unreached.size())));
         }
     }
 
