@@ -2889,8 +2889,37 @@ public final class ServerlessNode implements Closeable {
      * @param commit the commit the check was made against
      * @param departures the {@link #departures} count at the check
      * @param owner the live owner the check found, or null if nobody was writing the shard
+     * @param headTerm the head's term at the check
+     * @param checkedAtNanos when the head was last read for it
      */
-    private record ReaderCheck(org.opensearch.serverless.store.CommitManifest commit, long departures, String owner) {
+    private record ReaderCheck(org.opensearch.serverless.store.CommitManifest commit, long departures, String owner, long headTerm,
+        long checkedAtNanos) {
+        ReaderCheck reread(long nanos) {
+            return new ReaderCheck(commit, departures, owner, headTerm, nanos);
+        }
+    }
+
+    /**
+     * How long a reader's check stands before the shard's head is read again, by default.
+     *
+     * <p>A check that found nobody writing the shard stood until a node departed, with no read at all: a writer that
+     * took the shard afterwards, acknowledged a write and gave the head back unpublished -- a lease lapse under
+     * throttling -- left the reader serving its commit as current, one document short and no failure reported. Every
+     * acquisition moves the head's term, so a head read that finds the same term is proof nothing was written behind
+     * the commit; it is made at most once a second per shard, the bound the incarnation fence already holds reads to,
+     * and the log is listed only when the term has moved.
+     */
+    public static final long READER_CHECK_MILLIS = 1_000L;
+
+    private volatile long readerCheckMillis = READER_CHECK_MILLIS;
+
+    /**
+     * Sets how long a reader's check stands before its head is read again; zero reads it on every check. For tests.
+     *
+     * @param millis the window
+     */
+    public void setReaderCheckMillis(long millis) {
+        this.readerCheckMillis = Math.max(0L, millis);
     }
 
     /** The last check of each reader, by index and shard number. */
@@ -2938,20 +2967,30 @@ public final class ServerlessNode implements Closeable {
         }
         final ReaderCheck last = readerChecks.get(key);
         final long departed = departures.get();
-        if (last != null
-            && last.commit() == commit
-            && last.departures() == departed
+        final long now = System.nanoTime();
+        final boolean sameCheck = last != null && last.commit() == commit && last.departures() == departed;
+        if (sameCheck
+            && now - last.checkedAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readerCheckMillis)
             && (last.owner() == null || liveLease(plane, last.owner()))) {
             return;
         }
         final var head = plane.heads().read(indexName, shardNumber);
         final String owner = head.map(org.opensearch.serverless.metadata.ShardHead::ownerNodeId).orElse(null);
+        final long headTerm = head.map(org.opensearch.serverless.metadata.ShardHead::term).orElse(0L);
+        if (sameCheck && last.headTerm() == headTerm && java.util.Objects.equals(last.owner(), owner)) {
+            // Nobody has acquired the shard since the last check -- every acquisition moves the term -- so nothing can
+            // have been written behind the commit that the check did not already account for.
+            if (owner == null || liveLease(plane, owner)) {
+                readerChecks.put(key, last.reread(now));
+                return;
+            }
+        }
         if (owner != null
             && owner.equals(localNode.getId()) == false
             && liveLease(plane, owner)
             && head.get().ownerEphemeralId() != null
             && ownerIncarnationLive(plane, owner, head.get().ownerEphemeralId())) {
-            readerChecks.put(key, new ReaderCheck(commit, departed, owner));
+            readerChecks.put(key, new ReaderCheck(commit, departed, owner, headTerm, now));
             return;
         }
         // Nobody is writing it -- no owner, a dead one, or this node named with nothing open. The commit has to
@@ -2974,7 +3013,7 @@ public final class ServerlessNode implements Closeable {
             signals().ownershipDoubted(indexName, shardNumber);
             throw new ShardBehindLogException(indexName, shardNumber);
         }
-        readerChecks.put(key, new ReaderCheck(commit, departed, null));
+        readerChecks.put(key, new ReaderCheck(commit, departed, null, headTerm, now));
     }
 
     /**
