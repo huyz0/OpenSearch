@@ -289,6 +289,50 @@ public final class DigestRollups {
         });
     }
 
+    /**
+     * Removes an index's entry if it still records nothing: no shard owned, none published.
+     *
+     * <p>An entry is created when a writer marks a shard, before it opens. A dormant index opened only to be read --
+     * a get, a check -- and given back with nothing written keeps that entry with no digest, and an entry with no
+     * digest can never rule its index out: a fleet run found more than half of a group's entries were exactly that,
+     * 60,000 indices no wide search could skip. With nothing to find, the index needs no entry at all -- a name
+     * missing from the rollups is one with nothing searchable -- and the next writer marks it again before it opens.
+     * The caller has checked the shards hold nothing; this only refuses to remove an entry that has since changed.
+     *
+     * @param name the index
+     * @param uuid the incarnation the caller checked
+     * @return true if the entry was removed or was already gone
+     * @throws IOException if the register cannot be updated
+     */
+    public boolean removeIfNothing(String name, String uuid) throws IOException {
+        final boolean[] removed = { true };
+        update(name, false, entry -> {
+            if (entry == null) {
+                return null;
+            }
+            if (entry.alias() || entry.uuid().equals(uuid) == false || recordsNothing(entry) == false) {
+                removed[0] = false;
+                return null;
+            }
+            removed[0] = true;
+            return REMOVED;
+        });
+        return removed[0];
+    }
+
+    /** Whether an entry records no owner and no published digest for any shard. */
+    public static boolean recordsNothing(Entry entry) {
+        for (ShardState state : entry.states()) {
+            if (state.ownerTerm() != 0L || state.digest() != null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** What a change returns to remove the entry rather than replace it. */
+    private static final Entry REMOVED = new Entry("_removed", 0, List.of());
+
     /** The uuid an alias's entry carries: never an index's, so an index's first event replaces it. */
     static final String ALIAS_UUID = "_alias";
 
@@ -425,7 +469,11 @@ public final class DigestRollups {
                 known.put(key, current);
                 return;
             }
-            current.put(name, next);
+            if (next == REMOVED) {
+                current.remove(name);
+            } else {
+                current.put(name, next);
+            }
             final BytesReference bytes = encode(current);
             final BlobRegisterCasResult result = register.isEmpty()
                 ? container.createRegisterIfAbsent(blob(bucket), bytes)
