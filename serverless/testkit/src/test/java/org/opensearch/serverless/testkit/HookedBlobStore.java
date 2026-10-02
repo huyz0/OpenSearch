@@ -78,6 +78,17 @@ public final class HookedBlobStore implements BlobStore {
     }
 
     /**
+     * Fails every register read in a container whose path contains a fragment.
+     *
+     * @param pathContains the fragment, or null to read normally again
+     */
+    public void failRegisterReadsUnder(String pathContains) {
+        failRegisterReadsUnder = pathContains;
+    }
+
+    private volatile String failRegisterReadsUnder;
+
+    /**
      * Wraps a store.
      *
      * @param delegate the real store
@@ -226,6 +237,10 @@ public final class HookedBlobStore implements BlobStore {
 
         @Override
         public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+            final String failing = failRegisterReadsUnder;
+            if (failing != null && inner.path().buildAsString().contains(failing)) {
+                throw new IOException("injected: register reads under [" + failing + "] fail");
+            }
             final Optional<BlobRegister> read = inner.readRegister(blobName);
             final Hook hook = armed.get();
             if (hook != null
