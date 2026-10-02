@@ -221,6 +221,59 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         }
     }
 
+    /** Rewrites a shard's manifest as manifests were written before they recorded how far into the log they reach. */
+    private static void makeManifestLegacy(BlobStore store, MetadataPlane plane, String index) throws Exception {
+        final var current = plane.segmentPublisher(index, descriptor(index).uuid(), 0).readManifest().orElseThrow();
+        final var legacy = new org.opensearch.serverless.store.CommitManifest(
+            current.term(),
+            current.files(),
+            current.writer(),
+            current.lengths(),
+            current.digest()
+        );
+        assertEquals(-1L, legacy.walOrdinal());
+        final var container = store.blobContainer(
+            org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), index, descriptor(index).uuid(), 0)
+        );
+        final var register = container.readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST).orElseThrow();
+        assertTrue(
+            container.compareAndSwapRegister(
+                org.opensearch.serverless.store.SegmentPublisher.MANIFEST,
+                register.generation(),
+                legacy.toBytes()
+            ).applied()
+        );
+    }
+
+    /**
+     * A commit published before manifests recorded their reach is judged from its commit point, not by a replay: a
+     * crashed fleet's tens of thousands of such shards each cost a full activation to clean up.
+     */
+    public void testAnOldManifestIsJudgedWithoutAReplay() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final BlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane setup = plane(store, clock);
+        setup.createIndex(descriptor("published"));
+        setup.createIndex(descriptor("unpublished"));
+        try (ServerlessNode dying = new ServerlessNode(nodeSettings("legacy-dying"))) {
+            crashWithOnePublishedAndOneNot(store, clock, dying);
+            makeManifestLegacy(store, setup, "published");
+            makeManifestLegacy(store, setup, "unpublished");
+            final String dead = dying.localNode().getId();
+            clock.addAndGet(2 * TTL);
+
+            final MetadataPlane plane = plane(store, clock);
+            assertEquals(MetadataPlane.Settled.RELEASED_CLEAN, plane.settleAbandoned("published", 0, dead));
+            assertEquals(0L, markedTerm(plane, "published"));
+            assertEquals(
+                "the write only in the log is found, and the shard left for a replay",
+                MetadataPlane.Settled.NEEDS_REPLAY,
+                plane.settleAbandoned("unpublished", 0, dead)
+            );
+            assertTrue("and stays marked", markedTerm(plane, "unpublished") > 0L);
+        }
+    }
+
     /**
      * A dead fleet's stale claims do not starve the marks. A fleet run's janitor spent every pass forgetting claims of
      * nodes long gone -- thousands of them -- and the marks that make wide searches slow were never reached.

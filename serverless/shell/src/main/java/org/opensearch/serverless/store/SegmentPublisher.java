@@ -289,6 +289,49 @@ public final class SegmentPublisher {
     }
 
     /**
+     * The highest sequence number a published commit holds, read from its commit point.
+     *
+     * <p>For a commit published before manifests recorded how far into the log they reach: the log keeps each term's
+     * highest record after a publish, so a listing cannot tell whether a record is covered, and a crashed fleet's
+     * cleanup had to replay every such shard to find out. Reading the commit point answers it in a few small reads.
+     *
+     * @param manifest the published commit
+     * @return its maximum sequence number, or empty if the commit does not record one
+     * @throws IOException if the commit cannot be read
+     */
+    public java.util.OptionalLong committedMaxSeqNo(CommitManifest manifest) throws IOException {
+        // Only the commit point and its segments' info files: a few small blobs, nothing of the segments themselves.
+        try (Directory scratch = new org.apache.lucene.store.ByteBuffersDirectory()) {
+            String commitFile = null;
+            for (Map.Entry<String, String> file : manifest.files().entrySet()) {
+                final String name = file.getKey();
+                final boolean isCommit = name.startsWith(org.apache.lucene.index.IndexFileNames.SEGMENTS + "_");
+                if (isCommit == false && name.endsWith(".si") == false) {
+                    continue;
+                }
+                if (isCommit) {
+                    commitFile = name;
+                }
+                final BlobContainer source = blobStore.blobContainer(shardBase.add(file.getValue()));
+                try (InputStream in = source.readBlob(name); IndexOutput out = scratch.createOutput(name, IOContext.DEFAULT)) {
+                    final byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = in.read(buffer)) > 0) {
+                        out.writeBytes(buffer, read);
+                    }
+                }
+            }
+            if (commitFile == null) {
+                return java.util.OptionalLong.empty();
+            }
+            final String maxSeqNo = org.apache.lucene.index.SegmentInfos.readCommit(scratch, commitFile)
+                .getUserData()
+                .get(org.opensearch.index.seqno.SequenceNumbers.MAX_SEQ_NO);
+            return maxSeqNo == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(Long.parseLong(maxSeqNo));
+        }
+    }
+
+    /**
      * Restores the published commit into a directory, whole, so a shard can open from local disk alone.
      *
      * <p>Not on the activation path any more: a writer opens the way a reader does, on a directory that

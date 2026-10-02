@@ -257,9 +257,27 @@ public final class DigestRollups {
      * @throws IOException if the register cannot be updated
      */
     public void clearOwned(String name, String uuid, int shard, long term) throws IOException {
-        // Always against the register: this node's copy may predate another node's write, and a clear skipped on a
-        // stale copy left the shard marked for good -- never ruled out of a wide search again.
-        update(name, false, entry -> {
+        clearOwned(name, uuid, shard, term, true);
+    }
+
+    /**
+     * Clears a mark another node left, reading the register rather than trusting this node's copy.
+     *
+     * <p>An owner clearing its own mark can trust its copy: its own mark is in it. A node cleaning up after a dead one
+     * cannot -- its copy may predate the mark, and a clear skipped on that copy left the shard marked for good.
+     *
+     * @param name the index
+     * @param uuid the incarnation
+     * @param shard the shard
+     * @param term the term the mark records
+     * @throws IOException if the register cannot be updated
+     */
+    public void clearOwnedOf(String name, String uuid, int shard, long term) throws IOException {
+        clearOwned(name, uuid, shard, term, false);
+    }
+
+    private void clearOwned(String name, String uuid, int shard, long term, boolean trustRemembered) throws IOException {
+        update(name, trustRemembered, entry -> {
             if (entry == null || entry.alias() || entry.uuid().equals(uuid) == false || shard >= entry.states().size()) {
                 return null;
             }

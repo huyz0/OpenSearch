@@ -1479,7 +1479,7 @@ public final class MetadataPlane {
         if (unpublished(indexName, uuid, shard, log)) {
             return Settled.NEEDS_REPLAY;
         }
-        rollups().clearOwned(indexName, uuid, shard, previous.term());
+        rollups().clearOwnedOf(indexName, uuid, shard, previous.term());
         forgetAssignment(deadNodeId, indexName, shard);
         return Settled.RELEASED_CLEAN;
     }
@@ -1511,20 +1511,26 @@ public final class MetadataPlane {
             return Settled.NEEDS_REPLAY;
         }
         // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone.
-        rollups().clearOwned(indexName, uuid, shard, markedTerm);
+        rollups().clearOwnedOf(indexName, uuid, shard, markedTerm);
         return Settled.RELEASED_CLEAN;
     }
 
-    /** Whether the shard's log holds a write its published commit does not cover; a commit that cannot say counts as behind. */
+    /**
+     * Whether the shard's log holds a write its published commit does not cover. A commit that records how far into
+     * the log it reaches is judged by a listing; an older one by its commit point's highest sequence number against
+     * the log's, as a reader judges it; one that records neither counts as behind.
+     */
     private boolean unpublished(String indexName, String uuid, int shard, org.opensearch.serverless.store.WalStore log) throws IOException {
-        final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
+        final org.opensearch.serverless.store.SegmentPublisher publisher = segmentPublisher(indexName, uuid, shard);
+        final Optional<org.opensearch.serverless.store.CommitManifest> commit = publisher.readManifest();
         if (commit.isEmpty()) {
             return log.landedPast(0L, -1L);
         }
         if (commit.get().walOrdinal() >= 0L) {
             return log.landedPast(commit.get().term(), commit.get().walOrdinal());
         }
-        return true;
+        final java.util.OptionalLong committed = publisher.committedMaxSeqNo(commit.get());
+        return committed.isEmpty() || log.maxSeqNoFromTerm(commit.get().term()) > committed.getAsLong();
     }
 
     /**
