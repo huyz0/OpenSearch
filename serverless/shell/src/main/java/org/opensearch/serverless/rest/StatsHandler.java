@@ -384,6 +384,14 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("rejections", pressure.getCoordinatingRejections());
             builder.endObject();
 
+            final var backpressure = serving.writeBackpressure();
+            builder.startObject("write_backpressure");
+            builder.field("limit", backpressure.limit());
+            builder.field("in_flight", backpressure.inFlight());
+            builder.field("append_millis", backpressure.appendMillis());
+            builder.field("refused", backpressure.refused());
+            builder.endObject();
+
             objectStore(builder, metadata);
             blockCache(builder, serving);
             scheduler(builder, serving);
@@ -439,6 +447,15 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("activations", counts.activations());
             builder.field("backstops", counts.backstops());
             final var queue = scheduler.activationStats();
+            final var janitor = scheduler.janitorStats();
+            builder.startObject("janitor");
+            builder.field("passes", janitor.passes());
+            builder.field("store_requests", janitor.storeRequests());
+            builder.field("examined", janitor.examined());
+            builder.field("released", janitor.released());
+            builder.field("replays", janitor.replays());
+            builder.field("claims_forgotten", janitor.claimsForgotten());
+            builder.endObject();
             builder.startObject("activation_queue");
             builder.field("queued", queue.queued());
             builder.field("running", queue.running());

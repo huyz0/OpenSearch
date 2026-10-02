@@ -169,6 +169,33 @@ public final class ObjectStores {
      * <p>Bytes are counted at the stream: a ranged read of a segment counts what was actually pulled,
      * which is the number that says whether reads are lazy.
      */
+    /** Where requests made on this thread are also counted, if anywhere; see {@link #attributedTo}. */
+    private static final ThreadLocal<java.util.concurrent.atomic.AtomicLong> ATTRIBUTION = new ThreadLocal<>();
+
+    /**
+     * Runs work and counts every metered store request it makes on this thread into a sink as well, so one activity's
+     * share of a node's requests can be told apart from the rest.
+     *
+     * @param sink where the requests are counted
+     * @param work the work
+     * @param <T> what it returns
+     * @return what it returned
+     * @throws Exception whatever it threw
+     */
+    public static <T> T attributedTo(java.util.concurrent.atomic.AtomicLong sink, java.util.concurrent.Callable<T> work) throws Exception {
+        final java.util.concurrent.atomic.AtomicLong previous = ATTRIBUTION.get();
+        ATTRIBUTION.set(sink);
+        try {
+            return work.call();
+        } finally {
+            if (previous == null) {
+                ATTRIBUTION.remove();
+            } else {
+                ATTRIBUTION.set(previous);
+            }
+        }
+    }
+
     public static final class Metered implements BlobStore {
 
         private final BlobStore delegate;
@@ -314,6 +341,10 @@ public final class ObjectStores {
                 org.opensearch.common.CheckedSupplier<T, java.io.IOException> call
             ) throws java.io.IOException {
                 counter.incrementAndGet();
+                final java.util.concurrent.atomic.AtomicLong attributed = ATTRIBUTION.get();
+                if (attributed != null) {
+                    attributed.incrementAndGet();
+                }
                 try {
                     return call.get();
                 } catch (java.io.IOException | RuntimeException e) {
