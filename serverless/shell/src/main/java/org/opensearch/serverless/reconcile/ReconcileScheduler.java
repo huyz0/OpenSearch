@@ -128,6 +128,32 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     private volatile Scheduler.Cancellable janitorTask;
     private volatile TimeValue janitorInterval;
     private final AtomicLong janitorPasses = new AtomicLong();
+    private final AtomicLong janitorRequests = new AtomicLong();
+    private final AtomicLong janitorExamined = new AtomicLong();
+    private final AtomicLong janitorReleased = new AtomicLong();
+    private final AtomicLong janitorReplays = new AtomicLong();
+    private final AtomicLong janitorForgotten = new AtomicLong();
+
+    /** What the janitor has done since the node started, and the store requests its passes made. */
+    public record JanitorStats(long passes, long storeRequests, long examined, long released, long replays, long claimsForgotten) {
+    }
+
+    /**
+     * Returns the janitor's counters. Store requests are those its passes made on their own thread; the replays it
+     * starts run as activations and are counted with them.
+     *
+     * @return the counters
+     */
+    public JanitorStats janitorStats() {
+        return new JanitorStats(
+            janitorPasses.get(),
+            janitorRequests.get(),
+            janitorExamined.get(),
+            janitorReleased.get(),
+            janitorReplays.get(),
+            janitorForgotten.get()
+        );
+    }
 
     /**
      * Sets how often the janitor cleans up after crashed nodes; null, the default, runs none. Takes effect at
@@ -162,7 +188,15 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     public BackgroundReconciler.JanitorPass janitorNow() {
         janitorPasses.incrementAndGet();
         try {
-            return loop.sweepAbandoned(BackgroundReconciler.DEFAULT_JANITOR_BUDGET, BackgroundReconciler.DEFAULT_JANITOR_REPLAYS);
+            final BackgroundReconciler.JanitorPass pass = org.opensearch.serverless.store.ObjectStores.attributedTo(
+                janitorRequests,
+                () -> loop.sweepAbandoned(BackgroundReconciler.DEFAULT_JANITOR_BUDGET, BackgroundReconciler.DEFAULT_JANITOR_REPLAYS)
+            );
+            janitorExamined.addAndGet(pass.examined());
+            janitorReleased.addAndGet(pass.released());
+            janitorReplays.addAndGet(pass.replays());
+            janitorForgotten.addAndGet(pass.claimsForgotten());
+            return pass;
         } catch (Exception e) {
             logger.warn("janitor pass failed; the next one will try again", e);
             return null;

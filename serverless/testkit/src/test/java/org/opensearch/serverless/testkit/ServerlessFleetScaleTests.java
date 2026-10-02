@@ -194,6 +194,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                     case "slowdown" -> slowdown(seconds);
                     case "restart" -> rollingRestart(seconds);
                     case "storm" -> storm(seconds, steady);
+                    case "drain" -> drain();
                     default -> throw new IllegalArgumentException("unknown scenario " + scenario);
                 }
                 final long ended = System.nanoTime();
@@ -260,11 +261,25 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
     /** The load alone, then the load stopped: a node-hour of background, per node. */
     private void steady(int seconds) throws Exception {
         resetStoreCounts();
+        final Map<String, Long> refusedBefore = perNodeField("write_backpressure", "refused");
         final long started = System.nanoTime();
         sleepSeconds(seconds);
         final double elapsed = (System.nanoTime() - started) / 1e9;
         final Map<String, Long> total = totalStoreCounts();
         line("- store requests per second under load, fleet-wide, by type: " + perSecond(total, elapsed));
+        // Where the write limiter settled with nothing injected: its limit, the append time it is reacting to, and
+        // how many writes it refused under this load.
+        final Map<String, Long> limits = perNodeField("write_backpressure", "limit");
+        final Map<String, Long> appendMillis = perNodeField("write_backpressure", "append_millis");
+        final Map<String, Long> refusedAfter = perNodeField("write_backpressure", "refused");
+        final Map<String, String> limiter = new TreeMap<>();
+        long shed = 0;
+        for (String node : limits.keySet()) {
+            final long refused = refusedAfter.getOrDefault(node, 0L) - refusedBefore.getOrDefault(node, 0L);
+            shed += refused;
+            limiter.put(node, "limit " + limits.get(node) + ", append " + appendMillis.get(node) + " ms, refused " + refused);
+        }
+        line("- write limiter at the end of the load, no throttling injected: " + limiter + "; " + shed + " writes refused in all");
 
         load.stop();
         // Past the client's timeout before counting: a write the load sent last is still being appended, forwarded
@@ -272,11 +287,54 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         sleepSeconds(IDLE_SETTLE_SECONDS);
         final int idle = Math.max(180, seconds / 2);
         final Map<String, Integer> heldBefore = heldShardsPerNode();
+        final Map<String, Long> janitorBefore = perNodeField("janitor", "store_requests");
         resetStoreCounts();
         final long idleStarted = System.nanoTime();
         sleepSeconds(idle);
         final double idleElapsed = (System.nanoTime() - idleStarted) / 1e9;
         final Map<String, Integer> heldAfter = heldShardsPerNode();
+        final Map<String, Long> janitorAfter = perNodeField("janitor", "store_requests");
+        // The figure the idle-cost target is about: nodes that held the same shards throughout, so no release or
+        // activation is in it, and without the janitor's own requests. The rest is reported beside it.
+        double stableRequests = 0;
+        double stableJanitor = 0;
+        double stableHeld = 0;
+        final List<String> stableNodes = new ArrayList<>();
+        double movingRequests = 0;
+        int movedShards = 0;
+        long janitorTotal = 0;
+        for (int i = 0; i < proxies.size(); i++) {
+            final String name = fleet.get(i).name();
+            final long requests = proxies.get(i).counts().values().stream().mapToLong(Long::longValue).sum();
+            final long janitor = janitorAfter.getOrDefault(name, 0L) - janitorBefore.getOrDefault(name, 0L);
+            janitorTotal += janitor;
+            final int before = heldBefore.getOrDefault(name, 0);
+            final int after = heldAfter.getOrDefault(name, 0);
+            if (Math.abs(after - before) <= Math.max(2, before / 50)) {
+                stableNodes.add(name);
+                stableRequests += requests;
+                stableJanitor += janitor;
+                stableHeld += (before + after) / 2d;
+            } else {
+                movingRequests += requests;
+                movedShards += Math.abs(after - before);
+            }
+        }
+        line(
+            String.format(
+                Locale.ROOT,
+                "- idle cost on nodes that held their shards (%s): %.1f requests per held shard-hour, %.1f without the janitor's own"
+                    + " (%.0f shards per node); nodes that released or took shards: %.0f requests per node-hour over %d shards moved;"
+                    + " janitor: %.0f requests per node-hour",
+                stableNodes,
+                stableHeld == 0 ? 0d : stableRequests * 3600 / idleElapsed / stableHeld,
+                stableHeld == 0 ? 0d : (stableRequests - stableJanitor) * 3600 / idleElapsed / stableHeld,
+                stableNodes.isEmpty() ? 0d : stableHeld / stableNodes.size(),
+                proxies.size() == stableNodes.size() ? 0d : movingRequests * 3600 / idleElapsed / (proxies.size() - stableNodes.size()),
+                movedShards,
+                janitorTotal * 3600 / idleElapsed / proxies.size()
+            )
+        );
         final Map<String, String> perNodeHour = new TreeMap<>();
         long fleetRequests = 0;
         double fleetHeld = 0;
@@ -388,16 +446,100 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
      * writer, live or left behind by a crash, plus any refused for another reason. The janitor drives it down.
      */
     private String unprunable() {
+        final String answer = nextMonthSearch();
+        final long count = unprunableCount(answer);
+        return "logs-* for next month: "
+            + (count >= 0 ? count + " indices could not be ruled out" : searchSummary(answer))
+            + (CANDIDATES.matcher(answer).find() ? ", refused at the cap" : ", answered under the cap");
+    }
+
+    private String nextMonthSearch() {
         final String body = rangeFrom(System.currentTimeMillis() + TimeUnit.DAYS.toMillis(30));
-        String answer;
         try {
-            answer = load.requestBody(load.inRotation().get(0), "POST", "/logs-*/_search", body);
+            return load.requestBody(load.inRotation().get(0), "POST", "/logs-*/_search", body);
         } catch (Exception e) {
             // A refusal at the cap is the usual answer, and it names the count.
-            answer = String.valueOf(e.getMessage());
+            return String.valueOf(e.getMessage());
         }
-        final Matcher m = CANDIDATES.matcher(answer);
-        return "logs-* for next month: " + (m.find() ? m.group(1) + " indices could not be ruled out" : searchSummary(answer));
+    }
+
+    private static final Pattern SHARDS_SKIPPED = Pattern.compile("\"_shards\"\\s*:\\s*\\{[^}]*\"skipped\"\\s*:\\s*(\\d+)");
+
+    /**
+     * The indices a next-month search could not rule out: the count a refusal at the cap names, or, once it fits under
+     * the cap, the shards it searched rather than skipped (one shard an index here). -1 if neither can be read.
+     */
+    private static long unprunableCount(String answer) {
+        final Matcher refused = CANDIDATES.matcher(answer);
+        if (refused.find()) {
+            return Long.parseLong(refused.group(1));
+        }
+        final Matcher total = SHARDS_TOTAL.matcher(answer);
+        if (total.find() == false) {
+            return -1L;
+        }
+        final Matcher skipped = SHARDS_SKIPPED.matcher(answer);
+        return Long.parseLong(total.group(1)) - (skipped.find() ? Long.parseLong(skipped.group(1)) : 0L);
+    }
+
+    /**
+     * Runs the load until the janitor's backlog is flat: the next-month search's unprunable count every two minutes,
+     * stopping when three samples in a row are within one percent of each other, or at tests.fleet.drain_max_seconds.
+     * Reports the series and what the janitor's passes cost while draining and in the last, flat interval.
+     */
+    private void drain() throws Exception {
+        final long maxSeconds = Long.parseLong(prop("drain_max_seconds", "5400"));
+        final long started = System.nanoTime();
+        final long janitorStart = fleetSum("janitor", "store_requests");
+        final List<String> series = new ArrayList<>();
+        final List<Long> counts = new ArrayList<>();
+        long lastJanitor = janitorStart;
+        long lastAt = started;
+        double lastIntervalPerNodeHour = 0;
+        boolean flat = false;
+        while (true) {
+            final long count = unprunableCount(nextMonthSearch());
+            final long now = System.nanoTime();
+            final long janitor = fleetSum("janitor", "store_requests");
+            if (now > lastAt) {
+                lastIntervalPerNodeHour = (janitor - lastJanitor) * 3600e9 / (now - lastAt) / Math.max(1, fleet.size());
+            }
+            lastJanitor = janitor;
+            lastAt = now;
+            counts.add(count);
+            series.add(TimeUnit.NANOSECONDS.toMinutes(now - started) + "m:" + count);
+            if (counts.size() >= 3) {
+                final long a = counts.get(counts.size() - 3);
+                final long b = counts.get(counts.size() - 1);
+                if (a >= 0 && b >= 0 && Math.abs(a - b) <= Math.max(10L, a / 100)) {
+                    flat = true;
+                    break;
+                }
+            }
+            if (TimeUnit.NANOSECONDS.toSeconds(now - started) >= maxSeconds) {
+                break;
+            }
+            sleepSeconds(120);
+        }
+        final double hours = (System.nanoTime() - started) / 3600e9;
+        line(
+            "- janitor backlog (logs-* next month, indices not ruled out) over time: "
+                + series
+                + (flat ? ", flat" : ", NOT flat at the limit")
+        );
+        line(
+            String.format(
+                Locale.ROOT,
+                "- janitor while draining: %.0f store requests per node-hour over %.1f h; in the last interval %.0f; %d released, %d replays,"
+                    + " %d stale claims forgotten in all",
+                (lastJanitor - janitorStart) / hours / Math.max(1, fleet.size()),
+                hours,
+                lastIntervalPerNodeHour,
+                fleetSum("janitor", "released"),
+                fleetSum("janitor", "replays"),
+                fleetSum("janitor", "claims_forgotten")
+            )
+        );
     }
 
     /** The head term of each active index's shard, read from the store. */
@@ -1153,17 +1295,109 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
     private static final Pattern HELD_SHARD = Pattern.compile("\"kind\"\\s*:\\s*\"(writer|reader|frozen_view)\"");
 
-    private static final Pattern QUEUE_FIELD = Pattern.compile(
-        "\"(queued|running|done|wait_millis|run_millis|max_wait_millis|max_run_millis)\"\\s*:\\s*(\\d+)"
-    );
+    /** The columns activation.csv records per node, as object/field of the node's stats. */
+    private static final String[][] SAMPLED = {
+        { "activation_queue", "queued" },
+        { "activation_queue", "running" },
+        { "activation_queue", "done" },
+        { "activation_queue", "wait_millis" },
+        { "activation_queue", "run_millis" },
+        { "activation_queue", "max_wait_millis" },
+        { "activation_queue", "max_run_millis" },
+        { "janitor", "passes" },
+        { "janitor", "store_requests" },
+        { "janitor", "examined" },
+        { "janitor", "released" },
+        { "janitor", "replays" },
+        { "write_backpressure", "limit" },
+        { "write_backpressure", "append_millis" },
+        { "write_backpressure", "refused" } };
+
+    private static final Pattern NUMBER_FIELD = Pattern.compile("\"([a-z_]+)\"\\s*:\\s*(-?\\d+)");
+
+    /** The numeric fields of one object, by name, in a stats body; an object nested in it is not looked into. */
+    static Map<String, Long> objectFields(String body, String object) {
+        final Map<String, Long> fields = new HashMap<>();
+        final int at = body.indexOf("\"" + object + "\"");
+        if (at < 0) {
+            return fields;
+        }
+        final int open = body.indexOf('{', at);
+        final int close = body.indexOf('}', open);
+        if (open < 0 || close < 0) {
+            return fields;
+        }
+        final Matcher m = NUMBER_FIELD.matcher(body.substring(open, close));
+        while (m.find()) {
+            fields.putIfAbsent(m.group(1), Long.parseLong(m.group(2)));
+        }
+        return fields;
+    }
+
+    /** One node's stats body, or null if it did not answer. */
+    private String statsOf(java.net.http.HttpClient client, NodeProcess node) {
+        try {
+            return client.send(
+                java.net.http.HttpRequest.newBuilder()
+                    .uri(URI.create("http://" + node.http() + "/_serverless/stats"))
+                    .timeout(java.time.Duration.ofSeconds(10))
+                    .GET()
+                    .build(),
+                java.net.http.HttpResponse.BodyHandlers.ofString()
+            ).body();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** One field of every live node's stats, by node name. */
+    private Map<String, Long> perNodeField(String object, String field) {
+        final Map<String, Long> values = new TreeMap<>();
+        try (
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build()
+        ) {
+            for (NodeProcess node : List.copyOf(fleet)) {
+                final String body = statsOf(client, node);
+                if (body != null) {
+                    final Long value = objectFields(body, object).get(field);
+                    if (value != null) {
+                        values.put(node.name(), value);
+                    }
+                }
+            }
+        }
+        return values;
+    }
+
+    /** One field summed over the live nodes' stats, e.g. the janitor's store requests. */
+    private long fleetSum(String object, String field) {
+        long sum = 0;
+        try (
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build()
+        ) {
+            for (NodeProcess node : List.copyOf(fleet)) {
+                final String body = statsOf(client, node);
+                if (body != null) {
+                    sum += objectFields(body, object).getOrDefault(field, 0L);
+                }
+            }
+        }
+        return sum;
+    }
 
     /**
-     * Every node's activation queue and held shards, every fifteen seconds, to activation.csv: how long a take waited
-     * for its turn, which a node's own counters are the only record of.
+     * Every node's activation queue, janitor, write limiter and held shards, every fifteen seconds, to activation.csv.
      */
     private Thread startActivationSampler() throws java.io.IOException {
         final Path csv = results.resolve("activation.csv");
-        Files.writeString(csv, "epoch_ms,node,held,queued,running,done,wait_millis,run_millis,max_wait_millis,max_run_millis\n");
+        final StringBuilder header = new StringBuilder("epoch_ms,node,held");
+        for (String[] column : SAMPLED) {
+            header.append(',').append(column[0]).append('.').append(column[1]);
+        }
+        Files.writeString(csv, header.append('\n'));
         final Thread thread = new Thread(() -> {
             try (
                 java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
@@ -1173,43 +1407,23 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 while (Thread.currentThread().isInterrupted() == false) {
                     final StringBuilder rows = new StringBuilder();
                     for (NodeProcess node : List.copyOf(fleet)) {
-                        try {
-                            final String body = client.send(
-                                java.net.http.HttpRequest.newBuilder()
-                                    .uri(URI.create("http://" + node.http() + "/_serverless/stats"))
-                                    .timeout(java.time.Duration.ofSeconds(10))
-                                    .GET()
-                                    .build(),
-                                java.net.http.HttpResponse.BodyHandlers.ofString()
-                            ).body();
-                            final Map<String, String> fields = new HashMap<>();
-                            final Matcher m = QUEUE_FIELD.matcher(body);
-                            while (m.find()) {
-                                fields.putIfAbsent(m.group(1), m.group(2));
-                            }
-                            int held = 0;
-                            final Matcher h = HELD_SHARD.matcher(body);
-                            while (h.find()) {
-                                held++;
-                            }
-                            rows.append(System.currentTimeMillis()).append(',').append(node.name()).append(',').append(held);
-                            for (String f : new String[] {
-                                "queued",
-                                "running",
-                                "done",
-                                "wait_millis",
-                                "run_millis",
-                                "max_wait_millis",
-                                "max_run_millis" }) {
-                                rows.append(',').append(fields.getOrDefault(f, ""));
-                            }
-                            rows.append('\n');
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        } catch (Exception e) {
-                            rows.append(System.currentTimeMillis()).append(',').append(node.name()).append(",,,,,,,,\n");
+                        final String body = statsOf(client, node);
+                        rows.append(System.currentTimeMillis()).append(',').append(node.name()).append(',');
+                        if (body == null) {
+                            rows.append(",".repeat(SAMPLED.length)).append('\n');
+                            continue;
                         }
+                        int held = 0;
+                        final Matcher h = HELD_SHARD.matcher(body);
+                        while (h.find()) {
+                            held++;
+                        }
+                        rows.append(held);
+                        for (String[] column : SAMPLED) {
+                            final Long value = objectFields(body, column[0]).get(column[1]);
+                            rows.append(',').append(value == null ? "" : value.toString());
+                        }
+                        rows.append('\n');
                     }
                     Files.writeString(csv, rows, StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.APPEND);
                     Thread.sleep(15_000L);
