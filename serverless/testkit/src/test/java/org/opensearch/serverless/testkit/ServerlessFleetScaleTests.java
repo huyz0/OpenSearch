@@ -488,12 +488,13 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
      * Reports the series and what the janitor's passes cost while draining and in the last, flat interval.
      */
     private void drain() throws Exception {
-        final long maxSeconds = Long.parseLong(prop("drain_max_seconds", "5400"));
+        final long maxSeconds = Long.parseLong(prop("drain_max_seconds", "7200"));
         final long started = System.nanoTime();
         final long janitorStart = fleetSum("janitor", "store_requests");
         final List<String> series = new ArrayList<>();
         final List<Long> counts = new ArrayList<>();
         long lastJanitor = janitorStart;
+        long lastWork = janitorWork();
         long lastAt = started;
         double lastIntervalPerNodeHour = 0;
         boolean flat = false;
@@ -501,14 +502,19 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             final long count = unprunableCount(nextMonthSearch());
             final long now = System.nanoTime();
             final long janitor = fleetSum("janitor", "store_requests");
+            final long work = janitorWork();
             if (now > lastAt) {
                 lastIntervalPerNodeHour = (janitor - lastJanitor) * 3600e9 / (now - lastAt) / Math.max(1, fleet.size());
             }
+            final long workInInterval = work - lastWork;
             lastJanitor = janitor;
+            lastWork = work;
             lastAt = now;
             counts.add(count);
-            series.add(TimeUnit.NANOSECONDS.toMinutes(now - started) + "m:" + count);
-            if (counts.size() >= 3) {
+            series.add(TimeUnit.NANOSECONDS.toMinutes(now - started) + "m:" + count + "/" + workInInterval);
+            // Flat means the janitor has run out of work, not that the count paused: a first run stopped at a lull and
+            // the count fell by a third over the scenarios after it.
+            if (counts.size() >= 3 && workInInterval <= Math.max(5L, fleet.size())) {
                 final long a = counts.get(counts.size() - 3);
                 final long b = counts.get(counts.size() - 1);
                 if (a >= 0 && b >= 0 && Math.abs(a - b) <= Math.max(10L, a / 100)) {
@@ -523,7 +529,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         }
         final double hours = (System.nanoTime() - started) / 3600e9;
         line(
-            "- janitor backlog (logs-* next month, indices not ruled out) over time: "
+            "- janitor backlog (logs-* next month: indices not ruled out / janitor actions in the interval) over time: "
                 + series
                 + (flat ? ", flat" : ", NOT flat at the limit")
         );
@@ -1351,6 +1357,11 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /** Everything the janitor has done across the fleet: shards released, replayed, and claims forgotten. */
+    private long janitorWork() {
+        return fleetSum("janitor", "released") + fleetSum("janitor", "replays") + fleetSum("janitor", "claims_forgotten");
     }
 
     /** One field of every live node's stats, by node name. */

@@ -153,6 +153,79 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * An entry that records no digest over a shard with a published commit gets the commit's digest from the janitor,
+     * or -- for a commit too old to carry one -- a replay whose publish computes it, after which a search it cannot match
+     * rules the index out.
+     */
+    public void testTheJanitorBackfillsDigestsFromCommitsOrReplays() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final BlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = plane(store, clock);
+        plane.createIndex(descriptor("digested"));
+        plane.createIndex(descriptor("undigested"));
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("backfill-node"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            node.renewLease(plane);
+            plane.membership().refresh();
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(List.of(Map.entry("digested", 0), Map.entry("undigested", 0)));
+            for (ShardId shardId : node.reconciler().openShards()) {
+                node.index(shardId, "doc", "{\"msg\":\"x\",\"n\":5}");
+            }
+            loop.setIdleAfterMillis(1);
+            loop.releaseIdle(System.currentTimeMillis() + 60_000L);
+            assertTrue(node.reconciler().openShards().isEmpty());
+            makeManifestLegacy(store, plane, "undigested");
+            stripDigest(store, plane, "undigested");
+            // What earlier releases left: entries for the right incarnation that record no digest.
+            for (String index : List.of("digested", "undigested")) {
+                plane.rollups().markOwned(index, "uuid-elsewhere", 1, 0, 99L);
+                plane.rollups().markOwned(index, descriptor(index).uuid(), 1, 0, 100L);
+                plane.rollups().clearOwned(index, descriptor(index).uuid(), 0, 100L);
+                assertNull(entryOf(plane, index).states().get(0).digest());
+            }
+
+            final int slots = plane.rollups().groups().size() * DigestRollups.BUCKETS;
+            for (int i = 0; i < slots; i++) {
+                loop.sweepAbandoned(100, 8);
+            }
+            final var never = org.opensearch.index.query.QueryBuilders.rangeQuery("n").gte(1_000);
+            assertBusy(() -> {
+                for (String index : List.of("digested", "undigested")) {
+                    final DigestRollups.Entry entry = entryOf(plane, index);
+                    assertNotNull(index, entry.states().get(0).digest());
+                    assertTrue(index + " is ruled out by its digest: " + entry, entry.rulesOut(never, System.currentTimeMillis()));
+                }
+            }, 30, java.util.concurrent.TimeUnit.SECONDS);
+            assertTrue("the replayed shard is given back", node.reconciler().openShards().isEmpty());
+        }
+    }
+
+    /** Rewrites a shard's manifest without its digest, as commits were published before they carried one. */
+    private static void stripDigest(BlobStore store, MetadataPlane plane, String index) throws Exception {
+        final var current = plane.segmentPublisher(index, descriptor(index).uuid(), 0).readManifest().orElseThrow();
+        final var bare = new org.opensearch.serverless.store.CommitManifest(
+            current.term(),
+            current.files(),
+            current.writer(),
+            current.lengths(),
+            org.opensearch.serverless.store.PruningDigest.EMPTY
+        );
+        final var container = store.blobContainer(
+            org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), index, descriptor(index).uuid(), 0)
+        );
+        final var register = container.readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST).orElseThrow();
+        assertTrue(
+            container.compareAndSwapRegister(
+                org.opensearch.serverless.store.SegmentPublisher.MANIFEST,
+                register.generation(),
+                bare.toBytes()
+            ).applied()
+        );
+    }
+
     /** The term the rollups mark the shard owned at; zero if none. */
     private static long markedTerm(MetadataPlane plane, String index) throws Exception {
         final Map<String, DigestRollups.Entry> group = plane.rollups().readGroup(DigestRollups.group(index), new DescriptorStore.Reads() {
