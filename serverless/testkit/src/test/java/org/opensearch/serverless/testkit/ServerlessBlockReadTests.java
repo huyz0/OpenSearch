@@ -87,11 +87,27 @@ public class ServerlessBlockReadTests extends OpenSearchTestCase {
                     "{\"msg\":\"haystack" + (i == 1234 ? " solitaire" : "") + "\",\"n\":" + i + "}"
                 );
             }
+            // One segment, whatever the machine's load. Opening a segment costs a roughly fixed amount -- headers,
+            // footers, a block each -- and the background refreshes that cut segments during the loop above cut more
+            // of them the slower it runs: a busy machine published four or seven segments where an idle one published
+            // two, and the open cost alone crossed half the published bytes. The claim is about reads, not topology.
+            writer.reconciler()
+                .shard(shardId)
+                .forceMerge(new org.opensearch.action.admin.indices.forcemerge.ForceMergeRequest().maxNumSegments(1).flush(true));
             writer.reconciler().shard(shardId).refresh("blocks");
             writer.publishShard(shardId, plane.heads().read("bulky", 0).orElseThrow().term());
         }
 
         final long published = publishedBytes(plane, objectStore, "bulky", 0);
+        final long segments = plane.segmentPublisher("bulky", 0)
+            .readManifest()
+            .orElseThrow()
+            .files()
+            .keySet()
+            .stream()
+            .filter(name -> name.endsWith(".si"))
+            .count();
+        assertEquals("the shard is published as one segment", 1L, segments);
         assertTrue("the test needs segments spanning many blocks: " + published, published > 256 * 1024);
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("blocks-r", "search"))) {
