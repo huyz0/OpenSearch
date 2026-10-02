@@ -1089,6 +1089,28 @@ out; survivors at their shard cap re-take a frozen node's shards slowly; the idl
 going idle, so the 5× target is not yet shown; and the write limiter sheds load on this single-drive store even
 without injected throttling, and took 116 s to recover from a SlowDown burst.
 
+### Goal 10: cleaning up after a crash
+
+A crashed node left every shard it held named to it -- heads, claims, rollup entries -- and the only cleanup was a
+takeover. Now ([`scale-test-results.md`](scale-test-results.md#goal-10-cleaning-up-after-a-crash)):
+
+- **A dead owner's shards are given back, not taken, when everything they hold is published**: lease revoked, head
+  moved to the next term with no owner, older terms sealed, then the mark and claim cleared. Only a shard whose log is
+  ahead of its commit is taken and replayed. Pause re-takes went from 44 of 376 to 141 of 147; kill -9 takeover to
+  p50 28.9 s, p99 36.7 s.
+- **A janitor on every node** settles claims of nodes long dead, marks with a dead owner or none, and replays and
+  gives back shards left behind their log -- a bounded amount a pass, split between nodes by hash
+  (`serverless.janitor.interval_millis`, default one minute). Old commits are judged from their commit point rather
+  than replayed.
+- **An index that holds nothing keeps no rollup entry.** The biggest leftover was not a crash's: dormant indices
+  opened only to be read left entries with no digest, which no wide search can rule out -- over half of the `logs-`
+  group. Those are removed, by a swap a writer's mark always wins. A `logs-*` search for next month went from 63,020
+  indices it could not rule out to 34,647 over one run, and falling.
+
+Correctness held in every run: 0 lost, 0 refused-but-visible, 0 silently behind; two runs whose ledgers reported
+losses had every write found on inspection. Steady write latency was higher in these runs (p50 4-8 s) while the
+janitor worked through the backlog on a single-drive store, and should be measured again once it is gone.
+
 ## How it is tested
 
 671 tests in `:serverless:testkit:test` and 37 in `s3Test`, plus `pluginTest` (a real plugin installed from its
