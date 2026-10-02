@@ -95,6 +95,29 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
         assertTrue("a store slow on average is backed off from: " + limiter.stats(), limiter.stats().limit() < 64);
     }
 
+    /**
+     * A limit cut to its floor by a burst is back within a few hundred healthy appends, not a hundred thousand: a fleet
+     * shed writes for most of an hour after a minute of SlowDown because growth was additive only.
+     */
+    public void testALimitCutByABurstRecoversQuicklyOnceTheStoreIs() {
+        final WriteBackpressure limiter = new WriteBackpressure(1_000, 5_000, 4, 1024);
+        for (int i = 0; i < 20; i++) {
+            limiter.onAppend(TimeUnit.MILLISECONDS.toNanos(3_000), false);
+            sleepPastACut();
+            if (limiter.stats().limit() <= 4) {
+                break;
+            }
+        }
+        assertEquals("the burst cut it to the floor", 4, limiter.stats().limit());
+        int appends = 0;
+        while (limiter.stats().limit() < 1024 && appends < 2_000) {
+            limiter.onAppend(TimeUnit.MILLISECONDS.toNanos(100), true);
+            appends++;
+        }
+        assertEquals("back to the ceiling", 1024, limiter.stats().limit());
+        assertTrue("within a few hundred healthy appends: " + appends, appends < 600);
+    }
+
     /** Appends averaging past the budget refuse new writes even under the limit. */
     public void testAppendsPastTheBudgetRefuseNewWrites() {
         final WriteBackpressure limiter = new WriteBackpressure(100, 500, 1, 64);
