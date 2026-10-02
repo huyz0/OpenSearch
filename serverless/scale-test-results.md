@@ -132,11 +132,85 @@ honestly; whether the one-second target suits this store is open.
 
 - **Rollup "owned" marks outlive crashed owners.** A shard marked owned is never ruled out of a wide search, and the
   mark is cleared only on a clean release, so every crashed run leaves its shards' marks behind. A `logs-*` search
-  for a range thirty days in the future still found about 47,700 candidates.
+  for a range thirty days in the future still found about 47,700 candidates. *(Goal 10: the marks were not the
+  cause -- see below.)*
 - **Survivors at their cap take a frozen node's shards slowly.** With every node near 400 shards, the pause scenario
-  re-took 44 of 376 while the owner was frozen (p50 55.8 s); taking needs evicting first.
+  re-took 44 of 376 while the owner was frozen (p50 55.8 s); taking needs evicting first. *(Goal 10: 141 of 147.)*
 - **The idle measurement includes going idle.** See part 4.
 - **The write limiter's target** against this store, and SlowDown recovery in 116 s rather than 20 s; see part 5.
+
+## Goal 10: cleaning up after a crash
+
+A crashed node leaves everything it held named to it: shard heads, its claims, and rollup entries. Goal 10 made the
+fleet clean that up itself, and found on the way that the biggest leftover was not a crash's at all. Final run
+`run1790905591572`, the same fleet and load, five scenarios on the bucket every earlier run -- several of them crashed
+-- had left behind.
+
+**Correctness held in every run of the milestone: 0 acknowledged writes lost, 0 refused writes visible, 0 searches
+answering from a commit behind the log.** Two runs' ledgers reported losses (16 and 399 writes); in both, every one of
+them was found -- by forensics reading through every node, or by taking the shard fresh and replaying its commit and log
+-- and the cause was the read-back failing to reach shards that were changing hands.
+
+| | before (Goal 9) | after (Goal 10) |
+| --- | --- | --- |
+| a dead node's shards, on a heard departure | all taken: opened, replayed, held | given back when fully published; only those with unpublished writes taken |
+| pause: shards re-taken while the owner was frozen | 44 of 376 | **141 of 147** |
+| kill -9 takeover p50 / p99 | 35.3 s / 43.2 s | **28.9 s / 36.7 s** |
+| `logs-*` for next month: indices that cannot be ruled out | ~47,700, rising ~1,000 a scenario | **63,020 → 34,647 over the run**, falling every scenario |
+| janitor, one hour | none | 32,495 cleaned up, 29 replays, 252 stale claims forgotten |
+
+### Giving a dead node's shards back instead of taking them
+
+A survivor that hears a departure used to take every shard the dead node claimed: open it, replay its log, and hold
+it -- a few hundred mostly idle shards onto nodes already near their cap. Now each is first given back on the dead
+owner's behalf, with a takeover's own guarantees: the owner must not be live, its lease is revoked, the head moves to
+the next term with no owner, and the older terms are sealed so a writer that was not as dead as it looked can add
+nothing. Then the log is compared with the published commit; if everything is published, the rollup mark and the
+claim go and the shard is left for whoever needs it next. Only a shard whose log is ahead is taken and replayed
+(`MetadataPlane#settleAbandoned`, `ServerlessCrashCleanupTests`). In the final run a departure typically read "taking 2
+of its 309 claimed shards and giving back 55 fully published", and the frozen node's shards were re-taken almost all
+within the window.
+
+### The janitor
+
+Each node runs a janitor every minute (`serverless.janitor.interval_millis`), splitting the work by hash between live
+nodes, a bounded number of shards a pass, and following a full pass after five seconds so a backlog is worked through:
+
+- **Claims of nodes long dead** -- a fleet that crashed as a whole, a departure nobody heard -- settled as above; a claim
+  whose head has moved on is forgotten. Claims get at most half a pass, after a run where thousands of a crashed
+  fleet's stale claims took every pass.
+- **Rollup entries**, one bucket a pass in rotation: an owned mark under a head with a dead owner or none is settled as
+  above, and a shard left behind its log is replayed, published and given straight back so it holds a cap slot for
+  seconds. A commit published before manifests recorded their reach is judged from its commit point -- its segments
+  file's highest sequence number against the log's -- rather than by a replay, which cost a full activation each.
+
+### What the leftover actually was
+
+A sample of the `logs-` rollups showed the owned marks crashes leave were 27 of 14,612 entries, 24 of them owned
+legitimately. More than half, 7,758, were entries that recorded nothing: dormant indices opened only to be read -- a
+get, a stale-read check, a verify retry -- and given back with nothing written. Activation enters an index before it
+opens; release cleared the mark but left an entry with no digest, which can never rule its index out. Those indices
+hold nothing, and the rollups' own invariant -- a name with no entry has nothing searchable -- means they need no
+entry: an index whose every shard has no owner, no published commit and an empty log now has its entry removed, by a
+swap that refuses if a writer has marked it since, and a writer enters it again before it opens. Releases do this for
+what they give back empty, and the janitor for the 60,000 already there.
+
+### Also fixed
+
+- `clearOwned` skipped the register when the node's remembered copy said nothing would change; for a node clearing
+  another's mark that copy could be stale. It now reads the register for those clears.
+- Proactive takeover acted on the membership view, which loses a member whose lease read failed or came back late; it
+  reads the departed node's lease first.
+- The harness reports how far the active shards' terms move in each scenario and its read-back, and takes any node
+  setting as `-Dtests.fleet.setting.<name>`.
+
+### Still open
+
+- **Write latency.** Steady write p50 in this milestone's runs was 4 to 8 s, against 0.4 to 1 s in Goal 9's, with the
+  janitor working through the backlog on the same single-drive store; it should be measured again once the backlog is
+  gone.
+- **Idle cost** in this milestone's runs includes the janitor's backlog and is not comparable to part 4's figures.
+- **About 35,000 indices** still could not be ruled out at the end of the run, falling by about 13,000 a scenario.
 
 
 ## Method
