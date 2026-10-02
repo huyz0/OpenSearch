@@ -11,6 +11,7 @@ package org.opensearch.serverless.store;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -87,20 +88,29 @@ public final class WriteBackpressure {
      * @throws ThrottledException if the store is too slow to take it now
      */
     public Releasable admit() {
+        final long now = System.nanoTime();
+        // The oldest write still waiting, as well as how long appends took: an append is only measured once it ends,
+        // and a store answering SlowDown keeps appends in retries for tens of seconds -- a fleet admitted writes for the
+        // whole of a burst on a smoothed time that had not moved, and they ended in timeouts rather than early 429s.
+        final Map.Entry<Long, Long> oldest = waiting.firstEntry();
+        final long oldestWait = oldest == null ? 0L : now - oldest.getValue();
+        if (oldestWait > targetNanos) {
+            slow(now);
+        }
         final int limitNow;
-        final double latencyNow;
+        final double pressure;
         synchronized (this) {
             limitNow = (int) Math.floor(limit);
-            latencyNow = latencyNanos;
+            pressure = Math.max(latencyNanos, oldestWait);
         }
         final int current = inFlight.incrementAndGet();
-        if (current > limitNow || (latencyNow > budgetNanos && current > minLimit)) {
+        if (current > limitNow || (pressure > budgetNanos && current > minLimit)) {
             inFlight.decrementAndGet();
             refused.incrementAndGet();
-            final int retryAfter = (int) Math.max(1L, Math.min(30L, TimeUnit.NANOSECONDS.toSeconds((long) latencyNow) + 1));
+            final int retryAfter = (int) Math.max(1L, Math.min(30L, TimeUnit.NANOSECONDS.toSeconds((long) pressure) + 1));
             throw new ThrottledException(
                 "the object store is slow to take writes (an append is taking about "
-                    + TimeUnit.NANOSECONDS.toMillis((long) latencyNow)
+                    + TimeUnit.NANOSECONDS.toMillis((long) pressure)
                     + " ms; "
                     + (current - 1)
                     + " writes already waiting, limit "
@@ -111,7 +121,24 @@ public final class WriteBackpressure {
                 retryAfter
             );
         }
-        return inFlight::decrementAndGet;
+        final long key = admissions.incrementAndGet();
+        waiting.put(key, now);
+        return () -> {
+            waiting.remove(key);
+            inFlight.decrementAndGet();
+        };
+    }
+
+    /** Admitted writes still in flight: admission order to when each was admitted. The first is the oldest. */
+    private final java.util.concurrent.ConcurrentSkipListMap<Long, Long> waiting = new java.util.concurrent.ConcurrentSkipListMap<>();
+    private final java.util.concurrent.atomic.AtomicLong admissions = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Cuts the limit by a third, at most twice a second. */
+    private synchronized void slow(long now) {
+        if (lastDecreaseNanos == Long.MIN_VALUE || now - lastDecreaseNanos > TimeUnit.MILLISECONDS.toNanos(500)) {
+            limit = Math.max(minLimit, limit * (2d / 3d));
+            lastDecreaseNanos = now;
+        }
     }
 
     /**
@@ -127,10 +154,7 @@ public final class WriteBackpressure {
         // was cut by a third twice a second, and a fleet's limits sat at 18 to 27 -- refusing 22,000 writes in five
         // minutes of steady load that the store was taking.
         if (succeeded == false || latencyNanos > targetNanos) {
-            if (lastDecreaseNanos == Long.MIN_VALUE || now - lastDecreaseNanos > TimeUnit.MILLISECONDS.toNanos(500)) {
-                limit = Math.max(minLimit, limit * (2d / 3d));
-                lastDecreaseNanos = now;
-            }
+            slow(now);
         } else if (latencyNanos < targetNanos / 2) {
             // Comfortably inside the target: grow geometrically. Additive growth alone takes a limit cut to its floor by
             // a burst some 130,000 appends to climb back to a thousand -- an hour at a node's steady rate -- so a fleet
