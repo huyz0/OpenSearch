@@ -2609,7 +2609,11 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         final long last = headsVerifiedAtNanos;
-        final boolean due = headVerifyIntervalMillis <= 0L
+        // Due on every pass while acknowledgement is suspended: only a full read of the heads lifts the suspension,
+        // and the read right after a lapse fails under exactly the conditions that cause one. Waiting for the interval
+        // left a node refusing every write for minutes after a minute of SlowDown had ended.
+        final boolean due = ownershipUnverified
+            || headVerifyIntervalMillis <= 0L
             || last == Long.MIN_VALUE
             || System.nanoTime() - last >= java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(headVerifyIntervalMillis);
         if (due) {
