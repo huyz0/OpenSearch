@@ -182,7 +182,19 @@ public final class ObjectStores {
      * @return what it returned
      * @throws Exception whatever it threw
      */
+    /**
+     * Returns where this thread's requests are being attributed, so work handed to another thread can carry it.
+     *
+     * @return the sink, or null if none
+     */
+    public static java.util.concurrent.atomic.AtomicLong currentAttribution() {
+        return ATTRIBUTION.get();
+    }
+
     public static <T> T attributedTo(java.util.concurrent.atomic.AtomicLong sink, java.util.concurrent.Callable<T> work) throws Exception {
+        if (sink == null) {
+            return work.call();
+        }
         final java.util.concurrent.atomic.AtomicLong previous = ATTRIBUTION.get();
         ATTRIBUTION.set(sink);
         try {

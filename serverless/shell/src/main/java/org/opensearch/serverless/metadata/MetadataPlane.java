@@ -1565,6 +1565,49 @@ public final class MetadataPlane {
     }
 
     /**
+     * Gives an entry that records no digest the digest its shards' published commits carry, where nobody owns them.
+     *
+     * <p>For an index {@link #forgetIfNothing} must keep because its shards hold something: a commit, or writes still
+     * in the log. A commit that carries a digest widens the entry at once; one published before commits carried
+     * digests, or a log ahead of the commit, needs the shard replayed and published again, and those shards are
+     * returned for the caller to replay.
+     *
+     * @param indexName the index
+     * @return the shards that need a replay before the entry can rule anything out; empty if none, or if a shard is owned
+     * @throws IOException if the store cannot be read or written
+     */
+    public List<Integer> backfillDigest(String indexName) throws IOException {
+        final Optional<IndexDescriptor> descriptor = describe(indexName);
+        if (descriptor.isEmpty()) {
+            return List.of();
+        }
+        final String uuid = descriptor.get().uuid();
+        final int shards = descriptor.get().numberOfShards();
+        final List<Integer> replay = new ArrayList<>();
+        for (int shard = 0; shard < shards; shard++) {
+            final Optional<ShardHead> head = heads.read(indexName, shard);
+            if (head.isPresent() && head.get().ownerNodeId() != null) {
+                // Its writer publishes, and the publish widens the entry.
+                return List.of();
+            }
+            if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))) {
+                replay.add(shard);
+                continue;
+            }
+            final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
+            if (commit.isEmpty()) {
+                continue;
+            }
+            if (commit.get().digest().isEmpty()) {
+                replay.add(shard);
+            } else {
+                rollups().widen(indexName, uuid, shards, shard, commit.get().digest());
+            }
+        }
+        return replay;
+    }
+
+    /**
      * Lists every node that has, or once had, claims on shards -- live or long gone.
      *
      * @return node ids

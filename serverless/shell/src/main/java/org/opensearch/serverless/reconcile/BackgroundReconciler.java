@@ -1299,6 +1299,16 @@ public final class BackgroundReconciler implements Closeable {
      * activation is never handed to a later caller.
      */
     private java.util.concurrent.CompletableFuture<Optional<ShardId>> activate(String indexName, int shard, boolean onDemand) {
+        return activate(indexName, shard, onDemand, null);
+    }
+
+    /** As {@link #activate(String, int, boolean)}, counting the store requests of the activation into a sink if one is given. */
+    private java.util.concurrent.CompletableFuture<Optional<ShardId>> activate(
+        String indexName,
+        int shard,
+        boolean onDemand,
+        java.util.concurrent.atomic.AtomicLong sink
+    ) {
         final Map.Entry<String, Integer> key = Map.entry(indexName, shard);
         final java.util.concurrent.CompletableFuture<Optional<ShardId>> mine = new java.util.concurrent.CompletableFuture<>();
         final java.util.concurrent.CompletableFuture<Optional<ShardId>> running = activating.putIfAbsent(key, mine);
@@ -1310,7 +1320,11 @@ public final class BackgroundReconciler implements Closeable {
             final long startedAt = System.nanoTime();
             activationWaitMax.accumulateAndGet(startedAt - queuedAt, Math::max);
             try {
-                mine.complete(activateNow(indexName, shard, onDemand));
+                mine.complete(
+                    sink == null
+                        ? activateNow(indexName, shard, onDemand)
+                        : org.opensearch.serverless.store.ObjectStores.attributedTo(sink, () -> activateNow(indexName, shard, onDemand))
+                );
             } catch (Throwable t) {
                 mine.completeExceptionally(t);
             } finally {
@@ -1660,11 +1674,25 @@ public final class BackgroundReconciler implements Closeable {
                     continue;
                 }
                 if (DigestRollups.recordsNothing(entry.getValue())) {
-                    // Opened once, given back with nothing written: an entry no wide search can rule out.
+                    // An entry no wide search can rule out: opened once and given back with nothing written, which
+                    // needs no entry; or holding data under no digest, which gets the one its commit carries -- or a
+                    // replay, whose publish computes one.
                     counts[0]++;
                     try {
                         if (plane.forgetIfNothing(entry.getKey())) {
                             counts[1]++;
+                        } else {
+                            final List<Integer> replay = plane.backfillDigest(entry.getKey());
+                            if (replay.isEmpty()) {
+                                counts[1]++;
+                            }
+                            for (int shard : replay) {
+                                if (replaysLeft[0] > 0) {
+                                    replaysLeft[0]--;
+                                    counts[2]++;
+                                    replayAndRelease(entry.getKey(), shard);
+                                }
+                            }
                         }
                     } catch (Exception e) {
                         logger.debug("janitor could not take " + entry.getKey() + " out of its rollup", e);
@@ -1751,7 +1779,9 @@ public final class BackgroundReconciler implements Closeable {
      * replay costs a slot for seconds. A shard somebody used meanwhile is kept, for the idle release to judge.
      */
     private void replayAndRelease(String index, int shard) {
-        activate(index, shard, true).whenComplete((taken, failure) -> {
+        // The janitor's: counted with its passes, though it runs on the activation threads.
+        final java.util.concurrent.atomic.AtomicLong sink = org.opensearch.serverless.store.ObjectStores.currentAttribution();
+        activate(index, shard, true, sink).whenComplete((taken, failure) -> {
             if (failure != null || taken.isEmpty()) {
                 return;
             }
@@ -1761,7 +1791,14 @@ public final class BackgroundReconciler implements Closeable {
             if (opened != null && used.isPresent() && used.getAsLong() > opened) {
                 return;
             }
-            letGo(shardId, "replayed and published by the janitor; nobody is using it");
+            try {
+                org.opensearch.serverless.store.ObjectStores.attributedTo(
+                    sink,
+                    () -> letGo(shardId, "replayed and published by the janitor; nobody is using it")
+                );
+            } catch (Exception e) {
+                logger.debug("could not give back " + shardId + " after the janitor replayed it", e);
+            }
         });
     }
 
