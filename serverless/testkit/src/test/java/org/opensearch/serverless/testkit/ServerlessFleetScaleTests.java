@@ -483,8 +483,8 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
     }
 
     /**
-     * Runs the load until the janitor's backlog is flat: the next-month search's unprunable count every two minutes,
-     * stopping when three samples in a row are within one percent of each other, or at tests.fleet.drain_max_seconds.
+     * Runs the load until the janitor's backlog is drained: the next-month search's unprunable count every two minutes,
+     * stopping when the janitor has done next to nothing three intervals running, or at tests.fleet.drain_max_seconds.
      * Reports the series and what the janitor's passes cost while draining and in the last, flat interval.
      */
     private void drain() throws Exception {
@@ -498,6 +498,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         long lastAt = started;
         double lastIntervalPerNodeHour = 0;
         boolean flat = false;
+        int idleIntervals = 0;
         while (true) {
             final long count = unprunableCount(nextMonthSearch());
             final long now = System.nanoTime();
@@ -514,13 +515,12 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             series.add(TimeUnit.NANOSECONDS.toMinutes(now - started) + "m:" + count + "/" + workInInterval);
             // Flat means the janitor has run out of work, not that the count paused: a first run stopped at a lull and
             // the count fell by a third over the scenarios after it.
-            if (counts.size() >= 3 && workInInterval <= Math.max(5L, fleet.size())) {
-                final long a = counts.get(counts.size() - 3);
-                final long b = counts.get(counts.size() - 1);
-                if (a >= 0 && b >= 0 && Math.abs(a - b) <= Math.max(10L, a / 100)) {
-                    flat = true;
-                    break;
-                }
+            // Under load the count never settles to a percent -- it includes every shard held at the moment, and those
+            // turn over -- so drained is the janitor finding nothing to do three intervals running.
+            idleIntervals = workInInterval <= Math.max(5L, fleet.size()) ? idleIntervals + 1 : 0;
+            if (idleIntervals >= 3) {
+                flat = true;
+                break;
             }
             if (TimeUnit.NANOSECONDS.toSeconds(now - started) >= maxSeconds) {
                 break;
@@ -997,11 +997,25 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         // shard whose owner died is read from its published commit until someone takes it and replays its log,
         // so a retry writes to it first, which makes somebody take it.
         final Map<String, List<FleetLedger.Write>> missing = new java.util.concurrent.ConcurrentHashMap<>();
-        for (Map.Entry<String, List<FleetLedger.Write>> index : mustExist.entrySet()) {
-            final List<FleetLedger.Write> absent = missingOf(index.getKey(), index.getValue(), true);
-            if (absent.isEmpty() == false) {
-                missing.put(index.getKey(), absent);
+        // In parallel: a long scenario writes to tens of thousands of dormant indices, each read back by opening a reader,
+        // and one at a time that was hours.
+        final ExecutorService firstPass = Executors.newFixedThreadPool(16);
+        try {
+            final List<Future<?>> reads = new ArrayList<>();
+            for (Map.Entry<String, List<FleetLedger.Write>> index : mustExist.entrySet()) {
+                reads.add(firstPass.submit(() -> {
+                    final List<FleetLedger.Write> absent = missingOf(index.getKey(), index.getValue(), true);
+                    if (absent.isEmpty() == false) {
+                        missing.put(index.getKey(), absent);
+                    }
+                    return null;
+                }));
             }
+            for (Future<?> read : reads) {
+                read.get();
+            }
+        } finally {
+            firstPass.shutdown();
         }
         final List<FleetLedger.Write> lost = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<FleetLedger.Write> unreached = java.util.Collections.synchronizedList(new ArrayList<>());
