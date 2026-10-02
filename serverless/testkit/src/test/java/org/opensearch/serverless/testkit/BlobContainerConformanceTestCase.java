@@ -312,9 +312,15 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
         final java.util.List<String> walked = new java.util.ArrayList<>();
         String cursor = null;
         while (true) {
+            // The page as the store returned it decides whether there is another and where it starts; only what is
+            // recorded skips the test filesystem's planted "extra" entries. Filtering first made a full page that held
+            // one look short, and the walk stopped a page early.
             final java.util.List<String> page = new java.util.ArrayList<>(root.children(cursor, pageSize).keySet());
-            page.removeIf(n -> n.startsWith("extra"));
-            walked.addAll(page);
+            for (String name : page) {
+                if (name.startsWith("extra") == false) {
+                    walked.add(name);
+                }
+            }
             if (page.size() < pageSize) {
                 break;
             }
