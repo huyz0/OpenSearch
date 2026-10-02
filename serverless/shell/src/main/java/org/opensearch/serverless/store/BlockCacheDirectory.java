@@ -191,12 +191,22 @@ public final class BlockCacheDirectory extends FilterDirectory {
         in.deleteFile(name);
     }
 
+    /**
+     * Does nothing: the local directory is a cache, and nothing it holds is ever trusted after a crash.
+     *
+     * <p>What is durable is in the object store -- the log before a write is acknowledged, the segments before their
+     * manifest -- and a shard opens from there, after deleting every local commit point and every file the manifest
+     * names (see {@code ShardReconciler#dropLocalFilesNamedBy}). An fsync here bought nothing, and it was the most
+     * expensive thing a publish did while holding the shard's exclusive guard: a fleet's thread dumps had a hundred
+     * publish threads in fsync and every write to those shards queued behind them, at three seconds' median latency on
+     * a store answering in a tenth of one.
+     */
     @Override
-    public void sync(java.util.Collection<String> names) throws IOException {
-        final Set<String> local = new LinkedHashSet<>(java.util.Arrays.asList(in.listAll()));
-        local.retainAll(names);
-        in.sync(local);
-    }
+    public void sync(java.util.Collection<String> names) {}
+
+    /** Does nothing, for the reason {@link #sync} does nothing. */
+    @Override
+    public void syncMetaData() {}
 
     private static boolean contains(String[] names, String name) {
         for (String candidate : names) {
