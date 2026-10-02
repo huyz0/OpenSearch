@@ -1534,6 +1534,37 @@ public final class MetadataPlane {
     }
 
     /**
+     * Takes an index out of its group's rollups if it holds nothing: no shard owned, published or logged to.
+     *
+     * <p>See {@link DigestRollups#removeIfNothing}. Every shard is checked here -- head, manifest, log -- and the
+     * removal itself refuses an entry a writer has marked since, so a writer arriving at any point keeps its entry.
+     *
+     * @param indexName the index
+     * @return true if the index had nothing and is no longer entered
+     * @throws IOException if the store cannot be read or written
+     */
+    public boolean forgetIfNothing(String indexName) throws IOException {
+        final Optional<IndexDescriptor> descriptor = describe(indexName);
+        if (descriptor.isEmpty()) {
+            return false;
+        }
+        final String uuid = descriptor.get().uuid();
+        for (int shard = 0; shard < descriptor.get().numberOfShards(); shard++) {
+            final Optional<ShardHead> head = heads.read(indexName, shard);
+            if (head.isPresent() && head.get().ownerNodeId() != null) {
+                return false;
+            }
+            if (segmentPublisher(indexName, uuid, shard).readManifest().isPresent()) {
+                return false;
+            }
+            if (walStore(indexName, uuid, shard).landedPast(0L, -1L)) {
+                return false;
+            }
+        }
+        return rollups().removeIfNothing(indexName, uuid);
+    }
+
+    /**
      * Lists every node that has, or once had, claims on shards -- live or long gone.
      *
      * @return node ids

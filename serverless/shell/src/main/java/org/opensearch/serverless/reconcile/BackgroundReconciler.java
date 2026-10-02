@@ -1082,6 +1082,15 @@ public final class BackgroundReconciler implements Closeable {
         // And forget the claim, so a node that churns through shards does not read a head per stale
         // claim on every heartbeat for the rest of its life.
         plane.forgetAssignment(node.localNode().getId(), shardId.getIndexName(), shardId.id());
+        if (maxSeqNo < 0) {
+            // Opened and given back with nothing ever written: its entry would keep every wide search from ruling
+            // it out. See MetadataPlane#forgetIfNothing.
+            try {
+                plane.forgetIfNothing(shardId.getIndexName());
+            } catch (Exception e) {
+                logger.debug("could not take empty " + shardId + " out of its rollup", e);
+            }
+        }
         return true;
     }
 
@@ -1647,7 +1656,19 @@ public final class BackgroundReconciler implements Closeable {
             final int bucket = (int) (slot % DigestRollups.BUCKETS);
             read = group + "/" + bucket;
             for (Map.Entry<String, DigestRollups.Entry> entry : plane.rollups().readBucket(group, bucket).entrySet()) {
-                if (entry.getValue().alias()) {
+                if (entry.getValue().alias() || counts[0] >= budget) {
+                    continue;
+                }
+                if (DigestRollups.recordsNothing(entry.getValue())) {
+                    // Opened once, given back with nothing written: an entry no wide search can rule out.
+                    counts[0]++;
+                    try {
+                        if (plane.forgetIfNothing(entry.getKey())) {
+                            counts[1]++;
+                        }
+                    } catch (Exception e) {
+                        logger.debug("janitor could not take " + entry.getKey() + " out of its rollup", e);
+                    }
                     continue;
                 }
                 final List<DigestRollups.ShardState> states = entry.getValue().states();

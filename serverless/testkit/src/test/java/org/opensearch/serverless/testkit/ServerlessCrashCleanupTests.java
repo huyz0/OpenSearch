@@ -65,6 +65,94 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         return new IndexDescriptor(index, "uuid-" + index + "-000000000000".substring(index.length()), 1, MAPPING, null);
     }
 
+    /** The index's rollup entry, or null if it has none. */
+    private static DigestRollups.Entry entryOf(MetadataPlane plane, String index) throws Exception {
+        return plane.rollups().readGroup(DigestRollups.group(index), new DescriptorStore.Reads() {
+            @Override
+            public <T> List<T> runAll(List<Callable<T>> tasks) throws InterruptedException {
+                final List<T> out = new ArrayList<>();
+                for (Callable<T> task : tasks) {
+                    try {
+                        out.add(task.call());
+                    } catch (Exception e) {
+                        out.add(null);
+                    }
+                }
+                return out;
+            }
+        }).get(index);
+    }
+
+    /**
+     * An index opened and given back with nothing written leaves no rollup entry behind -- one that recorded nothing
+     * kept every wide search from ruling the index out, and a fleet had 60,000 of them -- and a later write enters it
+     * again before it lands.
+     */
+    public void testAnIndexOpenedAndGivenBackEmptyLeavesNoEntry() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final BlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = plane(store, clock);
+        plane.createIndex(descriptor("hollow"));
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("hollow-node"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            node.renewLease(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(List.of(Map.entry("hollow", 0)));
+            assertNotNull("entered before it opened", entryOf(plane, "hollow"));
+            loop.setIdleAfterMillis(1);
+            loop.releaseIdle(System.currentTimeMillis() + 60_000L);
+            assertTrue(node.reconciler().openShards().isEmpty());
+            assertNull("given back with nothing written, it leaves no entry", entryOf(plane, "hollow"));
+
+            loop.activateOnDemand(List.of(Map.entry("hollow", 0)));
+            final ShardId shardId = node.reconciler().openShards().iterator().next();
+            assertNotNull("a writer enters it again before it opens", entryOf(plane, "hollow"));
+            node.index(shardId, "doc", "{\"msg\":\"x\",\"n\":1}");
+            loop.releaseIdle(System.currentTimeMillis() + 120_000L);
+            final DigestRollups.Entry entry = entryOf(plane, "hollow");
+            assertNotNull("given back with something written, it keeps its entry", entry);
+            assertNotNull("with a digest", entry.states().get(0).digest());
+        }
+    }
+
+    /** The janitor takes out entries that record nothing, and leaves one whose shard has something in its log. */
+    public void testTheJanitorRemovesEntriesThatRecordNothingOnly() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final BlobStore store = new FsBlobStore(1024, createTempDir(), false);
+        final MetadataPlane plane = plane(store, clock);
+        plane.createIndex(descriptor("hollow"));
+        plane.createIndex(descriptor("logged"));
+        // What earlier releases left: entries marked and cleared, never published.
+        for (String index : List.of("hollow", "logged")) {
+            plane.rollups().markOwned(index, descriptor(index).uuid(), 1, 0, 1L);
+            plane.rollups().clearOwned(index, descriptor(index).uuid(), 0, 1L);
+            assertNotNull(entryOf(plane, index));
+        }
+        // One of them has a record in its log nobody published.
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("hollow-janitor"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            node.renewLease(plane);
+            plane.membership().refresh();
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(List.of(Map.entry("logged", 0)));
+            final ShardId logged = node.reconciler().openShards().iterator().next();
+            node.index(logged, "unpublished", "{\"msg\":\"x\",\"n\":1}");
+            final long term = plane.heads().read("logged", 0).orElseThrow().term();
+            node.reconciler().releaseShard(logged, "test: given back unpublished, as a lapsed owner does");
+            assertTrue(plane.heads().release("logged", 0, node.localNode().getId(), term));
+            plane.rollups().clearOwned("logged", descriptor("logged").uuid(), 0, term);
+
+            final int slots = plane.rollups().groups().size() * DigestRollups.BUCKETS;
+            for (int i = 0; i < slots; i++) {
+                loop.sweepAbandoned(100, 0);
+            }
+            assertNull("an entry recording nothing over a shard holding nothing is removed", entryOf(plane, "hollow"));
+            assertNotNull("one over a shard with a write in its log stays", entryOf(plane, "logged"));
+        }
+    }
+
     /** The term the rollups mark the shard owned at; zero if none. */
     private static long markedTerm(MetadataPlane plane, String index) throws Exception {
         final Map<String, DigestRollups.Entry> group = plane.rollups().readGroup(DigestRollups.group(index), new DescriptorStore.Reads() {
