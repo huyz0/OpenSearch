@@ -143,6 +143,59 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
     }
 
     /**
+     * A reader that validated a shard nobody owned, after which a writer took it, acknowledged a write and gave the head
+     * back unpublished -- what a lease lapse under throttling does -- must not go on serving the old commit as current.
+     *
+     * <p>The reader remembered "nobody owns it" and, while no node had departed, answered from that memory without a
+     * read: a fleet's stale-read check found two searches returning one of two acknowledged documents and no failure.
+     */
+    public void testAReaderNoticesAWriterThatCameAndWentUnpublished() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode writer = new ServerlessNode(nodeSettings("came-and-went-writer", "ingest"));
+            ServerlessNode reader = new ServerlessNode(nodeSettings("came-and-went-reader", "search"))
+        ) {
+            writer.start();
+            reader.start();
+            writer.setMetadataPlane(plane);
+            reader.setMetadataPlane(plane);
+            writer.renewLease(plane);
+            reader.renewLease(plane);
+            // Re-checked on every search here, so the test needs no sleep; the production bound is a second.
+            reader.setReaderCheckMillis(0);
+            final BackgroundReconciler loop = new BackgroundReconciler(writer, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(java.util.List.of(java.util.Map.entry("alpha", 0)));
+            assertEquals(201, send(writer, "PUT", "/alpha/_doc/first", "{\"msg\":\"needle\",\"n\":1}").status());
+            loop.publishAll();
+            loop.setIdleAfterMillis(1);
+            loop.releaseIdle(System.currentTimeMillis() + 60_000L);
+            assertNull("given back cleanly, published", plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
+
+            final Response before = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
+            assertEquals(before.body(), 1L, number(before.body(), "value"));
+
+            // A writer comes, acknowledges a write, and goes without publishing it.
+            loop.activateOnDemand(java.util.List.of(java.util.Map.entry("alpha", 0)));
+            final var shardId = writer.reconciler().openShards().iterator().next();
+            assertEquals(201, send(writer, "PUT", "/alpha/_doc/second", "{\"msg\":\"needle\",\"n\":2}").status());
+            final long term = plane.heads().read("alpha", 0).orElseThrow().term();
+            writer.reconciler().releaseShard(shardId, "test: lease lapsed, given back unpublished");
+            assertTrue(plane.heads().release("alpha", 0, writer.localNode().getId(), term));
+
+            final Response after = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
+            final long hits = after.status() == 200 ? number(after.body(), "value") : -1L;
+            final long failed = after.status() == 200 ? number(after.body(), "failed") : -1L;
+            assertTrue(
+                "both documents, or the shard reported as not answered -- never one hit and no failure: " + after.body(),
+                hits == 2L || failed > 0L || after.status() >= 500
+            );
+        }
+    }
+
+    /**
      * A commit published before commits recorded how far into the log they reach is served when the log holds
      * nothing it lacks. Treating such a commit as covering none of its term made every shard ever written look
      * behind -- a term's highest record stays in the log after a publish -- and a fleet reopened on old manifests
