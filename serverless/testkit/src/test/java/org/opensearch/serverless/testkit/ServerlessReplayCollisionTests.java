@@ -97,6 +97,52 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
     }
 
     /**
+     * A write reaching a reader that is open but not recorded as one -- the moment between a reader's open and its
+     * recording, before readers were recorded first -- is refused and logs nothing.
+     *
+     * <p>On an ingest node a reader's engine accepts writes, at its commit's term and numbered from its commit. A fleet
+     * run found one acknowledged that way: its first append began the term unchecked, fenced the writer's records off
+     * behind it, and logged a sequence number the writer had already given -- which replay would have dropped one of.
+     */
+    public void testAWriteToAReaderIsNeverLogged() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final IndexDescriptor alpha = new IndexDescriptor(
+            "alpha",
+            "uuid-alpha-0000000000",
+            1,
+            "{\"properties\":{\"msg\":{\"type\":\"text\"}}}",
+            null
+        );
+        plane.createIndex(alpha);
+        try (
+            ServerlessNode writer = new ServerlessNode(nodeSettings("reader-write-writer"));
+            ServerlessNode other = new ServerlessNode(nodeSettings("reader-write-other"))
+        ) {
+            writer.start();
+            writer.setMetadataPlane(plane);
+            writer.renewLease(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(writer, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(List.of(Map.entry("alpha", 0)));
+            writer.index(writer.reconciler().openShards().iterator().next(), "a", "{\"msg\":\"a\"}");
+            loop.publishAll();
+            loop.setIdleAfterMillis(1);
+            loop.releaseIdle(System.currentTimeMillis() + 60_000L);
+
+            other.start();
+            other.setMetadataPlane(plane);
+            other.renewLease(plane);
+            final ShardId reader = other.serveAsReader(plane, "alpha", 0);
+            other.reconciler().unrecordReaderForTesting(reader);
+
+            expectThrows(java.io.IOException.class, () -> other.index(reader, "b", "{\"msg\":\"b\"}"));
+            for (WalRecord record : plane.walStore("alpha", alpha.uuid(), 0).replayableAfterFencing()) {
+                assertNotEquals("nothing written through a reader reaches the log", "b", record.id());
+            }
+        }
+    }
+
+    /**
      * Two records in the log itself under one sequence number, both past the commit: what a writer's record landing past
      * its successor's fence leaves. Core would apply the first and skip the second, and the open's first publish would
      * trim it -- which is how a fleet run lost three acknowledged writes. The shard refuses to open instead.

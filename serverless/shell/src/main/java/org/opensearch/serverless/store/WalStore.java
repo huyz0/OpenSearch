@@ -748,6 +748,20 @@ public final class WalStore {
     }
 
     /**
+     * Whether this writer has begun a term: fenced it, after checking ownership when asked to.
+     *
+     * <p>An append to a term not begun begins it on its own, unchecked, which is right for a log used directly and wrong
+     * for a shard's writer: one that has not begun its term is not the writer the head names, and its first append would
+     * fence the real one's records off behind it.
+     *
+     * @param term the term
+     * @return true if begun
+     */
+    public boolean begun(long term) {
+        return seededTerm == term && poisoned == false;
+    }
+
+    /**
      * Whether any record has landed past a position: in a newer term, or in the same term at a higher ordinal.
      *
      * <p>What a reader asks before serving a commit nobody is writing ahead of: a record past the position the
