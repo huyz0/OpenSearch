@@ -2879,7 +2879,17 @@ public final class ServerlessNode implements Closeable {
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final String openingKey = indexName + "#" + shardNumber;
         final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey);
-        validateReader(plane, indexName, shardNumber, served);
+        try {
+            validateReader(plane, indexName, shardNumber, served);
+        } catch (ShardBehindLogException e) {
+            if (e.superseded() == false || reconciler.readerShards().contains(served)) {
+                throw e;
+            }
+            // The copy was on a replaced commit and has been let go: one open now is onto the current one.
+            final org.opensearch.core.index.shard.ShardId reopened = openOrShareReader(plane, indexName, shardNumber, openingKey);
+            validateReader(plane, indexName, shardNumber, reopened);
+            return reopened;
+        }
         return served;
     }
 
@@ -2993,8 +3003,26 @@ public final class ServerlessNode implements Closeable {
             readerChecks.put(key, new ReaderCheck(commit, departed, owner, headTerm, now));
             return;
         }
-        // Nobody is writing it -- no owner, a dead one, or this node named with nothing open. The commit has to
-        // cover the log on its own. One that does not say how far it reaches covers none of its own term.
+        // Nobody is writing it -- no owner, a dead one, or this node named with nothing open. The commit has to be the
+        // published one first: a writer that replayed the log and published replaced it, and trimmed the log behind
+        // its own commit, so a listing finds nothing past this one and it would be served one write short. A fleet
+        // run found exactly that, answered complete.
+        final var published = plane.segmentPublisher(indexName, shardId.getIndex().getUUID(), shardNumber).readManifest();
+        if (published.isPresent() && sameCommit(commit, published.get()) == false) {
+            readerChecks.remove(key);
+            // Let go now if no query holds it, so the retry opens the current commit; one that does is let go by the
+            // reconciler's next refresh, and refuses until then.
+            if (reconciler.releaseReader(
+                shardId,
+                commit,
+                "the commit it was serving has been superseded"
+            ) == org.opensearch.serverless.shard.ShardReconciler.ReaderRelease.RELEASED) {
+                forgetReader(shardId);
+            }
+            throw ShardBehindLogException.superseded(indexName, shardNumber);
+        }
+        // Then it has to cover the log on its own. One that does not say how far it reaches covers none of its own
+        // term.
         final var log = plane.walStore(indexName, shardId.getIndex().getUUID(), shardNumber);
         final boolean behind;
         if (commit.walOrdinal() >= 0L) {
@@ -3055,6 +3083,11 @@ public final class ServerlessNode implements Closeable {
                 }
             });
         }
+    }
+
+    /** Whether two manifests name the same commit: the same term and the same files. */
+    private static boolean sameCommit(org.opensearch.serverless.store.CommitManifest a, org.opensearch.serverless.store.CommitManifest b) {
+        return a.term() == b.term() && a.files().equals(b.files());
     }
 
     /** Whether a node holds a live lease: the membership snapshot first, the register only when it says no. */
