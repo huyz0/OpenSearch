@@ -85,6 +85,23 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         return overrides;
     }
 
+    /**
+     * Log4j lines setting each logger named in tests.fleet.debug_loggers, comma-separated, to debug: the nodes'
+     * own loggers are configured here, so a node setting cannot reach them.
+     */
+    private static String debugLoggers() {
+        final StringBuilder lines = new StringBuilder();
+        int i = 0;
+        for (String name : prop("debug_loggers", "").split(",")) {
+            if (name.isBlank() == false) {
+                lines.append("logger.debug").append(i).append(".name = ").append(name.trim()).append('\n');
+                lines.append("logger.debug").append(i).append(".level = debug").append('\n');
+                i++;
+            }
+        }
+        return lines.toString();
+    }
+
     private static String prop(String key, String fallback) {
         return System.getProperty("tests.fleet." + key, fallback);
     }
@@ -1224,7 +1241,13 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 out.append("  count failed: ").append(e.getMessage()).append('\n');
             }
         }
-        Files.writeString(results.resolve("forensics.txt"), out.toString(), StandardCharsets.UTF_8);
+        Files.writeString(
+            results.resolve("forensics.txt"),
+            out.toString(),
+            StandardCharsets.UTF_8,
+            java.nio.file.StandardOpenOption.CREATE,
+            java.nio.file.StandardOpenOption.APPEND
+        );
         line("- forensics in " + results.resolve("forensics.txt"));
     }
 
@@ -1275,6 +1298,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 "logger.fanout.level = error",
                 "logger.searchfanout.name = org.opensearch.serverless.rest.SearchFanout",
                 "logger.searchfanout.level = error",
+                debugLoggers(),
                 ""
             ),
             StandardCharsets.UTF_8

@@ -255,7 +255,7 @@ public final class SegmentPublisher {
         if (result.applied() == false && remembered != null) {
             // The register moved under what this instance remembered -- a repair, a restore, a manifest
             // rewritten by hand. Once, the way every publish used to begin: read it and publish over it.
-            return publish(store, commit, term, writerId, digest);
+            return publish(store, commit, term, writerId, digest, walOrdinal);
         }
         if (result.applied() == false) {
             // Who moved it. A newer term is the fence this exception exists for. The same term and the
