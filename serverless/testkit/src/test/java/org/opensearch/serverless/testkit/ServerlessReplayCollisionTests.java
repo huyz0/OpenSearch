@@ -95,4 +95,56 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             assertNull("and its head is given back for the next attempt", plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
         }
     }
+
+    /**
+     * Two records in the log itself under one sequence number, both past the commit: what a writer's record landing past
+     * its successor's fence leaves. Core would apply the first and skip the second, and the open's first publish would
+     * trim it -- which is how a fleet run lost three acknowledged writes. The shard refuses to open instead.
+     */
+    public void testAShardWhoseLogHoldsOneSequenceNumberTwiceRefusesToOpen() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final IndexDescriptor alpha = new IndexDescriptor(
+            "alpha",
+            "uuid-alpha-0000000000",
+            1,
+            "{\"properties\":{\"msg\":{\"type\":\"text\"}}}",
+            null
+        );
+        plane.createIndex(alpha);
+        try (
+            ServerlessNode first = new ServerlessNode(nodeSettings("twice-first"));
+            ServerlessNode second = new ServerlessNode(nodeSettings("twice-second"))
+        ) {
+            first.start();
+            first.setMetadataPlane(plane);
+            first.renewLease(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(first, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(List.of(Map.entry("alpha", 0)));
+            final ShardId shardId = first.reconciler().openShards().iterator().next();
+            first.index(shardId, "a", "{\"msg\":\"a\"}");
+            loop.publishAll();
+            loop.setIdleAfterMillis(1);
+            loop.releaseIdle(System.currentTimeMillis() + 60_000L);
+            assertTrue(first.reconciler().openShards().isEmpty());
+
+            // Sequence number 1, twice: an older writer's record past the fence, and its successor's own write.
+            final long term = plane.heads().read("alpha", 0).orElseThrow().term();
+            plane.walStore("alpha", alpha.uuid(), 0).append(term, new WalRecord("stale", "{\"msg\":\"stale\"}", 1L, term, 1L));
+            plane.walStore("alpha", alpha.uuid(), 0)
+                .append(term + 1, new WalRecord("acknowledged", "{\"msg\":\"acknowledged\"}", 1L, term + 1, 1L));
+
+            second.start();
+            second.setMetadataPlane(plane);
+            second.renewLease(plane);
+            final BackgroundReconciler other = new BackgroundReconciler(second, plane).setDemandDrivenActivation(true);
+            try {
+                other.activateOnDemand(List.of(Map.entry("alpha", 0)));
+            } catch (Exception expected) {
+                // Refused: the activation reports it, or settles without the shard.
+            }
+            assertTrue("the shard does not open dropping one of them", second.reconciler().openShards().isEmpty());
+            assertNull("and its head is given back for the next attempt", plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
+        }
+    }
 }

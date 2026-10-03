@@ -88,6 +88,29 @@ public final class HookedBlobStore implements BlobStore {
 
     private volatile String failRegisterReadsUnder;
 
+    private record Hold(String pathContains, String blobName, java.util.concurrent.CountDownLatch entered,
+        java.util.concurrent.CountDownLatch release) {
+    }
+
+    private volatile Hold held;
+
+    /**
+     * Holds the next write of one blob in flight -- a PUT the store has not yet answered -- until released.
+     *
+     * @param pathContains a fragment of the container's path
+     * @param blobName the blob's name
+     * @param entered counted down once the write is held
+     * @param release the write proceeds once this is counted down
+     */
+    public void holdNextWrite(
+        String pathContains,
+        String blobName,
+        java.util.concurrent.CountDownLatch entered,
+        java.util.concurrent.CountDownLatch release
+    ) {
+        held = new Hold(pathContains, blobName, entered, release);
+    }
+
     /**
      * Wraps a store.
      *
@@ -173,6 +196,19 @@ public final class HookedBlobStore implements BlobStore {
 
         @Override
         public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
+            final Hold hold = held;
+            if (hold != null && blobName.equals(hold.blobName()) && inner.path().buildAsString().contains(hold.pathContains())) {
+                held = null;
+                hold.entered().countDown();
+                try {
+                    if (hold.release().await(30, java.util.concurrent.TimeUnit.SECONDS) == false) {
+                        throw new IOException("held write of [" + blobName + "] was never released");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(e);
+                }
+            }
             final String fragment = delayWritesUnder;
             if (fragment != null && inner.path().buildAsString().contains(fragment)) {
                 java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(delayMillis));

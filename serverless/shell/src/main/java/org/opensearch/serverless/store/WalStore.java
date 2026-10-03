@@ -68,6 +68,15 @@ public final class WalStore {
     /** A seal's blob name. Deliberately not a bare ordinal, so nothing counting records can count a seal. */
     private static final java.util.regex.Pattern SEAL_NAME = java.util.regex.Pattern.compile("seal-\\d{20}");
 
+    /**
+     * Left in a term's directory by a successor that has fenced it. A term whose last blob is a fence is closed only if
+     * a successor put it there: the writer's own fence, placed when it began the term, looks the same, and a successor
+     * that took it for one left a live writer appending -- its records acknowledged after the successor had replayed.
+     */
+    private static final String FENCED_MARKER = "fenced";
+    /** One append in flight per writer, so its names stay contiguous and a fence in its next slot stops it. */
+    private final Object appendLock = new Object();
+
     private final AtomicLong ordinal = new AtomicLong();
     private volatile long seededTerm = -1L;
     /** Set by any failed or ambiguous append: this instance never appends to that term again. See {@link #append}. */
@@ -263,6 +272,15 @@ public final class WalStore {
         // Zero-padded so a lexicographic listing is a chronological one. Within a term there is exactly
         // one writer, so the ordinal needs no coordination. A batch takes one ordinal and its records
         // replay in the order they were written, so the total order over a term is (ordinal, position).
+        // One at a time. With several in flight a fence could take the slot of one whose PUT had not landed while the
+        // next, past it, landed and was acknowledged: a record behind the fence that a later successor replays, ahead
+        // of the write its predecessor made under the same sequence number.
+        synchronized (appendLock) {
+            appendOne(term, bytes);
+        }
+    }
+
+    private void appendOne(long term, byte[] bytes) throws IOException {
         if (poisoned) {
             throw new IOException("this log writer stopped appending to term " + term + " after an earlier append failed or it was fenced");
         }
@@ -377,7 +395,7 @@ public final class WalStore {
     }
 
     /**
-     * Fences every older term whose last blob is not already a fence, at a takeover.
+     * Fences every older term that no successor has fenced already, at a takeover.
      *
      * <p>This is the seal, made a fence: rather than recording how far the predecessor's log reached, which
      * a listing can only say about the past, it stops the log reaching further. Every older term, not just
@@ -401,10 +419,11 @@ public final class WalStore {
                     lastLength = blob.getValue().length();
                 }
             }
-            if (last != null && lastLength == 0L) {
+            if (last != null && lastLength == 0L && listed.containsKey(FENCED_MARKER)) {
                 continue;
             }
             fence(older.getKey(), false, listed);
+            older.getValue().writeBlob(FENCED_MARKER, new ByteArrayInputStream(new byte[0]), 0L, false);
         }
     }
 
@@ -953,7 +972,11 @@ public final class WalStore {
             final List<String> ours = new ArrayList<>(child.listBlobs().keySet());
             // Seals go too: this is the log being destroyed, not truncated, so the cutoffs recorded
             // against it have nothing left to bound.
-            ours.removeIf(name -> RECORD_NAME.matcher(name).matches() == false && SEAL_NAME.matcher(name).matches() == false);
+            ours.removeIf(
+                name -> RECORD_NAME.matcher(name).matches() == false
+                    && SEAL_NAME.matcher(name).matches() == false
+                    && FENCED_MARKER.equals(name) == false
+            );
             child.deleteBlobsIgnoringIfNotExists(ours);
         }
     }

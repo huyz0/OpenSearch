@@ -82,6 +82,71 @@ public abstract class LogFencingTestCase extends OpenSearchTestCase {
         assertFalse("refused at the fence: never replayed", replayed.contains("after-fence"));
     }
 
+    /**
+     * A writer with two appends in flight, the first held unanswered while a successor fences its slot: the second must
+     * not land past the fence and be acknowledged. A fleet run lost three acknowledged writes this way -- the record
+     * past the fence was replayed by a later successor ahead of the newer term's write of the same sequence number,
+     * which recovery then skipped, and that successor's publish trimmed it away.
+     */
+    public void testASecondAppendInFlightCannotLandPastAFence() throws Exception {
+        final HookedBlobStore store = new HookedBlobStore(newStore());
+        final WalStore predecessor = new WalStore(store, SHARD);
+        predecessor.establish(1L, null);
+        // establish fenced slot 1; this record is slot 2, the held one slot 3, and the one behind it slot 4.
+        predecessor.append(1L, List.of(record("landed", 1L)));
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        store.holdNextWrite("t=1", "00000000000000000003", entered, release);
+        final java.util.concurrent.atomic.AtomicReference<Exception> first = new java.util.concurrent.atomic.AtomicReference<>();
+        final Thread held = new Thread(() -> {
+            try {
+                predecessor.append(1L, List.of(record("held", 1L)));
+            } catch (Exception e) {
+                first.set(e);
+            }
+        });
+        held.start();
+        assertTrue(entered.await(30, java.util.concurrent.TimeUnit.SECONDS));
+
+        // The successor fences, while the first is unanswered: slot 3, which the held write has not filled.
+        new WalStore(store, SHARD).fenceOlderTerms(2L);
+        // Then the predecessor's next write.
+        final java.util.concurrent.atomic.AtomicReference<Exception> second = new java.util.concurrent.atomic.AtomicReference<>();
+        final java.util.concurrent.atomic.AtomicBoolean secondDone = new java.util.concurrent.atomic.AtomicBoolean();
+        final Thread next = new Thread(() -> {
+            try {
+                predecessor.append(1L, List.of(record("second", 1L)));
+            } catch (Exception e) {
+                second.set(e);
+            } finally {
+                secondDone.set(true);
+            }
+        });
+        next.start();
+        release.countDown();
+        held.join(30_000L);
+        next.join(30_000L);
+        assertTrue(secondDone.get());
+
+        assertNotNull("the held write lost its slot to the fence", first.get());
+        assertNotNull("so the one behind it is refused too, never acknowledged past the fence", second.get());
+        assertFalse(ids(new WalStore(store, SHARD).replayableAfterFencing()).contains("second"));
+    }
+
+    /**
+     * A writer that has begun its term and written nothing yet is fenced by its successor all the same. Its own fence
+     * is the term's last blob, which a successor used to take for a fence of its own and skip -- leaving the writer
+     * free to append after the successor had replayed.
+     */
+    public void testAWriterThatHasWrittenNothingIsStillFenced() throws Exception {
+        final BlobStore store = newStore();
+        final WalStore predecessor = new WalStore(store, SHARD);
+        predecessor.establish(1L, null);
+        new WalStore(store, SHARD).fenceOlderTerms(2L);
+        expectThrows(IOException.class, () -> predecessor.append(1L, List.of(record("after-the-takeover", 1L))));
+        assertFalse(ids(new WalStore(store, SHARD).replayableAfterFencing()).contains("after-the-takeover"));
+    }
+
     /** A writer refused once stops for good, even where the next slot is free. */
     public void testAWriterRefusedOnceNeverWritesAgain() throws Exception {
         final BlobStore store = newStore();
