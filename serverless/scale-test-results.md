@@ -279,6 +279,107 @@ asserts so; the full suite ran green three times but for the known Windows jar l
 - Idle cost: 5x needs per-node rather than per-shard background.
 - The unprunable remainder sits at the 1,024-shard activation budget.
 
+## After Goal 11: latency, SlowDown, two stale-read defects, and one loss not yet explained
+
+This round took Goal 11's two open performance items, and the runs that measured them found three correctness
+problems: two ways a reader could answer from a commit behind an acknowledged write, and one loss of three
+acknowledged writes. The stale reads are fixed, each with a test that failed first. **The loss is not explained.** It
+happened once, has not recurred in three hours of runs with every writer open and replay logged, and a shard now
+refuses to open rather than drop a write if the leading theory is ever right. Same fleet, load and bucket
+(`fleet-g11fresh`) as Goal 11, five-minute scenarios.
+
+| | Goal 11 | now |
+| --- | --- | --- |
+| steady writes, p50 / p99 | 3.2-4.8 s / 11-19 s | **0.27-0.37 s** / 2.6-7.6 s |
+| write limiter, nothing injected | 777-1,024, 0 refused | 352-1,024, 0-78 refused per node |
+| SlowDown burst | not back within the window | **still not back within the window** |
+| silent stale reads | 0 | 2, then 1, both fixed; **0** in the last 10 scenarios |
+| acknowledged writes lost | 0 | **3 once** (`run1790974395481`); 0 in 15 scenarios since |
+| kill -9 takeover p50 / p99 | 38.0 s / 63.3 s | **67-99 s / 84-288 s** (worse; not investigated) |
+| idle cost, per held shard-hour | 141 | 127-141 |
+
+### Latency: the local fsync
+
+Each write's commit path fsynced the local segment cache under the shard's exclusive guard. That cache is
+rebuilt from the object store on every open -- local commits and every file a manifest names are deleted first -- so
+the fsync protected nothing, and it held every write to the shard behind a disk flush. `BlockCacheDirectory`'s
+`sync` is now a no-op. Steady p50 went from 3-5 s to about 0.3 s. The limiter was also made to regrow geometrically
+once appends are fast, and to refuse while an admitted write has waited past its budget, so one stuck append no
+longer holds the shard's queue indefinitely.
+
+### SlowDown recovery: partly
+
+A node whose lease lapsed under throttling stopped taking writes until its next head verification, up to a full
+interval away; it now rereads as soon as the lease is back. One run then recovered in 146 s, but the runs since did
+not recover within the window. Still open.
+
+### Stale read 1: a reader that remembered "nobody owns it"
+
+`run1790953109586`, slowdown: 2 searches returned one of two acknowledged documents with no failure. A reader that
+had validated a shard with no owner trusted that until a node departed. Meanwhile a writer took the shard,
+acknowledged a write, and gave it back unpublished (a lease lapse). The check is now bound to the head's term and
+owner, and the head is reread at most once a second (`ServerlessStaleReadTests.testAReaderNoticesAWriterThatCameAndWentUnpublished`).
+
+### Stale read 2: a reader on a commit a successor replaced
+
+`run1791010969808`, restart: one search returned one of two documents with no failure. The store showed the whole
+sequence:
+
+1. A reader opened on the term-1 commit.
+2. A term-2 writer acknowledged a second write and went without publishing.
+3. A term-3 writer replayed the write, published it, and its publish trimmed the log behind its own commit
+   (`wal/t=2` holds only fences).
+4. With nobody writing the shard, the reader compared its commit with the log, found nothing past it, and served it
+   as complete.
+
+The write was never at risk; the reader did not know its commit had been replaced. Readers were moved onto a new
+commit only by a background pass. A reader of a shard with no live writer now compares its commit with the published
+manifest first. A replaced one is let go and refused as retryable, without asking anyone to take the shard, and the
+search path reopens it once onto the current commit
+(`ServerlessStaleReadTests.testAReaderNoticesItsCommitWasSuperseded`, which returned the fleet's exact wrong answer
+before the fix).
+
+### The loss: three writes, not reproduced
+
+`run1790974395481`, steady: three acknowledged writes in neither the commit nor the log. Example: `logs-0000088`,
+seqNo 9706 at term 29, where `wal/t=29` holds fences 1 and 3 and record 2 is gone, and the current owner's
+realtime get does not find the document.
+
+**Ruled out from logs and store:**
+- fencing;
+- lease lapses;
+- failed appends and failed engines;
+- a stale local open;
+- legacy seals;
+- the writer's own truncation;
+- overlapping publishes of one shard (serialised per node);
+- truncation state carried across a term change (reset by each new term).
+
+**The leading theory:** two operations sharing a sequence number across terms. Core's recovery skips a replayed
+operation whose number the restored commit has already processed, which would drop one silently, and the next
+publish trims the record. A canary shows that this loses a write. `ServerlessWriterEngine` now checks every replayed
+record at or below the commit's checkpoint against the commit, logs any that is absent, and refuses to open on a
+proven collision (`ServerlessReplayCollisionTests`).
+
+**Since then:** three reproduction runs over 15 scenarios, with every writer open and replay logged
+(`-Dtests.fleet.debug_loggers=...`):
+- 27,000+ opens, and more than 14,000 replayed records at or below their commit's checkpoint;
+- every one of those records was in its commit;
+- not one skip, not one refusal, and 0 lost.
+
+The other untested suspect is the janitor's replay-and-release, which these runs did not log.
+
+### Still open
+
+- **The three-write loss:** cause unknown. Next: log the janitor's replays and log deletions, and run kill and
+  slowdown again.
+- **SlowDown recovery:** not within the window.
+- **Kill -9 takeover:** p50 67-99 s and p99 84-288 s, against Goal 11's 38 s and 63 s.
+- **Readers refusing:** many shards with no live writer are reported as not answering, 1,000-4,000 per scenario,
+  before and after the second fix. One cause seen in a test: a writer that only replays the log publishes nothing,
+  so its readers keep refusing until someone does.
+- **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
+
 
 ## Method
 
