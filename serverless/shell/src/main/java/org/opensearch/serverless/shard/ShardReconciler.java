@@ -523,6 +523,15 @@ public final class ShardReconciler {
                 ? Optional.of(knownCommit)
                 : (publisher == null ? Optional.empty() : publisher.readManifest());
             final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
+            if (replayWal) {
+                logger.debug(
+                    "opening writer {} at term {} from {}",
+                    shardId,
+                    shardHeadTerm,
+                    published.map(m -> "manifest term " + m.term() + " log ordinal " + m.walOrdinal() + " by " + m.writer())
+                        .orElse("nothing published")
+                );
+            }
 
             final ShardRouting initializing = ShardRouting.newUnassigned(
                 shardId,
@@ -1152,6 +1161,19 @@ public final class ShardReconciler {
     }
 
     private boolean releaseShardLocked(ShardId shardId, String reason, boolean deleteStore) {
+        if (readers.contains(shardId) == false && open.containsKey(shardId)) {
+            // Writers only: every way a writer stops, for reconstructing a handover.
+            final IndexShard writer = open.get(shardId);
+            long maxSeqNo = -1L;
+            long term = -1L;
+            try {
+                maxSeqNo = writer.seqNoStats().getMaxSeqNo();
+                term = writer.getOperationPrimaryTerm();
+            } catch (Exception e) {
+                // closing under us
+            }
+            logger.info("releasing writer {} at term {} with max seqNo {}: {}", shardId, term, maxSeqNo, reason);
+        }
         final int busy = inFlight(shardId);
         // Readers only. A writer being released has lost its head, or is about to give it up, and a
         // writer that stays open past that point would go on acknowledging writes nobody will replay; a

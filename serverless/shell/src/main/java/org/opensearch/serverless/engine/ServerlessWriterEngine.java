@@ -80,6 +80,114 @@ public final class ServerlessWriterEngine extends InternalEngine {
         this.replayLog = replayLog;
     }
 
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(
+        ServerlessWriterEngine.class
+    );
+
+    /**
+     * Says what a recovery is about to replay over what it restored, and shouts about any record the replay would skip.
+     *
+     * <p>Core's recovery skips an operation whose sequence number the restored commit has already processed. That is
+     * right when the commit holds that operation, and silent loss when it holds a different one under the same number:
+     * a fleet run lost acknowledged writes whose records were in the log at a takeover and never reached the
+     * successor's commit. Each record at or below the processed checkpoint is checked for its document in the commit:
+     * one that is not there is logged as an error -- it may have been deleted since, which is not a loss -- and one
+     * whose sequence number a different live document holds is a proven collision, and the open is refused. A shard
+     * that will not open is an outage someone sees; a shard opened without an acknowledged write is a loss nobody does.
+     */
+    private void reportReplay(ShardId shardId, List<Translog.Operation> operations) {
+        final long processed = getProcessedLocalCheckpoint();
+        long min = Long.MAX_VALUE;
+        long max = -1L;
+        final java.util.Set<Long> terms = new java.util.TreeSet<>();
+        int atOrBelow = 0;
+        int skippedAbsent = 0;
+        String collision = null;
+        try (org.opensearch.index.engine.Engine.Searcher searcher = acquireSearcher("serverless-replay-check", SearcherScope.INTERNAL)) {
+            for (Translog.Operation operation : operations) {
+                min = Math.min(min, operation.seqNo());
+                max = Math.max(max, operation.seqNo());
+                terms.add(operation.primaryTerm());
+                if (operation.seqNo() > processed || operation instanceof Translog.Index == false) {
+                    continue;
+                }
+                atOrBelow++;
+                final String id = ((Translog.Index) operation).id();
+                final int found = searcher.count(
+                    new org.apache.lucene.search.TermQuery(
+                        new org.apache.lucene.index.Term(
+                            org.opensearch.index.mapper.IdFieldMapper.NAME,
+                            org.opensearch.index.mapper.Uid.encodeId(id)
+                        )
+                    )
+                );
+                if (found == 0) {
+                    skippedAbsent++;
+                    final String holder = holderOf(searcher, operation.seqNo());
+                    logger.error(
+                        "{} replay would SKIP record {} (seqNo {}, term {}): the restored commit has processed through {} and does not "
+                            + "hold this document; seqNo {} is held there by {}",
+                        shardId,
+                        id,
+                        operation.seqNo(),
+                        operation.primaryTerm(),
+                        processed,
+                        operation.seqNo(),
+                        holder == null ? "no live document (deleted since, or merged away)" : "document " + holder
+                    );
+                    if (holder != null && holder.equals(id) == false) {
+                        collision = "record "
+                            + id
+                            + " at seqNo "
+                            + operation.seqNo()
+                            + " term "
+                            + operation.primaryTerm()
+                            + " collides with document "
+                            + holder
+                            + " in the restored commit";
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("could not check the replay of " + shardId + " against its restored commit", e);
+        }
+        if (collision != null) {
+            throw new EngineException(
+                shardId,
+                "refusing to open: two acknowledged operations share a sequence number and replay would drop one -- " + collision
+            );
+        }
+        logger.debug(
+            "{} replaying {} records (seqNo {}..{}, terms {}) over a commit processed through {}; {} at or below it, {} absent from it",
+            shardId,
+            operations.size(),
+            operations.isEmpty() ? "-" : min,
+            operations.isEmpty() ? "-" : max,
+            terms,
+            processed,
+            atOrBelow,
+            skippedAbsent
+        );
+    }
+
+    /** The id of the live document holding a sequence number in the commit, or null if none does. */
+    private static String holderOf(org.opensearch.index.engine.Engine.Searcher searcher, long seqNo) throws IOException {
+        final org.apache.lucene.search.TopDocs top = searcher.search(
+            org.apache.lucene.document.LongPoint.newExactQuery(org.opensearch.index.mapper.SeqNoFieldMapper.NAME, seqNo),
+            1
+        );
+        if (top.scoreDocs.length == 0) {
+            return null;
+        }
+        final org.apache.lucene.document.Document stored = searcher.storedFields().document(top.scoreDocs[0].doc);
+        final org.apache.lucene.util.BytesRef idBytes = stored.getBinaryValue(org.opensearch.index.mapper.IdFieldMapper.NAME);
+        return idBytes == null
+            ? "(unreadable id)"
+            : org.opensearch.index.mapper.Uid.decodeId(
+                java.util.Arrays.copyOfRange(idBytes.bytes, idBytes.offset, idBytes.offset + idBytes.length)
+            );
+    }
+
     @Override
     public List<Translog.Operation> engineRecoveryOperations() {
         if (replayLog == null) {
@@ -115,6 +223,7 @@ public final class ServerlessWriterEngine extends InternalEngine {
                     );
                 }
             }
+            reportReplay(shardId, operations);
             if (operations.isEmpty() == false) {
                 // Raise the update-or-delete watermark to cover what is about to be replayed, before it
                 // is replayed. The engine's append-only fast path is only sound while every operation it
