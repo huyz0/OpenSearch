@@ -3514,6 +3514,18 @@ public final class ServerlessNode implements Closeable {
             return;
         }
         ensureOwnLeaseIsStillValid(shardId);
+        if (wal.begun(shard.getOperationPrimaryTerm()) == false) {
+            // Not this term's writer: only a writer's open begins its term, after confirming the head names it. Appending
+            // anyway would begin the term here, unchecked, and fence the real writer's records off behind this one.
+            writeFenced.add(shardId);
+            throw new java.io.IOException(
+                "could not log to "
+                    + shardId
+                    + ": this node is not writing its log at term "
+                    + shard.getOperationPrimaryTerm()
+                    + " -- never began it here, or stopped after a failed append; the write was not acknowledged"
+            );
+        }
         final long appendStarted = System.nanoTime();
         try {
             // Through the group committer rather than straight to the log: concurrent writes to this shard

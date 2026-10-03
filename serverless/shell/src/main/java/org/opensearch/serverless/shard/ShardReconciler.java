@@ -636,6 +636,13 @@ public final class ShardReconciler {
                 if (replayWal && walStores != null) {
                     replayRecordsWithoutSequenceIdentity(shard, shardId);
                 }
+                if (replayWal == false) {
+                    // A reader is a reader before it is open. To the write path a shard open and not a reader is this
+                    // node's writer, and on an ingest node a reader's engine accepts writes: one that landed between
+                    // the two was applied at the reader's commit, numbered from there, and acknowledged -- a fleet
+                    // run found a sequence number given twice that way, which replay would have dropped one of.
+                    readers.add(shardId);
+                }
                 open.put(shardId, shard);
                 return shard;
             } catch (Exception e) {
@@ -1160,6 +1167,16 @@ public final class ShardReconciler {
         }
     }
 
+    /**
+     * Stops counting an open reader as a reader, leaving it open: the state a reader passed through between being opened
+     * and being recorded, before readers were recorded first. For tests of what the write path does in that state.
+     *
+     * @param shardId the reader
+     */
+    public void unrecordReaderForTesting(ShardId shardId) {
+        readers.remove(shardId);
+    }
+
     private boolean releaseShardLocked(ShardId shardId, String reason, boolean deleteStore) {
         if (readers.contains(shardId) == false && open.containsKey(shardId)) {
             // Writers only: every way a writer stops, for reconstructing a handover.
@@ -1188,13 +1205,15 @@ public final class ShardReconciler {
             );
             return false;
         }
+        // Out of the open set before it stops being a reader: a shard open and not a reader is this node's writer to
+        // the write path, and a reader is a writable engine on an ingest node.
+        final IndexShard shard = open.remove(shardId);
         readers.remove(shardId);
         readerCommits.remove(shardId);
         walCache.remove(shardId);
         publisherCache.remove(shardId);
         lastUsed.remove(shardId);
         writeGuards.remove(shardId);
-        final IndexShard shard = open.remove(shardId);
         final Index index = shardId.getIndex();
         final IndexService indexService = indicesService.indexService(index);
         boolean removed = false;
