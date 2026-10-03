@@ -279,24 +279,27 @@ asserts so; the full suite ran green three times but for the known Windows jar l
 - Idle cost: 5x needs per-node rather than per-shard background.
 - The unprunable remainder sits at the 1,024-shard activation budget.
 
-## After Goal 11: latency, SlowDown, two stale-read defects, and one loss not yet explained
+## After Goal 11: latency, two stale reads, and a loss traced to writes past a fence
 
-This round took Goal 11's two open performance items, and the runs that measured them found three correctness
-problems: two ways a reader could answer from a commit behind an acknowledged write, and one loss of three
-acknowledged writes. The stale reads are fixed, each with a test that failed first. **The loss is not explained.** It
-happened once, has not recurred in three hours of runs with every writer open and replay logged, and a shard now
-refuses to open rather than drop a write if the leading theory is ever right. Same fleet, load and bucket
-(`fleet-g11fresh`) as Goal 11, five-minute scenarios.
+This round took Goal 11's two open performance items. The runs that measured them found:
+- two ways a reader could answer from a commit behind an acknowledged write;
+- one loss of three acknowledged writes.
+
+All are fixed, each with a test that failed first. The loss came from a writer whose records landed after its
+successor had fenced the log, which happened three ways. A shard now refuses to open, rather than drop a write, if
+its log ever holds one sequence number twice. The final run (`run1791031482814`) was 0 lost, 0 refused-but-visible,
+0 unreached and 0 silently behind in all six scenarios. Same fleet, load and bucket (`fleet-g11fresh`) as Goal 11,
+five-minute scenarios.
 
 | | Goal 11 | now |
 | --- | --- | --- |
-| steady writes, p50 / p99 | 3.2-4.8 s / 11-19 s | **0.27-0.37 s** / 2.6-7.6 s |
+| steady writes, p50 / p99 | 3.2-4.8 s / 11-19 s | **0.19-0.53 s** / 0.5-8.4 s |
 | write limiter, nothing injected | 777-1,024, 0 refused | 352-1,024, 0-78 refused per node |
 | SlowDown burst | not back within the window | **still not back within the window** |
-| silent stale reads | 0 | 2, then 1, both fixed; **0** in the last 10 scenarios |
-| acknowledged writes lost | 0 | **3 once** (`run1790974395481`); 0 in 15 scenarios since |
-| kill -9 takeover p50 / p99 | 38.0 s / 63.3 s | **67-99 s / 84-288 s** (worse; not investigated) |
-| idle cost, per held shard-hour | 141 | 127-141 |
+| silent stale reads | 0 | 2, then 1, both fixed; **0** in every run since |
+| acknowledged writes lost | 0 | **3 once** (`run1790974395481`); cause found and fixed; **0** since |
+| kill -9 takeover p50 / p99 | 38.0 s / 63.3 s | 52-99 s / 84-288 s (worse; not investigated) |
+| idle cost, per held shard-hour | 141 | 127-151 |
 
 ### Latency: the local fsync
 
@@ -339,45 +342,65 @@ search path reopens it once onto the current commit
 (`ServerlessStaleReadTests.testAReaderNoticesItsCommitWasSuperseded`, which returned the fleet's exact wrong answer
 before the fix).
 
-### The loss: three writes, not reproduced
+### The loss: records that landed past a fence
 
 `run1790974395481`, steady: three acknowledged writes in neither the commit nor the log. Example: `logs-0000088`,
-seqNo 9706 at term 29, where `wal/t=29` holds fences 1 and 3 and record 2 is gone, and the current owner's
-realtime get does not find the document.
+seqNo 9706 at term 29, where `wal/t=29` holds fences 1 and 3, record 2 is gone, and the current owner's realtime get
+does not find the document.
 
-**Ruled out from logs and store:**
-- fencing;
-- lease lapses;
-- failed appends and failed engines;
-- a stale local open;
-- legacy seals;
-- the writer's own truncation;
-- overlapping publishes of one shard (serialised per node);
-- truncation state carried across a term change (reset by each new term).
+**What the ledger showed.** A collision can make replay skip a record but cannot delete one, so something judged
+record 2 covered. The ledger records each acknowledged write's seqNo and term, and **every lost seqNo had been
+acknowledged twice**, within the same eight seconds:
+- `logs-0000088` 9706: at term 29, then at term 28 six seconds later;
+- `logs-0000095` 9760: at term 20 and at term 19;
+- `logs-0000101` 9908: twice at term 20, for different documents.
 
-**The leading theory:** two operations sharing a sequence number across terms. Core's recovery skips a replayed
-operation whose number the restored commit has already processed, which would drop one silently, and the next
-publish trims the record. A canary shows that this loses a write. `ServerlessWriterEngine` now checks every replayed
-record at or below the commit's checkpoint against the commit, logs any that is absent, and refuses to open on a
-proven collision (`ServerlessReplayCollisionTests`).
+A superseded writer's record had landed after its successor fenced and replayed the term. The next successor
+replayed term 28 -- including that record -- before term 29. Core skipped term 29's 9706 as already processed, and
+that successor's publish dropped the older terms, deleting it.
 
-**Since then:** three reproduction runs over 15 scenarios, with every writer open and replay logged
-(`-Dtests.fleet.debug_loggers=...`):
-- 27,000+ opens, and more than 14,000 replayed records at or below their commit's checkpoint;
-- every one of those records was in its commit;
-- not one skip, not one refusal, and 0 lost.
+**Three ways a record could land past a fence**, each closed, with a test that failed first:
 
-The other untested suspect is the janitor's replay-and-release, which these runs did not log.
+1. **Appends were pipelined.** With several PUTs in flight, a successor's fence took the slot of one not yet landed
+   while the next, past it, landed and was acknowledged. A log writer now has one append in flight at a time
+   (`FsLogFencingTests.testASecondAppendInFlightCannotLandPastAFence`). Steady latency did not suffer: p50
+   193-531 ms, p99 0.5-8.4 s.
+2. **A takeover skipped terms that only looked fenced.** It skipped any older term whose last blob was a fence, but
+   a writer's own fence from beginning its term looks the same, so a writer that had written nothing yet was never
+   fenced. A successor now leaves a marker when it fences a term, and skips only marked terms
+   (`testAWriterThatHasWrittenNothingIsStillFenced`).
+3. **A write could reach a reader's engine.** Found by the first run after 1 and 2 (`run1791029314869`). There,
+   `logs-0000120` held seqNo 14752 twice at term 41: after the writer's records, a second term-41 writer placed a
+   fence and logged it again.
+   - On an ingest node a reader runs a writable engine, at its commit's term and numbered from its commit.
+   - A reader was added to the open set before being recorded as a reader, and left the reader set first on
+     release. A write on that node in either gap was applied to the reader.
+   - Its first append began the term implicitly, with no ownership check, and the write was acknowledged.
+
+   Readers are now recorded before they open and leave the open set first. A write is acknowledged only if the
+   shard's log writer began that exact term, which only a writer's open does, after checking the head
+   (`ServerlessReplayCollisionTests.testAWriteToAReaderIsNeverLogged`).
+
+**And loudly, if it ever happens again.** An open refuses, naming both operations, when the log holds one seqNo
+twice for different operations, or a record collides with a different document in the restored commit
+(`ServerlessReplayCollisionTests`). That is how path 3 was found: the shard refused to open rather than drop one,
+and `logs-0000120` still refuses. Repairing it needs someone to decide which write to keep.
+
+**The confirming run, `run1791031482814`:** steady, slowdown, kill, pause, restart and steady, with every writer open
+and replay logged:
+- 14,414 writer opens;
+- no new collision;
+- 0 lost, 0 refused-but-visible, 0 unreached and 0 silently behind in every scenario.
 
 ### Still open
 
-- **The three-write loss:** cause unknown. Next: log the janitor's replays and log deletions, and run kill and
-  slowdown again.
 - **SlowDown recovery:** not within the window.
-- **Kill -9 takeover:** p50 67-99 s and p99 84-288 s, against Goal 11's 38 s and 63 s.
-- **Readers refusing:** many shards with no live writer are reported as not answering, 1,000-4,000 per scenario,
-  before and after the second fix. One cause seen in a test: a writer that only replays the log publishes nothing,
-  so its readers keep refusing until someone does.
+- **Kill -9 takeover:** p50 52-99 s and p99 84-288 s, against Goal 11's 38 s and 63 s. A pause re-took only 189 of
+  316 shards while the node was frozen.
+- **Readers refusing:** many shards with no live writer are reported as not answering, rising through a run to
+  2,000-4,000 per scenario. One cause seen in a test: a writer that only replays the log publishes nothing, so its
+  readers keep refusing until someone does.
+- **`logs-0000120`:** refuses to open on its recorded collision until repaired.
 - **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
 
 

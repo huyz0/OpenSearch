@@ -1101,7 +1101,7 @@ that kept their shards is 141 requests per held shard-hour (1.35x below Goal 8, 
 costs about 1,750 requests per node-hour. Open: steady write p50 of 3-5 s now that nothing is refused, SlowDown
 recovery, kill -9 p99 of 63 s. Details in [`scale-test-results.md`](scale-test-results.md#goal-11-a-verdict-that-needs-no-forensics-measured-clean).
 
-### After Goal 11: latency, and one loss not yet explained
+### After Goal 11: latency, two stale reads, and a loss traced to writes past a fence
 
 **Steady write p50 fell from 3-5 s to about 0.3 s.** The cause was a local fsync, under the shard's exclusive guard,
 of a cache that every open rebuilds from the store anyway.
@@ -1111,18 +1111,24 @@ test that failed first:
 - a reader trusted "nobody owns it" while a writer came and went unpublished;
 - a reader stayed on a commit that a successor had replaced and trimmed the log behind.
 
-**One run lost three acknowledged writes** (`run1790974395481`), and the cause is not known. The leading theory is
-a sequence-number collision that core's recovery would skip silently. A shard now refuses to open, naming both
-operations, if that ever happens. Three runs since then logged every writer open and replay: 27,000+ opens, and 0
-skips, refusals or losses.
+**One run lost three acknowledged writes** (`run1790974395481`). Each lost seqNo had been acknowledged twice: a
+superseded writer's record landed after its successor had fenced the log, and the next successor replayed it first,
+skipped the newer write as already processed, and trimmed it. Records could land past a fence three ways, all now
+closed, each with a test that failed first:
+- pipelined appends;
+- a takeover skipping terms whose only fence was the writer's own;
+- writes reaching a reader's writable engine.
+
+An open now refuses, naming both operations, when the log holds one seqNo twice. The final run was clean in all six
+scenarios.
 
 **Open:**
-- the loss;
 - SlowDown recovery;
-- kill -9 takeover, now slower: p50 67-99 s and p99 84-288 s;
-- many readers refusing where nobody is writing.
+- kill -9 takeover, now slower: p50 52-99 s and p99 84-288 s;
+- many readers refusing where nobody is writing;
+- `logs-0000120`, which refuses to open on its recorded collision until repaired.
 
-Details in [`scale-test-results.md`](scale-test-results.md#after-goal-11-latency-slowdown-two-stale-read-defects-and-one-loss-not-yet-explained).
+Details in [`scale-test-results.md`](scale-test-results.md#after-goal-11-latency-two-stale-reads-and-a-loss-traced-to-writes-past-a-fence).
 
 ### Goal 10: cleaning up after a crash
 
