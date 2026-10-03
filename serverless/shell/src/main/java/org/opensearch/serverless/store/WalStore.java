@@ -74,6 +74,16 @@ public final class WalStore {
      * that took it for one left a live writer appending -- its records acknowledged after the successor had replayed.
      */
     private static final String FENCED_MARKER = "fenced";
+    /**
+     * Left at the log's root once every term below a term holds nothing but fences: what a publish at that term leaves
+     * after dropping older terms, when each was fenced. Those terms are not listed again -- a shard's history of takeovers
+     * otherwise cost every later takeover one listing per term, three times over, and a fleet whose active shards had
+     * forty-odd terms each took twice as long to take a dead node's shards. Safe because nothing lands past a fence.
+     */
+    private static final String COMPACTED_PREFIX = "compacted-below-";
+    /** The highest compaction this instance has seen; it only rises. */
+    private volatile long compactedBelowSeen = 0L;
+    private volatile boolean compactionRead;
     /** One append in flight per writer, so its names stay contiguous and a fence in its next slot stops it. */
     private final Object appendLock = new Object();
 
@@ -442,7 +452,7 @@ public final class WalStore {
         // directory is listed only when it is there, which on a log begun after fences is never.
         final Map<String, BlobContainer> children = blobStore.blobContainer(shardBase.add("wal")).children();
         if (children.containsKey(SEALS) == false) {
-            return replayable(null, termsIn(children));
+            return replayable(null, liveTerms(children));
         }
         final BlobContainer sealsContainer = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
         final List<String> sealNames = sealNamesIn(sealsContainer.listBlobs().keySet());
@@ -500,7 +510,8 @@ public final class WalStore {
      */
     public Map<Long, String> position() throws IOException {
         final Map<Long, String> highest = new java.util.HashMap<>();
-        for (Map.Entry<Long, BlobContainer> term : termsInOrder().entrySet()) {
+        // Every term, compacted or not: a legacy seal's cutoff speaks for all of them.
+        for (Map.Entry<Long, BlobContainer> term : termsIn(blobStore.blobContainer(shardBase.add("wal")).children()).entrySet()) {
             String max = "";
             for (String name : term.getValue().listBlobs().keySet()) {
                 if (RECORD_NAME.matcher(name).matches() && name.compareTo(max) > 0) {
@@ -811,8 +822,35 @@ public final class WalStore {
         return max;
     }
 
+    /** The log's term directories not yet compacted away, lowest term first. */
     private Map<Long, BlobContainer> termsInOrder() throws IOException {
-        return termsIn(blobStore.blobContainer(shardBase.add("wal")).children());
+        return liveTerms(blobStore.blobContainer(shardBase.add("wal")).children());
+    }
+
+    private Map<Long, BlobContainer> liveTerms(Map<String, BlobContainer> children) throws IOException {
+        final long below = compactedBelow();
+        final Map<Long, BlobContainer> terms = termsIn(children);
+        terms.keySet().removeIf(term -> term < below);
+        return terms;
+    }
+
+    /** Every term below this holds only fences, by the highest compaction marker at the log's root. */
+    private long compactedBelow() throws IOException {
+        long below = compactedBelowSeen;
+        if (compactionRead) {
+            // Once per instance: a marker landed since is one more term listed, never one skipped wrongly.
+            return below;
+        }
+        compactionRead = true;
+        for (String name : blobStore.blobContainer(shardBase.add("wal")).listBlobsByPrefix(COMPACTED_PREFIX).keySet()) {
+            try {
+                below = Math.max(below, Long.parseLong(name.substring(COMPACTED_PREFIX.length())));
+            } catch (NumberFormatException e) {
+                // Not one of ours.
+            }
+        }
+        compactedBelowSeen = below;
+        return below;
     }
 
     private static Map<Long, BlobContainer> termsIn(Map<String, BlobContainer> children) {
@@ -949,11 +987,13 @@ public final class WalStore {
     private int dropOlderTerms(long term) throws IOException {
         final BlobContainer walRoot = blobStore.blobContainer(shardBase.add("wal"));
         int dropped = 0;
-        for (Map.Entry<String, BlobContainer> child : walRoot.children().entrySet()) {
-            final Long childTerm = parseTerm(child.getKey());
-            if (childTerm == null || childTerm >= term) {
+        boolean onlyFencesLeft = true;
+        for (Map.Entry<Long, BlobContainer> live : termsInOrder().entrySet()) {
+            final Long childTerm = live.getKey();
+            if (childTerm >= term) {
                 continue;
             }
+            final Map.Entry<String, BlobContainer> child = Map.entry("t=" + childTerm, live.getValue());
             final Map<String, org.opensearch.common.blobstore.BlobMetadata> listed = child.getValue().listBlobs();
             final List<String> ours = new ArrayList<>(listed.keySet());
             // Fences stay, and so does the term's highest blob -- which after a takeover is its fence, so the
@@ -961,6 +1001,10 @@ public final class WalStore {
             // will find the slot.
             ours.removeIf(name -> RECORD_NAME.matcher(name).matches() == false);
             final String highest = ours.stream().max(Comparator.naturalOrder()).orElse(null);
+            if (highest != null && listed.get(highest).length() != 0L) {
+                // Not fenced yet: its last record stays for the fence to find, so it is not compacted.
+                onlyFencesLeft = false;
+            }
             ours.removeIf(name -> listed.get(name).length() == 0L || name.equals(highest));
             if (ours.isEmpty() == false) {
                 child.getValue().deleteBlobsIgnoringIfNotExists(ours);
@@ -971,6 +1015,22 @@ public final class WalStore {
             // term existed and holds nothing -- position() and the tests that read the log off disk key
             // on it -- and a store that has no real directories (S3) lists nothing for an empty prefix
             // anyway. The per-term listing cost is bounded by the number of takeovers, not by writes.
+        }
+        if (onlyFencesLeft && term > compactedBelowSeen) {
+            // Every older term is fenced and emptied, and nothing lands past a fence: none of them is listed again.
+            walRoot.writeBlob(
+                String.format(java.util.Locale.ROOT, "%s%020d", COMPACTED_PREFIX, term),
+                new ByteArrayInputStream(new byte[0]),
+                0L,
+                false
+            );
+            final long previous = compactedBelowSeen;
+            compactedBelowSeen = term;
+            if (previous > 0L) {
+                walRoot.deleteBlobsIgnoringIfNotExists(
+                    List.of(String.format(java.util.Locale.ROOT, "%s%020d", COMPACTED_PREFIX, previous))
+                );
+            }
         }
         return dropped;
     }
@@ -993,6 +1053,7 @@ public final class WalStore {
             );
             child.deleteBlobsIgnoringIfNotExists(ours);
         }
+        walRoot.deleteBlobsIgnoringIfNotExists(new ArrayList<>(walRoot.listBlobsByPrefix(COMPACTED_PREFIX).keySet()));
     }
 
     private static Long parseTerm(String containerName) {

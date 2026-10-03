@@ -147,6 +147,32 @@ public abstract class LogFencingTestCase extends OpenSearchTestCase {
         assertFalse(ids(new WalStore(store, SHARD).replayableAfterFencing()).contains("after-the-takeover"));
     }
 
+    /**
+     * Once a publish has fenced and emptied every older term, later takeovers do not list those terms again, and lose
+     * nothing by it. Each takeover used to list every term the shard had ever had, three times over; at forty-odd terms
+     * a shard, taking a dead node's shards took twice as long.
+     */
+    public void testACompactedTermIsNotListedAgain() throws Exception {
+        final HookedBlobStore store = new HookedBlobStore(newStore());
+        final WalStore first = new WalStore(store, SHARD);
+        first.establish(1L, null);
+        first.append(1L, List.of(record("one", 1L)));
+        final WalStore second = new WalStore(store, SHARD);
+        second.fenceOlderTerms(2L);
+        second.establish(2L, null);
+        assertTrue(ids(second.replayableAfterFencing()).contains("one"));
+        second.append(2L, List.of(record("two", 2L)));
+        // Its first publish: term 1 is fenced, so its records are dropped and it is compacted.
+        second.onPublished(2L);
+
+        store.failListingsUnder("/t=1/");
+        final WalStore third = new WalStore(store, SHARD);
+        third.fenceOlderTerms(3L);
+        third.establish(3L, null);
+        assertTrue("term 2's record is still replayed", ids(third.replayableAfterFencing()).contains("two"));
+        third.onPublished(3L);
+    }
+
     /** A writer refused once stops for good, even where the next slot is free. */
     public void testAWriterRefusedOnceNeverWritesAgain() throws Exception {
         final BlobStore store = newStore();
