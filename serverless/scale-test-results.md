@@ -298,7 +298,7 @@ five-minute scenarios.
 | SlowDown burst | not back within the window | **still not back within the window** |
 | silent stale reads | 0 | 2, then 1, both fixed; **0** in every run since |
 | acknowledged writes lost | 0 | **3 once** (`run1790974395481`); cause found and fixed; **0** since |
-| kill -9 takeover p50 / p99 | 38.0 s / 63.3 s | 52-99 s / 84-288 s (worse; not investigated) |
+| kill -9 takeover p50 / p99 | 38.0 s / 63.3 s | 30 s / 56 s for 68 shards; 45-76 s / 70-150 s for 200-300 (bound by the shard cap; see below) |
 | idle cost, per held shard-hour | 141 | 127-151 |
 
 ### Latency: the local fsync
@@ -392,15 +392,44 @@ and replay logged:
 - no new collision;
 - 0 lost, 0 refused-but-visible, 0 unreached and 0 silently behind in every scenario.
 
+### Takeover, readers refusing, and SlowDown: one cause, the shard cap
+
+Three items were open after the loss: slower kill -9 takeover, 2,000-4,000 shards per scenario "not answering", and
+SlowDown recovery. The runs that followed (`run1791036555877`, `run1791041810675`) show one cause under all three:
+**the survivors are at their shard cap.** Six nodes hold about 395-400 shards each, against a cap of 400.
+
+**Takeover.** The harness splits the time into lease expiry, a survivor taking the head, and the first acknowledged
+write.
+- One part was the log, and is fixed. Every takeover listed every term directory the shard had ever had, three times
+  over: to fence, to replay, and to drop older terms. Those directories are never removed, and the active shards had
+  44 on average (up to 271). Once a publish has dropped every older term, and each was fenced, the log now records
+  that at its root, and later takeovers skip those terms. That is safe because nothing lands past a fence. Head to
+  first write went from **8 s to 2.7-5.3 s** at p50 (`FsLogFencingTests.testACompactedTermIsNotListedAgain`).
+- The rest is room. Kill to first write was p50 30 s for 68 shards, and 45-76 s for 200-300. Almost all of it is
+  waiting for a survivor to take the head: survivors at the cap must evict a writer, which needs a minute unused, to
+  make room.
+
+**"Not answering" is the cap refusing reader opens, not a shard behind its log.** The stale check now says why each
+search did not answer. Nearly every one was `this node holds 400 shards, the cap; ... was not opened`. The check
+searches up to 6,000 indices in a burst against 2,400 slots fleet-wide, and a full node whose shards are all in use
+refuses rather than thrash. That refusal is honest, by design.
+
+**SlowDown recovery.** Write errors return to about baseline (3.5%) within 90 s of the burst ending. Write p99 stays
+at the client's 30 s timeout for minutes. Those writes are to shards nobody holds, `503 activation_in_progress`
+after waiting for an activation with no room, across almost 500 distinct indices. The harness's recovery test asks for
+p99 back within 2x baseline, so it reports "not within the window".
+
+**Tried and reverted: evicting idle readers first.** Giving readers a 5 s grace ahead of writers' minute did not
+help, because the nodes were full of writers in use. Steady p99 rose to 22-25 s, against about 10 s, and the cap
+refusals remained, so it was dropped.
+
 ### Still open
 
-- **SlowDown recovery:** not within the window.
-- **Kill -9 takeover:** p50 52-99 s and p99 84-288 s, against Goal 11's 38 s and 63 s. A pause re-took only 189 of
-  316 shards while the node was frozen.
-- **Readers refusing:** many shards with no live writer are reported as not answering, rising through a run to
-  2,000-4,000 per scenario. One cause seen in a test: a writer that only replays the log publishes nothing, so its
-  readers keep refusing until someone does.
-- **`logs-0000120`:** refuses to open on its recorded collision until repaired.
+- **The shard cap is the fleet's limit under this load.** Takeover beyond about 30 s, the reader refusals and the
+  SlowDown p99 tail all come from survivors at the cap. The levers are capacity -- a higher cap or more nodes -- or
+  routing a refused open to a node with room, rather than per-shard costs.
+- **`logs-0000120`:** refuses to open on its recorded collision until repaired. Repairing it means deciding which
+  write to keep.
 - **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
 
 
