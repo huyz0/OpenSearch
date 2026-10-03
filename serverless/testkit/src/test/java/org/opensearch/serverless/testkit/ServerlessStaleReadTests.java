@@ -196,6 +196,72 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
     }
 
     /**
+     * A reader open on a commit that a later writer has since superseded -- replaying the log, publishing, and trimming
+     * the log behind it -- must not serve that commit as current once nobody is writing the shard.
+     *
+     * <p>The reader's check compared its commit with the log, and after the successor's publish the log holds nothing
+     * past it: the record the commit lacks is in the successor's commit, and trimmed. A fleet run found a search
+     * answering from such a reader with one of two acknowledged documents and no failure.
+     */
+    public void testAReaderNoticesItsCommitWasSuperseded() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+
+        try (
+            ServerlessNode writer = new ServerlessNode(nodeSettings("superseded-writer", "ingest"));
+            ServerlessNode reader = new ServerlessNode(nodeSettings("superseded-reader", "search"))
+        ) {
+            writer.start();
+            reader.start();
+            writer.setMetadataPlane(plane);
+            reader.setMetadataPlane(plane);
+            writer.renewLease(plane);
+            reader.renewLease(plane);
+            reader.setReaderCheckMillis(0);
+            final BackgroundReconciler loop = new BackgroundReconciler(writer, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(java.util.List.of(java.util.Map.entry("alpha", 0)));
+            assertEquals(201, send(writer, "PUT", "/alpha/_doc/first", "{\"msg\":\"needle\",\"n\":1}").status());
+            loop.publishAll();
+            loop.setIdleAfterMillis(1);
+            loop.releaseIdle(System.currentTimeMillis() + 60_000L);
+
+            final Response before = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
+            assertEquals(before.body(), 1L, number(before.body(), "value"));
+
+            // A writer acknowledges a write and goes without publishing it.
+            loop.activateOnDemand(java.util.List.of(java.util.Map.entry("alpha", 0)));
+            final var shardId = writer.reconciler().openShards().iterator().next();
+            assertEquals(201, send(writer, "PUT", "/alpha/_doc/second", "{\"msg\":\"needle\",\"n\":2}").status());
+            final long term = plane.heads().read("alpha", 0).orElseThrow().term();
+            writer.reconciler().releaseShard(shardId, "test: lease lapsed, given back unpublished");
+            assertTrue(plane.heads().release("alpha", 0, writer.localNode().getId(), term));
+
+            // A successor takes it, replays the write, publishes -- trimming the older terms -- and gives it back.
+            loop.activateOnDemand(java.util.List.of(java.util.Map.entry("alpha", 0)));
+            assertEquals(term + 1, plane.heads().read("alpha", 0).orElseThrow().term());
+            writer.publishShard(writer.reconciler().openShards().iterator().next(), term + 1);
+            loop.releaseIdle(System.currentTimeMillis() + 120_000L);
+            assertNull("given back cleanly", plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
+            assertEquals("the successor published", term + 1, plane.segmentPublisher("alpha", 0).readManifest().orElseThrow().term());
+
+            final Response after = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
+            final long hits = after.status() == 200 ? number(after.body(), "value") : -1L;
+            final long failed = after.status() == 200 ? number(after.body(), "failed") : -1L;
+            assertTrue(
+                "both documents, or the shard reported as not answered -- never one hit and no failure: " + after.body(),
+                hits == 2L || failed > 0L || after.status() >= 500
+            );
+            final Response again = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
+            assertEquals(
+                "and the reader moves onto the current commit: " + again.body() + " after " + after.body(),
+                2L,
+                again.status() == 200 ? number(again.body(), "value") : -1L
+            );
+        }
+    }
+
+    /**
      * A commit published before commits recorded how far into the log they reach is served when the log holds
      * nothing it lacks. Treating such a commit as covering none of its term made every shard ever written look
      * behind -- a term's highest record stays in the log after a publish -- and a fleet reopened on old manifests

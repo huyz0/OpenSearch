@@ -16,11 +16,16 @@ import java.io.IOException;
  *
  * <p>Retryable. The refusal raised the doubt that makes a node take the shard, which replays the log and publishes;
  * a reader opened after that serves everything acknowledged.
+ *
+ * <p>Or, {@link #superseded()}: the copy refusing is open on a commit a later writer has replaced. The log cannot say
+ * so -- the publish that replaced it trimmed what it covered -- so the published manifest does. Nothing is wrong
+ * with the shard, and a reader opened now serves the current commit.
  */
 public final class ShardBehindLogException extends IOException {
 
     private final String index;
     private final int shard;
+    private final boolean superseded;
 
     /**
      * Creates the refusal.
@@ -39,6 +44,38 @@ public final class ShardBehindLogException extends IOException {
         );
         this.index = index;
         this.shard = shard;
+        this.superseded = false;
+    }
+
+    private ShardBehindLogException(String index, int shard, String message) {
+        super(message);
+        this.index = index;
+        this.shard = shard;
+        this.superseded = true;
+    }
+
+    /**
+     * Creates the refusal of a copy whose commit a later publish has replaced.
+     *
+     * @param index the index
+     * @param shard the shard number
+     * @return the refusal
+     */
+    public static ShardBehindLogException superseded(String index, int shard) {
+        return new ShardBehindLogException(
+            index,
+            shard,
+            "this copy of shard " + shard + " of " + index + " serves a commit a later publish has replaced -- retry"
+        );
+    }
+
+    /**
+     * Whether the refusing copy was open on a replaced commit, rather than the shard's commit being behind its log.
+     *
+     * @return true if superseded
+     */
+    public boolean superseded() {
+        return superseded;
     }
 
     /**
