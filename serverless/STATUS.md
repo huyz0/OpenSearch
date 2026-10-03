@@ -1122,10 +1122,19 @@ closed, each with a test that failed first:
 An open now refuses, naming both operations, when the log holds one seqNo twice. The final run was clean in all six
 scenarios.
 
+**Takeover no longer lists every term a shard ever had.** That cost grew with every takeover, at 44 terms per active
+shard on average. Head to first write went from 8 s to 2.7-5.3 s at p50.
+
+**What is left is the shard cap.** Survivors hold about 395-400 shards against a cap of 400, and three symptoms trace
+to it:
+- kill -9 takeover beyond about 30 s, spent waiting for room;
+- the stale check's "not answering" shards, which are reader opens refused at the cap;
+- SlowDown's p99 tail, which is writes waiting on activations with no room.
+
+Evicting idle readers first was tried and reverted: it made steady p99 worse.
+
 **Open:**
-- SlowDown recovery;
-- kill -9 takeover, now slower: p50 52-99 s and p99 84-288 s;
-- many readers refusing where nobody is writing;
+- capacity under this load: a higher cap, more nodes, or routing a refused open to a node with room;
 - `logs-0000120`, which refuses to open on its recorded collision until repaired.
 
 Details in [`scale-test-results.md`](scale-test-results.md#after-goal-11-latency-two-stale-reads-and-a-loss-traced-to-writes-past-a-fence).
