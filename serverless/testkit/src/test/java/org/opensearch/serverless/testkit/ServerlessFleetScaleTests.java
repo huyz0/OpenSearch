@@ -844,7 +844,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
     /** What the stale-read check found. */
     private record StaleCheck(int indices, int withoutWriter, int complete, int reportedBehind, int lagging, int inconclusive, List<
-        String> violations) {
+        String> violations, Map<String, Integer> notAnswering) {
         @Override
         public String toString() {
             return indices
@@ -860,7 +860,8 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 + lagging
                 + " with a live writer behind by the publish window; "
                 + inconclusive
-                + " changed owner during the check";
+                + " changed owner during the check; not answering, by first reason: "
+                + notAnswering;
         }
     }
 
@@ -886,6 +887,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         final java.util.concurrent.atomic.AtomicInteger lagging = new java.util.concurrent.atomic.AtomicInteger();
         final java.util.concurrent.atomic.AtomicInteger inconclusive = new java.util.concurrent.atomic.AtomicInteger();
         final List<String> violations = java.util.Collections.synchronizedList(new ArrayList<>());
+        final Map<String, java.util.concurrent.atomic.AtomicInteger> why = new java.util.concurrent.ConcurrentHashMap<>();
         final ExecutorService searchers = Executors.newFixedThreadPool(16);
         try {
             final List<Future<?>> pending = new ArrayList<>();
@@ -914,6 +916,8 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                         withoutWriter.incrementAndGet();
                         if (failed > 0) {
                             reportedBehind.incrementAndGet();
+                            why.computeIfAbsent(firstFailureType(body), k -> new java.util.concurrent.atomic.AtomicInteger())
+                                .incrementAndGet();
                         } else if (total >= expected) {
                             complete.incrementAndGet();
                         } else {
@@ -929,6 +933,9 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 } catch (java.util.concurrent.ExecutionException e) {
                     // A search that failed outright said so; it is not a silent answer.
                     reportedBehind.incrementAndGet();
+                    final String message = String.valueOf(e.getCause() == null ? e : e.getCause().getMessage());
+                    why.computeIfAbsent("whole search: " + firstFailureType(message), k -> new java.util.concurrent.atomic.AtomicInteger())
+                        .incrementAndGet();
                 }
             }
         } finally {
@@ -941,8 +948,23 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             reportedBehind.get(),
             lagging.get(),
             inconclusive.get(),
-            List.copyOf(violations)
+            List.copyOf(violations),
+            new TreeMap<>(why.entrySet().stream().collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, e -> e.getValue().get())))
         );
+    }
+
+    /** The type of the first failure a search response or error names, its status if it names none. */
+    private static String firstFailureType(String body) {
+        final Matcher failure = Pattern.compile("\"failures\":\\[\\{.*?\"type\":\"([^\"]+)\"", Pattern.DOTALL).matcher(body);
+        if (failure.find()) {
+            return failure.group(1);
+        }
+        final Matcher type = Pattern.compile("\"type\":\"([^\"]+)\"").matcher(body);
+        if (type.find()) {
+            return type.group(1);
+        }
+        final Matcher status = Pattern.compile("\\b([45]\\d\\d)\\b").matcher(body);
+        return status.find() ? "status " + status.group(1) : body.length() > 60 ? body.substring(0, 60) : body;
     }
 
     /** Whether a node holds an unexpired lease, read from the store. */
