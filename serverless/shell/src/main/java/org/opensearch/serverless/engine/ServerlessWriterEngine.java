@@ -103,6 +103,19 @@ public final class ServerlessWriterEngine extends InternalEngine {
         int atOrBelow = 0;
         int skippedAbsent = 0;
         String collision = null;
+        // Two operations in the log itself under one sequence number: core applies the first and skips the second,
+        // and the publish after this open trims the record. A fleet run lost three acknowledged writes so, when a
+        // writer's record landed past its successor's fence. The same operation twice -- a record kept for a fence
+        // and replayed again -- is the same id at the same term, and is not one.
+        final java.util.Map<Long, String> bySeqNo = new java.util.HashMap<>();
+        for (Translog.Operation operation : operations) {
+            final String identity = operation.opType() + " " + identityOf(operation) + " term " + operation.primaryTerm();
+            final String earlier = bySeqNo.putIfAbsent(operation.seqNo(), identity);
+            if (earlier != null && earlier.equals(identity) == false && collision == null) {
+                collision = "seqNo " + operation.seqNo() + " is in the log twice: " + earlier + ", and " + identity;
+                logger.error("{} replay would drop an acknowledged operation: {}", shardId, collision);
+            }
+        }
         try (org.opensearch.index.engine.Engine.Searcher searcher = acquireSearcher("serverless-replay-check", SearcherScope.INTERNAL)) {
             for (Translog.Operation operation : operations) {
                 min = Math.min(min, operation.seqNo());
@@ -168,6 +181,17 @@ public final class ServerlessWriterEngine extends InternalEngine {
             atOrBelow,
             skippedAbsent
         );
+    }
+
+    /** The document an operation is about, or "-" for one about none. */
+    private static String identityOf(Translog.Operation operation) {
+        if (operation instanceof Translog.Index index) {
+            return index.id();
+        }
+        if (operation instanceof Translog.Delete delete) {
+            return delete.id();
+        }
+        return "-";
     }
 
     /** The id of the live document holding a sequence number in the commit, or null if none does. */
