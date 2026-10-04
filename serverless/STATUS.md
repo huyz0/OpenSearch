@@ -1135,9 +1135,17 @@ are now ordered by rendezvous rank, so each survivor takes its own share first. 
 Evicting idle readers first was tried and reverted: it made steady p99 worse. `logs-0000120` is repaired with both of
 its acknowledged writes kept, using a one-off tool that re-applies the stray record as a fresh operation.
 
+Searches now spill past full nodes: when a placement-preferred node refuses at its cap, the next node with room
+answers. A standing reserve of free slots on every node was measured and dropped. It sped up how soon survivors held
+each head, but its evictions doubled misrouted writes and slowed SlowDown recovery.
+
+Room for a takeover is now made outside the cap lock, so a full survivor's takeovers no longer wait on each other's
+evictions. Onto survivors at the cap, a dead node's shards are writable at p50 54 s and p99 76 s, against 75 s and
+119 s before.
+
 **Open:**
-- takeover onto full survivors;
-- reader opens refused at the cap during the stale check's bursts.
+- the takeover tail onto full survivors, about half of which is the 30 s lease;
+- reader refusals during the stale check's bursts, which are capacity rather than a defect.
 
 Details in [`scale-test-results.md`](scale-test-results.md#after-goal-11-latency-two-stale-reads-and-a-loss-traced-to-writes-past-a-fence).
 
