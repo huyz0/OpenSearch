@@ -295,10 +295,10 @@ five-minute scenarios.
 | --- | --- | --- |
 | steady writes, p50 / p99 | 3.2-4.8 s / 11-19 s | **0.19-0.53 s** / 0.5-8.4 s |
 | write limiter, nothing injected | 777-1,024, 0 refused | 352-1,024, 0-78 refused per node |
-| SlowDown burst | not back within the window | **still not back within the window** |
+| SlowDown burst | not back within the window | **back to baseline 71 s after the burst** (ranked takeover) |
 | silent stale reads | 0 | 2, then 1, both fixed; **0** in every run since |
 | acknowledged writes lost | 0 | **3 once** (`run1790974395481`); cause found and fixed; **0** since |
-| kill -9 takeover p50 / p99 | 38.0 s / 63.3 s | 30 s / 56 s for 68 shards; 45-76 s / 70-150 s for 200-300 (bound by the shard cap; see below) |
+| kill -9 takeover p50 / p99 | 38.0 s / 63.3 s | **39 s / 58 s** for 205 shards with room; 75 s / 119 s onto survivors at the cap (see below) |
 | idle cost, per held shard-hour | 141 | 127-151 |
 
 ### Latency: the local fsync
@@ -423,13 +423,43 @@ p99 back within 2x baseline, so it reports "not within the window".
 help, because the nodes were full of writers in use. Steady p99 rose to 22-25 s, against about 10 s, and the cap
 refusals remained, so it was dropped.
 
+### The cap was not the whole story: survivors raced each other
+
+A run with the cap raised to 600 (`run1791077875798`) tested the diagnosis above, and it did not hold.
+- **Kill:** 300 shards took p50 72 s, as at 400, while two survivors held under 300 shards each.
+- **Slowdown:** still did not recover.
+
+The survivors' activation queues show why. Each jumped to about 300 together -- the dead node's shard count -- because
+writes for every one of its shards reach every coordinator. All five queued the same activations in arrival order
+and raced on each shard at once: one won its head and four spent 5-13 s on nothing, so the fleet took a dead node's
+shards at one node's pace.
+
+**Queued activations are now ordered by rendezvous rank:** each node takes the shards it is the preferred taker of
+first, then the rest in arrival order. By the time it reaches the rest, they are usually taken, and finding that out
+costs a head read. No node is ever kept from a shard; a stale membership view only reorders the work
+(`ServerlessTakeoverRankTests`).
+
+`run1791081940875`, cap 400 again, showed:
+- **Kill with room on the survivors (205 shards): p50 39 s, p99 58 s,** against 45-76 s / 70-150 s before. That is
+  back to Goal 11's figures and under the 60 s target. A survivor holds each head 9 s after the lease runs out, and
+  the first write follows 1.6 s later at p50.
+- **Kill with every survivor at the cap (279 shards):** p50 75 s, p99 119 s, against 76 s / 150 s. Each takeover
+  there must evict a writer first.
+- **SlowDown recovered to baseline 70.8 s after the burst**, the first recovery within the window since Goal 9. A
+  burst leaves many shards to take again, and survivors had been racing for those too.
+- **Correctness:** 0 lost, 0 refused-but-visible, 0 unreached and 0 silently behind in all six scenarios.
+
+**`logs-0000120` is repaired, keeping both writes.** Both had been acknowledged, so dropping either would have been
+a loss. A one-off tool (`ServerlessLogRepairTests`, run under `s3Test` only when given its properties) rewrote the
+stray record without its sequence number, keeping the original beside it. Replay applied it as a fresh operation.
+The shard has opened since, with both documents: 85177 at seqNo 14752, and 86131 re-applied as 14760.
+
 ### Still open
 
-- **The shard cap is the fleet's limit under this load.** Takeover beyond about 30 s, the reader refusals and the
-  SlowDown p99 tail all come from survivors at the cap. The levers are capacity -- a higher cap or more nodes -- or
-  routing a refused open to a node with room, rather than per-shard costs.
-- **`logs-0000120`:** refuses to open on its recorded collision until repaired. Repairing it means deciding which
-  write to keep.
+- **Takeover onto full survivors:** each one must evict a writer first, which is a publish and a head release per
+  slot. That is the remaining p99 beyond 60 s.
+- **Reader refusals at the cap:** the stale check's bursts of up to 6,000 indices exceed 2,400 slots fleet-wide. The
+  refusal is honest; routing a refused open to a node with room would turn some of these into answers.
 - **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
 
 

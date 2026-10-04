@@ -1125,17 +1125,19 @@ scenarios.
 **Takeover no longer lists every term a shard ever had.** That cost grew with every takeover, at 44 terms per active
 shard on average. Head to first write went from 8 s to 2.7-5.3 s at p50.
 
-**What is left is the shard cap.** Survivors hold about 395-400 shards against a cap of 400, and three symptoms trace
-to it:
-- kill -9 takeover beyond about 30 s, spent waiting for room;
-- the stale check's "not answering" shards, which are reader opens refused at the cap;
-- SlowDown's p99 tail, which is writes waiting on activations with no room.
+**Survivors no longer race each other for a dead node's shards.** Every survivor used to queue the same takeovers in
+the same order, and four of five spent each one on nothing. Raising the shard cap to 600 did not help. Activations
+are now ordered by rendezvous rank, so each survivor takes its own share first. Results:
+- with room on the survivors: kill -9 takeover p50 39 s and p99 58 s, back to Goal 11 and under the 60 s target;
+- SlowDown recovered within the window (71 s) for the first time since Goal 9;
+- with every survivor at the cap: p50 75 s, p99 119 s, because each takeover must first evict a writer.
 
-Evicting idle readers first was tried and reverted: it made steady p99 worse.
+Evicting idle readers first was tried and reverted: it made steady p99 worse. `logs-0000120` is repaired with both of
+its acknowledged writes kept, using a one-off tool that re-applies the stray record as a fresh operation.
 
 **Open:**
-- capacity under this load: a higher cap, more nodes, or routing a refused open to a node with room;
-- `logs-0000120`, which refuses to open on its recorded collision until repaired.
+- takeover onto full survivors;
+- reader opens refused at the cap during the stale check's bursts.
 
 Details in [`scale-test-results.md`](scale-test-results.md#after-goal-11-latency-two-stale-reads-and-a-loss-traced-to-writes-past-a-fence).
 
