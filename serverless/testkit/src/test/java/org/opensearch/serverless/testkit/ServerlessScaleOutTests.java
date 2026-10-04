@@ -146,6 +146,39 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * A full node asked for a shard another live node already holds evicts nothing for it. Survivors of a dead node all
+     * queue all of its shards; the ones another survivor took first each cost an eviction for nothing.
+     */
+    public void testAFullNodeDoesNotEvictForAShardSomeoneElseHolds() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        for (String index : List.of("mine", "theirs")) {
+            plane.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, MAPPING, null));
+        }
+        try (ServerlessNode a = new ServerlessNode(settings("a")); ServerlessNode b = new ServerlessNode(settings("b"))) {
+            a.start();
+            a.setMetadataPlane(plane);
+            b.start();
+            b.setMetadataPlane(plane);
+            final BackgroundReconciler aLoop = new BackgroundReconciler(a, plane).setDemandDrivenActivation(true)
+                .setMaxShardsHeld(1)
+                .setEvictAfterMillis(30_000L);
+            final BackgroundReconciler bLoop = new BackgroundReconciler(b, plane).setDemandDrivenActivation(true);
+            a.renewLease(plane);
+            b.renewLease(plane);
+            aLoop.activateOnDemand(List.of(Map.entry("mine", 0)));
+            bLoop.activateOnDemand(List.of(Map.entry("theirs", 0)));
+            clock.addAndGet(60_000L);   // "mine" is past its grace: evictable
+            a.renewLease(plane);
+            b.renewLease(plane);
+
+            assertTrue("not taken", aLoop.activateOnDemand(List.of(Map.entry("theirs", 0))).isEmpty());
+            assertEquals("and nothing evicted for it", 0, a.capacity().evicted());
+            assertTrue(a.reconciler().openShards().stream().anyMatch(s -> s.getIndexName().equals("mine")));
+        }
+    }
+
     /** With every member as full as this one, nothing is handed off and nothing steered. */
     public void testNothingMovesWhenNobodyHasRoom() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000_000L);

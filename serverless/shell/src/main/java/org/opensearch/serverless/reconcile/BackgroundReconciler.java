@@ -1532,6 +1532,20 @@ public final class BackgroundReconciler implements Closeable {
      * shard nobody owns is read from that commit. So it is opened, over the cap if it must be; the next eviction
      * brings the node back under it the proper way, publishing before it lets go.
      */
+    /** Whether another node holds a shard's head under a live lease: one register read, against an eviction. */
+    private boolean heldByAnotherLiveNode(String indexName, int shard) {
+        try {
+            final var head = plane.heads().read(indexName, shard);
+            return head.isPresent()
+                && head.get().ownerNodeId() != null
+                && node.localNode().getId().equals(head.get().ownerNodeId()) == false
+                && plane.heads().isHeld(head.get(), plane.clock().getAsLong());
+        } catch (Exception e) {
+            // Unknown: go on as before, and let the acquisition decide.
+            return false;
+        }
+    }
+
     private boolean headNamesThisNode(String indexName, int shard) {
         try {
             final var head = plane.heads().read(indexName, shard);
@@ -1982,6 +1996,13 @@ public final class BackgroundReconciler implements Closeable {
                     capReserved++;
                     reserved = true;
                 }
+            }
+            if (full && heldByAnotherLiveNode(indexName, shard)) {
+                // Nothing to take, so nothing to make room for. Every survivor of a dead node queues every one of its
+                // shards; the ones another survivor has taken by the time this reaches them used to cost an eviction
+                // each -- a publish and a head release, for a shard this node then found it could not have -- and
+                // survivors at their cap took a dead node's 321 shards at p50 131 s.
+                return Optional.empty();
             }
             if (full) {
                 // Room is made outside the lock. An eviction is a publish and a head release, and every activation
