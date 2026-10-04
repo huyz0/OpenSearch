@@ -1939,18 +1939,34 @@ public final class BackgroundReconciler implements Closeable {
         }
         boolean reserved = false;
         if (onDemand) {
+            // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
+            // it counts against the bound. makeRoom only ever considers openShards, so counting one here
+            // can refuse an activation the node has no room for -- which is the point -- but can never
+            // take a view away from the caller holding it. The slots other activations in flight have
+            // reserved count too, or a burst of them would each see room for one and all take it.
+            boolean full;
             synchronized (capLock) {
-                // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
-                // it counts against the bound. makeRoom only ever considers openShards, so counting one here
-                // can refuse an activation the node has no room for -- which is the point -- but can never
-                // take a view away from the caller holding it. The slots other activations in flight have
-                // reserved count too, or a burst of them would each see room for one and all take it.
-                final boolean full = open == null && node.reconciler().heldShards().size() + capReserved >= maxShardsHeld;
-                // makeRoom answers for what is held, not for what is reserved, so the reservations are counted
-                // again after it: room it made may already be spoken for.
-                if (full
-                    && (makeRoom() == false || node.reconciler().heldShards().size() + capReserved >= maxShardsHeld)
-                    && headNamesThisNode(indexName, shard) == false) {
+                full = open == null && node.reconciler().heldShards().size() + capReserved >= maxShardsHeld;
+                if (full == false && open == null) {
+                    capReserved++;
+                    reserved = true;
+                }
+            }
+            if (full) {
+                // Room is made outside the lock. An eviction is a publish and a head release, and every activation
+                // reserves its slot under this lock: evicting inside it made the survivors of a node that died with
+                // them at the cap take its shards one eviction at a time, p99 two minutes.
+                makeRoom();
+            }
+            synchronized (capLock) {
+                if (reserved) {
+                    full = false;
+                } else {
+                    // makeRoom answers for what is held, not for what is reserved, so the reservations are counted
+                    // again after it: room it made may already be spoken for.
+                    full = open == null && node.reconciler().heldShards().size() + capReserved >= maxShardsHeld;
+                }
+                if (full && headNamesThisNode(indexName, shard) == false) {
                     // Refusing is a routing outcome, not an error. Saying so is the difference between a
                     // node that is full and a node that is broken, and only one of them should page anyone.
                     logger.info(
@@ -1961,7 +1977,7 @@ public final class BackgroundReconciler implements Closeable {
                     );
                     return Optional.empty();
                 }
-                if (open == null) {
+                if (open == null && reserved == false) {
                     capReserved++;
                     reserved = true;
                 }
