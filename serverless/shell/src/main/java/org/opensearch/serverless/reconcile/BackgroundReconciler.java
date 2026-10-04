@@ -112,7 +112,83 @@ public final class BackgroundReconciler implements Closeable {
         new ConcurrentHashMap<>();
     /** Activations run at most this many at a time, on the generic pool; the rest queue. */
     private volatile int activationConcurrency = DEFAULT_ACTIVATION_CONCURRENCY;
-    private final java.util.concurrent.ConcurrentLinkedQueue<Runnable> activationQueue = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /**
+     * Activations waiting for a slot: those this node is the preferred taker of first, see {@link #takeoverRank}.
+     *
+     * <p>First come, first served used to be the order, and when a node died every survivor received writes for every
+     * shard it had held, queued the same few hundred activations in the same order, and ran them at the same moment: one
+     * of each five won its head and four spent eight seconds on nothing. Taking a dead node's 300 shards ran at one
+     * node's pace whatever the cap. Ranked, each survivor does its own share first, and finds the rest taken by the time it
+     * reaches them -- which costs a head read, not an activation.
+     */
+    private final java.util.concurrent.PriorityBlockingQueue<QueuedActivation> activationQueue =
+        new java.util.concurrent.PriorityBlockingQueue<>();
+
+    private final java.util.concurrent.atomic.AtomicLong activationSequence = new java.util.concurrent.atomic.AtomicLong();
+
+    /** One activation waiting for a slot, ordered by this node's rank for its shard and then by arrival. */
+    private record QueuedActivation(int rank, long sequence, Runnable task) implements Comparable<QueuedActivation> {
+        @Override
+        public int compareTo(QueuedActivation other) {
+            final int byRank = Integer.compare(rank, other.rank);
+            return byRank != 0 ? byRank : Long.compare(sequence, other.sequence);
+        }
+    }
+
+    /**
+     * Where a node stands among the live members as the taker of a shard: 0 for the one member every node agrees should
+     * try first, by rendezvous hashing, and higher for the rest. Every member computes the same ranking from the same
+     * membership, with no coordination; a stale view only reorders work, it never stops anyone taking a shard.
+     *
+     * @param self the ranking node
+     * @param members the live members, including itself
+     * @param indexName the shard's index
+     * @param shard the shard number
+     * @return how many live members rank above this node for the shard
+     */
+    public static int takeoverRank(String self, java.util.Collection<String> members, String indexName, int shard) {
+        final long mine = rendezvous(self, indexName, shard);
+        int above = 0;
+        for (String member : members) {
+            if (member.equals(self) == false) {
+                final long theirs = rendezvous(member, indexName, shard);
+                if (theirs > mine || (theirs == mine && member.compareTo(self) < 0)) {
+                    above++;
+                }
+            }
+        }
+        return above;
+    }
+
+    private static long rendezvous(String member, String indexName, int shard) {
+        long h = 0xcbf29ce484222325L;
+        for (char c : (member + "/" + indexName + "/" + shard).toCharArray()) {
+            h ^= c;
+            h *= 0x100000001b3L;
+        }
+        h ^= h >>> 33;
+        h *= 0xff51afd7ed558ccdL;
+        h ^= h >>> 33;
+        return h;
+    }
+
+    private int rankHere(String indexName, int shard) {
+        try {
+            final java.util.List<String> members = new java.util.ArrayList<>();
+            for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+                members.add(lease.nodeId());
+            }
+            final String self = node.localNode().getId();
+            if (members.contains(self) == false) {
+                members.add(self);
+            }
+            return takeoverRank(self, members, indexName, shard);
+        } catch (RuntimeException e) {
+            // Ordering is an optimisation: without a membership view, arrival order.
+            return 0;
+        }
+    }
+
     private final java.util.concurrent.atomic.AtomicInteger activationsRunning = new java.util.concurrent.atomic.AtomicInteger();
     /** Guards the shard cap across concurrent on-demand activations, with the slots they have reserved. */
     private final Object capLock = new Object();
@@ -1316,7 +1392,7 @@ public final class BackgroundReconciler implements Closeable {
             return running;
         }
         final long queuedAt = System.nanoTime();
-        activationQueue.add(() -> {
+        activationQueue.add(new QueuedActivation(rankHere(indexName, shard), activationSequence.incrementAndGet(), () -> {
             final long startedAt = System.nanoTime();
             activationWaitMax.accumulateAndGet(startedAt - queuedAt, Math::max);
             try {
@@ -1335,7 +1411,7 @@ public final class BackgroundReconciler implements Closeable {
                 activationRunNanos.addAndGet(endedAt - startedAt);
                 activationRunMax.accumulateAndGet(endedAt - startedAt, Math::max);
             }
-        });
+        }));
         drainActivations();
         return mine;
     }
@@ -1388,7 +1464,8 @@ public final class BackgroundReconciler implements Closeable {
             if (activationsRunning.compareAndSet(running, running + 1) == false) {
                 continue;
             }
-            final Runnable task = activationQueue.poll();
+            final QueuedActivation queued = activationQueue.poll();
+            final Runnable task = queued == null ? null : queued.task();
             if (task == null) {
                 activationsRunning.decrementAndGet();
                 continue;
