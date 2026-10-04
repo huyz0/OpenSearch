@@ -954,15 +954,16 @@ public final class SearchFanout {
         // is the writer: routing searches to writers would couple search capacity to write capacity and
         // make per-index search scale-to-zero meaningless. Placement is a cache-affinity hint, so the
         // owner remains a last resort for the case where no search node exists at all.
-        final List<String> targets = new ArrayList<>(
-            org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
-                index,
-                shard,
-                metadata.membership().current(),
-                ServerlessNode.ROLE_SEARCH,
-                2
-            )
+        final List<String> ranked = org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+            index,
+            shard,
+            metadata.membership().current(),
+            ServerlessNode.ROLE_SEARCH,
+            Integer.MAX_VALUE
         );
+        final List<String> targets = new ArrayList<>(ranked.subList(0, Math.min(2, ranked.size())));
+        final java.util.Set<String> tried = new java.util.HashSet<>();
+        boolean refusedAtTheCap = false;
         // The owner is the last resort, and its head is read only when the placement candidates could
         // not answer: a head read per shard per search was the largest single cost of a hot search.
         boolean triedOwner = false;
@@ -980,37 +981,37 @@ public final class SearchFanout {
             } else {
                 break;
             }
+            tried.add(target);
             try {
-                if (serving.localNode().getId().equals(target)) {
-                    // We are the placement for this shard but do not hold it yet. Open it here rather
-                    // than asking ourselves over the network.
-                    final ShardId opened = serving.serveAsReader(metadata, index, shard);
-                    serving.markUsed(opened);
-                    return new ShardAnswer(queryHere(serving, opened, perShard, nowInMillis));
+                final ShardAnswer answer = askTarget(serving, metadata, descriptor, shard, target, perShard, nowInMillis);
+                if (answer != null) {
+                    return answer;
                 }
-                // The search bound, not the write bound: a peer that is merely busy should cost latency,
-                // not coverage.
-                final var peer = serving.router().peer(target, serving.router().searchForwardTimeout());
-                if (peer.isEmpty()) {
-                    continue;
-                }
-                return new ShardAnswer(
-                    serving.router()
-                        .forwardSearch(
-                            peer.get(),
-                            new org.opensearch.serverless.transport.ForwardedSearchRequest(
-                                index,
-                                shard,
-                                perShard,
-                                descriptor.uuid(),
-                                nowInMillis
-                            )
-                        )
-                );
             } catch (Exception e) {
                 // Try the next candidate. A shard that failed to answer is not a shard with no matches,
                 // so it only counts as searched if one of them succeeded.
                 LOG.warn("shard " + shard + " of " + index + " was not served by " + target, e);
+                lastFailure = e;
+                refusedAtTheCap |= atTheCap(e);
+            }
+        }
+        // A candidate was full. Placement is an affinity, not a requirement: any search node can open a reader,
+        // and one with room answers where the preferred ones could only refuse. A burst of searches over thousands of
+        // indices filled the preferred nodes and failed the rest outright while other nodes had slots free.
+        for (String spare : ranked) {
+            if (refusedAtTheCap == false) {
+                break;
+            }
+            if (tried.add(spare) == false) {
+                continue;
+            }
+            try {
+                final ShardAnswer answer = askTarget(serving, metadata, descriptor, shard, spare, perShard, nowInMillis);
+                if (answer != null) {
+                    return answer;
+                }
+            } catch (Exception e) {
+                LOG.debug("shard " + shard + " of " + index + " was not served by " + spare, e);
                 lastFailure = e;
             }
         }
@@ -1028,6 +1029,52 @@ public final class SearchFanout {
             throw new IOException(lastFailure);
         }
         return null;
+    }
+
+    /** Asks one node for a shard: this one by opening a reader, another over the wire; null if it cannot be reached. */
+    private static ShardAnswer askTarget(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        org.opensearch.serverless.cluster.IndexDescriptor descriptor,
+        int shard,
+        String target,
+        SearchSourceBuilder perShard,
+        long nowInMillis
+    ) throws Exception {
+        final String index = descriptor.name();
+        if (serving.localNode().getId().equals(target)) {
+            // We are the placement for this shard but do not hold it yet. Open it here rather
+            // than asking ourselves over the network.
+            final ShardId opened = serving.serveAsReader(metadata, index, shard);
+            serving.markUsed(opened);
+            return new ShardAnswer(queryHere(serving, opened, perShard, nowInMillis));
+        }
+        // The search bound, not the write bound: a peer that is merely busy should cost latency,
+        // not coverage.
+        final var peer = serving.router().peer(target, serving.router().searchForwardTimeout());
+        if (peer.isEmpty()) {
+            return null;
+        }
+        return new ShardAnswer(
+            serving.router()
+                .forwardSearch(
+                    peer.get(),
+                    new org.opensearch.serverless.transport.ForwardedSearchRequest(index, shard, perShard, descriptor.uuid(), nowInMillis)
+                )
+        );
+    }
+
+    /** Whether a failure was a node refusing a reader at its shard cap, here or on a peer. */
+    private static boolean atTheCap(Throwable e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause.getMessage() != null && cause.getMessage().contains(ServerlessNode.AT_THE_CAP)) {
+                return true;
+            }
+            if (cause == cause.getCause()) {
+                break;
+            }
+        }
+        return false;
     }
 
     /**
