@@ -183,7 +183,11 @@ public final class ShardRouter {
     private void handleIndex(ForwardedIndexRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         requireMac(ForwardedIndexRequest.ACTION, request);
         requirePluginOriginForSystemIndex(request.index());
-        final ShardId shardId = writerShard(request.index(), request.shard(), request.indexUuid());
+        ShardId shardId = writerShard(request.index(), request.shard(), request.indexUuid());
+        if (shardId == null && request.isSteered()) {
+            // Sent here to be taken, by a sender nearly at its cap: take it, as for a write that arrived here.
+            shardId = takeForSteeredWrite(request);
+        }
         // Accounted on the owner as a primary operation, the way core accounts a write that arrived from
         // a coordinating node: a flood of forwarded writes used to be invisible to this node's pressure.
         try (
@@ -192,6 +196,25 @@ public final class ShardRouter {
         ) {
             handleIndexAccounted(request, channel, shardId);
         }
+    }
+
+    /** How long a steered write waits for this node to take its shard. */
+    private static final long STEERED_ACTIVATION_WAIT_MILLIS = 30_000L;
+
+    /** Takes the shard a steered write is for, if nobody else has; null if it was not taken here. */
+    private ShardId takeForSteeredWrite(ForwardedIndexRequest request) {
+        try {
+            node.signals()
+                .activate(request.index(), request.shard())
+                .get(STEERED_ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
+            // Refused below as not held here: the sender takes it itself.
+            return null;
+        }
+        return writerShard(request.index(), request.shard(), request.indexUuid());
     }
 
     private void handleIndexAccounted(ForwardedIndexRequest request, TransportChannel channel, ShardId shardId) throws Exception {

@@ -354,6 +354,20 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("frozen_views", frozen.size());
             builder.endObject();
 
+            // What to scale on. Shards held against the cap says how full; the refusals and evictions say what being
+            // full has cost -- a node can sit at its cap harmlessly, and these move only when it has turned work away
+            // or given up shards to make room.
+            final ServerlessNode.Capacity capacity = serving.capacity();
+            builder.startObject("capacity");
+            builder.field("max_shards_held", capacity.maxShardsHeld());
+            builder.field("held", capacity.held());
+            builder.field("reader_opens_refused", capacity.readerOpensRefused());
+            builder.field("activations_refused", capacity.activationsRefused());
+            builder.field("evicted", capacity.evicted());
+            builder.field("handed_off", capacity.handedOff());
+            builder.field("writes_steered", capacity.writesSteered());
+            builder.endObject();
+
             builder.startArray("roles");
             for (String role : serving.roles()) {
                 builder.value(role);

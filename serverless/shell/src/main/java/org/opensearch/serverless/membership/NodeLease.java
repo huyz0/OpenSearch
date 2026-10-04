@@ -42,6 +42,8 @@ public final class NodeLease {
     private final String name;
     private final String version;
     private final boolean revoked;
+    private final int held;
+    private final int cap;
 
     /**
      * Creates a lease.
@@ -94,17 +96,54 @@ public final class NodeLease {
         this.name = name;
         this.version = version;
         this.revoked = false;
+        this.held = -1;
+        this.cap = -1;
     }
 
-    private NodeLease(NodeLease lease, boolean revoked) {
+    private NodeLease(NodeLease lease, boolean revoked, long expiresAtMillis, int held, int cap) {
         this.nodeId = lease.nodeId;
         this.ephemeralId = lease.ephemeralId;
         this.address = lease.address;
         this.roles = lease.roles;
-        this.expiresAtMillis = lease.expiresAtMillis;
+        this.expiresAtMillis = expiresAtMillis;
         this.name = lease.name;
         this.version = lease.version;
         this.revoked = revoked;
+        this.held = held;
+        this.cap = cap;
+    }
+
+    /**
+     * Returns this lease carrying how full its node is.
+     *
+     * <p>The lease is renewed every few seconds and read by every peer already, so it is where a node can say how
+     * many shards it holds against its cap at no extra request: a full node uses it to find a member with room to hand
+     * work to, and an operator or an autoscaler reads it fleet-wide from one listing.
+     *
+     * @param held shards this node holds
+     * @param cap the most it will hold, or -1 when unbounded
+     * @return the copy
+     */
+    public NodeLease withLoad(int held, int cap) {
+        return new NodeLease(this, revoked, expiresAtMillis, held, cap);
+    }
+
+    /**
+     * Returns how many shards the node held when it last renewed.
+     *
+     * @return the count, or -1 when the lease does not say
+     */
+    public int held() {
+        return held;
+    }
+
+    /**
+     * Returns the most shards the node will hold.
+     *
+     * @return the cap, or -1 when the lease does not say or there is none
+     */
+    public int cap() {
+        return cap;
     }
 
     /**
@@ -117,7 +156,7 @@ public final class NodeLease {
      * @return the revoked copy
      */
     public NodeLease revokedCopy() {
-        return new NodeLease(this, true);
+        return new NodeLease(this, true, expiresAtMillis, held, cap);
     }
 
     /**
@@ -210,7 +249,7 @@ public final class NodeLease {
      * @return the renewed lease
      */
     public NodeLease renewedUntil(long newExpiryMillis) {
-        return new NodeLease(nodeId, ephemeralId, address, roles, newExpiryMillis, name, version);
+        return new NodeLease(this, false, newExpiryMillis, held, cap);
     }
 
     /**
@@ -238,6 +277,12 @@ public final class NodeLease {
             if (revoked) {
                 builder.field("revoked", true);
             }
+            if (held >= 0) {
+                builder.field("held", held);
+            }
+            if (cap >= 0) {
+                builder.field("cap", cap);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -262,6 +307,8 @@ public final class NodeLease {
             String version = null;
             boolean revoked = false;
             long expiry = 0L;
+            int held = -1;
+            int cap = -1;
             final Set<String> roles = new LinkedHashSet<>();
             String field = null;
             XContentParser.Token token;
@@ -281,6 +328,8 @@ public final class NodeLease {
                         case "name" -> name = parser.text();
                         case "version" -> version = parser.text();
                         case "revoked" -> revoked = parser.booleanValue();
+                        case "held" -> held = parser.intValue();
+                        case "cap" -> cap = parser.intValue();
                         default -> {
                             // forward compatibility: ignore fields written by a newer node
                         }
@@ -290,7 +339,7 @@ public final class NodeLease {
             if (nodeId == null || ephemeralId == null || address == null) {
                 throw new IOException("malformed node lease: missing a required field");
             }
-            final NodeLease lease = new NodeLease(nodeId, ephemeralId, address, roles, expiry, name, version);
+            final NodeLease lease = new NodeLease(nodeId, ephemeralId, address, roles, expiry, name, version).withLoad(held, cap);
             return revoked ? lease.revokedCopy() : lease;
         }
     }

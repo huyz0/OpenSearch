@@ -496,6 +496,61 @@ public final class DocumentHandler extends BaseRestHandler {
             // only reason anyone would is that a write arrived -- which just happened. So this node takes
             // it, and the write waits for that rather than being sent away to retry.
             final String routedUuid = descriptor.get().uuid();
+            // Unless this node is nearly full and a member has room: the write goes there, marked to be taken, so a
+            // node that has just joined takes new shards rather than the full ones evicting to make room for them.
+            // Anything that went wrong before the member could have applied it falls back to taking it here.
+            final Optional<String> roomy = serving.nearlyFull() ? serving.memberWithRoom(metadata) : Optional.empty();
+            if (roomy.isPresent()) {
+                return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
+                    try (
+                        org.opensearch.common.lease.Releasable forwarded = serving.indexingPressure()
+                            .markCoordinatingOperationStarted(shapedSource == null ? 0L : shapedSource.length(), false)
+                    ) {
+                        final var ack = forwardTo(
+                            serving,
+                            roomy.get(),
+                            writtenIndex,
+                            routedUuid,
+                            shard,
+                            id,
+                            shapedSource,
+                            refresh,
+                            deletion,
+                            ifSeqNo,
+                            ifPrimaryTerm,
+                            requireAbsent,
+                            true
+                        );
+                        serving.noteWriteSteered();
+                        respond(
+                            channel,
+                            writtenIndex,
+                            id,
+                            shard,
+                            ack.ownerNodeId(),
+                            deletion,
+                            new ServerlessNode.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
+                            refresh
+                        );
+                    } catch (ForwardFailed failed) {
+                        if (org.opensearch.serverless.transport.ForwardFailure.classify(failed.getCause()).mayRetryElsewhere() == false) {
+                            // Applied, possibly applied, or answered: not written anywhere else.
+                            reportForwardFailure(channel, serving, writtenIndex, shard, failed.target(), failed.getCause());
+                            return;
+                        }
+                        // Waiting for an activation belongs on GENERIC, as below, not on a write thread.
+                        serving.threadPool()
+                            .executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
+                            .execute(() -> writeOnceActivated(channel, serving, writtenIndex, routedUuid, shard, false, writeHere));
+                    } catch (Exception e) {
+                        try {
+                            channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                        } catch (IOException nested) {
+                            logger.error("failed to report a refused write", nested);
+                        }
+                    }
+                });
+            }
             return channel -> serving.threadPool()
                 .executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
                 .execute(() -> writeOnceActivated(channel, serving, writtenIndex, routedUuid, shard, false, writeHere));
@@ -818,6 +873,38 @@ public final class DocumentHandler extends BaseRestHandler {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) throws Exception {
+        return forwardTo(
+            serving,
+            owner,
+            writtenIndex,
+            indexUuid,
+            shard,
+            id,
+            shapedSource,
+            refresh,
+            deletion,
+            ifSeqNo,
+            ifPrimaryTerm,
+            requireAbsent,
+            false
+        );
+    }
+
+    private org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
+        ServerlessNode serving,
+        String owner,
+        String writtenIndex,
+        String indexUuid,
+        int shard,
+        String id,
+        String shapedSource,
+        boolean refresh,
+        boolean deletion,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent,
+        boolean steered
+    ) throws Exception {
         final Optional<org.opensearch.cluster.node.DiscoveryNode> peer;
         try {
             peer = serving.router().peer(owner);
@@ -842,22 +929,19 @@ public final class DocumentHandler extends BaseRestHandler {
         // what comes out of the gate unwrapped is the gate's own refusal and nothing else.
         return gated(serving, deletion, writtenIndex, id, shapedSource, () -> {
             try {
-                return serving.router()
-                    .forwardIndex(
-                        peer.get(),
-                        new org.opensearch.serverless.transport.ForwardedIndexRequest(
-                            writtenIndex,
-                            indexUuid,
-                            shard,
-                            id,
-                            shapedSource == null ? "" : shapedSource,
-                            refresh,
-                            deletion,
-                            ifSeqNo,
-                            ifPrimaryTerm,
-                            requireAbsent
-                        )
-                    );
+                final var request = new org.opensearch.serverless.transport.ForwardedIndexRequest(
+                    writtenIndex,
+                    indexUuid,
+                    shard,
+                    id,
+                    shapedSource == null ? "" : shapedSource,
+                    refresh,
+                    deletion,
+                    ifSeqNo,
+                    ifPrimaryTerm,
+                    requireAbsent
+                );
+                return serving.router().forwardIndex(peer.get(), steered ? request.steered() : request);
             } catch (Exception e) {
                 throw new ForwardFailed(owner, e);
             }

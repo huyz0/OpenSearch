@@ -261,6 +261,111 @@ public final class ServerlessNode implements Closeable {
         this.admission = admission;
     }
 
+    /** Reader opens this node refused at its shard cap. */
+    private final java.util.concurrent.atomic.AtomicLong readerOpensRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
+    /** Writer activations this node refused at its shard cap. */
+    private final java.util.concurrent.atomic.AtomicLong activationsRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
+    /** Shards given up to make room for another. */
+    private final java.util.concurrent.atomic.AtomicLong evictedForRoom = new java.util.concurrent.atomic.AtomicLong();
+    /** Shards given up because a member with room could take them. */
+    private final java.util.concurrent.atomic.AtomicLong handedOff = new java.util.concurrent.atomic.AtomicLong();
+    /** Writes for a shard nobody held that this node sent to a member with room rather than take. */
+    private final java.util.concurrent.atomic.AtomicLong writesSteered = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * How full this node is and what fullness has cost: the numbers to scale on.
+     *
+     * @param maxShardsHeld the cap
+     * @param held shards held now
+     * @param readerOpensRefused reader opens refused at the cap
+     * @param activationsRefused writer activations refused at the cap
+     * @param evicted shards given up to make room
+     * @param handedOff shards given up for a member with room
+     * @param writesSteered writes for an unheld shard sent to a member with room
+     */
+    public record Capacity(int maxShardsHeld, int held, long readerOpensRefused, long activationsRefused, long evicted, long handedOff,
+        long writesSteered) {
+    }
+
+    /**
+     * Returns how full this node is and what fullness has cost.
+     *
+     * @return the figures
+     */
+    public Capacity capacity() {
+        return new Capacity(
+            admission.maxShardsHeld(),
+            reconciler == null ? 0 : reconciler.heldShards().size(),
+            readerOpensRefusedAtCap.get(),
+            activationsRefusedAtCap.get(),
+            evictedForRoom.get(),
+            handedOff.get(),
+            writesSteered.get()
+        );
+    }
+
+    /** Counts a writer activation refused at the cap. */
+    public void noteActivationRefusedAtCap() {
+        activationsRefusedAtCap.incrementAndGet();
+    }
+
+    /**
+     * Counts a shard given up, to make room or for a member with room.
+     *
+     * @param forHandOff true if given up for a member with room
+     */
+    public void noteEvicted(boolean forHandOff) {
+        (forHandOff ? handedOff : evictedForRoom).incrementAndGet();
+    }
+
+    /** Above this share of its cap a node looks for a member to hand work to. */
+    public static final double HAND_OFF_ABOVE = 0.9;
+    /** At or below this share of its cap a member can take work handed to it. */
+    public static final double ROOM_AT_OR_BELOW = 0.75;
+
+    /**
+     * Whether this node holds more than {@link #HAND_OFF_ABOVE} of its cap.
+     *
+     * @return true when nearly full
+     */
+    public boolean nearlyFull() {
+        final int cap = admission.maxShardsHeld();
+        return cap > 0 && reconciler != null && reconciler.heldShards().size() >= cap * HAND_OFF_ABOVE;
+    }
+
+    /**
+     * The live writer member with the most room, if any has {@link #ROOM_AT_OR_BELOW} of its cap or less: where a full
+     * node sends work. From the leases every member renews with its load, so it costs no request.
+     *
+     * @param plane the metadata plane
+     * @return the member's id
+     */
+    public java.util.Optional<String> memberWithRoom(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        final long now = plane.clock().getAsLong();
+        String best = null;
+        double bestShare = ROOM_AT_OR_BELOW;
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+            if (lease.nodeId().equals(localNode.getId())
+                || lease.isExpiredAt(now)
+                || lease.roles().contains(ROLE_INGEST) == false
+                || lease.held() < 0
+                || lease.cap() <= 0) {
+                continue;
+            }
+            final double share = (double) lease.held() / lease.cap();
+            if (share <= bestShare) {
+                best = lease.nodeId();
+                bestShare = share;
+            }
+        }
+        return java.util.Optional.ofNullable(best);
+    }
+
+    /** Counts a write for an unheld shard sent to a member with room. */
+    public void noteWriteSteered() {
+        writesSteered.incrementAndGet();
+    }
+
     private volatile org.opensearch.serverless.reconcile.ReconcileSignals signals =
         org.opensearch.serverless.reconcile.ReconcileSignals.NONE;
     private volatile LocalViewProjector projector;
@@ -1785,7 +1890,7 @@ public final class ServerlessNode implements Closeable {
                     0L,
                     localNode.getName(),
                     org.opensearch.Version.CURRENT.toString()
-                )
+                ).withLoad(reconciler == null ? 0 : reconciler.heldShards().size(), admission.maxShardsHeld())
             );
         ownLeaseValidUntilMillis = startedAt + plane.leaseTtlMillis();
     }
@@ -3189,6 +3294,7 @@ public final class ServerlessNode implements Closeable {
             // Readers used to be uncapped: a wide search burst could open thousands of shards on one
             // node. The same ceiling demand-driven writers have applies -- the configured one, counting
             // views -- and the same eviction makes room before this refuses.
+            readerOpensRefusedAtCap.incrementAndGet();
             throw new IllegalStateException(
                 "this node holds " + reconciler.openShards().size() + AT_THE_CAP + indexName + "[" + shardNumber + "] was not opened"
             );

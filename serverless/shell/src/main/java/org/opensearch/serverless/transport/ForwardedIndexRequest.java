@@ -34,6 +34,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
     private final long ifPrimaryTerm;
     private final boolean requireAbsent;
     private final String indexUuid;
+    private boolean steered;
 
     /**
      * Creates a request.
@@ -198,6 +199,29 @@ public final class ForwardedIndexRequest extends TransportRequest {
         this.ifPrimaryTerm = in.readVLong();
         this.requireAbsent = in.readBoolean();
         this.indexUuid = in.readOptionalString();
+        this.steered = in.readBoolean();
+    }
+
+    /**
+     * Marks this write as sent here to be taken: the shard has no owner, and the sender, nearly at its cap, chose this
+     * node because it has room. The receiver takes the shard for it, as it would for a write that arrived at it
+     * directly. An ordinary forward is for the owner, and one that finds the shard not held here is refused, so that a
+     * sender's stale view of who owns a shard can never make a write land somewhere else.
+     *
+     * @return this
+     */
+    public ForwardedIndexRequest steered() {
+        this.steered = true;
+        return this;
+    }
+
+    /**
+     * Whether the sender chose this node to take an unowned shard; see {@link #steered()}.
+     *
+     * @return true if steered
+     */
+    public boolean isSteered() {
+        return steered;
     }
 
     /**
@@ -222,6 +246,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
         out.writeVLong(ifPrimaryTerm);
         out.writeBoolean(requireAbsent);
         out.writeOptionalString(indexUuid);
+        out.writeBoolean(steered);
     }
 
     /**
