@@ -179,6 +179,61 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * An activation on a node whose lease lapsed does not wait behind a re-read of its held heads that another thread is
+     * already running: it declines, and is asked again once that re-read is done. Waiting put every activation thread
+     * behind the lease thread's scan on one lock: with the store slowed to seconds a request, every activation on every
+     * node waited an hour.
+     */
+    public void testAnActivationDoesNotWaitBehindAHeadReRead() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        for (String index : List.of("held", "wanted")) {
+            plane.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, MAPPING, null));
+        }
+        try (ServerlessNode node = new ServerlessNode(settings("lapsed"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            node.renewLease(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
+            loop.activateOnDemand(List.of(Map.entry("held", 0)));
+
+            clock.addAndGet(2 * TTL);   // the lease has lapsed
+            // The lease pass renews and re-reads the held heads; the read of one is held in flight.
+            final java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+            final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+            store.onNextRegisterRead("", org.opensearch.serverless.metadata.RegisterMap.shardHeadBlob("held", 0), () -> {
+                entered.countDown();
+                try {
+                    release.await(30, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            final Thread leasePass = new Thread(() -> {
+                try {
+                    node.renewLease(plane);
+                } catch (Exception e) {
+                    throw new AssertionError(e);
+                }
+            });
+            leasePass.start();
+            assertTrue(entered.await(30, java.util.concurrent.TimeUnit.SECONDS));
+
+            final long started = System.nanoTime();
+            assertTrue(
+                "not taken while another thread re-reads the held heads",
+                loop.activateOnDemand(List.of(Map.entry("wanted", 0))).isEmpty()
+            );
+            assertTrue("and without waiting for it", System.nanoTime() - started < java.util.concurrent.TimeUnit.SECONDS.toNanos(10));
+
+            release.countDown();
+            leasePass.join(30_000L);
+            assertEquals("taken once the re-read is done", 1, loop.activateOnDemand(List.of(Map.entry("wanted", 0))).size());
+        }
+    }
+
     /** With every member as full as this one, nothing is handed off and nothing steered. */
     public void testNothingMovesWhenNobodyHasRoom() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000_000L);
