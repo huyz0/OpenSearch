@@ -204,6 +204,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 final int ledgerMark = ledger.writes().size();
                 final long shedMark = load.shed();
                 final Map<String, Long> termsBefore = activeTerms(steady.activeIndices());
+                final Map<String, Long> phasesBefore = activationPhases();
                 line("\n## " + scenario + "\n");
                 switch (scenario.trim()) {
                     case "steady" -> steady(seconds);
@@ -219,12 +220,19 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 }
                 final long ended = System.nanoTime();
                 line("- writes: " + load.window("write", started, ended));
+                // And without the first minute. Between scenarios the load stops for the read-back and the idle
+                // measurement, long enough for the working set to be released; the minute after it resumes re-takes
+                // every hot shard at once, and folded into one figure it read as the steady state's p99.
+                if (ended - started > TimeUnit.SECONDS.toNanos(120)) {
+                    line("- writes after the first minute: " + load.window("write", started + TimeUnit.SECONDS.toNanos(60), ended));
+                }
                 line("- searches: " + load.window("search", started, ended));
                 line("- gets: " + load.window("get", started, ended));
                 line("- churn: " + load.window("create", started, ended) + "; " + load.window("delete", started, ended));
                 line("- not acknowledged, by reason: " + load.refusalReasons(started, ended));
                 line("- writes shed by the client, " + FleetLoad.MAX_IN_FLIGHT + " already in flight: " + (load.shed() - shedMark));
                 line("- store requests per node: " + storeCounts());
+                line("- " + activationPhaseAverages(phasesBefore, activationPhases()));
                 line("- " + unprunable());
                 final Map<String, Long> termsAfter = activeTerms(steady.activeIndices());
                 line("- ownership churn on the active set during the scenario: " + termChurn(termsBefore, termsAfter));
@@ -833,6 +841,31 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             moved.put(each.getKey(), each.getValue() - countersBefore.getOrDefault(each.getKey(), 0L));
         }
         line("- capacity counters across the fleet during the scenario: " + moved);
+    }
+
+    private static final List<String> PHASES = List.of("describe_millis", "acquire_millis", "mark_owned_millis", "open_millis", "opened");
+
+    /** Writer activations' time by phase, summed over the live nodes. */
+    private Map<String, Long> activationPhases() {
+        final Map<String, Long> totals = new TreeMap<>();
+        for (String field : PHASES) {
+            totals.put(field, fleetSum("activation_phases", field));
+        }
+        return totals;
+    }
+
+    /** The average writer activation, by phase, between two readings. Restarted nodes start their sums again. */
+    private static String activationPhaseAverages(Map<String, Long> before, Map<String, Long> after) {
+        final long opened = after.getOrDefault("opened", 0L) - before.getOrDefault("opened", 0L);
+        if (opened <= 0) {
+            return "writer activations: none opened";
+        }
+        final StringBuilder out = new StringBuilder("writer activations: " + opened + " opened; average ms by phase:");
+        for (String field : PHASES.subList(0, 4)) {
+            final long spent = Math.max(0L, after.getOrDefault(field, 0L) - before.getOrDefault(field, 0L));
+            out.append(' ').append(field.replace("_millis", "")).append('=').append(spent / opened);
+        }
+        return out.toString();
     }
 
     /** The fleet's capacity counters, summed over the live nodes. */

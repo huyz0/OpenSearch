@@ -368,6 +368,16 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("writes_steered", capacity.writesSteered());
             builder.endObject();
 
+            // Where a writer activation's time goes, summed: divide by opened for the average of each.
+            final long[] phases = serving.activationPhaseMillis();
+            builder.startObject("activation_phases");
+            builder.field("describe_millis", phases[0]);
+            builder.field("acquire_millis", phases[1]);
+            builder.field("mark_owned_millis", phases[2]);
+            builder.field("open_millis", phases[3]);
+            builder.field("opened", phases[4]);
+            builder.endObject();
+
             builder.startArray("roles");
             for (String role : serving.roles()) {
                 builder.value(role);
