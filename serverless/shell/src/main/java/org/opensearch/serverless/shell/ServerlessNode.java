@@ -3162,6 +3162,12 @@ public final class ServerlessNode implements Closeable {
         }
     }
 
+    /**
+     * What a reader open refused at this node's shard cap says, so a coordinator can tell a full node, which another
+     * node may stand in for, from a shard nobody can open.
+     */
+    public static final String AT_THE_CAP = " shards, the cap; ";
+
     private org.opensearch.core.index.shard.ShardId openReader(
         org.opensearch.serverless.metadata.MetadataPlane plane,
         String indexName,
@@ -3184,13 +3190,7 @@ public final class ServerlessNode implements Closeable {
             // node. The same ceiling demand-driven writers have applies -- the configured one, counting
             // views -- and the same eviction makes room before this refuses.
             throw new IllegalStateException(
-                "this node holds "
-                    + reconciler.openShards().size()
-                    + " shards, the cap; "
-                    + indexName
-                    + "["
-                    + shardNumber
-                    + "] was not opened"
+                "this node holds " + reconciler.openShards().size() + AT_THE_CAP + indexName + "[" + shardNumber + "] was not opened"
             );
         }
         // One manifest read: the shard being opened. Every other reader's term is what was read when it
