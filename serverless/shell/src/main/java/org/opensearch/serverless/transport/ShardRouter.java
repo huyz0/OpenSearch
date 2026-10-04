@@ -323,6 +323,7 @@ public final class ShardRouter {
     private void handleSearch(ForwardedSearchRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         requireMac(ForwardedSearchRequest.ACTION, request);
         ShardId shardId = localShard(request.index(), request.shard(), request.indexUuid());
+        final boolean openedForThis = shardId == null;
         if (shardId == null) {
             // Open it. This is the property that makes placement a hint rather than a requirement: a
             // node asked for a shard it does not have fetches the manifest and serves, so a stale or
@@ -335,7 +336,10 @@ public final class ShardRouter {
             // Open already, perhaps as a reader whose writer has since died: checked like a fresh one.
             node.ensureReaderCurrent(plane.get(), request.index(), request.shard(), shardId);
         }
-        node.markUsed(shardId);
+        if (openedForThis) {
+            // Opened now, so used now; one already held is used only if it matches, below -- see SearchFanout.
+            node.markUsed(shardId);
+        }
         // Before the query too, so it runs on the mapping in force now; see ServerlessNode#ensureIncarnationLive.
         node.ensureIncarnationLive(shardId);
         // The coordinator's instant for "now", so this shard scores against the same clock as every other
@@ -349,6 +353,9 @@ public final class ShardRouter {
             node.reconciler().exit(shardId);
         }
         node.ensureIncarnationLive(shardId);
+        if (result.total() > 0) {
+            node.markUsed(shardId);
+        }
         channel.sendResponse(new ForwardedSearchResponse(result));
     }
 
