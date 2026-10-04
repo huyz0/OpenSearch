@@ -484,11 +484,57 @@ outside it. In `run1791095872059` the second kill landed on survivors holding 37
 - SlowDown recovered within the window again, 102 s after the burst;
 - 0 lost, 0 refused-but-visible, 0 unreached and 0 silently behind in every scenario.
 
+### Scaling out: the signals, the hand-off, and what kept every shard busy
+
+The next question was whether the fleet says when to scale, and whether a node added at the cap relieves latency soon
+enough. It measured as follows (`run1791104708788`, `run1791107747703`, `run1791148967324`, the last on a fresh
+bucket).
+
+**What to scale on.** `GET /_serverless/stats` gained a `capacity` section: the cap, shards held, reader opens and
+writer activations refused at the cap, shards evicted for room or handed off, and writes steered elsewhere. It also
+gained `activation_phases`, an activation's time by phase. Each node's lease carries shards held and the cap, so peers
+see each other's load without a request. The refusals and evictions are the scale signal: a node can sit at its cap
+harmlessly, as a cache, and these move only when it turns work away.
+
+**Handing work to a node with room.** A node at 90% of its cap, when a live writer is at 75% of its own or less, lets go
+of idle shards down to 80%, a tenth of its cap a pass. It also sends a write for a shard nobody owns to that member,
+marked to be taken there. With nobody to take them it sheds nothing.
+
+**Three things the measurements found:**
+1. **Every search counted as use.** The wide search every two seconds touched every held writer, so nothing was ever old
+   enough to evict, full nodes refused new shards outright, and a node added at the cap filled within two minutes. A
+   search now counts as use of a shard it was already holding only if it matched something there. Cap refusals during
+   scale-out halved.
+2. **Full nodes evicted for shards someone else had taken.** Survivors of a dead node all queue all of its shards. A
+   survivor at its cap evicted a shard for each, before finding that another survivor already held it. With 321 shards
+   to take, takeover ran p50 131 s and p99 200 s. A full node now reads the head first.
+3. **A slow store stopped every activation.** An activation renews the node's lease. After a lapse that meant re-reading
+   every held head, under a lock the lease thread holds during its own re-read. With the store slowed to seconds a
+   request -- Docker degraded after two days -- every activation on every node waited over an hour behind it. An
+   activation now declines while another thread is re-reading. A shard taken then could not be written to.
+
+**The fresh-bucket run** was 0 lost, 0 refused-but-visible, 0 unreached and 0 silently behind in all five scenarios.
+
+| | |
+| --- | --- |
+| steady write p99, after the first minute | 2.1 s (5.5 s with it) |
+| an activation, average | 1.4 s: describe 13 ms, acquire 534, mark owned 309, open 552 |
+| kill -9, 233 shards | p50 45 s, p99 66 s |
+| kill -9, 220 shards, survivors at the cap after scale-out | p50 64 s, p99 91 s; activations 7.2 s each |
+| a node added at the cap | serving in 4.5 s; half the others' average in 37-50 s |
+| write p99 after the join | 9-23 s the first minutes, then 3-8 s |
+
+**Why p99 read 9 s.** Hot shards' writes run at p99 1-2 s in steady minutes. Between scenarios the harness stops the
+load to read everything back. That gap releases the working set: at one resumption 221 of the 240 hot shards had
+changed owner, so the first minute re-takes them all at once, with p99 near 20 s. The harness now reports each
+scenario without its first minute too. That burst is real behaviour for any index that wakes after five idle minutes,
+and the per-phase timings say where it goes: no single step dominates.
+
 ### Still open
 
-- **Takeover onto full survivors** is now p50 54 s and p99 76 s. Roughly half of it is the 30 s lease running out
-  before anyone may take the shard.
-- **Reader refusals during the stale check's bursts:** these are capacity, not a defect, at 2,400 slots fleet-wide.
+- **Capacity under this load:** the load's working set is close to the fleet's 2,400 slots, so nodes stay at the cap
+  and refusals continue. Adding a node helps for minutes, then it fills as well.
+- **The first minute after a pause:** every hot shard is re-taken at about 1.4 s each, eight at a time per node.
 - **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
 
 

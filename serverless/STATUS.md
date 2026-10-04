@@ -1143,9 +1143,22 @@ Room for a takeover is now made outside the cap lock, so a full survivor's takeo
 evictions. Onto survivors at the cap, a dead node's shards are writable at p50 54 s and p99 76 s, against 75 s and
 119 s before.
 
+**Scaling out.**
+- **Signals:** `GET /_serverless/stats` reports capacity (the cap, shards held, refusals at the cap, evictions,
+  hand-offs, steered writes) and an activation's time by phase, and leases carry each node's load.
+- **Hand-off:** a full node hands idle shards off, and steers writes for unowned shards, to a member with room.
+- **Fixes found on the way:**
+  - a search counts as use only when it matches;
+  - a full node no longer evicts for a shard another node took;
+  - an activation no longer waits behind a lease re-read on a slow store, which had stopped every activation for an
+    hour.
+- **Results:** a node added at the cap serves in seconds and holds half the others' average within a minute.
+  Steady-state write p99 is about 2 s; the 5-9 s figures were the first minute after a pause, re-taking the hot set.
+- **Correctness:** a fresh-bucket run was clean in all five scenarios.
+
 **Open:**
-- the takeover tail onto full survivors, about half of which is the 30 s lease;
-- reader refusals during the stale check's bursts, which are capacity rather than a defect.
+- capacity under this load, whose working set is close to the fleet's slots;
+- the burst of re-takes after an idle pause, about 1.4 s a shard, eight at a time per node.
 
 Details in [`scale-test-results.md`](scale-test-results.md#after-goal-11-latency-two-stale-reads-and-a-loss-traced-to-writes-past-a-fence).
 
