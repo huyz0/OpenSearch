@@ -454,12 +454,41 @@ a loss. A one-off tool (`ServerlessLogRepairTests`, run under `s3Test` only when
 stray record without its sequence number, keeping the original beside it. Replay applied it as a fresh operation.
 The shard has opened since, with both documents: 85177 at seqNo 14752, and 86131 re-applied as 14760.
 
+### The last two: full survivors, and reader opens refused at the cap
+
+Both were addressed; one change is kept and one was measured and dropped (`run1791090809192`).
+
+**Searches now spill to any node with room (kept).** A search for a shard tried its two placement-preferred nodes and
+its owner. If both preferred nodes were full and nobody owned the shard, it failed, even with slots free elsewhere.
+When a candidate refuses at the cap, the search now asks the other search nodes in placement order until one answers
+(`ServerlessSearchSpillTests`, which failed without it). In this fleet every node runs near its cap, so there is
+rarely room to spill to. The stale check's refusals continued, and they are the fleet's real capacity: its bursts of
+thousands of indices exceed 2,400 slots. The change matters wherever load is uneven, such as dedicated search nodes.
+
+**A standing reserve on every node (dropped).** Each 30 s pass kept a fifth of the cap free by evicting shards idle
+past the one-minute grace, so a takeover would not have to evict inline.
+- **What it did:** it held every node at 320 after each pass, and demand refilled them to about 390 by the next one.
+- **Kill onto full survivors (259 shards):** a survivor held each head sooner (p50 39 s, against 61 s). But the first
+  write after that slowed (p50 25 s, against 5 s), so the total moved only from 75 s / 119 s to 68 s / 99 s.
+- **Side effects:** the evictions kept moving shards, so `421 not_the_writer` roughly doubled, and SlowDown recovery
+  fell back outside the window (about 160 s, against 71 s).
+
+A gain within the noise of single runs, with churn that showed up elsewhere, so it was taken out.
+
+**Room is made outside the cap lock (kept).** A shard taken on demand by a full node evicted another first, inside
+the lock every activation takes to reserve its slot. An eviction is a publish and a head release, so the survivors
+took a dead node's shards one eviction at a time. The slot is still reserved under the lock; the eviction now runs
+outside it. In `run1791095872059` the second kill landed on survivors holding 379-399 shards each:
+- **211 shards: p50 54 s, p99 76 s,** against 75 s / 119 s with ranking alone and 68 s / 99 s with the dropped
+  reserve;
+- SlowDown recovered within the window again, 102 s after the burst;
+- 0 lost, 0 refused-but-visible, 0 unreached and 0 silently behind in every scenario.
+
 ### Still open
 
-- **Takeover onto full survivors:** each one must evict a writer first, which is a publish and a head release per
-  slot. That is the remaining p99 beyond 60 s.
-- **Reader refusals at the cap:** the stale check's bursts of up to 6,000 indices exceed 2,400 slots fleet-wide. The
-  refusal is honest; routing a refused open to a node with room would turn some of these into answers.
+- **Takeover onto full survivors** is now p50 54 s and p99 76 s. Roughly half of it is the 30 s lease running out
+  before anyone may take the shard.
+- **Reader refusals during the stale check's bursts:** these are capacity, not a defect, at 2,400 slots fleet-wide.
 - **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
 
 
