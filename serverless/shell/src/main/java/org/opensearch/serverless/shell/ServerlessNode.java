@@ -204,6 +204,8 @@ public final class ServerlessNode implements Closeable {
     private final Object leaseRenewalLock = new Object();
     /** Serialises head verification: two passes interleaving their releases was the hazard, and waiting is cheaper than skipping. */
     private final Object headVerificationLock = new Object();
+    /** Whether a head verification is running, so an activation can tell it would only wait behind one. */
+    private final java.util.concurrent.atomic.AtomicBoolean verifyingHeads = new java.util.concurrent.atomic.AtomicBoolean();
     /**
      * True from the moment this node's lease is found lapsed until a head verification that began after
      * the renewal has read every head. While set, no write is acknowledged and no forwarded write is
@@ -2429,7 +2431,16 @@ public final class ServerlessNode implements Closeable {
             // not. Half the TTL left, less the skew margin, is the bar -- the renewal timer runs at a third.
             final long now = plane.clock().getAsLong();
             if (now + plane.leaseTtlMillis() / 2 >= ownLeaseValidUntilMillis - plane.membership().skewMarginMillis()) {
-                renewLease(plane);
+                renewLease(plane, false);
+            }
+            if (ownershipUnverified) {
+                // The lease lapsed, or was revoked, and another thread is re-reading the heads this node holds. Writes are
+                // refused until it finishes, so a shard taken now could not be written; and waiting for it put every
+                // activation thread behind that scan, on one lock, for as long as the store took to answer four hundred
+                // reads -- a store slowed to seconds a request stopped a whole fleet taking any shard for an hour. The
+                // activation is asked again once the scan is done.
+                logger.debug("not taking {}[{}]: this node's held heads are being re-read after its lease lapsed", indexName, shardNumber);
+                return java.util.Optional.empty();
             }
         }
         // The incarnation being activated, so a head left by a deleted index of the same name is not
@@ -2567,6 +2578,17 @@ public final class ServerlessNode implements Closeable {
      */
     public java.util.Set<org.opensearch.core.index.shard.ShardId> renewLease(org.opensearch.serverless.metadata.MetadataPlane plane)
         throws Exception {
+        return renewLease(plane, true);
+    }
+
+    /**
+     * Renews the lease and, after a lapse, re-reads the held heads -- unless asked not to wait and another thread is already
+     * re-reading them, as an activation is.
+     */
+    private java.util.Set<org.opensearch.core.index.shard.ShardId> renewLease(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        boolean verifyAfterLapse
+    ) throws Exception {
         ensureStarted();
         adopt(plane);
         final java.util.Set<org.opensearch.core.index.shard.ShardId> released = new java.util.LinkedHashSet<>();
@@ -2610,7 +2632,7 @@ public final class ServerlessNode implements Closeable {
                 renewOwnLease(plane);
             }
         }
-        if (lapsed || revoked) {
+        if ((lapsed || revoked) && (verifyAfterLapse || verifyingHeads.get() == false)) {
             // Now, not on the next timer: the suspension lasts exactly as long as this scan.
             released.addAll(verifyHeads(plane));
         }
@@ -2661,7 +2683,12 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         synchronized (headVerificationLock) {
-            return verifyHeadsExclusively(plane, true);
+            verifyingHeads.set(true);
+            try {
+                return verifyHeadsExclusively(plane, true);
+            } finally {
+                verifyingHeads.set(false);
+            }
         }
     }
 
@@ -2762,7 +2789,12 @@ public final class ServerlessNode implements Closeable {
         // shard whose index was deleted or recreated, and reopening one whose log could not be appended to
         // -- is not what costs, and deferring it would leave a deleted index served until the next scan.
         synchronized (headVerificationLock) {
-            return verifyHeadsExclusively(plane, due);
+            verifyingHeads.set(true);
+            try {
+                return verifyHeadsExclusively(plane, due);
+            } finally {
+                verifyingHeads.set(false);
+            }
         }
     }
 
