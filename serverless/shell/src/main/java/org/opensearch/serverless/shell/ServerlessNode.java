@@ -361,6 +361,32 @@ public final class ServerlessNode implements Closeable {
         return java.util.Optional.ofNullable(best);
     }
 
+    /**
+     * Where writer activations spend their time, summed: reading the descriptor, acquiring the head, marking the rollup
+     * entry owned, and opening the shard -- restoring its commit and replaying its log. With {@link #activationsOpened}
+     * an operator reads the average of each, and which one a burst of cold shards is waiting on.
+     */
+    private final java.util.concurrent.atomic.AtomicLong[] activationPhases = {
+        new java.util.concurrent.atomic.AtomicLong(),
+        new java.util.concurrent.atomic.AtomicLong(),
+        new java.util.concurrent.atomic.AtomicLong(),
+        new java.util.concurrent.atomic.AtomicLong() };
+    private final java.util.concurrent.atomic.AtomicLong activationsOpened = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Writer activations' time by phase, in milliseconds summed since the node started, and how many opened.
+     *
+     * @return describe, acquire, mark owned and open, then the count of activations that opened
+     */
+    public long[] activationPhaseMillis() {
+        return new long[] {
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[0].get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[1].get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[2].get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[3].get()),
+            activationsOpened.get() };
+    }
+
     /** Counts a write for an unheld shard sent to a member with room. */
     public void noteWriteSteered() {
         writesSteered.incrementAndGet();
@@ -2414,6 +2440,8 @@ public final class ServerlessNode implements Closeable {
         if (described.isEmpty()) {
             return java.util.Optional.empty();
         }
+        final long acquiringAt = System.nanoTime();
+        activationPhases[0].addAndGet(acquiringAt - describedAt);
         final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
             indexName,
             shardNumber,
@@ -2421,6 +2449,7 @@ public final class ServerlessNode implements Closeable {
             localNode.getEphemeralId(),
             described.get().uuid()
         );
+        activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
         if (acquisition.acquired() == false) {
             // The winner's head is the freshest routing fact this node has, and it was paid for: a
             // write for this shard forwards there without another read.
@@ -2441,9 +2470,14 @@ public final class ServerlessNode implements Closeable {
         try {
             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
             // documents its published digest does not describe.
+            final long markingAt = System.nanoTime();
             plane.rollups().markOwned(indexName, described.get().uuid(), described.get().numberOfShards(), shardNumber, assignment.term());
+            final long openingAt = System.nanoTime();
+            activationPhases[2].addAndGet(openingAt - markingAt);
             final ClusterState view = projectAndApply(java.util.List.of(described.get()), java.util.List.of(assignment));
             reconciler.ensureOpen(view, java.util.List.of(assignment));
+            activationPhases[3].addAndGet(System.nanoTime() - openingAt);
+            activationsOpened.incrementAndGet();
             confirmIncarnation(described.get().uuid(), describedAt);
         } catch (Exception e) {
             // The head was won and the shard could not be opened. Held and unserved, that head would
