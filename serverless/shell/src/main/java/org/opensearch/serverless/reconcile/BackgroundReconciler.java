@@ -275,6 +275,7 @@ public final class BackgroundReconciler implements Closeable {
         final Set<ShardId> published = publishAll();
         // After publishing, so a shard released for idleness has just had its chance to flush.
         released.addAll(releaseIdle(nowMillis));
+        handOffToMemberWithRoom();
         // And after that, so a reader this node has just let go of for idleness is not looked up again.
         released.addAll(refreshReaders());
         // Views this node is holding for a record that has gone: in-memory to decide, so it costs nothing
@@ -931,16 +932,44 @@ public final class BackgroundReconciler implements Closeable {
         // DEFAULT_EVICT_HEADROOM_FRACTION for why clearing further than the immediate request pays for
         // itself under sustained demand. Never above the cap itself, so a headroom fraction close to or
         // above 1.0 cannot make this evict shards nobody needed room for.
-        final int floor = Math.min(maxShardsHeld, Math.max(0, maxShardsHeld - headroomShards()));
+        evictDownTo(Math.min(maxShardsHeld, Math.max(0, maxShardsHeld - headroomShards())), Integer.MAX_VALUE, false);
+        return node.reconciler().heldShards().size() < maxShardsHeld;
+    }
+
+    /**
+     * Gives work to a member with room: a node nearly at its cap, when another live writer has room, lets go of shards
+     * past their eviction grace -- least recently used first, down to {@link #HAND_OFF_DOWN_TO} of its cap and at most a
+     * tenth of it a pass -- so the next write for one is taken where there is room.
+     *
+     * <p>Only when someone has room. Shedding on a timer whatever the fleet looked like was measured and dropped: every
+     * node kept giving shards up and taking them back, and misrouted writes doubled. A node that joins, or one restarted
+     * empty, is what this is for -- without it the full ones stayed full until their shards went idle five minutes later,
+     * and the new node took only what happened to arrive at it.
+     *
+     * @return how many shards were let go
+     */
+    public int handOffToMemberWithRoom() {
+        if (demandDriven == false || evictAfterMillis <= 0 || node.nearlyFull() == false || node.memberWithRoom(plane).isEmpty()) {
+            return 0;
+        }
+        final int floor = (int) Math.floor(maxShardsHeld * HAND_OFF_DOWN_TO);
+        return evictDownTo(floor, Math.max(1, maxShardsHeld / 10), true);
+    }
+
+    /** The share of its cap a node hands off down to when a member has room. */
+    public static final double HAND_OFF_DOWN_TO = 0.8;
+
+    private int evictDownTo(int floor, int most, boolean handOff) {
         int evicted = 0;
-        while (node.reconciler().heldShards().size() > floor) {
+        while (node.reconciler().heldShards().size() > floor && evicted < most) {
             final long now = plane.clock().getAsLong();
             final ShardId victim = pickVictim(now);
             if (victim == null) {
                 break;
             }
             final long victimLastUsed = node.reconciler().lastUsed(victim).orElse(openedAt.getOrDefault(victim, now));
-            if (letGo(victim, "evicted to make room, unused for " + (now - victimLastUsed) + "ms") == false) {
+            final String why = handOff ? "handed off to a member with room" : "evicted to make room";
+            if (letGo(victim, why + ", unused for " + (now - victimLastUsed) + "ms") == false) {
                 // The head could not be released; letGo already logged why. Stopping rather than trying a
                 // different victim next: a head release failing once tends to keep failing, and spinning
                 // through every open shard to find one that happens to release is work for no room gained.
@@ -950,18 +979,20 @@ public final class BackgroundReconciler implements Closeable {
             if (demandDriven) {
                 wanted.remove(Map.entry(victim.getIndexName(), victim.id()));
             }
+            node.noteEvicted(handOff);
             evicted++;
         }
         if (evicted > 0) {
             logger.info(
-                "evicted {} shard(s) to make room at the shard cap, {} held against a cap of {} (floor {})",
+                "{} {} shard(s), {} held against a cap of {} (floor {})",
+                handOff ? "handed off" : "evicted to make room",
                 evicted,
                 node.reconciler().heldShards().size(),
                 maxShardsHeld,
                 floor
             );
         }
-        return node.reconciler().heldShards().size() < maxShardsHeld;
+        return evicted;
     }
 
     /** The number of shards headroom clears beyond the one slot immediately needed, at least one. */
@@ -1975,6 +2006,7 @@ public final class BackgroundReconciler implements Closeable {
                         shard,
                         maxShardsHeld
                     );
+                    node.noteActivationRefusedAtCap();
                     return Optional.empty();
                 }
                 if (open == null && reserved == false) {
