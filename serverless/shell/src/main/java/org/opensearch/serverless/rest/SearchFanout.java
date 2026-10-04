@@ -928,12 +928,13 @@ public final class SearchFanout {
         Exception lastFailure = null;
         final ShardId local = localShard(serving, descriptor, shard);
         if (local != null) {
-            serving.markUsed(local);
             try {
                 // A reader here is asked first whether its commit may be behind an acknowledged write nobody is
                 // writing; one that is answers for no document, and the next copy is tried.
                 serving.ensureReaderCurrent(metadata, index, shard, local);
-                return new ShardAnswer(queryHere(serving, local, perShard, nowInMillis));
+                final org.opensearch.serverless.shard.ShardQuery.Result result = queryHere(serving, local, perShard, nowInMillis);
+                markUsedIfMatched(serving, local, result);
+                return new ShardAnswer(result);
             } catch (Exception e) {
                 if (copyUnusable(e) == false) {
                     // The query's own failure, not this copy's: a script that does not compile, a breaker
@@ -1029,6 +1030,25 @@ public final class SearchFanout {
             throw new IOException(lastFailure);
         }
         return null;
+    }
+
+    /**
+     * Counts a search as use of a shard it was already holding only if the shard matched something.
+     *
+     * <p>Eviction gives up what nobody has used lately, and a scan that touched a shard and found nothing in it is not
+     * use. A fleet's wide search ran every two seconds over every index; nothing rules a held writer out of one, so every
+     * held shard looked busy forever, nothing was ever old enough to evict, and full nodes refused new shards outright --
+     * a node added to the fleet filled to its cap within two minutes and relieved nothing. A shard just opened for a
+     * search still counts as used when it opens.
+     */
+    private static void markUsedIfMatched(
+        ServerlessNode serving,
+        ShardId shardId,
+        org.opensearch.serverless.shard.ShardQuery.Result result
+    ) {
+        if (result.total() > 0) {
+            serving.markUsed(shardId);
+        }
     }
 
     /** Asks one node for a shard: this one by opening a reader, another over the wire; null if it cannot be reached. */

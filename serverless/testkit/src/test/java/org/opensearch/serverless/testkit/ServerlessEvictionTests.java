@@ -91,6 +91,54 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
     }
 
     /**
+     * A search that finds nothing in a shard does not keep it resident. A fleet's wide search touched every held writer
+     * every two seconds; each one counted as used, nothing was ever old enough to evict, and full nodes refused new shards.
+     */
+    public void testASearchThatMatchesNothingIsNotUse() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        for (String index : List.of("first", "second", "third")) {
+            plane.createIndex(new IndexDescriptor(index, "uuid-" + index + "-0000000000".substring(index.length()), 1, MAPPING, null));
+        }
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-scanned"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            node.renewLease(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
+                .setMaxShardsHeld(2)
+                .setEvictAfterMillis(30_000L);
+            loop.activateOnDemand(List.of(Map.entry("first", 0), Map.entry("second", 0)));
+            node.index(shard(node, "first"), "doc", "{\"msg\":\"hay\"}");
+
+            clock.addAndGet(60_000L);
+            node.markUsed(shard(node, "second"));
+            // Scanned, and nothing in it matches.
+            final int status = search(node, "/first/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
+            assertEquals(200, status);
+
+            loop.activateOnDemand(List.of(Map.entry("third", 0)));
+            assertTrue("the new shard must have been taken, held=" + node.reconciler().openShards(), holds(node, "third"));
+            assertTrue("the shard in use is kept", holds(node, "second"));
+            assertFalse("and the one only scanned is given up", holds(node, "first"));
+        }
+    }
+
+    private static int search(ServerlessNode node, String path, String body) throws Exception {
+        final var address = node.boundHttpAddress().publishAddress();
+        try (java.net.http.HttpClient client = java.net.http.HttpClient.newHttpClient()) {
+            return client.send(
+                java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create("http://" + address.getAddress() + ":" + address.getPort() + path))
+                    .header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(body))
+                    .build(),
+                java.net.http.HttpResponse.BodyHandlers.ofString()
+            ).statusCode();
+        }
+    }
+
+    /**
      * A full node that the head already names, for a shard it has not opened, opens it anyway.
      *
      * <p>That head is the one state nobody else can resolve: the owner's lease is live, so every peer forwards to
