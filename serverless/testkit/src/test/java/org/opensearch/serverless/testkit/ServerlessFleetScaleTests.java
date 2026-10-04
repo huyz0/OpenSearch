@@ -114,6 +114,9 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
     private final List<FaultProxy> proxies = new ArrayList<>();
     private final List<Path> homes = new ArrayList<>();
     private final Map<String, String> nodeSettings = new LinkedHashMap<>();
+    private URI storeEndpoint;
+    private String storeAccess;
+    private String storeSecret;
     private final StringBuilder report = new StringBuilder();
     private FleetLedger ledger;
     private boolean keepBucket;
@@ -167,12 +170,11 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         nodeSettings.put("serverless.roles", "ingest,search");
         // Any node setting, as tests.fleet.setting.<name>: what an A/B run changes without a code change.
         nodeSettings.putAll(settingOverrides());
+        storeEndpoint = store;
+        storeAccess = access;
+        storeSecret = secret;
         for (int i = 0; i < nodes; i++) {
-            proxies.add(new FaultProxy("n" + i, store.getHost(), store.getPort()));
-            final Path home = results.resolve("nodes").resolve("n" + i);
-            Files.createDirectories(home);
-            NodeProcess.writeKeystore(home, Map.of("s3.client.default.access_key", access, "s3.client.default.secret_key", secret));
-            homes.add(home);
+            addNodeSlot(i);
         }
         for (int i = 0; i < nodes; i++) {
             fleet.add(startNode(i));
@@ -212,6 +214,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                     case "restart" -> rollingRestart(seconds);
                     case "storm" -> storm(seconds, steady);
                     case "drain" -> drain();
+                    case "scaleout" -> scaleOut(seconds);
                     default -> throw new IllegalArgumentException("unknown scenario " + scenario);
                 }
                 final long ended = System.nanoTime();
@@ -764,6 +767,81 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             line("- restarted " + node.name() + " in " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - at) + " ms");
             LockSupport.parkNanos(gap);
         }
+    }
+
+    /** A node's proxy, home and keystore, before it is started. */
+    private void addNodeSlot(int i) throws Exception {
+        proxies.add(new FaultProxy("n" + i, storeEndpoint.getHost(), storeEndpoint.getPort()));
+        final Path home = results.resolve("nodes").resolve("n" + i);
+        Files.createDirectories(home);
+        NodeProcess.writeKeystore(home, Map.of("s3.client.default.access_key", storeAccess, "s3.client.default.secret_key", storeSecret));
+        homes.add(home);
+    }
+
+    /**
+     * A node added while the fleet is at its cap: how long until it carries its share, and what write latency does
+     * meanwhile. Each minute after the join reports the writes' p99 and every node's shards, and the fleet's capacity
+     * counters say how the share moved -- handed off by full nodes, steered to the new one, or only refused.
+     */
+    private void scaleOut(int seconds) throws Exception {
+        final long beforeFrom = System.nanoTime() - TimeUnit.SECONDS.toNanos(60);
+        line("- the minute before: " + load.window("write", beforeFrom, System.nanoTime()) + "; held " + perNodeField("capacity", "held"));
+        final Map<String, Long> countersBefore = capacityCounters();
+        final int i = homes.size();
+        final String name = "n" + i;
+        addNodeSlot(i);
+        final long joinedAt = System.nanoTime();
+        fleet.add(startNode(i));
+        line("- added " + name + " in " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - joinedAt) + " ms");
+        long halfShareAt = -1;
+        long minuteFrom = System.nanoTime();
+        while (System.nanoTime() - joinedAt < TimeUnit.SECONDS.toNanos(seconds)) {
+            sleepSeconds(15);
+            final Map<String, Long> held = perNodeField("capacity", "held");
+            final long mine = held.getOrDefault(name, 0L);
+            final double others = held.entrySet()
+                .stream()
+                .filter(e -> e.getKey().equals(name) == false)
+                .mapToLong(Map.Entry::getValue)
+                .average()
+                .orElse(0);
+            if (halfShareAt < 0 && others > 0 && mine >= others / 2) {
+                halfShareAt = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - joinedAt);
+            }
+            if (System.nanoTime() - minuteFrom >= TimeUnit.SECONDS.toNanos(60)) {
+                final long now = System.nanoTime();
+                line(
+                    "- minute "
+                        + TimeUnit.NANOSECONDS.toMinutes(now - joinedAt)
+                        + " after the join: "
+                        + load.window("write", minuteFrom, now)
+                        + "; held "
+                        + held
+                );
+                minuteFrom = now;
+            }
+        }
+        line(
+            "- "
+                + name
+                + " held half the others' average "
+                + (halfShareAt < 0 ? "NOT within the scenario" : halfShareAt + " ms after joining")
+        );
+        final Map<String, Long> countersAfter = capacityCounters();
+        final Map<String, Long> moved = new TreeMap<>();
+        for (Map.Entry<String, Long> each : countersAfter.entrySet()) {
+            moved.put(each.getKey(), each.getValue() - countersBefore.getOrDefault(each.getKey(), 0L));
+        }
+        line("- capacity counters across the fleet during the scenario: " + moved);
+    }
+
+    /** The fleet's capacity counters, summed over the live nodes. */
+    private Map<String, Long> capacityCounters() {
+        final Map<String, Long> counters = new TreeMap<>();
+        for (String field : List.of("reader_opens_refused", "activations_refused", "evicted", "handed_off", "writes_steered")) {
+            counters.put(field, fleetSum("capacity", field));
+        }
+        return counters;
     }
 
     /** Deletes and recreates of the very names being written to: a write to a deleted index must be refused. */
