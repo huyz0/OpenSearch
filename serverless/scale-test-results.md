@@ -530,10 +530,28 @@ changed owner, so the first minute re-takes them all at once, with p99 near 20 s
 scenario without its first minute too. That burst is real behaviour for any index that wakes after five idle minutes,
 and the per-phase timings say where it goes: no single step dominates.
 
+**Taking more shards at once.** A node activated eight shards at a time, a fixed number. That is now
+`serverless.activation.concurrency`, and the activation pool is sized from it. At 32, against 8 on the same fresh
+bucket (`run1791165104451` against `run1791148967324`):
+
+| | 8 at a time | 32 at a time |
+| --- | --- | --- |
+| kill -9, survivors with room | p50 45 s, p99 66 s | **p50 37.5 s, p99 52.5 s** |
+| kill -9 onto full survivors after scale-out | p50 64 s, p99 91 s | p50 52 s, p99 92 s |
+| a new node at half the others' average | 37 s | 52 s |
+| steady write p99, after the first minute | 2.1-7.1 s | 6.6-7.6 s |
+| an activation, average | 1.4 s | 2.3 s, and up to 9.6 s in the second kill |
+
+The single-drive store is the limit, not the node: more activations at once only slow each one down. Only the first
+kill gained, and steady writes paid for it. The default stays at eight; the setting is for a store that takes more
+concurrent requests. What remains of a takeover with room is mostly the 30 s lease.
+
 ### Still open
 
 - **Capacity under this load:** the load's working set is close to the fleet's 2,400 slots, so nodes stay at the cap
   and refusals continue. Adding a node helps for minutes, then it fills as well.
+- **Activation concurrency that follows the store:** the AIMD limiter the write path already uses, applied to
+  activations, would take more at once when the store is fast and fewer when it is not.
 - **The first minute after a pause:** every hot shard is re-taken at about 1.4 s each, eight at a time per node.
 - **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
 
