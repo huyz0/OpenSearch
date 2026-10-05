@@ -550,8 +550,13 @@ concurrent requests. What remains of a takeover with room is mostly the 30 s lea
 
 - **Capacity under this load:** the load's working set is close to the fleet's 2,400 slots, so nodes stay at the cap
   and refusals continue. Adding a node helps for minutes, then it fills as well.
-- **Activation concurrency that follows the store:** the AIMD limiter the write path already uses, applied to
-  activations, would take more at once when the store is fast and fewer when it is not.
+- **Activation concurrency that follows the store: tried, and dropped.** An AIMD limit over activations started at
+  eight, cut by a quarter when activations averaged over 2 s, and grew while they were under 1 s (`run1791197021281`).
+  - On this store it spent most of the run at its floor of four.
+  - Kills were no faster than at a fixed eight: p50 47 s / p99 62 s, and 66 s / 91 s onto full survivors.
+  - Steady write p99 was no better.
+
+  Concurrency is not this store's lever. A store that takes more concurrent requests is where the setting would pay.
 - **The first minute after a pause:** every hot shard is re-taken at about 1.4 s each, eight at a time per node.
 - **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
 
