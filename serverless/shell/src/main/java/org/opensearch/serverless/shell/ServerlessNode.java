@@ -131,6 +131,9 @@ public final class ServerlessNode implements Closeable {
      */
     public static final String ACTIVATION_POOL = "serverless_activation";
 
+    /** How many shards a node activates at once; see {@code ServerlessBootstrap#ACTIVATION_CONCURRENCY}. */
+    public static final String ACTIVATION_CONCURRENCY_SETTING = "serverless.activation.concurrency";
+
     /** The pool a forwarded get is answered on, at its owner: not GET, for the reason {@link #FORWARDED_WRITE_POOL} is not WRITE. */
     public static final String FORWARDED_READ_POOL = "serverless_forwarded_read";
 
@@ -511,7 +514,21 @@ public final class ServerlessNode implements Closeable {
             new org.opensearch.threadpool.FixedExecutorBuilder(settings, LEASE_POOL, 1, 16, "thread_pool." + LEASE_POOL),
             // Sized past the default activation concurrency, which is what bounds how many are submitted at once;
             // the queue only absorbs a concurrency raised beyond the pool.
-            new org.opensearch.threadpool.FixedExecutorBuilder(settings, ACTIVATION_POOL, 16, 1000, "thread_pool." + ACTIVATION_POOL),
+            // Twice the activations allowed at once, and never fewer than sixteen: an activation can wait on another's
+            // single-flight while holding a thread.
+            new org.opensearch.threadpool.FixedExecutorBuilder(
+                settings,
+                ACTIVATION_POOL,
+                Math.max(
+                    16,
+                    2 * settings.getAsInt(
+                        ACTIVATION_CONCURRENCY_SETTING,
+                        org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY
+                    )
+                ),
+                1000,
+                "thread_pool." + ACTIVATION_POOL
+            ),
             new org.opensearch.threadpool.FixedExecutorBuilder(
                 settings,
                 FORWARDED_READ_POOL,

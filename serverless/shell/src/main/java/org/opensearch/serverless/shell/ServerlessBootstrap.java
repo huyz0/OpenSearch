@@ -74,6 +74,13 @@ public final class ServerlessBootstrap implements Closeable {
     public static final String EVICT_AFTER = "serverless.activation.evict_after_millis";
 
     /**
+     * How many shards a node activates at once; the activation pool is sized from it. An activation spends most of its time
+     * waiting on the object store, so a node taking a dead node's shards, or a new node taking its share, is bounded by
+     * this times the store's latency rather than by its own work.
+     */
+    public static final String ACTIVATION_CONCURRENCY = ServerlessNode.ACTIVATION_CONCURRENCY_SETTING;
+
+    /**
      * How long a node goes between re-reading the head of every writer shard it holds. Zero reads them on
      * every pass, which is the library default.
      *
@@ -166,7 +173,8 @@ public final class ServerlessBootstrap implements Closeable {
         "path.",
         "http.",
         "transport.",
-        "network."
+        "network.",
+        "thread_pool."
     );
 
     private final ServerlessNode node;
@@ -259,7 +267,8 @@ public final class ServerlessBootstrap implements Closeable {
         )
             .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
             .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))
-            .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS));
+            .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS))
+            .setActivationConcurrency(complete.getAsInt(ACTIVATION_CONCURRENCY, BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY));
 
         final ReconcileScheduler scheduler = new ReconcileScheduler(
             loop,
