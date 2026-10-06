@@ -399,6 +399,7 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("mark_owned_millis", phases[2]);
             builder.field("open_millis", phases[3]);
             builder.field("opened", phases[4]);
+            builder.field("view_millis", phases[5]);
             builder.endObject();
 
             builder.startArray("roles");

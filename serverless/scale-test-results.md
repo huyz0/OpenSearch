@@ -643,6 +643,14 @@ structural either way.)
 Recovery after a kill is bounded by how fast survivors open shards, not by the lease: 40 s of the 50 s p50 is after
 the lease ran out. That is where to spend.
 
+**Overlapping the takeover's steps: tried, reverted.** Marking the rollup entry owned (a compare-and-swap, ~130 ms) was
+run alongside projecting the local view, on GENERIC, the open waiting for both (`run1791301905865`). Steady was
+unchanged; the kill stalled -- no node opened a writer for the whole scenario, 80 of 337 shards writable after five
+minutes, 48% of writes failing, nothing lost. The likely cause: during a takeover burst GENERIC fills with writes waiting
+on activations, and the activations waited on a mark queued behind them. The split it measured says it was not worth
+having anyway: of a 461 ms open, the local view is 14 ms. What is left is the shard open itself, and the acquire
+(~220 ms: the head's swap, the seal, the claim).
+
 ### Still open
 
 - **Capacity under this load:** at a cap of 400 the load's working set was close to the fleet's 2,400 slots and
