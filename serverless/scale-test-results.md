@@ -617,6 +617,32 @@ and made little difference.
 The default cap stays at 1,000 -- reasoned before, measured now. What a higher cap costs is the store's bill, per held
 shard-hour, and a longer takeover when a full node dies.
 
+### The lease: 30 s stays
+
+A shorter lease notices a dead node sooner. Run at 15 s against 30 s, same fleet, cap 1,000, steady, kill and pause
+(`run1791289306089`, `run1791298414962`), both clean:
+
+| | TTL 15 s | TTL 30 s |
+| --- | --- | --- |
+| steady write errors, after the first minute | 17.7% | 2.7% |
+| steady write p99, after the first minute | 5.8 s | 1.2 s |
+| ownership changes on the active set, steady, nobody failing | 148 | 0 |
+| kill: lease ran out after | 11.4 s | 28.3 s |
+| kill: kill to first acknowledged write, p50 / p99 (~280 shards) | 61 s / 110 s | 50 s / 69 s |
+| kill: write errors | 24.9% | 8.0% |
+| background requests per held shard-hour | 289 | 187 |
+| append latency at the end of steady | 180-310 ms | 55-77 ms |
+| average open | 2.6 s | 0.3 s |
+
+The lease is not only a lease. Each renewal also re-reads one head per held shard, and reader refreshes are paced by
+renewals, so halving the TTL roughly doubles that traffic. On one drive the store slowed under it: writes waited and
+were refused, and every open got slower -- the takeover with them. Detection was 17 s faster and recovery slower. (The
+store was shared with another project's build during the 15 s run, which may have added to it; the extra traffic is
+structural either way.)
+
+Recovery after a kill is bounded by how fast survivors open shards, not by the lease: 40 s of the 50 s p50 is after
+the lease ran out. That is where to spend.
+
 ### Still open
 
 - **Capacity under this load:** at a cap of 400 the load's working set was close to the fleet's 2,400 slots and
