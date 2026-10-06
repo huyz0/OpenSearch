@@ -53,9 +53,14 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class BackgroundReconciler implements Closeable {
 
     /**
-     * How many shards a node takes on demand before refusing. A reasoned bound, not a measured one:
-     * phase 9 measured index residency, never shard-count scaling, so nothing here knows what a node can
-     * actually hold.
+     * How many shards a node takes on demand before refusing.
+     *
+     * <p>Measured, now, and memory is not what bounds it: a held shard costs 110-190 KB of heap, writer or reader, so a
+     * thousand is under 200 MB. A fleet of 3 GB nodes ran at 1,200 shards each with heap under 1.7 GB and steady writes at
+     * 3-8% errors, and refused no search for want of room -- once publishing ran a pass at a time on a pool of its own.
+     * Before that, the cost that grew with shards held was publishing: passes piled up on GENERIC and starved the writes.
+     * What a higher cap still costs is background store requests, about 240-330 per held shard-hour, and a longer
+     * takeover when a node holding that many dies.
      */
     public static final int DEFAULT_MAX_SHARDS_HELD = 1000;
 
