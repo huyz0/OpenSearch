@@ -583,10 +583,44 @@ In `run1791257830497` every node then saw every member and agreed within one nod
 That is the shape an autoscaler needs. It should smooth the figure itself: scale up on a short sustained window,
 scale in only after low demand has held. Nothing in the fleet starts or stops machines.
 
+### Shards per node: not memory, but publishing
+
+**What a held shard costs.** Measured in one node, with batches of 100 shards and the heap read after GC, a held
+shard costs 119-140 KB as a writer (50 documents, published) and 109-192 KB as a reader. A node at a cap of 400 spends
+about 55 MB of a 3 GB heap on its shards. Memory is not what bounds the cap. Stats now report heap used and max.
+
+**What actually broke at a higher cap.** Raised to 1,200, steady writes failed at 36%:
+- The write limiter refused 15,000 writes while appends took 10 ms.
+- Opening a shard averaged 5 s.
+
+Thread dumps of a loaded node found 288 GENERIC threads blocked on publish locks:
+- A publish pass worked through every dirty shard in turn, which took minutes at that many shards.
+- Every write meanwhile scheduled another pass.
+- The passes piled up on the same shards and starved everything else waiting on GENERIC, including writes waiting for
+  an activation or a forward.
+
+A pass now runs alone, going round again while shards are dirty, and publishes eight shards at once on a pool of its
+own. Batching the local view projection that each activation rebuilt, which also grows with shards held, was done too
+and made little difference.
+
+**Cap 1,200, after the fix** (`run1791285770133`). Clean in all three scenarios.
+
+| | |
+| --- | --- |
+| steady write errors, after the first minute | 2.9% and 7.9%, against 31-39% before the fix and 6-9% at cap 400 |
+| steady write p99, after the first minute | 4.1-4.5 s |
+| stale-check searches refused for want of room | **0**, against thousands per scenario at cap 400 |
+| kill -9, 134 shards | p50 55 s, p99 87 s |
+| heap | at most 1.7 GB of 3 GB |
+| background store requests | 236-334 per held shard-hour |
+
+The default cap stays at 1,000 -- reasoned before, measured now. What a higher cap costs is the store's bill, per held
+shard-hour, and a longer takeover when a full node dies.
+
 ### Still open
 
-- **Capacity under this load:** the load's working set is close to the fleet's 2,400 slots, so nodes stay at the cap
-  and refusals continue. Adding a node helps for minutes, then it fills as well.
+- **Capacity under this load:** at a cap of 400 the load's working set was close to the fleet's 2,400 slots and
+  refusals continued. At 1,200 they stopped.
 - **Not measured on S3:** the adaptive activation limit and the fleet size need a run against a store with real
   concurrency, and S3's request cost has not been priced.
 - **The first minute after a pause:** every hot shard is re-taken at about 1.4 s each, eight at a time per node.
