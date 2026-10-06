@@ -2216,74 +2216,117 @@ public final class BackgroundReconciler implements Closeable {
     }
 
     private Set<ShardId> publish(Collection<ShardId> candidates) throws Exception {
-        final Set<ShardId> published = new LinkedHashSet<>();
+        final Set<ShardId> published = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        final java.util.concurrent.ExecutorService pool = publishPool();
+        if (pool == null || candidates.size() <= 1) {
+            for (ShardId shardId : candidates) {
+                if (publishOne(shardId)) {
+                    published.add(shardId);
+                }
+            }
+            return published;
+        }
+        // Several at once, on a pool of their own. One after another, a node holding a thousand shards took minutes to get
+        // round to the last dirty one -- its readers that far behind its writes -- and the passes started meanwhile piled
+        // up on GENERIC, blocked on the same shards, until the writes waiting on GENERIC for an activation or a forward
+        // starved and the write limiter refused them.
+        final List<java.util.concurrent.Future<?>> running = new java.util.ArrayList<>();
         for (ShardId shardId : candidates) {
-            if (node.reconciler().readerShards().contains(shardId)) {
-                continue;
-            }
-            final var shard = node.reconciler().shard(shardId);
-            if (shard == null) {
-                continue;
-            }
-            final long maxSeqNo = shard.seqNoStats().getMaxSeqNo();
-            // What the commit about to be flushed is certain to hold: every operation at or below the processed
-            // checkpoint, read before the flush. Not the highest sequence number assigned -- an operation can be
-            // assigned one and still be on its way into the index when the flush commits, and recording its
-            // number as published let a later release skip the publish that would have carried it, leaving an
-            // acknowledged write readable only after someone replayed the log.
-            final long covered = shard.seqNoStats().getLocalCheckpoint();
-            if (maxSeqNo < 0 || maxSeqNo <= lastPublishedMaxSeqNo.getOrDefault(shardId, -1L)) {
-                // Nothing new. Publishing anyway would flush a fresh commit and upload it every tick,
-                // forever, on an idle shard -- an object-store bill for saying nothing happened. This
-                // guard stays on the edge path too: a spurious mark must not become an upload.
-                continue;
-            }
-            if (node.isWriteFenced(shardId)) {
-                // Its engine holds an operation its log does not. Publishing that commit would make the
-                // failure the caller was told a lie; the shard is reopened from its log by the next
-                // heartbeat that reaches the store, and published after.
-                continue;
-            }
+            running.add(pool.submit(() -> {
+                if (publishOne(shardId)) {
+                    published.add(shardId);
+                }
+            }));
+        }
+        for (java.util.concurrent.Future<?> each : running) {
             try {
-                // The heartbeat read this head a moment ago; the manifest's own compare-and-swap is the
-                // fence that matters, so a head up to one renewal old is as good here as a fresh read.
-                final var head = recentOrReadHead(shardId);
-                if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
-                    continue;
-                }
-                synchronized (publishLock(shardId)) {
-                    lastManifests.put(shardId, node.publishShard(shardId, head.get().term()));
-                }
-            } catch (org.opensearch.serverless.store.StaleWriterException e) {
-                // A newer term has already published. This node is a zombie for this shard: it read a
-                // head that named it, and by the time it wrote, it did not. Stop serving it now rather
-                // than at the next renewal, and go look at ownership -- this is exactly the evidence
-                // ownershipDoubted exists for. Under the fence, so a write in flight is not acknowledged
-                // against a shard that is being closed as fenced.
-                try {
-                    node.underShardFence(shardId, () -> {
-                        node.reconciler().releaseShard(shardId, "fenced while publishing: " + e.getMessage());
-                        return null;
-                    });
-                } catch (Exception releaseFailure) {
-                    logger.warn("could not release " + shardId + " after a fenced publish", releaseFailure);
-                }
-                lastPublishedMaxSeqNo.remove(shardId);
-                fenced.add(shardId);
-                continue;
-            } catch (Exception e) {
-                // One shard's upload failing must not defer every other dirty shard to the backstop:
-                // the marks were drained before this loop began, so an exception out of it silently left
-                // the rest unpublished for up to a backstop interval. This shard is re-marked and the
-                // loop goes on.
-                logger.warn("could not publish " + shardId + "; it is re-marked and will be retried", e);
-                dirty.add(shardId);
-                continue;
+                each.get();
+            } catch (java.util.concurrent.ExecutionException e) {
+                logger.warn("a publish failed outside its own handling", e.getCause());
             }
-            lastPublishedMaxSeqNo.put(shardId, covered);
-            published.add(shardId);
         }
         return published;
+    }
+
+    private java.util.concurrent.ExecutorService publishPool() {
+        try {
+            return node.threadPool().executor(org.opensearch.serverless.shell.ServerlessNode.PUBLISH_POOL);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Whether any shard has been written to since it was last published. */
+    public boolean hasDirty() {
+        return dirty.isEmpty() == false;
+    }
+
+    /** Publishes one shard if it has anything new; true if it did. */
+    private boolean publishOne(ShardId shardId) {
+        if (node.reconciler().readerShards().contains(shardId)) {
+            return false;
+        }
+        final var shard = node.reconciler().shard(shardId);
+        if (shard == null) {
+            return false;
+        }
+        final long maxSeqNo = shard.seqNoStats().getMaxSeqNo();
+        // What the commit about to be flushed is certain to hold: every operation at or below the processed
+        // checkpoint, read before the flush. Not the highest sequence number assigned -- an operation can be
+        // assigned one and still be on its way into the index when the flush commits, and recording its
+        // number as published let a later release skip the publish that would have carried it, leaving an
+        // acknowledged write readable only after someone replayed the log.
+        final long covered = shard.seqNoStats().getLocalCheckpoint();
+        if (maxSeqNo < 0 || maxSeqNo <= lastPublishedMaxSeqNo.getOrDefault(shardId, -1L)) {
+            // Nothing new. Publishing anyway would flush a fresh commit and upload it every tick,
+            // forever, on an idle shard -- an object-store bill for saying nothing happened. This
+            // guard stays on the edge path too: a spurious mark must not become an upload.
+            return false;
+        }
+        if (node.isWriteFenced(shardId)) {
+            // Its engine holds an operation its log does not. Publishing that commit would make the
+            // failure the caller was told a lie; the shard is reopened from its log by the next
+            // heartbeat that reaches the store, and published after.
+            return false;
+        }
+        try {
+            // The heartbeat read this head a moment ago; the manifest's own compare-and-swap is the
+            // fence that matters, so a head up to one renewal old is as good here as a fresh read.
+            final var head = recentOrReadHead(shardId);
+            if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
+                return false;
+            }
+            synchronized (publishLock(shardId)) {
+                lastManifests.put(shardId, node.publishShard(shardId, head.get().term()));
+            }
+        } catch (org.opensearch.serverless.store.StaleWriterException e) {
+            // A newer term has already published. This node is a zombie for this shard: it read a
+            // head that named it, and by the time it wrote, it did not. Stop serving it now rather
+            // than at the next renewal, and go look at ownership -- this is exactly the evidence
+            // ownershipDoubted exists for. Under the fence, so a write in flight is not acknowledged
+            // against a shard that is being closed as fenced.
+            try {
+                node.underShardFence(shardId, () -> {
+                    node.reconciler().releaseShard(shardId, "fenced while publishing: " + e.getMessage());
+                    return null;
+                });
+            } catch (Exception releaseFailure) {
+                logger.warn("could not release " + shardId + " after a fenced publish", releaseFailure);
+            }
+            lastPublishedMaxSeqNo.remove(shardId);
+            fenced.add(shardId);
+            return false;
+        } catch (Exception e) {
+            // One shard's upload failing must not defer every other dirty shard to the backstop:
+            // the marks were drained before this loop began, so an exception out of it silently left
+            // the rest unpublished for up to a backstop interval. This shard is re-marked and the
+            // loop goes on.
+            logger.warn("could not publish " + shardId + "; it is re-marked and will be retried", e);
+            dirty.add(shardId);
+            return false;
+        }
+        lastPublishedMaxSeqNo.put(shardId, covered);
+        return true;
     }
 
     /**
