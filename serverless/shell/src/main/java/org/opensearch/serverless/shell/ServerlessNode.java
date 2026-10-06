@@ -131,6 +131,12 @@ public final class ServerlessNode implements Closeable {
      */
     public static final String ACTIVATION_POOL = "serverless_activation";
 
+    /**
+     * Where shards are published, several at once: a node holding hundreds published them one after another on GENERIC,
+     * and the passes that piled up behind each other starved everything else waiting there.
+     */
+    public static final String PUBLISH_POOL = "serverless_publish";
+
     /** How many shards a node activates at once; see {@code ServerlessBootstrap#ACTIVATION_CONCURRENCY}. */
     public static final String ACTIVATION_CONCURRENCY_SETTING = "serverless.activation.concurrency";
 
@@ -619,6 +625,7 @@ public final class ServerlessNode implements Closeable {
             // the queue only absorbs a concurrency raised beyond the pool.
             // Twice the activations allowed at once, and never fewer than sixteen: an activation can wait on another's
             // single-flight while holding a thread.
+            new org.opensearch.threadpool.FixedExecutorBuilder(settings, PUBLISH_POOL, 8, 100_000, "thread_pool." + PUBLISH_POOL),
             new org.opensearch.threadpool.FixedExecutorBuilder(
                 settings,
                 ACTIVATION_POOL,

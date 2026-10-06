@@ -538,6 +538,8 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         return released;
     }
 
+    private final java.util.concurrent.atomic.AtomicBoolean publishRunning = new java.util.concurrent.atomic.AtomicBoolean();
+
     /**
      * Publishes the shards written to since the last publish, now.
      *
@@ -545,18 +547,38 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      */
     public java.util.Set<ShardId> publishNow() {
         publishPending.set(false);
-        publishes.incrementAndGet();
+        // One pass at a time. A pass used to take minutes on a node holding a thousand shards, and each write meanwhile
+        // scheduled another: they piled up on GENERIC, blocked on the same shards' publish locks, until nothing else could
+        // run there. A pass that finds another running leaves its marks to it; the running one goes round again while any
+        // shard is dirty.
+        if (publishRunning.compareAndSet(false, true) == false) {
+            return java.util.Set.of();
+        }
+        final java.util.Set<ShardId> all = new java.util.LinkedHashSet<>();
+        int rounds = 0;
         try {
-            final var published = loop.publishDirty();
-            loop.noteForSweep(published);
-            final var fenced = loop.drainFenced();
-            if (fenced.isEmpty() == false) {
-                ownershipDoubted(fenced.iterator().next().getIndexName(), fenced.iterator().next().id());
-            }
-            return published;
+            do {
+                publishes.incrementAndGet();
+                final var published = loop.publishDirty();
+                loop.noteForSweep(published);
+                all.addAll(published);
+                final var fenced = loop.drainFenced();
+                if (fenced.isEmpty() == false) {
+                    ownershipDoubted(fenced.iterator().next().getIndexName(), fenced.iterator().next().id());
+                }
+                // Bounded, so a shard whose publish keeps failing -- re-marked each time -- cannot spin a pass while the
+                // store is down; the rest wait one debounce.
+            } while (closed == false && loop.hasDirty() && ++rounds < 10);
+            return all;
         } catch (Exception e) {
             logger.warn("edge-triggered publish failed; the backstop will retry", e);
-            return java.util.Set.of();
+            return all;
+        } finally {
+            publishRunning.set(false);
+            // A mark made between the last look and here would wait for the next write or the backstop.
+            if (closed == false && loop.hasDirty() && publishPending.compareAndSet(false, true)) {
+                threadPool.schedule(this::publishNow, publishDebounce, ThreadPool.Names.GENERIC);
+            }
         }
     }
 
