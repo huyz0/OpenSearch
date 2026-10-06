@@ -358,6 +358,14 @@ public final class StatsHandler extends BaseRestHandler {
             // full has cost -- a node can sit at its cap harmlessly, and these move only when it has turned work away
             // or given up shards to make room.
             final ServerlessNode.Capacity capacity = serving.capacity();
+            // The heap, for setting the cap from memory: a held shard measured at 110-190 KB, so heap is rarely what bounds
+            // how many a node can hold -- this is where to see whether it is.
+            final java.lang.management.MemoryUsage heap = java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+            builder.startObject("jvm");
+            builder.field("heap_used_bytes", heap.getUsed());
+            builder.field("heap_max_bytes", heap.getMax());
+            builder.endObject();
+
             builder.startObject("capacity");
             builder.field("max_shards_held", capacity.maxShardsHeld());
             builder.field("held", capacity.held());
