@@ -312,6 +312,103 @@ public final class ServerlessNode implements Closeable {
     /** Counts a writer activation refused at the cap. */
     public void noteActivationRefusedAtCap() {
         activationsRefusedAtCap.incrementAndGet();
+        noteRefusedRecently();
+    }
+
+    /** Refusals at the cap per second, over the last minute: a ring of sixty one-second buckets. */
+    private final java.util.concurrent.atomic.AtomicLongArray refusedBySecond = new java.util.concurrent.atomic.AtomicLongArray(60);
+    private final java.util.concurrent.atomic.AtomicLongArray refusedSecondOf = new java.util.concurrent.atomic.AtomicLongArray(60);
+
+    private void noteRefusedRecently() {
+        final long second = java.util.concurrent.TimeUnit.NANOSECONDS.toSeconds(System.nanoTime());
+        final int slot = (int) Math.floorMod(second, 60L);
+        if (refusedSecondOf.getAndSet(slot, second) != second) {
+            refusedBySecond.set(slot, 0L);
+        }
+        refusedBySecond.incrementAndGet(slot);
+    }
+
+    /**
+     * How many shards this node turned away at its cap in the last minute: writer activations and reader opens.
+     *
+     * @return the count
+     */
+    public int refusedLastMinute() {
+        final long now = java.util.concurrent.TimeUnit.NANOSECONDS.toSeconds(System.nanoTime());
+        long sum = 0;
+        for (int slot = 0; slot < 60; slot++) {
+            if (now - refusedSecondOf.get(slot) < 60L) {
+                sum += refusedBySecond.get(slot);
+            }
+        }
+        return (int) Math.min(Integer.MAX_VALUE, sum);
+    }
+
+    /** How long a shard counts as in use after it was last used. */
+    public static final long IN_USE_WINDOW_MILLIS = 60_000L;
+
+    /**
+     * How many shards this node used in the last minute: what it holds for demand, rather than as a cache that fills
+     * whatever the load.
+     *
+     * @return the count
+     */
+    public int inUseLastMinute() {
+        if (reconciler == null) {
+            return 0;
+        }
+        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
+        final long now = plane == null ? System.currentTimeMillis() : plane.clock().getAsLong();
+        int used = 0;
+        for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
+            final java.util.OptionalLong last = reconciler.lastUsed(shardId);
+            if (last.isPresent() && now - last.getAsLong() < IN_USE_WINDOW_MILLIS) {
+                used++;
+            }
+        }
+        return used;
+    }
+
+    /** The share of a node's cap a fleet sized by {@link #fleetSize} aims to use. */
+    public static final double TARGET_UTILISATION = 0.8;
+
+    /**
+     * How many writer nodes the fleet has and how many its demand wants: the number to scale on.
+     *
+     * @param members live writer nodes that report their load
+     * @param wanted the nodes the demand of the last minute needs at {@link #TARGET_UTILISATION}
+     * @param demand shards used or turned away across those nodes in the last minute
+     */
+    public record FleetSize(int members, int wanted, long demand) {
+    }
+
+    /**
+     * Sizes the writer fleet from the load every member renews into its lease: shards used in the last minute, and shards
+     * turned away at a cap, over the average cap at {@link #TARGET_UTILISATION}. Shards merely held do not count -- a
+     * node's cap is a cache that fills whatever the load -- so a fleet full but turning nothing away does not ask for more,
+     * and one turning shards away asks for as many more nodes as would have taken them.
+     *
+     * @param plane the metadata plane
+     * @return the members counted and the nodes wanted
+     */
+    public FleetSize fleetSize(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        final long now = plane.clock().getAsLong();
+        int members = 0;
+        long demand = 0;
+        long caps = 0;
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+            if (lease.isExpiredAt(now) || lease.roles().contains(ROLE_INGEST) == false || lease.inUse() < 0 || lease.cap() <= 0) {
+                continue;
+            }
+            members++;
+            demand += lease.inUse() + Math.max(0, lease.refused());
+            caps += lease.cap();
+        }
+        if (members == 0) {
+            return new FleetSize(0, 0, 0);
+        }
+        final double perNode = (double) caps / members * TARGET_UTILISATION;
+        return new FleetSize(members, (int) Math.max(1, Math.ceil(demand / perNode)), demand);
     }
 
     /**
@@ -1935,7 +2032,12 @@ public final class ServerlessNode implements Closeable {
                     0L,
                     localNode.getName(),
                     org.opensearch.Version.CURRENT.toString()
-                ).withLoad(reconciler == null ? 0 : reconciler.heldShards().size(), admission.maxShardsHeld())
+                ).withLoad(
+                    reconciler == null ? 0 : reconciler.heldShards().size(),
+                    admission.maxShardsHeld(),
+                    inUseLastMinute(),
+                    refusedLastMinute()
+                )
             );
         ownLeaseValidUntilMillis = startedAt + plane.leaseTtlMillis();
     }
@@ -3378,6 +3480,7 @@ public final class ServerlessNode implements Closeable {
             // node. The same ceiling demand-driven writers have applies -- the configured one, counting
             // views -- and the same eviction makes room before this refuses.
             readerOpensRefusedAtCap.incrementAndGet();
+            noteRefusedRecently();
             throw new IllegalStateException(
                 "this node holds " + reconciler.openShards().size() + AT_THE_CAP + indexName + "[" + shardNumber + "] was not opened"
             );

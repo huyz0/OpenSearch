@@ -80,6 +80,12 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static final String ACTIVATION_CONCURRENCY = ServerlessNode.ACTIVATION_CONCURRENCY_SETTING;
 
+    /** Whether the activations at once follow the store, up to {@link #ACTIVATION_CONCURRENCY}; off by default. */
+    public static final String ACTIVATION_ADAPTIVE = "serverless.activation.adaptive";
+
+    /** How long an activation should take before the adaptive limit falls. */
+    public static final String ACTIVATION_TARGET = "serverless.activation.target_millis";
+
     /**
      * How long a node goes between re-reading the head of every writer shard it holds. Zero reads them on
      * every pass, which is the library default.
@@ -268,7 +274,9 @@ public final class ServerlessBootstrap implements Closeable {
             .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
             .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))
             .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS))
-            .setActivationConcurrency(complete.getAsInt(ACTIVATION_CONCURRENCY, BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY));
+            .setActivationConcurrency(complete.getAsInt(ACTIVATION_CONCURRENCY, BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY))
+            .setActivationTargetMillis(complete.getAsLong(ACTIVATION_TARGET, BackgroundReconciler.DEFAULT_ACTIVATION_TARGET_MILLIS))
+            .setAdaptiveActivation(complete.getAsBoolean(ACTIVATION_ADAPTIVE, false));
 
         final ReconcileScheduler scheduler = new ReconcileScheduler(
             loop,
