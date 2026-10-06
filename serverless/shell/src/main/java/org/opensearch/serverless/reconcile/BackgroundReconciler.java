@@ -1427,11 +1427,15 @@ public final class BackgroundReconciler implements Closeable {
             final long startedAt = System.nanoTime();
             activationWaitMax.accumulateAndGet(startedAt - queuedAt, Math::max);
             try {
-                mine.complete(
-                    sink == null
-                        ? activateNow(indexName, shard, onDemand)
-                        : org.opensearch.serverless.store.ObjectStores.attributedTo(sink, () -> activateNow(indexName, shard, onDemand))
-                );
+                final Optional<ShardId> taken = sink == null
+                    ? activateNow(indexName, shard, onDemand)
+                    : org.opensearch.serverless.store.ObjectStores.attributedTo(sink, () -> activateNow(indexName, shard, onDemand));
+                if (taken.isPresent()) {
+                    // Only an activation that opened a shard says how fast the store is taking them: a refusal or a
+                    // shard already held elsewhere returns in a read and would make it look faster than it is.
+                    adaptActivationLimit(System.nanoTime() - startedAt);
+                }
+                mine.complete(taken);
             } catch (Throwable t) {
                 mine.completeExceptionally(t);
             } finally {
@@ -1463,9 +1467,10 @@ public final class BackgroundReconciler implements Closeable {
      * @param runMillis their total time running
      * @param maxWaitMillis the longest wait since the last time these were read
      * @param maxRunMillis the longest run since the last time these were read
+     * @param limit how many may run at once now
      */
     public record ActivationStats(int queued, int running, long done, long waitMillis, long runMillis, long maxWaitMillis,
-        long maxRunMillis) {
+        long maxRunMillis, int limit) {
     }
 
     /**
@@ -1481,7 +1486,8 @@ public final class BackgroundReconciler implements Closeable {
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationWaitNanos.get()),
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationRunNanos.get()),
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationWaitMax.getAndSet(0L)),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationRunMax.getAndSet(0L))
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationRunMax.getAndSet(0L)),
+            currentActivationLimit()
         );
     }
 
@@ -1489,7 +1495,7 @@ public final class BackgroundReconciler implements Closeable {
     private void drainActivations() {
         while (true) {
             final int running = activationsRunning.get();
-            if (running >= activationConcurrency || activationQueue.isEmpty()) {
+            if (running >= currentActivationLimit() || activationQueue.isEmpty()) {
                 return;
             }
             if (activationsRunning.compareAndSet(running, running + 1) == false) {
@@ -1956,8 +1962,97 @@ public final class BackgroundReconciler implements Closeable {
         plane.membership().refreshIfOlderThan(maxAgeMillis);
     }
 
-    /** How many shards a node activates at once by default. */
+    /** How many shards a node activates at once by default, or the most when the limit adapts. */
     public static final int DEFAULT_ACTIVATION_CONCURRENCY = 8;
+
+    /** Where the adaptive activation limit starts, and the fewest it falls to. */
+    static final int ACTIVATION_LIMIT_START = 8;
+    static final int ACTIVATION_LIMIT_FLOOR = 4;
+
+    /** How long an activation that opened a shard should take, by default; longer means the store is the limit. */
+    public static final long DEFAULT_ACTIVATION_TARGET_MILLIS = 2_000L;
+
+    private volatile boolean adaptiveActivation;
+    private volatile long activationTargetMillis = DEFAULT_ACTIVATION_TARGET_MILLIS;
+
+    /**
+     * Lets the number of shards activated at once follow the store, up to the activation concurrency; off, it is that number.
+     *
+     * <p>Off by default. On a single-drive store it sat at its floor and gained nothing over a fixed eight; it is for a store
+     * that takes many requests at once -- S3 -- where an activation is a few dozen fast requests and eight at a time leaves
+     * most of the store's throughput unused.
+     *
+     * @param adaptive whether the limit adapts
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setAdaptiveActivation(boolean adaptive) {
+        this.adaptiveActivation = adaptive;
+        drainActivations();
+        return this;
+    }
+
+    /**
+     * Sets how long an activation that opened a shard should take before the adaptive limit falls.
+     *
+     * @param millis the target
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setActivationTargetMillis(long millis) {
+        this.activationTargetMillis = Math.max(1L, millis);
+        return this;
+    }
+
+    private final Object activationLimitLock = new Object();
+    private double activationLimit = ACTIVATION_LIMIT_START;
+    private double activationRunEwmaMillis = -1;
+    private long activationLimitCutAtNanos = Long.MIN_VALUE;
+
+    /**
+     * The activations allowed at once now: the adaptive limit, under the configured most.
+     *
+     * @return the limit
+     */
+    public int currentActivationLimit() {
+        if (adaptiveActivation == false) {
+            return activationConcurrency;
+        }
+        synchronized (activationLimitLock) {
+            return Math.max(1, Math.min(activationConcurrency, (int) Math.floor(activationLimit)));
+        }
+    }
+
+    /**
+     * Moves the number of shards activated at once with how fast the store takes them, as the write path's limiter does
+     * for appends: down by a quarter when activations run long, at most once a second; up by one a window while they run
+     * well inside the target.
+     *
+     * <p>An activation spends nearly all of its time waiting on the object store. Eight at a time left a fast store idle
+     * while a dead node's shards queued; thirty-two at a time on a single-drive store made each one slower -- from 1.4 s
+     * to 2.3 s, and to nearly 10 s under a takeover -- and steady writes paid for it. The right number is the store's,
+     * not a constant.
+     *
+     * @param runNanos how long an activation that opened a shard took
+     */
+    public void adaptActivationLimit(long runNanos) {
+        if (adaptiveActivation == false) {
+            return;
+        }
+        final long target = activationTargetMillis;
+        final double runMillis = runNanos / 1_000_000.0;
+        synchronized (activationLimitLock) {
+            activationRunEwmaMillis = activationRunEwmaMillis < 0 ? runMillis : 0.8 * activationRunEwmaMillis + 0.2 * runMillis;
+            final long now = System.nanoTime();
+            if (activationRunEwmaMillis > target) {
+                if (activationLimitCutAtNanos == Long.MIN_VALUE || now - activationLimitCutAtNanos >= 1_000_000_000L) {
+                    activationLimit = Math.max(ACTIVATION_LIMIT_FLOOR, activationLimit * 0.75);
+                    activationLimitCutAtNanos = now;
+                }
+            } else if (activationRunEwmaMillis < target / 2.0) {
+                activationLimit = Math.min(activationConcurrency, activationLimit + 1.0 / activationLimit);
+            }
+        }
+        drainActivations();
+    }
 
     /**
      * Sets how many shards this node activates at once.

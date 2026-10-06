@@ -234,6 +234,59 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * The fleet's size, from its members' leases: demand -- shards used in the last minute, and turned away at a cap -- over
+     * the average cap at the target utilisation. A fleet turning shards away asks for more nodes; one full only of idle
+     * shards asks for fewer.
+     */
+    public void testTheFleetSaysHowManyNodesItWants() throws Exception {
+        assertEquals("busy and turning work away: more than the two it has", 4, wanted(true));
+        assertEquals("full of idle shards and turning nothing away: fewer", 1, wanted(false));
+    }
+
+    private int wanted(boolean busy) throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        for (String index : List.of("a0", "a1", "a2", "b0", "b1", "b2")) {
+            plane.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, MAPPING, null));
+        }
+        try (ServerlessNode a = new ServerlessNode(settings("a")); ServerlessNode b = new ServerlessNode(settings("b"))) {
+            final List<ServerlessNode> nodes = List.of(a, b);
+            final List<String> prefixes = List.of("a", "b");
+            for (int n = 0; n < 2; n++) {
+                final ServerlessNode node = nodes.get(n);
+                node.start();
+                node.setMetadataPlane(plane);
+                node.renewLease(plane);
+                final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
+                    .setMaxShardsHeld(2)
+                    .setEvictAfterMillis(0L);   // refuse rather than evict
+                for (int i = 0; i < 2; i++) {
+                    final String index = prefixes.get(n) + i;
+                    loop.activateOnDemand(List.of(Map.entry(index, 0)));
+                    node.index(
+                        node.reconciler().openShards().stream().filter(s -> s.getIndexName().equals(index)).findFirst().orElseThrow(),
+                        "doc",
+                        "{\"msg\":\"x\"}"
+                    );
+                }
+                if (busy) {
+                    assertTrue("full: refused", loop.activateOnDemand(List.of(Map.entry(prefixes.get(n) + "2", 0))).isEmpty());
+                }
+            }
+            if (busy == false) {
+                clock.addAndGet(120_000L);   // nothing used for two minutes
+            }
+            for (ServerlessNode node : nodes) {
+                node.renewLease(plane);
+            }
+            plane.membership().refresh();
+            final ServerlessNode.FleetSize size = a.fleetSize(plane);
+            assertEquals(2, size.members());
+            return size.wanted();
+        }
+    }
+
     /** With every member as full as this one, nothing is handed off and nothing steered. */
     public void testNothingMovesWhenNobodyHasRoom() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000_000L);

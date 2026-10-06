@@ -366,7 +366,20 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("evicted", capacity.evicted());
             builder.field("handed_off", capacity.handedOff());
             builder.field("writes_steered", capacity.writesSteered());
+            builder.field("in_use", serving.inUseLastMinute());
+            builder.field("refused_last_minute", serving.refusedLastMinute());
             builder.endObject();
+
+            // The fleet as this node sees it from the members' leases: how many writer nodes report their load, and how many
+            // the last minute's demand wants. One number for an autoscaler, the same from whichever node it asks.
+            if (metadata != null) {
+                final ServerlessNode.FleetSize fleet = serving.fleetSize(metadata);
+                builder.startObject("fleet");
+                builder.field("members", fleet.members());
+                builder.field("wanted_nodes", fleet.wanted());
+                builder.field("demand", fleet.demand());
+                builder.endObject();
+            }
 
             // Where a writer activation's time goes, summed: divide by opened for the average of each.
             final long[] phases = serving.activationPhaseMillis();
@@ -488,6 +501,7 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("run_millis", queue.runMillis());
             builder.field("max_wait_millis", queue.maxWaitMillis());
             builder.field("max_run_millis", queue.maxRunMillis());
+            builder.field("limit", queue.limit());
             builder.endObject();
             builder.endObject();
         }
