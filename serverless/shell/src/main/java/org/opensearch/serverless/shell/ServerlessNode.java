@@ -309,39 +309,36 @@ public final class ServerlessNode implements Closeable {
         );
     }
 
-    /** Counts a writer activation refused at the cap. */
-    public void noteActivationRefusedAtCap() {
+    /**
+     * Counts a writer activation refused at the cap.
+     *
+     * @param indexName the index
+     * @param shard the shard
+     */
+    public void noteActivationRefusedAtCap(String indexName, int shard) {
         activationsRefusedAtCap.incrementAndGet();
-        noteRefusedRecently();
-    }
-
-    /** Refusals at the cap per second, over the last minute: a ring of sixty one-second buckets. */
-    private final java.util.concurrent.atomic.AtomicLongArray refusedBySecond = new java.util.concurrent.atomic.AtomicLongArray(60);
-    private final java.util.concurrent.atomic.AtomicLongArray refusedSecondOf = new java.util.concurrent.atomic.AtomicLongArray(60);
-
-    private void noteRefusedRecently() {
-        final long second = java.util.concurrent.TimeUnit.NANOSECONDS.toSeconds(System.nanoTime());
-        final int slot = (int) Math.floorMod(second, 60L);
-        if (refusedSecondOf.getAndSet(slot, second) != second) {
-            refusedBySecond.set(slot, 0L);
-        }
-        refusedBySecond.incrementAndGet(slot);
+        noteRefusedRecently(indexName, shard);
     }
 
     /**
-     * How many shards this node turned away at its cap in the last minute: writer activations and reader opens.
+     * When each shard turned away at the cap was last turned away: distinct shards, not refusals. A burst of searches asked
+     * for the same shards over and over, and counted as events one minute's refusals said the fleet wanted forty-three nodes.
+     */
+    private final Map<String, Long> refusedShards = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private void noteRefusedRecently(String indexName, int shard) {
+        refusedShards.put(shardKey(indexName, shard), System.nanoTime());
+    }
+
+    /**
+     * How many distinct shards this node turned away at its cap in the last minute: writer activations and reader opens.
      *
      * @return the count
      */
     public int refusedLastMinute() {
-        final long now = java.util.concurrent.TimeUnit.NANOSECONDS.toSeconds(System.nanoTime());
-        long sum = 0;
-        for (int slot = 0; slot < 60; slot++) {
-            if (now - refusedSecondOf.get(slot) < 60L) {
-                sum += refusedBySecond.get(slot);
-            }
-        }
-        return (int) Math.min(Integer.MAX_VALUE, sum);
+        final long cutoff = System.nanoTime() - java.util.concurrent.TimeUnit.MINUTES.toNanos(1);
+        refusedShards.values().removeIf(at -> at < cutoff);
+        return refusedShards.size();
     }
 
     /** How long a shard counts as in use after it was last used. */
@@ -376,7 +373,8 @@ public final class ServerlessNode implements Closeable {
      * How many writer nodes the fleet has and how many its demand wants: the number to scale on.
      *
      * @param members live writer nodes that report their load
-     * @param wanted the nodes the demand of the last minute needs at {@link #TARGET_UTILISATION}
+     * @param wanted the nodes the demand of the last minute needs at {@link #TARGET_UTILISATION}, or -1 if no member
+     *     reports a load
      * @param demand shards used or turned away across those nodes in the last minute
      */
     public record FleetSize(int members, int wanted, long demand) {
@@ -405,7 +403,8 @@ public final class ServerlessNode implements Closeable {
             caps += lease.cap();
         }
         if (members == 0) {
-            return new FleetSize(0, 0, 0);
+            // Nobody reports a load yet -- a fleet starting, or a view from before leases carried it. Not "none wanted".
+            return new FleetSize(0, -1, 0);
         }
         final double perNode = (double) caps / members * TARGET_UTILISATION;
         return new FleetSize(members, (int) Math.max(1, Math.ceil(demand / perNode)), demand);
@@ -3480,7 +3479,7 @@ public final class ServerlessNode implements Closeable {
             // node. The same ceiling demand-driven writers have applies -- the configured one, counting
             // views -- and the same eviction makes room before this refuses.
             readerOpensRefusedAtCap.incrementAndGet();
-            noteRefusedRecently();
+            noteRefusedRecently(indexName, shardNumber);
             throw new IllegalStateException(
                 "this node holds " + reconciler.openShards().size() + AT_THE_CAP + indexName + "[" + shardNumber + "] was not opened"
             );
