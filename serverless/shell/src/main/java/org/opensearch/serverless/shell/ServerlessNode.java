@@ -477,10 +477,12 @@ public final class ServerlessNode implements Closeable {
 
     /**
      * Where writer activations spend their time, summed: reading the descriptor, acquiring the head, marking the rollup
-     * entry owned, and opening the shard -- restoring its commit and replaying its log. With {@link #activationsOpened}
+     * entry owned, and opening the shard -- restoring its commit and replaying its log -- of which projecting and applying
+     * the local view that names it is a part of its own. With {@link #activationsOpened}
      * an operator reads the average of each, and which one a burst of cold shards is waiting on.
      */
     private final java.util.concurrent.atomic.AtomicLong[] activationPhases = {
+        new java.util.concurrent.atomic.AtomicLong(),
         new java.util.concurrent.atomic.AtomicLong(),
         new java.util.concurrent.atomic.AtomicLong(),
         new java.util.concurrent.atomic.AtomicLong(),
@@ -490,7 +492,8 @@ public final class ServerlessNode implements Closeable {
     /**
      * Writer activations' time by phase, in milliseconds summed since the node started, and how many opened.
      *
-     * @return describe, acquire, mark owned and open, then the count of activations that opened
+     * @return describe, acquire, mark owned and open, the count of activations that opened, then the part of open spent on
+     *         the local view
      */
     public long[] activationPhaseMillis() {
         return new long[] {
@@ -498,7 +501,8 @@ public final class ServerlessNode implements Closeable {
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[1].get()),
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[2].get()),
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[3].get()),
-            activationsOpened.get() };
+            activationsOpened.get(),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[4].get()) };
     }
 
     /** Counts a write for an unheld shard sent to a member with room. */
@@ -2676,11 +2680,16 @@ public final class ServerlessNode implements Closeable {
         try {
             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
             // documents its published digest does not describe.
+            //
+            // In turn, not alongside the view. Run on GENERIC beside it, the mark can wait behind the writes that are
+            // themselves waiting on activations: in a fleet test a dead node's shards stopped being taken at all. And the view it
+            // would have overlapped averages 14 ms of a 460 ms open.
             final long markingAt = System.nanoTime();
             plane.rollups().markOwned(indexName, described.get().uuid(), described.get().numberOfShards(), shardNumber, assignment.term());
             final long openingAt = System.nanoTime();
             activationPhases[2].addAndGet(openingAt - markingAt);
             final ClusterState view = projectAndApply(java.util.List.of(described.get()), java.util.List.of(assignment));
+            activationPhases[4].addAndGet(System.nanoTime() - openingAt);
             reconciler.ensureOpen(view, java.util.List.of(assignment));
             activationPhases[3].addAndGet(System.nanoTime() - openingAt);
             activationsOpened.incrementAndGet();

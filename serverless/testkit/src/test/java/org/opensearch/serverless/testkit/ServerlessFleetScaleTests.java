@@ -843,7 +843,14 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         line("- capacity counters across the fleet during the scenario: " + moved);
     }
 
-    private static final List<String> PHASES = List.of("describe_millis", "acquire_millis", "mark_owned_millis", "open_millis", "opened");
+    private static final List<String> PHASES = List.of(
+        "describe_millis",
+        "acquire_millis",
+        "mark_owned_millis",
+        "open_millis",
+        "opened",
+        "view_millis"
+    );
 
     /** Writer activations' time by phase, summed over the live nodes. */
     private Map<String, Long> activationPhases() {
@@ -865,6 +872,8 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             final long spent = Math.max(0L, after.getOrDefault(field, 0L) - before.getOrDefault(field, 0L));
             out.append(' ').append(field.replace("_millis", "")).append('=').append(spent / opened);
         }
+        final long view = Math.max(0L, after.getOrDefault("view_millis", 0L) - before.getOrDefault("view_millis", 0L));
+        out.append(" (of open, the local view ").append(view / opened).append(')');
         return out.toString();
     }
 
