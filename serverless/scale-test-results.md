@@ -546,17 +546,49 @@ The single-drive store is the limit, not the node: more activations at once only
 kill gained, and steady writes paid for it. The default stays at eight; the setting is for a store that takes more
 concurrent requests. What remains of a takeover with room is mostly the 30 s lease.
 
+### What a store like S3 would need: adapting by itself, and a fleet size to scale on
+
+**Activation concurrency that follows the store: opt-in.** An AIMD limit over activations
+(`serverless.activation.adaptive`, off by default):
+- It starts at eight.
+- It is cut by a quarter while activations that open a shard average over `serverless.activation.target_millis`
+  (2 s), and grows while they average under half of it.
+- It moves between four and `serverless.activation.concurrency`.
+
+On this store (`run1791197021281`) it spent most of the run at its floor of four, and was no faster than a fixed eight:
+- kills at p50 47 s / p99 62 s, and 66 s / 91 s onto full survivors;
+- steady write p99 no better.
+
+Concurrency is not this store's lever. It is there for a store that takes many requests at once, where a fixed eight
+leaves throughput unused. It has not been measured on one.
+
+**A fleet size to scale on.** Each node renews into its lease the shards it used in the last minute and the distinct
+shards it turned away at its cap. `GET /_serverless/stats` reports, under `fleet`, the writer members and the nodes
+that demand wants at 80% of the average cap. Shards merely held do not count, since a cap is a cache that fills
+whatever the load. Two things had to be fixed before the figure could be used:
+- **Refusals were counted as events.** A search burst asking for the same shards repeatedly read as 43 nodes wanted.
+  Demand now counts each refused shard once.
+- **Nodes left out members whose renewal they had not read yet.** Asked at the same moment, nodes answered 1 and 7. A
+  member now counts until a TTL past its lease's expiry.
+
+In `run1791257830497` every node then saw every member and agreed within one node:
+
+| Phase | Nodes present | Nodes wanted |
+| --- | --- | --- |
+| Steady load | 6-7 | 5-6 |
+| The harness's heavy measurement searches | 6 | 10-14 |
+| The stale check's burst of thousands of indices | 7 | up to 55, for one sample |
+| Load stopped for the read-back | 6-7 | 1-2 |
+
+That is the shape an autoscaler needs. It should smooth the figure itself: scale up on a short sustained window,
+scale in only after low demand has held. Nothing in the fleet starts or stops machines.
+
 ### Still open
 
 - **Capacity under this load:** the load's working set is close to the fleet's 2,400 slots, so nodes stay at the cap
   and refusals continue. Adding a node helps for minutes, then it fills as well.
-- **Activation concurrency that follows the store: tried, and dropped.** An AIMD limit over activations started at
-  eight, cut by a quarter when activations averaged over 2 s, and grew while they were under 1 s (`run1791197021281`).
-  - On this store it spent most of the run at its floor of four.
-  - Kills were no faster than at a fixed eight: p50 47 s / p99 62 s, and 66 s / 91 s onto full survivors.
-  - Steady write p99 was no better.
-
-  Concurrency is not this store's lever. A store that takes more concurrent requests is where the setting would pay.
+- **Not measured on S3:** the adaptive activation limit and the fleet size need a run against a store with real
+  concurrency, and S3's request cost has not been priced.
 - **The first minute after a pause:** every hot shard is re-taken at about 1.4 s each, eight at a time per node.
 - **A superseded reader in use:** one held by a running query refuses until the background pass lets go of it.
 
