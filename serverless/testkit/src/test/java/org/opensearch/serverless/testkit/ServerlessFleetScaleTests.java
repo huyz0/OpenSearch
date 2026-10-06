@@ -1485,6 +1485,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         { "capacity", "in_use" },
         { "capacity", "refused_last_minute" },
         { "fleet", "wanted_nodes" },
+        { "fleet", "members" },
         { "janitor", "passes" },
         { "janitor", "store_requests" },
         { "janitor", "examined" },

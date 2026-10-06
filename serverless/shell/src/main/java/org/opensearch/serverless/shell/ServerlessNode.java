@@ -395,7 +395,14 @@ public final class ServerlessNode implements Closeable {
         long demand = 0;
         long caps = 0;
         for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.isExpiredAt(now) || lease.roles().contains(ROLE_INGEST) == false || lease.inUse() < 0 || lease.cap() <= 0) {
+            // A member's lease as this node last read it, which is re-read only once it has run out: up to a TTL past its
+            // expiry it is a live member whose renewal this node has not fetched yet, not a departed one. Counting only
+            // unexpired copies dropped a varying share of the fleet, and nodes asked at the same moment answered 1 and 7.
+            if (lease.revoked()
+                || now >= lease.expiresAtMillis() + plane.leaseTtlMillis()
+                || lease.roles().contains(ROLE_INGEST) == false
+                || lease.inUse() < 0
+                || lease.cap() <= 0) {
                 continue;
             }
             members++;
