@@ -2075,12 +2075,75 @@ public final class ServerlessNode implements Closeable {
      */
     private final Object viewLock = new Object();
 
+    /** One caller's part of a batched view: what it adds, and the view that included it. */
+    private record PendingView(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening,
+        java.util.concurrent.CompletableFuture<ClusterState> applied) {
+    }
+
+    private final java.util.List<PendingView> pendingViews = new java.util.ArrayList<>();
+
+    /**
+     * Projects the local view with what a caller adds, and applies it -- for every caller waiting at once, in one projection.
+     *
+     * <p>A projection covers every index this node hosts or serves, and applying it is the same size again, so its cost
+     * grows with the shards held; and every activation made one, one at a time under this lock. At four hundred shards that
+     * was a fraction of a second; at twelve hundred an open averaged five seconds and a dead node's shards queued for
+     * minutes behind each other's projections. The callers waiting on the lock now hand in what they add, and whichever
+     * holds it projects and applies them all at once: a burst of N activations pays for a few projections, not N.
+     *
+     * <p>A projection that fails is retried for each caller alone, so one index whose view cannot be built fails only its
+     * own activation, as before.
+     */
     private ClusterState projectAndApply(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
         throws Exception {
+        final PendingView mine = new PendingView(extra, opening, new java.util.concurrent.CompletableFuture<>());
+        synchronized (pendingViews) {
+            pendingViews.add(mine);
+        }
         synchronized (viewLock) {
-            final ClusterState view = projectView(extra, opening);
-            applyLocalView(view, () -> 30_000L);
-            return view;
+            if (mine.applied().isDone() == false) {
+                final java.util.List<PendingView> batch;
+                synchronized (pendingViews) {
+                    batch = new java.util.ArrayList<>(pendingViews);
+                    pendingViews.clear();
+                }
+                applyBatch(batch);
+            }
+        }
+        try {
+            return mine.applied().get();
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw e.getCause() instanceof Exception cause ? cause : e;
+        }
+    }
+
+    private void applyBatch(java.util.List<PendingView> batch) {
+        if (batch.size() > 1) {
+            final java.util.List<IndexDescriptor> extra = new java.util.ArrayList<>();
+            final java.util.List<ShardAssignment> opening = new java.util.ArrayList<>();
+            for (PendingView each : batch) {
+                extra.addAll(each.extra());
+                opening.addAll(each.opening());
+            }
+            try {
+                final ClusterState view = projectView(extra, opening);
+                applyLocalView(view, () -> 30_000L);
+                for (PendingView each : batch) {
+                    each.applied().complete(view);
+                }
+                return;
+            } catch (Exception e) {
+                logger.debug("a batched view of " + batch.size() + " activations failed; projecting each alone", e);
+            }
+        }
+        for (PendingView each : batch) {
+            try {
+                final ClusterState view = projectView(each.extra(), each.opening());
+                applyLocalView(view, () -> 30_000L);
+                each.applied().complete(view);
+            } catch (Exception e) {
+                each.applied().completeExceptionally(e);
+            }
         }
     }
 
