@@ -374,11 +374,13 @@ public final class StatsHandler extends BaseRestHandler {
             // the last minute's demand wants. One number for an autoscaler, the same from whichever node it asks.
             if (metadata != null) {
                 final ServerlessNode.FleetSize fleet = serving.fleetSize(metadata);
-                builder.startObject("fleet");
-                builder.field("members", fleet.members());
-                builder.field("wanted_nodes", fleet.wanted());
-                builder.field("demand", fleet.demand());
-                builder.endObject();
+                if (fleet.wanted() >= 0) {
+                    builder.startObject("fleet");
+                    builder.field("members", fleet.members());
+                    builder.field("wanted_nodes", fleet.wanted());
+                    builder.field("demand", fleet.demand());
+                    builder.endObject();
+                }
             }
 
             // Where a writer activation's time goes, summed: divide by opened for the average of each.

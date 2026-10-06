@@ -2122,7 +2122,7 @@ public final class BackgroundReconciler implements Closeable {
                         shard,
                         maxShardsHeld
                     );
-                    node.noteActivationRefusedAtCap();
+                    node.noteActivationRefusedAtCap(indexName, shard);
                     return Optional.empty();
                 }
                 if (open == null && reserved == false) {
