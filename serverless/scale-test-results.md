@@ -730,6 +730,17 @@ seconds on, at which every survivor took whatever was not yet taken, and gets of
 shard wherever they arrived. Both now leave a shard to the survivor named for it; a last look a lease later takes
 whatever is still the dead node's, whoever was named, so a named survivor that cannot is not waited on for ever.
 
+With every path routed (`run1791409364997`, `run1791411834129`), both clean:
+
+| node killed held | deepest survivor queue | kill p50 / p99 | throughput to half / all | writes failing, kill until all back |
+| --- | --- | --- | --- | --- |
+| 304 | 206-332 | 51 / 69 s | 7.1 / 7.2 shards/s | 29% |
+| 246 | 50-217 | 48 / 58 s | 6.5 / 8.5 shards/s | 36% |
+
+Against the unrouted runs, p50 10-20 s and p99 20-30 s better, and throughput up. The queues are still deeper than a
+survivor's share (about a fifth of the dead node's shards): something else still queues a dead node's shards on
+survivors not named for them, not yet found.
+
 **Hand-off on deviation.** A node above 1.5x the fleet's mean of held shards, and above a quarter of its cap, hands
 idle shards off towards 1.25x the mean while a member is below the mean, and steers writes for unheld shards to it --
 however far it is from its cap. Near the cap only, load stayed uneven below it.
