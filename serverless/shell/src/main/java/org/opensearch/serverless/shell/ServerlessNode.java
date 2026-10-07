@@ -503,6 +503,145 @@ public final class ServerlessNode implements Closeable {
         return java.util.Optional.ofNullable(best);
     }
 
+    private volatile double takeoverOvercommit = 0.0;
+
+    private volatile boolean routeTakeovers = true;
+
+    /**
+     * Sets whether requests for a dead member's shard go to the one survivor named for it: on by default; off only to
+     * measure what it saves.
+     *
+     * @param route whether to
+     */
+    public void setRouteTakeovers(boolean route) {
+        this.routeTakeovers = route;
+    }
+
+    /**
+     * Whether requests for a dead member's shard go to the one survivor named for it.
+     *
+     * @return true if they do
+     */
+    public boolean routesTakeovers() {
+        return routeTakeovers;
+    }
+
+    /**
+     * Sets how far past its cap a member may take a dead member's shards, as BackgroundReconciler does: the ceiling a
+     * member's room is judged against when choosing who takes over a shard.
+     *
+     * @param fraction of the cap
+     */
+    public void setTakeoverOvercommit(double fraction) {
+        this.takeoverOvercommit = Math.max(0.0, fraction);
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong takeoverWritesRouted = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong takeoverDoubtsLeft = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Counts a write for a dead member's shard sent to the member that takes it over. */
+    public void noteTakeoverWriteRouted() {
+        takeoverWritesRouted.incrementAndGet();
+    }
+
+    /** Counts a doubt about a dead member's shard this node left to the member that takes it over. */
+    public void noteTakeoverDoubtLeft() {
+        takeoverDoubtsLeft.incrementAndGet();
+    }
+
+    /**
+     * Writes routed to, and doubts left to, the member that takes a dead member's shard over.
+     *
+     * @return routed, then left
+     */
+    public long[] takeoverRouting() {
+        return new long[] { takeoverWritesRouted.get(), takeoverDoubtsLeft.get() };
+    }
+
+    /**
+     * The member that takes over a shard whose owner's lease has run out: of the live writer members other than that
+     * owner, in name order, the first from the shard's hash with room under its overcommit ceiling -- or, if none has
+     * room, the one the hash names. Every member computes the same answer from the same leases, so a dead node's shards
+     * are each taken by one survivor rather than queued by every survivor a request for them happens to reach: a fleet
+     * run had every survivor queueing ~300 of a dead node's shards, and requests waited 30-60 s in those queues.
+     *
+     * <p>Routing only. The head's compare-and-swap still decides who owns the shard; two members with different views
+     * cost a wasted activation, never a second owner.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shard the shard
+     * @param deadOwner the owner whose lease ran out, left out of the choice
+     * @return the member's id, or empty if no live writer member is known
+     */
+    public java.util.Optional<String> takeoverWinner(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shard,
+        String deadOwner
+    ) {
+        final long now = plane.clock().getAsLong();
+        final java.util.TreeMap<String, org.opensearch.serverless.membership.NodeLease> live = new java.util.TreeMap<>();
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+            if (lease.nodeId().equals(deadOwner) == false && lease.isExpiredAt(now) == false && lease.roles().contains(ROLE_INGEST)) {
+                live.put(lease.nodeId(), lease);
+            }
+        }
+        if (live.isEmpty()) {
+            return java.util.Optional.empty();
+        }
+        final java.util.List<String> order = new java.util.ArrayList<>(live.keySet());
+        final int first = Math.floorMod((indexName + "#" + shard).hashCode(), order.size());
+        for (int i = 0; i < order.size(); i++) {
+            final String candidate = order.get((first + i) % order.size());
+            if (hasTakeoverRoom(candidate, live.get(candidate))) {
+                return java.util.Optional.of(candidate);
+            }
+        }
+        return java.util.Optional.of(order.get(first));
+    }
+
+    /**
+     * Whether a shard is a dead member's that another live member is to take over, so this node should leave it: the head
+     * names an owner with no live lease, and the member named for it is not this one. False when anything is unknown, and
+     * when routing is off: routing must never become nobody taking it.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shard the shard
+     * @return true to leave it to the member named
+     */
+    public boolean takeoverBelongsElsewhere(org.opensearch.serverless.metadata.MetadataPlane plane, String indexName, int shard) {
+        if (routeTakeovers == false) {
+            return false;
+        }
+        try {
+            final var head = plane.heads().read(indexName, shard);
+            if (head.isEmpty()
+                || head.get().ownerNodeId() == null
+                || head.get().ownerNodeId().equals(localNode.getId())
+                || plane.heads().isHeld(head.get(), plane.clock().getAsLong())) {
+                return false;
+            }
+            final java.util.Optional<String> winner = takeoverWinner(plane, indexName, shard, head.get().ownerNodeId());
+            return winner.isPresent() && winner.get().equals(localNode.getId()) == false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean hasTakeoverRoom(String nodeId, org.opensearch.serverless.membership.NodeLease lease) {
+        if (nodeId.equals(localNode.getId())) {
+            final int cap = admission.maxShardsHeld();
+            final int held = reconciler == null ? 0 : reconciler.heldShards().size();
+            return cap <= 0 || held < cap + Math.floor(cap * takeoverOvercommit);
+        }
+        if (lease.held() < 0 || lease.cap() <= 0) {
+            return true;
+        }
+        return lease.held() < lease.cap() + Math.floor(lease.cap() * takeoverOvercommit);
+    }
+
     /** Above this multiple of the fleet's mean held shards a node hands work off, however far it is from its cap. */
     public static final double HAND_OFF_ABOVE_MEAN = 1.5;
     /** A node handing off for being above the mean hands off down to this multiple of it. */

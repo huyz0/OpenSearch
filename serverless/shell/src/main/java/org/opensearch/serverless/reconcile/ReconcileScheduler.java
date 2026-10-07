@@ -440,7 +440,17 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         try {
             final java.util.List<Map.Entry<String, Integer>> later = loop.takeOverFrom(deadNodeId);
             if (later.isEmpty() == false && closed == false) {
-                threadPool.schedule(() -> loop.takeOverRemaining(deadNodeId, later), renewalInterval, ThreadPool.Names.GENERIC);
+                threadPool.schedule(() -> {
+                    final java.util.List<Map.Entry<String, Integer>> deferred = loop.takeOverRemaining(deadNodeId, later, false);
+                    if (deferred.isEmpty() == false && closed == false) {
+                        // The last look, a lease on: whatever the member named for it has still not taken.
+                        threadPool.schedule(
+                            () -> loop.takeOverRemaining(deadNodeId, deferred, true),
+                            TimeValue.timeValueMillis(renewalInterval.millis() * RENEWALS_PER_TTL),
+                            ThreadPool.Names.GENERIC
+                        );
+                    }
+                }, renewalInterval, ThreadPool.Names.GENERIC);
             }
         } catch (Exception e) {
             logger.warn("could not take over the shards of departed node " + deadNodeId, e);

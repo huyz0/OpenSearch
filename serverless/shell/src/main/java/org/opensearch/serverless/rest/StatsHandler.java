@@ -375,6 +375,9 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("handed_off", capacity.handedOff());
             builder.field("writes_steered", capacity.writesSteered());
             builder.field("takeovers_overcommitted", serving.takeoversOvercommitted());
+            final long[] routing = serving.takeoverRouting();
+            builder.field("takeover_writes_routed", routing[0]);
+            builder.field("takeover_doubts_left", routing[1]);
             builder.field("in_use", serving.inUseLastMinute());
             builder.field("refused_last_minute", serving.refusedLastMinute());
             builder.endObject();

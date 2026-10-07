@@ -698,6 +698,11 @@ public final class ShardOperations {
      */
     private Read readOnceTaken(String index, String id, int shard, org.opensearch.serverless.shell.ShardBehindLogException behind)
         throws IOException {
+        if (node.takeoverBelongsElsewhere(plane, index, shard)) {
+            // A dead member's shard another survivor is named to take: asking for it here queued it on every survivor
+            // a get reached. The caller retries, and finds it taken there.
+            throw NotHereException.behindLog(behind);
+        }
         java.util.Optional<org.opensearch.core.index.shard.ShardId> taken = java.util.Optional.empty();
         try {
             taken = node.signals().activate(index, shard).get(BEHIND_LOG_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
