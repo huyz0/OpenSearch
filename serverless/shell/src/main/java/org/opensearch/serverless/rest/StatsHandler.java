@@ -400,6 +400,22 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("open_millis", phases[3]);
             builder.field("opened", phases[4]);
             builder.field("view_millis", phases[5]);
+            final long[] views = serving.localViewMillis();
+            builder.field("view_project_millis", views[0]);
+            builder.field("view_apply_millis", views[1]);
+            builder.field("views_applied", views[2]);
+            final var reconciler = serving.reconciler();
+            if (reconciler != null) {
+                // The open, by step: what a takeover is mostly waiting on.
+                final long[] steps = reconciler.writerOpenPhaseMillis();
+                builder.startObject("writer_open");
+                for (int i = 0; i < org.opensearch.serverless.shard.ShardReconciler.WRITER_OPEN_PHASES.size(); i++) {
+                    builder.field(org.opensearch.serverless.shard.ShardReconciler.WRITER_OPEN_PHASES.get(i) + "_millis", steps[i]);
+                }
+                builder.field("opened", steps[steps.length - 1]);
+                builder.field("log_records", reconciler.logRecordsRead());
+                builder.endObject();
+            }
             builder.endObject();
 
             builder.startArray("roles");

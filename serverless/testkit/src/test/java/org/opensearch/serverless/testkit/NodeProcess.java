@@ -227,7 +227,21 @@ final class NodeProcess implements Closeable {
      */
     void killHard() throws InterruptedException {
         process.destroyForcibly();
-        assert process.waitFor(30, TimeUnit.SECONDS) : "node " + name + " would not die";
+        if (process.waitFor(30, TimeUnit.SECONDS)) {
+            return;
+        }
+        // A 3 GB node under load once outlived destroyForcibly by more than 30 s on Windows, and the run stopped there
+        // with nothing wrong in the fleet. taskkill /F is the same termination, asked again from outside.
+        if (System.getProperty("os.name", "").startsWith("Windows")) {
+            try {
+                new ProcessBuilder("taskkill", "/F", "/T", "/PID", String.valueOf(process.pid())).redirectErrorStream(true)
+                    .start()
+                    .waitFor(60, TimeUnit.SECONDS);
+            } catch (java.io.IOException e) {
+                throw new IllegalStateException("could not run taskkill for " + name, e);
+            }
+        }
+        assert process.waitFor(120, TimeUnit.SECONDS) : "node " + name + " would not die";
     }
 
     /**

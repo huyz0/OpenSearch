@@ -2128,6 +2128,33 @@ public final class ServerlessNode implements Closeable {
         }
     }
 
+    private final java.util.concurrent.atomic.AtomicLong viewProjectNanos = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong viewApplyNanos = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong viewsApplied = new java.util.concurrent.atomic.AtomicLong();
+
+    private ClusterState timedProjectAndApply(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
+        throws Exception {
+        final long projectingAt = System.nanoTime();
+        final ClusterState view = projectView(extra, opening);
+        final long applyingAt = System.nanoTime();
+        viewProjectNanos.addAndGet(applyingAt - projectingAt);
+        applyLocalView(view, () -> 30_000L);
+        viewApplyNanos.addAndGet(System.nanoTime() - applyingAt);
+        viewsApplied.incrementAndGet();
+        return view;
+    }
+
+    /**
+     * The local views activations have projected and applied: milliseconds projecting, milliseconds applying, and how many
+     * -- fewer than the activations when they were batched.
+     */
+    public long[] localViewMillis() {
+        return new long[] {
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(viewProjectNanos.get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(viewApplyNanos.get()),
+            viewsApplied.get() };
+    }
+
     private void applyBatch(java.util.List<PendingView> batch) {
         if (batch.size() > 1) {
             final java.util.List<IndexDescriptor> extra = new java.util.ArrayList<>();
@@ -2137,8 +2164,7 @@ public final class ServerlessNode implements Closeable {
                 opening.addAll(each.opening());
             }
             try {
-                final ClusterState view = projectView(extra, opening);
-                applyLocalView(view, () -> 30_000L);
+                final ClusterState view = timedProjectAndApply(extra, opening);
                 for (PendingView each : batch) {
                     each.applied().complete(view);
                 }
@@ -2149,8 +2175,7 @@ public final class ServerlessNode implements Closeable {
         }
         for (PendingView each : batch) {
             try {
-                final ClusterState view = projectView(each.extra(), each.opening());
-                applyLocalView(view, () -> 30_000L);
+                final ClusterState view = timedProjectAndApply(each.extra(), each.opening());
                 each.applied().complete(view);
             } catch (Exception e) {
                 each.applied().completeExceptionally(e);
