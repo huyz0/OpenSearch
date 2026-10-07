@@ -83,6 +83,17 @@ public final class ServerlessBootstrap implements Closeable {
     /** Whether the activations at once follow the store, up to {@link #ACTIVATION_CONCURRENCY}; off by default. */
     public static final String ACTIVATION_ADAPTIVE = "serverless.activation.adaptive";
 
+    /** Whether activations at once are cut while the write path's limiter is cutting writes; off until measured. */
+    public static final String ACTIVATION_PACED = "serverless.activation.paced_by_writes";
+
+    /** How far past its cap a node may take a dead member's shards, as a fraction of the cap; 0 turns it off. */
+    public static final String TAKEOVER_OVERCOMMIT = "serverless.takeover.overcommit";
+
+    /**
+     * Whether the local view reuses an unchanged index's last projection; on by default. Off only to measure what it saves.
+     */
+    public static final String VIEW_REUSE = "serverless.view.reuse_projections";
+
     /** How long an activation should take before the adaptive limit falls. */
     public static final String ACTIVATION_TARGET = "serverless.activation.target_millis";
 
@@ -253,8 +264,14 @@ public final class ServerlessBootstrap implements Closeable {
         // The node comes first, and it has to: an s3 store is built through the repository plugin, which
         // wants a ClusterService, and the node is what owns one. The plane is attached immediately
         // afterwards, so nothing observable happens in between.
+        // Each step of startup logged with its time: a restarted node once sat five minutes between the keystore and the
+        // scheduler with nothing in its log to say where.
+        final long bootAt = System.nanoTime();
         final ServerlessNode node = new ServerlessNode(complete);
+        logger.info("startup: node built in {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
         node.start();
+        node.projector().setReuseProjections(complete.getAsBoolean(VIEW_REUSE, true));
+        logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
 
         final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(
             complete,
@@ -262,7 +279,9 @@ public final class ServerlessBootstrap implements Closeable {
             configPath
         );
         final MetadataPlane plane = new MetadataPlane(store.blobStore(), BlobPath.cleanPath(), System::currentTimeMillis, ttl);
+        logger.info("startup: store open at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
         node.setMetadataPlane(plane);
+        logger.info("startup: lease published at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
         node.setHeadVerifyIntervalMillis(complete.getAsLong(HEAD_VERIFY_INTERVAL, DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS));
         node.setDescriptorRefreshIntervalMillis(
             complete.getAsLong(DESCRIPTOR_REFRESH_INTERVAL, DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS)
@@ -276,7 +295,9 @@ public final class ServerlessBootstrap implements Closeable {
             .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS))
             .setActivationConcurrency(complete.getAsInt(ACTIVATION_CONCURRENCY, BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY))
             .setActivationTargetMillis(complete.getAsLong(ACTIVATION_TARGET, BackgroundReconciler.DEFAULT_ACTIVATION_TARGET_MILLIS))
-            .setAdaptiveActivation(complete.getAsBoolean(ACTIVATION_ADAPTIVE, false));
+            .setAdaptiveActivation(complete.getAsBoolean(ACTIVATION_ADAPTIVE, false))
+            .setTakeoverOvercommit(complete.getAsDouble(TAKEOVER_OVERCOMMIT, BackgroundReconciler.DEFAULT_TAKEOVER_OVERCOMMIT))
+            .setActivationPacedByWrites(complete.getAsBoolean(ACTIVATION_PACED, false));
 
         final ReconcileScheduler scheduler = new ReconcileScheduler(
             loop,

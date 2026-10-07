@@ -70,6 +70,20 @@ public final class LocalViewProjector {
      */
     private volatile Map<String, Projected> lastProjected = Map.of();
 
+    private volatile boolean reuseProjections = true;
+
+    /**
+     * Whether unchanged indices reuse their last projection. Off only to measure what reusing saves.
+     *
+     * @param reuse whether to reuse
+     */
+    public void setReuseProjections(boolean reuse) {
+        this.reuseProjections = reuse;
+        if (reuse == false) {
+            lastProjected = Map.of();
+        }
+    }
+
     /**
      * Creates a projector for one node.
      *
@@ -103,7 +117,7 @@ public final class LocalViewProjector {
         for (IndexDescriptor descriptor : descriptors) {
             final Map<Integer, Long> terms = termsByIndex.getOrDefault(descriptor.name(), Map.of());
             Projected index = previous.get(descriptor.name());
-            if (index == null || index.descriptor() != descriptor || index.terms().equals(terms) == false) {
+            if (index == null || reuseProjections == false || index.descriptor() != descriptor || index.terms().equals(terms) == false) {
                 final IndexMetadata indexMetadata = descriptor.toIndexMetadata(terms);
                 index = new Projected(descriptor, terms, indexMetadata, routingFor(indexMetadata, terms));
             }

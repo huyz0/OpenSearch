@@ -180,6 +180,154 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
     }
 
     /**
+     * A node far above the fleet's mean hands idle shards off towards it, and steers writes for shards nobody holds to the
+     * member below it -- well short of its cap. Hand-off near the cap only left load uneven everywhere below it: the node a
+     * fleet run killed held anywhere from 103 to 847 shards, and recovery followed that.
+     */
+    public void testANodeFarAboveTheMeanHandsOffBelowItsCap() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final int cap = 20;
+        for (int i = 0; i < 10; i++) {
+            plane.createIndex(new IndexDescriptor("i" + i, "uuid-i" + i, 1, MAPPING, null));
+        }
+        plane.createIndex(new IndexDescriptor("fresh", "uuid-fresh", 1, MAPPING, null));
+        try (
+            ServerlessNode heavy = new ServerlessNode(settings("heavy"));
+            ServerlessNode light = new ServerlessNode(settings("light"));
+            ServerlessNode empty = new ServerlessNode(settings("empty"))
+        ) {
+            for (ServerlessNode node : List.of(heavy, light, empty)) {
+                node.start();
+                node.setMetadataPlane(plane);
+            }
+            final BackgroundReconciler heavyLoop = new BackgroundReconciler(heavy, plane).setDemandDrivenActivation(true)
+                .setMaxShardsHeld(cap)
+                .setEvictAfterMillis(30_000L);
+            final BackgroundReconciler lightLoop = new BackgroundReconciler(light, plane).setDemandDrivenActivation(true)
+                .setMaxShardsHeld(cap);
+            final org.opensearch.serverless.reconcile.ReconcileScheduler heavyScheduler = scheduler(heavyLoop, heavy, clock);
+            final org.opensearch.serverless.reconcile.ReconcileScheduler emptyScheduler = scheduler(
+                new BackgroundReconciler(empty, plane).setDemandDrivenActivation(true).setMaxShardsHeld(cap),
+                empty,
+                clock
+            );
+            heavy.setSignals(heavyScheduler);
+            empty.setSignals(emptyScheduler);
+            heavyScheduler.start();
+            emptyScheduler.start();
+            for (int i = 0; i < 8; i++) {
+                heavyLoop.activateOnDemand(List.of(Map.entry("i" + i, 0)));
+            }
+            lightLoop.activateOnDemand(List.of(Map.entry("i8", 0), Map.entry("i9", 0)));
+
+            clock.addAndGet(60_000L);   // every shard past its grace
+            for (ServerlessNode node : List.of(heavy, light, empty)) {
+                node.renewLease(plane);
+            }
+            plane.membership().refresh();
+            assertFalse("well short of its cap", heavy.nearlyFull());
+            assertTrue("8 against a mean of 10/3", heavy.aboveFleetShare(plane));
+            assertEquals(empty.localNode().getId(), heavy.memberBelowMean(plane).orElseThrow());
+
+            assertEquals("a tenth of the cap a pass", 2, heavyLoop.handOffToMemberWithRoom());
+            assertEquals(6, heavy.capacity().held());
+            assertEquals(2, heavy.capacity().handedOff());
+
+            final int status = send(heavy, "PUT", "/fresh/_doc/1", "{\"msg\":\"x\"}");
+            assertEquals(201, status);
+            assertEquals("the write went to the member below the mean", 1, heavy.capacity().writesSteered());
+            assertEquals(empty.localNode().getId(), plane.heads().read("fresh", 0).orElseThrow().ownerNodeId());
+
+            // Down to the mean's band, and no further: it stops handing off once it is within it.
+            heavy.renewLease(plane);
+            empty.renewLease(plane);
+            plane.membership().refresh();
+            int passes = 0;
+            while (heavyLoop.handOffToMemberWithRoom() > 0 && passes++ < 10) {
+                heavy.renewLease(plane);
+                plane.membership().refresh();
+            }
+            final double mean = heavy.fleetMeanHeld(plane);
+            assertTrue(
+                "within the band, or under the share of the cap the mean matters from: "
+                    + heavy.capacity().held()
+                    + " against a mean of "
+                    + mean,
+                heavy.capacity().held() <= Math.max(
+                    Math.ceil(mean * ServerlessNode.HAND_OFF_ABOVE_MEAN),
+                    cap * ServerlessNode.MEAN_MATTERS_FROM
+                )
+            );
+            assertFalse("and so no longer handing off", heavy.aboveFleetShare(plane));
+            heavyScheduler.close();
+            emptyScheduler.close();
+        }
+    }
+
+    /**
+     * A survivor at its cap takes a dead member's shards past the cap, evicting nothing to do it, and is trimmed back to
+     * the cap by the passes after. Evicting on the take path put a publish and a head release in front of every shard a
+     * full survivor took from a dead node, and was most of how long a kill took to recover from.
+     */
+    public void testAFullSurvivorTakesADeadMembersShardsWithoutEvicting() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final int cap = 10;
+        for (int i = 0; i < cap; i++) {
+            plane.createIndex(new IndexDescriptor("own" + i, "uuid-own" + i, 1, MAPPING, null));
+        }
+        for (String index : List.of("dead0", "dead1", "cold")) {
+            plane.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, MAPPING, null));
+        }
+        try (ServerlessNode survivor = new ServerlessNode(settings("survivor"))) {
+            survivor.start();
+            survivor.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(survivor, plane).setDemandDrivenActivation(true)
+                .setMaxShardsHeld(cap)
+                .setEvictAfterMillis(30_000L);
+            survivor.renewLease(plane);
+            try (ServerlessNode dead = new ServerlessNode(settings("dead"))) {
+                dead.start();
+                dead.setMetadataPlane(plane);
+                dead.renewLease(plane);
+                final BackgroundReconciler deadLoop = new BackgroundReconciler(dead, plane).setDemandDrivenActivation(true);
+                deadLoop.activateOnDemand(List.of(Map.entry("dead0", 0), Map.entry("dead1", 0)));
+            }
+            for (int i = 0; i < cap; i++) {
+                loop.activateOnDemand(List.of(Map.entry("own" + i, 0)));
+            }
+            assertEquals(cap, survivor.capacity().held());
+
+            // The dead member's lease runs out; the survivor's own shards are all past their grace.
+            clock.addAndGet(TTL + 1);
+            survivor.renewLease(plane);
+            plane.membership().refresh();
+            assertEquals(2, loop.activateOnDemand(List.of(Map.entry("dead0", 0), Map.entry("dead1", 0))).size());
+            assertEquals("past the cap, within the ceiling", cap + 2, survivor.capacity().held());
+            assertEquals("nothing evicted on the take path", 0, survivor.capacity().evicted());
+            assertEquals(2, survivor.takeoversOvercommitted());
+
+            // The passes after bring it back to the cap, a tenth of the cap a pass, and never the shards just taken.
+            int passes = 0;
+            while (survivor.capacity().held() > cap && passes < 5) {
+                loop.trimToCap();
+                passes++;
+            }
+            assertEquals("back to the cap within a few passes", cap, survivor.capacity().held());
+            for (String index : List.of("dead0", "dead1")) {
+                assertTrue(index + " kept", survivor.reconciler().openShards().stream().anyMatch(s -> s.getIndexName().equals(index)));
+            }
+
+            // Ordinary demand is not a takeover: at the cap it evicts first, as before.
+            final long evictedBefore = survivor.capacity().evicted();
+            assertEquals(1, loop.activateOnDemand(List.of(Map.entry("cold", 0))).size());
+            assertTrue("a shard nobody owned is taken by evicting", survivor.capacity().evicted() > evictedBefore);
+            assertTrue(survivor.capacity().held() <= cap);
+        }
+    }
+
+    /**
      * An activation on a node whose lease lapsed does not wait behind a re-read of its held heads that another thread is
      * already running: it declines, and is asked again once that re-read is done. Waiting put every activation thread
      * behind the lease thread's scan on one lock: with the store slowed to seconds a request, every activation on every

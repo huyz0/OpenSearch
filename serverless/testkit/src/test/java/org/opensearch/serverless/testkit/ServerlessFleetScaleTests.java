@@ -651,7 +651,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
     /** kill -9 of the node holding the most shards, writes continuing; how long until each of its shards takes writes again. */
     private void kill(int seconds) throws Exception {
-        final int victim = busiestNode();
+        final int victim = victimNode();
         final NodeProcess node = fleet.get(victim);
         final List<String> owned = shardsOwnedBy(node.nodeId());
         line("- killing " + node.name() + ", which owned " + owned.size() + " shards; lease TTL " + ttlMillis + " ms");
@@ -676,6 +676,25 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 + "; head to first acknowledged write: "
                 + summarise(gaps(acquiredAfter, takeover), owned.size())
         );
+        if (leaseExpiresAt >= 0 && takeover.isEmpty() == false) {
+            // The figure runs compare on: how fast the survivors made the dead node's shards writable once they could
+            // take them at all, which neither the lease nor how many shards it held decides.
+            final long expiredAfter = leaseExpiresAt - killedAtMillis;
+            final List<Long> sorted = new ArrayList<>(takeover.values());
+            java.util.Collections.sort(sorted);
+            final long half = sorted.get(sorted.size() / 2) - expiredAfter;
+            final long all = sorted.get(sorted.size() - 1) - expiredAfter;
+            line(
+                String.format(
+                    Locale.ROOT,
+                    "- takeover throughput after the lease ran out: %.1f shards/s to half writable (%d ms), %.1f shards/s to all (%d ms)",
+                    (sorted.size() / 2.0) / Math.max(1L, half) * 1000.0,
+                    half,
+                    sorted.size() / (double) Math.max(1L, all) * 1000.0,
+                    all
+                )
+            );
+        }
         line("- writes from the kill until every shard was back: " + load.window("write", killedAt, killedAt + maxOr(takeover, 0L)));
         sleepSeconds(Math.max(0, seconds - (int) TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - killedAt)));
         fleet.add(victim, startNode(victim));
@@ -686,7 +705,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
     /** A process frozen past its lease, then thawed: it must not acknowledge anything it no longer owns. */
     private void pause(int seconds) throws Exception {
-        final int victim = busiestNode();
+        final int victim = victimNode();
         final NodeProcess node = fleet.get(victim);
         final List<String> owned = shardsOwnedBy(node.nodeId());
         final long pauseMillis = 2 * ttlMillis;
@@ -710,7 +729,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
     /** One node cut off from the store, still reachable by clients and peers: its acks must stop, its lease lapse. */
     private void partition(int seconds) throws Exception {
-        final int victim = busiestNode();
+        final int victim = victimNode();
         final NodeProcess node = fleet.get(victim);
         final List<String> owned = shardsOwnedBy(node.nodeId());
         final long partitionMillis = 2 * ttlMillis;
@@ -898,7 +917,14 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
     /** The fleet's capacity counters, summed over the live nodes. */
     private Map<String, Long> capacityCounters() {
         final Map<String, Long> counters = new TreeMap<>();
-        for (String field : List.of("reader_opens_refused", "activations_refused", "evicted", "handed_off", "writes_steered")) {
+        for (String field : List.of(
+            "reader_opens_refused",
+            "activations_refused",
+            "evicted",
+            "handed_off",
+            "writes_steered",
+            "takeovers_overcommitted"
+        )) {
             counters.put(field, fleetSum("capacity", field));
         }
         return counters;
@@ -1712,6 +1738,28 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             readers.shutdown();
         }
         return owned;
+    }
+
+    /**
+     * The node a fault is aimed at: by default the one holding the median number of shards, so runs compare. Aimed at the
+     * busiest, a kill took 282 shards in one run and 847 in the next, and recovery scaled with that rather than with
+     * anything changed between them. {@code tests.fleet.victim=busiest} keeps the worst case available.
+     */
+    private int victimNode() throws Exception {
+        if ("busiest".equals(prop("victim", "median"))) {
+            return busiestNode();
+        }
+        final List<int[]> held = new ArrayList<>();
+        for (int i = 0; i < fleet.size(); i++) {
+            held.add(new int[] { i, shardsOwnedBy(fleet.get(i).nodeId()).size() });
+        }
+        held.sort(java.util.Comparator.comparingInt(h -> h[1]));
+        final StringBuilder spread = new StringBuilder("- shards owned by node:");
+        for (int[] h : held) {
+            spread.append(' ').append(fleet.get(h[0]).name()).append('=').append(h[1]);
+        }
+        line(spread.append(" (lowest to highest)").toString());
+        return held.get(held.size() / 2)[0];
     }
 
     private int busiestNode() throws Exception {

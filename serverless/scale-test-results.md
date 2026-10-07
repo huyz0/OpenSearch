@@ -647,9 +647,73 @@ the lease ran out. That is where to spend.
 run alongside projecting the local view, on GENERIC, the open waiting for both (`run1791301905865`). Steady was
 unchanged; the kill stalled -- no node opened a writer for the whole scenario, 80 of 337 shards writable after five
 minutes, 48% of writes failing, nothing lost. The likely cause: during a takeover burst GENERIC fills with writes waiting
-on activations, and the activations waited on a mark queued behind them. The split it measured says it was not worth
-having anyway: of a 461 ms open, the local view is 14 ms. What is left is the shard open itself, and the acquire
-(~220 ms: the head's swap, the seal, the claim).
+on activations, and the activations waited on a mark queued behind them. That run put the local view at 14 ms of a 461 ms open;
+the runs below found it at 650-1,350 ms under ordinary load, which is what made it worth fixing properly.
+
+### Where a takeover's time goes, and the local view
+
+**Measured by step.** Stats now break a writer's open into its steps, and the local view into projecting and applying.
+In the fleet, an open averaged 1-2.7 s, of which:
+- recover was 0.6-1.2 s, of which reading the log was only 30-90 ms; the rest is the engine;
+- create_shard was 0.2-0.4 s;
+- the local view was 0.65-1.35 s.
+
+Applying a view takes under a millisecond. Projecting it is what costs: every activation rebuilt the metadata of every
+index the node served or hosted, mapping parse included, one projection at a time under the view lock. A single-node
+test (`ServerlessActivationCostTests`, one-shard indices opened in batches of 100) put projection at 4.5 ms a shard
+taken at 100 held and 44 ms at 600, and growing. In the fleet, with activations queued on the lock, it was a second.
+
+**The fix:** an index whose descriptor (the same object) and shard terms are unchanged reuses its last projection. In
+the single-node test projection is now 1-2.5 ms at any size, and taking a shard a flat ~170 ms. The setting
+`serverless.view.reuse_projections=false` turns it off, for measuring.
+
+**The fleet, both ways, twice each** (cap 1,000, the kill aimed at the node holding the median of held shards; on:
+`run1791369896819`, `run1791375826545`; off: `run1791372730518`, `run1791378899406`). All four clean.
+
+| | node killed held | local view, steady / kill | open, kill | throughput to half / all writable | kill p50 / p99 |
+| --- | --- | --- | --- | --- | --- |
+| reuse on | 216 | 66 / 191 ms | 1,480 ms | 3.4 / 3.2 shards/s | 50 / 82 s |
+| reuse on | 448 | 53 / 114 ms | 1,429 ms | 6.4 / 6.6 shards/s | 64 / 96 s |
+| reuse off | 103 | 693 / 1,348 ms | 2,724 ms | 2.7 / 1.8 shards/s | 44 / 73 s |
+| reuse off | 396 | 664 / 1,302 ms | 2,280 ms | 5.2 / 4.3 shards/s | 61 / 95 s |
+
+The view is a tenth of what it was and the open during a kill 40% shorter, in every run. Recovery after a kill does not
+show it cleanly: the median node held 103-448 shards across runs, and throughput roughly doubles with that -- more
+shards spread over the same survivors' slots -- so the spread within one setting (3.4 against 6.4) is larger than any
+difference between the two. The closest pair, 448 and 396 shards, favours reuse by a quarter to a half. A change has to
+be about 2x to show in one pair of runs here.
+
+**Overcommitting on takeover.** A survivor at its cap evicted a shard for nearly every one it took from a dead node --
+a publish and a head release in front of each take. Now a shard whose head names a member with no live lease may be
+taken past the cap, up to `serverless.takeover.overcommit` of it (0.2 by default, about 40 MB of heap at a cap of a
+thousand), never past that; ordinary demand still evicts first, and each pass trims the node back to its cap, a tenth of
+the cap a pass, never touching shards inside their eviction grace. Both ways, twice each (on: `run1791382924093`,
+`run1791388393528`; off: `run1791385609045`, `run1791391145730`), all clean:
+
+| | node killed held | throughput to half / all writable | kill p50 / p99 | writes failing, kill until all back |
+| --- | --- | --- | --- | --- |
+| overcommit 0.2 | 313 | 4.8 / 4.7 shards/s | 55 / 78 s | 27% |
+| overcommit 0.2 | 360 | 6.3 / 5.0 shards/s | 51 / 87 s | 36% |
+| off | 310 | 4.7 / 5.8 shards/s | 61 / 78 s | 37% |
+| off | 338 | 4.9 / 4.3 shards/s | 58 / 99 s | 37% |
+
+About 6 s off the kill p50 in both pairs: the right direction, inside the noise. It was barely needed: held peaked at
+1,008-1,023. Survivors own 250-500 shards and hold about a thousand -- half their cap is readers, which cost nothing to
+evict -- so evicting on the take path was not the bottleneck it looked like. What is: during a kill each survivor's
+activation queue held ~300 of the dead node's shards, every survivor queueing every shard, because every write
+through any coordinator for an unheld shard asks for it.
+
+These four runs also ran two changes made while they were queued: hand-off on deviation (below) and write-paced
+activations, both in all four. Paced, a node whose write limiter fell to 4 ran one activation at a time with 300
+queued. Pacing is off by default until a run measures it.
+
+**Hand-off on deviation.** A node above 1.5x the fleet's mean of held shards, and above a quarter of its cap, hands
+idle shards off towards 1.25x the mean while a member is below the mean, and steers writes for unheld shards to it --
+however far it is from its cap. Near the cap only, load stayed uneven below it.
+
+**Load is uneven.** Even the median node held anywhere from 103 to 448 shards, and the busiest up to 847 against a cap
+of 1,000. Hand-off moves shards only above 90% of the cap, so below it nothing evens them out, and whichever node dies
+is the one whose share decides the recovery.
 
 ### Still open
 

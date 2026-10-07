@@ -199,6 +199,18 @@ public final class ServerlessNode implements Closeable {
 
     /** How many writes may wait on the object store at once; see WriteBackpressure. */
     private final org.opensearch.serverless.store.WriteBackpressure writeBackpressure;
+    private final int writeBackpressureMax;
+
+    /**
+     * How much of its room the write path's limiter is giving writes now: its limit over its most, in (0, 1]. Below 1 the
+     * store has been slow to take appends, and other work on the store should give way.
+     *
+     * @return the share
+     */
+    public double writeHeadroom() {
+        return Math.min(1.0, Math.max(0.0, writeBackpressure.stats().limit() / (double) Math.max(1, writeBackpressureMax)));
+    }
+
     /**
      * Writer shards whose log could not be appended to. Still open and still readable; refusing writes;
      * reopened from the log by the next heartbeat that reaches the store. See {@link #appendOrRelease}.
@@ -432,6 +444,22 @@ public final class ServerlessNode implements Closeable {
         (forHandOff ? handedOff : evictedForRoom).incrementAndGet();
     }
 
+    private final java.util.concurrent.atomic.AtomicLong takeoversOvercommitted = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Counts a dead member's shard taken past the cap, without evicting for it. */
+    public void noteTakeoverOvercommitted() {
+        takeoversOvercommitted.incrementAndGet();
+    }
+
+    /**
+     * Dead members' shards taken past the cap, since the node started.
+     *
+     * @return the count
+     */
+    public long takeoversOvercommitted() {
+        return takeoversOvercommitted.get();
+    }
+
     /** Above this share of its cap a node looks for a member to hand work to. */
     public static final double HAND_OFF_ABOVE = 0.9;
     /** At or below this share of its cap a member can take work handed to it. */
@@ -473,6 +501,99 @@ public final class ServerlessNode implements Closeable {
             }
         }
         return java.util.Optional.ofNullable(best);
+    }
+
+    /** Above this multiple of the fleet's mean held shards a node hands work off, however far it is from its cap. */
+    public static final double HAND_OFF_ABOVE_MEAN = 1.5;
+    /** A node handing off for being above the mean hands off down to this multiple of it. */
+    public static final double HAND_OFF_DOWN_TO_MEAN = 1.25;
+    /** Below this share of its cap a node is never too busy for the mean to matter: a small fleet's few shards stay. */
+    public static final double MEAN_MATTERS_FROM = 0.25;
+
+    /**
+     * The mean of held shards over the live writer members, this node counted from its own count rather than its lease.
+     *
+     * @param plane the metadata plane
+     * @return the mean, or -1 if no member says
+     */
+    public double fleetMeanHeld(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        final long now = plane.clock().getAsLong();
+        long sum = reconciler == null ? 0 : reconciler.heldShards().size();
+        int members = 1;
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+            if (lease.nodeId().equals(localNode.getId())
+                || lease.isExpiredAt(now)
+                || lease.roles().contains(ROLE_INGEST) == false
+                || lease.held() < 0) {
+                continue;
+            }
+            sum += lease.held();
+            members++;
+        }
+        return members < 2 ? -1 : (double) sum / members;
+    }
+
+    /**
+     * Whether this node holds far more than its share: more than {@link #HAND_OFF_ABOVE_MEAN} of the fleet's mean, and at
+     * least {@link #MEAN_MATTERS_FROM} of its cap. Hand-off near the cap left load uneven everywhere below it: the node a
+     * fleet run killed held anywhere from 103 to 847 shards, and how long recovery took followed that.
+     *
+     * @param plane the metadata plane
+     * @return true when above its share
+     */
+    public boolean aboveFleetShare(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        final int cap = admission.maxShardsHeld();
+        final int held = reconciler == null ? 0 : reconciler.heldShards().size();
+        final double mean = fleetMeanHeld(plane);
+        return cap > 0 && mean > 0 && held >= cap * MEAN_MATTERS_FROM && held > mean * HAND_OFF_ABOVE_MEAN;
+    }
+
+    /**
+     * The live writer member holding the fewest shards, if it holds fewer than the fleet's mean: where a node above its
+     * share sends work.
+     *
+     * @param plane the metadata plane
+     * @return the member's id
+     */
+    public java.util.Optional<String> memberBelowMean(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        final double mean = fleetMeanHeld(plane);
+        if (mean <= 0) {
+            return java.util.Optional.empty();
+        }
+        final long now = plane.clock().getAsLong();
+        String best = null;
+        long fewest = Long.MAX_VALUE;
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+            if (lease.nodeId().equals(localNode.getId())
+                || lease.isExpiredAt(now)
+                || lease.roles().contains(ROLE_INGEST) == false
+                || lease.held() < 0
+                || lease.held() >= mean) {
+                continue;
+            }
+            if (lease.held() < fewest) {
+                best = lease.nodeId();
+                fewest = lease.held();
+            }
+        }
+        return java.util.Optional.ofNullable(best);
+    }
+
+    /**
+     * Where this node should send work it would otherwise take, if anywhere: to a member with room when this one is nearly
+     * full, or to a member below the mean when this one holds far more than its share.
+     *
+     * @param plane the metadata plane
+     * @return the member's id
+     */
+    public java.util.Optional<String> handOffTarget(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        if (nearlyFull()) {
+            final java.util.Optional<String> roomy = memberWithRoom(plane);
+            if (roomy.isPresent()) {
+                return roomy;
+            }
+        }
+        return aboveFleetShare(plane) ? memberBelowMean(plane) : java.util.Optional.empty();
     }
 
     /**
@@ -584,11 +705,12 @@ public final class ServerlessNode implements Closeable {
         // Group commit for the log. Batching only ever happens while a PUT for the same shard is already
         // in flight, so these bound the size of a group rather than schedule one -- there is no window to
         // configure. Setting max_records to 1 restores one PUT per write, which is what this replaced.
+        this.writeBackpressureMax = settings.getAsInt("serverless.write.backpressure.max_in_flight", 1_024);
         this.writeBackpressure = new org.opensearch.serverless.store.WriteBackpressure(
             settings.getAsLong("serverless.write.backpressure.target_millis", 1_000L),
             settings.getAsLong("serverless.write.backpressure.budget_millis", 5_000L),
             settings.getAsInt("serverless.write.backpressure.min_in_flight", 4),
-            settings.getAsInt("serverless.write.backpressure.max_in_flight", 1_024)
+            writeBackpressureMax
         );
         this.walCommitter = new org.opensearch.serverless.store.WalGroupCommitter(
             settings.getAsInt(

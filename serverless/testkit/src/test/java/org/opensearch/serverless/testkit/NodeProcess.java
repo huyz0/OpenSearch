@@ -165,6 +165,17 @@ final class NodeProcess implements Closeable {
             Thread.sleep(100);
         }
         if (readyLine == null) {
+            // Where it is stuck, before it is killed: a start that never finishes says nothing in its own log.
+            try {
+                final Path jcmd = org.opensearch.common.io.PathUtils.get(System.getProperty("java.home"), "bin", "jcmd");
+                final Process dump = new ProcessBuilder(jcmd.toString(), String.valueOf(process.pid()), "Thread.print").redirectErrorStream(
+                    true
+                ).start();
+                output.add(new String(dump.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
+                dump.waitFor(60, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                output.add("could not take a thread dump: " + e);
+            }
             process.destroyForcibly();
             throw new IllegalStateException("node " + name + " did not start; output was:\n" + String.join("\n", output));
         }

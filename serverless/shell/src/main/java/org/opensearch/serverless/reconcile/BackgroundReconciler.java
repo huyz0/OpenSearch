@@ -280,6 +280,7 @@ public final class BackgroundReconciler implements Closeable {
         final Set<ShardId> published = publishAll();
         // After publishing, so a shard released for idleness has just had its chance to flush.
         released.addAll(releaseIdle(nowMillis));
+        trimToCap();
         handOffToMemberWithRoom();
         // And after that, so a reader this node has just let go of for idleness is not looked up again.
         released.addAll(refreshReaders());
@@ -954,11 +955,20 @@ public final class BackgroundReconciler implements Closeable {
      * @return how many shards were let go
      */
     public int handOffToMemberWithRoom() {
-        if (demandDriven == false || evictAfterMillis <= 0 || node.nearlyFull() == false || node.memberWithRoom(plane).isEmpty()) {
+        if (demandDriven == false || evictAfterMillis <= 0) {
             return 0;
         }
-        final int floor = (int) Math.floor(maxShardsHeld * HAND_OFF_DOWN_TO);
-        return evictDownTo(floor, Math.max(1, maxShardsHeld / 10), true);
+        if (node.nearlyFull() && node.memberWithRoom(plane).isPresent()) {
+            final int floor = (int) Math.floor(maxShardsHeld * HAND_OFF_DOWN_TO);
+            return evictDownTo(floor, Math.max(1, maxShardsHeld / 10), true);
+        }
+        // Far above its share, near its cap or not, while a member is below the mean: down towards the mean, at the same
+        // pace. The writes for what it lets go are steered to that member, so they do not come straight back.
+        if (node.aboveFleetShare(plane) && node.memberBelowMean(plane).isPresent()) {
+            final int floor = (int) Math.ceil(node.fleetMeanHeld(plane) * ServerlessNode.HAND_OFF_DOWN_TO_MEAN);
+            return evictDownTo(floor, Math.max(1, maxShardsHeld / 10), true);
+        }
+        return 0;
     }
 
     /** The share of its cap a node hands off down to when a member has room. */
@@ -1543,6 +1553,61 @@ public final class BackgroundReconciler implements Closeable {
      * shard nobody owns is read from that commit. So it is opened, over the cap if it must be; the next eviction
      * brings the node back under it the proper way, publishing before it lets go.
      */
+    /** How far past its cap a node may take a dead member's shards, as a fraction of the cap. */
+    public static final double DEFAULT_TAKEOVER_OVERCOMMIT = 0.2;
+
+    private volatile double takeoverOvercommit = DEFAULT_TAKEOVER_OVERCOMMIT;
+
+    /**
+     * Sets how far past its cap a node may take a dead member's shards; 0 turns overcommitting off. Bounded in memory:
+     * a held shard costs 110-190 KB of heap, so a fifth of a thousand is about 40 MB.
+     *
+     * @param fraction of the cap, at least 0
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setTakeoverOvercommit(double fraction) {
+        this.takeoverOvercommit = Math.max(0.0, fraction);
+        return this;
+    }
+
+    /** The hard ceiling for takeovers: the cap and its overcommit. Nothing is taken past it. */
+    private int takeoverCeiling() {
+        return maxShardsHeld + (int) Math.floor(maxShardsHeld * takeoverOvercommit);
+    }
+
+    /**
+     * Whether a shard may be taken past the cap: its head names another node whose lease is no longer live -- a dead or
+     * revoked member's shard, which somebody has to take now -- and overcommitting is on. Ordinary demand still evicts
+     * first: only a takeover is urgent enough to be worth holding more than the cap for a while.
+     */
+    private boolean takeoverMayOvercommit(String indexName, int shard) {
+        if (takeoverOvercommit <= 0.0) {
+            return false;
+        }
+        try {
+            final var head = plane.heads().read(indexName, shard);
+            return head.isPresent()
+                && head.get().ownerNodeId() != null
+                && node.localNode().getId().equals(head.get().ownerNodeId()) == false
+                && plane.heads().isHeld(head.get(), plane.clock().getAsLong()) == false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Brings a node that took a dead member's shards past its cap back down to it, a tenth of the cap a pass, and only
+     * shards past their eviction grace -- so the shards just taken, which are the ones being written, stay.
+     *
+     * @return how many shards were let go
+     */
+    public int trimToCap() {
+        if (evictAfterMillis <= 0 || node.reconciler().heldShards().size() <= maxShardsHeld) {
+            return 0;
+        }
+        return evictDownTo(maxShardsHeld, Math.max(1, maxShardsHeld / 10), false);
+    }
+
     /** Whether another node holds a shard's head under a live lease: one register read, against an eviction. */
     private boolean heldByAnotherLiveNode(String indexName, int shard) {
         try {
@@ -2018,12 +2083,35 @@ public final class BackgroundReconciler implements Closeable {
      * @return the limit
      */
     public int currentActivationLimit() {
+        final int limit;
         if (adaptiveActivation == false) {
-            return activationConcurrency;
+            limit = activationConcurrency;
+        } else {
+            synchronized (activationLimitLock) {
+                limit = Math.max(1, Math.min(activationConcurrency, (int) Math.floor(activationLimit)));
+            }
         }
-        synchronized (activationLimitLock) {
-            return Math.max(1, Math.min(activationConcurrency, (int) Math.floor(activationLimit)));
+        if (pacedByWrites == false) {
+            return limit;
         }
+        // Paced by the write path's limiter: a takeover storm saturated the store, and the live writes paid -- a fleet run
+        // shed 77% of them while survivors opened a dead node's shards. While the limiter has cut how many writes may wait,
+        // activations are cut in the same proportion; never below one, so takeovers still move.
+        return Math.max(1, (int) Math.floor(limit * node.writeHeadroom()));
+    }
+
+    private volatile boolean pacedByWrites = false;
+
+    /**
+     * Sets whether activations at once follow the write path's limiter: off by default, until a fleet run says it is worth it.
+     *
+     * @param paced whether to
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setActivationPacedByWrites(boolean paced) {
+        this.pacedByWrites = paced;
+        drainActivations();
+        return this;
     }
 
     /**
@@ -2095,6 +2183,22 @@ public final class BackgroundReconciler implements Closeable {
                 if (full == false && open == null) {
                     capReserved++;
                     reserved = true;
+                }
+            }
+            if (full && takeoverMayOvercommit(indexName, shard)) {
+                // A dead member's shard, and room under the takeover ceiling: taken without evicting. Evicting here put
+                // a publish and a head release in front of every shard a survivor near its cap took from a dead node,
+                // one at a time, and that -- not the open -- was most of how long a kill took to recover from. The trim
+                // in each pass brings the node back to its cap once the taken shards have been idle a while.
+                synchronized (capLock) {
+                    if (node.reconciler().heldShards().size() + capReserved < takeoverCeiling()) {
+                        capReserved++;
+                        reserved = true;
+                        full = false;
+                    }
+                }
+                if (reserved) {
+                    node.noteTakeoverOvercommitted();
                 }
             }
             if (full && heldByAnotherLiveNode(indexName, shard)) {
