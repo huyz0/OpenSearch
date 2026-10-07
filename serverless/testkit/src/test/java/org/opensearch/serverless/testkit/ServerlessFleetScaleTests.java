@@ -858,6 +858,11 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         for (String field : PHASES) {
             totals.put(field, fleetSum("activation_phases", field));
         }
+        for (String step : org.opensearch.serverless.shard.ShardReconciler.WRITER_OPEN_PHASES) {
+            totals.put("writer_open." + step, fleetSum("writer_open", step + "_millis"));
+        }
+        totals.put("writer_open.opened", fleetSum("writer_open", "opened"));
+        totals.put("writer_open.log_records", fleetSum("writer_open", "log_records"));
         return totals;
     }
 
@@ -874,6 +879,19 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         }
         final long view = Math.max(0L, after.getOrDefault("view_millis", 0L) - before.getOrDefault("view_millis", 0L));
         out.append(" (of open, the local view ").append(view / opened).append(')');
+        final long writers = after.getOrDefault("writer_open.opened", 0L) - before.getOrDefault("writer_open.opened", 0L);
+        if (writers > 0) {
+            out.append("; a writer's open by step, average ms over ").append(writers).append(':');
+            for (String step : org.opensearch.serverless.shard.ShardReconciler.WRITER_OPEN_PHASES) {
+                final String key = "writer_open." + step;
+                out.append(' ')
+                    .append(step)
+                    .append('=')
+                    .append(Math.max(0L, after.getOrDefault(key, 0L) - before.getOrDefault(key, 0L)) / writers);
+            }
+            final long records = after.getOrDefault("writer_open.log_records", 0L) - before.getOrDefault("writer_open.log_records", 0L);
+            out.append(String.format(java.util.Locale.ROOT, "; log records read per open %.1f", (double) records / writers));
+        }
         return out.toString();
     }
 

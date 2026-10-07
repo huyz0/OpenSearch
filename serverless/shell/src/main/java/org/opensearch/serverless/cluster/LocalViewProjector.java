@@ -54,6 +54,22 @@ public final class LocalViewProjector {
     private final DiscoveryNode localNode;
     private final AtomicLong version = new AtomicLong(0);
 
+    /** One index as last projected: reused while its descriptor and its shards' terms are the same. */
+    private record Projected(IndexDescriptor descriptor, Map<Integer, Long> terms, IndexMetadata metadata, IndexRoutingTable routing) {
+    }
+
+    /**
+     * The indices of the last projection, by name.
+     *
+     * <p>Every activation projects the whole view -- every index the node serves or hosts -- and building an index's
+     * metadata parses its mapping. That made taking a shard cost a node in proportion to what it already held: 4 ms a
+     * projection at a hundred shards, 44 ms at six hundred, and a dead node's shards queued behind each other's
+     * projections. An index whose descriptor is the same object and whose terms are the same is the same projection.
+     * Matched on the descriptor's identity, not its equality: equality leaves out fields the metadata is built from, and a
+     * refreshed descriptor is a new object.
+     */
+    private volatile Map<String, Projected> lastProjected = Map.of();
+
     /**
      * Creates a projector for one node.
      *
@@ -82,11 +98,20 @@ public final class LocalViewProjector {
         final Metadata.Builder metadata = Metadata.builder();
         final RoutingTable.Builder routing = RoutingTable.builder();
 
+        final Map<String, Projected> previous = lastProjected;
+        final Map<String, Projected> projected = new HashMap<>();
         for (IndexDescriptor descriptor : descriptors) {
-            final IndexMetadata indexMetadata = descriptor.toIndexMetadata(termsByIndex.getOrDefault(descriptor.name(), Map.of()));
-            metadata.put(indexMetadata, false);
-            routing.add(routingFor(indexMetadata, termsByIndex.getOrDefault(descriptor.name(), Map.of())));
+            final Map<Integer, Long> terms = termsByIndex.getOrDefault(descriptor.name(), Map.of());
+            Projected index = previous.get(descriptor.name());
+            if (index == null || index.descriptor() != descriptor || index.terms().equals(terms) == false) {
+                final IndexMetadata indexMetadata = descriptor.toIndexMetadata(terms);
+                index = new Projected(descriptor, terms, indexMetadata, routingFor(indexMetadata, terms));
+            }
+            projected.put(descriptor.name(), index);
+            metadata.put(index.metadata(), false);
+            routing.add(index.routing());
         }
+        lastProjected = projected;
 
         return ClusterState.builder(clusterName)
             .version(version.incrementAndGet())

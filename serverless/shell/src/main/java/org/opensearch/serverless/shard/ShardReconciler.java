@@ -81,6 +81,50 @@ public final class ShardReconciler {
     private final IndicesService indicesService;
     private final DiscoveryNode localNode;
     private final Map<ShardId, IndexShard> open = new ConcurrentHashMap<>();
+
+    /** The steps of a writer's open, in {@link #writerOpenPhaseMillis} order. */
+    public static final java.util.List<String> WRITER_OPEN_PHASES = java.util.List.of(
+        "index_service",
+        "manifest",
+        "create_shard",
+        "local_files",
+        "fence",
+        "recover",
+        "start",
+        // Not a step of its own: the part of recover spent reading the log.
+        "log_read"
+    );
+
+    /** Time writers' opens spent in each step, summed, and how many opened. */
+    private final java.util.concurrent.atomic.AtomicLong[] writerOpenNanos = new java.util.concurrent.atomic.AtomicLong[WRITER_OPEN_PHASES
+        .size()];
+    private final java.util.concurrent.atomic.AtomicLong writerOpens = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong logRecordsRead = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Log records writers' opens have read for replay, summed: with the opens, how much log an open finds. */
+    public long logRecordsRead() {
+        return logRecordsRead.get();
+    }
+
+    {
+        for (int i = 0; i < writerOpenNanos.length; i++) {
+            writerOpenNanos[i] = new java.util.concurrent.atomic.AtomicLong();
+        }
+    }
+
+    /**
+     * Where writers' opens spend their time, by step, in milliseconds summed since start, then the count of opens. The
+     * open is most of a takeover; this says which part of it.
+     */
+    public long[] writerOpenPhaseMillis() {
+        final long[] out = new long[writerOpenNanos.length + 1];
+        for (int i = 0; i < writerOpenNanos.length; i++) {
+            out[i] = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(writerOpenNanos[i].get());
+        }
+        out[writerOpenNanos.length] = writerOpens.get();
+        return out;
+    }
+
     /** Queries running against each shard right now, so a release does not close a reader mid-query. */
     private final Map<ShardId, java.util.concurrent.atomic.AtomicInteger> inFlight = new ConcurrentHashMap<>();
     private final Set<ShardId> readers = ConcurrentHashMap.newKeySet();
@@ -437,7 +481,10 @@ public final class ShardReconciler {
         if (wal == null) {
             return java.util.List.of();
         }
+        final long readingAt = System.nanoTime();
         final java.util.List<org.opensearch.serverless.store.WalRecord> records = wal.replayableAfterFencing();
+        writerOpenNanos[WRITER_OPEN_PHASES.indexOf("log_read")].addAndGet(System.nanoTime() - readingAt);
+        logRecordsRead.addAndGet(records.size());
         // Kept for the pass after recovery, which applies the records without sequence identity: the log was
         // fenced before either read, so nothing can have landed in between, and reading it twice was a listing
         // per term and a GET per record paid again on every open.
@@ -513,8 +560,19 @@ public final class ShardReconciler {
         CommitManifest knownCommit
     ) throws IOException {
         opening.add(shardId);
+        final long[] at = { System.nanoTime() };
+        final int[] step = { 0 };
+        final Runnable lap = () -> {
+            final long now = System.nanoTime();
+            if (replayWal) {
+                writerOpenNanos[step[0]].addAndGet(now - at[0]);
+            }
+            step[0]++;
+            at[0] = now;
+        };
         try {
             final IndexService indexService = indexServiceFor(indexMetadata);
+            lap.run();
 
             // Whether anything was published decides the recovery source, and the decision must be made
             // before the shard is created because the source is baked into its routing entry.
@@ -523,6 +581,7 @@ public final class ShardReconciler {
                 ? Optional.of(knownCommit)
                 : (publisher == null ? Optional.empty() : publisher.readManifest());
             final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
+            lap.run();
             if (replayWal) {
                 logger.debug(
                     "opening writer {} at term {} from {}",
@@ -560,6 +619,7 @@ public final class ShardReconciler {
             } finally {
                 pendingManifests.remove(shardId);
             }
+            lap.run();
             // A failed engine is reported, not just left in place: a shard whose engine has failed still counts as
             // open, and a writer's head kept naming a node that answered "engine is closed" to everything.
             shard.addShardFailureCallback(failure -> {
@@ -584,6 +644,7 @@ public final class ShardReconciler {
                     // over has none.
                     bootstrapTranslogFor(shard);
                 }
+                lap.run();
 
                 if (replayWal && walStores != null) {
                     // Armed for exactly the window in which the engine is built and recovery runs, which is
@@ -607,6 +668,7 @@ public final class ShardReconciler {
                     final java.util.function.BiPredicate<ShardId, Long> check = ownsAtTerm;
                     log.establish(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
                 }
+                lap.run();
                 try {
                     shard.markAsRecovering("serverless-store", new RecoveryState(initializing, localNode, null));
                     final PlainActionFuture<Boolean> recovered = PlainActionFuture.newFuture();
@@ -617,6 +679,7 @@ public final class ShardReconciler {
                 } finally {
                     pendingReplay.remove(shardId);
                 }
+                lap.run();
 
                 final ShardRouting started = initializing.moveToStarted();
                 // The applying version is the SHARD-HEAD TERM, not the projected view's version. S1
@@ -642,6 +705,10 @@ public final class ShardReconciler {
                     // the two was applied at the reader's commit, numbered from there, and acknowledged -- a fleet
                     // run found a sequence number given twice that way, which replay would have dropped one of.
                     readers.add(shardId);
+                }
+                lap.run();
+                if (replayWal) {
+                    writerOpens.incrementAndGet();
                 }
                 open.put(shardId, shard);
                 return shard;
