@@ -659,13 +659,54 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         final long killedAtMillis = System.currentTimeMillis();
         final long killedAt = System.nanoTime();
         fleet.remove(node);
+        final long routedBefore = fleetSum("capacity", "takeover_writes_routed");
+        final long leftBefore = fleetSum("capacity", "takeover_doubts_left");
         node.killHard();
         acquiredAfter.clear();
-        final Map<String, Long> takeover = probeUntilWritable(
-            owned,
-            killedAt,
-            Math.max(seconds, (int) (6 * ttlMillis / 1000)),
-            node.nodeId()
+        // Each survivor's activation queue while it takes the dead node's shards: how deep, and how long the longest wait.
+        final Map<String, long[]> queues = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.concurrent.atomic.AtomicBoolean watching = new java.util.concurrent.atomic.AtomicBoolean(true);
+        final Thread watcher = new Thread(() -> {
+            try (
+                java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                    .connectTimeout(java.time.Duration.ofSeconds(5))
+                    .build()
+            ) {
+                while (watching.get()) {
+                    for (NodeProcess survivor : List.copyOf(fleet)) {
+                        final String body = statsOf(client, survivor);
+                        if (body != null) {
+                            final Map<String, Long> q = objectFields(body, "activation_queue");
+                            queues.merge(
+                                survivor.name(),
+                                new long[] { q.getOrDefault("queued", 0L), q.getOrDefault("max_wait_millis", 0L) },
+                                (a, b) -> new long[] { Math.max(a[0], b[0]), Math.max(a[1], b[1]) }
+                            );
+                        }
+                    }
+                    LockSupport.parkNanos(TimeUnit.SECONDS.toNanos(2));
+                }
+            }
+        }, "kill-queue-watcher");
+        watcher.setDaemon(true);
+        watcher.start();
+        final Map<String, Long> takeover;
+        try {
+            takeover = probeUntilWritable(owned, killedAt, Math.max(seconds, (int) (6 * ttlMillis / 1000)), node.nodeId());
+        } finally {
+            watching.set(false);
+            watcher.join(30_000);
+        }
+        final StringBuilder depth = new StringBuilder("- survivors' activation queues during the takeover, deepest / longest wait:");
+        new TreeMap<>(queues).forEach(
+            (name, q) -> depth.append(' ').append(name).append('=').append(q[0]).append('/').append(q[1]).append("ms")
+        );
+        line(depth.toString());
+        line(
+            "- routed to the member taking a dead member's shard: "
+                + (fleetSum("capacity", "takeover_writes_routed") - routedBefore)
+                + " writes; doubts left to it: "
+                + (fleetSum("capacity", "takeover_doubts_left") - leftBefore)
         );
         line("- takeover, kill to first acknowledged write on each of its shards: " + summarise(takeover, owned.size()));
         line(

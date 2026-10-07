@@ -448,6 +448,64 @@ public final class DocumentHandler extends BaseRestHandler {
                                 return;
                             }
                             if (fresh.equals(forwardTarget)) {
+                                // Still the owner that did not answer. If its lease has run out, the write goes to the
+                                // member that takes its shards over, once, marked to be taken there -- not to a doubt
+                                // here that queued the shard on every survivor a write reached. Anything short of an
+                                // answer from there falls back to taking it here.
+                                if (serving.routesTakeovers()
+                                    && head.isPresent()
+                                    && metadata.heads().isHeld(head.get(), metadata.clock().getAsLong()) == false) {
+                                    final Optional<String> winner = serving.takeoverWinner(metadata, writtenIndex, shard, fresh);
+                                    if (winner.isPresent() && winner.get().equals(serving.localNode().getId()) == false) {
+                                        try {
+                                            ack = forwardTo(
+                                                serving,
+                                                winner.get(),
+                                                writtenIndex,
+                                                indexUuid,
+                                                shard,
+                                                id,
+                                                shapedSource,
+                                                refresh,
+                                                deletion,
+                                                ifSeqNo,
+                                                ifPrimaryTerm,
+                                                requireAbsent,
+                                                true
+                                            );
+                                            serving.noteTakeoverWriteRouted();
+                                            respond(
+                                                channel,
+                                                writtenIndex,
+                                                id,
+                                                shard,
+                                                ack.ownerNodeId(),
+                                                deletion,
+                                                new ServerlessNode.WriteOutcome(
+                                                    ack.seqNo(),
+                                                    ack.primaryTerm(),
+                                                    ack.version(),
+                                                    ack.created(),
+                                                    ack.found()
+                                                ),
+                                                refresh
+                                            );
+                                            return;
+                                        } catch (ForwardFailed routed) {
+                                            if (org.opensearch.serverless.transport.ForwardFailure.classify(routed.getCause())
+                                                .mayRetryElsewhere() == false) {
+                                                throw routed;
+                                            }
+                                        }
+                                    }
+                                    // This node is the one to take it, or the one that is did not: take it here.
+                                    serving.threadPool()
+                                        .executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
+                                        .execute(
+                                            () -> writeOnceActivated(channel, serving, writtenIndex, indexUuid, shard, false, writeHere)
+                                        );
+                                    return;
+                                }
                                 throw first;
                             }
                             forwardTarget = fresh;

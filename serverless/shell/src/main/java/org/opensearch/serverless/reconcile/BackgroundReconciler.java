@@ -1350,11 +1350,26 @@ public final class BackgroundReconciler implements Closeable {
         }
         final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
         for (Map.Entry<String, Integer> candidate : candidates) {
-            if (heldAsWriter(candidate.getKey(), candidate.getValue()) == false) {
+            if (heldAsWriter(candidate.getKey(), candidate.getValue()) == false && leftToTakeoverWinner(candidate) == false) {
                 pending.add(activate(candidate.getKey(), candidate.getValue(), true));
             }
         }
         return settle(pending);
+    }
+
+    /**
+     * Whether a doubted shard is a dead member's that another member is to take over: then this node leaves it. Every
+     * survivor a request reached doubted the shard and queued it, so each held the whole of a dead node's shards in its
+     * queue. Not left when anything is unknown -- the head unreadable, no winner -- nor when the winner is this node:
+     * routing must never become nobody taking it. The winner's own departure pass, its second look and the writes routed
+     * to it take the shard; if the winner fails at that, the second look on every survivor still does.
+     */
+    private boolean leftToTakeoverWinner(Map.Entry<String, Integer> candidate) {
+        if (node.takeoverBelongsElsewhere(plane, candidate.getKey(), candidate.getValue())) {
+            node.noteTakeoverDoubtLeft();
+            return true;
+        }
+        return false;
     }
 
     /** Whether the shard is open here as a writer: a pass reports only what it newly took. */
@@ -1567,6 +1582,7 @@ public final class BackgroundReconciler implements Closeable {
      */
     public BackgroundReconciler setTakeoverOvercommit(double fraction) {
         this.takeoverOvercommit = Math.max(0.0, fraction);
+        node.setTakeoverOvercommit(this.takeoverOvercommit);
         return this;
     }
 
@@ -1689,10 +1705,9 @@ public final class BackgroundReconciler implements Closeable {
         final long settledBefore = settledClean.get();
         int taking = 0;
         for (Map.Entry<String, Integer> claim : claims) {
-            final int mine = live.isEmpty() || rank < 0
-                ? 0
-                : Math.floorMod((claim.getKey() + "#" + claim.getValue()).hashCode(), live.size());
-            if (rank < 0 || mine == rank) {
+            // The same choice a request for the shard is routed by, so the shard is queued on one survivor only.
+            final Optional<String> winner = node.takeoverWinner(plane, claim.getKey(), claim.getValue(), deadNodeId);
+            if (rank < 0 || winner.isEmpty() || winner.get().equals(node.localNode().getId())) {
                 if (takeIfStillHeldBy(deadNodeId, claim)) {
                     taking++;
                 }
@@ -1733,8 +1748,30 @@ public final class BackgroundReconciler implements Closeable {
      * @param claims the claims {@link #takeOverFrom} left for later
      */
     public void takeOverRemaining(String deadNodeId, List<Map.Entry<String, Integer>> claims) {
+        takeOverRemaining(deadNodeId, claims, false);
+    }
+
+    /**
+     * The second look at a departed node's shards, or the last.
+     *
+     * <p>The second look leaves alone what a live member other than this one is named to take: ten seconds after a
+     * departure the members named are still opening their shares, and every survivor queueing everything not yet taken
+     * put a dead node's whole set back in every queue. The last look, a lease later, takes whatever is still the dead
+     * node's, whoever is named: a member that was named and could not is not waited on for ever.
+     *
+     * @param deadNodeId the node whose lease ran out
+     * @param claims its shards left for this look
+     * @param last whether this is the last look
+     * @return the shards left for the last look
+     */
+    public List<Map.Entry<String, Integer>> takeOverRemaining(String deadNodeId, List<Map.Entry<String, Integer>> claims, boolean last) {
         int taking = 0;
+        final List<Map.Entry<String, Integer>> deferred = new java.util.ArrayList<>();
         for (Map.Entry<String, Integer> claim : claims) {
+            if (last == false && node.takeoverBelongsElsewhere(plane, claim.getKey(), claim.getValue())) {
+                deferred.add(claim);
+                continue;
+            }
             if (takeIfStillHeldBy(deadNodeId, claim)) {
                 taking++;
             }
@@ -1742,6 +1779,7 @@ public final class BackgroundReconciler implements Closeable {
         if (taking > 0) {
             logger.info("node {} left: took {} more of its shards that no other survivor had", deadNodeId, taking);
         }
+        return deferred;
     }
 
     private boolean takeIfStillHeldBy(String deadNodeId, Map.Entry<String, Integer> claim) {

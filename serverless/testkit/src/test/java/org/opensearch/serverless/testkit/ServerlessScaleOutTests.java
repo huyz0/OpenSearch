@@ -180,6 +180,93 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
     }
 
     /**
+     * A dead member's shard is taken by the one survivor every member names for it: a doubt about it on another survivor
+     * is left alone, and a write for it through another survivor is routed there and taken there. With no survivor to
+     * route to, it is taken locally -- routing must never become nobody taking it.
+     */
+    public void testADeadMembersShardIsTakenByTheOneSurvivorNamedForIt() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("orphan", "uuid-orphan", 1, MAPPING, null));
+        try (ServerlessNode a = new ServerlessNode(settings("a")); ServerlessNode b = new ServerlessNode(settings("b"))) {
+            for (ServerlessNode node : List.of(a, b)) {
+                node.start();
+                node.setMetadataPlane(plane);
+            }
+            final BackgroundReconciler aLoop = new BackgroundReconciler(a, plane).setDemandDrivenActivation(true).setMaxShardsHeld(10);
+            final BackgroundReconciler bLoop = new BackgroundReconciler(b, plane).setDemandDrivenActivation(true).setMaxShardsHeld(10);
+            final org.opensearch.serverless.reconcile.ReconcileScheduler aScheduler = scheduler(aLoop, a, clock);
+            final org.opensearch.serverless.reconcile.ReconcileScheduler bScheduler = scheduler(bLoop, b, clock);
+            a.setSignals(aScheduler);
+            b.setSignals(bScheduler);
+            aScheduler.start();
+            bScheduler.start();
+            final String deadId;
+            try (ServerlessNode dead = new ServerlessNode(settings("dead"))) {
+                dead.start();
+                dead.setMetadataPlane(plane);
+                dead.renewLease(plane);
+                new BackgroundReconciler(dead, plane).setDemandDrivenActivation(true).activateOnDemand(List.of(Map.entry("orphan", 0)));
+                deadId = dead.localNode().getId();
+            }
+            clock.addAndGet(TTL + 1);
+            a.renewLease(plane);
+            b.renewLease(plane);
+            plane.membership().refresh();
+
+            final String winnerId = a.takeoverWinner(plane, "orphan", 0, deadId).orElseThrow();
+            assertEquals("every member names the same one", winnerId, b.takeoverWinner(plane, "orphan", 0, deadId).orElseThrow());
+            final ServerlessNode winner = winnerId.equals(a.localNode().getId()) ? a : b;
+            final ServerlessNode other = winner == a ? b : a;
+            final BackgroundReconciler otherLoop = other == a ? aLoop : bLoop;
+
+            assertTrue(
+                "a doubt on the other survivor is left to the one named",
+                otherLoop.activateOnDemand(List.of(Map.entry("orphan", 0))).isEmpty()
+            );
+            assertEquals(1, other.takeoverRouting()[1]);
+            assertEquals(deadId, plane.heads().read("orphan", 0).orElseThrow().ownerNodeId());
+            assertEquals(
+                "the second look on the other survivor leaves it too",
+                List.of(Map.entry("orphan", 0)),
+                otherLoop.takeOverRemaining(deadId, List.of(Map.entry("orphan", 0)), false)
+            );
+            assertEquals(deadId, plane.heads().read("orphan", 0).orElseThrow().ownerNodeId());
+
+            final int status = send(other, "PUT", "/orphan/_doc/1", "{\"msg\":\"x\"}");
+            assertEquals(201, status);
+            assertEquals("routed once, to the member named", 1, other.takeoverRouting()[0]);
+            assertEquals(winnerId, plane.heads().read("orphan", 0).orElseThrow().ownerNodeId());
+            assertFalse(other.reconciler().openShards().stream().anyMatch(s -> s.getIndexName().equals("orphan")));
+            aScheduler.close();
+            bScheduler.close();
+        }
+    }
+
+    /** With no other survivor, a dead member's shard is taken by whoever is asked for it. */
+    public void testWithNobodyElseADeadMembersShardIsTakenLocally() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("orphan", "uuid-orphan", 1, MAPPING, null));
+        try (ServerlessNode alone = new ServerlessNode(settings("alone"))) {
+            alone.start();
+            alone.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(alone, plane).setDemandDrivenActivation(true).setMaxShardsHeld(10);
+            try (ServerlessNode dead = new ServerlessNode(settings("dead"))) {
+                dead.start();
+                dead.setMetadataPlane(plane);
+                dead.renewLease(plane);
+                new BackgroundReconciler(dead, plane).setDemandDrivenActivation(true).activateOnDemand(List.of(Map.entry("orphan", 0)));
+            }
+            clock.addAndGet(TTL + 1);
+            alone.renewLease(plane);
+            plane.membership().refresh();
+            assertEquals(1, loop.activateOnDemand(List.of(Map.entry("orphan", 0))).size());
+            assertEquals(0, alone.takeoverRouting()[1]);
+        }
+    }
+
+    /**
      * A node far above the fleet's mean hands idle shards off towards it, and steers writes for shards nobody holds to the
      * member below it -- well short of its cap. Hand-off near the cap only left load uneven everywhere below it: the node a
      * fleet run killed held anywhere from 103 to 847 shards, and recovery followed that.

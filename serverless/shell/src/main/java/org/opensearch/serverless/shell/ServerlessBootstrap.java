@@ -83,6 +83,9 @@ public final class ServerlessBootstrap implements Closeable {
     /** Whether the activations at once follow the store, up to {@link #ACTIVATION_CONCURRENCY}; off by default. */
     public static final String ACTIVATION_ADAPTIVE = "serverless.activation.adaptive";
 
+    /** Whether requests for a dead member's shard go to the one survivor named for it; on by default. */
+    public static final String ROUTE_TAKEOVERS = "serverless.takeover.route_to_winner";
+
     /** Whether activations at once are cut while the write path's limiter is cutting writes; off until measured. */
     public static final String ACTIVATION_PACED = "serverless.activation.paced_by_writes";
 
@@ -271,6 +274,7 @@ public final class ServerlessBootstrap implements Closeable {
         logger.info("startup: node built in {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
         node.start();
         node.projector().setReuseProjections(complete.getAsBoolean(VIEW_REUSE, true));
+        node.setRouteTakeovers(complete.getAsBoolean(ROUTE_TAKEOVERS, true));
         logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
 
         final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(

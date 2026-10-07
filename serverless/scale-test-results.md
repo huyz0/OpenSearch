@@ -707,6 +707,29 @@ These four runs also ran two changes made while they were queued: hand-off on de
 activations, both in all four. Paced, a node whose write limiter fell to 4 ran one activation at a time with 300
 queued. Pacing is off by default until a run measures it.
 
+**One survivor per dead member's shard.** Every survivor queued every one of a dead node's shards: any write, get or
+second look reaching a survivor for an unheld shard asked for it there. Every member now names the same survivor for
+each such shard -- of the live writer members, in name order, the first from the shard's hash with room under its
+overcommit ceiling -- and the departure pass splits by it. A doubt about the shard elsewhere is left to that survivor,
+and a write for it is forwarded there once, marked to be taken; anything short of an answer from there takes it locally.
+Routing only: the head's compare-and-swap still decides. `serverless.takeover.route_to_winner=false` turns it off.
+
+The first version covered writes and doubts. Twice each way (on: `run1791396248723`, `run1791402406554`; off:
+`run1791399438196`, `run1791405501132`), all clean:
+
+| | node killed held | deepest survivor queue | kill p50 / p99 | throughput to half / all | writes failing, kill until all back |
+| --- | --- | --- | --- | --- | --- |
+| routed | 354 | 65-191 | 49 / 72 s | 6.7 / 6.7 shards/s | 31% |
+| routed | 366 | 103-142 | 57 / 78 s | 6.3 / 6.8 shards/s | 32% |
+| not | 386 | 348-381 | 59 / 90 s | 6.4 / 5.8 shards/s | 35% |
+| not | 499 | 33-50 | 75 / 86 s | 5.0 / 7.6 shards/s | 56% |
+
+Queues roughly halved, the p99 and the failing writes better in both pairs. But only 33-37 writes and 2 doubts were
+routed: the rest of the queueing came from two paths it did not cover -- the departure pass's second look, ten
+seconds on, at which every survivor took whatever was not yet taken, and gets of a shard behind its log, which took the
+shard wherever they arrived. Both now leave a shard to the survivor named for it; a last look a lease later takes
+whatever is still the dead node's, whoever was named, so a named survivor that cannot is not waited on for ever.
+
 **Hand-off on deviation.** A node above 1.5x the fleet's mean of held shards, and above a quarter of its cap, hands
 idle shards off towards 1.25x the mean while a member is below the mean, and steers writes for unheld shards to it --
 however far it is from its cap. Near the cap only, load stayed uneven below it.
