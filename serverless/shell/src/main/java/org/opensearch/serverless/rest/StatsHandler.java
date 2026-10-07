@@ -374,6 +374,7 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("evicted", capacity.evicted());
             builder.field("handed_off", capacity.handedOff());
             builder.field("writes_steered", capacity.writesSteered());
+            builder.field("takeovers_overcommitted", serving.takeoversOvercommitted());
             builder.field("in_use", serving.inUseLastMinute());
             builder.field("refused_last_minute", serving.refusedLastMinute());
             builder.endObject();

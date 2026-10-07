@@ -496,10 +496,11 @@ public final class DocumentHandler extends BaseRestHandler {
             // only reason anyone would is that a write arrived -- which just happened. So this node takes
             // it, and the write waits for that rather than being sent away to retry.
             final String routedUuid = descriptor.get().uuid();
-            // Unless this node is nearly full and a member has room: the write goes there, marked to be taken, so a
-            // node that has just joined takes new shards rather than the full ones evicting to make room for them.
+            // Unless this node is nearly full and a member has room, or holds far more than its share and a member is
+            // below the mean: the write goes there, marked to be taken, so a node that has just joined takes new shards
+            // rather than the full ones evicting to make room for them, and load evens out below the cap as well.
             // Anything that went wrong before the member could have applied it falls back to taking it here.
-            final Optional<String> roomy = serving.nearlyFull() ? serving.memberWithRoom(metadata) : Optional.empty();
+            final Optional<String> roomy = serving.handOffTarget(metadata);
             if (roomy.isPresent()) {
                 return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
                     try (
