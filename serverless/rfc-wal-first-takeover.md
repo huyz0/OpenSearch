@@ -154,10 +154,12 @@ survivors that is roughly 350 / 40 slots × 0.2 s ≈ 2 s, instead of ~18 s. Ope
 Estimate: head-to-first-ack p50 from ~11 s to ~1-2 s, and the head-held wait shrinks too. Kill-to-first-ack p50 from
 ~50 s to ~32-35 s, of which 28 s is the lease. For writes that are blind indexes only.
 
-Most of that gain does not need early acks. It needs **acquisitions not to queue behind opens**: a separate, larger
-pool for acquire+establish, with opens on their own pool. On its own that brings the head-held time down to ~1-2 s
-after expiry. Writes still wait for their own shard's open (~1-2 s), so kill-to-first-ack p50 would be about
-31-33 s, against 32-35 s with early acks. And it changes no API, no replay order, and no invariant.
+Without early acks, a write waits for its own shard's open, and the opens are the queue. Separating acquisition
+from opening -- acquire on a pool of its own, opens behind it -- lets survivors claim the heads within seconds. But
+the opens still run 8 at a time per node, so the last shard is writable no sooner. It frees only the acquire's
+~115 ms per open slot. What moves time-to-first-ack without early acks is **open throughput**: cheaper opens, or
+more of them at once if the store can take it. Ordering opens hottest first moves the writes that are actually
+waiting to the front.
 
 ## Recommendation
 
@@ -167,8 +169,9 @@ replay-order change on the path where data loss would hide. For blind-index load
 the alternative, against a 28 s lease that dominates either way.
 
 Do instead, in this order:
-1. **Separate acquiring from opening.** A takeover burst acquires and establishes everything it will take within
-   seconds, on a pool that does no opens. Opens run on their own pool, hottest first.
-2. **Make the open cheaper** (Part A): recover and create-shard are most of it.
-3. Revisit early acks only if a workload is blind-index-only, and the lease has been shortened to the point where
+1. **Make the open cheaper** (Part A): recover and create-shard are most of it.
+2. **Open more at once,** if the store allows (the pool-size sweep).
+3. **Open the shards being written to first.** Separating acquisition from opening is worth it only as part of
+   this: claiming the heads quickly ends the survivors' contention, and the opens behind it are ordered by heat.
+4. Revisit early acks only if a workload is blind-index-only, and the lease has been shortened to the point where
    the open is the larger part of recovery.
