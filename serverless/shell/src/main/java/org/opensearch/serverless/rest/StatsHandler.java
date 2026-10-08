@@ -533,6 +533,12 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("max_wait_millis", queue.maxWaitMillis());
             builder.field("max_run_millis", queue.maxRunMillis());
             builder.field("limit", queue.limit());
+            final long[] sources = scheduler.activationSources();
+            builder.startObject("by_source");
+            for (int i = 0; i < org.opensearch.serverless.reconcile.BackgroundReconciler.ACTIVATION_SOURCES.size(); i++) {
+                builder.field(org.opensearch.serverless.reconcile.BackgroundReconciler.ACTIVATION_SOURCES.get(i), sources[i]);
+            }
+            builder.endObject();
             builder.endObject();
             builder.endObject();
         }

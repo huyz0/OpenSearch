@@ -738,8 +738,22 @@ With every path routed (`run1791409364997`, `run1791411834129`), both clean:
 | 246 | 50-217 | 48 / 58 s | 6.5 / 8.5 shards/s | 36% |
 
 Against the unrouted runs, p50 10-20 s and p99 20-30 s better, and throughput up. The queues are still deeper than a
-survivor's share (about a fifth of the dead node's shards): something else still queues a dead node's shards on
-survivors not named for them, not yet found.
+survivor's share (about a fifth of the dead node's shards): something else still queued a dead node's shards on
+survivors not named for them.
+
+**Found by counting the queue by source** (counters now in stats as `activation_queue.by_source`): during one kill, 3,699 activations from doubts, 1,049 from requests, 20 from the
+departure pass. The doubts were raised in the dead node's last lease: every write that could not reach it doubted the
+shard on its coordinator, and the head, still naming an owner whose lease looked live, passed none of them to the
+survivor named -- so each queued the shard, to run the moment the lease ran out. Such a doubt is now dropped: the
+acquisition it asks for would be refused while the lease lives, and the departure pass and the doubts after it take
+the shard. One run since (`run1791417827458`), clean:
+
+| node killed held | deepest survivor queue | longest wait | kill p50 / p99 | throughput to half / all |
+| --- | --- | --- | --- | --- |
+| 286 | 18-61 | 13-24 s | 44 / 53 s | 7.3 / 9.8 shards/s |
+
+Queues at about a survivor's share, doubt activations from 3,699 to 376, and the best kill yet. Writes failing from the
+kill until all were back: 44%, mostly timeouts -- the live traffic still pays for a takeover.
 
 **Hand-off on deviation.** A node above 1.5x the fleet's mean of held shards, and above a quarter of its cap, hands
 idle shards off towards 1.25x the mean while a member is below the mean, and steers writes for unheld shards to it --

@@ -659,6 +659,10 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         final long killedAtMillis = System.currentTimeMillis();
         final long killedAt = System.nanoTime();
         fleet.remove(node);
+        final Map<String, Long> sourcesBefore = new TreeMap<>();
+        for (String source : org.opensearch.serverless.reconcile.BackgroundReconciler.ACTIVATION_SOURCES) {
+            sourcesBefore.put(source, fleetSum("by_source", source));
+        }
         final long routedBefore = fleetSum("capacity", "takeover_writes_routed");
         final long leftBefore = fleetSum("capacity", "takeover_doubts_left");
         node.killHard();
@@ -702,6 +706,11 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             (name, q) -> depth.append(' ').append(name).append('=').append(q[0]).append('/').append(q[1]).append("ms")
         );
         line(depth.toString());
+        final StringBuilder bySource = new StringBuilder("- activations asked for across the survivors during the takeover, by source:");
+        for (String source : org.opensearch.serverless.reconcile.BackgroundReconciler.ACTIVATION_SOURCES) {
+            bySource.append(' ').append(source).append('=').append(fleetSum("by_source", source) - sourcesBefore.get(source));
+        }
+        line(bySource.toString());
         line(
             "- routed to the member taking a dead member's shard: "
                 + (fleetSum("capacity", "takeover_writes_routed") - routedBefore)

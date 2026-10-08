@@ -1315,6 +1315,7 @@ public final class BackgroundReconciler implements Closeable {
         final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
         for (Map.Entry<String, Integer> target : wanted) {
             if (heldAsWriter(target.getKey(), target.getValue()) == false) {
+                countSource("wanted");
                 pending.add(activate(target.getKey(), target.getValue(), false));
             }
         }
@@ -1350,7 +1351,10 @@ public final class BackgroundReconciler implements Closeable {
         }
         final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
         for (Map.Entry<String, Integer> candidate : candidates) {
-            if (heldAsWriter(candidate.getKey(), candidate.getValue()) == false && leftToTakeoverWinner(candidate) == false) {
+            if (heldAsWriter(candidate.getKey(), candidate.getValue()) == false
+                && heldByAnotherLiveNode(candidate.getKey(), candidate.getValue()) == false
+                && leftToTakeoverWinner(candidate) == false) {
+                countSource("doubt");
                 pending.add(activate(candidate.getKey(), candidate.getValue(), true));
             }
         }
@@ -1371,6 +1375,12 @@ public final class BackgroundReconciler implements Closeable {
         }
         return false;
     }
+
+    // A doubt about a shard whose head names another node with a live lease is not acted on: the acquisition would be
+    // refused. Raised in the lease's last seconds by every write that could not reach a dying owner, those doubts queued
+    // the shard on every survivor, and all of them ran at once when the lease ran out -- 3,699 doubt activations across
+    // five survivors for a dead node's 274 shards. The departure pass, and the doubts after the lease has run out, which
+    // are left to the survivor named for the shard, take it.
 
     /** Whether the shard is open here as a writer: a pass reports only what it newly took. */
     private boolean heldAsWriter(String indexName, int shard) {
@@ -1396,6 +1406,7 @@ public final class BackgroundReconciler implements Closeable {
     public java.util.concurrent.CompletableFuture<Optional<ShardId>> activateForRequest(String indexName, int shard) {
         // A shard this node was told to want is taken whatever the policy, and without the cap -- exactly as
         // the pass would take it; any other shard only under demand-driven activation.
+        countSource("request");
         if (wanted.contains(Map.entry(indexName, shard))) {
             return activate(indexName, shard, false);
         }
@@ -1482,6 +1493,32 @@ public final class BackgroundReconciler implements Closeable {
     }
 
     private final java.util.concurrent.atomic.AtomicLong activationsDone = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Where queued activations came from, in {@link #activationSources} order. */
+    public static final List<String> ACTIVATION_SOURCES = List.of("wanted", "doubt", "request", "departure", "janitor");
+
+    private final java.util.concurrent.atomic.AtomicLongArray activationsBySource = new java.util.concurrent.atomic.AtomicLongArray(
+        ACTIVATION_SOURCES.size()
+    );
+
+    private void countSource(String source) {
+        activationsBySource.incrementAndGet(ACTIVATION_SOURCES.indexOf(source));
+    }
+
+    /**
+     * Activations asked for since the node started, by where the asking came from: which path fills the queue when it is
+     * deep.
+     *
+     * @return counts in {@link #ACTIVATION_SOURCES} order
+     */
+    public long[] activationSources() {
+        final long[] out = new long[ACTIVATION_SOURCES.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = activationsBySource.get(i);
+        }
+        return out;
+    }
+
     private final java.util.concurrent.atomic.AtomicLong activationWaitNanos = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong activationRunNanos = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong activationWaitMax = new java.util.concurrent.atomic.AtomicLong();
@@ -1803,6 +1840,7 @@ public final class BackgroundReconciler implements Closeable {
             logger.debug("could not settle " + claim + " of departed node " + deadNodeId + "; it waits for a request", e);
             return false;
         }
+        countSource("departure");
         activate(claim.getKey(), claim.getValue(), true);
         return true;
     }
@@ -2017,6 +2055,7 @@ public final class BackgroundReconciler implements Closeable {
     private void replayAndRelease(String index, int shard) {
         // The janitor's: counted with its passes, though it runs on the activation threads.
         final java.util.concurrent.atomic.AtomicLong sink = org.opensearch.serverless.store.ObjectStores.currentAttribution();
+        countSource("janitor");
         activate(index, shard, true, sink).whenComplete((taken, failure) -> {
             if (failure != null || taken.isEmpty()) {
                 return;
