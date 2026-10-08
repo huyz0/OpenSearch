@@ -435,6 +435,15 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         return loop.activationStats();
     }
 
+    /**
+     * Activations asked for by source; see {@link BackgroundReconciler#activationSources}.
+     *
+     * @return the counts
+     */
+    public long[] activationSources() {
+        return loop.activationSources();
+    }
+
     /** The two looks at a departed node's shards; see BackgroundReconciler#takeOverFrom. */
     private void takeOver(String deadNodeId) {
         try {
