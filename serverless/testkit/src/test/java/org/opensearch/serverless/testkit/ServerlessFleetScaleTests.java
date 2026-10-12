@@ -746,6 +746,11 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
             );
         }
         line("- writes from the kill until every shard was back: " + load.window("write", killedAt, killedAt + maxOr(takeover, 0L)));
+        // Split: the dead node's own shards cannot be written until they are taken; everything else should not notice.
+        final Set<String> deadIndices = new java.util.HashSet<>(owned);
+        final long backAt = killedAt + maxOr(takeover, 0L);
+        line("  - to the dead node's shards: " + load.ledgerWindow(killedAt, backAt, deadIndices::contains));
+        line("  - to every other shard: " + load.ledgerWindow(killedAt, backAt, index -> deadIndices.contains(index) == false));
         sleepSeconds(Math.max(0, seconds - (int) TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - killedAt)));
         fleet.add(victim, startNode(victim));
     }

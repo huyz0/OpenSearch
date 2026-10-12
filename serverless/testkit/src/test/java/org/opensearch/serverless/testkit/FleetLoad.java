@@ -448,6 +448,37 @@ final class FleetLoad implements Closeable {
         return new Window(kind, acked + refused + unknown, acked, refused, unknown, percentile(latencies, 50), percentile(latencies, 99));
     }
 
+    /** The ledger's writes ending between two instants to indices the filter accepts, as a window. */
+    Window ledgerWindow(long fromNanos, long toNanos, java.util.function.Predicate<String> index) {
+        final List<Long> latencies = new ArrayList<>();
+        long acked = 0;
+        long refused = 0;
+        long unknown = 0;
+        for (FleetLedger.Write write : ledger.writes()) {
+            if (write.endedNanos() < fromNanos || write.endedNanos() > toNanos || index.test(write.index()) == false) {
+                continue;
+            }
+            switch (write.outcome()) {
+                case ACKED -> {
+                    acked++;
+                    latencies.add(write.endedNanos() - write.startedNanos());
+                }
+                case REFUSED -> refused++;
+                case UNKNOWN -> unknown++;
+            }
+        }
+        Collections.sort(latencies);
+        return new Window(
+            "write",
+            acked + refused + unknown,
+            acked,
+            refused,
+            unknown,
+            percentile(latencies, 50),
+            percentile(latencies, 99)
+        );
+    }
+
     Map<String, Long> refusalReasons(long fromNanos, long toNanos) {
         final Map<String, Long> reasons = new TreeMap<>();
         for (FleetLedger.Write write : ledger.writes()) {
