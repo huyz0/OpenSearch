@@ -80,8 +80,15 @@ public final class GarbageCollector {
 
     private final BlobStore blobStore;
     private final org.opensearch.common.blobstore.BlobPath base;
-    /** Per {@code index#shard}, when each candidate was first seen unreferenced, in the plane's clock. */
-    private final Map<String, Map<String, Long>> firstSeenUnreferenced = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Per logical shard, the incarnation and when each candidate was first seen, in the plane's clock. */
+    private final Map<String, CandidateTimes> firstSeenUnreferenced = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private record CandidateTimes(String uuid, Map<String, Long> times) {
+        CandidateTimes(String uuid) {
+            this(uuid, new java.util.concurrent.ConcurrentHashMap<>());
+        }
+    }
+
     private volatile long minimumUnreferencedMillis = 0L;
 
     /**
@@ -253,7 +260,14 @@ public final class GarbageCollector {
             }
         }
 
-        final SegmentPublisher publisher = plane.segmentPublisher(indexName, shardId);
+        // Resolve the incarnation once. Resolving the manifest and storage independently by name
+        // can apply the old incarnation's references to a replacement created midway through a sweep.
+        final Optional<IndexDescriptor> descriptor = plane.describe(indexName);
+        if (descriptor.isEmpty() || shardId < 0 || shardId >= descriptor.get().numberOfShards()) {
+            return new ShardSweep(List.of(), Set.of());
+        }
+        final String uuid = descriptor.get().uuid();
+        final SegmentPublisher publisher = plane.segmentPublisher(indexName, uuid, shardId);
         final Optional<CommitManifest> manifest = publisher.readManifest();
         if (manifest.isEmpty()) {
             // Nothing published means nothing is safe to judge: a writer may be mid-first-publish, and
@@ -267,18 +281,6 @@ public final class GarbageCollector {
         final Set<String> referenced = new HashSet<>();
         for (Map.Entry<String, String> file : manifest.get().files().entrySet()) {
             referenced.add(file.getValue() + "/" + file.getKey());
-        }
-
-        // The index's uuid, read only when something to check against it exists: a snapshot pins by uuid,
-        // and a view that recorded one is matched by it rather than by a name that may since have been
-        // reused. A deployment with neither pays nothing extra for this.
-        String uuid = null;
-        boolean uuidNeeded = snapshots.isEmpty() == false;
-        for (PointInTime pit : views) {
-            uuidNeeded |= pit.index().equals(indexName) && pit.indexUuid() != null;
-        }
-        if (uuidNeeded) {
-            uuid = plane.describe(indexName).map(IndexDescriptor::uuid).orElse(null);
         }
 
         // And what any frozen view is still holding.
@@ -321,11 +323,15 @@ public final class GarbageCollector {
         // The wall-clock half of the grace, applied only to a graced sweep: an ungraced one is an operator
         // or a deletion, where there is nothing left to be reading.
         final String shardKey = indexName + RegisterMap.SHARD_SEPARATOR + shardId;
-        final Map<String, Long> firstSeen = previousCandidates == null
+        final CandidateTimes tracked = previousCandidates == null
             ? null
-            : firstSeenUnreferenced.computeIfAbsent(shardKey, ignored -> new java.util.concurrent.ConcurrentHashMap<>());
+            : firstSeenUnreferenced.compute(
+                shardKey,
+                (ignored, previous) -> previous != null && previous.uuid().equals(uuid) ? previous : new CandidateTimes(uuid)
+            );
+        final Map<String, Long> firstSeen = tracked == null ? null : tracked.times();
         final long now = plane.clock().getAsLong();
-        final BlobContainer shardContainer = blobStore.blobContainer(plane.shardData(indexName, shardId));
+        final BlobContainer shardContainer = blobStore.blobContainer(RegisterMap.shardData(plane.basePath(), indexName, uuid, shardId));
         for (Map.Entry<String, BlobContainer> child : shardContainer.children().entrySet()) {
             final String termDir = child.getKey();
             final Long term = parseTerm(termDir);
@@ -367,7 +373,7 @@ public final class GarbageCollector {
         if (firstSeen != null) {
             firstSeen.keySet().retainAll(candidates);
             if (firstSeen.isEmpty()) {
-                firstSeenUnreferenced.remove(shardKey);
+                firstSeenUnreferenced.remove(shardKey, tracked);
             }
         }
         return new ShardSweep(deleted, candidates);

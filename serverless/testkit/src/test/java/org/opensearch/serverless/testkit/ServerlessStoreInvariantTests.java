@@ -62,6 +62,61 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         container.writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, false);
     }
 
+    public void testReplacementFilesReceiveTheirOwnUnreferencedGracePeriod() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = planeOver(store, clock);
+            final var collector = new GarbageCollector(store, BlobPath.cleanPath()).setMinimumUnreferencedMillis(100L);
+            plane.createIndex(new IndexDescriptor("recreated", "uuid-grace-old", 1, MAPPING, null));
+            final BlobPath oldData = plane.shardData("recreated", 0);
+            write(store.blobContainer(oldData.add("t=1")), "_0.cfs", "old orphan");
+            store.blobContainer(oldData).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            final var first = collector.sweepShard(plane, "recreated", 0, Set.of());
+            assertEquals(Set.of("t=1/_0.cfs"), first.candidates());
+            assertTrue(plane.deleteIndex("recreated"));
+            plane.createIndex(new IndexDescriptor("recreated", "uuid-grace-new", 1, MAPPING, null));
+            final BlobPath newData = plane.shardData("recreated", 0);
+            write(store.blobContainer(newData.add("t=1")), "_0.cfs", "new orphan");
+            store.blobContainer(newData).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            clock.addAndGet(200L);
+            final var replacement = collector.sweepShard(plane, "recreated", 0, first.candidates());
+            assertTrue("the previous incarnation's timestamps must not shorten the replacement's grace", replacement.deleted().isEmpty());
+            clock.addAndGet(100L);
+            assertEquals(List.of("t=1/_0.cfs"), collector.sweepShard(plane, "recreated", 0, replacement.candidates()).deleted());
+        }
+    }
+
+    public void testCollectionCannotUseAnOldManifestToDeleteARecreatedIndex() throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1_000L, TTL);
+            final String index = "recreated";
+            final String oldUuid = "uuid-old-generation";
+            final String newUuid = "uuid-new-generation";
+            plane.createIndex(new IndexDescriptor(index, oldUuid, 1, MAPPING, null));
+            final BlobPath oldData = RegisterMap.shardData(BlobPath.cleanPath(), index, oldUuid, 0);
+            store.blobContainer(oldData).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(9L, Map.of()).toBytes());
+            final BlobPath newData = RegisterMap.shardData(BlobPath.cleanPath(), index, newUuid, 0);
+            store.onNextRegisterRead(oldData.buildAsString(), SegmentPublisher.MANIFEST, () -> {
+                try {
+                    assertTrue(plane.deleteIndex(index));
+                    plane.createIndex(new IndexDescriptor(index, newUuid, 1, MAPPING, null));
+                    write(store.blobContainer(newData.add("t=1")), "_0.cfs", "live replacement data");
+                    store.blobContainer(newData)
+                        .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(1L, Map.of("_0.cfs", "t=1")).toBytes());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            final var collector = new GarbageCollector(store, BlobPath.cleanPath());
+            assertTrue(
+                "a sweep of the old incarnation must never delete replacement data",
+                collector.collectShard(plane, index, 0).isEmpty()
+            );
+            assertTrue(store.fired());
+            assertTrue(store.blobContainer(newData.add("t=1")).blobExists("_0.cfs"));
+        }
+    }
+
     /**
      * A prefix pattern counts live names against its cap, not the tombstones of names that used to exist.
      *
