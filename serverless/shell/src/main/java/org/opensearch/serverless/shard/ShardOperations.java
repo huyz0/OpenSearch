@@ -1549,11 +1549,51 @@ public final class ShardOperations {
         boolean refresh,
         boolean abortOnConflict
     ) throws IOException {
-        return gated(
-            org.opensearch.index.reindex.DeleteByQueryAction.NAME,
-            new org.opensearch.index.reindex.DeleteByQueryRequest(index),
-            () -> doDeleteByQuery(index, query, maxDocs, refresh, abortOnConflict)
-        );
+        final var request = new org.opensearch.index.reindex.DeleteByQueryRequest(index).setQuery(query)
+            .setRefresh(refresh)
+            .setAbortOnVersionConflict(abortOnConflict);
+        if (maxDocs != Long.MAX_VALUE) {
+            if (maxDocs < 1 || maxDocs > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("max_docs must be between 1 and " + Integer.MAX_VALUE);
+            }
+            request.setMaxDocs(Math.toIntExact(maxDocs));
+        }
+        return gated(org.opensearch.index.reindex.DeleteByQueryAction.NAME, request, admitted -> {
+            if ((admitted instanceof org.opensearch.index.reindex.DeleteByQueryRequest) == false) {
+                throw new IllegalArgumentException("a delete-by-query filter must provide DeleteByQueryRequest");
+            }
+            final var accepted = (org.opensearch.index.reindex.DeleteByQueryRequest) admitted;
+            final var validation = accepted.validate();
+            if (validation != null) {
+                throw validation;
+            }
+            if (accepted.indices().length != 1 || accepted.getRouting() != null) {
+                throw new UnsupportedOperationException("delete-by-query requires one concrete index and no routing");
+            }
+            final var search = accepted.getSearchRequest();
+            final var acceptedQuery = search.source().query();
+            final var supportedSource = new org.opensearch.index.reindex.DeleteByQueryRequest(accepted.indices()).setQuery(acceptedQuery)
+                .getSearchRequest()
+                .source();
+            if (search.source().equals(supportedSource) == false
+                || search.searchType() != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH
+                || accepted.getSlices() != 1
+                || accepted.getRequestsPerSecond() != Float.POSITIVE_INFINITY
+                || accepted.getShouldStoreResult()) {
+                throw new UnsupportedOperationException(
+                    "delete-by-query search options, slicing, throttling and stored tasks are not supported"
+                );
+            }
+            return doDeleteByQuery(
+                accepted.indices()[0],
+                acceptedQuery,
+                accepted.getMaxDocs() == org.opensearch.index.reindex.AbstractBulkByScrollRequest.MAX_DOCS_ALL_MATCHES
+                    ? Long.MAX_VALUE
+                    : accepted.getMaxDocs(),
+                accepted.isRefresh(),
+                accepted.isAbortOnVersionConflict()
+            );
+        }, org.opensearch.serverless.shell.ActionGate.opaque());
     }
 
     private DeleteByQueryOutcome doDeleteByQuery(
@@ -1563,6 +1603,9 @@ public final class ShardOperations {
         boolean refresh,
         boolean abortOnConflict
     ) throws Exception {
+        if (refuseSystemIndices && node.isSystemIndex(index)) {
+            throw new SystemIndexException(index);
+        }
         final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
 
         // A frozen view, exactly as _pit takes one -- see the class javadoc for why the query is decided

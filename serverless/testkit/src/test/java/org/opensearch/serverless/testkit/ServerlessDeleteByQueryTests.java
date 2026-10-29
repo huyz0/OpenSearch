@@ -99,6 +99,96 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         }
     }
 
+    public static final class DeleteSelectionPlugin extends org.opensearch.plugins.Plugin implements org.opensearch.plugins.ActionPlugin {
+        private final boolean replace;
+
+        DeleteSelectionPlugin(boolean replace) {
+            this.replace = replace;
+        }
+
+        @Override
+        public java.util.List<org.opensearch.action.support.ActionFilter> getActionFilters() {
+            return java.util.List.of(new org.opensearch.action.support.ActionFilter() {
+                @Override
+                public int order() {
+                    return 0;
+                }
+
+                @Override
+                @SuppressWarnings("unchecked")
+                public <
+                    Request extends org.opensearch.action.ActionRequest,
+                    Response extends org.opensearch.core.action.ActionResponse> void apply(
+                        org.opensearch.tasks.Task task,
+                        String action,
+                        Request request,
+                        org.opensearch.action.support.ActionRequestMetadata<Request, Response> metadata,
+                        org.opensearch.core.action.ActionListener<Response> listener,
+                        org.opensearch.action.support.ActionFilterChain<Request, Response> chain
+                    ) {
+                    Request admitted = request;
+                    if (request instanceof org.opensearch.index.reindex.DeleteByQueryRequest original) {
+                        // A security filter must see the selection and limits actually being executed.
+                        if (original.getSearchRequest().source().query() == null
+                            || original.isRefresh() == false
+                            || original.getMaxDocs() != 2) {
+                            listener.onFailure(new IllegalStateException("delete request lost its query, refresh or maximum"));
+                            return;
+                        }
+                        final var restricted = replace
+                            ? new org.opensearch.index.reindex.DeleteByQueryRequest(original.indices())
+                            : original;
+                        restricted.setQuery(org.opensearch.index.query.QueryBuilders.termQuery("keep", false));
+                        restricted.setMaxDocs(1);
+                        restricted.setRefresh(true);
+                        admitted = (Request) restricted;
+                    }
+                    chain.proceed(task, action, admitted, listener);
+                }
+            });
+        }
+    }
+
+    public void testDeleteFiltersCanRestrictTheAdmittedSelectionAndLimits() throws Exception {
+        for (boolean replace : new boolean[] { false, true }) {
+            final var clock = new AtomicLong(1_000L);
+            final var plane = planeOver(createTempDir(), clock);
+            try (
+                var node = new ServerlessNode(nodeSettings("dbq-filter-" + replace), java.util.List.of(new DeleteSelectionPlugin(replace)))
+            ) {
+                node.start();
+                node.setMetadataPlane(plane);
+                prepareSelectionDocuments(node, plane);
+                final var http = node.boundHttpAddress().publishAddress();
+                final var response = send(
+                    http,
+                    "POST",
+                    "/alpha/_delete_by_query?max_docs=2&refresh=true",
+                    "{\"query\":{\"match_all\":{}}}"
+                );
+                assertEquals(response.body(), 200, response.status());
+                assertTrue(response.body(), response.body().contains("\"deleted\":1"));
+                assertEquals(404, send(http, "GET", "/alpha/_doc/both", null).status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/red", null).status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/blue", null).status());
+            }
+        }
+    }
+
+    public void testInvalidMaximumsAreRejectedWithoutDeletingDocuments() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = planeOver(createTempDir(), clock);
+        try (var node = started(metadata, "dbq-invalid-maximum")) {
+            prepareSelectionDocuments(node, metadata);
+            final var http = node.boundHttpAddress().publishAddress();
+            for (String maximum : java.util.List.of("0", "-1", "-9223372036854775808", "2147483648")) {
+                final var response = send(http, "POST", "/alpha/_delete_by_query?max_docs=" + maximum, "{\"query\":{\"match_all\":{}}}");
+                assertEquals(response.body(), 400, response.status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/both", null).status());
+            }
+        }
+    }
+
     public void testUrlQueryOptionsCannotBroadenDeletion() throws Exception {
         final var clock = new AtomicLong(1_000L);
         final var plane = planeOver(createTempDir(), clock);
