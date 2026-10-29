@@ -132,3 +132,7 @@ The MAC also binds the intended receiver and the propagated request headers,
 including caller identity and plugin origin. All members must use the same MAC
 algorithm version; deploy this authentication hardening across the fleet together.
 Header order does not affect authentication.
+
+Unknown secret generations trigger at most one secret-store probe per node per
+second. Requests waiting for a probe receive a retryable 429, so a forged generation
+cannot force a store read per frame or turn a brief key-rotation delay into a 403.
