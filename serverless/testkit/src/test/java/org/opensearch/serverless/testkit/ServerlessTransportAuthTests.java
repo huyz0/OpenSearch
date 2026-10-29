@@ -63,11 +63,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * API and the transport only. The header names and the header's shape are the wire protocol, which a
  * test is entitled to know; nothing here reaches into the router.
  *
- * <p><b>Two headers, for the length of the move.</b> A sender presents both the per-request MAC
- * ({@code generation:sender:timestamp:nonce:mac}) and the static token it replaces, and a receiver
- * verifies the MAC whenever one is presented and falls back to the token only in its absence. So a
- * wrong MAC is refused however good the token beside it is, and a wrong token is only reachable as a
- * refusal from a sender that signs nothing -- which is what a raw send from a stranger is.
+ * <p>Signed sends carry only a per-request MAC. A raw legacy sender can still present a static token,
+ * but presenting a MAC always requires it to verify: a valid token beside a bad MAC is not a fallback.
  *
  * <p><b>D5:</b> {@code FsBlobContainer} only.
  */
@@ -88,6 +85,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
     /** The last forwarded request the interceptor saw leave, and the MAC header it left under. */
     private static final AtomicReference<TransportRequest> LAST_REQUEST = new AtomicReference<>();
     private static final AtomicReference<String> LAST_MAC = new AtomicReference<>();
+    private static final AtomicReference<String> LAST_TOKEN = new AtomicReference<>();
 
     private Settings nodeSettings(String name) {
         return Settings.builder()
@@ -182,6 +180,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
                             if (ForwardedIndexRequest.ACTION.equals(action)) {
                                 LAST_REQUEST.set(request);
                                 LAST_MAC.set(threadContext.getHeader(MAC_HEADER));
+                                LAST_TOKEN.set(threadContext.getHeader(TOKEN_HEADER));
                             }
                             sender.sendRequest(connection, action, request, options, handler);
                         }
@@ -194,14 +193,9 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
     /**
      * A member of the deployment whose MAC does not verify is refused, and nothing is written.
      *
-     * <p>The bad header gets there the way a bad one would in life: it is already in the sender's thread
-     * context, and the router does not overwrite a header that is present. It is well formed -- the right
-     * generation, this sender, a timestamp inside the window, a fresh nonce -- and only the MAC field is
-     * wrong, so what is refused is the signature and not the envelope. The static token beside it is the
-     * deployment's real one, which is the point: a receiver that knows the MAC does not fall back to the
-     * token when the MAC is bad. The write goes out through the node's ordinary client, so what is
-     * refused is the shell's own forward and not a request this test assembled by hand, and the control at
-     * the end -- the same write with nothing planted -- is what says the refusal was about the MAC.
+     * <p>A raw transport send carries an invalid MAC beside a valid legacy token. Verification must
+     * refuse the MAC rather than fall back to the token. The ordinary client send afterwards is the
+     * control proving that a freshly signed forward succeeds.
      */
     public void testAForwardedWriteWithTheWrongMacIsRefused() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -210,7 +204,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
 
         try (
             ServerlessNode owner = new ServerlessNode(nodeSettings("mac-owner"), List.of());
-            ServerlessNode other = new ServerlessNode(nodeSettings("mac-other"), List.of())
+            ServerlessNode other = new ServerlessNode(nodeSettings("mac-other"), List.of(new TransportCapturingPlugin()))
         ) {
             owner.start();
             other.start();
@@ -232,15 +226,17 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
                 + "00112233445566778899aabbccddeeff"
                 + ":"
                 + "0".repeat(64);
+            final TransportService transport = TRANSPORT.get();
+            transport.connectToNode(owner.localNode());
+            final ForwardedIndexRequest write = new ForwardedIndexRequest("alpha", 0, "k", "{\"msg\":\"wrong mac\",\"n\":1}", true);
             final ThreadContext context = other.threadPool().getThreadContext();
             final Exception refused;
             try (ThreadContext.StoredContext ignored = context.stashContext()) {
                 context.putHeader(MAC_HEADER, tampered);
+                context.putHeader(TOKEN_HEADER, other.transportToken());
                 refused = expectThrows(
                     Exception.class,
-                    () -> other.client()
-                        .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"wrong mac\",\"n\":1}", XContentType.JSON))
-                        .actionGet()
+                    () -> sendRaw(transport, owner.localNode(), write).actionGet(TimeValue.timeValueSeconds(30))
                 );
             }
             assertTrue("refused for the signature, not for something else: " + describe(refused), mentions(refused, "transport token"));
@@ -349,6 +345,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             final String mac = LAST_MAC.get();
             assertNotNull("the interceptor must have seen the forwarded write", captured);
             assertNotNull("and the MAC it left under", mac);
+            assertNull("a signed frame must not expose a reusable deployment token", LAST_TOKEN.get());
 
             // The same bytes under the same header, from a transport that is otherwise a member in good
             // standing: the receiver refuses on the nonce, not on who is asking.

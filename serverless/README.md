@@ -123,3 +123,7 @@ Size this for peak incoming forwarded requests per second multiplied by twice th
 lease TTL in seconds. The factor of two covers accepted sender clock skew. Higher
 capacity uses proportionally more heap. Expiration is ordered by signed timestamp,
 so out-of-order delivery does not delay reclaiming expired entries.
+
+Signed transport requests carry a fresh MAC for each hop and omit the reusable
+deployment token. Receivers retain token verification for legacy unsigned senders;
+MAC-capable senders therefore require MAC-capable receivers.

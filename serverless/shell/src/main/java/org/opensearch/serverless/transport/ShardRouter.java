@@ -403,8 +403,8 @@ public final class ShardRouter {
      * anything goes on, so closing the try takes it off again; this used to return a no-op and the secret
      * lingered on the REST request's context, riding every later outgoing call from it.
      *
-     * <p>During the move from the static token to the per-request MAC both are presented: a receiver that
-     * knows the MAC prefers it, one that does not still finds the token.
+     * <p>Each hop signs afresh. A signed frame carries no reusable deployment token; legacy token
+     * authentication remains available only when this node cannot yet sign.
      *
      * <p>Package-private rather than private because {@link PluginHopAuthentication} signs a plugin's own
      * transport request with it. One implementation, so a plugin's hop and the shell's own are authenticated
@@ -415,19 +415,35 @@ public final class ShardRouter {
         org.opensearch.transport.TransportRequest request
     ) throws IOException {
         final org.opensearch.common.util.concurrent.ThreadContext context = transportService.getThreadPool().getThreadContext();
-        final org.opensearch.common.util.concurrent.ThreadContext.StoredContext restore = context.newStoredContext(false);
         final String mac = authenticator.sign(action, request);
-        if (mac != null && context.getHeader(TransportAuthenticator.MAC_HEADER) == null) {
-            context.putHeader(TransportAuthenticator.MAC_HEADER, mac);
+        final java.util.Map<String, String> headers = new java.util.HashMap<>(context.getHeaders());
+        headers.remove(TransportAuthenticator.MAC_HEADER);
+        headers.remove(TOKEN_HEADER);
+        if (context.getTransient(PLUGIN_SUBJECT_TRANSIENT) != null) {
+            headers.put(PLUGIN_ORIGIN_HEADER, "true");
         }
-        final String token = node.transportToken();
-        if (token != null && context.getHeader(TOKEN_HEADER) == null) {
-            context.putHeader(TOKEN_HEADER, token);
+        final var restore = context.stashContext();
+        try {
+            // stashContext preserves task headers and registered transient propagators. Copy the caller's
+            // remaining headers, but never reuse another hop's authentication for this request.
+            for (var entry : headers.entrySet()) {
+                if (context.getHeader(entry.getKey()) == null) {
+                    context.putHeader(entry.getKey(), entry.getValue());
+                }
+            }
+            if (mac != null) {
+                context.putHeader(TransportAuthenticator.MAC_HEADER, mac);
+            } else {
+                final String token = node.transportToken();
+                if (token != null) {
+                    context.putHeader(TOKEN_HEADER, token);
+                }
+            }
+            return restore;
+        } catch (RuntimeException e) {
+            restore.close();
+            throw e;
         }
-        if (context.getTransient(PLUGIN_SUBJECT_TRANSIENT) != null && context.getHeader(PLUGIN_ORIGIN_HEADER) == null) {
-            context.putHeader(PLUGIN_ORIGIN_HEADER, "true");
-        }
-        return restore;
     }
 
     /**
