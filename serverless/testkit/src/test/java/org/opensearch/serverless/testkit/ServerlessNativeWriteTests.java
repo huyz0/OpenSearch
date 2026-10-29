@@ -113,6 +113,26 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
         }
     }
 
+    public void testGeneratedIdsStayOnTheRequestForReuseAndRetry() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = plane(clock);
+        try (var owner = new ServerlessNode(settings("native-id-owner")); var peer = new ServerlessNode(settings("native-id-peer"))) {
+            attach(owner, plane);
+            attach(peer, plane);
+            own(owner, plane, clock);
+            for (var via : List.of(owner, peer)) {
+                final var request = new IndexRequest("alpha").source("{\"msg\":\"generated\"}", XContentType.JSON);
+                final var created = via.client().index(request).actionGet();
+                assertNotNull(created.getId());
+                assertEquals("the caller must know the id even if it later needs to retry", created.getId(), request.id());
+                final var repeated = via.client().index(request).actionGet();
+                assertEquals(created.getId(), repeated.getId());
+                assertEquals(DocWriteResponse.Result.UPDATED, repeated.getResult());
+                assertEquals(2L, repeated.getVersion());
+            }
+        }
+    }
+
     public void testUnsupportedWriteDirectivesAreRefusedBeforeApplying() throws Exception {
         final var clock = new AtomicLong(1_000L);
         final var plane = plane(clock);
