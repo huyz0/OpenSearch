@@ -59,6 +59,19 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
         );
     }
 
+    public void testNonpositiveLeaseTtlIsRefusedBeforeStartingTheNode() {
+        for (long ttl : new long[] { 0L, -1L, Long.MIN_VALUE }) {
+            final Settings settings = Settings.builder()
+                .put(bootSettings("invalid-lease-ttl", createTempDir()))
+                .put(ServerlessBootstrap.LEASE_TTL, ttl)
+                // No node may start: the network setting would fail first if TTL validation were late.
+                .put("network.host", "invalid.invalid")
+                .build();
+            final var failure = expectThrows(IllegalArgumentException.class, () -> ServerlessBootstrap.start(settings));
+            assertTrue(failure.getMessage(), failure.getMessage().contains(ServerlessBootstrap.LEASE_TTL));
+        }
+    }
+
     /**
      * The whole of M13 in one test: start a process, create an index over HTTP, write to it, search it
      * back, and observe that the node took the shard, renewed its lease and published a commit without
