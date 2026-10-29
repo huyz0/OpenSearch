@@ -332,7 +332,7 @@ public final class DocumentHandler extends BaseRestHandler {
         final int shard = DocumentRouting.shardFor(descriptor.get(), id);
         // A single write is accounted the same way a batch is, for the same reason: a flood of large
         // documents is a flood of large documents whether or not they arrived together.
-        final long inFlightBytes = shapedSource == null ? 0L : shapedSource.length();
+        final long inFlightBytes = org.opensearch.serverless.store.WalRecord.contentBytes(id, deletion ? null : shapedSource);
         // The write, applied here to a shard open here: the ordinary path, and the one a write waiting for its
         // shard to be taken resumes on.
         final java.util.function.BiConsumer<org.opensearch.rest.RestChannel, ShardId> writeHere = (channel, into) -> {
@@ -427,7 +427,7 @@ public final class DocumentHandler extends BaseRestHandler {
                     // write is: the bytes are held here until the owner answers, whichever node applies them.
                     try (
                         org.opensearch.common.lease.Releasable forwarded = serving.indexingPressure()
-                            .markCoordinatingOperationStarted(shapedSource == null ? 0L : shapedSource.length(), false)
+                            .markCoordinatingOperationStarted(inFlightBytes, false)
                     ) {
                         String forwardTarget = owner;
                         org.opensearch.serverless.transport.ForwardedIndexResponse ack;
@@ -592,7 +592,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
                     try (
                         org.opensearch.common.lease.Releasable forwarded = serving.indexingPressure()
-                            .markCoordinatingOperationStarted(shapedSource == null ? 0L : shapedSource.length(), false)
+                            .markCoordinatingOperationStarted(inFlightBytes, false)
                     ) {
                         final var ack = forwardTo(
                             serving,
