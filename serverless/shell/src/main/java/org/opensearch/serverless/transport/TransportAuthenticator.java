@@ -58,6 +58,10 @@ public final class TransportAuthenticator {
     private final LongSupplier clock;
     private final LongSupplier windowMillis;
     private final NonceCache seen;
+    private final LongSupplier probeClock;
+    private boolean secretProbeRunning;
+    private long lastSecretProbe = Long.MIN_VALUE;
+    private static final long SECRET_PROBE_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1L);
 
     /**
      * Creates the authenticator.
@@ -96,9 +100,22 @@ public final class TransportAuthenticator {
         LongSupplier windowMillis,
         int capacity
     ) {
+        this(secrets, refresh, localNodeId, clock, windowMillis, capacity, System::nanoTime);
+    }
+
+    TransportAuthenticator(
+        Supplier<MetadataPlane.TransportSecrets> secrets,
+        Runnable refresh,
+        Supplier<String> localNodeId,
+        LongSupplier clock,
+        LongSupplier windowMillis,
+        int capacity,
+        LongSupplier probeClock
+    ) {
         if (capacity < 1) {
             throw new IllegalArgumentException("transport replay cache capacity must be positive");
         }
+        this.probeClock = probeClock;
         this.secrets = secrets;
         this.refresh = refresh;
         this.localNodeId = localNodeId;
@@ -203,9 +220,26 @@ public final class TransportAuthenticator {
             throw refuse("this node has no transport secret yet");
         }
         if (generation > current.generation()) {
-            // A newer generation exists that this node has not read: the register, not the cache, answers.
-            refresh.run();
+            // The claimed generation has not been authenticated yet. Bound probes independently of the
+            // wall clock so arbitrary headers cannot buy one object-store read each, even with frozen clocks.
+            if (beginSecretProbe()) {
+                try {
+                    refresh.run();
+                } finally {
+                    endSecretProbe();
+                }
+            } else {
+                final MetadataPlane.TransportSecrets latest = secrets.get();
+                if (latest != null && generation > latest.generation()) {
+                    throw new org.opensearch.core.concurrency.OpenSearchRejectedExecutionException(
+                        "transport secret refresh is pending or rate limited; retry after one second"
+                    );
+                }
+            }
             current = secrets.get();
+            if (current == null) {
+                throw refuse("this node has no transport secret yet");
+            }
         }
         final String key;
         if (generation == current.generation()) {
@@ -223,6 +257,20 @@ public final class TransportAuthenticator {
         if (seen.remember(sender + ":" + nonceHex, timestamp) == false) {
             throw refuse("replayed forwarded request or transport replay cache full");
         }
+    }
+
+    private synchronized boolean beginSecretProbe() {
+        final long now = probeClock.getAsLong();
+        if (secretProbeRunning || (lastSecretProbe != Long.MIN_VALUE && now - lastSecretProbe < SECRET_PROBE_INTERVAL_NANOS)) {
+            return false;
+        }
+        lastSecretProbe = now;
+        secretProbeRunning = true;
+        return true;
+    }
+
+    private synchronized void endSecretProbe() {
+        secretProbeRunning = false;
     }
 
     private static byte[] mac(
