@@ -28,6 +28,26 @@ public class TransportAuthenticationContextTests extends OpenSearchTestCase {
         authenticator("receiver").verify("action", request, mac, Map.of());
     }
 
+    public void testCapturedFrameCannotReplayAfterReceiverRestarts() throws Exception {
+        final var before = new org.opensearch.cluster.node.DiscoveryNode(
+            "receiver",
+            buildNewFakeTransportAddress(),
+            org.opensearch.Version.CURRENT
+        );
+        final var after = new org.opensearch.cluster.node.DiscoveryNode("receiver", before.getAddress(), org.opensearch.Version.CURRENT);
+        assertEquals(before.getId(), after.getId());
+        assertNotEquals(before.getEphemeralId(), after.getEphemeralId());
+        final var request = new GetRequest("index", "id");
+        final var sender = authenticator("sender");
+        final String captured = sender.sign("action", request, TransportAuthenticator.identity(before), Map.of());
+        authenticator(TransportAuthenticator.identity(before)).verify("action", request, captured, Map.of());
+        // The replacement has an empty replay cache, so only the receiver incarnation prevents replay.
+        final var replacement = authenticator(TransportAuthenticator.identity(after));
+        expectThrows(OpenSearchSecurityException.class, () -> replacement.verify("action", request, captured, Map.of()));
+        final String fresh = sender.sign("action", request, TransportAuthenticator.identity(after), Map.of());
+        replacement.verify("action", request, fresh, Map.of());
+    }
+
     public void testCallerAndPluginOriginCannotBeChanged() throws Exception {
         final var request = new GetRequest("index", "id");
         final Map<String, String> headers = Map.of("caller", "alice", ShardRouter.PLUGIN_ORIGIN_HEADER, "false");
