@@ -275,63 +275,99 @@ public final class ServerlessBootstrap implements Closeable {
         final long bootAt = System.nanoTime();
         final ServerlessNode node = new ServerlessNode(complete);
         logger.info("startup: node built in {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
-        node.start();
-        node.projector().setReuseProjections(complete.getAsBoolean(VIEW_REUSE, true));
-        node.setRouteTakeovers(complete.getAsBoolean(ROUTE_TAKEOVERS, true));
-        logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
+        org.opensearch.serverless.store.ObjectStores.Handle openedStore = null;
+        MetadataPlane openedPlane = null;
+        BackgroundReconciler openedLoop = null;
+        ReconcileScheduler openedScheduler = null;
+        try {
+            node.start();
+            node.projector().setReuseProjections(complete.getAsBoolean(VIEW_REUSE, true));
+            node.setRouteTakeovers(complete.getAsBoolean(ROUTE_TAKEOVERS, true));
+            logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
 
-        final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(
-            complete,
-            node.clusterService(),
-            configPath
-        );
-        final MetadataPlane plane = new MetadataPlane(store.blobStore(), BlobPath.cleanPath(), System::currentTimeMillis, ttl);
-        logger.info("startup: store open at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
-        node.setMetadataPlane(plane);
-        logger.info("startup: lease published at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
-        node.setHeadVerifyIntervalMillis(complete.getAsLong(HEAD_VERIFY_INTERVAL, DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS));
-        node.setDescriptorRefreshIntervalMillis(
-            complete.getAsLong(DESCRIPTOR_REFRESH_INTERVAL, DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS)
-        );
+            final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(
+                complete,
+                node.clusterService(),
+                configPath
+            );
+            openedStore = store;
+            final MetadataPlane plane = new MetadataPlane(store.blobStore(), BlobPath.cleanPath(), System::currentTimeMillis, ttl);
+            openedPlane = plane;
+            logger.info("startup: store open at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
+            node.setMetadataPlane(plane);
+            logger.info(
+                "startup: lease published at {} ms",
+                java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt)
+            );
+            node.setHeadVerifyIntervalMillis(complete.getAsLong(HEAD_VERIFY_INTERVAL, DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS));
+            node.setDescriptorRefreshIntervalMillis(
+                complete.getAsLong(DESCRIPTOR_REFRESH_INTERVAL, DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS)
+            );
 
-        final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(
-            complete.getAsBoolean(ON_DEMAND, true)
-        )
-            .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
-            .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))
-            .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS))
-            .setActivationConcurrency(complete.getAsInt(ACTIVATION_CONCURRENCY, BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY))
-            .setActivationTargetMillis(complete.getAsLong(ACTIVATION_TARGET, BackgroundReconciler.DEFAULT_ACTIVATION_TARGET_MILLIS))
-            .setAdaptiveActivation(complete.getAsBoolean(ACTIVATION_ADAPTIVE, false))
-            .setTakeoverOvercommit(complete.getAsDouble(TAKEOVER_OVERCOMMIT, BackgroundReconciler.DEFAULT_TAKEOVER_OVERCOMMIT))
-            .setActivationPacedByWrites(complete.getAsBoolean(ACTIVATION_PACED, false));
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            openedLoop = loop;
+            loop.setDemandDrivenActivation(complete.getAsBoolean(ON_DEMAND, true))
+                .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
+                .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))
+                .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS))
+                .setActivationConcurrency(complete.getAsInt(ACTIVATION_CONCURRENCY, BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY))
+                .setActivationTargetMillis(complete.getAsLong(ACTIVATION_TARGET, BackgroundReconciler.DEFAULT_ACTIVATION_TARGET_MILLIS))
+                .setAdaptiveActivation(complete.getAsBoolean(ACTIVATION_ADAPTIVE, false))
+                .setTakeoverOvercommit(complete.getAsDouble(TAKEOVER_OVERCOMMIT, BackgroundReconciler.DEFAULT_TAKEOVER_OVERCOMMIT))
+                .setActivationPacedByWrites(complete.getAsBoolean(ACTIVATION_PACED, false));
 
-        final ReconcileScheduler scheduler = new ReconcileScheduler(
-            loop,
-            node.threadPool(),
-            plane.clock(),
-            org.opensearch.common.unit.TimeValue.timeValueMillis(Math.max(1L, ttl / ReconcileScheduler.RENEWALS_PER_TTL)),
-            org.opensearch.common.unit.TimeValue.timeValueMillis(
-                complete.getAsLong(PUBLISH_DEBOUNCE, ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
-            ),
-            ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
-        );
-        node.setSignals(scheduler);
-        final long janitorMillis = complete.getAsLong(JANITOR_INTERVAL, DEFAULT_JANITOR_INTERVAL_MILLIS);
-        if (janitorMillis > 0) {
-            scheduler.setJanitorInterval(org.opensearch.common.unit.TimeValue.timeValueMillis(janitorMillis));
+            final ReconcileScheduler scheduler = new ReconcileScheduler(
+                loop,
+                node.threadPool(),
+                plane.clock(),
+                org.opensearch.common.unit.TimeValue.timeValueMillis(Math.max(1L, ttl / ReconcileScheduler.RENEWALS_PER_TTL)),
+                org.opensearch.common.unit.TimeValue.timeValueMillis(
+                    complete.getAsLong(PUBLISH_DEBOUNCE, ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
+                ),
+                ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
+            );
+            openedScheduler = scheduler;
+            node.setSignals(scheduler);
+            final long janitorMillis = complete.getAsLong(JANITOR_INTERVAL, DEFAULT_JANITOR_INTERVAL_MILLIS);
+            if (janitorMillis > 0) {
+                scheduler.setJanitorInterval(org.opensearch.common.unit.TimeValue.timeValueMillis(janitorMillis));
+            }
+            scheduler.start();
+
+            logger.info(
+                "serverless node [{}] running: {} store, lease ttl {}ms, http {}, on-demand activation {}",
+                node.localNode().getName(),
+                storeType,
+                ttl,
+                node.boundHttpAddress().publishAddress(),
+                complete.getAsBoolean(ON_DEMAND, true)
+            );
+            return new ServerlessBootstrap(node, plane, loop, scheduler, store);
+        } catch (Exception | Error failure) {
+            // Stop every producer before releasing the address-book entry, keeping the store open until last.
+            closeAfterFailedStart(failure, openedScheduler, openedLoop, node);
+            if (openedPlane != null) {
+                try {
+                    openedPlane.membership().release(node.localNode().getId());
+                } catch (Exception cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            closeAfterFailedStart(failure, openedStore);
+            throw failure;
         }
-        scheduler.start();
+    }
 
-        logger.info(
-            "serverless node [{}] running: {} store, lease ttl {}ms, http {}, on-demand activation {}",
-            node.localNode().getName(),
-            storeType,
-            ttl,
-            node.boundHttpAddress().publishAddress(),
-            complete.getAsBoolean(ON_DEMAND, true)
-        );
-        return new ServerlessBootstrap(node, plane, loop, scheduler, store);
+    private static void closeAfterFailedStart(Throwable failure, java.io.Closeable... resources) {
+        for (java.io.Closeable resource : resources) {
+            if (resource != null) {
+                try {
+                    resource.close();
+                } catch (Exception cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+        }
     }
 
     private static Path configPath(Settings settings) {
