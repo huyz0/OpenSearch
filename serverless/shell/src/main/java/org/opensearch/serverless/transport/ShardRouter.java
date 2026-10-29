@@ -295,27 +295,35 @@ public final class ShardRouter {
 
     private void handleGet(ForwardedGetRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         requireMac(ForwardedGetRequest.ACTION, request);
-        final ShardId shardId = writerShard(request.index(), request.shard());
+        final ShardId shardId = writerShard(request.index(), request.shard(), request.indexUuid());
         if (shardId == null) {
             // Refuse rather than open it as a reader, which is what handleSearch does here and is right
             // there. A get was forwarded to this node precisely because the shard-head named it the
             // owner; if the shard is not open as a writer, that head is stale, and answering from a
             // published commit would return a stale document to a caller that asked for a fresh one.
             // Failing sends the caller back to re-read the head, which is the only thing that fixes it.
-            throw new NotShardOwnerException(request.index(), request.shard(), whyNotHeld(request.index(), request.shard(), null));
+            throw new NotShardOwnerException(
+                request.index(),
+                request.shard(),
+                whyNotHeld(request.index(), request.shard(), request.indexUuid())
+            );
         }
         channel.sendResponse(new ForwardedGetResponse(node.localNode().getId(), node.get(shardId, request.id())));
     }
 
     private void handleExplain(ForwardedExplainRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         requireMac(ForwardedExplainRequest.ACTION, request);
-        final ShardId shardId = writerShard(request.index(), request.shard());
+        final ShardId shardId = writerShard(request.index(), request.shard(), request.indexUuid());
         if (shardId == null) {
             // Refused rather than opened as a reader, following handleGet and not handleSearch. An explain
             // was forwarded here because the shard-head named this node the owner; if the shard is not open
             // as a writer that head is stale, and explaining from a published commit would score against
             // segment statistics that are missing every unpublished write. The number would look right.
-            throw new NotShardOwnerException(request.index(), request.shard(), whyNotHeld(request.index(), request.shard(), null));
+            throw new NotShardOwnerException(
+                request.index(),
+                request.shard(),
+                whyNotHeld(request.index(), request.shard(), request.indexUuid())
+            );
         }
         final ShardExplain.Outcome outcome = node.explain(shardId, request.id(), request.query());
         channel.sendResponse(new ForwardedExplainResponse(node.localNode().getId(), outcome.exists(), outcome.explanation()));
@@ -580,18 +588,6 @@ public final class ShardRouter {
             return "it is open here only as a search reader";
         }
         return "the shard-head no longer names this node";
-    }
-
-    /**
-     * The shard as this node holds it for writing, or null if it holds it only as a search reader.
-     *
-     * <p>A forwarded get or explain was sent here because the head named this node the owner. A reader
-     * opened for a search is a published commit, not the owner's live shard, and answering from it
-     * stamped {@code realtime: true} on a document that was missing every unpublished write.
-     */
-    private ShardId writerShard(String index, int shard) {
-        final ShardId found = localShard(index, shard);
-        return found == null || node.reconciler().readerShards().contains(found) ? null : found;
     }
 
     private ShardId localShard(String index, int shard) {

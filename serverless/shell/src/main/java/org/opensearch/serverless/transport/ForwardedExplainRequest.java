@@ -28,6 +28,7 @@ public final class ForwardedExplainRequest extends TransportRequest {
     public static final String ACTION = "internal:serverless/explain/shard";
 
     private final String index;
+    private final String indexUuid;
     private final int shard;
     private final String id;
     private final QueryBuilder query;
@@ -41,6 +42,20 @@ public final class ForwardedExplainRequest extends TransportRequest {
      * @param query the query to score it against
      */
     public ForwardedExplainRequest(String index, int shard, String id, QueryBuilder query) {
+        this(index, null, shard, id, query);
+    }
+
+    /**
+     * Creates an explain bound to the resolved index incarnation.
+     *
+     * @param index the index name
+     * @param indexUuid the resolved UUID, or null to match by name
+     * @param shard the shard number
+     * @param id the document id
+     * @param query the query to score
+     */
+    public ForwardedExplainRequest(String index, String indexUuid, int shard, String id, QueryBuilder query) {
+        this.indexUuid = indexUuid;
         this.index = index;
         this.shard = shard;
         this.id = id;
@@ -56,6 +71,7 @@ public final class ForwardedExplainRequest extends TransportRequest {
     public ForwardedExplainRequest(StreamInput in) throws IOException {
         super(in);
         this.index = in.readString();
+        this.indexUuid = in.readOptionalString();
         this.shard = in.readVInt();
         this.id = in.readString();
         this.query = in.readNamedWriteable(QueryBuilder.class);
@@ -65,6 +81,7 @@ public final class ForwardedExplainRequest extends TransportRequest {
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeString(index);
+        out.writeOptionalString(indexUuid);
         out.writeVInt(shard);
         out.writeString(id);
         out.writeNamedWriteable(query);
@@ -77,6 +94,15 @@ public final class ForwardedExplainRequest extends TransportRequest {
      */
     public String index() {
         return index;
+    }
+
+    /**
+     * Returns the resolved index incarnation.
+     *
+     * @return the UUID, or null for a name-only request
+     */
+    public String indexUuid() {
+        return indexUuid;
     }
 
     /**

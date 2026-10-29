@@ -99,6 +99,56 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
         }
     }
 
+    public void testForwardedReadsRefuseADifferentIndexIncarnation() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock);
+        final String uuid = "uuid-alpha-current";
+        plane.createIndex(new IndexDescriptor("alpha", uuid, 2, MAPPING, null));
+        try (
+            Pair pair = new Pair(
+                new ServerlessNode(nodeSettings("read-uuid-a")),
+                new ServerlessNode(nodeSettings("read-uuid-b")),
+                plane,
+                clock
+            )
+        ) {
+            final var router = pair.a.router();
+            final var peer = router.peer(pair.b.localNode().getId()).orElseThrow();
+            final var getFailure = expectThrows(
+                Exception.class,
+                () -> router.forwardGet(
+                    peer,
+                    new org.opensearch.serverless.transport.ForwardedGetRequest("alpha", "uuid-alpha-deleted", 1, "doc")
+                )
+            );
+            assertEquals(
+                org.opensearch.serverless.transport.ForwardFailure.NOT_OWNER,
+                org.opensearch.serverless.transport.ForwardFailure.classify(getFailure)
+            );
+            final var query = org.opensearch.index.query.QueryBuilders.matchAllQuery();
+            final var explainFailure = expectThrows(
+                Exception.class,
+                () -> router.forwardExplain(
+                    peer,
+                    new org.opensearch.serverless.transport.ForwardedExplainRequest("alpha", "uuid-alpha-deleted", 1, "doc", query)
+                )
+            );
+            assertEquals(
+                org.opensearch.serverless.transport.ForwardFailure.NOT_OWNER,
+                org.opensearch.serverless.transport.ForwardFailure.classify(explainFailure)
+            );
+            assertFalse(
+                router.forwardGet(peer, new org.opensearch.serverless.transport.ForwardedGetRequest("alpha", uuid, 1, "doc"))
+                    .document()
+                    .found()
+            );
+            assertFalse(
+                router.forwardExplain(peer, new org.opensearch.serverless.transport.ForwardedExplainRequest("alpha", uuid, 1, "doc", query))
+                    .exists()
+            );
+        }
+    }
+
     /**
      * Two nodes forwarding writes to each other at once do not wait on each other's write pools.
      *
