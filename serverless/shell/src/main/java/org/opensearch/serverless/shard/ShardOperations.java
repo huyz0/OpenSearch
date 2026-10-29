@@ -1881,10 +1881,10 @@ public final class ShardOperations {
             final String result;
             if (existing.found() == false) {
                 if (docAsUpsert) {
-                    merged = doc;
+                    merged = org.opensearch.ingest.IngestDocument.deepCopyMap(doc);
                     result = "created";
                 } else if (upsert != null) {
-                    merged = upsert;
+                    merged = org.opensearch.ingest.IngestDocument.deepCopyMap(upsert);
                     result = "created";
                 } else {
                     throw new DocumentMissingException(index, id);
@@ -1910,13 +1910,24 @@ public final class ShardOperations {
                 // UpdateScript defines rather than one chosen here.
                 final java.util.Map<String, Object> ctx = new java.util.HashMap<>();
                 ctx.put("_source", merged);
-                ctx.put("_index", index);
-                ctx.put("_id", id);
-                ctx.put("_version", existing.found() ? existing.version() : 0L);
-                ctx.put("op", "index");
+                ctx.put("_now", node.threadPool().absoluteTimeInMillis());
+                ctx.put("op", existing.found() ? "index" : "create");
+                if (existing.found()) {
+                    ctx.put("_index", index);
+                    ctx.put("_id", id);
+                    ctx.put("_version", existing.version());
+                    ctx.put("_routing", null);
+                }
                 final var factory = node.scriptService().compile(script, org.opensearch.script.UpdateScript.CONTEXT);
                 factory.newInstance(script.getParams(), ctx).execute();
-                operation = String.valueOf(ctx.getOrDefault("op", "index"));
+                operation = (String) ctx.get("op");
+                // Core permits only create for an upsert, and index/delete for an existing
+                // document. Every other script operation is a noop, including unknown values.
+                if (existing.found()
+                    ? "index".equals(operation) == false && "delete".equals(operation) == false
+                    : "create".equals(operation) == false) {
+                    operation = "noop";
+                }
                 @SuppressWarnings("unchecked")
                 final java.util.Map<String, Object> edited = (java.util.Map<String, Object>) ctx.get("_source");
                 // A script usually mutates ctx._source in place, in which case it *is* this map and there is
