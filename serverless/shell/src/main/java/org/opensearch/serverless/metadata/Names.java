@@ -117,6 +117,7 @@ public final class Names {
         if (prefix.isEmpty()) {
             return;
         }
+        validateUnicode(prefix, "index pattern");
         if (prefix.getBytes(StandardCharsets.UTF_8).length > MAX_BYTES) {
             throw new IllegalArgumentException("Invalid index pattern [" + prefix + "*], too long");
         }
@@ -139,6 +140,7 @@ public final class Names {
         if (name == null || name.isEmpty()) {
             throw new IllegalArgumentException("Invalid " + what + " name [" + name + "], must not be empty");
         }
+        validateUnicode(name, what);
         if (name.getBytes(StandardCharsets.UTF_8).length > MAX_BYTES) {
             throw new IllegalArgumentException(
                 "Invalid "
@@ -158,4 +160,18 @@ public final class Names {
             }
         }
     }
+
+    private static void validateUnicode(String name, String what) {
+        for (int i = 0; i < name.length(); i++) {
+            final char c = name.charAt(i);
+            if (Character.isSurrogate(c)) {
+                if (Character.isHighSurrogate(c) && i + 1 < name.length() && Character.isLowSurrogate(name.charAt(i + 1))) {
+                    i++;
+                } else {
+                    throw new IllegalArgumentException("Invalid " + what + ": unpaired Unicode surrogate at position " + i);
+                }
+            }
+        }
+    }
+
 }
