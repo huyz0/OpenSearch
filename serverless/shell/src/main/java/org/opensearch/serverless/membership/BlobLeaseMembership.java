@@ -141,6 +141,9 @@ public final class BlobLeaseMembership implements MembershipSource {
      * @param ttlMillis how far ahead a renewal stamps its expiry
      */
     public BlobLeaseMembership(BlobContainer container, LongSupplier clock, long ttlMillis) {
+        if (ttlMillis <= 0L) {
+            throw new IllegalArgumentException("lease TTL must be positive, got " + ttlMillis);
+        }
         this.container = container;
         this.clock = clock;
         this.ttlMillis = ttlMillis;

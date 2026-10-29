@@ -257,6 +257,9 @@ public final class ServerlessBootstrap implements Closeable {
             );
         }
         final long ttl = settings.getAsLong(LEASE_TTL, DEFAULT_LEASE_TTL_MILLIS);
+        if (ttl <= 0L) {
+            throw new IllegalArgumentException(LEASE_TTL + " must be positive, got " + ttl);
+        }
 
         // Secure settings, before anything reads them. An object store's credentials are SecureSettings
         // and live in the keystore, so without this a deployed node has no way to be given any: the shell

@@ -43,6 +43,15 @@ public class BlobLeaseMembershipTests extends OpenSearchTestCase {
         return new NodeLease(id, id + "-eph", "127.0.0.1:9300", Set.of(roles), 0L);
     }
 
+    public void testNonpositiveLeaseTtlIsRefused() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(BlobPath.cleanPath());
+            for (long ttl : new long[] { 0L, -1L, Long.MIN_VALUE }) {
+                expectThrows(IllegalArgumentException.class, () -> new BlobLeaseMembership(container, () -> 1_000L, ttl));
+            }
+        }
+    }
+
     /**
      * Two takers revoking one dead node's lease at once are both told it is revoked.
      *
