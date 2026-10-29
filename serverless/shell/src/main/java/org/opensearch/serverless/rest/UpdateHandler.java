@@ -25,20 +25,9 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * {@code POST /{index}/_update/{id}} — a partial-document merge, read then written back.
- *
- * <p><b>Not a transaction on its own, but it can be made one.</b> The read and the write are two separate
- * calls with nothing holding the document still in between, so an unconditional update silently overwrites
- * a write that lands in that window — the same as two plain writes racing. What has changed is that the
- * caller can now close that window itself: {@code if_seq_no} and {@code if_primary_term} are accepted here
- * and passed to the write, so read-modify-write with a retry loop is the compare-and-swap classic
- * OpenSearch's own {@code _update} performs internally. Unconditional remains the default, and remains
- * best-effort; the response carries the {@code _seq_no} a retry would condition on.
- *
- * <p><b>{@code script} and {@code scripted_upsert} are refused</b>, for the same reason scripting is refused
- * everywhere else on this surface — no engine is registered, and a plugin gets core's own "no lang
- * registered" rather than this shell approximating one. {@code doc}, {@code upsert}, {@code doc_as_upsert}
- * and {@code detect_noop} are the whole of what this endpoint understands.
+ * {@code POST /{index}/_update/{id}} merges or scripts a document, then conditionally writes
+ * against the sequence identity it read. Conflicting writes may be retried from a fresh read.
+ * Native parsing and validation keep the accepted body consistent with core's update API.
  */
 public final class UpdateHandler extends BaseRestHandler {
 
@@ -56,50 +45,6 @@ public final class UpdateHandler extends BaseRestHandler {
         this.plane = plane;
     }
 
-    /**
-     * Reads the {@code script} field, in either shape a client sends it.
-     *
-     * <p>A bare string is shorthand for a painless source; an object may name {@code source}, {@code lang},
-     * {@code params} or an {@code id}. A stored script is refused by name rather than compiled, because
-     * resolving one goes through cluster state this design does not have.
-     *
-     * @param given the script field's value
-     * @return the parsed script
-     */
-    private static org.opensearch.script.Script parseScript(Object given) {
-        if (given instanceof String source) {
-            return new org.opensearch.script.Script(source);
-        }
-        if (given instanceof java.util.Map<?, ?> map) {
-            @SuppressWarnings("unchecked")
-            final java.util.Map<String, Object> storedParams = map.get("params") instanceof java.util.Map
-                ? (java.util.Map<String, Object>) map.get("params")
-                : java.util.Map.of();
-            if (map.get("id") != null) {
-                // A stored script, resolved by the script service from this deployment's own register.
-                return new org.opensearch.script.Script(
-                    org.opensearch.script.ScriptType.STORED,
-                    null,
-                    String.valueOf(map.get("id")),
-                    storedParams
-                );
-            }
-            final Object source = map.get("source");
-            if (source == null) {
-                throw new IllegalArgumentException("a script needs a 'source'");
-            }
-            final String lang = map.get("lang") == null
-                ? org.opensearch.script.Script.DEFAULT_SCRIPT_LANG
-                : String.valueOf(map.get("lang"));
-            @SuppressWarnings("unchecked")
-            final java.util.Map<String, Object> params = map.get("params") instanceof java.util.Map
-                ? (java.util.Map<String, Object>) map.get("params")
-                : java.util.Map.of();
-            return new org.opensearch.script.Script(org.opensearch.script.ScriptType.INLINE, lang, String.valueOf(source), params);
-        }
-        throw new IllegalArgumentException("'script' must be a string or an object");
-    }
-
     @Override
     public String getName() {
         return "serverless_update_action";
@@ -111,7 +56,6 @@ public final class UpdateHandler extends BaseRestHandler {
     }
 
     @Override
-    @SuppressWarnings("unchecked")
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         // Every parameter read before any early return, or BaseRestHandler turns a deliberate refusal
         // into a 400 about an unconsumed parameter.
@@ -196,20 +140,14 @@ public final class UpdateHandler extends BaseRestHandler {
                 )
             );
         }
-        final long ifSeqNo;
-        final long ifPrimaryTerm;
-        try {
-            ifSeqNo = ifSeqNoParam == null ? org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO : Long.parseLong(ifSeqNoParam);
-            ifPrimaryTerm = ifPrimaryTermParam == null ? 0L : Long.parseLong(ifPrimaryTermParam);
-        } catch (NumberFormatException e) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "invalid_condition",
-                    "if_seq_no and if_primary_term must be numbers"
-                )
-            );
+        final var parsed = new org.opensearch.action.update.UpdateRequest(index, id).detectNoop(detectNoopParam)
+            .retryOnConflict(retryOnConflict);
+        if (retryOnConflict < 0) {
+            throw new IllegalArgumentException("retry_on_conflict must be non negative");
+        }
+        if (ifSeqNoParam != null) {
+            parsed.setIfSeqNo(Long.parseLong(ifSeqNoParam));
+            parsed.setIfPrimaryTerm(Long.parseLong(ifPrimaryTermParam));
         }
         if (request.hasContent() == false) {
             return channel -> channel.sendResponse(
@@ -217,55 +155,31 @@ public final class UpdateHandler extends BaseRestHandler {
             );
         }
 
-        final Map<String, Object> body;
         try (XContentParser parser = request.contentOrSourceParamParser()) {
-            body = parser.map();
-        }
-        // A scripted update, compiled by the node's own ScriptService under core's UpdateScript context. The
-        // refusal that stood here said no scripting engine was registered, which stopped being true the
-        // moment one was.
-        final org.opensearch.script.Script script;
-        if (body.get("script") != null) {
-            try {
-                script = parseScript(body.get("script"));
-            } catch (IllegalArgumentException e) {
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage())
-                );
+            if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                throw new IllegalArgumentException("an update body must be an object");
             }
-        } else {
-            script = null;
+            parsed.fromXContent(parser);
+            if (parser.nextToken() != null) {
+                throw new IllegalArgumentException("unexpected content after the update body");
+            }
         }
-        final boolean scriptedUpsert = Boolean.TRUE.equals(body.get("scripted_upsert"));
-        if (script == null && scriptedUpsert) {
+        final var validation = parsed.validate();
+        if (validation != null) {
+            throw validation;
+        }
+        if (parsed.scriptedUpsert() && parsed.script() == null) {
+            throw new IllegalArgumentException("scripted_upsert was given without a script");
+        }
+        if (parsed.fetchSource() != null && parsed.fetchSource().fetchSource()) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "illegal_argument_exception",
-                    "scripted_upsert was given without a script"
-                )
+                IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_write", "_source on an update is not supported")
             );
         }
-        final boolean docAsUpsert = Boolean.TRUE.equals(body.get("doc_as_upsert"));
-        final Object docField = body.get("doc");
-        final Object upsertField = body.get("upsert");
-        if (script == null && (docField instanceof Map) == false) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_doc", "an update body needs a 'doc' object or a 'script'")
-            );
-        }
-        if (upsertField != null && (upsertField instanceof Map) == false) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_upsert", "'upsert' must be an object")
-            );
-        }
-        final Map<String, Object> doc = (Map<String, Object>) docField;
-        final Map<String, Object> upsert = (Map<String, Object>) upsertField;
-        // detect_noop defaults true classically, and a request body can override the query param -- the
-        // query param exists mainly so a canary or a curious operator can flip it without editing JSON.
-        final boolean detectNoop = body.get("detect_noop") instanceof Boolean value ? value : detectNoopParam;
-
+        final Map<String, Object> doc = parsed.doc() == null ? null : parsed.doc().sourceAsMap();
+        final Map<String, Object> upsert = parsed.upsertRequest() == null ? null : parsed.upsertRequest().sourceAsMap();
+        final long ifSeqNo = parsed.ifSeqNo();
+        final long ifPrimaryTerm = parsed.ifPrimaryTerm();
         final ServerlessNode serving = node.get();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             final var operations = new ShardOperations(serving, metadata, true);
@@ -275,21 +189,21 @@ public final class UpdateHandler extends BaseRestHandler {
                 // followed by a compare-and-swap against what was read, and a lost race is retried from a
                 // fresh read up to the count the caller allowed. A caller who passed their own condition
                 // gets exactly one attempt, since retrying would be retrying against a token they chose.
-                final int attempts = ifSeqNoParam == null ? 1 + Math.max(0, retryOnConflict) : 1;
-                for (int attempt = 0; attempt < attempts; attempt++) {
+                final long attempts = 1L + retryOnConflict;
+                for (long attempt = 0; attempt < attempts; attempt++) {
                     try {
                         outcome = operations.update(
                             index,
                             id,
                             doc,
                             upsert,
-                            docAsUpsert,
-                            detectNoop,
+                            parsed.docAsUpsert(),
+                            parsed.detectNoop(),
                             refresh,
                             ifSeqNo,
                             ifPrimaryTerm,
-                            script,
-                            scriptedUpsert
+                            parsed.script(),
+                            parsed.scriptedUpsert()
                         );
                         break;
                     } catch (org.opensearch.index.engine.VersionConflictEngineException e) {

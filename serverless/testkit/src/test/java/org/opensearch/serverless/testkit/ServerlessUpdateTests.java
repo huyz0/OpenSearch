@@ -125,6 +125,69 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         }
     }
 
+    public void testInvalidUpdateOptionsAreRefusedBeforeWriting() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = planeOver(createTempDir(), clock);
+        try (var node = started(metadata, "update-validation")) {
+            final var http = node.boundHttpAddress().publishAddress();
+            send(http, "PUT", "/alpha?shards=1", MAPPING);
+            node.activateWriter(metadata, "alpha", 0);
+            send(http, "PUT", "/alpha/_doc/1", "{\"n\":1}");
+            for (String body : java.util.List.of(
+                "{\"doc\":{\"n\":99},\"script\":\"ctx._source.n = 99\"}",
+                "{\"doc\":{\"n\":99},\"unknown_option\":true}",
+                "{\"doc\":{\"n\":99},\"detect_noop\":{}}",
+                "{\"doc\":{\"n\":99},\"upsert\":[]}",
+                "{\"doc\":{\"n\":99}} {}",
+                "{\"doc\":{\"n\":99},\"scripted_upsert\":true}"
+            )) {
+                final var response = send(http, "POST", "/alpha/_update/1", body);
+                assertEquals(response.body(), 400, response.status());
+                assertTrue(send(http, "GET", "/alpha/_doc/1", null).body().contains("\"n\":1"));
+            }
+            final var source = send(http, "POST", "/alpha/_update/1", "{\"doc\":{\"n\":99},\"_source\":true}");
+            assertEquals(source.body(), 501, source.status());
+            assertTrue(send(http, "GET", "/alpha/_doc/1", null).body().contains("\"n\":1"));
+        }
+    }
+
+    public void testMaximumRetryCountDoesNotSkipTheUpdate() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = planeOver(createTempDir(), clock);
+        try (var node = started(metadata, "update-retry-overflow")) {
+            final var http = node.boundHttpAddress().publishAddress();
+            send(http, "PUT", "/alpha?shards=1", MAPPING);
+            node.activateWriter(metadata, "alpha", 0);
+            send(http, "PUT", "/alpha/_doc/1", "{\"n\":1}");
+            final var response = send(http, "POST", "/alpha/_update/1?retry_on_conflict=2147483647", "{\"doc\":{\"n\":2}}");
+            assertEquals(response.body(), 200, response.status());
+            assertTrue(send(http, "GET", "/alpha/_doc/1", null).body().contains("\"n\":2"));
+        }
+    }
+
+    public void testBodyConditionsAndNativeUpdateValidationAreHonored() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = planeOver(createTempDir(), clock);
+        try (var node = started(metadata, "update-body-condition")) {
+            final var http = node.boundHttpAddress().publishAddress();
+            send(http, "PUT", "/alpha?shards=1", MAPPING);
+            node.activateWriter(metadata, "alpha", 0);
+            send(http, "PUT", "/alpha/_doc/1", "{\"n\":1}");
+            final var before = new org.opensearch.serverless.shard.ShardOperations(node, metadata).get("alpha", "1").document();
+            send(http, "PUT", "/alpha/_doc/1", "{\"n\":2}");
+            final String condition = "\"if_seq_no\":" + before.seqNo() + ",\"if_primary_term\":" + before.primaryTerm();
+            final var stale = send(http, "POST", "/alpha/_update/1", "{\"doc\":{\"n\":99}," + condition + "}");
+            assertEquals(stale.body(), 409, stale.status());
+            final var retry = send(http, "POST", "/alpha/_update/1?retry_on_conflict=1", "{\"doc\":{\"n\":99}," + condition + "}");
+            assertEquals(retry.body(), 400, retry.status());
+            for (String extra : java.util.List.of(",\"upsert\":{\"n\":99}", ",\"doc_as_upsert\":true")) {
+                final var response = send(http, "POST", "/alpha/_update/1", "{\"doc\":{\"n\":99}," + condition + extra + "}");
+                assertEquals(response.body(), 400, response.status());
+            }
+            assertTrue(send(http, "GET", "/alpha/_doc/1", null).body().contains("\"n\":2"));
+        }
+    }
+
     /** An update on a document that does not exist, with nothing to fall back to, is a plain miss. */
     public void testUpdateOnAMissingDocumentIsRefused() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
