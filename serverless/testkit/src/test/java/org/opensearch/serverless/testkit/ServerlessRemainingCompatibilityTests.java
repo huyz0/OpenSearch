@@ -234,6 +234,30 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
     }
 
     /** A search pipeline's request processors narrow every shard's question; its response processors reshape the answer. */
+    public void testInlinePipelineConfigurationsCanBeReusedWithoutMutation() throws Exception {
+        try (Fixture f = fixture("inline-pipeline-config")) {
+            final var config = java.util.Map.<String, Object>of(
+                "request_processors",
+                java.util.List.of(
+                    java.util.Map.of("filter_query", java.util.Map.of("query", java.util.Map.of("term", java.util.Map.of("tag", "a"))))
+                )
+            );
+            for (int i = 0; i < 2; i++) {
+                final var request = new org.opensearch.action.search.SearchRequest("alpha").source(
+                    new org.opensearch.search.builder.SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.matchAllQuery())
+                );
+                final var transformed = f.node().searchPipelines().transformRequest("inline", config, request);
+                final var query = (org.opensearch.index.query.BoolQueryBuilder) transformed.source().query();
+                assertEquals(1, query.filter().size());
+                assertEquals(new org.opensearch.index.query.TermQueryBuilder("tag", "a"), query.filter().get(0));
+            }
+            assertEquals(
+                java.util.Map.of("query", java.util.Map.of("term", java.util.Map.of("tag", "a"))),
+                ((java.util.Map<?, ?>) ((java.util.List<?>) config.get("request_processors")).get(0)).get("filter_query")
+            );
+        }
+    }
+
     public void testSearchPipelines() throws Exception {
         try (Fixture f = fixture("pipelines")) {
             alpha(f);

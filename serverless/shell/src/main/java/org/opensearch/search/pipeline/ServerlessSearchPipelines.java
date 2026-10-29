@@ -170,7 +170,7 @@ public final class ServerlessSearchPipelines {
         }
         return PipelineWithMetrics.create(
             id,
-            new java.util.HashMap<>(config),
+            SearchPipelineService.deepCopyConfig(config),
             requestFactories,
             responseFactories,
             Map.of(),
