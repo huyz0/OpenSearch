@@ -5962,8 +5962,12 @@ public final class ServerlessNode implements Closeable {
             .orElse(null);
     }
 
-    private volatile org.opensearch.serverless.metadata.MetadataPlane.TransportSecrets transportSecrets;
-    private volatile long transportSecretsReadAt = Long.MIN_VALUE;
+    private record CachedTransportSecrets(org.opensearch.serverless.metadata.MetadataPlane plane,
+        org.opensearch.serverless.metadata.MetadataPlane.TransportSecrets secrets, long readAt) {
+    }
+
+    private volatile CachedTransportSecrets transportSecrets;
+    private final Object transportSecretsLock = new Object();
 
     /**
      * Returns the transport secrets as last read, re-reading the register at most once per lease TTL and
@@ -5985,18 +5989,30 @@ public final class ServerlessNode implements Closeable {
         if (plane == null) {
             return null;
         }
-        org.opensearch.serverless.metadata.MetadataPlane.TransportSecrets cached = transportSecrets;
+        final CachedTransportSecrets observed = transportSecrets;
         final long now = plane.clock().getAsLong();
-        if (cached == null || forceReread || now - transportSecretsReadAt > plane.leaseTtlMillis()) {
-            try {
-                cached = plane.transportSecrets();
-                transportSecrets = cached;
-                transportSecretsReadAt = now;
-            } catch (java.io.IOException e) {
-                throw new java.io.UncheckedIOException(e);
+        if (forceReread || expiredSecrets(observed, plane, now)) {
+            synchronized (transportSecretsLock) {
+                CachedTransportSecrets cached = transportSecrets;
+                // Another reader may have refreshed while this one waited. Publish the value and its
+                // timestamp together, and coalesce concurrent explicit refreshes of the same snapshot.
+                if ((forceReread && cached == observed) || expiredSecrets(cached, plane, plane.clock().getAsLong())) {
+                    try {
+                        final var fresh = plane.transportSecrets();
+                        cached = new CachedTransportSecrets(plane, fresh, plane.clock().getAsLong());
+                        transportSecrets = cached;
+                    } catch (java.io.IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                }
+                return cached.secrets();
             }
         }
-        return cached;
+        return observed.secrets();
+    }
+
+    private static boolean expiredSecrets(CachedTransportSecrets cached, org.opensearch.serverless.metadata.MetadataPlane plane, long now) {
+        return cached == null || cached.plane() != plane || now < cached.readAt() || now - cached.readAt() > plane.leaseTtlMillis();
     }
 
     /**
