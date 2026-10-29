@@ -138,6 +138,36 @@ public class ServerlessDescriptorPropagationTests extends OpenSearchTestCase {
         }
     }
 
+    public void testAnExplainUsesAMappingChangedElsewhere() throws Exception {
+        assertExplainRefreshesMapping(false);
+    }
+
+    public void testAForwardedExplainUsesAMappingChangedElsewhere() throws Exception {
+        assertExplainRefreshesMapping(true);
+    }
+
+    private void assertExplainRefreshesMapping(boolean forwarded) throws Exception {
+        try (Pair p = pair()) {
+            assertEquals(200, call(p.owner(), "PUT", "/alpha/_doc/warm?refresh=true", "{\"msg\":\"warm\"}").status());
+            p.owner().setIncarnationFenceMillis(0L);
+            final Answer mapped = call(
+                p.other(),
+                "PUT",
+                "/alpha/_mapping",
+                "{\"properties\":{\"lookup\":{\"type\":\"alias\",\"path\":\"msg\"}}}"
+            );
+            assertEquals(mapped.body(), 200, mapped.status());
+            final Answer explained = call(
+                forwarded ? p.other() : p.owner(),
+                "POST",
+                "/alpha/_explain/warm",
+                "{\"query\":{\"match\":{\"lookup\":\"warm\"}}}"
+            );
+            assertEquals(explained.body(), 200, explained.status());
+            assertTrue("explain must resolve the alias from the current mapping: " + explained.body(), explained.has("\"matched\":true"));
+        }
+    }
+
     /**
      * A dynamic setting changed through another node reaches the owner's open shard by its next read.
      *

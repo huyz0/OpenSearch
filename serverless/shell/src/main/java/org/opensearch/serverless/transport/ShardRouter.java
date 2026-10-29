@@ -317,7 +317,7 @@ public final class ShardRouter {
             // segment statistics that are missing every unpublished write. The number would look right.
             throw new NotShardOwnerException(request.index(), request.shard(), whyNotHeld(request.index(), request.shard(), null));
         }
-        final ShardExplain.Outcome outcome = ShardExplain.execute(node.searchService(), shardId, request.id(), request.query());
+        final ShardExplain.Outcome outcome = node.explain(shardId, request.id(), request.query());
         channel.sendResponse(new ForwardedExplainResponse(node.localNode().getId(), outcome.exists(), outcome.explanation()));
     }
 
