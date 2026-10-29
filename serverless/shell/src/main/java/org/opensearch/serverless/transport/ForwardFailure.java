@@ -77,10 +77,15 @@ public enum ForwardFailure {
             failure,
             OwnerUnreachableException.class,
             org.opensearch.transport.ConnectTransportException.class,
-            org.opensearch.transport.SendRequestTransportException.class,
             java.net.ConnectException.class
         ) != null) {
             return UNREACHABLE;
+        }
+        // Core also uses this wrapper when closing transport with response handlers still pending.
+        // A send failure alone does not prove the owner never applied the write. Only the explicit
+        // connection failures above establish that it is safe to send the request elsewhere.
+        if (org.opensearch.ExceptionsHelper.unwrap(failure, org.opensearch.transport.SendRequestTransportException.class) != null) {
+            return INTERRUPTED;
         }
         return REMOTE;
     }
