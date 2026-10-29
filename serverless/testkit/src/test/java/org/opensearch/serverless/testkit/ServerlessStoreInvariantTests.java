@@ -216,12 +216,15 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         // stamps a tombstone with its own clock, so the sweep is driven by the same one.
         final long quarantine = DescriptorStore.DEFAULT_TOMBSTONE_QUARANTINE_MILLIS;
         clock.addAndGet(quarantine + 60_000L);
+        plane.descriptors().setConditionalDelete(true); // reap legacy records using the filesystem's conditional delete
         assertEquals(6, plane.descriptors().sweepTombstones(clock.get(), quarantine).size());
         assertEquals(List.of("logs-7"), plane.namesWithPrefix("logs-", 5));
         assertTrue("nothing left to collect", plane.descriptors().sweepTombstones(clock.get(), quarantine).isEmpty());
 
         // A tombstone inside its quarantine still guards the generation a swap in flight may carry.
+        plane.descriptors().setConditionalDelete(false);
         assertTrue(plane.deleteIndex("logs-7"));
+        plane.descriptors().setConditionalDelete(true);
         clock.addAndGet(quarantine / 2);
         assertTrue("a fresh tombstone is kept", plane.descriptors().sweepTombstones(clock.get(), quarantine).isEmpty());
         assertTrue("and the name is still absent", plane.describe("logs-7").isEmpty());

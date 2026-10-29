@@ -627,8 +627,8 @@ below is closed for the index-delete case. No quarantine, no marker, no claim, n
 **Only where the store is seen to honour it.** A store can accept `If-Match` on a delete and ignore it, and
 then a delete racing a write removes the write. So `ConditionalDeleteProbe` runs once per node against the
 store in use: it moves a register on through a second container and deletes through the first at the stale
-generation; a store that deletes it anyway fails, and that node keeps tombstones, markers and the sweep —
-the fallback is the whole previous path, unchanged. **MinIO (`RELEASE.2025-04-22`) fails the probe**: it
+generation; a store that deletes it anyway fails, and that node retains tombstones and markers —
+the fallback no longer reaps those records without conditional deletion. **MinIO (`RELEASE.2025-04-22`) fails the probe**: it
 ignores `If-Match` on `DeleteObject`, and a node on it stays on tombstones. **RustFS 1.0.0 passes it**
 (`rustfs/rustfs@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`), both as one node on
 one drive and as one node over a four-drive erasure set (four tmpfs mounts, since it refuses drives sharing a
@@ -737,22 +737,19 @@ handler. The cap now lives in `BlobLeaseMembership#refreshIfOlderThan` — at mo
 node, wall-clock — and search's copy is gone. `ServerlessRequestPathCostTests` counts it: ten health checks
 in well under a second read the members index at most once, and fail with the cap removed.
 
-**The tombstone sweep no longer walks the population, and no longer loses a recreated index.** It used to
-list every descriptor and read each one, on every node, hourly — a million reads per node per hour at a
-million indices, to find the few hundred names deleted that hour — and it deleted the expired tombstones in
-one batch at the end of that walk, with nothing checking at delete time that the name had not been recreated
-since. At scale the walk takes hours, and a name recreated inside it lost its new descriptor; the collector
-then deleted the new index's shards as orphans. Now a delete also drops an empty marker into an hourly bucket
-under `tombstones/`, and the sweep reads only the markers in buckets old enough to hold an expired name — one
-listing of the buckets, then a read per deleted name. Rendezvous hashing over membership gives each bucket to
-one node, so the deployment pays once per deleted name rather than once per node. The unconditional delete
-is made safe by a claim: the sweep first swaps the tombstone to a claimed one, a create refuses to swap over
-a claim for a minute (`name_being_reclaimed`, 503), and the sweep deletes only within ten seconds of
-claiming, by its own clock. What remains is a pause between that check and the delete landing, the same
-residual every lease-timed write here carries. Tombstones written before markers existed have none and are
-never swept. Pinned by `ServerlessTombstoneSweepTests`: register reads equal at populations of 10 and 200,
-and each of the claim, the deadline, the create's refusal, the marker and bucket ownership has a planted
-defect that fails a test.
+**Tombstone cleanup requires verified conditional deletion.** A timed claim alone did not protect
+against a delete request that reached the backing store after the claim's handoff window: a new index
+could already have replaced the tombstone. Cleanup now deletes only the generation claimed by the sweep.
+Stores that fail the conditional-delete probe retain their tombstones and markers; names can still be
+recreated with CAS, but retained records increase storage and prefix-listing costs. Restart after a backend
+upgrade to re-probe its capability. A verified backend can clean up legacy tombstones using the existing
+hourly discovery buckets, without enumerating the index population. Claims and their deadlines remain
+compatible with existing records, but provide no substitute for the store's generation check.
+
+The earlier fallback cost measurements above included a claim and unconditional cleanup. That protocol
+is no longer used on backends without conditional deletion; its historical totals do not describe the
+current retention policy. `ServerlessDeleteCostTests` now measures the retained fallback and the conditional
+path separately, without asserting an identical retention guarantee or a universal cost ordering.
 
 **Cold activation: the first write waits for its shard, and the activation stopped repeating itself.**
 Measured on RustFS 1.0.0 with a fixed delay injected before every object-store request

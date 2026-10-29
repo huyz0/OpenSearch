@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>The sweep used to list and read every descriptor on every node, hourly, and delete the expired
  * tombstones in one batch at the end of that walk -- so its cost was the population, and a name recreated
  * during the walk lost its new descriptor. These pin both halves of the replacement: cost set by what was
- * deleted, and a claim a create must respect before the unconditional delete lands.
+ * deleted, and a generation check that protects a recreated index when deletion is delayed.
  *
  * <p><b>D5:</b> {@code FsBlobContainer} only.
  */
@@ -55,8 +55,60 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         return plane;
     }
 
+    // The forced fallback creates legacy records. Reaping them requires a store that enforces conditional deletion.
+    private static List<String> sweepLegacyTombstones(MetadataPlane plane, long now, long quarantine) throws IOException {
+        return sweepLegacyTombstones(plane, now, quarantine, bucket -> true);
+    }
+
+    private static List<String> sweepLegacyTombstones(
+        MetadataPlane plane,
+        long now,
+        long quarantine,
+        java.util.function.Predicate<String> owns
+    ) throws IOException {
+        plane.descriptors().setConditionalDelete(true);
+        return plane.descriptors().sweepTombstones(now, quarantine, owns);
+    }
+
     private static IndexDescriptor index(String name) {
         return new IndexDescriptor(name, org.opensearch.common.UUIDs.randomBase64UUID(), 1, MAPPING, null);
+    }
+
+    public void testADelayedDeleteCannotRemoveARecreatedIndex() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new HookedStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
+            plane.createIndex(index("delayed"));
+            assertTrue(plane.deleteIndex("delayed"));
+            // Legacy tombstones may remain after an upgrade to a store with verified conditional deletes.
+            plane.descriptors().setConditionalDelete(true);
+            clock.addAndGet(PAST_QUARANTINE);
+            final var replacement = index("delayed");
+            store.beforeDescriptorDelete = () -> {
+                store.beforeDescriptorDelete = null;
+                // The request was sent inside the deadline, but the backing store applies it after handoff.
+                clock.addAndGet(DescriptorStore.TOMBSTONE_REAP_HANDOFF_MILLIS + 1);
+                plane.createIndex(replacement);
+            };
+            assertTrue("the changed generation must prevent deletion", sweepLegacyTombstones(plane, clock.get(), QUARANTINE).isEmpty());
+            assertNull("the delete must reach the delayed backing store", store.beforeDescriptorDelete);
+            assertEquals(replacement.uuid(), plane.describe("delayed").orElseThrow().uuid());
+        }
+    }
+
+    public void testTombstonesAreRetainedWithoutConditionalDeletion() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = tombstoning(new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL));
+            plane.createIndex(index("retained"));
+            assertTrue(plane.deleteIndex("retained"));
+            clock.addAndGet(PAST_QUARANTINE);
+            assertTrue(plane.descriptors().sweepTombstones(clock.get(), QUARANTINE).isEmpty());
+            assertTrue(plane.describe("retained").isEmpty());
+            // Retaining the old generation does not reserve its name: recreation still uses CAS.
+            plane.createIndex(index("retained"));
+            assertTrue(plane.describe("retained").isPresent());
+        }
     }
 
     /**
@@ -90,7 +142,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
             strays += bucket.listBlobs().keySet().stream().filter(name -> name.startsWith("extra")).count();
         }
         store.reset();
-        assertEquals(3, plane.descriptors().sweepTombstones(clock.get(), QUARANTINE).size());
+        assertEquals(3, sweepLegacyTombstones(plane, clock.get(), QUARANTINE).size());
         final long reads = store.registerReads() - strays;
         assertEquals("only the names that were deleted are gone", List.of(), plane.namesWithPrefix("gone-", 10));
         assertEquals(live, plane.namesWithPrefix("live-", live + 1).size());
@@ -101,8 +153,8 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
      * A create that arrives between the sweep claiming a tombstone and deleting it is refused, not
      * silently deleted with it.
      *
-     * <p>The delete cannot be made conditional, so this is the one ordering that loses an acknowledged
-     * index if the create is allowed to swap over the claim. The hook runs the create exactly there.
+     * <p>The legacy handoff still asks an immediate create to retry. The generation check separately
+     * protects a recreation that succeeds after handoff; the delayed-delete regression covers that case.
      */
     public void testACreateInsideTheSweepsWindowIsRefusedRatherThanLost() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -122,7 +174,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
                 createInWindow.set(e);
             }
         };
-        assertEquals(List.of("reused"), plane.descriptors().sweepTombstones(clock.get(), QUARANTINE));
+        assertEquals(List.of("reused"), sweepLegacyTombstones(plane, clock.get(), QUARANTINE));
         store.beforeDescriptorDelete = null;
 
         assertTrue(
@@ -154,10 +206,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
                 plane.createIndex(index("raced"));
             }
         };
-        assertTrue(
-            "the sweep lost its claim and must remove nothing",
-            plane.descriptors().sweepTombstones(clock.get(), QUARANTINE).isEmpty()
-        );
+        assertTrue("the sweep lost its claim and must remove nothing", sweepLegacyTombstones(plane, clock.get(), QUARANTINE).isEmpty());
         assertNull("the create must have run inside the window", store.afterDescriptorRead);
         assertTrue("the index created in the window must survive the sweep", plane.describe("raced").isPresent());
     }
@@ -176,17 +225,14 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
 
         // The sweep stalls for the whole deadline right after its claim lands.
         store.afterDescriptorSwap = () -> clock.addAndGet(DescriptorStore.TOMBSTONE_REAP_DEADLINE_MILLIS);
-        assertTrue("a stalled sweep must not delete", plane.descriptors().sweepTombstones(clock.get(), QUARANTINE).isEmpty());
+        assertTrue("a stalled sweep must not delete", sweepLegacyTombstones(plane, clock.get(), QUARANTINE).isEmpty());
         store.afterDescriptorSwap = null;
 
         expectThrows(NameBeingReclaimedException.class, () -> plane.createIndex(index("slow")));
         clock.addAndGet(DescriptorStore.TOMBSTONE_REAP_HANDOFF_MILLIS);
         plane.createIndex(index("slow"));
 
-        assertTrue(
-            "a later sweep finds a live name behind the marker",
-            plane.descriptors().sweepTombstones(clock.get(), QUARANTINE).isEmpty()
-        );
+        assertTrue("a later sweep finds a live name behind the marker", sweepLegacyTombstones(plane, clock.get(), QUARANTINE).isEmpty());
         assertTrue("and leaves it alone", plane.describe("slow").isPresent());
         assertTrue("the marker is gone, so no sweep reads it again", markerBuckets(store).isEmpty());
     }
@@ -202,7 +248,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         assertEquals("the marker is written before the swap", 1, markerBuckets(store).size());
 
         clock.addAndGet(PAST_QUARANTINE);
-        assertTrue(plane.descriptors().sweepTombstones(clock.get(), QUARANTINE).isEmpty());
+        assertTrue(sweepLegacyTombstones(plane, clock.get(), QUARANTINE).isEmpty());
         assertTrue(plane.describe("kept").isPresent());
         assertTrue("an emptied bucket is removed", markerBuckets(store).isEmpty());
     }
@@ -217,10 +263,10 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         clock.addAndGet(PAST_QUARANTINE);
 
         store.reset();
-        assertTrue(plane.descriptors().sweepTombstones(clock.get(), QUARANTINE, bucket -> false).isEmpty());
+        assertTrue(sweepLegacyTombstones(plane, clock.get(), QUARANTINE, bucket -> false).isEmpty());
         assertEquals("not this node's bucket: no register read", 0L, store.registerReads());
         assertEquals("one listing of the buckets and nothing else", 1L, store.reads());
-        assertEquals(List.of("other"), plane.descriptors().sweepTombstones(clock.get(), QUARANTINE, bucket -> true));
+        assertEquals(List.of("other"), sweepLegacyTombstones(plane, clock.get(), QUARANTINE, bucket -> true));
     }
 
     /** A bucket holding more markers than one page is drained completely, a page at a time. */
@@ -239,7 +285,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         assertEquals(
             "every marker must be reached, not only the first page",
             deleted,
-            plane.descriptors().sweepTombstones(clock.get(), QUARANTINE).size()
+            sweepLegacyTombstones(plane, clock.get(), QUARANTINE).size()
         );
         assertEquals(List.of(), plane.namesWithPrefix("paged-", deleted + 1));
     }
@@ -260,6 +306,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         plane.createIndex(index("held"));
         plane.createIndex(index("drained"));
         assertTrue(plane.deleteIndex("drained"));
+        plane.descriptors().setConditionalDelete(true);
         clock.addAndGet(PAST_QUARANTINE);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings())) {
@@ -305,7 +352,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
             assertTrue("and the name still reads as absent", plane.describe("drained").isEmpty());
             // Once the abandoned claim is past the handoff, the next sweep takes it.
             clock.addAndGet(DescriptorStore.TOMBSTONE_REAP_HANDOFF_MILLIS);
-            assertEquals(List.of("drained"), plane.descriptors().sweepTombstones(clock.get(), QUARANTINE));
+            assertEquals(List.of("drained"), sweepLegacyTombstones(plane, clock.get(), QUARANTINE));
             assertEquals(List.of(), plane.namesWithPrefix("drained", 5));
         }
     }
@@ -379,6 +426,15 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
                         hook.accept(blobName);
                     }
                     return read;
+                }
+
+                @Override
+                public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+                    final IoRunnable hook = beforeDescriptorDelete;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                    return super.deleteRegisterIfUnchanged(blobName, expectedGeneration);
                 }
 
                 @Override
