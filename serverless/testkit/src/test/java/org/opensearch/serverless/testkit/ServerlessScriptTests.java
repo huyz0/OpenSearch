@@ -200,6 +200,77 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
         }
     }
 
+    public void testScriptedUpsertReceivesCreateContextAndCurrentTime() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var node = running(plane(clock, createTempDir()), clock, "script-create-context")) {
+            final var response = call(
+                "POST",
+                "/alpha/_update/new",
+                "{\"scripted_upsert\":true,\"upsert\":{\"n\":0},\"script\":{\"source\":"
+                    + "\"if (ctx.op == 'create' && ctx._now > 0) { ctx._source.n = 42 } else { ctx.op = 'none' }\"}}"
+            );
+            assertEquals(response.body(), 201, response.status());
+            assertTrue(call("GET", "/alpha/_doc/new", null).has("\"n\":42"));
+            final var existing = call(
+                "POST",
+                "/alpha/_update/1",
+                "{\"script\":{\"source\":\"if (ctx._now > 0 && ctx.containsKey('_routing')) { ctx._source.n = 43 }\"}}"
+            );
+            assertEquals(existing.body(), 200, existing.status());
+            assertTrue(call("GET", "/alpha/_doc/1", null).has("\"n\":43"));
+        }
+    }
+
+    public void testScriptOperationsCannotFallThroughIntoAnIndexWrite() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var node = running(plane(clock, createTempDir()), clock, "script-operation-context")) {
+            for (String operation : java.util.List.of("create", "unexpected", "none", "noop")) {
+                final var response = call(
+                    "POST",
+                    "/alpha/_update/1",
+                    "{\"script\":{\"source\":\"ctx._source.n = 99; ctx.op = '" + operation + "'\"}}"
+                );
+                assertEquals(response.body(), 200, response.status());
+                assertTrue(response.body(), response.has("\"result\":\"noop\""));
+                assertTrue(call("GET", "/alpha/_doc/1", null).has("\"n\":10"));
+            }
+            for (String operation : java.util.List.of("index", "delete", "unexpected", "none", "noop")) {
+                final var response = call(
+                    "POST",
+                    "/alpha/_update/absent-" + operation,
+                    "{\"scripted_upsert\":true,\"upsert\":{\"n\":0},\"script\":{\"source\":\"ctx.op = '" + operation + "'\"}}"
+                );
+                assertEquals(response.body(), 200, response.status());
+                assertTrue(response.body(), response.has("\"result\":\"noop\""));
+                assertEquals(404, call("GET", "/alpha/_doc/absent-" + operation, null).status());
+            }
+        }
+    }
+
+    public void testScriptedUpsertDoesNotMutateTheCallersDocument() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = plane(clock, createTempDir());
+        try (var node = running(metadata, clock, "script-upsert-copy")) {
+            final var source = java.util.Map.<String, Object>of("nested", java.util.Map.of("n", 1));
+            final var result = new org.opensearch.serverless.shard.ShardOperations(node, metadata).update(
+                "alpha",
+                "immutable",
+                null,
+                source,
+                false,
+                true,
+                false,
+                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                0,
+                new org.opensearch.script.Script("ctx._source.nested.n += 1"),
+                true
+            );
+            assertEquals("created", result.result());
+            assertEquals(java.util.Map.of("nested", java.util.Map.of("n", 1)), source);
+            assertTrue(call("GET", "/alpha/_doc/immutable", null).has("\"n\":2"));
+        }
+    }
+
     public void testStaleConditionsAreCheckedBeforeNoopAndScriptedDelete() throws Exception {
         final var clock = new AtomicLong(1_000L);
         final var metadata = plane(clock, createTempDir());
