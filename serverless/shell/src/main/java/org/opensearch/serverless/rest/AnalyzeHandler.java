@@ -16,6 +16,7 @@ import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
 import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
@@ -270,7 +271,7 @@ public final class AnalyzeHandler extends BaseRestHandler {
             if (chosen == null) {
                 throw new IllegalArgumentException("failed to find global analyzer [" + using + "]");
             }
-            render(channel, chosen, using, ask);
+            render(channel, chosen, using, ask, IndexSettings.MAX_TOKEN_COUNT_SETTING.get(serving.settings()));
             return;
         }
         final Optional<IndexDescriptor> descriptor = metadata.describe(index);
@@ -313,19 +314,20 @@ public final class AnalyzeHandler extends BaseRestHandler {
                 using = "default";
             }
 
-            render(channel, chosen, using, ask);
+            render(channel, chosen, using, ask, IndexSettings.MAX_TOKEN_COUNT_SETTING.get(descriptor.get().extraSettings()));
         } finally {
             mapperService.close();
         }
     }
 
-    private static void render(org.opensearch.rest.RestChannel channel, Analyzer chosen, String using, Ask ask) throws IOException {
+    private static void render(org.opensearch.rest.RestChannel channel, Analyzer chosen, String using, Ask ask, int maxTokens)
+        throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.startArray("tokens");
-            int carried = 0;
+            final TokenState carried = new TokenState();
             for (String each : ask.text()) {
-                carried = tokens(builder, chosen, ask.field() == null ? "text" : ask.field(), each, carried);
+                tokens(builder, chosen, ask.field() == null ? "text" : ask.field(), each, carried, maxTokens);
             }
             builder.endArray();
             // Additive, and useful precisely because this endpoint is used to settle disagreements: a
@@ -343,13 +345,12 @@ public final class AnalyzeHandler extends BaseRestHandler {
      * @param analyzer the analyzer to use
      * @param field the field name to analyze as
      * @param text the string
-     * @param positionOffset the position the previous string ended at
-     * @return the position the next string should start at
+     * @param state positions, offsets and token count carried across input values
+     * @param maxTokens the most tokens this request may produce
      * @throws IOException if analysis or writing fails
      */
-    private static int tokens(XContentBuilder builder, Analyzer analyzer, String field, String text, int positionOffset)
+    private static void tokens(XContentBuilder builder, Analyzer analyzer, String field, String text, TokenState state, int maxTokens)
         throws IOException {
-        int position = positionOffset;
         try (TokenStream stream = analyzer.tokenStream(field, text)) {
             final CharTermAttribute term = stream.addAttribute(CharTermAttribute.class);
             final OffsetAttribute offset = stream.addAttribute(OffsetAttribute.class);
@@ -360,15 +361,22 @@ public final class AnalyzeHandler extends BaseRestHandler {
             );
             stream.reset();
             while (stream.incrementToken()) {
-                position += increment.getPositionIncrement();
+                if (++state.count > maxTokens) {
+                    throw new IllegalArgumentException(
+                        "The number of tokens produced by calling _analyze has exceeded the allowed maximum of ["
+                            + maxTokens
+                            + "]. This limit can be set by changing the [index.analyze.max_token_count] index level setting."
+                    );
+                }
+                if (increment.getPositionIncrement() > 0) {
+                    state.position += increment.getPositionIncrement();
+                }
                 builder.startObject();
                 builder.field("token", term.toString());
-                builder.field("start_offset", offset.startOffset());
-                builder.field("end_offset", offset.endOffset());
+                builder.field("start_offset", state.offset + offset.startOffset());
+                builder.field("end_offset", state.offset + offset.endOffset());
                 builder.field("type", type.type());
-                // Positions are one sequence across several strings, which is what makes a phrase query
-                // spanning them behave the way this says it will.
-                builder.field("position", position - 1);
+                builder.field("position", state.position);
                 if (length.getPositionLength() > 1) {
                     // Core reports it only when a token spans more than one position, which is the only
                     // case in which it says anything.
@@ -377,7 +385,14 @@ public final class AnalyzeHandler extends BaseRestHandler {
                 builder.endObject();
             }
             stream.end();
+            state.offset += offset.endOffset() + analyzer.getOffsetGap(field);
+            state.position += increment.getPositionIncrement() + analyzer.getPositionIncrementGap(field);
         }
-        return position;
+    }
+
+    private static final class TokenState {
+        private int position = -1;
+        private int offset;
+        private int count;
     }
 }

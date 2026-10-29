@@ -101,6 +101,68 @@ public class ServerlessAnalyzeAndMsearchTests extends OpenSearchTestCase {
         return node;
     }
 
+    public void testAnalyzeEnforcesTheTokenBudgetAcrossInputValues() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = plane(clock, createTempDir());
+        try (var node = new ServerlessNode(nodeSettings("analyze-limit"))) {
+            node.start();
+            node.setMetadataPlane(metadata);
+            port = node.boundHttpAddress().publishAddress().getPort();
+            assertEquals(200, call("PUT", "/limited", "{\"settings\":{\"analyze.max_token_count\":2}}").status());
+            assertEquals(200, call("POST", "/limited/_analyze", "{\"text\":[\"one\",\"two\"]}").status());
+            final var limited = call("POST", "/limited/_analyze", "{\"text\":[\"one two\",\"three\"]}");
+            assertEquals(limited.body(), 400, limited.status());
+            assertTrue(limited.body(), limited.body().contains("index.analyze.max_token_count"));
+            final var global = call("POST", "/_analyze", "{\"text\":\"" + "word ".repeat(10_001) + "\"}");
+            assertEquals(global.body(), 400, global.status());
+        }
+    }
+
+    public void testMultiValueAnalysisUsesNativeOffsetsAndPositionGaps() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = plane(clock, createTempDir());
+        try (var node = running(metadata, clock, "analyze-multi-value")) {
+            for (boolean field : new boolean[] { false, true }) {
+                final var nativeRequest = new org.opensearch.action.admin.indices.analyze.AnalyzeAction.Request(field ? "alpha" : null)
+                    .text("Quick Brown", "Foxes");
+                final org.opensearch.index.IndexService indexService;
+                if (field) {
+                    nativeRequest.field("msg");
+                    indexService = node.indicesService()
+                        .indexServiceSafe(new org.opensearch.core.index.Index("alpha", metadata.describe("alpha").orElseThrow().uuid()));
+                } else {
+                    nativeRequest.analyzer("standard");
+                    indexService = null;
+                }
+                final var expected = org.opensearch.action.admin.indices.analyze.TransportAnalyzeAction.analyze(
+                    nativeRequest,
+                    node.indicesService().getAnalysis(),
+                    indexService,
+                    10_000
+                );
+                final String expectedJson = org.opensearch.core.common.Strings.toString(
+                    org.opensearch.common.xcontent.XContentType.JSON,
+                    expected
+                );
+                final var response = call(
+                    "POST",
+                    field ? "/alpha/_analyze" : "/_analyze",
+                    "{\"text\":[\"Quick Brown\",\"Foxes\"]," + (field ? "\"field\":\"msg\"}" : "\"analyzer\":\"standard\"}")
+                );
+                assertEquals(response.body(), 200, response.status());
+                assertEquals(jsonObject(expectedJson).get("tokens"), jsonObject(response.body()).get("tokens"));
+            }
+        }
+    }
+
+    private static java.util.Map<String, Object> jsonObject(String json) {
+        return org.opensearch.common.xcontent.XContentHelper.convertToMap(
+            new org.opensearch.core.common.bytes.BytesArray(json),
+            false,
+            org.opensearch.common.xcontent.XContentType.JSON
+        ).v2();
+    }
+
     /**
      * A field's own analyzer, which is the question this endpoint exists to answer.
      *
