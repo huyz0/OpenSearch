@@ -193,7 +193,7 @@ public final class ShardRouter {
         // a coordinating node: a flood of forwarded writes used to be invisible to this node's pressure.
         try (
             org.opensearch.common.lease.Releasable primary = node.indexingPressure()
-                .markPrimaryOperationStarted(request.source() == null ? 0L : request.source().length(), false)
+                .markPrimaryOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(request.id(), request.source()), false)
         ) {
             handleIndexAccounted(request, channel, shardId);
         }
