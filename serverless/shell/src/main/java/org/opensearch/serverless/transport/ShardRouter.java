@@ -169,7 +169,7 @@ public final class ShardRouter {
         final ForwardedStatsRequest request = new ForwardedStatsRequest();
         final PlainActionFuture<ForwardedStatsResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        try (var ignored = withMac(ForwardedStatsRequest.ACTION, request)) {
+        try (var ignored = withMac(ForwardedStatsRequest.ACTION, request, peer.getId())) {
             transportService.sendRequest(
                 peer,
                 ForwardedStatsRequest.ACTION,
@@ -412,10 +412,10 @@ public final class ShardRouter {
      */
     org.opensearch.common.util.concurrent.ThreadContext.StoredContext withMac(
         String action,
-        org.opensearch.transport.TransportRequest request
+        org.opensearch.transport.TransportRequest request,
+        String recipient
     ) throws IOException {
         final org.opensearch.common.util.concurrent.ThreadContext context = transportService.getThreadPool().getThreadContext();
-        final String mac = authenticator.sign(action, request);
         final java.util.Map<String, String> headers = new java.util.HashMap<>(context.getHeaders());
         headers.remove(TransportAuthenticator.MAC_HEADER);
         headers.remove(TOKEN_HEADER);
@@ -431,6 +431,18 @@ public final class ShardRouter {
                     context.putHeader(entry.getKey(), entry.getValue());
                 }
             }
+            final String mac;
+            try (var out = new org.opensearch.common.io.stream.BytesStreamOutput()) {
+                context.captureAsWriteable().writeTo(out);
+                try (var in = out.bytes().streamInput()) {
+                    mac = authenticator.sign(
+                        action,
+                        request,
+                        recipient,
+                        org.opensearch.common.util.concurrent.ThreadContext.readHeadersFromStream(in).v1()
+                    );
+                }
+            }
             if (mac != null) {
                 context.putHeader(TransportAuthenticator.MAC_HEADER, mac);
             } else {
@@ -440,7 +452,7 @@ public final class ShardRouter {
                 }
             }
             return restore;
-        } catch (RuntimeException e) {
+        } catch (IOException | RuntimeException e) {
             restore.close();
             throw e;
         }
@@ -462,7 +474,7 @@ public final class ShardRouter {
     void requireMac(String action, org.opensearch.transport.TransportRequest request) throws IOException {
         final String mac = transportService.getThreadPool().getThreadContext().getHeader(TransportAuthenticator.MAC_HEADER);
         if (mac != null) {
-            authenticator.verify(action, request, mac);
+            authenticator.verify(action, request, mac, transportService.getThreadPool().getThreadContext().getRequestHeadersOnly());
             return;
         }
         requireToken();
@@ -698,7 +710,7 @@ public final class ShardRouter {
     public ForwardedIndexResponse forwardIndex(DiscoveryNode peer, ForwardedIndexRequest request) throws IOException {
         final PlainActionFuture<ForwardedIndexResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        try (var ignored = withMac(ForwardedIndexRequest.ACTION, request)) {
+        try (var ignored = withMac(ForwardedIndexRequest.ACTION, request, peer.getId())) {
             transportService.sendRequest(
                 peer,
                 ForwardedIndexRequest.ACTION,
@@ -725,7 +737,7 @@ public final class ShardRouter {
     public ForwardedBulkResponse forwardBulk(DiscoveryNode peer, ForwardedBulkRequest request) throws IOException {
         final PlainActionFuture<ForwardedBulkResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = bulkForwardTimeout(request);
-        try (var ignored = withMac(ForwardedBulkRequest.ACTION, request)) {
+        try (var ignored = withMac(ForwardedBulkRequest.ACTION, request, peer.getId())) {
             transportService.sendRequest(
                 peer,
                 ForwardedBulkRequest.ACTION,
@@ -798,7 +810,7 @@ public final class ShardRouter {
         // The write bound, not the search one. A get is a point lookup on the owner rather than a fan-out,
         // so it is the cheaper of the two and has no reason to wait as long as a query.
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        try (var ignored = withMac(ForwardedGetRequest.ACTION, request)) {
+        try (var ignored = withMac(ForwardedGetRequest.ACTION, request, peer.getId())) {
             transportService.sendRequest(
                 peer,
                 ForwardedGetRequest.ACTION,
@@ -822,7 +834,7 @@ public final class ShardRouter {
         // The get bound rather than the search one, for the reason a get uses it: this is a point lookup on
         // one shard with no fan-out to wait behind.
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        try (var ignored = withMac(ForwardedExplainRequest.ACTION, request)) {
+        try (var ignored = withMac(ForwardedExplainRequest.ACTION, request, peer.getId())) {
             transportService.sendRequest(
                 peer,
                 ForwardedExplainRequest.ACTION,
@@ -844,7 +856,7 @@ public final class ShardRouter {
     public ForwardedSearchResponse forwardSearch(DiscoveryNode peer, ForwardedSearchRequest request) throws IOException {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
         final TimeValue timeout = searchForwardTimeout();
-        try (var ignored = withMac(ForwardedSearchRequest.ACTION, request)) {
+        try (var ignored = withMac(ForwardedSearchRequest.ACTION, request, peer.getId())) {
             transportService.sendRequest(
                 peer,
                 ForwardedSearchRequest.ACTION,
@@ -869,7 +881,7 @@ public final class ShardRouter {
     public ForwardedSearchResponse forwardFrozenSearch(DiscoveryNode peer, ForwardedFrozenSearchRequest request) throws IOException {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
         final TimeValue timeout = searchForwardTimeout();
-        try (var ignored = withMac(ForwardedFrozenSearchRequest.ACTION, request)) {
+        try (var ignored = withMac(ForwardedFrozenSearchRequest.ACTION, request, peer.getId())) {
             transportService.sendRequest(
                 peer,
                 ForwardedFrozenSearchRequest.ACTION,

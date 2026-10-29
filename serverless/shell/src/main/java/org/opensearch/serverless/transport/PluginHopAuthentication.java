@@ -101,7 +101,7 @@ public final class PluginHopAuthentication implements TransportInterceptor {
                 // context so they are written into the request, and come off again when this returns.
                 // sendRequest serialises the context synchronously, so the asynchronous completion below
                 // does not need them.
-                try (var ignored = signer.withMac(action, request)) {
+                try (var ignored = signer.withMac(action, request, connection.getNode().getId())) {
                     sender.sendRequest(connection, action, request, options, handler);
                 } catch (IOException e) {
                     // Reported to the caller's own handler rather than thrown: a sender that throws where
