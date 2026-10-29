@@ -85,6 +85,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
     /** The last forwarded request the interceptor saw leave, and the MAC header it left under. */
     private static final AtomicReference<TransportRequest> LAST_REQUEST = new AtomicReference<>();
     private static final AtomicReference<String> LAST_MAC = new AtomicReference<>();
+    private static final AtomicReference<java.util.Map<String, String>> LAST_HEADERS = new AtomicReference<>();
     private static final AtomicReference<String> LAST_TOKEN = new AtomicReference<>();
 
     private Settings nodeSettings(String name) {
@@ -179,6 +180,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
                         ) {
                             if (ForwardedIndexRequest.ACTION.equals(action)) {
                                 LAST_REQUEST.set(request);
+                                LAST_HEADERS.set(java.util.Map.copyOf(threadContext.getHeaders()));
                                 LAST_MAC.set(threadContext.getHeader(MAC_HEADER));
                                 LAST_TOKEN.set(threadContext.getHeader(TOKEN_HEADER));
                             }
@@ -355,7 +357,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             final ThreadContext context = other.threadPool().getThreadContext();
             final Exception replayed;
             try (ThreadContext.StoredContext ignored = context.stashContext()) {
-                context.putHeader(MAC_HEADER, mac);
+                context.putHeader(LAST_HEADERS.get());
                 replayed = expectThrows(
                     Exception.class,
                     () -> sendRaw(transport, target, captured).actionGet(TimeValue.timeValueSeconds(30))

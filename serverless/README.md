@@ -127,3 +127,8 @@ so out-of-order delivery does not delay reclaiming expired entries.
 Signed transport requests carry a fresh MAC for each hop and omit the reusable
 deployment token. Receivers retain token verification for legacy unsigned senders;
 MAC-capable senders therefore require MAC-capable receivers.
+
+The MAC also binds the intended receiver and the propagated request headers,
+including caller identity and plugin origin. All members must use the same MAC
+algorithm version; deploy this authentication hardening across the fleet together.
+Header order does not affect authentication.

@@ -116,6 +116,21 @@ public final class TransportAuthenticator {
      * @throws IOException if the request cannot be serialised for its digest
      */
     public String sign(String action, TransportRequest request) throws IOException {
+        return sign(action, request, localNodeId.get(), java.util.Map.of());
+    }
+
+    /**
+     * Signs a request for one receiver and its exact propagated caller context.
+     *
+     * @param action action name
+     * @param request request payload
+     * @param recipient intended receiver's node id
+     * @param headers headers as they will be transmitted
+     * @return authentication header, or null before secrets are available
+     * @throws IOException if serialization fails
+     */
+    public String sign(String action, TransportRequest request, String recipient, java.util.Map<String, String> headers)
+        throws IOException {
         final MetadataPlane.TransportSecrets current = secrets.get();
         if (current == null) {
             return null;
@@ -125,7 +140,7 @@ public final class TransportAuthenticator {
         RANDOM.nextBytes(nonce);
         final String nonceHex = MessageDigests.toHexString(nonce);
         final String sender = localNodeId.get();
-        final byte[] mac = mac(current.current(), action, sender, now, nonceHex, digest(request));
+        final byte[] mac = mac(current.current(), action, sender, recipient, now, nonceHex, digest(request), digestHeaders(headers));
         return current.generation() + ":" + sender + ":" + now + ":" + nonceHex + ":" + MessageDigests.toHexString(mac);
     }
 
@@ -139,6 +154,20 @@ public final class TransportAuthenticator {
      * @throws OpenSearchSecurityException with 403 for anything that does not verify
      */
     public void verify(String action, TransportRequest request, String header) throws IOException {
+        verify(action, request, header, java.util.Map.of());
+    }
+
+    /**
+     * Verifies a request and its caller context for this node only.
+     *
+     * @param action action name
+     * @param request received payload
+     * @param header authentication header
+     * @param headers request headers received from the wire
+     * @throws IOException if serialization fails
+     * @throws OpenSearchSecurityException when authentication fails
+     */
+    public void verify(String action, TransportRequest request, String header, java.util.Map<String, String> headers) throws IOException {
         if (header == null) {
             throw refuse("forwarded request without transport authentication");
         }
@@ -186,7 +215,7 @@ public final class TransportAuthenticator {
         } else {
             throw refuse("transport authentication under an unknown secret generation");
         }
-        final byte[] expected = mac(key, action, sender, timestamp, nonceHex, digest(request));
+        final byte[] expected = mac(key, action, sender, localNodeId.get(), timestamp, nonceHex, digest(request), digestHeaders(headers));
         if (MessageDigest.isEqual(expected, presented) == false) {
             // The same words the token check used, so a test that pins the refusal still holds.
             throw refuse("forwarded request without a valid transport token");
@@ -196,15 +225,25 @@ public final class TransportAuthenticator {
         }
     }
 
-    private static byte[] mac(String keyHex, String action, String sender, long timestamp, String nonceHex, byte[] digest) {
+    private static byte[] mac(
+        String keyHex,
+        String action,
+        String sender,
+        String recipient,
+        long timestamp,
+        String nonceHex,
+        byte[] digest,
+        byte[] headersDigest
+    ) {
         try {
             final Mac mac = Mac.getInstance(ALGORITHM);
             mac.init(new SecretKeySpec(hexToBytes(keyHex), ALGORITHM));
-            for (String field : new String[] { action, sender, Long.toString(timestamp), nonceHex }) {
+            for (String field : new String[] { "serverless-transport-v2", action, sender, recipient, Long.toString(timestamp), nonceHex }) {
                 mac.update(field.getBytes(StandardCharsets.UTF_8));
                 mac.update((byte) 0);
             }
             mac.update(digest);
+            mac.update(headersDigest);
             return mac.doFinal();
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("this JVM has no " + ALGORITHM, e);
@@ -215,6 +254,20 @@ public final class TransportAuthenticator {
     private static byte[] digest(TransportRequest request) throws IOException {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             request.writeTo(out);
+            return MessageDigests.sha256().digest(BytesReference.toBytes(out.bytes()));
+        }
+    }
+
+    private static byte[] digestHeaders(java.util.Map<String, String> headers) throws IOException {
+        final java.util.Map<String, String> authenticated = new java.util.TreeMap<>(headers);
+        authenticated.remove(MAC_HEADER);
+        authenticated.remove(ShardRouter.TOKEN_HEADER);
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeMap(
+                authenticated,
+                org.opensearch.core.common.io.stream.StreamOutput::writeString,
+                org.opensearch.core.common.io.stream.StreamOutput::writeString
+            );
             return MessageDigests.sha256().digest(BytesReference.toBytes(out.bytes()));
         }
     }
