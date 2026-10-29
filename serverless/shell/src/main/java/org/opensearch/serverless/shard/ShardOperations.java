@@ -1862,6 +1862,20 @@ public final class ShardOperations {
             // which is not what a filter checking "may this caller write" expects to see for an update.
             final Read current = doGet(index, id);
             final ServerlessNode.Document existing = current.document();
+            if (existing.found()
+                && ifSeqNo != org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO
+                && (existing.seqNo() != ifSeqNo || existing.primaryTerm() != ifPrimaryTerm)) {
+                // Core checks the condition on its update read, before a script or noop can bypass
+                // the write path. A stale condition must also fail when no write would be emitted.
+                throw new org.opensearch.index.engine.VersionConflictEngineException(
+                    current.shardId(),
+                    id,
+                    ifSeqNo,
+                    ifPrimaryTerm,
+                    existing.seqNo(),
+                    existing.primaryTerm()
+                );
+            }
 
             final java.util.Map<String, Object> merged;
             final String result;
@@ -1921,13 +1935,20 @@ public final class ShardOperations {
                 return new UpdateOutcome("noop", current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
             }
             if ("delete".equals(operation)) {
-                // A script may remove the document, and that is the point of one: the alternative is a read,
-                // a decision in the client, and a second request that races with anyone else writing.
-                // doDelete, not delete: this is already inside the update's own gate, and running the
-                // delete filter chain here would show a filter a DeleteAction it did not see the caller ask
-                // for -- the same reason the read above is doGet rather than get.
-                doDelete(index, id, refresh);
-                return new UpdateOutcome("deleted", current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
+                if (existing.found() == false) {
+                    // A scripted upsert cannot delete a document another writer created after this read.
+                    return new UpdateOutcome("noop", current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
+                }
+                // The script decided against the document we read. Deleting unconditionally here
+                // removed a newer concurrent write; use the same compare-and-swap as an indexed update.
+                final Written removed = written(index, id, "", refresh, true, existing.seqNo(), existing.primaryTerm());
+                return new UpdateOutcome(
+                    "deleted",
+                    removed.servedBy(),
+                    removed.outcome().seqNo(),
+                    removed.outcome().primaryTerm(),
+                    removed.outcome().version()
+                );
             }
 
             if ("noop".equals(result)) {

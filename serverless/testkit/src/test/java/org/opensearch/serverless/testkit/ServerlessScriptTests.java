@@ -200,6 +200,84 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
         }
     }
 
+    public void testStaleConditionsAreCheckedBeforeNoopAndScriptedDelete() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = plane(clock, createTempDir());
+        try (var node = running(metadata, clock, "update-outcome-cas")) {
+            final var operations = new org.opensearch.serverless.shard.ShardOperations(node, metadata);
+            final var before = operations.get("alpha", "1").document();
+            assertEquals(200, call("PUT", "/alpha/_doc/1", "{\"msg\":\"newer\",\"n\":99}").status());
+            final String path = "/alpha/_update/1?if_seq_no=" + before.seqNo() + "&if_primary_term=" + before.primaryTerm();
+            for (String body : new String[] {
+                "{\"doc\":{\"n\":99}}",
+                "{\"script\":{\"source\":\"ctx.op = 'noop'\"}}",
+                "{\"script\":{\"source\":\"ctx.op = 'delete'\"}}" }) {
+                final var response = call("POST", path, body);
+                assertEquals(response.body(), 409, response.status());
+                assertTrue(call("GET", "/alpha/_doc/1", null).has("\"n\":99"));
+            }
+        }
+    }
+
+    public void testScriptedDeletionReturnsTheAssignedSequenceAndVersion() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = plane(clock, createTempDir());
+        try (
+            var owner = running(metadata, clock, "update-delete-owner");
+            var peer = new ServerlessNode(nodeSettings("update-delete-peer"))
+        ) {
+            peer.start();
+            peer.setMetadataPlane(metadata);
+            final int ownerPort = owner.boundHttpAddress().publishAddress().getPort();
+            for (var via : java.util.List.of(owner, peer)) {
+                port = via.boundHttpAddress().publishAddress().getPort();
+                final String id = "removed-" + port;
+                assertEquals(201, call("PUT", "/alpha/_doc/" + id, "{\"n\":1}").status());
+                final var before = new org.opensearch.serverless.shard.ShardOperations(via, metadata).get("alpha", id).document();
+                final var response = call(
+                    "POST",
+                    "/alpha/_update/" + id + "?if_seq_no=" + before.seqNo() + "&if_primary_term=" + before.primaryTerm(),
+                    "{\"script\":{\"source\":\"ctx.op = 'delete'\"}}"
+                );
+                assertEquals(response.body(), 200, response.status());
+                final var body = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                    new org.opensearch.core.common.bytes.BytesArray(response.body()),
+                    false,
+                    org.opensearch.common.xcontent.XContentType.JSON
+                ).v2();
+                assertEquals(before.version() + 1, ((Number) body.get("_version")).longValue());
+                assertTrue(response.body(), ((Number) body.get("_seq_no")).longValue() > before.seqNo());
+                assertTrue(response.body(), ((Number) body.get("_primary_term")).longValue() > 0);
+                assertEquals(404, call("GET", "/alpha/_doc/" + id, null).status());
+            }
+            port = ownerPort;
+        }
+    }
+
+    public void testScriptedDeleteCannotRemoveAWriteThatLandedAfterItsRead() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            try (var node = running(metadata, clock, "script-delete-race")) {
+                metadata.scripts().put("remove", "{\"script\":{\"lang\":\"painless\",\"source\":\"ctx.op = 'delete'\"}}");
+                store.onNextRegisterRead(
+                    "scripts",
+                    "_version",
+                    () -> node.client()
+                        .index(
+                            new org.opensearch.action.index.IndexRequest("alpha").id("1")
+                                .source("{\"msg\":\"raced\",\"n\":99}", org.opensearch.common.xcontent.XContentType.JSON)
+                        )
+                        .actionGet()
+                );
+                final var response = call("POST", "/alpha/_update/1", "{\"script\":{\"id\":\"remove\"}}");
+                assertTrue("the concurrent write must land during script compilation, after the update read", store.fired());
+                assertEquals(response.body(), 409, response.status());
+                assertTrue(call("GET", "/alpha/_doc/1", null).has("raced"));
+            }
+        }
+    }
+
     /** A script that will not compile is the caller's mistake, reported as core words it. */
     public void testABadScriptIsTheCallersMistake() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
