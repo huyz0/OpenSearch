@@ -207,6 +207,30 @@ public class ServerlessAdminTruthTests extends OpenSearchTestCase {
         }
     }
 
+    public void testHealthDoesNotCountExpiredLeasesInAYoungSnapshot() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = plane(clock);
+        try (var node = new ServerlessNode(nodeSettings("health-expiry"))) {
+            node.start();
+            node.setMetadataPlane(metadata);
+            final var ghost = new org.opensearch.serverless.membership.BlobLeaseMembership(
+                metadata.blobStore().blobContainer(org.opensearch.serverless.metadata.RegisterMap.members(BlobPath.cleanPath())),
+                clock::get,
+                TTL
+            );
+            ghost.renew(new NodeLease("departed", "departed-process", "127.0.0.1:9301", Set.of("ingest"), 0L));
+            clock.set(29_000L);
+            metadata.membership().renew(leaseFor(node));
+            assertEquals(2, metadata.membership().refresh().size());
+            clock.set(31_001L);
+            assertEquals("the cached snapshot is young but still contains the expired member", 2, metadata.membership().current().size());
+            final Response response = send(node, "GET", "/_cluster/health?wait_for_nodes=2&timeout=0ms", null);
+            assertEquals(response.body(), 408, response.status());
+            assertTrue(response.body(), response.body().contains("\"number_of_nodes\":1"));
+            assertTrue(response.body(), response.body().contains("\"timed_out\":true"));
+        }
+    }
+
     private static NodeLease leaseFor(ServerlessNode node) {
         return new NodeLease(node.localNode().getId(), node.localNode().getEphemeralId(), "127.0.0.1:9300", Set.of("ingest"), 0L);
     }

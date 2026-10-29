@@ -375,7 +375,12 @@ public final class ClusterHealthHandler extends BaseRestHandler {
         try {
             // A fraction of a lease old is fresh enough for a count, and this is what load balancers poll.
             metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
-            health.nodes = metadata.membership().current().size();
+            final long countingAt = metadata.clock().getAsLong();
+            for (var lease : metadata.membership().current()) {
+                if (lease.isExpiredAt(countingAt) == false) {
+                    health.nodes++;
+                }
+            }
         } catch (IOException e) {
             // The control plane could not be read. That is the red that matters here, and it is reported
             // rather than thrown, because a health endpoint that fails with a 500 when things are unhealthy
