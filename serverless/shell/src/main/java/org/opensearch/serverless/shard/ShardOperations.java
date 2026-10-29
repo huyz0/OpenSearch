@@ -830,7 +830,8 @@ public final class ShardOperations {
 
     private Explained doExplain(String index, String id, org.opensearch.index.query.QueryBuilder query) throws IOException {
         final Placement placement = place(index, id);
-        if (placement.local() != null) {
+        // A retained writer may lag the successor's acknowledged writes, just as in doGet.
+        if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
             final ShardExplain.Outcome outcome = ShardExplain.execute(node.searchService(), placement.local(), id, query);
             return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), true);
         }

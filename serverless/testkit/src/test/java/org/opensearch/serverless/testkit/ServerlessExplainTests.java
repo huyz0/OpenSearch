@@ -94,6 +94,30 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
         return node;
     }
 
+    public void testARetainedWriterForwardsExplainToItsSuccessor() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane metadata = plane(clock, createTempDir());
+        try (
+            ServerlessNode former = running(metadata, clock, "explain-former");
+            ServerlessNode successor = new ServerlessNode(nodeSettings("explain-successor"))
+        ) {
+            successor.start();
+            successor.setMetadataPlane(metadata);
+            assertTrue(metadata.heads().release("books", 0, former.localNode().getId()));
+            assertTrue(successor.activateWriter(metadata, "books", 0).isPresent());
+            port = successor.boundHttpAddress().publishAddress().getPort();
+            final Answer updated = call("PUT", "/books/_doc/1?refresh=true", "{\"title\":\"newest\"}");
+            assertEquals(updated.body(), 200, updated.status());
+            assertFalse("the old writer must remain open to exercise stale placement", former.reconciler().openShards().isEmpty());
+            former.forgetOwner("books", 0);
+            port = former.boundHttpAddress().publishAddress().getPort();
+            final Answer explained = call("POST", "/books/_explain/1", "{\"query\":{\"match\":{\"title\":\"newest\"}}}");
+            assertEquals(explained.body(), 200, explained.status());
+            assertTrue(explained.body(), explained.has("\"matched\":true"));
+            assertTrue(explained.body(), explained.has("\"_node\":\"" + successor.localNode().getId() + "\""));
+        }
+    }
+
     /** A document that matches: the score is accounted for, term by term. */
     public void testAMatchingDocumentIsExplained() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
