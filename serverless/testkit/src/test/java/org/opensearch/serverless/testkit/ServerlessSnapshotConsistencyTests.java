@@ -62,6 +62,28 @@ import java.util.function.Predicate;
  */
 public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
 
+    public void testUnreadableSnapshotStopsCollectionBeforeDeletingFiles() throws Exception {
+        try (FsBlobStore store = new FsBlobStore(1024, createTempDir(), false)) {
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1_000L, 30_000L);
+            plane.createIndex(new IndexDescriptor("protected", "uuid-protected-000", 1, "{}", null));
+            final BlobPath shard = plane.shardData("protected", 0);
+            final BlobContainer old = store.blobContainer(shard.add("t=1"));
+            old.writeBlobAtomic("snapshot-file", new java.io.ByteArrayInputStream(new byte[] { 1 }), 1L, true);
+            store.blobContainer(shard).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            final BlobContainer snapshots = store.blobContainer(
+                org.opensearch.serverless.metadata.RegisterMap.snapshots(BlobPath.cleanPath())
+            );
+            snapshots.writeBlobAtomic("damaged", new java.io.ByteArrayInputStream(new byte[] { 0 }), 1L, true);
+            final var collector = new org.opensearch.serverless.reconcile.GarbageCollector(store, BlobPath.cleanPath());
+            assertTrue(
+                expectThrows(IOException.class, () -> collector.collectShard(plane, "protected", 0)).getMessage().contains("damaged")
+            );
+            assertTrue("unknown snapshot references must remain intact", old.blobExists("snapshot-file"));
+            snapshots.deleteBlobsIgnoringIfNotExists(List.of("damaged"));
+            assertEquals(List.of("t=1/snapshot-file"), collector.collectShard(plane, "protected", 0));
+        }
+    }
+
     private static final long TTL = 300_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
 
