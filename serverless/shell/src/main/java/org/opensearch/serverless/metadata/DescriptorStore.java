@@ -71,9 +71,8 @@ public final class DescriptorStore {
     /**
      * How long a sweep may take, by its own clock, between claiming a tombstone and deleting it.
      *
-     * <p>Past this the sweep leaves the tombstone for a later pass rather than delete it. The delete is
-     * unconditional -- the object store has none other -- so it is only safe while no create can have
-     * swapped over the claim, and creates are held off for {@link #TOMBSTONE_REAP_HANDOFF_MILLIS}.
+     * <p>Past this the sweep leaves the tombstone for a later pass. The actual delete also checks the
+     * claimed generation, which protects recreation even when a request lands after its deadline.
      */
     public static final long TOMBSTONE_REAP_DEADLINE_MILLIS = 10_000L;
 
@@ -229,11 +228,9 @@ public final class DescriptorStore {
      * @param name the register name
      * @param value what to store
      * @return the generation as stored
-     * <p><b>Except a tombstone a sweep has claimed.</b> The sweep's delete cannot be made conditional, so a
-     * create that swapped in between the sweep's claim and its delete would be deleted with the tombstone
-     * -- an acknowledged index gone. A claim is refused for {@link #TOMBSTONE_REAP_HANDOFF_MILLIS} and the
-     * sweep deletes within {@link #TOMBSTONE_REAP_DEADLINE_MILLIS} of making it or not at all; past the
-     * handoff the claim was abandoned and the tombstone is taken as usual.
+     * <p>A legacy sweep claim is refused for {@link #TOMBSTONE_REAP_HANDOFF_MILLIS}; past the
+     * handoff it is abandoned and creation can swap over it. A sweep deletes only the generation it
+     * claimed, so even a request applied after handoff cannot remove that recreated index.
      *
      * @throws IOException if the store cannot be read or written
      * @throws IndexAlreadyExistsException if the name is taken by a live record
@@ -522,7 +519,7 @@ public final class DescriptorStore {
      *
      * <p>Where the store honours a conditional delete ({@link #conditionalDelete()}), that is all it is: the
      * register is deleted at the generation the caller read, and nothing is left behind. Otherwise it is a
-     * swap to a tombstone, which the sweep removes later. Either way the conditional step is the
+     * swap to a tombstone, retained until verified conditional deletion is available. Either way the conditional step is the
      * linearization point: after it, {@link #get} reports the index as absent.
      *
      * <p>The tombstone records when the delete happened, in the caller's clock, so
@@ -643,13 +640,10 @@ public final class DescriptorStore {
      * hour to find the few hundred names deleted that hour. The cost is now one listing of the buckets,
      * plus a read and a claim per name deleted in the buckets this node owns.
      *
-     * <p><b>Claimed, then deleted, never deleted on the strength of a read.</b> The object store has no
-     * conditional delete, and the walk this replaced read a tombstone, moved on, and deleted it at the end:
-     * a name recreated in between -- hours, at scale -- lost its new descriptor, and the collector then
-     * deleted the new index's shards as orphans. Now a tombstone is first swapped to a claimed one, which
-     * {@code createRegister} refuses to swap over, and deleted only if the claim is still younger than
-     * {@link #TOMBSTONE_REAP_DEADLINE_MILLIS} by this node's clock. What is left is the pause between
-     * that check and the delete landing, the same residual every lease-timed write here carries.
+     * <p><b>Deletion is conditional on the claimed generation.</b> A deadline checked before sending a
+     * request cannot prevent a slow backing store from applying it after a name was recreated. Only
+     * stores that passed the conditional-delete probe may reap old tombstones. Other stores retain
+     * them: recreation can still swap over them, but prefix enumeration may cost more as they accumulate.
      *
      * <p><b>Safe to run on more than one node.</b> Two sweeps of the same bucket contend on the claim and
      * one of them loses it; which is what lets {@code ownsBucket} be a hint drawn from membership rather
@@ -677,6 +671,11 @@ public final class DescriptorStore {
      * @throws IOException if listing, reading or deleting fails
      */
     public List<String> sweepTombstones(long nowMillis, long quarantineMillis, Predicate<String> ownsBucket) throws IOException {
+        // A deadline checked before a remote request does not bound when its delete is applied.
+        // Retain tombstones unless the backing store has proved it enforces the expected generation.
+        if (conditionalDelete() == false) {
+            return List.of();
+        }
         final List<String> removed = new ArrayList<>();
         for (String bucket : new ArrayList<>(blobStore.blobContainer(tombstonesPath).children().keySet())) {
             final long start = tombstoneBucketStart(bucket);
@@ -732,7 +731,7 @@ public final class DescriptorStore {
                 BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC
             );
             final List<String> finished = new ArrayList<>();
-            final List<String> claimed = new ArrayList<>();
+            final Map<String, Long> claimed = new LinkedHashMap<>();
             long oldestClaim = 0L;
             for (org.opensearch.common.blobstore.BlobMetadata marker : listed) {
                 final String blobName = marker.name();
@@ -743,12 +742,11 @@ public final class DescriptorStore {
                     kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
                 }
                 final long claimAt = clock.getAsLong();
-                switch (reap(blobName, bucketStart, nowMillis, quarantineMillis, claimAt)) {
+                switch (reap(blobName, bucketStart, nowMillis, quarantineMillis, claimAt, claimed)) {
                     case CLAIMED -> {
-                        if (claimed.isEmpty()) {
+                        if (claimed.size() == 1) {
                             oldestClaim = claimAt;
                         }
-                        claimed.add(blobName);
                     }
                     case STALE -> finished.add(blobName);
                     case KEEP -> kept = true;
@@ -776,7 +774,8 @@ public final class DescriptorStore {
      *
      * @return false if they were not, and the markers are kept for a later sweep
      */
-    private boolean flushClaims(List<String> claimed, long oldestClaim, List<String> finished, List<String> removed) throws IOException {
+    private boolean flushClaims(Map<String, Long> claimed, long oldestClaim, List<String> finished, List<String> removed)
+        throws IOException {
         if (claimed.isEmpty()) {
             return true;
         }
@@ -786,16 +785,24 @@ public final class DescriptorStore {
                 // marker, sees the claim has aged past the handoff, and claims it afresh.
                 return false;
             }
-            container.deleteBlobsIgnoringIfNotExists(claimed);
-            removed.addAll(claimed);
-            finished.addAll(claimed);
-            return true;
+            boolean all = true;
+            for (Map.Entry<String, Long> claim : claimed.entrySet()) {
+                if (container.deleteRegisterIfUnchanged(claim.getKey(), claim.getValue())) {
+                    removed.add(claim.getKey());
+                    finished.add(claim.getKey());
+                } else {
+                    // A newer claim or lifecycle change still needs its discovery marker.
+                    all = false;
+                }
+            }
+            return all;
         } finally {
             claimed.clear();
         }
     }
 
-    private Reaped reap(String blobName, long bucketStart, long nowMillis, long quarantineMillis, long claimAt) throws IOException {
+    private Reaped reap(String blobName, long bucketStart, long nowMillis, long quarantineMillis, long claimAt, Map<String, Long> claimed)
+        throws IOException {
         final Optional<BlobRegister> register = container.readRegister(blobName);
         if (register.isEmpty() || isTombstone(register.get().value()) == false) {
             // Already removed, recreated since, or a delete whose swap lost after its marker was written.
@@ -821,7 +828,11 @@ public final class DescriptorStore {
             register.get().generation(),
             tombstone(deletedAt, claimAt)
         );
-        return swapped.applied() ? Reaped.CLAIMED : Reaped.KEEP;
+        if (swapped.applied()) {
+            claimed.put(blobName, swapped.currentGeneration());
+            return Reaped.CLAIMED;
+        }
+        return Reaped.KEEP;
     }
 
     /**
