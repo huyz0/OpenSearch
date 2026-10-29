@@ -90,6 +90,38 @@ public class ServerlessTemplateTests extends OpenSearchTestCase {
         return node;
     }
 
+    public void testPrivateSettingsCannotPoisonNewIndicesOrTemplates() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = plane(clock, createTempDir());
+        try (ServerlessNode node = running(plane, "private-index-settings")) {
+            assertNotNull(node);
+            int ordinal = 0;
+            for (String key : java.util.List.of("index.uuid", "index.version.created", "index.creation_date", "index.provided_name")) {
+                final String index = "private-" + ordinal;
+                final String settings = "{\"" + key + "\":\"poison\"}";
+                final Answer created = call("PUT", "/" + index, "{\"settings\":" + settings + "}");
+                assertEquals("must refuse private " + key + ": " + created.body(), 400, created.status());
+                assertTrue(created.body(), created.has(key));
+                assertTrue("the refused index must not be persisted", plane.describe(index).isEmpty());
+                for (String path : java.util.List.of("/_component_template/", "/_index_template/")) {
+                    final String name = "private-template-" + ordinal;
+                    final Answer stored = call(
+                        "PUT",
+                        path + name,
+                        "{"
+                            + (path.contains("_component") ? "" : "\"index_patterns\":[\"logs-*\"],")
+                            + "\"template\":{\"settings\":"
+                            + settings
+                            + "}}"
+                    );
+                    assertEquals("must refuse private " + key + ": " + stored.body(), 400, stored.status());
+                    assertEquals(404, call("GET", path + name, null).status());
+                }
+                ordinal++;
+            }
+        }
+    }
+
     private void templates() throws Exception {
         call(
             "PUT",
