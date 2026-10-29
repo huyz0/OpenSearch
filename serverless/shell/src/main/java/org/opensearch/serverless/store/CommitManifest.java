@@ -254,53 +254,88 @@ public final class CommitManifest {
             XContentParser parser = XContentType.JSON.xContent()
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
         ) {
+            if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                throw new IOException("malformed commit manifest: expected an object");
+            }
             long term = -1;
             String writer = null;
             final Map<String, String> files = new LinkedHashMap<>();
             final Map<String, Long> lengths = new LinkedHashMap<>();
             PruningDigest digest = PruningDigest.EMPTY;
             long walOrdinal = -1L;
-            String field = null;
+            boolean sawFiles = false;
             XContentParser.Token token;
-            while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
-                if (token == XContentParser.Token.FIELD_NAME) {
-                    field = parser.currentName();
-                } else if (token == XContentParser.Token.START_OBJECT && "lengths".equals(field)) {
-                    String fileName = null;
-                    XContentParser.Token inner;
-                    while ((inner = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
-                        if (inner == XContentParser.Token.FIELD_NAME) {
-                            fileName = parser.currentName();
-                        } else if (inner.isValue() && fileName != null) {
-                            lengths.put(fileName, parser.longValue());
+            while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                if (token != XContentParser.Token.FIELD_NAME) {
+                    throw new IOException("malformed commit manifest: expected a field");
+                }
+                final String field = parser.currentName();
+                token = parser.nextToken();
+                if (token == null) {
+                    throw new IOException("unexpected end of commit manifest");
+                }
+                switch (field) {
+                    case "files", "lengths" -> {
+                        if (token != XContentParser.Token.START_OBJECT) {
+                            throw new IOException("malformed commit manifest: " + field + " must be an object");
+                        }
+                        if (field.equals("files")) {
+                            sawFiles = true;
+                        }
+                        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                            if (token != XContentParser.Token.FIELD_NAME) {
+                                throw new IOException("malformed commit manifest: expected a file name");
+                            }
+                            final String fileName = parser.currentName();
+                            token = parser.nextToken();
+                            if (field.equals("files")) {
+                                if (token != XContentParser.Token.VALUE_STRING || parser.text().isEmpty()) {
+                                    throw new IOException("malformed commit manifest: expected a file location");
+                                }
+                                files.put(fileName, parser.text());
+                            } else {
+                                if (token != XContentParser.Token.VALUE_NUMBER) {
+                                    throw new IOException("malformed commit manifest: expected a file length");
+                                }
+                                final long length = parser.longValue(false);
+                                if (length < 0) {
+                                    throw new IOException("malformed commit manifest: negative file length");
+                                }
+                                lengths.put(fileName, length);
+                            }
                         }
                     }
-                } else if (token == XContentParser.Token.START_OBJECT && "files".equals(field)) {
-                    String fileName = null;
-                    XContentParser.Token inner;
-                    while ((inner = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
-                        if (inner == XContentParser.Token.FIELD_NAME) {
-                            fileName = parser.currentName();
-                        } else if (inner.isValue() && fileName != null) {
-                            files.put(fileName, parser.text());
+                    case "digest" -> {
+                        if (token != XContentParser.Token.START_OBJECT) {
+                            throw new IOException("malformed commit manifest: digest must be an object");
+                        }
+                        digest = PruningDigest.parse(parser);
+                    }
+                    case "term", "wal_ordinal" -> {
+                        if (token != XContentParser.Token.VALUE_NUMBER) {
+                            throw new IOException("malformed commit manifest: " + field + " must be an integer");
+                        }
+                        final long number = parser.longValue(false);
+                        if (field.equals("term")) {
+                            term = number;
+                        } else {
+                            walOrdinal = number;
                         }
                     }
-                } else if (token == XContentParser.Token.START_OBJECT && "digest".equals(field)) {
-                    digest = PruningDigest.parse(parser);
-                } else if (field != null && (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY)) {
-                    // Something a later version added: skipped whole, so its closing brace is not mistaken
-                    // for the manifest's own.
-                    parser.skipChildren();
-                } else if (token.isValue() && "term".equals(field)) {
-                    term = parser.longValue();
-                } else if (token.isValue() && "writer".equals(field)) {
-                    writer = parser.text();
-                } else if (token.isValue() && "wal_ordinal".equals(field)) {
-                    walOrdinal = parser.longValue();
+                    case "writer" -> {
+                        if (token != XContentParser.Token.VALUE_STRING && token != XContentParser.Token.VALUE_NULL) {
+                            throw new IOException("malformed commit manifest: writer must be a string");
+                        }
+                        writer = parser.textOrNull();
+                    }
+                    default -> parser.skipChildren();
                 }
             }
-            if (term < 0) {
-                throw new IOException("malformed commit manifest: no term");
+            if (term < 0 || sawFiles == false) {
+                throw new IOException("malformed commit manifest: missing term or files");
+            }
+            if (parser.nextToken() != null) {
+                throw new IOException("malformed commit manifest: trailing content");
             }
             return new CommitManifest(term, files, writer, lengths, digest, walOrdinal);
         }
