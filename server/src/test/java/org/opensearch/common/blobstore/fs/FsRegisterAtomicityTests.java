@@ -33,6 +33,7 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
     private static class Faults extends FilterFileSystemProvider {
         final AtomicBoolean interruptWrite = new AtomicBoolean();
         final AtomicBoolean readOnly = new AtomicBoolean();
+        final AtomicBoolean noHardLinks = new AtomicBoolean();
         final AtomicReference<Runnable> beforeDelete = new AtomicReference<>();
         final AtomicReference<Runnable> afterWrite = new AtomicReference<>();
 
@@ -59,6 +60,14 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
         public void delete(Path path) throws IOException {
             deleting(path);
             super.delete(path);
+        }
+
+        @Override
+        public void createLink(Path link, Path existing) throws IOException {
+            if (noHardLinks.get()) {
+                throw new UnsupportedOperationException("hard links unavailable");
+            }
+            super.createLink(link, existing);
         }
 
         @Override
@@ -298,6 +307,44 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
             });
             assertTrue(container.compareAndSwapRegister("record", generation, new BytesArray("new")).applied());
             assertTrue("the listing must run while the new version is still staged", observed.get());
+        }
+    }
+
+    public void testCreateWithoutHardLinksDoesNotPublishAPartialBlob() throws Exception {
+        final Path directory = createTempDir();
+        final Faults faults = new Faults(directory.getFileSystem());
+        try (FileSystem fs = faults.getFileSystem(null); var store = new FsBlobStore(1024, fs.getPath(directory.toString()), false)) {
+            final BlobContainer container = store.blobContainer(BlobPath.cleanPath());
+            faults.noHardLinks.set(true);
+            final byte[] value = new byte[8192];
+            expectThrows(
+                IOException.class,
+                () -> container.writeBlob("record", new java.io.ByteArrayInputStream(value), value.length, true)
+            );
+            assertTrue(container.listBlobs().isEmpty());
+            faults.noHardLinks.set(false);
+            container.writeBlob("record", new java.io.ByteArrayInputStream(value), value.length, true);
+            assertEquals(value.length, container.listBlobs().get("record").length());
+        }
+    }
+
+    public void testFailedCreateRemovesTheStagedBlob() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final BlobContainer container = store.blobContainer(BlobPath.cleanPath());
+            final var interrupted = new java.io.InputStream() {
+                private boolean started;
+
+                @Override
+                public int read() throws IOException {
+                    if (started) {
+                        throw new IOException("interrupted blob upload");
+                    }
+                    started = true;
+                    return 1;
+                }
+            };
+            expectThrows(IOException.class, () -> container.writeBlob("record", interrupted, 8192, true));
+            assertTrue(container.listBlobs().isEmpty());
         }
     }
 

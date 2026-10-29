@@ -363,13 +363,12 @@ public class FsBlobContainer extends AbstractBlobContainer {
     private void createWhole(String blobName, InputStream inputStream, long blobSize) throws IOException {
         final Path target = resolveBlobPath(blobName);
         final Path temp = path.resolve(tempBlobName(blobName));
-        writeToPath(inputStream, temp, blobSize);
         try {
+            writeToPath(inputStream, temp, blobSize);
             try {
                 Files.createLink(target, temp);
             } catch (UnsupportedOperationException e) {
-                // A filesystem without hard links: a copy still refuses a taken name, though not atomically.
-                Files.copy(temp, target);
+                throw new IOException("atomic blob creation requires filesystem hard link support", e);
             }
         } finally {
             Files.deleteIfExists(temp);
