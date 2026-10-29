@@ -150,6 +150,38 @@ public class PruningDigestTests extends OpenSearchTestCase {
         }
     }
 
+    public void testDateFormatsInAUnionCannotHideAMatchingIndex() {
+        final var seconds = new PruningDigest(Map.of("d", new PruningDigest.FieldRange("date", 1_000L, 1_000L, "epoch_second", "und")));
+        final var millis = new PruningDigest(Map.of("d", new PruningDigest.FieldRange("date", 1_000L, 1_000L, "epoch_millis", "und")));
+        assertTrue(millis.canMatch(QueryBuilders.termQuery("d", "1000"), NOW));
+        assertTrue(seconds.canMatch(QueryBuilders.termQuery("d", "1"), NOW));
+        assertTrue("a union must keep the millis match", seconds.union(millis).canMatch(QueryBuilders.termQuery("d", "1000"), NOW));
+        assertTrue("either operand may contribute a match", millis.union(seconds).canMatch(QueryBuilders.termQuery("d", "1"), NOW));
+    }
+
+    public void testDateLocalesInAUnionCannotHideAMatchingIndex() {
+        final String format = "YYYY-'W'ww-e";
+        final String value = "2026-W01-1";
+        final long usInstant = org.opensearch.common.time.DateFormatter.forPattern(format)
+            .withLocale(java.util.Locale.US)
+            .toDateMathParser()
+            .parse(value, () -> NOW, false, java.time.ZoneOffset.UTC)
+            .toEpochMilli();
+        final long ukInstant = org.opensearch.common.time.DateFormatter.forPattern(format)
+            .withLocale(java.util.Locale.UK)
+            .toDateMathParser()
+            .parse(value, () -> NOW, false, java.time.ZoneOffset.UTC)
+            .toEpochMilli();
+        assertNotEquals("the fixture needs locale-dependent week boundaries", usInstant, ukInstant);
+        final var us = new PruningDigest(Map.of("d", new PruningDigest.FieldRange("date", usInstant, usInstant, format, "en-US")));
+        final var uk = new PruningDigest(Map.of("d", new PruningDigest.FieldRange("date", usInstant, usInstant, format, "en-GB")));
+        assertTrue(us.canMatch(QueryBuilders.rangeQuery("d").gte(value), NOW));
+        assertTrue(
+            "a union must not interpret every index using one locale",
+            uk.union(us).canMatch(QueryBuilders.rangeQuery("d").gte(value), NOW)
+        );
+    }
+
     public void testWhatItCannotJudgeIsAMaybe() {
         final PruningDigest d = digest();
         assertTrue("an undigested field", d.canMatch(QueryBuilders.rangeQuery("other").gte(1000), NOW));

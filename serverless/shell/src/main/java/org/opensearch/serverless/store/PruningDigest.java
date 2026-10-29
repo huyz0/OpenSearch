@@ -202,7 +202,8 @@ public final class PruningDigest {
 
     /**
      * A digest covering everything either covers: only the fields both digest, each over the union of the two
-     * ranges. A field one side does not digest is one it cannot judge, so the union cannot judge it either.
+     * ranges. A field one side does not digest, or interprets using a different date format or locale,
+     * is one the union cannot judge safely.
      *
      * @param other the other digest
      * @return the union
@@ -212,7 +213,10 @@ public final class PruningDigest {
         for (Map.Entry<String, FieldRange> field : fields.entrySet()) {
             final FieldRange mine = field.getValue();
             final FieldRange theirs = other.fields.get(field.getKey());
-            if (theirs == null || mine.type().equals(theirs.type()) == false) {
+            if (theirs == null
+                || mine.type().equals(theirs.type()) == false
+                || java.util.Objects.equals(mine.format(), theirs.format()) == false
+                || java.util.Objects.equals(mine.locale(), theirs.locale()) == false) {
                 continue;
             }
             final Number min;
