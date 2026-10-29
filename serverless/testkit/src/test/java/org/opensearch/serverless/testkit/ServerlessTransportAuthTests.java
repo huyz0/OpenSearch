@@ -99,6 +99,59 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             .build();
     }
 
+    public void testConcurrentSecretCacheExpiryReadsTheStoreOnce() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var rendezvous = new java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CyclicBarrier>();
+        final var entered = ThreadLocal.withInitial(() -> false);
+        final java.util.function.LongSupplier now = () -> {
+            final var barrier = rendezvous.get();
+            if (barrier != null && Thread.currentThread().getName().startsWith("secret-cache-reader") && entered.get() == false) {
+                entered.set(true);
+                try {
+                    barrier.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new AssertionError(e);
+                }
+            }
+            return clock.get();
+        };
+        try (var store = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), now, TTL);
+            try (var node = new ServerlessNode(nodeSettings("secret-cache-coalescing"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                node.transportSecrets(false);
+                final var rotated = plane.rotateTransportSecret();
+                clock.addAndGet(TTL + 1);
+                store.reset();
+                rendezvous.set(new java.util.concurrent.CyclicBarrier(8));
+                final var workers = java.util.concurrent.Executors.newFixedThreadPool(8, runnable -> {
+                    final var thread = new Thread(runnable, "secret-cache-reader");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+                try {
+                    final var reads = new java.util.ArrayList<java.util.concurrent.Future<MetadataPlane.TransportSecrets>>();
+                    for (int i = 0; i < 8; i++) {
+                        reads.add(workers.submit(() -> node.transportSecrets(false)));
+                    }
+                    for (var read : reads) {
+                        assertEquals(rotated.generation(), read.get(15, java.util.concurrent.TimeUnit.SECONDS).generation());
+                    }
+                    assertEquals("one expired cache must produce one object-store read", 1L, store.registerReads());
+                } finally {
+                    rendezvous.set(null);
+                    workers.shutdownNow();
+                    assertTrue(workers.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS));
+                }
+                assertEquals(rotated.generation(), node.transportSecrets(false).generation());
+                assertEquals(1L, store.registerReads());
+                node.transportSecrets(true);
+                assertEquals("an explicit refresh still reads again", 2L, store.registerReads());
+            }
+        }
+    }
+
     /** A request that is never sent: the action exists so its constructor is handed the transport service. */
     public static final class ProbeRequest extends ActionRequest {
         ProbeRequest() {}
