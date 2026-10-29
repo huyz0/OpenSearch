@@ -157,19 +157,23 @@ public final class GetHandler extends BaseRestHandler {
                 )
             );
         }
-        // For the shard number and the placement, both checked against the uuid where the read lands, so a
-        // descriptor up to a second old costs nothing it can get wrong. See MetadataPlane#resolveForRouting.
-        final Optional<IndexDescriptor> descriptor = metadata.describeForRouting(index);
-        if (descriptor.isEmpty()) {
+        final ServerlessNode serving = node.get();
+        if (serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index)
+                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
             );
         }
-
-        final int shard = DocumentRouting.shardFor(descriptor.get(), id);
-        final ServerlessNode serving = node.get();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GET).execute(() -> {
             try {
+                // Routing-cache misses read the object store, so resolution belongs off the HTTP thread too.
+                final Optional<IndexDescriptor> descriptor = metadata.describeForRouting(index);
+                if (descriptor.isEmpty()) {
+                    channel.sendResponse(
+                        IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index)
+                    );
+                    return;
+                }
+                final int shard = DocumentRouting.shardFor(descriptor.get(), id);
                 answer(channel, serving, metadata, descriptor.get(), id, shard, bodyless, fetchSource, sourceOnly);
             } catch (Exception e) {
                 try {

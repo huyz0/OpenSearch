@@ -204,6 +204,42 @@ public final class DocumentHandler extends BaseRestHandler {
             );
         }
 
+        final ServerlessNode serving = node.get();
+        if (serving == null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
+            );
+        }
+        // Resolution, pipeline reads/execution and owner discovery can all block on the store.
+        // Preserve the existing execution pools for applying and forwarding the planned write.
+        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                planWrite(metadata, serving, index, id, source, pipeline, deletion, requireAbsent, refresh, ifSeqNo, ifPrimaryTerm).accept(
+                    channel
+                );
+            } catch (Exception e) {
+                try {
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                } catch (IOException nested) {
+                    logger.error("failed to report a write planning failure", nested);
+                }
+            }
+        });
+    }
+
+    private RestChannelConsumer planWrite(
+        MetadataPlane metadata,
+        ServerlessNode serving,
+        String index,
+        String id,
+        String source,
+        String pipeline,
+        boolean deletion,
+        boolean requireAbsent,
+        boolean refresh,
+        long ifSeqNo,
+        long ifPrimaryTerm
+    ) throws IOException {
         // An index by name, or a data stream's newest backing index. The response reports the backing
         // index, as core does -- {@code .ds-logs-000001} for a write through {@code logs} -- on the local
         // path and the forwarded path alike. The comment here used to claim the caller's name, the local
@@ -230,13 +266,6 @@ public final class DocumentHandler extends BaseRestHandler {
         }
         final Optional<IndexDescriptor> descriptor = Optional.of(target.get().index());
         final String writtenIndex = descriptor.get().name();
-        final ServerlessNode serving = node.get();
-        if (serving == null) {
-            // Checked once, here, rather than checked at one use and dereferenced at the next.
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
-            );
-        }
         if (serving.isSystemIndex(writtenIndex)) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
