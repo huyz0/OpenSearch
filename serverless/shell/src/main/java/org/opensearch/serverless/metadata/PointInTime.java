@@ -183,7 +183,7 @@ public final class PointInTime {
      * @return the extended view
      */
     public PointInTime withExpiry(long expiresAtMillis) {
-        return new PointInTime(id, index, indexUuid, expiresAtMillis, shards);
+        return new PointInTime(id, index, indexUuid, expiresAtMillis, shards, capturing);
     }
 
     /**
@@ -263,7 +263,7 @@ public final class PointInTime {
      * treatment still covers the case it exists for. Something with a name we would never mint is not ours
      * and does not get to speak for our data.
      *
-     * <p>The shape is {@link org.opensearch.common.UUIDs#randomBase64UUID}'s: twenty base64url characters
+     * <p>The shape is {@link org.opensearch.common.UUIDs#randomBase64UUID}'s: twenty-two base64url characters
      * with no padding.
      *
      * @param name the blob name
