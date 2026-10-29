@@ -1137,6 +1137,8 @@ public final class MetadataPlane {
                 if (pit.expiredAt(nowMillis) == false) {
                     live.add(pit);
                 }
+            } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
+                // A release after discovery is ordinary. It no longer protects any files.
             } catch (Exception e) {
                 // A view the collector cannot read is one it must assume is holding something, because the
                 // alternative is deleting files somebody is paging through. A half-written record still has
@@ -1985,6 +1987,8 @@ public final class MetadataPlane {
             }
             try (java.io.InputStream in = container.readBlob(key)) {
                 found.add(SnapshotRecord.fromStream(in));
+            } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
+                // Deleted after the listing: no references remain under this record.
             } catch (Exception e) {
                 throw new IOException("cannot establish snapshot protection: could not read snapshot [" + key + "]", e);
             }
