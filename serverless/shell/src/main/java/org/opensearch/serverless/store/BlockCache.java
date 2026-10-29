@@ -87,7 +87,6 @@ public final class BlockCache {
     private final AtomicLong coalesced = new AtomicLong();
     private final AtomicLong bytesFetched = new AtomicLong();
     private final AtomicLong bytesResident = new AtomicLong();
-    private final AtomicLong blocksResident = new AtomicLong();
 
     /**
      * Creates a cache.
@@ -144,7 +143,6 @@ public final class BlockCache {
         final long evicted = stripe.put(key, block);
         bytesFetched.addAndGet(block.length);
         bytesResident.addAndGet(block.length - evicted);
-        blocksResident.set(residentBlocks());
     }
 
     /**
