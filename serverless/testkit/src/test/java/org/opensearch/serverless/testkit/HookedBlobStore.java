@@ -42,6 +42,7 @@ public final class HookedBlobStore implements BlobStore {
     private final AtomicReference<Hook> swapHook = new AtomicReference<>();
     private final AtomicReference<Hook> deleteHook = new AtomicReference<>();
     private final AtomicReference<Hook> armed = new AtomicReference<>();
+    private final AtomicReference<Hook> listingHook = new AtomicReference<>();
     private volatile boolean fired;
     private volatile String failListingsUnder;
     private volatile String failRegisterWritesUnder;
@@ -133,6 +134,17 @@ public final class HookedBlobStore implements BlobStore {
     public void onNextRegisterRead(String pathContains, String blobName, Runnable action) {
         fired = false;
         armed.set(new Hook(pathContains, blobName, action));
+    }
+
+    /**
+     * Runs an action after a matching container's next listing is captured, before it is returned.
+     *
+     * @param pathContains container path fragment
+     * @param action concurrent operation
+     */
+    public void onNextListing(String pathContains, Runnable action) {
+        fired = false;
+        listingHook.set(new Hook(pathContains, "", action));
     }
 
     /**
@@ -263,7 +275,13 @@ public final class HookedBlobStore implements BlobStore {
         @Override
         public Map<String, BlobMetadata> listBlobs() throws IOException {
             listing();
-            return inner.listBlobs();
+            final Map<String, BlobMetadata> listed = inner.listBlobs();
+            final Hook hook = listingHook.get();
+            if (hook != null && inner.path().buildAsString().contains(hook.pathContains()) && listingHook.compareAndSet(hook, null)) {
+                hook.action().run();
+                fired = true;
+            }
+            return listed;
         }
 
         @Override

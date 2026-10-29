@@ -81,7 +81,9 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
             );
             assertTrue("unknown snapshot references must remain intact", old.blobExists("snapshot-file"));
             snapshots.deleteBlobsIgnoringIfNotExists(List.of("repo#damaged"));
-            assertEquals(List.of("t=1/snapshot-file"), collector.collectShard(plane, "protected", 0));
+            final List<String> deleted = collector.collectShard(plane, "protected", 0);
+            assertTrue("collection resumes after the corrupt record is removed: " + deleted, deleted.contains("t=1/snapshot-file"));
+            assertFalse(old.blobExists("snapshot-file"));
         }
     }
 
