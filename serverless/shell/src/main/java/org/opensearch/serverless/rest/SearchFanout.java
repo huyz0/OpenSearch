@@ -431,7 +431,7 @@ public final class SearchFanout {
             }
             checks.add(() -> {
                 final ShardId local = localShard(serving, target.descriptor(), target.shard());
-                if (local != null && serving.reconciler().readerShards().contains(local) == false) {
+                if (local != null && serving.reconciler().isReader(local) == false) {
                     // Open here as a writer: it may hold refreshed documents its published digest does not
                     // describe. A reader serves exactly the published commit, so it is judged like any other.
                     return false;
@@ -1121,12 +1121,8 @@ public final class SearchFanout {
     private static ShardId localShard(ServerlessNode serving, org.opensearch.serverless.cluster.IndexDescriptor descriptor, int shard) {
         // By uuid as well as name: a shard of a deleted index of the same name is still open here until
         // the next heartbeat notices, and it must not answer for the recreated one.
-        return serving.reconciler()
-            .openShards()
-            .stream()
-            .filter(s -> s.getIndexName().equals(descriptor.name()) && s.id() == shard && s.getIndex().getUUID().equals(descriptor.uuid()))
-            .findFirst()
-            .orElse(null);
+        final var held = serving.reconciler().servingShard(new ShardId(descriptor.name(), descriptor.uuid(), shard));
+        return held == null ? null : held.shardId();
     }
 
     /**

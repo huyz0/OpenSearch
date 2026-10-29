@@ -538,8 +538,11 @@ public final class ShardRouter {
     }
 
     private ShardId localShard(String index, int shard, String indexUuid) {
-        final ShardId found = localShard(index, shard);
-        return found == null || indexUuid == null || indexUuid.equals(found.getIndex().getUUID()) ? found : null;
+        if (indexUuid == null) {
+            return localShard(index, shard); // compatibility for legacy senders without an incarnation
+        }
+        final var held = node.reconciler().servingShard(new ShardId(index, indexUuid, shard));
+        return held == null ? null : held.shardId();
     }
 
     /**
@@ -552,7 +555,7 @@ public final class ShardRouter {
      */
     private ShardId writerShard(String index, int shard, String indexUuid) {
         final ShardId found = localShard(index, shard, indexUuid);
-        return found == null || node.reconciler().readerShards().contains(found) ? null : found;
+        return found == null || node.reconciler().isReader(found) ? null : found;
     }
 
     /**
@@ -589,7 +592,7 @@ public final class ShardRouter {
      */
     private String whyNotHeld(String index, int shard, String indexUuid) {
         final ShardId open = localShard(index, shard);
-        if (open == null || node.reconciler().readerShards().contains(open)) {
+        if (open == null || node.reconciler().isReader(open)) {
             node.signals().ownershipDoubted(index, shard);
         }
         if (open == null) {
@@ -598,7 +601,7 @@ public final class ShardRouter {
         if (indexUuid != null && indexUuid.equals(open.getIndex().getUUID()) == false) {
             return "the index was recreated, and the shard open here belongs to the previous incarnation";
         }
-        if (node.reconciler().readerShards().contains(open)) {
+        if (node.reconciler().isReader(open)) {
             return "it is open here only as a search reader";
         }
         return "the shard-head no longer names this node";

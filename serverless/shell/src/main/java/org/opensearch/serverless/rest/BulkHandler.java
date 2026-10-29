@@ -400,13 +400,8 @@ public final class BulkHandler extends BaseRestHandler {
         // deleted and recreated index keeps its name, and a writer that has not yet heartbeat still holds
         // the old incarnation open under it. Matched by name alone, a batch through that node was applied
         // to the old shard, logged into a log nothing replays, and answered 201.
-        final ShardId local = serving.reconciler()
-            .openShards()
-            .stream()
-            .filter(s -> s.getIndexName().equals(index) && s.id() == shard && s.getIndex().getUUID().equals(uuid))
-            .filter(s -> serving.reconciler().readerShards().contains(s) == false)
-            .findFirst()
-            .orElse(null);
+        final var writer = serving.reconciler().writerShard(new ShardId(index, uuid, shard));
+        final ShardId local = writer == null ? null : writer.shardId();
 
         if (local != null) {
             try {

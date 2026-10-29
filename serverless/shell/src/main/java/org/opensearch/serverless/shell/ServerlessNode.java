@@ -2850,7 +2850,7 @@ public final class ServerlessNode implements Closeable {
             stillOwned.add(shardKey(assignment.indexName(), assignment.shardId()));
         }
         for (org.opensearch.core.index.shard.ShardId held : reconciler.openShards()) {
-            if (reconciler.readerShards().contains(held) || stillOwned.contains(shardKey(held.getIndexName(), held.id()))) {
+            if (reconciler.isReader(held) || stillOwned.contains(shardKey(held.getIndexName(), held.id()))) {
                 continue;
             }
             final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = plane.heads()
@@ -3315,7 +3315,7 @@ public final class ServerlessNode implements Closeable {
 
         final java.util.List<org.opensearch.core.index.shard.ShardId> writers = new java.util.ArrayList<>();
         for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
-            if (reconciler.readerShards().contains(shardId) == false) {
+            if (reconciler.isReader(shardId) == false) {
                 writers.add(shardId);
             }
         }
@@ -3491,7 +3491,7 @@ public final class ServerlessNode implements Closeable {
         final var plane = metadataPlane;
         logger.warn("shard " + shardId + " failed; closing it and taking it again from its published commit and log", cause);
         try {
-            if (reconciler.readerShards().contains(shardId)) {
+            if (reconciler.isReader(shardId)) {
                 reconciler.releaseShard(shardId, "its engine failed");
                 forgetReader(shardId);
                 return;
@@ -3543,7 +3543,7 @@ public final class ServerlessNode implements Closeable {
         try {
             validateReader(plane, indexName, shardNumber, served);
         } catch (ShardBehindLogException e) {
-            if (e.superseded() == false || reconciler.readerShards().contains(served)) {
+            if (e.superseded() == false || reconciler.isReader(served)) {
                 throw e;
             }
             // The copy was on a replaced commit and has been let go: one open now is onto the current one.
@@ -4052,7 +4052,7 @@ public final class ServerlessNode implements Closeable {
         if (shard == null) {
             throw new java.io.IOException("cannot index into " + shardId + ": not open on " + nodeName);
         }
-        if (reconciler.readerShards().contains(shardId)) {
+        if (reconciler.isReader(shardId)) {
             throw new java.io.IOException("cannot index into " + shardId + ": it is open as a reader");
         }
         refuseIfWriteFenced(shardId);
@@ -4646,7 +4646,7 @@ public final class ServerlessNode implements Closeable {
         if (shard == null) {
             throw new java.io.IOException("cannot delete from " + shardId + ": not open on " + nodeName);
         }
-        if (reconciler.readerShards().contains(shardId)) {
+        if (reconciler.isReader(shardId)) {
             throw new java.io.IOException("cannot delete from " + shardId + ": it is open as a reader");
         }
         refuseIfWriteFenced(shardId);
@@ -4827,7 +4827,7 @@ public final class ServerlessNode implements Closeable {
         if (shard == null) {
             throw new java.io.IOException("cannot write to " + shardId + ": not open on " + nodeName);
         }
-        if (reconciler.readerShards().contains(shardId)) {
+        if (reconciler.isReader(shardId)) {
             throw new java.io.IOException("cannot write to " + shardId + ": it is open as a reader");
         }
         if (batch.isEmpty()) {
@@ -6305,7 +6305,7 @@ public final class ServerlessNode implements Closeable {
      */
     public boolean holdsAsWriter(org.opensearch.core.index.shard.ShardId shardId, long maxHeadAgeMillis) {
         ensureStarted();
-        if (reconciler.shard(shardId) == null || reconciler.readerShards().contains(shardId) || writeFenced.contains(shardId)) {
+        if (reconciler.shard(shardId) == null || reconciler.isReader(shardId) || writeFenced.contains(shardId)) {
             return false;
         }
         if (ownershipUnverified) {

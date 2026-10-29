@@ -1331,6 +1331,37 @@ public final class ShardReconciler {
     }
 
     /**
+     * Returns a live serving shard by its complete identity, excluding frozen views.
+     *
+     * @param shardId the index name, UUID and shard number
+     * @return the shard, or null when not held as a live reader or writer
+     */
+    public IndexShard servingShard(ShardId shardId) {
+        return frozenViews.contains(shardId) ? null : open.get(shardId);
+    }
+
+    /**
+     * Returns a writer by its complete identity without building snapshots of the held shards.
+     *
+     * @param shardId the index name, UUID and shard number
+     * @return the writer, or null for an absent shard, a reader or a frozen view
+     */
+    public IndexShard writerShard(ShardId shardId) {
+        final IndexShard held = servingShard(shardId);
+        return held == null || readers.contains(shardId) ? null : held;
+    }
+
+    /**
+     * Checks reader membership without copying the full reader set.
+     *
+     * @param shardId the shard to check
+     * @return whether it is held as a reader
+     */
+    public boolean isReader(ShardId shardId) {
+        return readers.contains(shardId);
+    }
+
+    /**
      * Records that something a user asked for touched this shard.
      *
      * <p><b>Called from the request paths and nowhere else</b>, which is the whole point. The obvious
