@@ -72,6 +72,41 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
         }
     }
 
+    public void testAStoreOpenFailureReleasesTheNodeHome() throws Exception {
+        final var invalidStore = createTempDir().resolve("store-file");
+        java.nio.file.Files.writeString(invalidStore, "not a directory");
+        final Settings settings = bootSettings("failed-store-start", invalidStore);
+        expectThrows(Exception.class, () -> ServerlessBootstrap.start(settings));
+        final Settings corrected = Settings.builder().put(settings).put(ServerlessBootstrap.STORE_PATH, createTempDir()).build();
+        try (var restarted = ServerlessBootstrap.start(corrected)) {
+            assertTrue(restarted.node().isStarted());
+        }
+    }
+
+    public void testAFailureAfterLeasePublicationRemovesTheLease() throws Exception {
+        final var directory = createTempDir();
+        final Settings settings = Settings.builder()
+            .put(bootSettings("failed-late-start", directory))
+            .put(ServerlessBootstrap.LEASE_TTL, 600_000L)
+            .put(ServerlessBootstrap.PUBLISH_DEBOUNCE, "not-a-number")
+            .build();
+        final var failure = expectThrows(Exception.class, () -> ServerlessBootstrap.start(settings));
+        assertTrue(failure.toString(), failure.getMessage().contains(ServerlessBootstrap.PUBLISH_DEBOUNCE));
+        try (var store = new org.opensearch.common.blobstore.fs.FsBlobStore(1024, directory, false)) {
+            final var plane = new org.opensearch.serverless.metadata.MetadataPlane(
+                store,
+                org.opensearch.common.blobstore.BlobPath.cleanPath(),
+                System::currentTimeMillis,
+                600_000L
+            );
+            assertTrue("failed startup must not remain in the address book", plane.membership().refresh().isEmpty());
+        }
+        final Settings corrected = Settings.builder().put(settings).put(ServerlessBootstrap.PUBLISH_DEBOUNCE, 10L).build();
+        try (var restarted = ServerlessBootstrap.start(corrected)) {
+            assertTrue(restarted.node().isStarted());
+        }
+    }
+
     /**
      * The whole of M13 in one test: start a process, create an index over HTTP, write to it, search it
      * back, and observe that the node took the shard, renewed its lease and published a commit without
