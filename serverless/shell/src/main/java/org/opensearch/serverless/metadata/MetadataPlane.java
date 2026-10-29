@@ -89,7 +89,7 @@ public final class MetadataPlane {
             blobStore.blobContainer(RegisterMap.members(base)),
             clock,
             leaseTtlMillis
-        );
+        ).conditionalDeletes(descriptors::conditionalDelete);
         final LivenessOracle oracle = new LivenessOracle() {
             @Override
             public boolean isLive(String nodeId, String ephemeralId) {

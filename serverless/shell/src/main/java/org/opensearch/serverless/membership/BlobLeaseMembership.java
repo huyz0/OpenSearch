@@ -68,7 +68,7 @@ public final class BlobLeaseMembership implements MembershipSource {
      * <p>The index that turns a refresh from a listing into a read. A node adds itself once, when it
      * first renews, and removes itself when it releases; a refresh that finds a listed node with no lease
      * at all prunes it, and one that finds a lease dead for {@link #DEAD_LEASE_PRUNE_TTLS} lease lifetimes
-     * prunes that too, blob and all. Nothing on the per-pass path writes it, so it adds no writes to a
+     * prunes that too. Its blob is deleted only where conditional deletes are verified. Nothing on the per-pass path writes it, so it adds no writes to a
      * steady state -- only one compare-and-swap per join, per clean leave and per pruning. A deployment
      * from before the index exists is listed once and the index written from that listing.
      */
@@ -96,18 +96,22 @@ public final class BlobLeaseMembership implements MembershipSource {
      * gone". Ten lifetimes is not slow. A fleet that mints a node id per pod incarnation accumulates one
      * dead lease per restart, and every refresh on every node reads every one of them, which is the
      * O(fleet history) term nothing else in the steady state has. A node that does come back after that
-     * long renews from an absent register and re-enrols, so pruning costs it one extra index swap.
+     * long encounters the changed lease generation and re-enrols. Pruning changes that generation before
+     * removing the index entry, so a concurrent renewal cannot silently lose its enrolment. Physical
+     * deletion requires a verified conditional-delete backend; otherwise the unlisted expired blob remains.
      */
     public static final int DEAD_LEASE_PRUNE_TTLS = 10;
 
     private final BlobContainer container;
     private final LongSupplier clock;
+    private java.util.function.BooleanSupplier conditionalDeletes = () -> false;
     private final long ttlMillis;
     private final List<Consumer<MembershipDelta>> listeners = new CopyOnWriteArrayList<>();
 
     private volatile Set<NodeLease> observed = Set.of();
     private volatile long lastRefreshedAt = Long.MIN_VALUE;
     private volatile long lastIndexGeneration = BlobRegister.ABSENT_GENERATION;
+    private final Set<String> enrollmentSwaps = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final Set<String> enrolled = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** How long a young snapshot is served without reading whether the members index moved; see {@link #refreshIfOlderThan}. */
@@ -141,6 +145,17 @@ public final class BlobLeaseMembership implements MembershipSource {
         this.clock = clock;
         this.ttlMillis = ttlMillis;
         this.skewMarginMillis = Math.max(0L, ttlMillis / SKEW_MARGIN_DIVISOR);
+    }
+
+    /**
+     * Enables physical cleanup only after the backend's conditional-delete probe succeeds.
+     *
+     * @param supported lazy result of the backend probe
+     * @return this source
+     */
+    public BlobLeaseMembership conditionalDeletes(java.util.function.BooleanSupplier supported) {
+        this.conditionalDeletes = supported;
+        return this;
     }
 
     /**
@@ -212,7 +227,8 @@ public final class BlobLeaseMembership implements MembershipSource {
             enrolled.clear();
             throw new LeaseRevokedException(self.nodeId(), expected, result.currentGeneration());
         }
-        if (result.applied() == false) {
+        final boolean moved = result.applied() == false;
+        if (moved) {
             // Re-read and retry once against the generation actually stored -- unless what is stored is
             // another live incarnation under this node id. Two processes with one id share every head
             // and every term, and the exactly-one-writer property has nothing left to stand on; refusing
@@ -262,13 +278,15 @@ public final class BlobLeaseMembership implements MembershipSource {
             // so it enrols again below. Without this a node whose lease blob was swept stayed off the
             // index for the life of the process: live, renewing, and invisible to reader placement.
             enrolled.clear();
+            enrollmentSwaps.add(self.nodeId());
         }
         ownGeneration = result.currentGeneration();
         ownExpiresAtMillis = renewed.expiresAtMillis();
         // This node's own lease, in its own view from now on: see #current.
         ownLease = renewed;
-        if (enrolled.contains(self.nodeId()) == false && enrol(self.nodeId())) {
+        if (enrolled.contains(self.nodeId()) == false && enrol(self.nodeId(), enrollmentSwaps.contains(self.nodeId()))) {
             enrolled.add(self.nodeId());
+            enrollmentSwaps.remove(self.nodeId());
         }
         return renewed;
     }
@@ -383,7 +401,7 @@ public final class BlobLeaseMembership implements MembershipSource {
      * attempts here are spread by a short random pause rather than fired back to back, and a node that
      * loses its three still comes back a renewal later.
      */
-    private boolean enrol(String nodeId) throws IOException {
+    private boolean enrol(String nodeId, boolean forceSwap) throws IOException {
         for (int attempt = 0; attempt < 3; attempt++) {
             if (attempt > 0) {
                 pauseBriefly(attempt);
@@ -400,7 +418,7 @@ public final class BlobLeaseMembership implements MembershipSource {
                 continue;
             }
             final Set<String> ids = decodeIds(index.get());
-            if (ids.contains(nodeId)) {
+            if (ids.contains(nodeId) && forceSwap == false) {
                 return true;
             }
             ids.add(nodeId);
@@ -443,23 +461,6 @@ public final class BlobLeaseMembership implements MembershipSource {
             }
         }
         return ids;
-    }
-
-    /** Takes ids out of the index, one attempt; a lost swap is left for the next refresh to repeat. */
-    private void unenrol(Set<String> ids) {
-        try {
-            final Optional<BlobRegister> index = container.readRegister(MEMBERS);
-            if (index.isEmpty()) {
-                return;
-            }
-            final Set<String> remaining = decodeIds(index.get());
-            if (remaining.removeAll(ids)) {
-                container.compareAndSwapRegister(MEMBERS, index.get().generation(), encodeIds(remaining));
-            }
-        } catch (Exception ignored) {
-            // Best effort: the index over-approximates until the next refresh prunes again, and an
-            // over-approximation costs one register read per pruned id, never a wrong answer.
-        }
     }
 
     /**
@@ -526,16 +527,40 @@ public final class BlobLeaseMembership implements MembershipSource {
      * @param nodeId the node whose lease to drop
      * @throws IOException if the delete fails
      */
-    public void release(String nodeId) throws IOException {
-        container.deleteBlobsIgnoringIfNotExists(List.of(LEASE_PREFIX + nodeId));
+    public synchronized void release(String nodeId) throws IOException {
+        final Optional<BlobRegister> index = container.readRegister(MEMBERS);
+        final Optional<BlobRegister> lease = container.readRegister(LEASE_PREFIX + nodeId);
+        if (lease.isPresent()) {
+            final NodeLease stored;
+            try (InputStream in = lease.get().value().streamInput()) {
+                stored = NodeLease.fromStream(in);
+            }
+            final NodeLease self = ownLease;
+            if (self != null && self.nodeId().equals(nodeId) && self.ephemeralId().equals(stored.ephemeralId()) == false) {
+                return;
+            }
+            final BlobRegisterCasResult released = container.compareAndSwapRegister(
+                LEASE_PREFIX + nodeId,
+                lease.get().generation(),
+                stored.renewedUntil(0L).toBytes()
+            );
+            if (released.applied() == false) {
+                return;
+            }
+            if (index.isPresent()) {
+                final Set<String> remaining = decodeIds(index.get());
+                remaining.remove(nodeId);
+                container.compareAndSwapRegister(MEMBERS, index.get().generation(), encodeIds(remaining));
+            }
+            if (conditionalDeletes.getAsBoolean()) {
+                container.deleteRegisterIfUnchanged(LEASE_PREFIX + nodeId, released.currentGeneration());
+            }
+        }
         ownGeneration = BlobRegister.ABSENT_GENERATION;
         final NodeLease self = ownLease;
         if (self != null && self.nodeId().equals(nodeId)) {
             ownLease = null;
         }
-        // The lease first, then the index: a refresh between the two finds a listed node with no lease
-        // and prunes it, which is the same end state.
-        unenrol(Set.of(nodeId));
         enrolled.remove(nodeId);
     }
 
@@ -644,8 +669,7 @@ public final class BlobLeaseMembership implements MembershipSource {
     public Set<NodeLease> refresh() throws IOException {
         final long now = clock.getAsLong();
         final Set<NodeLease> live = new LinkedHashSet<>();
-        final Set<String> missing = new LinkedHashSet<>();
-        final Set<String> longDead = new LinkedHashSet<>();
+        final java.util.Map<String, Long> prunable = new java.util.LinkedHashMap<>();
 
         // The members index, and a listing only when there is none yet -- in which case the index is
         // written from that listing so the next refresh is a read.
@@ -690,7 +714,13 @@ public final class BlobLeaseMembership implements MembershipSource {
                 if (register.isEmpty()) {
                     lastRead.remove(nodeId);
                     // Listed and gone: a clean leave whose index swap was lost. Pruned below.
-                    missing.add(nodeId);
+                    if (index.isPresent()) {
+                        final NodeLease marker = new NodeLease(nodeId, "", "", Set.of(), 0L);
+                        final BlobRegisterCasResult claimed = container.createRegisterIfAbsent(LEASE_PREFIX + nodeId, marker.toBytes());
+                        if (claimed.applied()) {
+                            prunable.put(nodeId, claimed.currentGeneration());
+                        }
+                    }
                     continue;
                 }
                 try (InputStream in = register.get().value().streamInput()) {
@@ -704,7 +734,16 @@ public final class BlobLeaseMembership implements MembershipSource {
                         // Pruned below, blob and index entry both. Recently expired leases are kept: the
                         // node may be slow rather than gone, and it renews the same register when it
                         // returns.
-                        longDead.add(nodeId);
+                        if (index.isPresent()) {
+                            final BlobRegisterCasResult claimed = container.compareAndSwapRegister(
+                                LEASE_PREFIX + nodeId,
+                                register.get().generation(),
+                                register.get().value()
+                            );
+                            if (claimed.applied()) {
+                                prunable.put(nodeId, claimed.currentGeneration());
+                            }
+                        }
                     }
                 }
                 if (live.contains(lastRead.get(nodeId)) == false) {
@@ -719,27 +758,24 @@ public final class BlobLeaseMembership implements MembershipSource {
                 // about safety depends on the member list (§10.1).
             }
         }
-        if (longDead.isEmpty() == false) {
-            // The index entry first, then the blob. In the other order a refresh between the two finds a
-            // listed id with no lease, which is also pruned -- the same end state -- but this order means
-            // a node that comes back in the gap renews a register that still exists and is simply
-            // re-enrolled by the swap below losing to its own. Best effort on both: a failure leaves the
-            // lease for the next refresh to prune again.
-            unenrol(longDead);
-            final List<String> blobs = new java.util.ArrayList<>();
-            for (String nodeId : longDead) {
-                blobs.add(LEASE_PREFIX + nodeId);
-            }
-            try {
-                container.deleteBlobsIgnoringIfNotExists(blobs);
-            } catch (Exception ignored) {
-                // The index no longer names them, so nothing reads them again; the blobs are a storage
-                // cost only, and the next refresh that lists (none, once the index exists) would collect.
+        if (prunable.isEmpty() == false && index.isPresent()) {
+            // The index was read BEFORE the leases were claimed. A renewal that loses to a claim must
+            // swap the index even if already listed. If it swaps first our stale index CAS fails; if we
+            // swap first it adds itself back. Unchanged renewals pay no extra index I/O.
+            final Set<String> remaining = decodeIds(index.get());
+            remaining.removeAll(prunable.keySet());
+            if (container.compareAndSwapRegister(MEMBERS, index.get().generation(), encodeIds(remaining)).applied()
+                && conditionalDeletes.getAsBoolean()) {
+                for (var entry : prunable.entrySet()) {
+                    try {
+                        container.deleteRegisterIfUnchanged(LEASE_PREFIX + entry.getKey(), entry.getValue());
+                    } catch (IOException e) {
+                        // Already unlisted. A retained expired lease costs storage, never recurring reads.
+                    }
+                }
             }
         }
-        if (missing.isEmpty() == false && index.isPresent()) {
-            unenrol(missing);
-        }
+        lastRead.keySet().retainAll(ids);
         lastRefreshedAt = now;
 
         final Set<NodeLease> previous = observed;

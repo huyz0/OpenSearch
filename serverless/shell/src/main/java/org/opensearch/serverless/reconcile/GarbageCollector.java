@@ -833,10 +833,15 @@ public final class GarbageCollector {
         final List<String> removed = new ArrayList<>();
         for (String blobName : members.listBlobsByPrefix(org.opensearch.serverless.membership.BlobLeaseMembership.LEASE_PREFIX).keySet()) {
             final String nodeId = blobName.substring(org.opensearch.serverless.membership.BlobLeaseMembership.LEASE_PREFIX.length());
-            final var lease = plane.membership().read(nodeId);
-            if (lease.isPresent() && lease.get().isExpiredAt(nowMillis)) {
-                members.deleteBlobsIgnoringIfNotExists(List.of(blobName));
-                removed.add(nodeId);
+            final var register = members.readRegister(blobName);
+            if (register.isPresent() && plane.descriptors().conditionalDelete()) {
+                final org.opensearch.serverless.membership.NodeLease lease;
+                try (var in = register.get().value().streamInput()) {
+                    lease = org.opensearch.serverless.membership.NodeLease.fromStream(in);
+                }
+                if (lease.isExpiredAt(nowMillis) && members.deleteRegisterIfUnchanged(blobName, register.get().generation())) {
+                    removed.add(nodeId);
+                }
             }
         }
         return removed;

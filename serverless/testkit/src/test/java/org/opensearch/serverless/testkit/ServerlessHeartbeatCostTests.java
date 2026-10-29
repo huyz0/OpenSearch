@@ -156,7 +156,7 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
     public void testLongDeadLeasesArePrunedFromTheIndex() throws Exception {
         final AtomicLong now = new AtomicLong(1_000L);
         final FsBlobContainer c = container(createTempDir());
-        final BlobLeaseMembership membership = new BlobLeaseMembership(c, now::get, TTL);
+        final BlobLeaseMembership membership = new BlobLeaseMembership(c, now::get, TTL).conditionalDeletes(() -> true);
 
         membership.renew(lease("dead", "127.0.0.1:9301"));
         membership.renew(lease("live", "127.0.0.1:9302"));
