@@ -165,11 +165,20 @@ public final class ReclaimQueue {
             final List<BlobMetadata> page = entries.listBlobsByPrefixInSortedOrder("", PAGE, BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC);
             final List<String> finished = new ArrayList<>();
             for (BlobMetadata entry : page) {
-                final Intent intent;
+                final byte[] body;
                 try (InputStream in = entries.readBlob(entry.name())) {
+                    body = in.readAllBytes();
+                } catch (IOException e) {
+                    // A failed GET says nothing about the intent's contents. Keep the cleanup work for
+                    // the next pass, including when the stream fails after the response was opened.
+                    kept = true;
+                    continue;
+                }
+                final Intent intent;
+                try (InputStream in = new ByteArrayInputStream(body)) {
                     intent = parse(in);
                 } catch (IOException e) {
-                    // Not an intent this queue wrote: nothing to do for it.
+                    // The complete body was read, but it is not an intent this queue wrote.
                     finished.add(entry.name());
                     continue;
                 }
