@@ -355,74 +355,108 @@ public final class SnapshotRecord {
             XContentParser parser = XContentType.JSON.xContent()
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
         ) {
+            if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                throw malformed("expected an object");
+            }
             final var body = parser.map();
-            final Object repo = body.get("repo");
-            final Object name = body.get("name");
-            final Object uuid = body.get("uuid");
-            final Object startTime = body.get("start_time_in_millis");
-            final Object endTime = body.get("end_time_in_millis");
-            if (repo == null || name == null || startTime == null || endTime == null) {
-                throw new IOException("malformed snapshot record: missing a required field");
+            if (parser.nextToken() != null) {
+                throw malformed("trailing content");
             }
-            final boolean shallow = Boolean.TRUE.equals(body.get("shallow")) || "true".equals(String.valueOf(body.get("shallow")));
+            final String repo = requiredString(body.get("repo"), "repo");
+            final String name = requiredString(body.get("name"), "name");
+            final String uuid = body.get("uuid") == null ? null : requiredString(body.get("uuid"), "uuid");
+            final long startTime = requiredLong(body.get("start_time_in_millis"), "start_time_in_millis");
+            final long endTime = requiredLong(body.get("end_time_in_millis"), "end_time_in_millis");
+            final Object shallowValue = body.get("shallow");
+            if (shallowValue instanceof Boolean == false && "true".equals(shallowValue) == false && "false".equals(shallowValue) == false) {
+                throw malformed("shallow must be a boolean");
+            }
+            final boolean shallow = Boolean.TRUE.equals(shallowValue) || "true".equals(shallowValue);
+            if (body.get("indices") instanceof Map<?, ?> == false) {
+                throw malformed("indices must be an object");
+            }
+            final Map<?, ?> indexMap = (Map<?, ?>) body.get("indices");
             final Map<String, SnapshottedIndex> indices = new LinkedHashMap<>();
-            if (body.get("indices") instanceof Map<?, ?> indexMap) {
-                for (Map.Entry<?, ?> entry : indexMap.entrySet()) {
-                    if ((entry.getValue() instanceof Map<?, ?>) == false) {
-                        throw new IOException("malformed snapshot record: an index entry is not an object");
-                    }
-                    final Map<?, ?> indexBody = (Map<?, ?>) entry.getValue();
-                    final Object indexUuid = indexBody.get("uuid");
-                    final Object numberOfShards = indexBody.get("number_of_shards");
-                    if (indexUuid == null || numberOfShards == null) {
-                        throw new IOException("malformed snapshot record: an index entry is missing its uuid or shard count");
-                    }
-                    final Object mapping = indexBody.get("mapping");
-                    @SuppressWarnings("unchecked")
-                    final Map<String, Object> settings = indexBody.get("settings") instanceof Map<?, ?> given
-                        ? (Map<String, Object>) given
-                        : Map.of();
-                    final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
-                    if (indexBody.get("shards") instanceof List<?> listed) {
-                        for (Object shardEntry : listed) {
-                            if ((shardEntry instanceof Map<?, ?>) == false) {
-                                throw new IOException("malformed snapshot record: a shard entry is not an object");
-                            }
-                            final Map<?, ?> shardBody = (Map<?, ?>) shardEntry;
-                            final Map<String, String> files = new LinkedHashMap<>();
-                            if (shardBody.get("files") instanceof Map<?, ?> named) {
-                                for (Map.Entry<?, ?> file : named.entrySet()) {
-                                    files.put(String.valueOf(file.getKey()), String.valueOf(file.getValue()));
-                                }
-                            }
-                            shards.put(
-                                Integer.parseInt(String.valueOf(shardBody.get("shard"))),
-                                new CommitManifest(Long.parseLong(String.valueOf(shardBody.get("term"))), files)
-                            );
-                        }
-                    }
-                    indices.put(
-                        String.valueOf(entry.getKey()),
-                        new SnapshottedIndex(
-                            indexUuid.toString(),
-                            Integer.parseInt(String.valueOf(numberOfShards)),
-                            mapping == null ? null : mapping.toString(),
-                            settings,
-                            shards
-                        )
-                    );
+            for (Map.Entry<?, ?> entry : indexMap.entrySet()) {
+                if (entry.getValue() instanceof Map<?, ?> == false) {
+                    throw malformed("an index entry is not an object");
                 }
+                final Map<?, ?> indexBody = (Map<?, ?>) entry.getValue();
+                final String indexUuid = requiredString(indexBody.get("uuid"), "index uuid");
+                final long shardCount = requiredLong(indexBody.get("number_of_shards"), "number_of_shards");
+                if (shardCount < 1 || shardCount > org.opensearch.serverless.cluster.IndexDescriptor.MAX_SHARDS) {
+                    throw malformed("invalid shard count");
+                }
+                final Object mapping = indexBody.get("mapping");
+                if (mapping != null && mapping instanceof String == false) {
+                    throw malformed("mapping must be a string");
+                }
+                if (indexBody.containsKey("settings") && indexBody.get("settings") instanceof Map<?, ?> == false) {
+                    throw malformed("settings must be an object");
+                }
+                @SuppressWarnings("unchecked")
+                final Map<String, Object> settings = indexBody.get("settings") instanceof Map<?, ?> given
+                    ? (Map<String, Object>) given
+                    : Map.of();
+                final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
+                // Older provisional records may omit shards. That means capture in progress, which
+                // pins the entire index. A present field must always have the writer's list shape.
+                if (indexBody.containsKey("shards")) {
+                    if (indexBody.get("shards") instanceof List<?> == false) {
+                        throw malformed("shards must be an array");
+                    }
+                    for (Object shardEntry : (List<?>) indexBody.get("shards")) {
+                        if (shardEntry instanceof Map<?, ?> == false) {
+                            throw malformed("a shard entry is not an object");
+                        }
+                        final Map<?, ?> shardBody = (Map<?, ?>) shardEntry;
+                        final long shard = requiredLong(shardBody.get("shard"), "shard");
+                        if (shard < 0 || shard >= shardCount || shards.containsKey((int) shard)) {
+                            throw malformed("invalid or duplicate shard number");
+                        }
+                        final long term = requiredLong(shardBody.get("term"), "term");
+                        if (term < 0 || shardBody.get("files") instanceof Map<?, ?> == false) {
+                            throw malformed("a shard must contain its term and files object");
+                        }
+                        final Map<String, String> files = new LinkedHashMap<>();
+                        for (Map.Entry<?, ?> file : ((Map<?, ?>) shardBody.get("files")).entrySet()) {
+                            files.put(requiredString(file.getKey(), "file name"), requiredString(file.getValue(), "file location"));
+                        }
+                        shards.put((int) shard, new CommitManifest(term, files));
+                    }
+                    if (shards.isEmpty() == false && shards.size() != shardCount) {
+                        throw malformed("a completed index must contain every shard");
+                    }
+                }
+                indices.put(
+                    requiredString(entry.getKey(), "index name"),
+                    new SnapshottedIndex(indexUuid, (int) shardCount, (String) mapping, settings, shards)
+                );
             }
-            return new SnapshotRecord(
-                repo.toString(),
-                name.toString(),
-                uuid == null ? null : uuid.toString(),
-                shallow,
-                Long.parseLong(String.valueOf(startTime)),
-                Long.parseLong(String.valueOf(endTime)),
-                indices
-            );
+            return new SnapshotRecord(repo, name, uuid, shallow, startTime, endTime, indices);
         }
+    }
+
+    private static IOException malformed(String reason) {
+        return new IOException("malformed snapshot record: " + reason);
+    }
+
+    private static String requiredString(Object value, String field) throws IOException {
+        if (value instanceof String text && text.isEmpty() == false) {
+            return text;
+        }
+        throw malformed(field + " must be a nonempty string");
+    }
+
+    private static long requiredLong(Object value, String field) throws IOException {
+        if (value instanceof Number || value instanceof String) {
+            try {
+                return Long.parseLong(value.toString());
+            } catch (NumberFormatException e) {
+                throw malformed(field + " must be an integer");
+            }
+        }
+        throw malformed("missing integer field " + field);
     }
 
     @Override
