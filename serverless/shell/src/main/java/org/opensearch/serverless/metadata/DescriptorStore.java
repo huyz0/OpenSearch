@@ -385,7 +385,27 @@ public final class DescriptorStore {
                     value.streamInput()
                 )
         ) {
-            return parser.map().containsKey(org.opensearch.serverless.cluster.AliasRecord.DISCRIMINATOR);
+            if (parser.nextToken() != org.opensearch.core.xcontent.XContentParser.Token.START_OBJECT) {
+                throw new IOException("a descriptor or alias must be an object");
+            }
+            boolean alias = false;
+            org.opensearch.core.xcontent.XContentParser.Token token;
+            while ((token = parser.nextToken()) != org.opensearch.core.xcontent.XContentParser.Token.END_OBJECT) {
+                if (token != org.opensearch.core.xcontent.XContentParser.Token.FIELD_NAME) {
+                    throw new IOException("invalid or truncated descriptor discriminator");
+                }
+                alias |= org.opensearch.serverless.cluster.AliasRecord.DISCRIMINATOR.equals(parser.currentName());
+                if (parser.nextToken() == null) {
+                    throw new IOException("truncated descriptor discriminator");
+                }
+                // Only root fields determine the record type. Do not materialize a whole mapping just
+                // to check this field before the descriptor parser reads the same mapping again.
+                parser.skipChildren();
+            }
+            if (parser.nextToken() != null) {
+                throw new IOException("unexpected content after descriptor or alias");
+            }
+            return alias;
         }
     }
 
@@ -895,7 +915,7 @@ public final class DescriptorStore {
         String cursor = after;
         while (true) {
             // One more than the page can take, so a full page knows whether anything follows it.
-            final int want = Math.min(limit - page.size() + 1, LIST_PAGE);
+            final int want = (int) Math.min((long) limit - page.size() + 1, LIST_PAGE);
             final List<org.opensearch.common.blobstore.BlobMetadata> batch = container.listBlobsByPrefix(prefix, cursor, want);
             // Every name the page can still take is read at once; the one beyond it only proves there is more.
             final List<java.util.concurrent.Callable<Optional<IndexDescriptor>>> tasks = new ArrayList<>();
@@ -934,7 +954,7 @@ public final class DescriptorStore {
     /** A descriptor if the name holds a live one; empty for a tombstone or a name deleted since it was listed. */
     private Optional<IndexDescriptor> readLive(String name) throws IOException {
         final Optional<BlobRegister> register = container.readRegister(name);
-        if (register.isEmpty() || isTombstone(register.get().value())) {
+        if (register.isEmpty() || isTombstone(register.get().value()) || isAlias(register.get().value())) {
             return Optional.empty();
         }
         try (InputStream in = register.get().value().streamInput()) {
@@ -1078,7 +1098,7 @@ public final class DescriptorStore {
         final List<String> names = new ArrayList<>();
         String cursor = null;
         while (names.size() <= cap) {
-            final int want = Math.min(cap + 1 - names.size(), LIST_PAGE);
+            final int want = (int) Math.min((long) cap + 1 - names.size(), LIST_PAGE);
             final List<org.opensearch.common.blobstore.BlobMetadata> batch = container.listBlobsByPrefix(prefix, cursor, want);
             for (org.opensearch.common.blobstore.BlobMetadata blob : batch) {
                 names.add(blob.name());
@@ -1136,7 +1156,7 @@ public final class DescriptorStore {
             if (register.isEmpty()) {
                 continue;
             }
-            if (isTombstone(register.get().value())) {
+            if (isTombstone(register.get().value()) || isAlias(register.get().value())) {
                 continue;
             }
             try (InputStream in = register.get().value().streamInput()) {
