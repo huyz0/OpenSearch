@@ -262,7 +262,7 @@ public final class WalGroupCommitter {
             }
             last.records.addAll(records);
             for (WalRecord record : records) {
-                last.bytes += record.id().length() + (record.source() == null ? 0 : record.source().length());
+                last.bytes += WalRecord.contentBytes(record.id(), record.source());
             }
             return last;
         }

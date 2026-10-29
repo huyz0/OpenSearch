@@ -115,7 +115,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
         long counted = 0L;
         for (org.opensearch.serverless.shell.ServerlessNode.BulkOperation item : batch) {
             records.add(item.record());
-            counted += item.record().source() == null ? 0L : item.record().source().length();
+            counted += WalRecord.contentBytes(item.record().id(), item.record().source());
         }
         this.operations = List.copyOf(records);
         this.refresh = refresh;
@@ -162,7 +162,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
             final boolean requireAbsent = in.readBoolean();
             read.add(record);
             readBatch.add(new org.opensearch.serverless.shell.ServerlessNode.BulkOperation(record, ifSeqNo, ifPrimaryTerm, requireAbsent));
-            counted += source == null ? 0L : source.length();
+            counted += WalRecord.contentBytes(id, source);
         }
         this.operations = List.copyOf(read);
         this.batch = List.copyOf(readBatch);
@@ -199,12 +199,12 @@ public final class ForwardedBulkRequest extends TransportRequest {
     }
 
     /**
-     * Returns the size of the batch's sources, for pressure accounting and the forward's deadline.
+     * Returns the UTF-8 size of the batch's ids and sources, for pressure accounting and the forward's deadline.
      *
-     * <p>Counted once as the request is built rather than by re-encoding every record on the receiving
-     * side, which was a second full JSON encode per forwarded batch spent purely on counting.
+     * <p>Counts code points without allocating encoded copies. Character counts understate non-ASCII
+     * sources, and omitting ids made delete-only batches invisible to primary pressure accounting.
      *
-     * @return the summed source lengths
+     * @return the summed id and source bytes
      */
     public long bytes() {
         return bytes;

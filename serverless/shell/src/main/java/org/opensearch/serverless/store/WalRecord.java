@@ -139,6 +139,19 @@ public final class WalRecord {
     }
 
     /**
+     * Counts UTF-8 content bytes without allocating an encoded copy.
+     *
+     * @param id document id
+     * @param source document source, or null for no source
+     * @return bytes held by the id and source, excluding object and protocol overhead
+     */
+    public static long contentBytes(String id, String source) {
+        return (id == null ? 0L : org.apache.lucene.util.UnicodeUtil.calcUTF16toUTF8Length(id, 0, id.length())) + (source == null
+            ? 0L
+            : org.apache.lucene.util.UnicodeUtil.calcUTF16toUTF8Length(source, 0, source.length()));
+    }
+
+    /**
      * Reports whether this record removes a document rather than adding one.
      *
      * @return true for a deletion
