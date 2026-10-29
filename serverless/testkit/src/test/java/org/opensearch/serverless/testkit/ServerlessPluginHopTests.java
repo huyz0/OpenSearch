@@ -154,7 +154,7 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
         private final ClusterService clusterService;
 
         public TransportWhereAction(TransportService transportService, ActionFilters actionFilters, ClusterService clusterService) {
-            super(WhereAction.NAME, transportService, actionFilters, WhereRequest::new);
+            super(WhereAction.NAME, transportService, actionFilters, WhereRequest::new, ThreadPool.Names.GENERIC);
             this.transportService = transportService;
             this.clusterService = clusterService;
         }
@@ -167,9 +167,10 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
                 listener.onResponse(new WhereResponse(local.getName(), context.getHeader(CALLER)));
                 return;
             }
+            final String[] remaining = request.target.split(",", 2);
             DiscoveryNode peer = null;
             for (DiscoveryNode candidate : clusterService.state().nodes()) {
-                if (candidate.getName().equals(request.target)) {
+                if (candidate.getName().equals(remaining[0])) {
                     peer = candidate;
                     break;
                 }
@@ -187,7 +188,7 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
             transportService.sendRequest(
                 peer,
                 WhereAction.NAME,
-                new WhereRequest((String) null),
+                new WhereRequest(remaining.length == 2 ? remaining[1] : null),
                 new TransportResponseHandler<WhereResponse>() {
                     @Override
                     public WhereResponse read(StreamInput in) throws IOException {
@@ -362,6 +363,11 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
             assertEquals(elsewhere.body(), 200, elsewhere.status());
             assertTrue("the action must have run on the node the plugin named: " + elsewhere.body(), elsewhere.has("\"ran_on\":\"hop-b\""));
             assertTrue("and the caller must have crossed the hop: " + elsewhere.body(), elsewhere.has("\"caller\":\"alice\""));
+
+            final Response roundTrip = get(first, "/_testkit/where/hop-b,hop-a");
+            assertEquals(roundTrip.body(), 200, roundTrip.status());
+            assertTrue(roundTrip.body(), roundTrip.has("\"ran_on\":\"hop-a\""));
+            assertTrue(roundTrip.body(), roundTrip.has("\"caller\":\"alice\""));
 
             final Response here = get(first, "/_testkit/where/hop-a");
             assertEquals(here.body(), 200, here.status());
