@@ -85,6 +85,44 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMalformedSnapshotShapesStopCollectionBeforeDeletingFiles() throws Exception {
+        final String prefix = "{\"repo\":\"repo\",\"name\":\"damaged\",\"shallow\":true,"
+            + "\"start_time_in_millis\":1,\"end_time_in_millis\":2,";
+        final String indexPrefix = "\"indices\":{\"protected\":{\"uuid\":\"uuid-protected-000\",\"number_of_shards\":2,";
+        final List<String> malformed = List.of(
+            prefix + "\"indices\":[]}",
+            prefix + "\"indices\":null}",
+            prefix + "\"unknown\":1}",
+            "[" + prefix + "\"indices\":{}}]",
+            prefix + indexPrefix + "\"shards\":[{\"shard\":0,\"term\":1,\"files\":{}}]}}}",
+            prefix + indexPrefix + "\"shards\":[{\"shard\":0,\"term\":1,\"files\":null}]}}}",
+            prefix + indexPrefix + "\"shards\":[{\"shard\":0,\"term\":1}]}}}",
+            prefix + indexPrefix + "\"shards\":{}}}}"
+        );
+        try (FsBlobStore store = new FsBlobStore(1024, createTempDir(), false)) {
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1_000L, 30_000L);
+            plane.createIndex(new IndexDescriptor("protected", "uuid-protected-000", 1, "{}", null));
+            final BlobPath shard = plane.shardData("protected", 0);
+            final BlobContainer old = store.blobContainer(shard.add("t=1"));
+            old.writeBlobAtomic("snapshot-file", new java.io.ByteArrayInputStream(new byte[] { 1 }), 1L, true);
+            store.blobContainer(shard).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            final BlobContainer snapshots = store.blobContainer(
+                org.opensearch.serverless.metadata.RegisterMap.snapshots(BlobPath.cleanPath())
+            );
+            final var collector = new org.opensearch.serverless.reconcile.GarbageCollector(store, BlobPath.cleanPath());
+            for (String body : malformed) {
+                final byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                snapshots.writeBlobAtomic("repo#damaged", new java.io.ByteArrayInputStream(bytes), bytes.length, false);
+                expectThrows(
+                    IOException.class,
+                    "malformed snapshot must stop collection: " + body,
+                    () -> collector.collectShard(plane, "protected", 0)
+                );
+                assertTrue("unknown snapshot references must remain intact", old.blobExists("snapshot-file"));
+            }
+        }
+    }
+
     private static final long TTL = 300_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
 
