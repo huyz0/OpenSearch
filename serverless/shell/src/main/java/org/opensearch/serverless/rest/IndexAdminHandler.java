@@ -638,10 +638,20 @@ public final class IndexAdminHandler extends BaseRestHandler {
         if (unsupported != null) {
             throw new RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);
         }
+        final var scoped = org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS;
+        for (String key : settings.keySet()) {
+            final var setting = scoped.get(key);
+            if (scoped.isPrivateSetting(key) || (setting != null && setting.isPrivateIndex())) {
+                throw new RefusedException(
+                    RestStatus.BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "private index setting [" + key + "] can not be set explicitly"
+                );
+            }
+        }
         try {
-            // Core's own registry and parsers, private and archived keys left alone: they are core's to
-            // write, and none reach here from a request or a template.
-            org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS.validate(settings, atCreation, true, true);
+            // Only user settings reach the descriptor: private values belong to its authoritative fields.
+            scoped.validate(settings, atCreation, false, false);
         } catch (IllegalArgumentException e) {
             throw new RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
         }
