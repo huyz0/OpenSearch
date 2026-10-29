@@ -1941,18 +1941,13 @@ public final class MetadataPlane {
      * Reads every snapshot in the deployment, across every repository.
      *
      * <p>For the collector, which sweeps one shard at a time and has to know what every snapshot,
-     * anywhere, is still pinning before it deletes anything — the same reason {@link #livePointsInTime}
-     * exists. A record that cannot be read is <b>skipped</b>, not treated as pinning everything the way an
-     * unreadable {@link PointInTime} is: a point in time's conservative fallback exists because a paging
-     * caller mid-request loses nothing but latency if the sweep is briefly more cautious than it needs to
-     * be, and it can name only one shard at a time, so "assume it holds this shard" is a bounded,
-     * affordable guess. A snapshot can name an unbounded number of indices and shards, so the equivalent
-     * guess would be "assume it holds everything, deployment-wide" — which turns one corrupted record into
-     * a garbage collector switched off everywhere, silently, forever. That trade is documented rather than
-     * made silently: see {@code m45-snapshot-restore-notes.md}.
+     * anywhere, is still pinning before it deletes anything. An unreadable record aborts collection:
+     * its references are unknown, and treating it as empty could destroy a valid snapshot after a
+     * transient store failure. A persistently damaged record must be repaired or explicitly deleted
+     * before collection can resume.
      *
-     * @return every readable snapshot record
-     * @throws IOException if listing fails
+     * @return every snapshot record
+     * @throws IOException if listing or reading any snapshot fails
      */
     public List<SnapshotRecord> liveSnapshots() throws IOException {
         final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
@@ -1961,7 +1956,7 @@ public final class MetadataPlane {
             try (java.io.InputStream in = container.readBlob(key)) {
                 found.add(SnapshotRecord.fromStream(in));
             } catch (Exception e) {
-                LOGGER.warn("could not read the snapshot [" + key + "]; its blobs will not be protected by this sweep", e);
+                throw new IOException("cannot establish snapshot protection: could not read snapshot [" + key + "]", e);
             }
         }
         return found;
