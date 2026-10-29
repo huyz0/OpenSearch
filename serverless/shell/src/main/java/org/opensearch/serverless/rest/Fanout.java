@@ -92,7 +92,12 @@ public final class Fanout {
         final int helpers = Math.min(Math.max(1, concurrency), tasks.size()) - 1;
         for (int i = 0; i < helpers; i++) {
             // A helper the pool starts late finds the queue drained and returns at once.
-            executor.execute(() -> drain(next, tasks, results, done));
+            try {
+                executor.execute(() -> drain(next, tasks, results, done));
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                // The caller can drain the queue even when a saturated executor refuses helpers.
+                break;
+            }
         }
         drain(next, tasks, results, done);
         // What the helpers still hold. Establishes happens-before with every countDown, so the plain array

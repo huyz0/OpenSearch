@@ -56,6 +56,18 @@ public class FanoutTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRejectedHelpersLeaveTheCallerToFinishEveryTask() throws Exception {
+        final AtomicInteger calls = new AtomicInteger();
+        final List<Callable<Integer>> tasks = List.of(calls::incrementAndGet, calls::incrementAndGet, calls::incrementAndGet);
+        final List<Integer> results = Fanout.run(
+            command -> { throw new java.util.concurrent.RejectedExecutionException("saturated"); },
+            3,
+            tasks
+        );
+        assertEquals(List.of(1, 2, 3), results);
+        assertEquals(3, calls.get());
+    }
+
     public void testNoMoreThanTheWidthRunAtOnce() throws Exception {
         final ExecutorService pool = Executors.newFixedThreadPool(16);
         try {
