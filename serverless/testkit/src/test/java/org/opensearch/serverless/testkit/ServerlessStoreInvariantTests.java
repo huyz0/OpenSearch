@@ -511,7 +511,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         assertEquals(orphan, warm.get("t2").orElseThrow());
         assertEquals(orphan, cold.get("t2").orElseThrow());
 
-        // Two names with the same bytes share them; deleting one leaves the other readable.
+        // Two names with the same bytes remain independent; deleting one leaves the other readable.
         writer.put("t3", orphan);
         assertTrue(writer.delete("t2"));
         assertFalse(writer.delete("t2"));

@@ -40,6 +40,7 @@ public final class HookedBlobStore implements BlobStore {
 
     private final BlobStore delegate;
     private final AtomicReference<Hook> swapHook = new AtomicReference<>();
+    private final AtomicReference<Hook> deleteHook = new AtomicReference<>();
     private final AtomicReference<Hook> armed = new AtomicReference<>();
     private volatile boolean fired;
     private volatile String failListingsUnder;
@@ -146,6 +147,12 @@ public final class HookedBlobStore implements BlobStore {
         swapHook.set(new Hook(pathContains, blobName, action));
     }
 
+    /** Runs an action immediately before deleting the named blob in the matching container. */
+    public void onNextBlobDelete(String pathContains, String blobName, Runnable action) {
+        fired = false;
+        deleteHook.set(new Hook(pathContains, blobName, action));
+    }
+
     /**
      * Whether the armed action has run.
      *
@@ -242,6 +249,14 @@ public final class HookedBlobStore implements BlobStore {
 
         @Override
         public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws IOException {
+            final Hook hook = deleteHook.get();
+            if (hook != null
+                && blobNames.contains(hook.blobName())
+                && inner.path().buildAsString().contains(hook.pathContains())
+                && deleteHook.compareAndSet(hook, null)) {
+                hook.action().run();
+                fired = true;
+            }
             inner.deleteBlobsIgnoringIfNotExists(blobNames);
         }
 

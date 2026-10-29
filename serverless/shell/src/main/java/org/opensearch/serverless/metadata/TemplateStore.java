@@ -34,7 +34,7 @@ import java.util.Optional;
 import java.util.TreeMap;
 
 /**
- * Index and component templates: content-addressed blobs behind one register that names them.
+ * Index and component templates: immutable revision blobs behind one register that names them.
  *
  * <p><b>Why this is not the enumeration the design refuses.</b> The standing objection to listing indices is
  * that their number is unbounded by design — a deployment is meant to hold a hundred million of them — so any
@@ -47,11 +47,11 @@ import java.util.TreeMap;
  * template under its own name and bumped a counter afterwards, so a node could tell whether its copy was
  * current. Two writes, and a crash between them left every warm cache in the fleet serving the old set —
  * the blob was there, the counter had not moved, and nothing would move it until an unrelated change
- * happened somewhere. Now the register holds {@code {version, entries: name → content hash}}, each
- * template's bytes live under their hash, and a change is one compare-and-swap of the register. A blob
+ * happened somewhere. Now the register holds {@code {version, entries: name → content key}}, each
+ * template's bytes live under a unique revision key, and a change is one compare-and-swap of the register. A blob
  * written before a crash is simply not indexed: invisible, consistent with the failure the operator was
  * told about, and harmless. A reader that sees the new register sees the new set, and re-reads only the
- * entries whose hash moved.
+ * entries whose key moved.
  *
  * <p>Templates are stored as the JSON a client sent, verbatim. Parsing them into a typed model here would mean
  * maintaining a second account of a shape OpenSearch defines, and the only thing this shell needs to read out
@@ -89,7 +89,7 @@ public final class TemplateStore {
      */
     private static final String LEGACY_PREFIX = "template-";
 
-    /** The prefix a template's bytes live under, followed by the hash of those bytes. */
+    /** The prefix a template's bytes live under, followed by their hash and a unique revision id. */
     private static final String CONTENT_PREFIX = "blob-";
 
     /** How many times a change re-reads the register and tries again when another writer moved it. */
@@ -223,9 +223,15 @@ public final class TemplateStore {
         if (marker.legacy() == false) {
             return marker.entries();
         }
+        return adoptLegacy(legacyReadAll());
+    }
+
+    private Map<String, String> adoptLegacy(Map<String, String> sources) throws IOException {
         final Map<String, String> entries = new LinkedHashMap<>();
-        for (Map.Entry<String, String> each : legacyReadAll().entrySet()) {
-            entries.put(each.getKey(), writeContent(each.getValue()));
+        for (Map.Entry<String, String> each : sources.entrySet()) {
+            // Adoption only publishes at the old marker generation. A losing migration retries from
+            // the indexed marker, so it can never add these keys after another writer removes them.
+            entries.put(each.getKey(), writeContent(each.getValue(), false));
         }
         return entries;
     }
@@ -233,7 +239,7 @@ public final class TemplateStore {
     /**
      * Stores a template, replacing any of the same name.
      *
-     * <p>The bytes first, under their hash; then one compare-and-swap of the register naming them. A crash
+     * <p>The bytes first, under a unique revision key; then one compare-and-swap of the register naming them. A crash
      * between the two leaves an unindexed blob, which no reader will ever see — the same answer the caller
      * got. The old bytes, if no other name shares them, go after the swap.
      *
@@ -244,12 +250,21 @@ public final class TemplateStore {
      */
     public void put(String name, String source) throws IOException {
         Names.validateId(name, "template");
-        final String hash = writeContent(source);
+        String hash = null;
         for (int attempt = 0; attempt < MARKER_ATTEMPTS; attempt++) {
             final Marker marker = readMarker();
-            final Map<String, String> entries = new LinkedHashMap<>(indexOf(marker));
+            Map<String, String> entries = marker.legacy() ? legacyReadAll() : new LinkedHashMap<>(marker.entries());
             if (entries.containsKey(name) == false && entries.size() >= MAX_TEMPLATES) {
+                if (hash != null) {
+                    dropContent(hash);
+                }
                 throw new TooManyTemplatesException(MAX_TEMPLATES);
+            }
+            if (marker.legacy()) {
+                entries = adoptLegacy(entries);
+            }
+            if (hash == null) {
+                hash = writeContent(source, true);
             }
             final String previous = entries.put(name, hash);
             if (writeMarker(marker, entries)) {
@@ -262,6 +277,8 @@ public final class TemplateStore {
                 return;
             }
         }
+        // Every swap explicitly lost, so nobody could have published this unique provisional key.
+        dropContent(hash);
         throw new IOException("could not move the store's marker: it is being changed concurrently");
     }
 
@@ -390,10 +407,15 @@ public final class TemplateStore {
         return matching;
     }
 
-    /** Writes bytes under their hash and returns the hash. Writing the same bytes twice is the same blob. */
-    private String writeContent(String source) throws IOException {
+    /**
+     * Writes bytes under a unique revision key. A content hash alone is unsafe: another put could index
+     * those same bytes just before a previous update deletes them. A key that no future put reuses can
+     * be removed after its last reference leaves the register, without deleting another writer's content.
+     * Older hash-only keys remain readable through the same register entries.
+     */
+    private String writeContent(String source, boolean revision) throws IOException {
         final byte[] bytes = source.getBytes(StandardCharsets.UTF_8);
-        final String hash = sha256(bytes);
+        final String hash = sha256(bytes) + (revision ? "-" + org.opensearch.common.UUIDs.randomBase64UUID() : "");
         container.writeBlob(CONTENT_PREFIX + hash, new java.io.ByteArrayInputStream(bytes), bytes.length, false);
         return hash;
     }
