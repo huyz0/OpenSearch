@@ -594,6 +594,15 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         assertEquals("while an object's fields merge", Set.of("x", "y"), a.keySet());
     }
 
+    public void testExtendingAnUnfinishedViewPreservesItsReadableCaptureMarker() throws Exception {
+        final var capturing = new PointInTime("capture", "logs", "uuid-1", 99L, Map.of(), true);
+        final var stored = PointInTime.fromStream(capturing.withExpiry(200L).toBytes().streamInput());
+        assertTrue(stored.isCapturing());
+        assertEquals("uuid-1", stored.indexUuid());
+        assertEquals(200L, stored.expiresAtMillis());
+        assertTrue(stored.shards().isEmpty());
+    }
+
     /** A view record carries the uuid of the index it froze; one written before that reads by name alone. */
     public void testAViewRecordCarriesItsIndexUuidAndAnOlderOneReadsWithout() throws Exception {
         final CommitManifest manifest = new CommitManifest(3L, Map.of("_0.cfs", "t=3"), "n1", Map.of("_0.cfs", 10L));
