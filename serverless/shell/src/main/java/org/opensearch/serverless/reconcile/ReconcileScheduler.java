@@ -293,7 +293,9 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         loop.membership().subscribe(delta -> {
             final java.util.Set<String> renewed = new java.util.HashSet<>();
             for (var joined : delta.joined()) {
-                renewed.add(joined.nodeId() + "/" + joined.ephemeralId());
+                final String incarnation = joined.nodeId() + "/" + joined.ephemeralId();
+                renewed.add(incarnation);
+                departures.remove(incarnation);
             }
             for (org.opensearch.serverless.membership.NodeLease left : delta.left()) {
                 // A changed expiry or address is an updated lease, not a departed process. Probing these
@@ -303,10 +305,12 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 }
                 // Only a departure that just happened. A lease that ran out long ago belongs to a node whose shards
                 // are dormant -- or to a fleet replaced wholesale, whose every shard taken at once would be a storm --
-                // and those are taken as requests ask for them. Once per incarnation: a departure can be heard again.
+                // and those are taken as requests ask for them. Deduplicate each absence; a rejoin starts afresh.
                 final long sinceExpiry = clock.getAsLong() - left.expiresAtMillis();
                 if (closed == false && sinceExpiry <= RECENT_DEPARTURE_TTLS * leaseTtlMillis()) {
-                    threadPool.generic().execute(() -> takeOverIfGone(left, 0));
+                    final String incarnation = left.nodeId() + "/" + left.ephemeralId();
+                    final Departure departure = departures.computeIfAbsent(incarnation, key -> new Departure(left, clock.getAsLong()));
+                    threadPool.generic().execute(() -> takeOverIfGone(departure, 0));
                 }
             }
         });
@@ -391,8 +395,19 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     /** How long ago a lease may have run out and still be a departure whose shards are taken at once, in TTLs. */
     static final int RECENT_DEPARTURE_TTLS = 3;
 
-    /** The departed incarnations already taken over from, so a departure heard twice is acted on once. */
-    private final java.util.Set<String> takenOver = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** One observed absence, discarded on rejoin so a later absence of the same process is independent. */
+    private record Departure(org.opensearch.serverless.membership.NodeLease lease, long noticedAt, AtomicBoolean takenOver) {
+        Departure(org.opensearch.serverless.membership.NodeLease lease, long noticedAt) {
+            this(lease, noticedAt, new AtomicBoolean());
+        }
+    }
+
+    private final java.util.Map<String, Departure> departures = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private void pruneDepartureHistory() {
+        final long now = clock.getAsLong();
+        departures.entrySet().removeIf(entry -> now - entry.getValue().noticedAt() > RECENT_DEPARTURE_TTLS * leaseTtlMillis());
+    }
 
     private long leaseTtlMillis() {
         return Math.max(1L, renewalInterval.millis() * RENEWALS_PER_TTL);
@@ -407,12 +422,13 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * <p>A node leaves the membership view when its lease read fails or comes back late, as well as when it dies, and a
      * live node's shards taken on that evidence is a storm of contested activations. So the lease is read first; a
      * live one is looked at again just after it would expire, which is when a dead node's departure is real. The
-     * incarnation is marked taken over only when the takeover happens, so a false departure does not use up the one
-     * proactive takeover a real death of that incarnation gets.
+     * absence is marked taken over only when the takeover happens, so a false departure does not use up the
+     * proactive takeover a later real departure gets.
      */
-    private void takeOverIfGone(org.opensearch.serverless.membership.NodeLease left, int rechecks) {
+    private void takeOverIfGone(Departure departure, int rechecks) {
+        final var left = departure.lease();
         final String incarnation = left.nodeId() + "/" + left.ephemeralId();
-        if (closed || takenOver.contains(incarnation)) {
+        if (closed || departure.takenOver().get() || departures.get(incarnation) != departure) {
             return;
         }
         long liveUntil;
@@ -423,7 +439,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             liveUntil = clock.getAsLong();
         }
         if (liveUntil == Long.MIN_VALUE) {
-            if (takenOver.add(incarnation)) {
+            if (departure.takenOver().compareAndSet(false, true)) {
                 takeOver(left.nodeId());
             }
             return;
@@ -432,7 +448,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             return;
         }
         final long delay = Math.max(0L, liveUntil - clock.getAsLong()) + renewalInterval.millis();
-        threadPool.schedule(() -> takeOverIfGone(left, rechecks + 1), TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
+        threadPool.schedule(() -> takeOverIfGone(departure, rechecks + 1), TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
     }
 
     /**
@@ -476,6 +492,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     }
 
     private java.util.Set<ShardId> renewLeaseNow() {
+        pruneDepartureHistory();
         renewals.incrementAndGet();
         try {
             return loop.renewLease();
