@@ -164,6 +164,27 @@ public final class ActionGate {
     }
 
     /**
+     * Shows a native action response and returns the response the filters supply.
+     *
+     * @param responseType the action's response class
+     * @param <T> the native response type
+     * @return the native response view
+     */
+    public static <T extends ActionResponse> ResponseView<T> identity(Class<T> responseType) {
+        return new ResponseView<>() {
+            @Override
+            public ActionResponse show(T result) {
+                return result;
+            }
+
+            @Override
+            public T read(ActionResponse response, T original) {
+                return responseType.cast(response);
+            }
+        };
+    }
+
+    /**
      * Runs one operation through the filters, showing them its result.
      *
      * <p><b>What changes when a view is given.</b> The chain's listener is completed with the operation's

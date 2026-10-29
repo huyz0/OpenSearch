@@ -25,10 +25,7 @@ import org.opensearch.action.index.IndexResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
-import org.opensearch.core.index.Index;
-import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.get.GetResult;
-import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shard.ShardOperations;
@@ -188,17 +185,7 @@ public final class ServerlessClient extends AbstractClient {
     }
 
     private IndexResponse index(IndexRequest request, ShardOperations operations, MetadataPlane metadata) throws Exception {
-        final String id = request.id() == null ? org.opensearch.common.UUIDs.base64UUID() : request.id();
-        operations.index(
-            request.index(),
-            id,
-            request.source().utf8ToString(),
-            request.getRefreshPolicy() != IndexRequest.RefreshPolicy.NONE
-        );
-        // Sequence numbers and versions are not modelled: WalRecord records document state, not history,
-        // and inventing numbers here would let a plugin build optimistic concurrency on a guarantee this
-        // system does not make. They are reported as unassigned, which is what they are.
-        return new IndexResponse(shardIdOf(request.index(), id, metadata), id, SequenceNumbers.UNASSIGNED_SEQ_NO, 0L, 1L, true);
+        return operations.index(request);
     }
 
     private GetResponse get(GetRequest request, ShardOperations operations, MetadataPlane metadata) throws Exception {
@@ -221,19 +208,7 @@ public final class ServerlessClient extends AbstractClient {
     }
 
     private DeleteResponse delete(DeleteRequest request, ShardOperations operations, MetadataPlane metadata) throws Exception {
-        final boolean found = operations.delete(
-            request.index(),
-            request.id(),
-            request.getRefreshPolicy() != IndexRequest.RefreshPolicy.NONE
-        );
-        return new DeleteResponse(
-            shardIdOf(request.index(), request.id(), metadata),
-            request.id(),
-            SequenceNumbers.UNASSIGNED_SEQ_NO,
-            0L,
-            1L,
-            found
-        );
+        return operations.delete(request);
     }
 
     /**
@@ -309,12 +284,6 @@ public final class ServerlessClient extends AbstractClient {
             )
         );
         return new CreateIndexResponse(true, true, request.index());
-    }
-
-    /** The shard a document routes to, for the response's benefit only. */
-    private ShardId shardIdOf(String index, String id, MetadataPlane metadata) throws java.io.IOException {
-        final var descriptor = metadata.describe(index).orElseThrow(() -> new ShardOperations.NoSuchIndexException(index));
-        return new ShardId(new Index(index, descriptor.uuid()), org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor, id));
     }
 
     @Override
