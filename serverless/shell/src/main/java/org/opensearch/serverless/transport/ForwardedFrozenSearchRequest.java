@@ -24,11 +24,9 @@ import java.io.IOException;
  * whether the commit they came from is the live one or a frozen one -- so this reuses
  * {@link ForwardedSearchResponse} rather than a parallel type that would only ever hold the same fields.
  *
- * <p><b>Carries the whole view, not a single shard's manifest.</b> Opening one shard of a view needs every
- * shard's term (see {@code ServerlessNode#openFrozenView}), so a request that carried only the shard being
- * asked for would leave the receiving node unable to call that method at all without a second
- * implementation of what it does. Sending the {@link PointInTime} whole means the node this is forwarded
- * to opens the view exactly as the coordinator would have, locally.
+ * <p>Only the selected shard's manifest travels whole. Other shards carry their terms so opening this
+ * shard cannot reset another frozen shard's primary term. Sending every file map to every shard would
+ * multiply manifest metadata by the shard count for each frozen search.
  */
 public final class ForwardedFrozenSearchRequest extends TransportRequest {
 
@@ -61,7 +59,15 @@ public final class ForwardedFrozenSearchRequest extends TransportRequest {
      * @param nowInMillis the instant {@code now} means for this whole search
      */
     public ForwardedFrozenSearchRequest(PointInTime pit, int shard, SearchSourceBuilder source, long nowInMillis) {
-        this.pit = pit;
+        final java.util.Map<Integer, org.opensearch.serverless.store.CommitManifest> needed = new java.util.LinkedHashMap<>();
+        pit.shards()
+            .forEach(
+                (number, manifest) -> needed.put(
+                    number,
+                    number == shard ? manifest : new org.opensearch.serverless.store.CommitManifest(manifest.term(), java.util.Map.of())
+                )
+            );
+        this.pit = new PointInTime(pit.id(), pit.index(), pit.indexUuid(), pit.expiresAtMillis(), needed);
         this.shard = shard;
         this.source = source;
         this.nowInMillis = nowInMillis;
@@ -100,7 +106,7 @@ public final class ForwardedFrozenSearchRequest extends TransportRequest {
     }
 
     /**
-     * Returns the frozen view.
+     * Returns the selected shard's frozen manifest and every shard's term.
      *
      * @return the view
      */
