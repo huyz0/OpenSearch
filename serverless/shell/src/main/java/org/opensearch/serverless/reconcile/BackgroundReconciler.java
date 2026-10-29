@@ -457,7 +457,7 @@ public final class BackgroundReconciler implements Closeable {
 
     private void forceSweepOfOpenWriters() {
         for (ShardId shardId : node.reconciler().openShards()) {
-            if (node.reconciler().readerShards().contains(shardId) == false) {
+            if (node.reconciler().isReader(shardId) == false) {
                 forceSweep.add(shardId);
                 pendingSweeps.add(shardId);
             }
@@ -571,7 +571,7 @@ public final class BackgroundReconciler implements Closeable {
             return deleted;
         }
         for (ShardId shardId : toSweep) {
-            if (node.reconciler().openShards().contains(shardId) == false || node.reconciler().readerShards().contains(shardId)) {
+            if (node.reconciler().openShards().contains(shardId) == false || node.reconciler().isReader(shardId)) {
                 // Not ours to sweep any more. Forgetting what we had seen is the safe direction: the next
                 // owner starts again from nothing and simply deletes later than it could have.
                 unreferencedFor.remove(shardId);
@@ -1387,7 +1387,7 @@ public final class BackgroundReconciler implements Closeable {
         return node.reconciler()
             .openShards()
             .stream()
-            .anyMatch(s -> s.getIndexName().equals(indexName) && s.id() == shard && node.reconciler().readerShards().contains(s) == false);
+            .anyMatch(s -> s.getIndexName().equals(indexName) && s.id() == shard && node.reconciler().isReader(s) == false);
     }
 
     /**
@@ -2244,7 +2244,7 @@ public final class BackgroundReconciler implements Closeable {
             .filter(s -> s.getIndexName().equals(indexName) && s.id() == shard)
             .findFirst()
             .orElse(null);
-        if (open != null && node.reconciler().readerShards().contains(open) == false) {
+        if (open != null && node.reconciler().isReader(open) == false) {
             return Optional.of(open);
         }
         boolean reserved = false;
@@ -2449,7 +2449,7 @@ public final class BackgroundReconciler implements Closeable {
 
     /** Publishes one shard if it has anything new; true if it did. */
     private boolean publishOne(ShardId shardId) {
-        if (node.reconciler().readerShards().contains(shardId)) {
+        if (node.reconciler().isReader(shardId)) {
             return false;
         }
         final var shard = node.reconciler().shard(shardId);
@@ -2622,7 +2622,7 @@ public final class BackgroundReconciler implements Closeable {
     public int handOverAll() {
         int handed = 0;
         for (ShardId shardId : new java.util.ArrayList<>(node.reconciler().openShards())) {
-            if (node.reconciler().readerShards().contains(shardId)) {
+            if (node.reconciler().isReader(shardId)) {
                 continue;
             }
             if (letGo(shardId, "shutting down")) {

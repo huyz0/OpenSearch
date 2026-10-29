@@ -472,16 +472,10 @@ public final class ShardOperations {
             throw new NoSuchIndexException(index);
         }
         final int shard = org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor.get(), id);
-        final ShardId local = node.reconciler()
-            .openShards()
-            .stream()
-            // Matched by uuid as well as name: a deleted and recreated index keeps its name and changes
-            // its uuid, and a writer that has not yet noticed the delete still holds the old one open under
-            // the same name. Matching by name alone acknowledged writes into that shard.
-            .filter(s -> s.getIndexName().equals(index) && s.id() == shard && s.getIndex().getUUID().equals(descriptor.get().uuid()))
-            .filter(s -> node.reconciler().readerShards().contains(s) == false)
-            .findFirst()
-            .orElse(null);
+        // Exact identity keeps routing independent of the number of other shards held here and
+        // cannot select a previous incarnation or a frozen view with the same logical name.
+        final var writer = node.reconciler().writerShard(new ShardId(index, descriptor.get().uuid(), shard));
+        final ShardId local = writer == null ? null : writer.shardId();
         final String owner = ownerOnce(index, shard).orElse(null);
         return new Placement(local, shard, owner, descriptor.get().uuid());
     }
@@ -789,7 +783,7 @@ public final class ShardOperations {
             Thread.currentThread().interrupt();
             behind.addSuppressed(e);
         }
-        if (taken.isPresent() && node.reconciler().readerShards().contains(taken.get()) == false) {
+        if (taken.isPresent() && node.reconciler().isReader(taken.get()) == false) {
             return new Read(node.get(taken.get(), id), node.localNode().getId(), true, taken.get());
         }
         throw NotHereException.behindLog(behind);

@@ -380,14 +380,10 @@ public final class DocumentHandler extends BaseRestHandler {
                 }
             }
         };
-        final ShardId shardId = serving.reconciler()
-            .openShards()
-            .stream()
-            .filter(s -> s.getIndexName().equals(writtenIndex) && s.id() == shard && s.getIndex().getUUID().equals(descriptor.get().uuid()))
-            .findFirst()
-            .orElse(null);
+        final var writer = serving.reconciler().writerShard(new ShardId(writtenIndex, descriptor.get().uuid(), shard));
+        final ShardId shardId = writer == null ? null : writer.shardId();
 
-        if (shardId == null || serving.reconciler().readerShards().contains(shardId)) {
+        if (shardId == null) {
             // The owner as last seen, if this node has seen it: a head read per write was the largest
             // fixed cost of a write this node does not serve itself. A hint that is wrong is refused by
             // the node it names, and the register is read then -- once -- and the write forwarded again.
