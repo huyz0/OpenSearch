@@ -10,8 +10,8 @@ package org.opensearch.serverless.transport;
 
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.common.hash.MessageDigests;
-import org.opensearch.common.io.stream.BytesStreamOutput;
-import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.common.io.stream.OutputStreamStreamOutput;
+import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.transport.TransportRequest;
@@ -20,7 +20,9 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.DigestOutputStream;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -303,26 +305,26 @@ public final class TransportAuthenticator {
         }
     }
 
-    /** SHA-256 of the request as it is written; ties the MAC to the payload, not only the envelope. */
-    private static byte[] digest(TransportRequest request) throws IOException {
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            request.writeTo(out);
-            return MessageDigests.sha256().digest(BytesReference.toBytes(out.bytes()));
+    /** SHA-256 of canonical serialization, streamed without retaining or copying the full request. */
+    private static byte[] digest(Writeable value) throws IOException {
+        final MessageDigest digest = MessageDigests.sha256();
+        try (var out = new OutputStreamStreamOutput(new DigestOutputStream(OutputStream.nullOutputStream(), digest))) {
+            value.writeTo(out);
         }
+        return digest.digest();
     }
 
     private static byte[] digestHeaders(java.util.Map<String, String> headers) throws IOException {
         final java.util.Map<String, String> authenticated = new java.util.TreeMap<>(headers);
         authenticated.remove(MAC_HEADER);
         authenticated.remove(ShardRouter.TOKEN_HEADER);
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            out.writeMap(
+        return digest(
+            out -> out.writeMap(
                 authenticated,
                 org.opensearch.core.common.io.stream.StreamOutput::writeString,
                 org.opensearch.core.common.io.stream.StreamOutput::writeString
-            );
-            return MessageDigests.sha256().digest(BytesReference.toBytes(out.bytes()));
-        }
+            )
+        );
     }
 
     private static byte[] hexToBytes(String hex) {

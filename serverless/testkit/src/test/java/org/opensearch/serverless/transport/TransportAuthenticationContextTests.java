@@ -21,6 +21,14 @@ public class TransportAuthenticationContextTests extends OpenSearchTestCase {
         return new TransportAuthenticator(() -> secrets, () -> {}, () -> node, () -> 1_000L, () -> 30_000L);
     }
 
+    public void testStreamingAuthenticationAcceptsABufferedFrame() throws Exception {
+        final var request = new GetRequest("index", "id-" + "π😀".repeat(1024));
+        // Captured from the previous BytesStreamOutput implementation, with the test's fixed key and clock.
+        final String buffered =
+            "1:sender:1000:cfc0df316d1382c4021bb375492b3d93:2810a7ed70450bf3deca8d07a86ccd9afb13d5b888f293d6512fb7ac5e142c6f";
+        authenticator("receiver").verify("action", request, buffered, Map.of("caller", "alice"));
+    }
+
     public void testCapturedFrameCannotBeUsedAtAnotherNode() throws Exception {
         final var request = new GetRequest("index", "id");
         final String mac = authenticator("sender").sign("action", request, "receiver", Map.of());
