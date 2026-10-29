@@ -47,6 +47,46 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
     private static final long TTL = 30_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
 
+    public void testRestWritesChargeUnicodeBytesBeforeApplying() throws Exception {
+        assertRestContentPressure(false);
+    }
+
+    public void testRestDeletesChargeTheirDocumentIdsBeforeApplying() throws Exception {
+        assertRestContentPressure(true);
+    }
+
+    private void assertRestContentPressure(boolean deletion) throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+        final Settings settings = Settings.builder()
+            .put("node.name", "rest-pressure-accounting")
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", "ingest")
+            .put("indexing_pressure.memory.limit", deletion ? "256b" : "1kb")
+            .build();
+        try (ServerlessNode node = new ServerlessNode(settings)) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            final String id = deletion ? "x".repeat(400) : "doc";
+            if (deletion) {
+                node.index(node.reconciler().openShards().iterator().next(), id, "{\"msg\":\"retained\"}");
+            }
+            final String source = deletion ? null : "{\"msg\":\"" + "漢".repeat(600) + "\"}";
+            final Response refused = send(node, deletion ? "DELETE" : "PUT", "/alpha/_doc/" + id, source);
+            assertEquals(refused.body(), 429, refused.status());
+            final Response document = send(node, "GET", "/alpha/_doc/" + id, null);
+            assertEquals(document.body(), deletion ? 200 : 404, document.status());
+            assertEquals(0L, node.indexingPressure().getCurrentCoordinatingBytes());
+        }
+    }
+
     /** The limit falls on slow appends, refuses past it, and recovers on fast ones. */
     public void testTheLimitFollowsHowTheStoreAnswers() {
         final WriteBackpressure limiter = new WriteBackpressure(100, 1_000, 2, 16);
