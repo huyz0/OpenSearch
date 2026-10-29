@@ -72,6 +72,69 @@ public final class AliasHandler extends BaseRestHandler {
 
     private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
 
+    private void executeAuthorized(
+        org.opensearch.rest.RestChannel channel,
+        String action,
+        org.opensearch.action.ActionRequest request,
+        org.opensearch.common.CheckedBiConsumer<org.opensearch.action.ActionRequest, org.opensearch.rest.RestChannel, Exception> work
+    ) {
+        final var serving = node.get();
+        final Runnable execute = () -> {
+            try {
+                final org.opensearch.common.CheckedFunction<
+                    org.opensearch.action.ActionRequest,
+                    org.opensearch.rest.RestResponse,
+                    Exception> capture = admitted -> {
+                        final var pending = new java.util.concurrent.atomic.AtomicReference<org.opensearch.rest.RestResponse>();
+                        final var buffered = new org.opensearch.rest.AbstractRestChannel(
+                            channel.request(),
+                            channel.detailedErrorsEnabled()
+                        ) {
+                            @Override
+                            public void sendResponse(org.opensearch.rest.RestResponse response) {
+                                if (pending.compareAndSet(null, response) == false) {
+                                    throw new IllegalStateException("an alias operation produced more than one response");
+                                }
+                            }
+                        };
+                        work.accept(admitted, buffered);
+                        if (pending.get() == null) {
+                            throw new IllegalStateException("an alias operation did not produce a response");
+                        }
+                        return pending.get();
+                    };
+                final var response = serving == null
+                    ? capture.apply(request)
+                    : serving.actionGate().run(action, request, capture, org.opensearch.serverless.shell.ActionGate.opaque());
+                if (response == null) {
+                    throw new UnsupportedOperationException("a cached alias action response is not supported");
+                }
+                // A listener filter may still refuse after the work. Nothing reaches HTTP before it completes.
+                channel.sendResponse(response);
+            } catch (Exception e) {
+                try {
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                } catch (IOException nested) {
+                    logger.error("failed to report an alias operation failure", nested);
+                }
+            }
+        };
+        if (serving == null) {
+            execute.run();
+        } else {
+            serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(execute);
+        }
+    }
+
+    private static org.opensearch.action.admin.indices.alias.get.GetAliasesRequest acceptedRead(
+        org.opensearch.action.ActionRequest request
+    ) {
+        if (request instanceof org.opensearch.action.admin.indices.alias.get.GetAliasesRequest accepted) {
+            return accepted;
+        }
+        throw new IllegalArgumentException("an alias read filter must provide GetAliasesRequest");
+    }
+
     @Override
     public String getName() {
         return "serverless_alias_action";
@@ -134,13 +197,18 @@ public final class AliasHandler extends BaseRestHandler {
                     IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
                 );
             }
-            return channel -> {
-                try {
-                    aliasesOf(channel, reverse, indexParam);
-                } catch (Exception e) {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+            return channel -> executeAuthorized(
+                channel,
+                org.opensearch.action.admin.indices.alias.get.GetAliasesAction.NAME,
+                new org.opensearch.action.admin.indices.alias.get.GetAliasesRequest().indices(indexParam),
+                (admitted, buffered) -> {
+                    final var selected = acceptedRead(admitted);
+                    if (selected.indices() == null || selected.indices().length != 1) {
+                        throw new UnsupportedOperationException("a reverse alias lookup requires one concrete index");
+                    }
+                    aliasesOf(buffered, reverse, selected.indices()[0], selected.aliases());
                 }
-            };
+            );
         }
         if (name == null && bulk == false && request.hasContentOrSourceParam()) {
             // PUT /{index}/_alias with the alias named in the body, which core accepts as "alias" or "name".
@@ -228,25 +296,12 @@ public final class AliasHandler extends BaseRestHandler {
                     IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not read the actions")
                 );
             }
-            return channel -> {
-                try {
-                    IndexAdminHandler.gate(
-                        node.get(),
-                        org.opensearch.action.admin.indices.alias.IndicesAliasesAction.NAME,
-                        new org.opensearch.action.admin.indices.alias.IndicesAliasesRequest(),
-                        () -> {
-                            actions(channel, metadata, body);
-                            return null;
-                        }
-                    );
-                } catch (Exception e) {
-                    try {
-                        channel.sendResponse(IndexAdminHandler.failure(channel, e));
-                    } catch (IOException nested) {
-                        logger.error("failed to report an alias action failure", nested);
-                    }
-                }
-            };
+            return channel -> executeAuthorized(
+                channel,
+                org.opensearch.action.admin.indices.alias.IndicesAliasesAction.NAME,
+                new org.opensearch.action.admin.indices.alias.IndicesAliasesRequest(),
+                (admitted, buffered) -> actions(buffered, metadata, body)
+            );
         }
 
         final String gateAction = method == RestRequest.Method.GET || method == RestRequest.Method.HEAD
@@ -255,20 +310,25 @@ public final class AliasHandler extends BaseRestHandler {
         final org.opensearch.action.ActionRequest gateRequest = method == RestRequest.Method.GET || method == RestRequest.Method.HEAD
             ? new org.opensearch.action.admin.indices.alias.get.GetAliasesRequest(aliasName).indices(indices.toArray(new String[0]))
             : new org.opensearch.action.admin.indices.alias.IndicesAliasesRequest();
-        return channel -> {
-            try {
-                IndexAdminHandler.gate(node.get(), gateAction, gateRequest, () -> {
-                    dispatch(channel, metadata, method, indexParam, aliasName, indices);
-                    return null;
-                });
-            } catch (Exception e) {
-                try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
-                } catch (IOException nested) {
-                    logger.error("failed to report an alias failure", nested);
+        return channel -> executeAuthorized(channel, gateAction, gateRequest, (admitted, buffered) -> {
+            if (method == RestRequest.Method.GET || method == RestRequest.Method.HEAD) {
+                final var selected = acceptedRead(admitted);
+                if (selected.aliases() == null || selected.aliases().length != 1) {
+                    throw new UnsupportedOperationException("this alias lookup requires one named alias");
                 }
+                final List<String> selectedIndices = selected.indices() == null ? List.of() : java.util.Arrays.asList(selected.indices());
+                dispatch(
+                    buffered,
+                    metadata,
+                    method,
+                    selectedIndices.isEmpty() ? null : String.join(",", selectedIndices),
+                    selected.aliases()[0],
+                    selectedIndices
+                );
+            } else {
+                dispatch(buffered, metadata, method, indexParam, aliasName, indices);
             }
-        };
+        });
     }
 
     private void dispatch(
@@ -933,7 +993,8 @@ public final class AliasHandler extends BaseRestHandler {
     }
 
     /** {@code GET /{index}/_alias}: every alias that names the index, verified against each alias record. */
-    private void aliasesOf(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String index) throws IOException {
+    private void aliasesOf(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String index, String[] wantedAliases)
+        throws IOException {
         final var descriptor = metadata.describe(index);
         if (descriptor.isEmpty()) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
@@ -944,8 +1005,16 @@ public final class AliasHandler extends BaseRestHandler {
             builder.startObject(index);
             builder.startObject("aliases");
             for (String alias : metadata.aliasesOf(descriptor.get())) {
+                if (wantedAliases != null
+                    && wantedAliases.length != 0
+                    && org.opensearch.common.regex.Regex.simpleMatch(wantedAliases, alias) == false) {
+                    continue;
+                }
                 final var record = metadata.aliasWithGeneration(alias);
-                writeAliasBody(builder, alias, record.isPresent() ? record.get().alias().writeIndex() : null, index);
+                if (record.isEmpty() || record.get().alias().dataStream() || record.get().alias().indices().contains(index) == false) {
+                    continue;
+                }
+                writeAliasBody(builder, alias, record.get().alias().writeIndex(), index);
             }
             builder.endObject();
             builder.endObject();
