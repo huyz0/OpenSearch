@@ -157,6 +157,8 @@ public final class CredentialStore {
     private final byte[] cacheKey = new byte[32];
 
     private final Map<String, Long> cache;
+    /** Guarded by cache; prevents a verification in flight from undoing a concurrent invalidation. */
+    private long cacheEpoch;
 
     /** When the marker was last consulted, so the check costs one read a second and not one a request. */
     private final AtomicLong markerCheckedAt;
@@ -340,6 +342,10 @@ public final class CredentialStore {
         if (markerPending.compareAndSet(true, false) || claimMarkerCheck()) {
             refreshMarker();
         }
+        final long validationEpoch;
+        synchronized (cache) {
+            validationEpoch = cacheEpoch;
+        }
         final String key = user + " " + PasswordHash.fingerprint(cacheKey, user, password);
         if (cachedAndFresh(key)) {
             return new Verdict(user, null);
@@ -348,7 +354,7 @@ public final class CredentialStore {
         if (bootstrapUser.equals(user)) {
             derived = true;
             if (PasswordHash.verify(password, bootstrapRecord, verifyCap)) {
-                remember(key);
+                remember(key, validationEpoch);
                 return new Verdict(user, null);
             }
         }
@@ -367,7 +373,7 @@ public final class CredentialStore {
         }
         if (record != null) {
             if (PasswordHash.verify(password, record, verifyCap)) {
-                remember(key);
+                remember(key, validationEpoch);
                 return new Verdict(user, null);
             }
             return REJECTED;
@@ -398,12 +404,17 @@ public final class CredentialStore {
             .endObject();
         final IndexRequest request = new IndexRequest(index).id(user).source(source).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
         try {
-            asPlugin(() -> require().index(request).actionGet(timeout));
-        } catch (IndexNotFoundException e) {
-            createIndex();
-            asPlugin(() -> require().index(request).actionGet(timeout));
+            try {
+                asPlugin(() -> require().index(request).actionGet(timeout));
+            } catch (IndexNotFoundException e) {
+                createIndex();
+                asPlugin(() -> require().index(request).actionGet(timeout));
+            }
+        } finally {
+            // An error can be a lost response after the new password landed. Trust neither the old
+            // cache entry nor an older verification still in flight, even when this call failed.
+            forget(user);
         }
-        forget(user);
         // After the record, so a node that sees the new marker sees the new record. A bump that fails
         // leaves the account written and the caller with an error; retrying rewrites the same record and
         // moves the marker, which is the right way for that to resolve.
@@ -581,6 +592,7 @@ public final class CredentialStore {
         if (current != markerSeen) {
             markerSeen = current;
             synchronized (cache) {
+                cacheEpoch++;
                 cache.clear();
             }
         }
@@ -600,15 +612,18 @@ public final class CredentialStore {
         }
     }
 
-    private void remember(String key) {
+    private void remember(String key, long validationEpoch) {
         synchronized (cache) {
-            cache.put(key, clock.getAsLong() + cacheTtlMillis);
+            if (cacheEpoch == validationEpoch) {
+                cache.put(key, clock.getAsLong() + cacheTtlMillis);
+            }
         }
     }
 
     private void forget(String user) {
         final String prefix = user + " ";
         synchronized (cache) {
+            cacheEpoch++;
             final Iterator<String> keys = cache.keySet().iterator();
             while (keys.hasNext()) {
                 if (keys.next().startsWith(prefix)) {
