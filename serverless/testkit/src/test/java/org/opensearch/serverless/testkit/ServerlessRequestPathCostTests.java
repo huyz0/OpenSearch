@@ -58,6 +58,33 @@ public class ServerlessRequestPathCostTests extends OpenSearchTestCase {
             .build();
     }
 
+    public void testColdGetMetadataRunsOffTheHttpThread() throws Exception {
+        assertColdMetadataOffHttp("GET", "cold-get", null);
+    }
+
+    public void testColdWriteMetadataRunsOffTheHttpThread() throws Exception {
+        assertColdMetadataOffHttp("PUT", "cold-write", "{\"msg\":\"hello\"}");
+    }
+
+    private void assertColdMetadataOffHttp(String method, String index, String body) throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("metadata-thread-" + index))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final var reader = new java.util.concurrent.atomic.AtomicReference<Thread>();
+            store.onNextRegisterRead("indices", index, () -> reader.set(Thread.currentThread()));
+            final Response response = send(node, method, "/" + index + "/_doc/1", body);
+            assertEquals(response.body(), 404, response.status());
+            assertNotNull("the cold request must read its descriptor", reader.get());
+            assertFalse(
+                "metadata IO ran on " + reader.get().getName(),
+                org.opensearch.transport.Transports.isTransportThread(reader.get())
+            );
+        }
+    }
+
     /**
      * Once a name has been resolved, searching it, multi-searching it, getting from it and multi-getting
      * from it read no descriptor at all; once the routing window passes, the next request reads it again.
