@@ -204,15 +204,16 @@ public final class ServerlessClient extends AbstractClient {
     private GetResponse get(GetRequest request, ShardOperations operations, MetadataPlane metadata) throws Exception {
         final var read = operations.get(request.index(), request.id());
         final var document = read.document();
+        final String source = org.opensearch.serverless.rest.SourceFiltering.apply(document.source(), request.fetchSourceContext());
         return new GetResponse(
             new GetResult(
                 request.index(),
                 request.id(),
-                SequenceNumbers.UNASSIGNED_SEQ_NO,
-                0L,
-                document.found() ? 1L : -1L,
+                document.seqNo(),
+                document.primaryTerm(),
+                document.version(),
                 document.found(),
-                document.found() ? new org.opensearch.core.common.bytes.BytesArray(document.source()) : null,
+                document.found() && source != null ? new org.opensearch.core.common.bytes.BytesArray(source) : null,
                 java.util.Map.of(),
                 java.util.Map.of()
             )
