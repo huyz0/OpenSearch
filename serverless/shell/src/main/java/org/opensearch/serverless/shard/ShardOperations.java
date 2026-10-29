@@ -1187,6 +1187,7 @@ public final class ShardOperations {
                     );
                 }
                 final String id = accepted.id() == null ? org.opensearch.common.UUIDs.base64UUID() : accepted.id();
+                accepted.id(id);
                 final String source = org.opensearch.common.xcontent.XContentHelper.convertToJson(
                     accepted.source(),
                     false,
