@@ -1953,6 +1953,12 @@ public final class MetadataPlane {
         final var container = blobStore.blobContainer(RegisterMap.snapshots(base));
         final List<SnapshotRecord> found = new ArrayList<>();
         for (String key : container.listBlobs().keySet()) {
+            // Snapshot records are always named repo#snapshot. A foreign object has no references
+            // to protect, but an unreadable object with one of our names must still stop collection.
+            final int separator = key.indexOf(RegisterMap.SHARD_SEPARATOR);
+            if (separator <= 0 || separator + RegisterMap.SHARD_SEPARATOR.length() == key.length()) {
+                continue;
+            }
             try (java.io.InputStream in = container.readBlob(key)) {
                 found.add(SnapshotRecord.fromStream(in));
             } catch (Exception e) {
