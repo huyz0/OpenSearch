@@ -43,6 +43,85 @@ public class ServerlessGroupCommitTests extends OpenSearchTestCase {
         return new WalRecord(id, "{\"msg\":\"" + id + "\"}");
     }
 
+    public void testFatalAppendReleasesTheShardQueue() throws Exception {
+        final var committer = new WalGroupCommitter();
+        final var fatal = new AssertionError("fatal append failure");
+        assertSame(
+            fatal,
+            expectThrows(AssertionError.class, () -> committer.commit(SHARD, 1L, List.of(record("failed")), (term, records) -> {
+                throw fatal;
+            }))
+        );
+        // Check this before attempting another commit: an unfinished failed flush would otherwise
+        // leave that caller waiting forever, hiding the original failure behind a test timeout.
+        assertEquals(0L, committer.recordsCommitted());
+        final var recorded = new Recording();
+        committer.commit(SHARD, 2L, List.of(record("recovered")), recorded);
+        assertEquals(List.of("recovered"), recorded.flattened().stream().map(WalRecord::id).toList());
+        assertEquals(1L, committer.recordsCommitted());
+    }
+
+    public void testFatalAppendRefusesQueuedGroups() throws Exception {
+        final var committer = new WalGroupCommitter();
+        final var entered = new CountDownLatch(1);
+        final var release = new CountDownLatch(1);
+        final List<Throwable> failures = new CopyOnWriteArrayList<>();
+        final var fatal = new AssertionError("fatal append failure");
+        final Thread leader = new Thread(() -> {
+            try {
+                committer.commit(SHARD, 1L, List.of(record("leader")), (term, records) -> {
+                    entered.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException(e);
+                    }
+                    throw fatal;
+                });
+            } catch (IOException | Error e) {
+                failures.add(e);
+            }
+        });
+        final Thread waiter = new Thread(() -> {
+            try {
+                committer.commit(
+                    SHARD,
+                    1L,
+                    List.of(record("queued")),
+                    (term, records) -> { fail("a queued group must be refused after a fatal append"); }
+                );
+            } catch (IOException | Error e) {
+                failures.add(e);
+            }
+        });
+        leader.start();
+        try {
+            assertTrue(entered.await(30, java.util.concurrent.TimeUnit.SECONDS));
+            waiter.start();
+            assertBusy(() -> assertEquals(Thread.State.WAITING, waiter.getState()));
+        } finally {
+            release.countDown();
+            leader.join(30_000);
+            waiter.join(30_000);
+        }
+        assertFalse(leader.isAlive());
+        assertFalse(waiter.isAlive());
+        assertEquals(2, failures.size());
+        assertTrue(failures.contains(fatal));
+        final var queuedFailure = failures.stream().filter(IOException.class::isInstance).findFirst().orElseThrow();
+        assertSame(fatal, queuedFailure.getCause());
+        assertEquals(0L, committer.recordsCommitted());
+    }
+
+    public void testFailedAppendsAreNotCountedAsCommitted() throws Exception {
+        final var committer = new WalGroupCommitter();
+        expectThrows(IOException.class, () -> committer.commit(SHARD, 1L, List.of(record("failed")), (term, records) -> {
+            throw new IOException("not durable");
+        }));
+        assertEquals(0L, committer.recordsCommitted());
+    }
+
     /** A flush that records what it was handed, one list per group. */
     private static final class Recording implements WalGroupCommitter.Flush {
         private final List<List<WalRecord>> groups = new CopyOnWriteArrayList<>();

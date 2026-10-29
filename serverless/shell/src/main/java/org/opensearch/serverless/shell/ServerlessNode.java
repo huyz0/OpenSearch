@@ -4197,9 +4197,12 @@ public final class ServerlessNode implements Closeable {
             // member of a group independently establishes that its record sits ahead of any seal.
             walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
             writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
-        } catch (Exception e) {
+        } catch (Exception | Error e) {
             writeBackpressure.onAppend(System.nanoTime() - appendStarted, false);
             writeFenced.add(shardId);
+            if (e instanceof Error fatal) {
+                throw fatal;
+            }
             throw new java.io.IOException(
                 "could not log "
                     + records.size()

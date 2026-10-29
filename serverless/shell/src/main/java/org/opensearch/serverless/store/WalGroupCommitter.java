@@ -181,9 +181,9 @@ public final class WalGroupCommitter {
                 final Group batch = state.pending.pollFirst();
                 state.flushing = true;
                 groups.incrementAndGet();
-                recordsCommitted.addAndGet(batch.records.size());
 
                 IOException thrown = null;
+                Error fatal = null;
                 state.lock.unlock();
                 try {
                     flush.append(batch.term, batch.records);
@@ -191,15 +191,33 @@ public final class WalGroupCommitter {
                     thrown = e;
                 } catch (RuntimeException e) {
                     thrown = new IOException("write-ahead log append to " + shardId + " failed", e);
+                } catch (Error e) {
+                    fatal = e;
+                    thrown = new IOException("write-ahead log append to " + shardId + " failed", e);
                 } finally {
                     state.lock.lock();
+                    batch.failure = thrown;
+                    batch.done = true;
+                    state.flushing = false;
+                    if (fatal != null) {
+                        // The flusher may have been working on an older group than its own. Refuse
+                        // every unflushed group now, so none survives its caller's fatal failure and
+                        // gets logged by an unrelated later commit.
+                        for (Group pending : state.pending) {
+                            pending.failure = thrown;
+                            pending.done = true;
+                        }
+                        state.pending.clear();
+                    }
+                    // Release every waiter even when the flusher must propagate a fatal error.
+                    state.changed.signalAll();
                 }
-                batch.failure = thrown;
-                batch.done = true;
-                state.flushing = false;
-                // Everyone: the members of the group that just landed, and the members of the group behind
-                // it, one of whom now has to take over as flusher.
-                state.changed.signalAll();
+                if (fatal != null) {
+                    throw fatal;
+                }
+                if (thrown == null) {
+                    recordsCommitted.addAndGet(batch.records.size());
+                }
             }
             failure = mine.failure;
         } finally {
