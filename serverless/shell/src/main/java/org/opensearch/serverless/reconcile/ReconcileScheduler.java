@@ -291,7 +291,16 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         // for each happens to find it. The membership view is refreshed on the renewal timer, so one is noticed
         // within a renewal interval of the lease running out.
         loop.membership().subscribe(delta -> {
+            final java.util.Set<String> renewed = new java.util.HashSet<>();
+            for (var joined : delta.joined()) {
+                renewed.add(joined.nodeId() + "/" + joined.ephemeralId());
+            }
             for (org.opensearch.serverless.membership.NodeLease left : delta.left()) {
+                // A changed expiry or address is an updated lease, not a departed process. Probing these
+                // scheduled repeated store reads for every live member on every renewal observation.
+                if (renewed.contains(left.nodeId() + "/" + left.ephemeralId())) {
+                    continue;
+                }
                 // Only a departure that just happened. A lease that ran out long ago belongs to a node whose shards
                 // are dormant -- or to a fleet replaced wholesale, whose every shard taken at once would be a storm --
                 // and those are taken as requests ask for them. Once per incarnation: a departure can be heard again.
