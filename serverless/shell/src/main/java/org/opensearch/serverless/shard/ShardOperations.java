@@ -524,11 +524,13 @@ public final class ShardOperations {
         private final ServerlessNode.Document document;
         private final String servedBy;
         private final boolean realtime;
+        private final ShardId shardId;
 
-        Read(ServerlessNode.Document document, String servedBy, boolean realtime) {
+        Read(ServerlessNode.Document document, String servedBy, boolean realtime, ShardId shardId) {
             this.document = document;
             this.servedBy = servedBy;
             this.realtime = realtime;
+            this.shardId = shardId;
         }
 
         /**
@@ -547,6 +549,15 @@ public final class ShardOperations {
          */
         public String servedBy() {
             return servedBy;
+        }
+
+        /**
+         * Returns the resolved shard, or null when a filter supplied the response without reading.
+         *
+         * @return the resolved shard
+         */
+        public ShardId shardId() {
+            return shardId;
         }
 
         /**
@@ -578,8 +589,64 @@ public final class ShardOperations {
         return gated(
             org.opensearch.action.get.GetAction.NAME,
             new org.opensearch.action.get.GetRequest(index, id),
-            () -> doGet(index, id),
+            admitted -> readAcceptedGet((org.opensearch.action.get.GetRequest) admitted),
             getView(index)
+        );
+    }
+
+    /**
+     * Reads a native request with its version and source selection intact.
+     *
+     * @param request the native get request
+     * @return the document response
+     * @throws IOException if the read fails
+     */
+    public org.opensearch.action.get.GetResponse get(org.opensearch.action.get.GetRequest request) throws IOException {
+        return gatedNative(
+            org.opensearch.action.get.GetAction.NAME,
+            request,
+            org.opensearch.action.get.GetResponse.class,
+            admitted -> (org.opensearch.action.get.GetResponse) getView(request.index()).show(
+                readAcceptedGet((org.opensearch.action.get.GetRequest) admitted)
+            )
+        );
+    }
+
+    private Read readAcceptedGet(org.opensearch.action.get.GetRequest request) throws Exception {
+        final var validation = request.validate();
+        if (validation != null) {
+            throw validation;
+        }
+        if (request.routing() != null) {
+            throw new UnsupportedOperationException("routing is not supported: documents are placed by their id");
+        }
+        if (request.storedFields() != null) {
+            throw new UnsupportedOperationException("stored_fields is not supported");
+        }
+        final Read read = doGet(request.index(), request.id());
+        final var document = read.document();
+        if (document.found() && request.versionType().isVersionConflictForReads(document.version(), request.version())) {
+            throw new org.opensearch.index.engine.VersionConflictEngineException(
+                read.shardId(),
+                request.id(),
+                request.versionType().explainConflictForReads(document.version(), request.version())
+            );
+        }
+        if (request.fetchSourceContext() == null) {
+            return read;
+        }
+        return new Read(
+            new ServerlessNode.Document(
+                document.id(),
+                document.found(),
+                org.opensearch.serverless.rest.SourceFiltering.apply(document.source(), request.fetchSourceContext()),
+                document.seqNo(),
+                document.primaryTerm(),
+                document.version()
+            ),
+            read.servedBy(),
+            read.realtime(),
+            read.shardId()
         );
     }
 
@@ -604,7 +671,7 @@ public final class ShardOperations {
             public org.opensearch.core.action.ActionResponse show(Read read) {
                 final var document = read.document();
                 final org.opensearch.index.get.GetResult result = new org.opensearch.index.get.GetResult(
-                    index,
+                    read.shardId() == null ? index : read.shardId().getIndexName(),
                     document.id(),
                     // Real now, not placeholders. A filter deciding what a caller may see should be shown
                     // the document as it actually is; a redaction policy keyed on a version it was told
@@ -640,8 +707,9 @@ public final class ShardOperations {
                             answered.getPrimaryTerm(),
                             answered.getVersion()
                         ),
-                        original.servedBy(),
-                        original.realtime()
+                        original == null ? null : original.servedBy(),
+                        original != null && original.realtime(),
+                        original == null ? null : original.shardId()
                     );
                 }
                 throw new IllegalStateException(
@@ -674,6 +742,15 @@ public final class ShardOperations {
         String action,
         org.opensearch.action.ActionRequest request,
         org.opensearch.common.CheckedSupplier<T, Exception> work,
+        org.opensearch.serverless.shell.ActionGate.ResponseView<T> view
+    ) throws IOException {
+        return gated(action, request, admitted -> work.get(), view);
+    }
+
+    private <T> T gated(
+        String action,
+        org.opensearch.action.ActionRequest request,
+        org.opensearch.common.CheckedFunction<org.opensearch.action.ActionRequest, T, Exception> work,
         org.opensearch.serverless.shell.ActionGate.ResponseView<T> view
     ) throws IOException {
         try {
@@ -713,7 +790,7 @@ public final class ShardOperations {
             behind.addSuppressed(e);
         }
         if (taken.isPresent() && node.reconciler().readerShards().contains(taken.get()) == false) {
-            return new Read(node.get(taken.get(), id), node.localNode().getId(), true);
+            return new Read(node.get(taken.get(), id), node.localNode().getId(), true, taken.get());
         }
         throw NotHereException.behindLog(behind);
     }
@@ -724,7 +801,7 @@ public final class ShardOperations {
         // node is a writer that has not noticed it lost the shard, and its documents are behind the real
         // owner's: the forward below asks the node the head names, which is the one answer that is fresh.
         if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
-            return new Read(node.get(placement.local(), id), node.localNode().getId(), true);
+            return new Read(node.get(placement.local(), id), node.localNode().getId(), true, placement.local());
         }
         if (placement.owner() == null) {
             // Nobody owns it, so there is no writer holding unpublished writes and the commit is the
@@ -736,11 +813,16 @@ public final class ShardOperations {
             // must not collapse into "empty" because a live writer really might be mid-first-publish.
             // Here the owner check already ruled that out.
             if (plane.segmentPublisher(index, placement.shard()).readManifest().isEmpty()) {
-                return new Read(org.opensearch.serverless.shell.ServerlessNode.Document.absent(id), node.localNode().getId(), false);
+                return new Read(
+                    org.opensearch.serverless.shell.ServerlessNode.Document.absent(id),
+                    node.localNode().getId(),
+                    false,
+                    new ShardId(new org.opensearch.core.index.Index(index, placement.uuid()), placement.shard())
+                );
             }
             try {
                 final var shardId = node.serveAsReader(plane, index, placement.shard());
-                return new Read(node.get(shardId, id), node.localNode().getId(), false);
+                return new Read(node.get(shardId, id), node.localNode().getId(), false, shardId);
             } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
                 return readOnceTaken(index, id, placement.shard(), behind);
             } catch (IOException e) {
@@ -777,7 +859,12 @@ public final class ShardOperations {
                     peer.get(),
                     new org.opensearch.serverless.transport.ForwardedGetRequest(index, placement.uuid(), placement.shard(), id)
                 );
-            return new Read(response.document(), response.ownerNodeId(), true);
+            return new Read(
+                response.document(),
+                response.ownerNodeId(),
+                true,
+                new ShardId(new org.opensearch.core.index.Index(index, placement.uuid()), placement.shard())
+            );
         } catch (NotHereException e) {
             throw e;
         } catch (Exception e) {

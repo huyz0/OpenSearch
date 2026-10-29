@@ -202,7 +202,17 @@ public final class GetHandler extends BaseRestHandler {
         operations.assumeDescribed(descriptor);
         try {
             final var read = operations.get(index, id);
-            respond(channel, index, shard, read.document(), read.servedBy(), read.realtime(), bodyless, fetchSource, sourceOnly);
+            respond(
+                channel,
+                read.shardId() == null ? index : read.shardId().getIndexName(),
+                read.shardId() == null ? shard : read.shardId().id(),
+                read.document(),
+                read.servedBy(),
+                read.realtime(),
+                bodyless,
+                fetchSource,
+                sourceOnly
+            );
         } catch (org.opensearch.serverless.shard.ShardOperations.SystemIndexException e) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
         } catch (org.opensearch.serverless.shard.ShardOperations.NotHereException e) {

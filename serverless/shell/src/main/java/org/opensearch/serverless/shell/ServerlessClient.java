@@ -25,7 +25,6 @@ import org.opensearch.action.index.IndexResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
-import org.opensearch.index.get.GetResult;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shard.ShardOperations;
@@ -189,22 +188,7 @@ public final class ServerlessClient extends AbstractClient {
     }
 
     private GetResponse get(GetRequest request, ShardOperations operations, MetadataPlane metadata) throws Exception {
-        final var read = operations.get(request.index(), request.id());
-        final var document = read.document();
-        final String source = org.opensearch.serverless.rest.SourceFiltering.apply(document.source(), request.fetchSourceContext());
-        return new GetResponse(
-            new GetResult(
-                request.index(),
-                request.id(),
-                document.seqNo(),
-                document.primaryTerm(),
-                document.version(),
-                document.found(),
-                document.found() && source != null ? new org.opensearch.core.common.bytes.BytesArray(source) : null,
-                java.util.Map.of(),
-                java.util.Map.of()
-            )
-        );
+        return operations.get(request);
     }
 
     private DeleteResponse delete(DeleteRequest request, ShardOperations operations, MetadataPlane metadata) throws Exception {

@@ -193,6 +193,29 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
                         org.opensearch.action.support.ActionFilterChain<Request, Response> chain
                     ) {
                     Request admitted = request;
+                    if (request instanceof org.opensearch.action.get.GetRequest get) {
+                        if ("cached".equals(get.id())) {
+                            listener.onResponse(
+                                (Response) new org.opensearch.action.get.GetResponse(
+                                    new org.opensearch.index.get.GetResult(
+                                        "alpha",
+                                        "cached",
+                                        5L,
+                                        1L,
+                                        7L,
+                                        true,
+                                        new org.opensearch.core.common.bytes.BytesArray("{\"msg\":\"cached\"}"),
+                                        java.util.Map.of(),
+                                        java.util.Map.of()
+                                    )
+                                )
+                            );
+                            return;
+                        }
+                        if ("redirect".equals(get.id())) {
+                            admitted = (Request) new org.opensearch.action.get.GetRequest(get.index(), "public");
+                        }
+                    }
                     if (request instanceof IndexRequest indexed && "rewrite".equals(indexed.id())) {
                         admitted = (Request) index(indexed.id(), "approved");
                     }
@@ -238,6 +261,81 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
                     node.client().get(new org.opensearch.action.get.GetRequest("alpha", "binary")).actionGet().getSourceAsMap().get("msg")
                 );
             }
+        }
+    }
+
+    public void testNativeGetConditionsAndRefusalsLocallyAndForwarded() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = plane(clock);
+        try (
+            var owner = new ServerlessNode(settings("native-get-contract-owner"));
+            var peer = new ServerlessNode(settings("native-get-contract-peer"))
+        ) {
+            attach(owner, plane);
+            attach(peer, plane);
+            own(owner, plane, clock);
+            owner.client().index(index("versioned", "first")).actionGet();
+            final var current = owner.client().index(index("versioned", "current")).actionGet();
+            for (var via : List.of(owner, peer)) {
+                for (var type : org.opensearch.index.VersionType.values()) {
+                    final var request = new org.opensearch.action.get.GetRequest("alpha", "versioned").version(current.getVersion())
+                        .versionType(type);
+                    assertEquals(current.getVersion(), via.client().get(request).actionGet().getVersion());
+                    expectThrows(
+                        VersionConflictEngineException.class,
+                        () -> via.client()
+                            .get(
+                                new org.opensearch.action.get.GetRequest("alpha", "versioned").version(current.getVersion() - 1)
+                                    .versionType(type)
+                            )
+                            .actionGet()
+                    );
+                }
+                assertFalse(
+                    via.client().get(new org.opensearch.action.get.GetRequest("alpha", "absent").version(1)).actionGet().isExists()
+                );
+                for (var request : List.of(
+                    new org.opensearch.action.get.GetRequest("alpha", "versioned").routing("custom"),
+                    new org.opensearch.action.get.GetRequest("alpha", "versioned").storedFields("msg")
+                )) {
+                    expectThrows(UnsupportedOperationException.class, () -> via.client().get(request).actionGet());
+                }
+            }
+        }
+    }
+
+    public void testNativeGetFiltersCanReplaceRequestsAndSupplyCachedResponses() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = plane(clock);
+        try (var node = new ServerlessNode(settings("native-get-filter-contract"), List.of(new NativeWriteContractPlugin()))) {
+            attach(node, plane);
+            own(node, plane, clock);
+            node.client().index(index("redirect", "private")).actionGet();
+            node.client().index(index("public", "visible")).actionGet();
+            final var redirected = node.client().get(new org.opensearch.action.get.GetRequest("alpha", "redirect")).actionGet();
+            assertEquals("public", redirected.getId());
+            assertEquals("visible", redirected.getSourceAsMap().get("msg"));
+            final var cached = node.client().get(new org.opensearch.action.get.GetRequest("alpha", "cached")).actionGet();
+            assertEquals("cached", cached.getSourceAsMap().get("msg"));
+            assertEquals(7L, cached.getVersion());
+            final var operations = new org.opensearch.serverless.shard.ShardOperations(node, plane);
+            assertEquals("public", operations.get("alpha", "redirect").document().id());
+            assertEquals(7L, operations.get("alpha", "cached").document().version());
+            final var address = node.boundHttpAddress().publishAddress();
+            try (var http = java.net.http.HttpClient.newHttpClient()) {
+                for (String id : List.of("redirect", "cached")) {
+                    final var response = http.send(
+                        java.net.http.HttpRequest.newBuilder(
+                            java.net.URI.create("http://" + address.getAddress() + ":" + address.getPort() + "/alpha/_doc/" + id)
+                        ).GET().build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString()
+                    );
+                    assertEquals(response.body(), 200, response.statusCode());
+                    assertFalse(response.body(), response.body().contains("private"));
+                    assertTrue(response.body(), response.body().contains(id.equals("redirect") ? "visible" : "cached"));
+                }
+            }
+
         }
     }
 
