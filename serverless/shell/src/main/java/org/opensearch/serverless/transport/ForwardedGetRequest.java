@@ -28,6 +28,7 @@ public final class ForwardedGetRequest extends TransportRequest {
     public static final String ACTION = "internal:serverless/document/get";
 
     private final String index;
+    private final String indexUuid;
     private final int shard;
     private final String id;
 
@@ -39,6 +40,19 @@ public final class ForwardedGetRequest extends TransportRequest {
      * @param id the document id
      */
     public ForwardedGetRequest(String index, int shard, String id) {
+        this(index, null, shard, id);
+    }
+
+    /**
+     * Creates a read bound to the resolved index incarnation.
+     *
+     * @param index the index name
+     * @param indexUuid the resolved UUID, or null to match by name
+     * @param shard the shard number
+     * @param id the document id
+     */
+    public ForwardedGetRequest(String index, String indexUuid, int shard, String id) {
+        this.indexUuid = indexUuid;
         this.index = index;
         this.shard = shard;
         this.id = id;
@@ -53,6 +67,7 @@ public final class ForwardedGetRequest extends TransportRequest {
     public ForwardedGetRequest(StreamInput in) throws IOException {
         super(in);
         this.index = in.readString();
+        this.indexUuid = in.readOptionalString();
         this.shard = in.readVInt();
         this.id = in.readString();
     }
@@ -61,6 +76,7 @@ public final class ForwardedGetRequest extends TransportRequest {
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeString(index);
+        out.writeOptionalString(indexUuid);
         out.writeVInt(shard);
         out.writeString(id);
     }
@@ -72,6 +88,15 @@ public final class ForwardedGetRequest extends TransportRequest {
      */
     public String index() {
         return index;
+    }
+
+    /**
+     * Returns the resolved index incarnation.
+     *
+     * @return the UUID, or null for a name-only request
+     */
+    public String indexUuid() {
+        return indexUuid;
     }
 
     /**

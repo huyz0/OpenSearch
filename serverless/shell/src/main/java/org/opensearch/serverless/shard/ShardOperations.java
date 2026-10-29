@@ -773,7 +773,10 @@ public final class ShardOperations {
                 );
             }
             final var response = node.router()
-                .forwardGet(peer.get(), new org.opensearch.serverless.transport.ForwardedGetRequest(index, placement.shard(), id));
+                .forwardGet(
+                    peer.get(),
+                    new org.opensearch.serverless.transport.ForwardedGetRequest(index, placement.uuid(), placement.shard(), id)
+                );
             return new Read(response.document(), response.ownerNodeId(), true);
         } catch (NotHereException e) {
             throw e;
@@ -877,7 +880,7 @@ public final class ShardOperations {
             final var response = node.router()
                 .forwardExplain(
                     peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedExplainRequest(index, placement.shard(), id, query)
+                    new org.opensearch.serverless.transport.ForwardedExplainRequest(index, placement.uuid(), placement.shard(), id, query)
                 );
             return new Explained(response.exists(), response.explanation(), response.ownerNodeId(), true);
         } catch (NotHereException e) {
