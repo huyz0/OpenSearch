@@ -72,6 +72,9 @@ public final class TemplateStore {
      */
     public static final int MAX_TEMPLATES = 1000;
 
+    /** Maximum estimated bytes retained by each content cache or complete snapshot. */
+    static final long MAX_CACHED_BYTES = 8L * 1024 * 1024;
+
     /**
      * The prefix a template blob carried before the register indexed them, so a foreign object in this
      * container is not read as one.
@@ -111,6 +114,9 @@ public final class TemplateStore {
      */
     public static final class Cache {
         private volatile Snapshot snapshot;
+        private final org.opensearch.common.cache.Cache<String, String> content = org.opensearch.common.cache.CacheBuilder.<
+            String,
+            String>builder().setMaximumWeight(MAX_CACHED_BYTES).weigher((key, value) -> retainedBytes(key, value)).build();
 
         /** Creates an empty cache, which the first read fills. */
         public Cache() {}
@@ -386,7 +392,11 @@ public final class TemplateStore {
             }
         }
         final Snapshot fresh = new Snapshot(marker.version(), Map.copyOf(hashes), Collections.unmodifiableMap(contents));
-        cache.snapshot = fresh;
+        long retained = 0L;
+        for (Map.Entry<String, String> entry : contents.entrySet()) {
+            retained += retainedBytes(entry.getKey(), entry.getValue());
+        }
+        cache.snapshot = retained <= MAX_CACHED_BYTES ? fresh : null;
         return fresh.contents();
     }
 
@@ -420,7 +430,23 @@ public final class TemplateStore {
         return hash;
     }
 
+    private static long retainedBytes(String key, String value) {
+        return 128L + 2L * (key.length() + (long) value.length());
+    }
+
     private String readContent(String name, String hash) throws IOException {
+        // A marker is still read for every operation. Only the immutable revision it names is cached,
+        // so an overwrite or deletion remains immediately visible without another body GET per document.
+        final String cached = cache.content.get(hash);
+        if (cached != null) {
+            return cached;
+        }
+        final String loaded = loadContent(name, hash);
+        cache.content.put(hash, loaded);
+        return loaded;
+    }
+
+    private String loadContent(String name, String hash) throws IOException {
         try (InputStream in = container.readBlob(CONTENT_PREFIX + hash)) {
             return new String(in.readAllBytes(), StandardCharsets.UTF_8);
         } catch (java.nio.file.NoSuchFileException e) {
