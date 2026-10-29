@@ -107,49 +107,66 @@ public final class ObjectStores {
 
         final S3RepositoryPlugin plugin = new S3RepositoryPlugin(settings, configPath);
 
-        // The plugin's asynchronous machinery is built in createComponents, out of executors it
-        // contributes to the node's thread pool before that pool exists. The shell builds its own pool
-        // without asking any plugin, so those executors are simply absent -- and the symptom is not a
-        // missing-executor error but a null AsyncExecutorContainer, hit on the first delete.
-        //
-        // So the object-store client gets a pool of its own, built from the plugin's own executor
-        // builders. Wasteful by a few threads, and worth it: object-store IO does not then share a pool
-        // with search or indexing, and starving one cannot starve the other.
-        final ThreadPool threadPool = new ThreadPool(
-            Settings.builder().put(settings).put("node.name", settings.get("node.name", "serverless") + "-object-store").build(),
-            plugin.getExecutorBuilders(settings).toArray(new ExecutorBuilder<?>[0])
-        );
-        final Environment environment = new Environment(settings, configPath);
-        plugin.createComponents(
-            null,
-            clusterService,
-            threadPool,
-            null,
-            null,
-            NamedXContentRegistry.EMPTY,
-            environment,
-            null,
-            null,
-            null,
-            null
-        );
+        ThreadPool threadPool = null;
+        Repository created = null;
+        boolean success = false;
+        try {
+            // The plugin's asynchronous machinery is built in createComponents, out of executors it
+            // contributes to the node's thread pool before that pool exists. The shell builds its own pool
+            // without asking any plugin, so those executors are simply absent -- and the symptom is not a
+            // missing-executor error but a null AsyncExecutorContainer, hit on the first delete.
+            //
+            // So the object-store client gets a pool of its own, built from the plugin's own executor
+            // builders. Wasteful by a few threads, and worth it: object-store IO does not then share a pool
+            // with search or indexing, and starving one cannot starve the other.
+            threadPool = new ThreadPool(
+                Settings.builder().put(settings).put("node.name", settings.get("node.name", "serverless") + "-object-store").build(),
+                plugin.getExecutorBuilders(settings).toArray(new ExecutorBuilder<?>[0])
+            );
+            final Environment environment = new Environment(settings, configPath);
+            plugin.createComponents(
+                null,
+                clusterService,
+                threadPool,
+                null,
+                null,
+                NamedXContentRegistry.EMPTY,
+                environment,
+                null,
+                null,
+                null,
+                null
+            );
 
-        final Repository.Factory factory = plugin.getRepositories(
-            environment,
-            NamedXContentRegistry.EMPTY,
-            clusterService,
-            new RecoverySettings(settings, clusterService.getClusterSettings())
-        ).get("s3");
+            final Repository.Factory factory = plugin.getRepositories(
+                environment,
+                NamedXContentRegistry.EMPTY,
+                clusterService,
+                new RecoverySettings(settings, clusterService.getClusterSettings())
+            ).get("s3");
 
-        final Repository created = factory.create(new RepositoryMetadata("serverless", "s3", repository.build()));
-        if (created instanceof BlobStoreRepository == false) {
-            throw new IllegalStateException("the s3 repository factory returned a " + created.getClass() + ", which has no blob store");
+            created = factory.create(new RepositoryMetadata("serverless", "s3", repository.build()));
+            if (created instanceof BlobStoreRepository == false) {
+                throw new IllegalStateException("the s3 repository factory returned a " + created.getClass() + ", which has no blob store");
+            }
+            final BlobStoreRepository blobStoreRepository = (BlobStoreRepository) created;
+            // Started here rather than left to the caller: blobStore() is lazy and throws on a repository
+            // that is not started, and the failure reads as a store problem rather than a lifecycle one.
+            blobStoreRepository.start();
+            final Handle handle = new Handle(new Metered(blobStoreRepository.blobStore()), threadPool, created, plugin);
+            success = true;
+            return handle;
+        } finally {
+            if (success == false) {
+                try {
+                    org.opensearch.common.util.io.IOUtils.closeWhileHandlingException(created, plugin);
+                } finally {
+                    if (threadPool != null) {
+                        ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
+                    }
+                }
+            }
         }
-        final BlobStoreRepository blobStoreRepository = (BlobStoreRepository) created;
-        // Started here rather than left to the caller: blobStore() is lazy and throws on a repository
-        // that is not started, and the failure reads as a store problem rather than a lifecycle one.
-        blobStoreRepository.start();
-        return new Handle(new Metered(blobStoreRepository.blobStore()), threadPool);
     }
 
     /**
@@ -619,10 +636,14 @@ public final class ObjectStores {
 
         private final BlobStore blobStore;
         private final ThreadPool threadPool;
+        private final java.io.Closeable[] owners;
+        private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
-        Handle(BlobStore blobStore, ThreadPool threadPool) {
+        Handle(BlobStore blobStore, ThreadPool threadPool, java.io.Closeable... owners) {
             this.blobStore = blobStore;
             this.threadPool = threadPool;
+            // A repository owns its lazy blob store; close that lifecycle rather than closing its store twice.
+            this.owners = owners.length == 0 ? new java.io.Closeable[] { blobStore } : owners.clone();
         }
 
         /**
@@ -636,9 +657,14 @@ public final class ObjectStores {
 
         @Override
         public void close() throws java.io.IOException {
-            blobStore.close();
-            if (threadPool != null) {
-                ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
+            if (closed.compareAndSet(false, true)) {
+                try {
+                    org.opensearch.common.util.io.IOUtils.close(owners);
+                } finally {
+                    if (threadPool != null) {
+                        ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
+                    }
+                }
             }
         }
     }
