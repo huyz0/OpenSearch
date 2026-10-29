@@ -349,6 +349,9 @@ public final class NodeLease {
             XContentParser parser = XContentType.JSON.xContent()
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
         ) {
+            if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                throw new IOException("malformed node lease: expected an object");
+            }
             String nodeId = null;
             String ephemeralId = null;
             String address = null;
@@ -364,6 +367,9 @@ public final class NodeLease {
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                if (token == null) {
+                    throw new IOException("malformed node lease: missing end of object");
+                }
                 if (token == XContentParser.Token.FIELD_NAME) {
                     field = parser.currentName();
                 } else if (token == XContentParser.Token.START_ARRAY && "roles".equals(field)) {
@@ -387,6 +393,8 @@ public final class NodeLease {
                             // forward compatibility: ignore fields written by a newer node
                         }
                     }
+                } else {
+                    parser.skipChildren();
                 }
             }
             if (nodeId == null || ephemeralId == null || address == null) {

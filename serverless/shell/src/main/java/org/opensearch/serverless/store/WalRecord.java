@@ -239,6 +239,9 @@ public final class WalRecord {
             XContentParser parser = XContentType.JSON.xContent()
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
         ) {
+            if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                throw new IOException("malformed metadata record: expected an object");
+            }
             String id = null;
             String source = null;
             boolean deleted = false;
@@ -247,9 +250,14 @@ public final class WalRecord {
             long version = Versions.MATCH_ANY;
             String field = null;
             XContentParser.Token token;
-            while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
+            while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                if (token == null) {
+                    throw new IOException("malformed metadata record: missing end of object");
+                }
                 if (token == XContentParser.Token.FIELD_NAME) {
                     field = parser.currentName();
+                } else if (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY) {
+                    parser.skipChildren();
                 } else if (token.isValue()) {
                     if ("id".equals(field)) {
                         id = parser.text();
