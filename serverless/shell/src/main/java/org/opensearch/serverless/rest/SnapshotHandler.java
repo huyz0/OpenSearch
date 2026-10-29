@@ -424,6 +424,12 @@ public final class SnapshotHandler extends BaseRestHandler {
         metadata.createSnapshot(new SnapshotRecord(repo, snapshot, snapshotUuid, shallow, startTime, startTime, provisional));
 
         try {
+            // The provisional pin is visible before verifying the incarnation. An orphan sweep that
+            // already observed the index's deletion can therefore neither miss a valid new capture nor
+            // delete data a capture started from a stale descriptor is about to read.
+            for (Map.Entry<String, IndexDescriptor> index : described.entrySet()) {
+                metadata.verifyCaptureIncarnation(index.getKey(), index.getValue().uuid());
+            }
             final Map<String, SnapshotRecord.SnapshottedIndex> captured = new LinkedHashMap<>();
             for (Map.Entry<String, IndexDescriptor> index : described.entrySet()) {
                 final String trimmed = index.getKey();

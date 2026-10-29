@@ -29,6 +29,7 @@ import org.opensearch.serverless.store.SegmentPublisher;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -60,6 +61,76 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
     private static void write(BlobContainer container, String name, String content) throws Exception {
         final byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
         container.writeBlob(name, new ByteArrayInputStream(bytes), bytes.length, false);
+    }
+
+    public void testImmediateSweepCannotMissAConcurrentFrozenView() throws Exception {
+        assertConcurrentPinIsProtected(false, false);
+    }
+
+    public void testOrphanSweepCannotMissAViewCreatedBeforeIndexDeletion() throws Exception {
+        assertConcurrentPinIsProtected(true, false);
+    }
+
+    public void testResumableOrphanSweepCannotMissAViewCreatedBeforeIndexDeletion() throws Exception {
+        assertConcurrentPinIsProtected(true, true);
+    }
+
+    private void assertConcurrentPinIsProtected(boolean deleteIndex, boolean resumable) throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1_000L, TTL);
+            plane.createIndex(new IndexDescriptor("pinned", "uuid-pin-race", 1, MAPPING, null));
+            final BlobPath data = plane.shardData("pinned", 0);
+            write(store.blobContainer(data.add("t=1")), "_0.cfs", "frozen data");
+            final var frozen = new CommitManifest(1L, Map.of("_0.cfs", "t=1"));
+            store.blobContainer(data).createRegisterIfAbsent(SegmentPublisher.MANIFEST, frozen.toBytes());
+            final String pitId = UUIDs.randomBase64UUID();
+            store.onNextListing(RegisterMap.pointsInTime(BlobPath.cleanPath()).buildAsString(), () -> {
+                try {
+                    plane.beginPointInTime(new PointInTime(pitId, "pinned", "uuid-pin-race", 100_000L, Map.of(), true));
+                    plane.finishPointInTime(new PointInTime(pitId, "pinned", "uuid-pin-race", 100_000L, Map.of(0, frozen)));
+                    if (deleteIndex) {
+                        assertTrue(plane.deleteIndex("pinned"));
+                    } else {
+                        final var container = store.blobContainer(data);
+                        final var current = container.readRegister(SegmentPublisher.MANIFEST).orElseThrow();
+                        assertTrue(
+                            container.compareAndSwapRegister(
+                                SegmentPublisher.MANIFEST,
+                                current.generation(),
+                                new CommitManifest(2L, Map.of()).toBytes()
+                            ).applied()
+                        );
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            final var collector = new GarbageCollector(store, BlobPath.cleanPath());
+            if (resumable) {
+                assertTrue(collector.collectOrphanedShards(plane, 1).deleted().isEmpty());
+            } else {
+                assertTrue(
+                    deleteIndex ? collector.collectOrphanedShards(plane).isEmpty() : collector.collectShard(plane, "pinned", 0).isEmpty()
+                );
+            }
+            assertTrue(store.fired());
+            assertTrue("a completed view must keep every captured file", store.blobContainer(data.add("t=1")).blobExists("_0.cfs"));
+            assertTrue(plane.pointInTime(pitId).isPresent());
+        }
+    }
+
+    public void testAFreezeCannotStartFromADeletedIncarnation() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1_000L, TTL);
+            plane.createIndex(new IndexDescriptor("deleted", "uuid-deleted-pin", 1, MAPPING, null));
+            assertTrue(plane.deleteIndex("deleted"));
+            final String pitId = UUIDs.randomBase64UUID();
+            expectThrows(
+                IOException.class,
+                () -> plane.beginPointInTime(new PointInTime(pitId, "deleted", "uuid-deleted-pin", 100_000L, Map.of(), true))
+            );
+            assertTrue(plane.livePointsInTime(1_000L).isEmpty());
+        }
     }
 
     public void testReplacementFilesReceiveTheirOwnUnreferencedGracePeriod() throws Exception {

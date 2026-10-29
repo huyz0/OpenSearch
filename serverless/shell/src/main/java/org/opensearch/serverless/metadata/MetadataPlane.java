@@ -966,6 +966,30 @@ public final class MetadataPlane {
             throw new IllegalArgumentException("a capture marker must name an index and hold no shards: " + pit.id());
         }
         writePointInTime(pit, true);
+        try {
+            verifyCaptureIncarnation(pit.index(), pit.indexUuid());
+        } catch (IOException | RuntimeException e) {
+            try {
+                releasePointInTime(pit.id());
+            } catch (Exception cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Checks an index after its provisional pin was published, before reading any captured files.
+     *
+     * @param index the captured index
+     * @param uuid its expected incarnation, or null for a legacy capture
+     * @throws IOException if the index was deleted or recreated
+     */
+    public void verifyCaptureIncarnation(String index, String uuid) throws IOException {
+        final Optional<IndexDescriptor> current = descriptors.get(index);
+        if (current.isEmpty() || (uuid != null && uuid.equals(current.get().uuid()) == false)) {
+            throw new IOException("index [" + index + "] was deleted or recreated while starting capture");
+        }
     }
 
     /**

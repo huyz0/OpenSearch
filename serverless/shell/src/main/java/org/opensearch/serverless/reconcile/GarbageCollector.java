@@ -206,17 +206,17 @@ public final class GarbageCollector {
             indexName,
             shardId,
             previousCandidates,
-            plane.livePointsInTime(plane.clock().getAsLong()),
-            plane.liveSnapshots()
+            previousCandidates == null ? List.of() : plane.livePointsInTime(plane.clock().getAsLong()),
+            previousCandidates == null ? List.of() : plane.liveSnapshots()
         );
     }
 
     /**
      * Sweeps one shard against views and snapshots the caller has already read.
      *
-     * <p>Read before this is called and before this lists anything, which keeps the safety rule the
-     * per-shard form documents: a view or snapshot taken while a sweep runs is seen or not seen, never
-     * half-seen. What changes is who pays for the read -- once per pass rather than once per shard.
+     * <p>A graced pass may share these lists across shards: a capture missed by one pass is visible
+     * before a later pass deletes that pass's candidates. Without grace, the lists are refreshed after
+     * observing the manifest, so a missed capture can only read that commit or a later one.
      *
      * @param plane the metadata plane
      * @param indexName the index
@@ -235,6 +235,35 @@ public final class GarbageCollector {
         List<PointInTime> views,
         List<SnapshotRecord> snapshots
     ) throws IOException {
+        // Resolve the incarnation once. Resolving the manifest and storage independently by name
+        // can apply the old incarnation's references to a replacement created midway through a sweep.
+        final Optional<IndexDescriptor> descriptor = plane.describe(indexName);
+        if (descriptor.isEmpty() || shardId < 0 || shardId >= descriptor.get().numberOfShards()) {
+            return new ShardSweep(List.of(), Set.of());
+        }
+        final String uuid = descriptor.get().uuid();
+        final SegmentPublisher publisher = plane.segmentPublisher(indexName, uuid, shardId);
+        final Optional<CommitManifest> manifest = publisher.readManifest();
+        if (manifest.isEmpty()) {
+            // Nothing published means nothing is safe to judge: a writer may be mid-first-publish, and
+            // every file present is a candidate for the commit it is about to make.
+            return new ShardSweep(List.of(), Set.of());
+        }
+        final long liveTerm = manifest.get().term();
+
+        if (previousCandidates == null) {
+            // A first-sight deletion must observe the manifest before observing pins. A capture that
+            // this listing misses reads this manifest or a later one, so its files cannot be orphans
+            // of the observed commit. A graced pass can share its earlier pin listing: any missed
+            // capture is seen by the next pass before that pass can delete the first pass's candidates.
+            final List<PointInTime> currentViews = new ArrayList<>(views);
+            currentViews.addAll(plane.livePointsInTime(plane.clock().getAsLong()));
+            views = currentViews;
+            final List<SnapshotRecord> currentSnapshots = new ArrayList<>(snapshots);
+            currentSnapshots.addAll(plane.liveSnapshots());
+            snapshots = currentSnapshots;
+        }
+
         for (PointInTime pit : views) {
             if (pit.isPlaceholder()) {
                 // A record the plane could not read. What it holds is unknowable, so nothing is deleted
@@ -259,22 +288,6 @@ public final class GarbageCollector {
                 return new ShardSweep(List.of(), previousCandidates == null ? Set.of() : Set.copyOf(previousCandidates));
             }
         }
-
-        // Resolve the incarnation once. Resolving the manifest and storage independently by name
-        // can apply the old incarnation's references to a replacement created midway through a sweep.
-        final Optional<IndexDescriptor> descriptor = plane.describe(indexName);
-        if (descriptor.isEmpty() || shardId < 0 || shardId >= descriptor.get().numberOfShards()) {
-            return new ShardSweep(List.of(), Set.of());
-        }
-        final String uuid = descriptor.get().uuid();
-        final SegmentPublisher publisher = plane.segmentPublisher(indexName, uuid, shardId);
-        final Optional<CommitManifest> manifest = publisher.readManifest();
-        if (manifest.isEmpty()) {
-            // Nothing published means nothing is safe to judge: a writer may be mid-first-publish, and
-            // every file present is a candidate for the commit it is about to make.
-            return new ShardSweep(List.of(), Set.of());
-        }
-        final long liveTerm = manifest.get().term();
 
         // Referenced as (term container, file name) pairs. A name alone is not enough: the same segment
         // name can exist in two term containers after a history bootstrap, and only one is referenced.
@@ -589,7 +602,7 @@ public final class GarbageCollector {
      * <p><b>Pinned is not orphaned.</b> Deleting an index deliberately leaves the shards a live shallow
      * snapshot references (see {@code MetadataPlane#purgeShardData}), and a view taken before the delete
      * still names its files; both look exactly like orphans to a sweep that consults only descriptors. The
-     * same pins index deletion honours are honoured here, read once per sweep, and a view record that
+     * same pins index deletion honours are honoured here, read once per page after its descriptors, and a view record that
      * cannot be read stops the sweep outright, since what it holds is unknowable.
      *
      * <p><b>A container this does not recognise is left alone.</b> Anything whose name is not
@@ -607,27 +620,17 @@ public final class GarbageCollector {
      * @throws IOException if listing fails
      */
     public List<String> collectOrphanedShards(MetadataPlane plane) throws IOException {
-        final List<SnapshotRecord> snapshots = plane.liveSnapshots();
-        final List<PointInTime> views = plane.livePointsInTime(plane.clock().getAsLong());
-        for (PointInTime pit : views) {
-            if (pit.isPlaceholder()) {
-                logger.warn("not sweeping orphaned shards: the point in time [{}] could not be read and may hold any of them", pit.id());
-                return List.of();
-            }
-        }
-
         final BlobContainer segments = blobStore.blobContainer(base.add("segments"));
         final List<String> deleted = new ArrayList<>();
-        // One descriptor read per index, not one per shard container. The loop below visits
-        // index#uuid#shard, so a fifty-shard index used to read its descriptor fifty times to be told the
-        // same thing. Memoised for the length of this pass only, which also makes the pass consistent: a
-        // create or delete landing midway can no longer have the sweep judge two shards of one index
-        // differently. Absent is memoised too -- that is the answer that decides a collection, and re-reading
-        // it per shard is how one index's shards could be half swept.
-        final Map<String, Optional<IndexDescriptor>> described = new java.util.HashMap<>();
         String cursor = null;
         while (true) {
             final Map<String, BlobContainer> page = segments.children(cursor, ORPHAN_LIST_PAGE);
+            final Map<String, Optional<IndexDescriptor>> described = describeContainers(plane, page.keySet());
+            final List<SnapshotRecord> snapshots = plane.liveSnapshots();
+            final List<PointInTime> views = plane.livePointsInTime(plane.clock().getAsLong());
+            if (hasUnreadableView(views)) {
+                return deleted;
+            }
             for (Map.Entry<String, BlobContainer> child : page.entrySet()) {
                 if (collectIfOrphaned(plane, child.getKey(), child.getValue(), snapshots, views, described)) {
                     deleted.add(child.getKey());
@@ -698,15 +701,6 @@ public final class GarbageCollector {
         final Optional<org.opensearch.common.blobstore.BlobRegister> stored = gc.readRegister(ORPHAN_CURSOR);
         final String from = stored.map(r -> r.value().utf8ToString()).orElse("");
 
-        final List<SnapshotRecord> snapshots = plane.liveSnapshots();
-        final List<PointInTime> views = plane.livePointsInTime(plane.clock().getAsLong());
-        for (PointInTime pit : views) {
-            if (pit.isPlaceholder()) {
-                logger.warn("not sweeping orphaned shards: the point in time [{}] could not be read and may hold any of them", pit.id());
-                return new OrphanSlice(List.of(), 0, from, false);
-            }
-        }
-
         final BlobContainer segments = blobStore.blobContainer(base.add("segments"));
         final Map<String, BlobContainer> page = segments.children(from.isEmpty() ? null : from, budget);
         String last = from;
@@ -725,7 +719,12 @@ public final class GarbageCollector {
         if (claimed == false) {
             return new OrphanSlice(List.of(), 0, from, false);
         }
-        final Map<String, Optional<IndexDescriptor>> described = new java.util.HashMap<>();
+        final Map<String, Optional<IndexDescriptor>> described = describeContainers(plane, page.keySet());
+        final List<SnapshotRecord> snapshots = plane.liveSnapshots();
+        final List<PointInTime> views = plane.livePointsInTime(plane.clock().getAsLong());
+        if (hasUnreadableView(views)) {
+            return new OrphanSlice(List.of(), page.size(), next, true);
+        }
         final List<String> deleted = new ArrayList<>();
         for (Map.Entry<String, BlobContainer> child : page.entrySet()) {
             if (collectIfOrphaned(plane, child.getKey(), child.getValue(), snapshots, views, described)) {
@@ -733,6 +732,50 @@ public final class GarbageCollector {
             }
         }
         return new OrphanSlice(deleted, page.size(), next, true);
+    }
+
+    private record ShardContainer(String index, String uuid, int shard) {
+    }
+
+    private static ShardContainer parseShardContainer(String container) {
+        final int last = container.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
+        final int middle = last < 0 ? -1 : container.lastIndexOf(RegisterMap.SHARD_SEPARATOR, last - 1);
+        if (middle <= 0 || middle + 1 == last) {
+            return null;
+        }
+        final String index = container.substring(0, middle);
+        try {
+            org.opensearch.serverless.metadata.Names.validateIndexOrAlias(index);
+            final int shard = Integer.parseInt(container.substring(last + 1));
+            if (shard < 0 || shard >= IndexDescriptor.MAX_SHARDS) {
+                return null;
+            }
+            return new ShardContainer(index, container.substring(middle + 1, last), shard);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private static Map<String, Optional<IndexDescriptor>> describeContainers(MetadataPlane plane, Set<String> containers)
+        throws IOException {
+        final Map<String, Optional<IndexDescriptor>> described = new java.util.HashMap<>();
+        for (String container : containers) {
+            final ShardContainer identity = parseShardContainer(container);
+            if (identity != null && described.containsKey(identity.index()) == false) {
+                described.put(identity.index(), plane.describe(identity.index()));
+            }
+        }
+        return described;
+    }
+
+    private static boolean hasUnreadableView(List<PointInTime> views) {
+        for (PointInTime pit : views) {
+            if (pit.isPlaceholder()) {
+                logger.warn("not sweeping orphaned shards: the point in time [{}] could not be read and may hold any of them", pit.id());
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Judges one shard container and deletes it if its index is gone and nothing pins it. */
@@ -744,21 +787,13 @@ public final class GarbageCollector {
         List<PointInTime> views,
         Map<String, Optional<IndexDescriptor>> described
     ) throws IOException {
-        // index#uuid#shard, split from the right, because an index name may contain the separator in
-        // no version of this system but the uuid and shard cannot.
-        final int lastSeparator = container.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
-        final int uuidSeparator = lastSeparator < 0 ? -1 : container.lastIndexOf(RegisterMap.SHARD_SEPARATOR, lastSeparator - 1);
-        if (uuidSeparator <= 0) {
+        final ShardContainer identity = parseShardContainer(container);
+        if (identity == null) {
             return false;
         }
-        final String indexName = container.substring(0, uuidSeparator);
-        final String uuid = container.substring(uuidSeparator + 1, lastSeparator);
-        final int shard;
-        try {
-            shard = Integer.parseInt(container.substring(lastSeparator + 1));
-        } catch (NumberFormatException e) {
-            return false;
-        }
+        final String indexName = identity.index();
+        final String uuid = identity.uuid();
+        final int shard = identity.shard();
 
         Optional<IndexDescriptor> descriptor = described.get(indexName);
         if (descriptor == null) {
