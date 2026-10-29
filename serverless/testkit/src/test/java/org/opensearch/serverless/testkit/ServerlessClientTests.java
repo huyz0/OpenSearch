@@ -99,6 +99,52 @@ public class ServerlessClientTests extends OpenSearchTestCase {
         }
     }
 
+    public void testNativeGetsKeepEngineMetadataAndSourceSelectionAcrossForwarding() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane metadata = plane(clock);
+        metadata.createIndex(new IndexDescriptor("alpha", "uuid-client-get", 1, MAPPING, null));
+        try (
+            ServerlessNode owner = new ServerlessNode(nodeSettings("client-get-owner"));
+            ServerlessNode peer = new ServerlessNode(nodeSettings("client-get-peer"))
+        ) {
+            owner.start();
+            peer.start();
+            owner.setMetadataPlane(metadata);
+            peer.setMetadataPlane(metadata);
+            final BackgroundReconciler loop = new BackgroundReconciler(owner, metadata);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            final var shard = owner.reconciler().openShards().iterator().next();
+            for (int i = 0; i < 2; i++) {
+                final var written = owner.index(shard, "doc", "{\"msg\":\"kept\",\"n\":" + i + "}");
+                for (ServerlessNode via : java.util.List.of(owner, peer)) {
+                    final var got = via.client().get(new GetRequest("alpha", "doc")).actionGet();
+                    assertEquals(written.seqNo(), got.getSeqNo());
+                    assertEquals(written.primaryTerm(), got.getPrimaryTerm());
+                    assertEquals(written.version(), got.getVersion());
+                    final var hidden = via.client()
+                        .get(
+                            new GetRequest("alpha", "doc").fetchSourceContext(
+                                org.opensearch.search.fetch.subphase.FetchSourceContext.DO_NOT_FETCH_SOURCE
+                            )
+                        )
+                        .actionGet();
+                    assertTrue(hidden.isExists());
+                    assertNull(hidden.getSourceAsString());
+                    final var selected = via.client()
+                        .get(
+                            new GetRequest("alpha", "doc").fetchSourceContext(
+                                new org.opensearch.search.fetch.subphase.FetchSourceContext(true, new String[] { "msg" }, new String[0])
+                            )
+                        )
+                        .actionGet();
+                    assertEquals(java.util.Map.of("msg", "kept"), selected.getSourceAsMap());
+                    assertEquals(written.seqNo(), selected.getSeqNo());
+                }
+            }
+        }
+    }
+
     /** A document that was never written is reported absent, not as an error and not as an empty success. */
     public void testAMissingDocumentIsReportedAbsent() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
