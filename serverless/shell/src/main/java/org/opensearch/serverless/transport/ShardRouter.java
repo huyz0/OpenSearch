@@ -140,18 +140,32 @@ public final class ShardRouter {
 
     private void handleStats(ForwardedStatsRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         requireMac(ForwardedStatsRequest.ACTION, request);
-        // Rendered by the same code that answers this node's own /_serverless/stats, so a node described
-        // through a peer and a node described directly cannot disagree.
-        final org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder();
-        builder.startObject();
-        org.opensearch.serverless.rest.StatsHandler.describe(builder, node, plane.get());
-        builder.endObject();
-        channel.sendResponse(
-            new ForwardedStatsResponse(
-                node.localNode().getId(),
-                org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString()
-            )
-        );
+        final ForwardedStatsResponse response = node.actionGate()
+            .run(
+                org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.NAME,
+                new org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest(node.localNode().getId()).all(),
+                admitted -> {
+                    if ((admitted instanceof org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest) == false
+                        || java.util.Arrays.equals(
+                            ((org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest) admitted).nodesIds(),
+                            new String[] { node.localNode().getId() }
+                        ) == false) {
+                        throw new UnsupportedOperationException("a forwarded stats request can only describe its receiving node");
+                    }
+                    // The same document as the REST endpoint, authorized by this receiving node's filters.
+                    try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+                        builder.startObject();
+                        org.opensearch.serverless.rest.StatsHandler.describe(builder, node, plane.get());
+                        builder.endObject();
+                        return new ForwardedStatsResponse(
+                            node.localNode().getId(),
+                            org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString()
+                        );
+                    }
+                },
+                org.opensearch.serverless.shell.ActionGate.opaque()
+            );
+        channel.sendResponse(response);
     }
 
     /**

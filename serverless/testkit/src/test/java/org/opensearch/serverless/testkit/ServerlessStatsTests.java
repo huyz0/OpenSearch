@@ -57,6 +57,106 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
         return builder.build();
     }
 
+    public static final class DenyStatsPlugin extends org.opensearch.plugins.Plugin implements org.opensearch.plugins.ActionPlugin {
+        private final boolean after;
+
+        DenyStatsPlugin() {
+            this(false);
+        }
+
+        DenyStatsPlugin(boolean after) {
+            this.after = after;
+        }
+
+        @Override
+        public java.util.List<org.opensearch.action.support.ActionFilter> getActionFilters() {
+            return java.util.List.of(new org.opensearch.action.support.ActionFilter() {
+                @Override
+                public int order() {
+                    return 0;
+                }
+
+                @Override
+                public <
+                    Request extends org.opensearch.action.ActionRequest,
+                    Response extends org.opensearch.core.action.ActionResponse> void apply(
+                        org.opensearch.tasks.Task task,
+                        String action,
+                        Request request,
+                        org.opensearch.action.support.ActionRequestMetadata<Request, Response> metadata,
+                        org.opensearch.core.action.ActionListener<Response> listener,
+                        org.opensearch.action.support.ActionFilterChain<Request, Response> chain
+                    ) {
+                    if (org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.NAME.equals(action)) {
+                        if (after) {
+                            chain.proceed(
+                                task,
+                                action,
+                                request,
+                                org.opensearch.core.action.ActionListener.wrap(
+                                    response -> listener.onFailure(
+                                        new org.opensearch.OpenSearchSecurityException(
+                                            "stats denied",
+                                            org.opensearch.core.rest.RestStatus.FORBIDDEN
+                                        )
+                                    ),
+                                    listener::onFailure
+                                )
+                            );
+                        } else {
+                            listener.onFailure(
+                                new org.opensearch.OpenSearchSecurityException(
+                                    "stats denied",
+                                    org.opensearch.core.rest.RestStatus.FORBIDDEN
+                                )
+                            );
+                        }
+                    } else {
+                        chain.proceed(task, action, request, listener);
+                    }
+                }
+            });
+        }
+    }
+
+    public void testStatsAuthorizationAppliesToLocalAndFleetRequests() throws Exception {
+        for (boolean after : new boolean[] { false, true }) {
+            try (
+                var node = new ServerlessNode(nodeSettings("stats-denied-" + after, null), java.util.List.of(new DenyStatsPlugin(after)))
+            ) {
+                node.start();
+                for (String path : java.util.List.of("/_serverless/stats", "/_serverless/stats?nodes=_all")) {
+                    final var response = send(node, "GET", path, null);
+                    assertEquals(response.body(), 403, response.status());
+                    assertTrue(response.body(), response.body().contains("stats denied"));
+                    assertFalse(response.body(), response.body().contains("breakers"));
+                }
+            }
+        }
+    }
+
+    public void testStatsAuthorizationAlsoAppliesOnTheReceivingPeer() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var metadata = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        try (
+            var first = new ServerlessNode(nodeSettings("stats-sender", null));
+            var second = new ServerlessNode(nodeSettings("stats-receiver", null), java.util.List.of(new DenyStatsPlugin(true)))
+        ) {
+            first.start();
+            first.setMetadataPlane(metadata);
+            second.start();
+            second.setMetadataPlane(metadata);
+            new BackgroundReconciler(first, metadata).tick(clock.get());
+            new BackgroundReconciler(second, metadata).tick(clock.get());
+            final var peer = first.router().peer(second.localNode().getId()).orElseThrow();
+            final var failure = expectThrows(Exception.class, () -> first.router().forwardStats(peer));
+            assertTrue(
+                failure.toString(),
+                org.opensearch.ExceptionsHelper.unwrapCause(failure) instanceof org.opensearch.OpenSearchSecurityException
+            );
+        }
+    }
+
     /** What the node is holding, reported as it changes. */
     public void testStatsReportWhatTheNodeIsActuallyHolding() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

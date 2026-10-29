@@ -99,32 +99,47 @@ public final class StatsHandler extends BaseRestHandler {
         final ServerlessNode serving = node.get();
         final MetadataPlane metadata = plane.get();
         final String nodes = request.param("nodes");
-        if (nodes != null) {
-            // Off the calling thread. The fan-out blocks on peers, and Fanout runs the caller's share on
-            // whichever thread called it, so doing this inline would block an HTTP worker for as long as
-            // the slowest node takes to answer.
-            return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT).execute(() -> {
+        final String[] targets = nodes == null ? new String[] { serving.localNode().getId() } : nodes.split(",");
+        // Filters may block or consult external authorization state, even for the local document.
+        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT).execute(() -> {
+            try {
+                final org.opensearch.rest.RestResponse response = serving.actionGate()
+                    .run(
+                        org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.NAME,
+                        new org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest(targets).all(),
+                        admitted -> {
+                            if ((admitted instanceof org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest) == false) {
+                                throw new IllegalArgumentException("a stats filter must provide NodesStatsRequest");
+                            }
+                            final String[] selected = ((org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest) admitted)
+                                .nodesIds();
+                            if (nodes == null && java.util.Arrays.equals(selected, targets)) {
+                                try (XContentBuilder builder = channel.newBuilder()) {
+                                    builder.startObject();
+                                    describe(builder, serving, metadata);
+                                    builder.endObject();
+                                    return new BytesRestResponse(RestStatus.OK, builder);
+                                }
+                            } else {
+                                return fleet(
+                                    channel,
+                                    serving,
+                                    metadata,
+                                    selected == null || selected.length == 0 ? "_all" : String.join(",", selected)
+                                );
+                            }
+                        },
+                        org.opensearch.serverless.shell.ActionGate.opaque()
+                    );
+                channel.sendResponse(response);
+            } catch (Exception e) {
                 try {
-                    fleet(channel, serving, metadata, nodes);
-                } catch (Exception e) {
-                    try {
-                        channel.sendResponse(
-                            IndexAdminHandler.error(channel, RestStatus.INTERNAL_SERVER_ERROR, "stats_failed", describeFailure(e))
-                        );
-                    } catch (Exception ignored) {
-                        // The channel is gone; there is nowhere left to report this.
-                    }
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                } catch (Exception ignored) {
+                    // The channel is gone; there is nowhere left to report this.
                 }
-            });
-        }
-        return channel -> {
-            try (XContentBuilder builder = channel.newBuilder()) {
-                builder.startObject();
-                describe(builder, serving, metadata);
-                builder.endObject();
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
             }
-        };
+        });
     }
 
     /**
@@ -145,13 +160,14 @@ public final class StatsHandler extends BaseRestHandler {
      * <p>Asked concurrently, and bounded per node by the forward deadline, for the same reason: the whole
      * answer must not be held up by the slowest member, or it arrives after it was useful.
      */
-    private void fleet(org.opensearch.rest.RestChannel channel, ServerlessNode serving, MetadataPlane metadata, String nodes)
-        throws IOException {
+    private org.opensearch.rest.RestResponse fleet(
+        org.opensearch.rest.RestChannel channel,
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        String nodes
+    ) throws IOException {
         if (metadata == null) {
-            channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
-            );
-            return;
+            return IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured");
         }
         final java.util.Set<String> wanted = new java.util.LinkedHashSet<>(List.of(nodes.split(",")));
         final boolean all = wanted.contains("_all");
@@ -179,15 +195,12 @@ public final class StatsHandler extends BaseRestHandler {
             }
             final java.util.List<String> unknown = wanted.stream().filter(one -> matched.contains(one) == false).sorted().toList();
             if (unknown.isEmpty() == false) {
-                channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.NOT_FOUND,
-                        "node_not_found",
-                        "no live node matches " + unknown + "; GET /_nodes lists the fleet"
-                    )
+                return IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_FOUND,
+                    "node_not_found",
+                    "no live node matches " + unknown + "; GET /_nodes lists the fleet"
                 );
-                return;
             }
         }
 
@@ -205,10 +218,7 @@ public final class StatsHandler extends BaseRestHandler {
             );
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "interrupted", "the fan-out was interrupted")
-            );
-            return;
+            return IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "interrupted", "the fan-out was interrupted");
         }
 
         // Fanout leaves a null where a task threw. Nothing above should throw -- ask() catches -- but a
@@ -263,7 +273,7 @@ public final class StatsHandler extends BaseRestHandler {
             }
             builder.endArray();
             builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            return new BytesRestResponse(RestStatus.OK, builder);
         }
     }
 
