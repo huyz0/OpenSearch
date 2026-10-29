@@ -83,7 +83,8 @@ public final class ShardRouter {
             () -> node.transportSecrets(true),
             () -> node.localNode().getId(),
             () -> plane.get() == null ? System.currentTimeMillis() : plane.get().clock().getAsLong(),
-            () -> forwardTimeout().millis()
+            () -> forwardTimeout().millis(),
+            node.settings().getAsInt("serverless.transport.replay_cache.capacity", 65_536)
         );
     }
 

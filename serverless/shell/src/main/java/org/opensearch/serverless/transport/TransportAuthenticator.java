@@ -24,8 +24,9 @@ import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.HashSet;
+import java.util.PriorityQueue;
+import java.util.Set;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -74,12 +75,36 @@ public final class TransportAuthenticator {
         LongSupplier clock,
         LongSupplier windowMillis
     ) {
+        this(secrets, refresh, localNodeId, clock, windowMillis, 65_536);
+    }
+
+    /**
+     * Creates an authenticator with a bounded replay cache.
+     *
+     * @param secrets current transport secrets
+     * @param refresh reloads secrets after rotation
+     * @param localNodeId this sender's identity
+     * @param clock wall clock in milliseconds
+     * @param windowMillis permitted clock skew
+     * @param capacity maximum live nonces; size for peak forwarded traffic over twice the window
+     */
+    public TransportAuthenticator(
+        Supplier<MetadataPlane.TransportSecrets> secrets,
+        Runnable refresh,
+        Supplier<String> localNodeId,
+        LongSupplier clock,
+        LongSupplier windowMillis,
+        int capacity
+    ) {
+        if (capacity < 1) {
+            throw new IllegalArgumentException("transport replay cache capacity must be positive");
+        }
         this.secrets = secrets;
         this.refresh = refresh;
         this.localNodeId = localNodeId;
         this.clock = clock;
         this.windowMillis = windowMillis;
-        this.seen = new NonceCache(65_536, windowMillis, clock);
+        this.seen = new NonceCache(capacity, windowMillis, clock);
     }
 
     /**
@@ -135,7 +160,13 @@ public final class TransportAuthenticator {
         final String nonceHex = parts[3];
         final long now = clock.getAsLong();
         final long window = windowMillis.getAsLong();
-        if (Math.abs(now - timestamp) > window) {
+        final long age;
+        try {
+            age = Math.subtractExact(now, timestamp);
+        } catch (ArithmeticException e) {
+            throw refuse("transport authentication outside the time window");
+        }
+        if (age < -window || age > window) {
             throw refuse("transport authentication outside the time window");
         }
         MetadataPlane.TransportSecrets current = secrets.get();
@@ -160,8 +191,8 @@ public final class TransportAuthenticator {
             // The same words the token check used, so a test that pins the refusal still holds.
             throw refuse("forwarded request without a valid transport token");
         }
-        if (seen.remember(sender + ":" + nonceHex, now) == false) {
-            throw refuse("replayed forwarded request");
+        if (seen.remember(sender + ":" + nonceHex, timestamp) == false) {
+            throw refuse("replayed forwarded request or transport replay cache full");
         }
     }
 
@@ -209,29 +240,44 @@ public final class TransportAuthenticator {
     }
 
     /**
-     * A bounded record of (sender, nonce) pairs seen, with expiry: a nonce older than the window can never
-     * verify again anyway, so it need not be remembered past it.
+     * A bounded record of accepted nonces, retained until the signed timestamp leaves the validity window.
+     * Saturation refuses new frames instead of evicting a nonce that could still be replayed.
      */
     static final class NonceCache {
 
-        private final Map<String, Long> table;
+        private record Entry(String nonce, long expiresAt) {
+        }
+
+        private final Set<String> table = new HashSet<>();
+        private final PriorityQueue<Entry> expirations = new PriorityQueue<>(java.util.Comparator.comparingLong(Entry::expiresAt));
+        private final int capacity;
         private final LongSupplier windowMillis;
         private final LongSupplier clock;
 
         NonceCache(int capacity, LongSupplier windowMillis, LongSupplier clock) {
+            this.capacity = capacity;
             this.windowMillis = windowMillis;
             this.clock = clock;
-            this.table = new LinkedHashMap<>(16, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
-                    return size() > capacity || eldest.getValue() < clock.getAsLong() - windowMillis.getAsLong();
-                }
-            };
         }
 
-        /** Records the nonce; false if it was already there. */
-        synchronized boolean remember(String nonce, long now) {
-            return table.putIfAbsent(nonce, now) == null;
+        /** Records a nonce through the signed timestamp's validity; refuses duplicates and saturation. */
+        synchronized boolean remember(String nonce, long timestamp) {
+            final long now = clock.getAsLong();
+            while (expirations.isEmpty() == false && expirations.peek().expiresAt() < now) {
+                table.remove(expirations.remove().nonce());
+            }
+            final long expiresAt;
+            try {
+                expiresAt = Math.addExact(timestamp, windowMillis.getAsLong());
+            } catch (ArithmeticException e) {
+                return false;
+            }
+            if (expiresAt < now || table.contains(nonce) || table.size() >= capacity) {
+                return false;
+            }
+            table.add(nonce);
+            expirations.add(new Entry(nonce, expiresAt));
+            return true;
         }
     }
 }
