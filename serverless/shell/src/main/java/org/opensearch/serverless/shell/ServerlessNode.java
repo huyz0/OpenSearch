@@ -5674,6 +5674,31 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * Explains a document using this incarnation's current mapping and records the shard as in use.
+     *
+     * @param shardId the shard open on this node
+     * @param id the document id
+     * @param query the query to explain
+     * @return whether the document exists and Lucene's explanation
+     * @throws java.io.IOException if the shard or its descriptor cannot be read
+     */
+    public org.opensearch.serverless.shard.ShardExplain.Outcome explain(
+        org.opensearch.core.index.shard.ShardId shardId,
+        String id,
+        org.opensearch.index.query.QueryBuilder query
+    ) throws java.io.IOException {
+        ensureStarted();
+        if (reconciler.shard(shardId) == null) {
+            throw new java.io.IOException("cannot explain from " + shardId + ": not open on " + nodeName);
+        }
+        markUsed(shardId);
+        ensureIncarnationLive(shardId);
+        final var outcome = org.opensearch.serverless.shard.ShardExplain.execute(searchService(), shardId, id, query);
+        ensureIncarnationLive(shardId);
+        return outcome;
+    }
+
+    /**
      * Reads one document by id, from this node's own copy of the shard.
      *
      * <p><b>Realtime, and that is the whole reason this exists separately from search.</b> A write is

@@ -832,7 +832,7 @@ public final class ShardOperations {
         final Placement placement = place(index, id);
         // A retained writer may lag the successor's acknowledged writes, just as in doGet.
         if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
-            final ShardExplain.Outcome outcome = ShardExplain.execute(node.searchService(), placement.local(), id, query);
+            final ShardExplain.Outcome outcome = node.explain(placement.local(), id, query);
             return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), true);
         }
         if (placement.owner() == null) {
@@ -844,7 +844,7 @@ public final class ShardOperations {
             }
             try {
                 final var shardId = node.serveAsReader(plane, index, placement.shard());
-                final ShardExplain.Outcome outcome = ShardExplain.execute(node.searchService(), shardId, id, query);
+                final ShardExplain.Outcome outcome = node.explain(shardId, id, query);
                 return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), false);
             } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
                 throw NotHereException.behindLog(behind);
