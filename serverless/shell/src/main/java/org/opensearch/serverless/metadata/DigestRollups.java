@@ -537,11 +537,18 @@ public final class DigestRollups {
             XContentParser parser = XContentType.JSON.xContent()
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, in)
         ) {
-            parser.nextToken();
+            if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                throw new IOException("digest rollup must be an object");
+            }
             XContentParser.Token token;
             while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                if (token == null) {
+                    throw new IOException("unexpected end of digest rollup");
+                }
                 if (token == XContentParser.Token.FIELD_NAME && "entries".equals(parser.currentName())) {
-                    parser.nextToken();
+                    if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                        throw new IOException("digest rollup entries must be an object");
+                    }
                     while (parser.nextToken() == XContentParser.Token.FIELD_NAME) {
                         final String name = parser.currentName();
                         parser.nextToken();
@@ -556,6 +563,9 @@ public final class DigestRollups {
     }
 
     private static Entry parseEntry(XContentParser parser) throws IOException {
+        if (parser.currentToken() != XContentParser.Token.START_OBJECT) {
+            throw new IOException("digest rollup entry must be an object");
+        }
         String uuid = null;
         int shards = 0;
         boolean alias = false;
@@ -563,6 +573,9 @@ public final class DigestRollups {
         String field = null;
         XContentParser.Token token;
         while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+            if (token == null) {
+                throw new IOException("unexpected end of digest rollup entry");
+            }
             if (token == XContentParser.Token.FIELD_NAME) {
                 field = parser.currentName();
             } else if (token == XContentParser.Token.START_ARRAY && "states".equals(field)) {
@@ -572,6 +585,9 @@ public final class DigestRollups {
                     String key = null;
                     XContentParser.Token inner;
                     while ((inner = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                        if (inner == null) {
+                            throw new IOException("unexpected end of digest rollup shard state");
+                        }
                         if (inner == XContentParser.Token.FIELD_NAME) {
                             key = parser.currentName();
                         } else if (inner == XContentParser.Token.START_OBJECT && "digest".equals(key)) {
