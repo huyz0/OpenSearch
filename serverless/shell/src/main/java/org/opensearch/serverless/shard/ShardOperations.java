@@ -1156,6 +1156,166 @@ public final class ShardOperations {
     }
 
     /**
+     * Executes a native index request with its conditions and returns the engine's actual result.
+     *
+     * @param request the plugin's request
+     * @return the native acknowledgement
+     * @throws IOException if the write cannot complete
+     */
+    public org.opensearch.action.index.IndexResponse index(org.opensearch.action.index.IndexRequest request) throws IOException {
+        return gatedNative(
+            org.opensearch.action.index.IndexAction.NAME,
+            request,
+            org.opensearch.action.index.IndexResponse.class,
+            admitted -> {
+                final var accepted = (org.opensearch.action.index.IndexRequest) admitted;
+                final var invalid = accepted.validate();
+                if (invalid != null) {
+                    throw invalid;
+                }
+                final boolean create = accepted.opType() == org.opensearch.action.DocWriteRequest.OpType.CREATE;
+                validateNativeWrite(accepted.routing(), accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), create);
+                if (accepted.isRequireAlias()) {
+                    throw new UnsupportedOperationException("require_alias is not supported through the native Client");
+                }
+                final var descriptor = describeOnce(accepted.index()).orElseThrow(() -> new NoSuchIndexException(accepted.index()));
+                if (org.opensearch.serverless.ingest.IngestPipelines.pipelinesFor(accepted.getPipeline(), descriptor.extraSettings())
+                    .isEmpty() == false
+                    || (accepted.getFinalPipeline() != null && "_none".equals(accepted.getFinalPipeline()) == false)) {
+                    throw new UnsupportedOperationException(
+                        "ingest pipelines require the REST write API; the native Client cannot apply them"
+                    );
+                }
+                final String id = accepted.id() == null ? org.opensearch.common.UUIDs.base64UUID() : accepted.id();
+                final String source = org.opensearch.common.xcontent.XContentHelper.convertToJson(
+                    accepted.source(),
+                    false,
+                    accepted.getContentType()
+                );
+                final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
+                try (
+                    var ignored = node.indexingPressure()
+                        .markCoordinatingOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(id, source), false)
+                ) {
+                    final Written written = written(
+                        accepted.index(),
+                        id,
+                        source,
+                        refresh,
+                        false,
+                        accepted.ifSeqNo(),
+                        accepted.ifPrimaryTerm(),
+                        create
+                    );
+                    final var outcome = written.outcome();
+                    final var response = new org.opensearch.action.index.IndexResponse(
+                        written.shardId,
+                        id,
+                        outcome.seqNo(),
+                        outcome.primaryTerm(),
+                        outcome.version(),
+                        outcome.created()
+                    );
+                    completeNativeWriteResponse(response, refresh);
+                    return response;
+                }
+            }
+        );
+    }
+
+    /**
+     * Executes a native delete request with its conditions and returns its actual found-ness and sequence identity.
+     *
+     * @param request the plugin's request
+     * @return the native acknowledgement
+     * @throws IOException if the deletion cannot complete
+     */
+    public org.opensearch.action.delete.DeleteResponse delete(org.opensearch.action.delete.DeleteRequest request) throws IOException {
+        return gatedNative(
+            org.opensearch.action.delete.DeleteAction.NAME,
+            request,
+            org.opensearch.action.delete.DeleteResponse.class,
+            admitted -> {
+                final var accepted = (org.opensearch.action.delete.DeleteRequest) admitted;
+                final var invalid = accepted.validate();
+                if (invalid != null) {
+                    throw invalid;
+                }
+                validateNativeWrite(accepted.routing(), accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), false);
+                final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
+                try (
+                    var ignored = node.indexingPressure()
+                        .markCoordinatingOperationStarted(
+                            org.opensearch.serverless.store.WalRecord.contentBytes(accepted.id(), null),
+                            false
+                        )
+                ) {
+                    final Written written = written(
+                        accepted.index(),
+                        accepted.id(),
+                        "",
+                        refresh,
+                        true,
+                        accepted.ifSeqNo(),
+                        accepted.ifPrimaryTerm()
+                    );
+                    final var outcome = written.outcome();
+                    final var response = new org.opensearch.action.delete.DeleteResponse(
+                        written.shardId,
+                        accepted.id(),
+                        outcome.seqNo(),
+                        outcome.primaryTerm(),
+                        outcome.version(),
+                        outcome.found()
+                    );
+                    completeNativeWriteResponse(response, refresh);
+                    return response;
+                }
+            }
+        );
+    }
+
+    private static void validateNativeWrite(
+        String routing,
+        long version,
+        org.opensearch.index.VersionType versionType,
+        org.opensearch.action.support.ActiveShardCount activeShards,
+        boolean create
+    ) {
+        if (routing != null) {
+            throw new UnsupportedOperationException("routing is not supported: documents are placed by their id");
+        }
+        if (versionType != org.opensearch.index.VersionType.INTERNAL
+            || (version != org.opensearch.common.lucene.uid.Versions.MATCH_ANY
+                && (create == false || version != org.opensearch.common.lucene.uid.Versions.MATCH_DELETED))) {
+            throw new UnsupportedOperationException("version/version_type is not supported; use if_seq_no and if_primary_term");
+        }
+        if (activeShards.validate(0) == false) {
+            throw new UnsupportedOperationException("wait_for_active_shards cannot exceed one: shards have no replicas");
+        }
+    }
+
+    private static void completeNativeWriteResponse(org.opensearch.action.DocWriteResponse response, boolean refresh) {
+        response.setForcedRefresh(refresh);
+        response.setShardInfo(new org.opensearch.action.support.replication.ReplicationResponse.ShardInfo(1, 1));
+    }
+
+    private <T extends org.opensearch.core.action.ActionResponse> T gatedNative(
+        String action,
+        org.opensearch.action.ActionRequest request,
+        Class<T> responseType,
+        org.opensearch.common.CheckedFunction<org.opensearch.action.ActionRequest, T, Exception> work
+    ) throws IOException {
+        try {
+            return node.actionGate().run(action, request, work, org.opensearch.serverless.shell.ActionGate.identity(responseType));
+        } catch (IOException | RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
+    /**
      * Removes one document, wherever it lives.
      *
      * @param index the index
@@ -1720,39 +1880,15 @@ public final class ShardOperations {
     }
 
     private boolean doDelete(String index, String id, boolean refresh) throws IOException {
-        final Placement placement = place(index, id);
-        if (placement.local() != null) {
-            final boolean found = node.delete(placement.local(), id).found();
-            if (refresh) {
-                node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
-            }
-            return found;
-        }
-        forward(index, id, "", refresh, true, placement);
-        // A forwarded acknowledgement does not carry found-ness; the single-document REST path has always
-        // reported a forwarded delete as found, and this keeps that rather than inventing a new answer.
-        return true;
+        return written(index, id, "", refresh, true, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L).outcome().found();
     }
 
-    /**
-     * Deletes a document only if it is still at the sequence number a frozen view saw it at.
-     *
-     * <p>A hit that carries no sequence number -- a shard that did not report one -- falls back to the
-     * unconditional delete, which is the behaviour this had for every document before.
-     */
+    /** Deletes against the sequence identity a frozen view recorded, when it recorded one. */
     private boolean doDeleteIfUnchanged(String index, String id, boolean refresh, long seqNo, long primaryTerm) throws IOException {
         if (seqNo < 0 || primaryTerm <= 0) {
             return doDelete(index, id, refresh);
         }
-        final Placement placement = place(index, id);
-        if (placement.local() != null) {
-            final boolean found = node.delete(placement.local(), id, seqNo, primaryTerm).found();
-            if (refresh) {
-                node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
-            }
-            return found;
-        }
-        return forwardWritten(index, id, "", refresh, true, placement, seqNo, primaryTerm).outcome().found();
+        return written(index, id, "", refresh, true, seqNo, primaryTerm).outcome().found();
     }
 
     private String write(String index, String id, String source, boolean refresh, boolean deletion) throws IOException {
@@ -1763,10 +1899,12 @@ public final class ShardOperations {
     private static final class Written {
         private final String servedBy;
         private final org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome;
+        private final ShardId shardId;
 
-        Written(String servedBy, org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome) {
+        Written(String servedBy, org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome, ShardId shardId) {
             this.servedBy = servedBy;
             this.outcome = outcome;
+            this.shardId = shardId;
         }
 
         String servedBy() {
@@ -1795,11 +1933,13 @@ public final class ShardOperations {
     ) throws IOException {
         final Placement placement = place(index, id);
         if (placement.local() != null) {
-            final var outcome = node.index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
+            final var outcome = deletion
+                ? node.delete(placement.local(), id, ifSeqNo, ifPrimaryTerm)
+                : node.index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
             if (refresh) {
                 node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
             }
-            return new Written(node.localNode().getId(), outcome);
+            return new Written(node.localNode().getId(), outcome, placement.local());
         }
         return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent);
     }
@@ -1891,7 +2031,8 @@ public final class ShardOperations {
                     ack.version(),
                     ack.created(),
                     ack.found()
-                )
+                ),
+                new ShardId(new org.opensearch.core.index.Index(index, placement.uuid()), placement.shard())
             );
         } catch (NotHereException e) {
             throw e;

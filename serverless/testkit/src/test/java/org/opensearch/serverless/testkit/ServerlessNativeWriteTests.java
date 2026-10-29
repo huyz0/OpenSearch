@@ -1,0 +1,224 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+package org.opensearch.serverless.testkit;
+
+import org.opensearch.action.DocWriteResponse;
+import org.opensearch.action.delete.DeleteRequest;
+import org.opensearch.action.index.IndexRequest;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.index.engine.VersionConflictEngineException;
+import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.test.OpenSearchTestCase;
+
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class ServerlessNativeWriteTests extends OpenSearchTestCase {
+    private Settings settings(String name) {
+        return Settings.builder()
+            .put("node.name", name)
+            .put("path.home", createTempDir())
+            .put("network.host", "127.0.0.1")
+            .put("http.port", "0")
+            .put("transport.port", "0")
+            .put("serverless.roles", "ingest")
+            .build();
+    }
+
+    private MetadataPlane plane(AtomicLong clock) throws Exception {
+        final var plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, 30_000L);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-native-writes", 1, "{\"properties\":{\"msg\":{\"type\":\"keyword\"}}}", null));
+        return plane;
+    }
+
+    private static void attach(ServerlessNode node, MetadataPlane plane) throws Exception {
+        node.start();
+        node.setMetadataPlane(plane);
+    }
+
+    private static void own(ServerlessNode owner, MetadataPlane plane, AtomicLong clock) throws Exception {
+        final var loop = new BackgroundReconciler(owner, plane);
+        loop.want("alpha", 0);
+        loop.tick(clock.get());
+    }
+
+    private static IndexRequest index(String id, String message) {
+        return new IndexRequest("alpha").id(id).source("{\"msg\":\"" + message + "\"}", XContentType.JSON);
+    }
+
+    public void testConditionsAndActualWriteResultsLocallyAndForwarded() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = plane(clock);
+        try (var owner = new ServerlessNode(settings("native-owner")); var peer = new ServerlessNode(settings("native-peer"))) {
+            attach(owner, plane);
+            attach(peer, plane);
+            own(owner, plane, clock);
+            int ordinal = 0;
+            for (var via : List.of(owner, peer)) {
+                final var client = via.client();
+                final String id = "doc-" + ordinal++;
+                final var created = client.index(index(id, "created")).actionGet();
+                assertEquals(DocWriteResponse.Result.CREATED, created.getResult());
+                assertTrue("the assigned sequence number must travel back", created.getSeqNo() >= 0L);
+                assertTrue(created.getPrimaryTerm() > 0L);
+                assertEquals(1L, created.getVersion());
+                assertEquals(1, created.getShardInfo().getSuccessful());
+                assertEquals("uuid-native-writes", created.getShardId().getIndex().getUUID());
+                final var updated = client.index(index(id, "updated")).actionGet();
+                assertEquals(DocWriteResponse.Result.UPDATED, updated.getResult());
+                assertEquals(2L, updated.getVersion());
+                assertTrue(updated.getSeqNo() > created.getSeqNo());
+                expectThrows(
+                    VersionConflictEngineException.class,
+                    () -> client.index(index(id, "create-overwrite").opType(org.opensearch.action.DocWriteRequest.OpType.CREATE))
+                        .actionGet()
+                );
+                expectThrows(
+                    VersionConflictEngineException.class,
+                    () -> client.index(
+                        index(id, "stale-overwrite").setIfSeqNo(created.getSeqNo()).setIfPrimaryTerm(created.getPrimaryTerm())
+                    ).actionGet()
+                );
+                final var conditional = client.index(
+                    index(id, "conditional").setIfSeqNo(updated.getSeqNo()).setIfPrimaryTerm(updated.getPrimaryTerm())
+                ).actionGet();
+                assertEquals(3L, conditional.getVersion());
+                expectThrows(
+                    VersionConflictEngineException.class,
+                    () -> client.delete(
+                        new DeleteRequest("alpha", id).setIfSeqNo(updated.getSeqNo()).setIfPrimaryTerm(updated.getPrimaryTerm())
+                    ).actionGet()
+                );
+                final var deleted = client.delete(
+                    new DeleteRequest("alpha", id).setIfSeqNo(conditional.getSeqNo()).setIfPrimaryTerm(conditional.getPrimaryTerm())
+                ).actionGet();
+                assertEquals(DocWriteResponse.Result.DELETED, deleted.getResult());
+                assertEquals(4L, deleted.getVersion());
+                assertTrue(deleted.getSeqNo() > conditional.getSeqNo());
+                final var absent = client.delete(new DeleteRequest("alpha", id)).actionGet();
+                assertEquals(DocWriteResponse.Result.NOT_FOUND, absent.getResult());
+                assertTrue(absent.getSeqNo() > deleted.getSeqNo());
+            }
+        }
+    }
+
+    public void testUnsupportedWriteDirectivesAreRefusedBeforeApplying() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = plane(clock);
+        try (var node = new ServerlessNode(settings("native-refusals"))) {
+            attach(node, plane);
+            own(node, plane, clock);
+            final var client = node.client();
+            for (IndexRequest request : List.of(
+                index("routing", "blocked").routing("custom"),
+                index("version", "blocked").version(7).versionType(org.opensearch.index.VersionType.EXTERNAL),
+                index("pipeline", "blocked").setPipeline("transform"),
+                index("alias", "blocked").setRequireAlias(true),
+                index("replicas", "blocked").waitForActiveShards(2)
+            )) {
+                expectThrows(UnsupportedOperationException.class, () -> client.index(request).actionGet());
+                assertFalse(client.get(new org.opensearch.action.get.GetRequest("alpha", request.id())).actionGet().isExists());
+            }
+            final var written = client.index(index("retained", "original")).actionGet();
+            assertTrue(written.getSeqNo() >= 0L);
+            for (DeleteRequest request : List.of(
+                new DeleteRequest("alpha", "retained").routing("custom"),
+                new DeleteRequest("alpha", "retained").version(7).versionType(org.opensearch.index.VersionType.EXTERNAL),
+                new DeleteRequest("alpha", "retained").waitForActiveShards(2)
+            )) {
+                expectThrows(UnsupportedOperationException.class, () -> client.delete(request).actionGet());
+                assertTrue(client.get(new org.opensearch.action.get.GetRequest("alpha", "retained")).actionGet().isExists());
+            }
+            plane.updateDescriptor(
+                plane.describe("alpha").orElseThrow().withSettings(Settings.builder().put("index.final_pipeline", "protect").build()),
+                plane.descriptorGeneration("alpha")
+            );
+            expectThrows(UnsupportedOperationException.class, () -> client.index(index("final-pipeline", "unprocessed")).actionGet());
+            assertFalse(client.get(new org.opensearch.action.get.GetRequest("alpha", "final-pipeline")).actionGet().isExists());
+        }
+    }
+
+    public static final class NativeWriteContractPlugin extends org.opensearch.plugins.Plugin
+        implements
+            org.opensearch.plugins.ActionPlugin {
+        @Override
+        public List<org.opensearch.action.support.ActionFilter> getActionFilters() {
+            return List.of(new org.opensearch.action.support.ActionFilter() {
+                @Override
+                public int order() {
+                    return 0;
+                }
+
+                @Override
+                @SuppressWarnings("unchecked")
+                public <
+                    Request extends org.opensearch.action.ActionRequest,
+                    Response extends org.opensearch.core.action.ActionResponse> void apply(
+                        org.opensearch.tasks.Task task,
+                        String action,
+                        Request request,
+                        org.opensearch.action.support.ActionRequestMetadata<Request, Response> metadata,
+                        org.opensearch.core.action.ActionListener<Response> listener,
+                        org.opensearch.action.support.ActionFilterChain<Request, Response> chain
+                    ) {
+                    Request admitted = request;
+                    if (request instanceof IndexRequest indexed && "rewrite".equals(indexed.id())) {
+                        admitted = (Request) index(indexed.id(), "approved");
+                    }
+                    chain.proceed(task, action, admitted, org.opensearch.core.action.ActionListener.wrap(response -> {
+                        if (org.opensearch.action.index.IndexAction.NAME.equals(action)
+                            && (response instanceof org.opensearch.action.index.IndexResponse) == false) {
+                            throw new IllegalStateException("an index filter must receive IndexResponse");
+                        }
+                        if (org.opensearch.action.delete.DeleteAction.NAME.equals(action)
+                            && (response instanceof org.opensearch.action.delete.DeleteResponse) == false) {
+                            throw new IllegalStateException("a delete filter must receive DeleteResponse");
+                        }
+                        listener.onResponse(response);
+                    }, listener::onFailure));
+                }
+            });
+        }
+    }
+
+    public void testNativeWriteFiltersSeeTheAdmittedRequestAndNativeResponses() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = plane(clock);
+        try (var node = new ServerlessNode(settings("native-filter-contract"), List.of(new NativeWriteContractPlugin()))) {
+            attach(node, plane);
+            own(node, plane, clock);
+            final var created = node.client().index(index("rewrite", "original")).actionGet();
+            assertTrue(created.getSeqNo() >= 0L);
+            assertEquals(
+                "approved",
+                node.client().get(new org.opensearch.action.get.GetRequest("alpha", "rewrite")).actionGet().getSourceAsMap().get("msg")
+            );
+            assertEquals(
+                DocWriteResponse.Result.DELETED,
+                node.client().delete(new DeleteRequest("alpha", "rewrite")).actionGet().getResult()
+            );
+            try (var builder = org.opensearch.common.xcontent.XContentFactory.cborBuilder()) {
+                builder.startObject().field("msg", "binary-source").endObject();
+                final var binary = new IndexRequest("alpha").id("binary")
+                    .source(org.opensearch.core.common.bytes.BytesReference.bytes(builder), XContentType.CBOR);
+                assertEquals(DocWriteResponse.Result.CREATED, node.client().index(binary).actionGet().getResult());
+                assertEquals(
+                    "binary-source",
+                    node.client().get(new org.opensearch.action.get.GetRequest("alpha", "binary")).actionGet().getSourceAsMap().get("msg")
+                );
+            }
+        }
+    }
+
+}
