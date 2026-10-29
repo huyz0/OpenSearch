@@ -11,10 +11,10 @@ package org.opensearch.serverless.rest;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
-import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shell.ServerlessNode;
@@ -73,7 +73,8 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         final boolean refresh = IndexAdminHandler.refresh(request);
         final boolean waitForCompletion = request.paramAsBoolean("wait_for_completion", true);
         final String routing = request.param("routing");
-        final String q = request.param("q");
+        final QueryBuilder urlQuery = org.opensearch.rest.action.RestActions.urlParamsToQueryBuilder(request);
+        final String unsupportedSelection = readUnsupportedSelection(request);
         // Core's default: the first document that changed since the query was taken stops the operation.
         final String conflicts = request.param("conflicts", "abort");
         // Hints, each with one possible answer here. The operation runs inline over a frozen view and
@@ -96,10 +97,6 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
             "expand_wildcards",
             "stats",
             "version",
-            "terminate_after",
-            "size",
-            "from",
-            "sort",
             "_source",
             "_source_includes",
             "_source_excludes",
@@ -109,6 +106,17 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
             "default_operator",
             "lenient" }) {
             request.param(hint);
+        }
+
+        if (unsupportedSelection != null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_delete_by_query",
+                    "'" + unsupportedSelection + "' is not supported in delete_by_query: only the query and max_docs select documents"
+                )
+            );
         }
 
         final MetadataPlane metadata = plane.get();
@@ -150,7 +158,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         }
         final boolean abortOnConflict = "abort".equals(conflicts);
         final ServerlessNode serving = node.get();
-        if (request.hasContent() == false && q == null) {
+        if (request.hasContent() == false && urlQuery == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
@@ -161,14 +169,9 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
             );
         }
 
-        final SearchSourceBuilder source;
+        final QueryBody body;
         if (request.hasContent() == false) {
-            // q= alone, parsed by core's own query-string parser as it is on _search.
-            final SearchSourceBuilder fromQuery = new SearchSourceBuilder().query(
-                org.opensearch.index.query.QueryBuilders.queryStringQuery(q)
-            );
-            final var query = fromQuery.query();
-            return channel -> run(channel, serving, metadata, index, query, maxDocs, refresh, abortOnConflict);
+            return channel -> run(channel, serving, metadata, index, urlQuery, maxDocs, refresh, abortOnConflict);
         }
         try (
             XContentParser parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
@@ -178,13 +181,13 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
                     request.content().streamInput()
                 )
         ) {
-            source = SearchSourceBuilder.fromXContent(parser, true);
+            body = readQueryBody(parser);
         } catch (Exception e) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "could not parse the query: " + e.getMessage())
             );
         }
-        if (source.query() == null) {
+        if (body.query() == null && urlQuery == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
@@ -194,7 +197,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
                 )
             );
         }
-        final String unsupported = firstUnsupportedField(source);
+        final String unsupported = body.unsupported();
         if (unsupported != null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
@@ -206,7 +209,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
             );
         }
 
-        final var query = source.query();
+        final QueryBuilder query = urlQuery == null ? body.query() : urlQuery;
         return channel -> run(channel, serving, metadata, index, query, maxDocs, refresh, abortOnConflict);
     }
 
@@ -238,30 +241,53 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         });
     }
 
-    /** Returns the name of the first field this endpoint does not read, or null if there is none. */
-    private static String firstUnsupportedField(SearchSourceBuilder source) {
-        if (source.sorts() != null) {
-            return "sort";
+    private static String readUnsupportedSelection(RestRequest request) {
+        String unsupported = null;
+        for (String field : new String[] { "sort", "from", "size", "terminate_after", "min_score" }) {
+            if (request.param(field) != null && unsupported == null) {
+                unsupported = field;
+            }
         }
-        if (source.size() != -1) {
-            return "size";
+        return unsupported;
+    }
+
+    private record QueryBody(QueryBuilder query, String unsupported) {
+    }
+
+    /** Parses exactly the supported query body without accepting and then discarding selection options. */
+    private static QueryBody readQueryBody(XContentParser parser) throws IOException {
+        if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+            throw new IOException("expected a query object");
         }
-        if (source.from() > 0) {
-            return "from";
+        QueryBuilder query = null;
+        String unsupported = null;
+        boolean sawQuery = false;
+        XContentParser.Token token;
+        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+            if (token != XContentParser.Token.FIELD_NAME) {
+                throw new IOException("expected a query field");
+            }
+            final String field = parser.currentName();
+            if (parser.nextToken() == null) {
+                throw new IOException("unexpected end of query body");
+            }
+            if ("query".equals(field)) {
+                if (sawQuery) {
+                    throw new IOException("duplicate query field");
+                }
+                sawQuery = true;
+                query = org.opensearch.index.query.AbstractQueryBuilder.parseInnerQueryBuilder(parser);
+            } else {
+                if (unsupported == null) {
+                    unsupported = field;
+                }
+                parser.skipChildren();
+            }
         }
-        if (source.aggregations() != null) {
-            return "aggs";
+        if (parser.nextToken() != null) {
+            throw new IOException("trailing content after query body");
         }
-        if (source.searchAfter() != null) {
-            return "search_after";
-        }
-        if (source.postFilter() != null) {
-            return "post_filter";
-        }
-        if (source.fetchSource() != null) {
-            return "_source";
-        }
-        return null;
+        return new QueryBody(query, unsupported);
     }
 
     private void sendError(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {

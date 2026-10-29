@@ -99,6 +99,86 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         }
     }
 
+    public void testUrlQueryOptionsCannotBroadenDeletion() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = planeOver(createTempDir(), clock);
+        try (var node = started(plane, "dbq-url-options")) {
+            final var http = node.boundHttpAddress().publishAddress();
+            prepareSelectionDocuments(node, plane);
+            final var response = send(http, "POST", "/alpha/_delete_by_query?q=red%20blue&df=msg&default_operator=AND&refresh=true", null);
+            assertEquals(response.body(), 200, response.status());
+            assertTrue(response.body(), response.body().contains("\"deleted\":1"));
+            assertEquals(404, send(http, "GET", "/alpha/_doc/both", null).status());
+            assertEquals(200, send(http, "GET", "/alpha/_doc/red", null).status());
+            assertEquals(200, send(http, "GET", "/alpha/_doc/blue", null).status());
+        }
+    }
+
+    public void testUrlQueryOverridesTheBodyQueryBeforeDeletion() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = planeOver(createTempDir(), clock);
+        try (var node = started(plane, "dbq-url-precedence")) {
+            final var http = node.boundHttpAddress().publishAddress();
+            prepareSelectionDocuments(node, plane);
+            final var response = send(http, "POST", "/alpha/_delete_by_query?q=keep:false&refresh=true", "{\"query\":{\"match_all\":{}}}");
+            assertEquals(response.body(), 200, response.status());
+            assertTrue(response.body(), response.body().contains("\"deleted\":1"));
+            assertEquals(200, send(http, "GET", "/alpha/_doc/red", null).status());
+            assertEquals(200, send(http, "GET", "/alpha/_doc/blue", null).status());
+        }
+    }
+
+    public void testUnsupportedUrlSelectionOptionsAreRefusedBeforeAnyDeletion() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = planeOver(createTempDir(), clock);
+        try (var node = started(plane, "dbq-url-selection")) {
+            final var http = node.boundHttpAddress().publishAddress();
+            prepareSelectionDocuments(node, plane);
+            for (String option : new String[] { "size=1", "from=1", "sort=n:asc", "terminate_after=1", "min_score=1000" }) {
+                final var response = send(http, "POST", "/alpha/_delete_by_query?refresh=true&" + option, "{\"query\":{\"match_all\":{}}}");
+                assertEquals(response.body(), 501, response.status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/both", null).status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/red", null).status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/blue", null).status());
+            }
+        }
+    }
+
+    public void testUnsupportedBodyOptionsAreRefusedBeforeAnyDeletion() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = planeOver(createTempDir(), clock);
+        try (var node = started(plane, "dbq-body-selection")) {
+            final var http = node.boundHttpAddress().publishAddress();
+            prepareSelectionDocuments(node, plane);
+            for (String option : new String[] {
+                "\"min_score\":1000",
+                "\"terminate_after\":1",
+                "\"timeout\":\"1ms\"",
+                "\"explain\":true" }) {
+                final var response = send(
+                    http,
+                    "POST",
+                    "/alpha/_delete_by_query?refresh=true",
+                    "{\"query\":{\"match_all\":{}}," + option + "}"
+                );
+                assertEquals(response.body(), 501, response.status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/both", null).status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/red", null).status());
+                assertEquals(200, send(http, "GET", "/alpha/_doc/blue", null).status());
+            }
+        }
+    }
+
+    private void prepareSelectionDocuments(ServerlessNode node, MetadataPlane plane) throws Exception {
+        final var http = node.boundHttpAddress().publishAddress();
+        assertEquals(200, send(http, "PUT", "/alpha?shards=1", MAPPING).status());
+        node.activateWriter(plane, "alpha", 0);
+        assertEquals(201, send(http, "PUT", "/alpha/_doc/both?refresh=true", "{\"msg\":\"red blue\",\"keep\":false}").status());
+        assertEquals(201, send(http, "PUT", "/alpha/_doc/red?refresh=true", "{\"msg\":\"red\",\"keep\":true}").status());
+        assertEquals(201, send(http, "PUT", "/alpha/_doc/blue?refresh=true", "{\"msg\":\"blue\",\"keep\":true}").status());
+        publish(node, plane, "alpha", 1);
+    }
+
     /**
      * Matching documents are removed, and everything else survives -- checked over several shards, which
      * is the case that actually exercises the per-shard walk rather than one shard answering everything.
