@@ -481,9 +481,15 @@ public final class PruningDigest {
      * @throws IOException if the bytes are malformed
      */
     public static PruningDigest parse(XContentParser parser) throws IOException {
+        if (parser.currentToken() != XContentParser.Token.START_OBJECT) {
+            throw new IOException("malformed pruning digest: expected an object");
+        }
         final Map<String, FieldRange> fields = new LinkedHashMap<>();
         XContentParser.Token token;
         while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+            if (token == null) {
+                throw new IOException("unexpected end of pruning digest");
+            }
             if (token != XContentParser.Token.FIELD_NAME) {
                 continue;
             }
@@ -500,6 +506,9 @@ public final class PruningDigest {
             String key = null;
             XContentParser.Token inner;
             while ((inner = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                if (inner == null) {
+                    throw new IOException("unexpected end of pruning digest field");
+                }
                 if (inner == XContentParser.Token.FIELD_NAME) {
                     key = parser.currentName();
                 } else if (inner == XContentParser.Token.START_OBJECT || inner == XContentParser.Token.START_ARRAY) {
