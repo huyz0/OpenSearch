@@ -85,6 +85,7 @@ public final class MultiGetHandler extends BaseRestHandler {
         private final String id;
         private final org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource;
         private ServerlessNode.Document document;
+        private String answeredIndex;
         private String failureType;
         private String failureReason;
 
@@ -291,7 +292,9 @@ public final class MultiGetHandler extends BaseRestHandler {
             }
             tasks.add(() -> {
                 try {
-                    item.document = operations.get(item.index, item.id).document();
+                    final var read = operations.get(item.index, item.id);
+                    item.document = read.document();
+                    item.answeredIndex = read.shardId() == null ? item.index : read.shardId().getIndexName();
                     return true;
                 } catch (ShardOperations.NoSuchIndexException e) {
                     item.fail("index_not_found", e.getMessage());
@@ -320,8 +323,8 @@ public final class MultiGetHandler extends BaseRestHandler {
             builder.startArray("docs");
             for (Item item : items) {
                 builder.startObject();
-                builder.field("_index", item.index);
-                builder.field("_id", item.id);
+                builder.field("_index", item.answeredIndex == null ? item.index : item.answeredIndex);
+                builder.field("_id", item.document == null ? item.id : item.document.id());
                 if (item.failureType != null) {
                     // An item that could not be read says so rather than reporting "not found", because a
                     // document that exists on a node we could not reach is not a document that is absent.
