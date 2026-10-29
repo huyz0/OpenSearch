@@ -193,6 +193,41 @@ public class ServerlessIngestTests extends OpenSearchTestCase {
         }
     }
 
+    public void testPipelinesCannotSilentlyDiscardDocumentMetadataChanges() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        try (ServerlessNode node = running(plane(clock, createTempDir()), clock, "pipeline-metadata")) {
+            assertNotNull(node);
+            for (var metadata : org.opensearch.ingest.IngestDocument.Metadata.values()) {
+                final String field = metadata.getFieldName();
+                final String value = switch (metadata) {
+                    case VERSION, IF_SEQ_NO, IF_PRIMARY_TERM -> "42";
+                    case VERSION_TYPE -> "\"external\"";
+                    default -> "\"changed\"";
+                };
+                final String pipeline = "change-" + metadata.name().toLowerCase(java.util.Locale.ROOT);
+                final Answer stored = call(
+                    "PUT",
+                    "/_ingest/pipeline/" + pipeline,
+                    "{\"processors\":[{\"set\":{\"field\":\"" + field + "\",\"value\":" + value + "}}]}"
+                );
+                assertEquals(stored.body(), 200, stored.status());
+                final Answer refused = call("PUT", "/alpha/_doc/single?pipeline=" + pipeline, "{\"msg\":\"unwritten\"}");
+                assertEquals("must refuse ignored " + field + ": " + refused.body(), 400, refused.status());
+                assertTrue(refused.body(), refused.has(field));
+                assertEquals(404, call("GET", "/alpha/_doc/single", null).status());
+                final Answer bulk = call(
+                    "POST",
+                    "/_bulk",
+                    "{\"index\":{\"_index\":\"alpha\",\"_id\":\"bulk\",\"pipeline\":\"" + pipeline + "\"}}\n{\"msg\":\"unwritten\"}\n"
+                );
+                assertEquals(bulk.body(), 200, bulk.status());
+                assertTrue(bulk.body(), bulk.has("\"errors\":true"));
+                assertTrue(bulk.body(), bulk.has("pipeline_failed"));
+                assertEquals(404, call("GET", "/alpha/_doc/bulk", null).status());
+            }
+        }
+    }
+
     /**
      * A pipeline may drop a document, and dropping is reported rather than looking like a write.
      *

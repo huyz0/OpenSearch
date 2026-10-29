@@ -154,7 +154,7 @@ public final class IngestPipelines {
      * @param id the document id
      * @param source the document, as JSON
      * @return the transformed document, or a dropped result
-     * @throws Exception if a processor failed
+     * @throws Exception if a processor failed or changed document metadata this write path cannot apply
      */
     public Result run(Pipeline pipeline, String index, String id, String source) throws Exception {
         final Map<String, Object> document = new LinkedHashMap<>(
@@ -186,6 +186,22 @@ public final class IngestPipelines {
         if (after == null) {
             // A processor dropped it. Not a failure, and not a write.
             return new Result(null, true);
+        }
+        // Placement and write conditions are resolved outside the pipeline. Returning only the source
+        // must never acknowledge metadata changes that those paths would silently discard.
+        for (IngestDocument.Metadata metadata : IngestDocument.Metadata.values()) {
+            final Object expected = switch (metadata) {
+                case INDEX -> index;
+                case ID -> id;
+                default -> null;
+            };
+            if (java.util.Objects.equals(expected, after.getSourceAndMetadata().get(metadata.getFieldName())) == false) {
+                throw new IllegalArgumentException(
+                    "ingest pipelines cannot change document metadata ["
+                        + metadata.getFieldName()
+                        + "]: index placement and write conditions are resolved outside the pipeline"
+                );
+            }
         }
         try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
             // Metadata back out: it went in so processors could read it, and it is not part of the document.
