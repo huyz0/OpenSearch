@@ -255,11 +255,30 @@ public final class TemplateStore {
      * @throws IOException if the write fails
      */
     public void put(String name, String source) throws IOException {
+        put(name, source, false);
+    }
+
+    /**
+     * Stores a template, optionally refusing an existing name under the marker's compare-and-swap.
+     *
+     * @param name the template name
+     * @param source the template's JSON
+     * @param requireAbsent whether replacing an existing name is forbidden
+     * @throws IOException if the write fails
+     * @throws IllegalArgumentException if the name already exists and replacement is forbidden
+     */
+    public void put(String name, String source, boolean requireAbsent) throws IOException {
         Names.validateId(name, "template");
         String hash = null;
         for (int attempt = 0; attempt < MARKER_ATTEMPTS; attempt++) {
             final Marker marker = readMarker();
             Map<String, String> entries = marker.legacy() ? legacyReadAll() : new LinkedHashMap<>(marker.entries());
+            if (requireAbsent && entries.containsKey(name)) {
+                if (hash != null) {
+                    dropContent(hash);
+                }
+                throw new IllegalArgumentException("template [" + name + "] already exists");
+            }
             if (entries.containsKey(name) == false && entries.size() >= MAX_TEMPLATES) {
                 if (hash != null) {
                     dropContent(hash);

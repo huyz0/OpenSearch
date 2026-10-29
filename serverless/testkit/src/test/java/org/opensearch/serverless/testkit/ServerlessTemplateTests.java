@@ -90,6 +90,51 @@ public class ServerlessTemplateTests extends OpenSearchTestCase {
         return node;
     }
 
+    public void testCreateOnlyCannotOverwriteAConcurrentTemplate() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            try (var node = running(metadata, "template-create-race")) {
+                assertNotNull(node);
+                for (boolean component : new boolean[] { false, true }) {
+                    final var templates = component ? metadata.componentTemplates() : metadata.indexTemplates();
+                    final String original = component
+                        ? "{\"template\":{},\"version\":1}"
+                        : "{\"index_patterns\":[\"logs-*\"],\"version\":1}";
+                    final String attempted = original.replace(":1", ":2");
+                    templates.put("seed", original);
+                    final String containerPath = (component
+                        ? org.opensearch.serverless.metadata.RegisterMap.componentTemplates(BlobPath.cleanPath())
+                        : org.opensearch.serverless.metadata.RegisterMap.indexTemplates(BlobPath.cleanPath())).buildAsString();
+                    store.onNextRegisterSwap(containerPath, "_version", () -> {
+                        try {
+                            templates.put("raced", original);
+                        } catch (java.io.IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    });
+                    final Answer response = call(
+                        "PUT",
+                        (component ? "/_component_template/" : "/_index_template/") + "raced?create=true",
+                        attempted
+                    );
+                    assertTrue("the concurrent creator must win before the outer marker swap", store.fired());
+                    assertEquals(response.body(), 400, response.status());
+                    assertEquals(original, templates.get("raced").orElseThrow());
+                    assertEquals(
+                        "only the seed and winning content should remain",
+                        2,
+                        store.blobContainer(
+                            component
+                                ? org.opensearch.serverless.metadata.RegisterMap.componentTemplates(BlobPath.cleanPath())
+                                : org.opensearch.serverless.metadata.RegisterMap.indexTemplates(BlobPath.cleanPath())
+                        ).listBlobsByPrefix("blob-").size()
+                    );
+                }
+            }
+        }
+    }
+
     public void testPrivateSettingsCannotPoisonNewIndicesOrTemplates() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(clock, createTempDir());

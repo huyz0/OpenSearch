@@ -265,12 +265,7 @@ public final class TemplateHandler extends BaseRestHandler {
                 return;
             }
         }
-        if (create && store.get(name).isPresent()) {
-            // create=true is "add, do not replace", and replacing would be exactly what it asked not to do.
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", "template [" + name + "] already exists");
-            return;
-        }
-        store.put(name, body);
+        store.put(name, body, create);
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.field("acknowledged", true);
