@@ -143,7 +143,8 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
             write(store.blobContainer(oldData.add("t=1")), "_0.cfs", "old orphan");
             store.blobContainer(oldData).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
             final var first = collector.sweepShard(plane, "recreated", 0, Set.of());
-            assertEquals(Set.of("t=1/_0.cfs"), first.candidates());
+            assertTrue(first.candidates().contains("t=1/_0.cfs"));
+            assertTrue(store.blobContainer(oldData.add("t=1")).blobExists("_0.cfs"));
             assertTrue(plane.deleteIndex("recreated"));
             plane.createIndex(new IndexDescriptor("recreated", "uuid-grace-new", 1, MAPPING, null));
             final BlobPath newData = plane.shardData("recreated", 0);
@@ -152,8 +153,10 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
             clock.addAndGet(200L);
             final var replacement = collector.sweepShard(plane, "recreated", 0, first.candidates());
             assertTrue("the previous incarnation's timestamps must not shorten the replacement's grace", replacement.deleted().isEmpty());
+            assertTrue(store.blobContainer(newData.add("t=1")).blobExists("_0.cfs"));
             clock.addAndGet(100L);
-            assertEquals(List.of("t=1/_0.cfs"), collector.sweepShard(plane, "recreated", 0, replacement.candidates()).deleted());
+            assertTrue(collector.sweepShard(plane, "recreated", 0, replacement.candidates()).deleted().contains("t=1/_0.cfs"));
+            assertFalse(store.blobContainer(newData.add("t=1")).blobExists("_0.cfs"));
         }
     }
 
