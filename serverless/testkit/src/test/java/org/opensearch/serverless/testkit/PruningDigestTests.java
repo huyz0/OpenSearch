@@ -87,6 +87,69 @@ public class PruningDigestTests extends OpenSearchTestCase {
         assertTrue(read.digest().canMatch(QueryBuilders.termQuery("n", big), NOW));
     }
 
+    public void testFloatQueryRoundingCannotHideAMatchingShard() throws Exception {
+        assertNativeMatchesAreNotPruned(org.opensearch.index.mapper.NumberFieldMapper.NumberType.FLOAT, 1.00000001, 0.99999999);
+        assertNativeMatchesAreNotPruned(org.opensearch.index.mapper.NumberFieldMapper.NumberType.FLOAT, "1.00000001", "0.99999999");
+    }
+
+    public void testDoubleQueryRoundingCannotHideAMatchingShard() throws Exception {
+        assertNativeMatchesAreNotPruned(
+            org.opensearch.index.mapper.NumberFieldMapper.NumberType.DOUBLE,
+            "1.00000000000000001",
+            "0.99999999999999999"
+        );
+    }
+
+    public void testIntegerQueryCoercionCannotHideAMatchingShard() throws Exception {
+        for (var type : java.util.List.of(
+            org.opensearch.index.mapper.NumberFieldMapper.NumberType.BYTE,
+            org.opensearch.index.mapper.NumberFieldMapper.NumberType.SHORT,
+            org.opensearch.index.mapper.NumberFieldMapper.NumberType.INTEGER,
+            org.opensearch.index.mapper.NumberFieldMapper.NumberType.LONG
+        )) {
+            assertNativeMatchesAreNotPruned(
+                type,
+                "1.00000000000000001",
+                type == org.opensearch.index.mapper.NumberFieldMapper.NumberType.LONG ? null : "0.99999999999999999"
+            );
+        }
+    }
+
+    private void assertNativeMatchesAreNotPruned(org.opensearch.index.mapper.NumberFieldMapper.NumberType type, Object lower, Object upper)
+        throws Exception {
+        try (
+            var directory = newDirectory();
+            var analyzer = new org.apache.lucene.tests.analysis.MockAnalyzer(random());
+            var writer = new org.apache.lucene.index.IndexWriter(directory, new org.apache.lucene.index.IndexWriterConfig(analyzer))
+        ) {
+            final var document = new org.apache.lucene.document.Document();
+            document.add(switch (type) {
+                case FLOAT -> new org.apache.lucene.document.FloatPoint("n", 1.0f);
+                case DOUBLE -> new org.apache.lucene.document.DoublePoint("n", 1.0);
+                case LONG -> new org.apache.lucene.document.LongPoint("n", 1L);
+                default -> new org.apache.lucene.document.IntPoint("n", 1);
+            });
+            writer.addDocument(document);
+            final var digest = new PruningDigest(Map.of("n", new PruningDigest.FieldRange(type.typeName(), 1L, 1L, null, null)));
+            try (var reader = org.apache.lucene.index.DirectoryReader.open(writer)) {
+                final var searcher = new org.apache.lucene.search.IndexSearcher(reader);
+                assertEquals(1, searcher.count(type.rangeQuery("n", lower, null, true, true, false, true, null)));
+                assertTrue(type + " native lower bound matches: " + lower, digest.canMatch(QueryBuilders.rangeQuery("n").gte(lower), NOW));
+                if (upper != null) {
+                    assertEquals(1, searcher.count(type.rangeQuery("n", null, upper, true, true, false, true, null)));
+                    assertTrue(
+                        type + " native upper bound matches: " + upper,
+                        digest.canMatch(QueryBuilders.rangeQuery("n").lte(upper), NOW)
+                    );
+                }
+                if (type != org.opensearch.index.mapper.NumberFieldMapper.NumberType.LONG) {
+                    assertEquals(1, searcher.count(type.termQuery("n", lower, false, true)));
+                    assertTrue(type + " native term matches: " + lower, digest.canMatch(QueryBuilders.termQuery("n", lower), NOW));
+                }
+            }
+        }
+    }
+
     public void testWhatItCannotJudgeIsAMaybe() {
         final PruningDigest d = digest();
         assertTrue("an undigested field", d.canMatch(QueryBuilders.rangeQuery("other").gte(1000), NOW));

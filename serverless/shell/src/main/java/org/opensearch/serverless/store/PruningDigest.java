@@ -412,10 +412,16 @@ public final class PruningDigest {
                     ? BigDecimal.valueOf(instant.toEpochMilli())
                     : BigDecimal.valueOf(DateUtils.toLong(DateUtils.clampToNanosRange(instant)));
             }
-            if (value instanceof Number number) {
-                return exact(number);
-            }
-            return new BigDecimal(String.valueOf(value).trim());
+            // Match the field's own query parsing precision. Comparing the original decimal with a
+            // float/double point can prune a bound that core rounds onto an existing value. Integer
+            // coercion toward zero is deliberately wider than core's inclusive/exclusive adjustment.
+            return switch (type) {
+                case "float" -> exact(NumberFieldMapper.NumberType.FLOAT.parse(value, false));
+                case "double" -> exact(NumberFieldMapper.NumberType.DOUBLE.parse(value, false));
+                case "byte", "short", "integer" -> exact(NumberFieldMapper.NumberType.INTEGER.parse(value, true));
+                case "long" -> exact(NumberFieldMapper.NumberType.LONG.parse(value, true));
+                default -> null;
+            };
         } catch (RuntimeException e) {
             // A bound this cannot read is a bound it cannot judge.
             return null;
