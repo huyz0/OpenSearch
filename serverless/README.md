@@ -113,3 +113,13 @@ stores `ObjectStores` will equally happily point this shell at.
 Reading it was not merely reassuring. The same page documents two further outcomes of those races -- `409`
 under concurrency, and `404` when a delete beats an `If-Match` write -- which the S3 register mapped to
 exceptions rather than to conflicts. See `STATUS.md`.
+
+## Transport replay capacity
+
+`serverless.transport.replay_cache.capacity` limits the accepted, still-valid nonces
+retained per node (default 65,536). A full cache refuses new forwarded requests with
+403 until entries expire; it never evicts a valid nonce to admit another request.
+Size this for peak incoming forwarded requests per second multiplied by twice the
+lease TTL in seconds. The factor of two covers accepted sender clock skew. Higher
+capacity uses proportionally more heap. Expiration is ordered by signed timestamp,
+so out-of-order delivery does not delay reclaiming expired entries.
