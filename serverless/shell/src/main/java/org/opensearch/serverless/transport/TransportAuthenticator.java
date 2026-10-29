@@ -68,7 +68,7 @@ public final class TransportAuthenticator {
      *
      * @param secrets the secrets as this node last read them, or null before a plane is attached
      * @param refresh re-reads the secrets from the register, for a generation this node has not seen
-     * @param localNodeId this node's id, which travels as the sender
+     * @param localNodeId this process's identity, which travels as the sender
      * @param clock the plane's clock
      * @param windowMillis how far a timestamp may be from now, and how long a nonce is remembered: one lease
      */
@@ -141,7 +141,7 @@ public final class TransportAuthenticator {
      *
      * @param action action name
      * @param request request payload
-     * @param recipient intended receiver's node id
+     * @param recipient intended receiver's process identity
      * @param headers headers as they will be transmitted
      * @return authentication header, or null before secrets are available
      * @throws IOException if serialization fails
@@ -257,6 +257,11 @@ public final class TransportAuthenticator {
         if (seen.remember(sender + ":" + nonceHex, timestamp) == false) {
             throw refuse("replayed forwarded request or transport replay cache full");
         }
+    }
+
+    /** The identity of a transport process, including the incarnation whose replay cache is in memory. */
+    static String identity(org.opensearch.cluster.node.DiscoveryNode node) {
+        return node.getId() + "/" + node.getEphemeralId();
     }
 
     private synchronized boolean beginSecretProbe() {
