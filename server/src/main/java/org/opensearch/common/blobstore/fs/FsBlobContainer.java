@@ -98,30 +98,16 @@ import static java.util.Collections.unmodifiableMap;
 public class FsBlobContainer extends AbstractBlobContainer {
 
     private static final String TEMP_FILE_PREFIX = "pending-";
+    /** Stable lock files, reserved for registers and excluded from container listings. */
+    private static final String REGISTER_LOCK_DIRECTORY = ".opensearch-register-locks#";
 
     protected final FsBlobStore blobStore;
     protected final Path path;
 
-    // Guards readRegister/compareAndSwapRegister: FileChannel#lock() is documented as
-    // inter-process only, and a second overlapping lock() from a different FileChannel in the
-    // *same* JVM throws OverlappingFileLockException rather than blocking, so real intra-process
-    // mutual exclusion has to come from here, not from the filesystem.
-    //
-    // Static, and keyed by the resolved register path rather than by blob name, because the unit of
-    // exclusion is the file and not the container that reached it. As a per-instance field keyed by
-    // name this arbitrated nothing between two containers over the same directory: both read the
-    // same generation, both passed the equality check, both wrote, and the second silently won.
-    // Internal cluster tests give every node its own container, so that is the normal case rather
-    // than an exotic one, and a test asserting one winner among concurrent CAS callers would have
-    // been asserting nothing.
-    //
-    // A fixed stripe table rather than a per-path map: a map entry per register path lives for the
-    // JVM's lifetime, which is an unbounded leak on a workload with many registers. Striping is
-    // bounded by construction and still correct, because a given path always hashes to the same
-    // stripe -- two callers on the same file always contend on the same lock. The only cost is
-    // over-exclusion: two different files that share a stripe serialize needlessly, which affects
-    // throughput, never correctness, and each register operation holds exactly one stripe at a time
-    // so no lock-ordering deadlock is possible.
+    // FileChannel locks exclude other processes, but overlapping locks in one JVM throw rather than
+    // wait. Bounded mutex stripes provide that local exclusion without retaining one lock per key.
+    // Writers lock stable sidecar files; the data inode itself changes on every atomic replacement.
+    // Published register files are immutable, so readers need only open one consistent version.
     private static final int REGISTER_LOCK_STRIPE_COUNT = 64;
     private static final ReentrantLock[] REGISTER_LOCK_STRIPES = new ReentrantLock[REGISTER_LOCK_STRIPE_COUNT];
     static {
@@ -146,7 +132,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
         Map<String, BlobContainer> builder = new HashMap<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
             for (Path file : stream) {
-                if (Files.isDirectory(file)) {
+                if (file.getFileName().toString().equals(REGISTER_LOCK_DIRECTORY) == false && Files.isDirectory(file)) {
                     final String name = file.getFileName().toString();
                     builder.put(name, new FsBlobContainer(blobStore, path().add(name), file));
                 }
@@ -167,7 +153,8 @@ public class FsBlobContainer extends AbstractBlobContainer {
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
                 for (Path file : stream) {
                     final String name = file.getFileName().toString();
-                    if ((startAfter != null && order.compare(name, startAfter) <= 0)
+                    if (name.equals(REGISTER_LOCK_DIRECTORY)
+                        || (startAfter != null && order.compare(name, startAfter) <= 0)
                         || (page.size() == limit && order.compare(name, page.peek()) >= 0)
                         || Files.isDirectory(file) == false) {
                         continue;
@@ -212,7 +199,9 @@ public class FsBlobContainer extends AbstractBlobContainer {
                     throw e;
                 }
                 if (attrs.isRegularFile()) {
-                    builder.put(file.getFileName().toString(), new PlainBlobMetadata(file.getFileName().toString(), attrs.size()));
+                    if (file.getFileName().toString().equals(REGISTER_LOCK_DIRECTORY) == false) {
+                        builder.put(file.getFileName().toString(), new PlainBlobMetadata(file.getFileName().toString(), attrs.size()));
+                    }
                 }
             }
         }
@@ -240,7 +229,9 @@ public class FsBlobContainer extends AbstractBlobContainer {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
             for (Path file : stream) {
                 final String name = file.getFileName().toString();
-                if (name.startsWith(prefix) == false || (startAfter != null && name.compareTo(startAfter) <= 0)) {
+                if (name.equals(REGISTER_LOCK_DIRECTORY)
+                    || name.startsWith(prefix) == false
+                    || (startAfter != null && name.compareTo(startAfter) <= 0)) {
                     continue;
                 }
                 if (page.size() == limit && name.compareTo(page.peek().name()) >= 0) {
@@ -288,8 +279,10 @@ public class FsBlobContainer extends AbstractBlobContainer {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                 Files.delete(file);
-                filesDeleted.incrementAndGet();
-                bytesDeleted.addAndGet(attrs.size());
+                if (file.getParent().getFileName().toString().equals(REGISTER_LOCK_DIRECTORY) == false) {
+                    filesDeleted.incrementAndGet();
+                    bytesDeleted.addAndGet(attrs.size());
+                }
                 return FileVisitResult.CONTINUE;
             }
         });
@@ -305,19 +298,19 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     @Override
     public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws IOException {
-        IOUtils.rm(blobNames.stream().map(path::resolve).toArray(Path[]::new));
+        IOUtils.rm(blobNames.stream().map(this::resolveBlobPath).toArray(Path[]::new));
         // See delete(): deletion invalidates any previously issued version token for these paths.
         blobNames.forEach(blobName -> CONDITIONAL_WRITE_VERSIONS.remove(conditionalWriteKey(blobName)));
     }
 
     @Override
     public boolean blobExists(String blobName) {
-        return Files.exists(path.resolve(blobName));
+        return isRegisterCoordinationPath(path.resolve(blobName)) == false && Files.exists(path.resolve(blobName));
     }
 
     @Override
     public InputStream readBlob(String name) throws IOException {
-        final Path resolvedPath = path.resolve(name);
+        final Path resolvedPath = resolveBlobPath(name);
         try {
             return Files.newInputStream(resolvedPath);
         } catch (FileNotFoundException fnfe) {
@@ -327,7 +320,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     @Override
     public InputStream readBlob(String blobName, long position, long length) throws IOException {
-        final SeekableByteChannel channel = Files.newByteChannel(path.resolve(blobName));
+        final SeekableByteChannel channel = Files.newByteChannel(resolveBlobPath(blobName));
         if (position > 0L) {
             channel.position(position);
         }
@@ -343,7 +336,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     @Override
     public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
-        final Path file = path.resolve(blobName);
+        final Path file = resolveBlobPath(blobName);
         if (failIfAlreadyExists) {
             createWhole(blobName, inputStream, blobSize);
         } else {
@@ -368,7 +361,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
      * whole content behind it or fails because the name is taken -- the same answer put-if-absent gives.
      */
     private void createWhole(String blobName, InputStream inputStream, long blobSize) throws IOException {
-        final Path target = path.resolve(blobName);
+        final Path target = resolveBlobPath(blobName);
         final Path temp = path.resolve(tempBlobName(blobName));
         writeToPath(inputStream, temp, blobSize);
         try {
@@ -399,6 +392,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
     @Override
     public void writeBlobAtomic(final String blobName, final InputStream inputStream, final long blobSize, boolean failIfAlreadyExists)
         throws IOException {
+        resolveBlobPath(blobName);
         final String tempBlob = tempBlobName(blobName);
         final Path tempBlobPath = path.resolve(tempBlob);
         try {
@@ -431,8 +425,8 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     public void moveBlobAtomic(final String sourceBlobName, final String targetBlobName, final boolean failIfAlreadyExists)
         throws IOException {
-        final Path sourceBlobPath = path.resolve(sourceBlobName);
-        final Path targetBlobPath = path.resolve(targetBlobName);
+        final Path sourceBlobPath = resolveBlobPath(sourceBlobName);
+        final Path targetBlobPath = resolveBlobPath(targetBlobName);
         // If the target file exists then Files.move() behaviour is implementation specific
         // the existing file might be replaced or this method fails by throwing an IOException.
         if (Files.exists(targetBlobPath)) {
@@ -523,7 +517,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
     @Override
     public VersionedBlob readBlobWithVersion(String blobName) throws IOException {
         synchronized (conditionalWriteLock(blobName)) {
-            final Path file = path.resolve(blobName);
+            final Path file = resolveBlobPath(blobName);
             final String versionToken = currentVersionToken(blobName);
             try {
                 // Versioned reads materialize the blob in memory and are meant for small control blobs only; refuse
@@ -542,6 +536,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
     @Override
     public String writeBlobConditionally(String blobName, InputStream inputStream, long blobSize, @Nullable String expectedVersionToken)
         throws IOException {
+        resolveBlobPath(blobName);
         synchronized (conditionalWriteLock(blobName)) {
             final String currentVersionToken = currentVersionToken(blobName);
             if (Objects.equals(expectedVersionToken, currentVersionToken) == false) {
@@ -588,143 +583,134 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     @Override
     public Optional<BlobRegister> readRegister(String blobName) throws IOException {
-        Path registerPath = path.resolve(blobName);
-        if (Files.exists(registerPath) == false) {
-            return Optional.empty();
-        }
-        ReentrantLock lock = registerLockFor(registerPath);
-        lock.lock();
-        try (FileChannel channel = FileChannel.open(registerPath, StandardOpenOption.READ)) {
-            // Shared, because the channel is read-only and an exclusive lock on it would throw. Enough
-            // to exclude a writer in another process, which is all this adds over the lock above.
-            try (FileLock fileLock = channel.lock(0L, Long.MAX_VALUE, true)) {
-                assert fileLock != null;
-                return readRegisterUnderLock(channel);
-            }
-        } catch (java.nio.file.NoSuchFileException e) {
-            // Deleted between the existence check and the open: absent, which is what it now is.
-            return Optional.empty();
-        } finally {
-            lock.unlock();
-        }
+        // A published data inode is never modified. An open file therefore remains a consistent
+        // snapshot through replacement or unlink, without creating coordination files on read-only stores.
+        return readRegisterFile(resolveBlobPath(blobName));
     }
 
     @Override
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
-        Path registerPath = path.resolve(blobName);
-        // The register's own parent, not the container root. A blob name carrying a path segment, which is
-        // how a store namespaces its keys, resolves below the container, and creating only the root left
-        // the open() below throwing NoSuchFileException. S3 has no equivalent failure because its keys are
-        // flat strings, so this was a third way for the two implementations to disagree about a call that
-        // works against one of them.
+        final Path registerPath = resolveBlobPath(blobName);
         Files.createDirectories(registerPath.getParent());
+        return underRegisterLock(registerPath, () -> {
+            final Optional<BlobRegister> current = readRegisterFile(registerPath);
+            final long generation = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+            if (generation != expectedGeneration) {
+                return BlobRegisterCasResult.conflict(generation);
+            }
+            final long next = generation == BlobRegister.ABSENT_GENERATION ? BlobRegister.initialGeneration() : generation + 1;
+            writeRegisterUnderLock(registerPath, next, newValue);
+            return BlobRegisterCasResult.applied(next);
+        });
+    }
 
-        ReentrantLock lock = registerLockFor(registerPath);
+    /** Deletes only the expected version, while the stable coordination inode remains locked. */
+    @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        final Path registerPath = resolveBlobPath(blobName);
+        try {
+            Files.readAttributes(registerPath, BasicFileAttributes.class);
+            return underRegisterLock(registerPath, () -> {
+                final Optional<BlobRegister> current = readRegisterFile(registerPath);
+                if (current.isEmpty() || current.get().generation() != expectedGeneration) {
+                    return false;
+                }
+                Files.delete(registerPath);
+                IOUtils.fsync(registerPath.getParent(), true);
+                return true;
+            });
+        } catch (NoSuchFileException e) {
+            return false;
+        }
+    }
+
+    private Path resolveBlobPath(String blobName) {
+        final Path registerPath = path.resolve(blobName);
+        if (isRegisterCoordinationPath(registerPath)) {
+            throw new IllegalArgumentException("reserved register coordination file: " + blobName);
+        }
+        return registerPath;
+    }
+
+    private static boolean isRegisterCoordinationPath(Path path) {
+        for (Path part : path) {
+            if (part.toString().equals(REGISTER_LOCK_DIRECTORY)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Coordinates through a stable sidecar, never the data inode that a delete or atomic replacement removes.
+     * Every process sharing a filesystem register must use this protocol. Canonical parent paths also keep
+     * aliases of one directory on the same in-process stripe. There are at most 64 lock files per
+     * container, rather than one per register. Separate files are necessary: on some systems closing
+     * any channel on a file releases all locks this process holds on it, including other byte ranges.
+     * The coordination directory remains after a register is deleted.
+     */
+    private <T> T underRegisterLock(Path registerPath, org.opensearch.common.CheckedSupplier<T, IOException> work) throws IOException {
+        final Path parent = registerPath.getParent().toRealPath();
+        final int stripe = Math.floorMod(parent.resolve(registerPath.getFileName()).toString().hashCode(), REGISTER_LOCK_STRIPE_COUNT);
+        final Path lockDirectory = parent.resolve(REGISTER_LOCK_DIRECTORY);
+        Files.createDirectories(lockDirectory);
+        final ReentrantLock lock = REGISTER_LOCK_STRIPES[stripe];
         lock.lock();
         try (
             FileChannel channel = FileChannel.open(
-                registerPath,
+                lockDirectory.resolve(Integer.toString(stripe)),
                 StandardOpenOption.CREATE,
                 StandardOpenOption.READ,
                 StandardOpenOption.WRITE
-            )
+            );
+            FileLock held = channel.lock()
         ) {
-            // Held across the read and the write, so the compare and the swap are one step. Taken only
-            // after the intra-process lock above, which is what keeps this from throwing
-            // OverlappingFileLockException when two containers in one JVM reach the same file.
-            try (FileLock fileLock = channel.lock()) {
-                assert fileLock != null;
-                Optional<BlobRegister> current = readRegisterUnderLock(channel);
-                long currentGeneration = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-                if (currentGeneration != expectedGeneration) {
-                    return BlobRegisterCasResult.conflict(currentGeneration);
-                }
-
-                long newGeneration = currentGeneration == BlobRegister.ABSENT_GENERATION
-                    ? BlobRegister.initialGeneration()
-                    : currentGeneration + 1;
-                writeRegisterUnderLock(channel, newGeneration, newValue);
-                return BlobRegisterCasResult.applied(newGeneration);
-            }
+            assert held != null;
+            return work.get();
         } finally {
             lock.unlock();
         }
     }
 
-    /**
-     * Deletes a register if it still holds the expected generation.
-     *
-     * <p>Emptied under both locks -- an empty file reads as absent -- and then removed while the in-process
-     * lock is still held, so no writer in this JVM can land between the compare and the removal. A writer in
-     * another process could, in the instant between releasing the file lock and removing the file; a
-     * filesystem repository shared between processes is a test and development arrangement, and it is the
-     * one place this leaves a gap.
-     */
-    @Override
-    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
-        Path registerPath = path.resolve(blobName);
-        if (Files.exists(registerPath) == false) {
-            return false;
-        }
-        ReentrantLock lock = registerLockFor(registerPath);
-        lock.lock();
-        try {
-            try (FileChannel channel = FileChannel.open(registerPath, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-                try (FileLock fileLock = channel.lock()) {
-                    assert fileLock != null;
-                    Optional<BlobRegister> current = readRegisterUnderLock(channel);
-                    if (current.isEmpty() || current.get().generation() != expectedGeneration) {
-                        return false;
-                    }
-                    channel.truncate(0);
-                    channel.force(true);
-                }
-            } catch (java.nio.file.NoSuchFileException e) {
-                return false;
+    private Optional<BlobRegister> readRegisterFile(Path registerPath) throws IOException {
+        try (FileChannel channel = FileChannel.open(registerPath, StandardOpenOption.READ)) {
+            final long size = channel.size();
+            if (size == 0L) {
+                return Optional.empty();
             }
-            Files.deleteIfExists(registerPath);
-            return true;
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * The intra-process lock stripe for one register file.
-     *
-     * <p>Keyed by the absolute normalised path so two containers that reach the same file through
-     * different {@link BlobPath}s always land on the same stripe -- mutual exclusion per file is
-     * preserved. Distinct files may share a stripe (bounded striping, see the field comment), which
-     * only serializes them, never lets two writers to the same file interleave.
-     */
-    private static ReentrantLock registerLockFor(Path registerPath) {
-        final int hash = registerPath.toAbsolutePath().normalize().toString().hashCode();
-        return REGISTER_LOCK_STRIPES[Math.floorMod(hash, REGISTER_LOCK_STRIPE_COUNT)];
-    }
-
-    private Optional<BlobRegister> readRegisterUnderLock(FileChannel channel) throws IOException {
-        long size = channel.size();
-        if (size == 0) {
+            if (size < Long.BYTES || size > Integer.MAX_VALUE) {
+                throw new IOException("invalid register length " + size + " at " + registerPath);
+            }
+            final byte[] bytes = org.opensearch.common.io.Channels.readFromFileChannel(channel, 0, (int) size);
+            final ByteBuffer buffer = ByteBuffer.wrap(bytes);
+            final long generation = buffer.getLong();
+            final byte[] value = new byte[buffer.remaining()];
+            buffer.get(value);
+            return Optional.of(new BlobRegister(generation, new BytesArray(value)));
+        } catch (NoSuchFileException e) {
             return Optional.empty();
         }
-        byte[] bytes = org.opensearch.common.io.Channels.readFromFileChannel(channel, 0, (int) size);
-        ByteBuffer buffer = ByteBuffer.wrap(bytes);
-        long generation = buffer.getLong();
-        byte[] value = new byte[buffer.remaining()];
-        buffer.get(value);
-        return Optional.of(new BlobRegister(generation, new BytesArray(value)));
     }
 
-    private void writeRegisterUnderLock(FileChannel channel, long newGeneration, BytesReference newValue) throws IOException {
-        byte[] valueBytes = BytesReference.toBytes(newValue);
-        ByteBuffer buffer = ByteBuffer.allocate(8 + valueBytes.length);
+    private void writeRegisterUnderLock(Path registerPath, long newGeneration, BytesReference newValue) throws IOException {
+        final byte[] valueBytes = BytesReference.toBytes(newValue);
+        final ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES + valueBytes.length);
         buffer.putLong(newGeneration);
         buffer.put(valueBytes);
-        buffer.flip();
-
-        channel.truncate(0);
-        org.opensearch.common.io.Channels.writeToChannel(buffer.array(), channel, 0);
-        channel.force(true);
+        // Independent of the register's name length, including names already at the filesystem's limit.
+        final Path staged = registerPath.getParent()
+            .resolve(REGISTER_LOCK_DIRECTORY)
+            .resolve(TEMP_FILE_PREFIX + "register-" + UUIDs.randomBase64UUID());
+        try {
+            try (FileChannel channel = FileChannel.open(staged, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                org.opensearch.common.io.Channels.writeToChannel(buffer.array(), channel, 0);
+                channel.force(true);
+            }
+            Files.move(staged, registerPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            IOUtils.fsync(registerPath.getParent(), true);
+        } finally {
+            Files.deleteIfExists(staged);
+        }
     }
 }

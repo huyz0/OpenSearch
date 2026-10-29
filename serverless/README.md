@@ -36,6 +36,14 @@ repository plugins, outside core: `StartAfter` on S3, `startOffset` on GCS, and 
 continuation marker is opaque and cannot be built from a name -- a walk from the prefix that skips up to
 the cursor and stops when the page is full.
 
+Filesystem registers publish complete immutable versions with atomic rename and
+sync the containing directory before acknowledging a change. Conditional writes
+and deletes coordinate through `.opensearch-register-locks#`, a reserved directory
+with at most 64 lock files per container. Blob and child listings exclude this
+internal metadata. Keep it while the store is in use, and upgrade all writer
+processes sharing a filesystem store to the same register protocol. Reads need
+no coordination writes, including when reading older registers on a read-only store.
+
 **Both engine hooks are needed, not just the method.** `ServerlessWriterEngine` overrides
 `engineRecoveryOperations` to replay its object-store write-ahead log during recovery, and
 `IndexShard` is what actually runs it, through the same `runTranslogRecovery` path local
