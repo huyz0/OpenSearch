@@ -39,6 +39,7 @@ public final class HookedBlobStore implements BlobStore {
     }
 
     private final BlobStore delegate;
+    private final AtomicReference<Hook> swapHook = new AtomicReference<>();
     private final AtomicReference<Hook> armed = new AtomicReference<>();
     private volatile boolean fired;
     private volatile String failListingsUnder;
@@ -131,6 +132,18 @@ public final class HookedBlobStore implements BlobStore {
     public void onNextRegisterRead(String pathContains, String blobName, Runnable action) {
         fired = false;
         armed.set(new Hook(pathContains, blobName, action));
+    }
+
+    /**
+     * Runs an action immediately before the next register swap.
+     *
+     * @param pathContains container path fragment
+     * @param blobName register name
+     * @param action concurrent operation
+     */
+    public void onNextRegisterSwap(String pathContains, String blobName, Runnable action) {
+        fired = false;
+        swapHook.set(new Hook(pathContains, blobName, action));
     }
 
     /**
@@ -298,6 +311,14 @@ public final class HookedBlobStore implements BlobStore {
         public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
             throws IOException {
             registerWrite();
+            final Hook hook = swapHook.get();
+            if (hook != null
+                && hook.blobName().equals(blobName)
+                && inner.path().buildAsString().contains(hook.pathContains())
+                && swapHook.compareAndSet(hook, null)) {
+                hook.action().run();
+                fired = true;
+            }
             return inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
     }

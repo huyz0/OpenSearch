@@ -141,6 +141,26 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         }
     }
 
+    public void testLeaseCollectionDoesNotDeleteAConcurrentRenewal() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        try (HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            final NodeLease lease = new NodeLease("returning", "eph", "127.0.0.1:9300", Set.of("ingest"), 0L);
+            plane.membership().renew(lease);
+            clock.addAndGet(TTL);
+            store.onNextRegisterRead("", "lease-returning", () -> {
+                try {
+                    plane.membership().renew(lease);
+                } catch (java.io.IOException e) {
+                    throw new AssertionError(e);
+                }
+            });
+            assertTrue(new GarbageCollector(store, BlobPath.cleanPath()).collectExpiredLeases(plane, clock.get()).isEmpty());
+            assertTrue(store.fired());
+            assertTrue(plane.membership().read("returning").orElseThrow().expiresAtMillis() > clock.get());
+        }
+    }
+
     /** The deployment-wide sweep, and expired-lease tidying. */
     public void testSweepCollectsEveryShardAndExpiredLeases() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

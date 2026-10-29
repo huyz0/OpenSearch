@@ -72,6 +72,82 @@ public class BlobLeaseMembershipTests extends OpenSearchTestCase {
         assertTrue("and the first taker revoked it", firstRevoked.get());
     }
 
+    public void testRenewalBeforePruningClaimsTheLeaseSurvives() throws Exception {
+        assertRenewalSurvivesPruning(false, false);
+    }
+
+    public void testRenewalAfterPruningClaimsTheLeaseSurvives() throws Exception {
+        assertRenewalSurvivesPruning(true, false);
+    }
+
+    public void testRenewalAfterPruningClaimsAMissingLeaseSurvives() throws Exception {
+        assertRenewalSurvivesPruning(true, true);
+    }
+
+    private void assertRenewalSurvivesPruning(boolean afterClaim, boolean missing) throws Exception {
+        final AtomicLong now = new AtomicLong(1_000L);
+        try (HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var c = store.blobContainer(BlobPath.cleanPath());
+            final BlobLeaseMembership owner = new BlobLeaseMembership(c, now::get, TTL);
+            final BlobLeaseMembership observer = new BlobLeaseMembership(c, now::get, TTL).conditionalDeletes(() -> true);
+            owner.renew(lease("returning", "search"));
+            now.addAndGet((BlobLeaseMembership.DEAD_LEASE_PRUNE_TTLS + 2) * TTL);
+            if (missing) {
+                c.deleteBlobsIgnoringIfNotExists(List.of(BlobLeaseMembership.LEASE_PREFIX + "returning"));
+            }
+            final Runnable renew = () -> {
+                try {
+                    owner.renew(lease("returning", "search"));
+                } catch (java.io.IOException e) {
+                    throw new AssertionError(e);
+                }
+            };
+            if (afterClaim) {
+                store.onNextRegisterSwap("", BlobLeaseMembership.MEMBERS, renew);
+            } else {
+                store.onNextRegisterRead("", BlobLeaseMembership.LEASE_PREFIX + "returning", renew);
+            }
+            observer.refresh();
+            assertTrue(store.fired());
+            assertTrue("renewed lease must survive cleanup", observer.read("returning").orElseThrow().expiresAtMillis() > now.get());
+            assertEquals(Set.of("returning"), observer.refresh().stream().map(NodeLease::nodeId).collect(Collectors.toSet()));
+        }
+    }
+
+    public void testReleaseDoesNotEraseAConcurrentRestart() throws Exception {
+        final AtomicLong now = new AtomicLong(1_000L);
+        try (HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var c = store.blobContainer(BlobPath.cleanPath());
+            final BlobLeaseMembership old = new BlobLeaseMembership(c, now::get, TTL).conditionalDeletes(() -> true);
+            final BlobLeaseMembership restarted = new BlobLeaseMembership(c, now::get, TTL);
+            old.renew(lease("node-a", "search"));
+            store.onNextRegisterSwap("", BlobLeaseMembership.MEMBERS, () -> {
+                try {
+                    restarted.renew(new NodeLease("node-a", "new-process", "127.0.0.1:9300", Set.of("search"), 0L));
+                } catch (java.io.IOException e) {
+                    throw new AssertionError(e);
+                }
+            });
+            old.release("node-a");
+            assertTrue(store.fired());
+            assertEquals("new-process", restarted.read("node-a").orElseThrow().ephemeralId());
+            assertEquals(1, new BlobLeaseMembership(c, now::get, TTL).refresh().size());
+        }
+    }
+
+    public void testUnverifiedConditionalDeletesRetainOnlyAnUnlistedExpiredLease() throws Exception {
+        final AtomicLong now = new AtomicLong(1_000L);
+        final var c = container(createTempDir());
+        final BlobLeaseMembership membership = new BlobLeaseMembership(c, now::get, TTL);
+        membership.renew(lease("old"));
+        now.addAndGet((BlobLeaseMembership.DEAD_LEASE_PRUNE_TTLS + 2) * TTL);
+        assertTrue(membership.refresh().isEmpty());
+        assertTrue(membership.read("old").isPresent());
+        assertFalse(c.readRegister(BlobLeaseMembership.MEMBERS).orElseThrow().value().utf8ToString().contains("old"));
+        membership.renew(lease("old"));
+        assertEquals(1, membership.refresh().size());
+    }
+
     public void testRenewMakesANodeVisible() throws Exception {
         final AtomicLong now = new AtomicLong(1_000L);
         final BlobLeaseMembership membership = new BlobLeaseMembership(container(createTempDir()), now::get, TTL);
