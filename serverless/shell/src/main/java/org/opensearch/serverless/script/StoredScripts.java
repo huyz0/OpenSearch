@@ -52,6 +52,8 @@ public final class StoredScripts {
     private final Supplier<MetadataPlane> plane;
     private volatile Map<String, StoredScriptSource> scripts = Map.of();
     private volatile long appliedVersion = -1L;
+    /** Advances after a refresh, so callers already waiting can share its marker observation. */
+    private volatile long refreshGeneration;
     /** Far enough in the past that the first lookup checks; not so far that the subtraction wraps. */
     private volatile long lastCheckedNanos = System.nanoTime() - 2 * CHECK_INTERVAL_NANOS;
 
@@ -71,6 +73,7 @@ public final class StoredScripts {
      * @return the script, or empty
      */
     public Optional<StoredScriptSource> lookup(String id) {
+        final long observedRefresh = refreshGeneration;
         final StoredScriptSource known = scripts.get(id);
         if (known != null && System.nanoTime() - lastCheckedNanos < CHECK_INTERVAL_NANOS) {
             return Optional.of(known);
@@ -78,8 +81,14 @@ public final class StoredScripts {
         // The marker, not the listing: this re-reads the store only when something changed since this
         // node last read it, so a request naming a script that does not exist -- or one that has not
         // changed -- costs one register read rather than a listing and a read per script.
-        refresh(false);
+        refreshIfUnchanged(observedRefresh);
         return Optional.ofNullable(scripts.get(id));
+    }
+
+    private synchronized void refreshIfUnchanged(long observedRefresh) {
+        if (refreshGeneration == observedRefresh) {
+            refresh(false);
+        }
     }
 
     /**
@@ -115,6 +124,8 @@ public final class StoredScripts {
         } catch (IOException e) {
             logger.warn("could not refresh stored scripts", e);
             return false;
+        } finally {
+            refreshGeneration++;
         }
     }
 
