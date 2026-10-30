@@ -41,11 +41,9 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p><b>What a filter sees, and what it does not.</b> The work happens <em>inside</em> the chain, so a
  * filter that refuses before calling {@code chain.proceed} prevents it, and one that wraps the listener
- * runs after it. What a filter does not get is the response: the shell's operations return their own types
- * — a {@code Read}, a {@code SearchOutcome} — and manufacturing an {@code ActionResponse} to carry them
- * would be lossy invention. The listener is completed with {@link Admitted}, which says only that the work
- * was done. A filter that inspects or rewrites responses will not work here; one that decides whether a
- * caller may proceed will, and that is the one authorization is made of.
+ * runs after it. Typed adapters expose and accept the corresponding native response through a
+ * {@link ResponseView}; adapters without a native response use {@link Admitted} and explicitly refuse
+ * cached or rewritten results they cannot apply.
  *
  * <p><b>Synchronous by construction.</b> The shell's operations block, so the chain is driven to completion
  * on the calling thread. That thread is never a transport thread — every call site already dispatched — but
@@ -254,7 +252,20 @@ public final class ActionGate {
         // Throws whatever a filter reported, which for a refusal is the plugin's own exception carrying the
         // plugin's own status. Nothing here reinterprets it: a security plugin's 403 should reach the caller
         // as the security plugin wrote it.
-        final ActionResponse answered = future.actionGet();
+        final ActionResponse answered;
+        try {
+            answered = future.get();
+        } catch (java.util.concurrent.ExecutionException e) {
+            // actionGet wraps checked failures, changing their type and HTTP status merely because
+            // a filter is installed. The unfiltered path already throws the operation's own failure.
+            if (e.getCause() instanceof Exception failure) {
+                throw failure;
+            }
+            throw new IllegalStateException("action filter failed", e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw e;
+        }
         return view.read(answered, result.get());
     }
 }
