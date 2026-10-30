@@ -1226,7 +1226,7 @@ public final class SearchFanout {
         SearchSourceBuilder perShard,
         long nowInMillis
     ) throws IOException {
-        final boolean frozen = serving.reconciler().frozenShards().contains(shardId);
+        final boolean frozen = serving.reconciler().isFrozen(shardId);
         if (frozen == false) {
             // Before the query too, so it runs on the mapping in force now; see ServerlessNode#ensureIncarnationLive.
             serving.ensureIncarnationLive(shardId);
@@ -1248,11 +1248,7 @@ public final class SearchFanout {
     }
 
     private static ShardId localFrozenView(ServerlessNode serving, org.opensearch.serverless.metadata.PointInTime pit, int shard) {
-        return serving.reconciler()
-            .frozenShards()
-            .stream()
-            .filter(s -> s.getIndex().getUUID().equals(pit.id()) && s.id() == shard)
-            .findFirst()
-            .orElse(null);
+        final ShardId candidate = new ShardId(pit.index(), pit.id(), shard);
+        return serving.reconciler().isFrozen(candidate) ? candidate : null;
     }
 }

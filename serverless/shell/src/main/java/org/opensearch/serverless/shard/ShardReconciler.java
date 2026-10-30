@@ -1553,6 +1553,16 @@ public final class ShardReconciler {
     }
 
     /**
+     * Tests a full shard identity without copying the frozen view inventory.
+     *
+     * @param shardId the index name, view uuid and shard number
+     * @return whether the shard is held as a frozen view
+     */
+    public boolean isFrozen(ShardId shardId) {
+        return frozenViews.contains(shardId);
+    }
+
+    /**
      * Returns the frozen views open on this node.
      *
      * <p>They are held, they cost memory and file handles, and nothing releases them but the caller or
