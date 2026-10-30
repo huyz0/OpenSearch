@@ -9,7 +9,6 @@
 package org.opensearch.serverless.rest;
 
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
@@ -25,7 +24,6 @@ import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
@@ -94,37 +92,76 @@ public final class StoredScriptHandler extends BaseRestHandler {
                 )
             );
         }
-        final String body = request.hasContent() ? request.content().utf8ToString() : null;
+        final var content = request.hasContent() ? request.content() : org.opensearch.core.common.bytes.BytesArray.EMPTY;
+        final var mediaType = request.getMediaType() == null ? org.opensearch.common.xcontent.XContentType.JSON : request.getMediaType();
         final RestRequest.Method method = request.method();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 final StoredScriptStore store = metadata.scripts();
-                final String action = switch (method) {
-                    case PUT, POST -> org.opensearch.action.admin.cluster.storedscripts.PutStoredScriptAction.NAME;
-                    case DELETE -> org.opensearch.action.admin.cluster.storedscripts.DeleteStoredScriptAction.NAME;
-                    default -> org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptAction.NAME;
-                };
-                IndexAdminHandler.gate(
-                    serving,
-                    action,
-                    new org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptRequest(id),
-                    () -> {
-                        switch (method) {
-                            case PUT, POST -> put(channel, serving, store, id, context, body);
-                            case GET -> get(channel, store, id, request);
-                            case DELETE -> delete(channel, serving, store, id);
-                            default -> channel.sendResponse(
-                                IndexAdminHandler.error(
-                                    channel,
-                                    RestStatus.METHOD_NOT_ALLOWED,
-                                    "method_not_allowed",
-                                    method + " is not supported here"
-                                )
+                if (method == RestRequest.Method.PUT || method == RestRequest.Method.POST) {
+                    final var ask = new org.opensearch.action.admin.cluster.storedscripts.PutStoredScriptRequest().id(id)
+                        .context(context)
+                        .content(content, mediaType);
+                    final var response = serving.actionGate()
+                        .run(org.opensearch.action.admin.cluster.storedscripts.PutStoredScriptAction.NAME, ask, admitted -> {
+                            final var selected = require(
+                                admitted,
+                                org.opensearch.action.admin.cluster.storedscripts.PutStoredScriptRequest.class
                             );
-                        }
-                        return null;
+                            validate(selected, selected.id());
+                            return put(serving, store, selected.id(), selected.context(), selected.source());
+                        },
+                            org.opensearch.serverless.shell.ActionGate.identity(
+                                org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
+                            )
+                        );
+                    try (XContentBuilder builder = channel.newBuilder()) {
+                        response.toXContent(builder, request);
+                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                     }
-                );
+                } else if (method == RestRequest.Method.DELETE) {
+                    final var response = serving.actionGate()
+                        .run(
+                            org.opensearch.action.admin.cluster.storedscripts.DeleteStoredScriptAction.NAME,
+                            new org.opensearch.action.admin.cluster.storedscripts.DeleteStoredScriptRequest(id),
+                            admitted -> {
+                                final var selected = require(
+                                    admitted,
+                                    org.opensearch.action.admin.cluster.storedscripts.DeleteStoredScriptRequest.class
+                                );
+                                validate(selected, selected.id());
+                                return delete(serving, store, selected.id());
+                            },
+                            org.opensearch.serverless.shell.ActionGate.identity(
+                                org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
+                            )
+                        );
+                    try (XContentBuilder builder = channel.newBuilder()) {
+                        response.toXContent(builder, request);
+                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                    }
+                } else {
+                    final var response = serving.actionGate()
+                        .run(
+                            org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptAction.NAME,
+                            new org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptRequest(id),
+                            admitted -> {
+                                final var selected = require(
+                                    admitted,
+                                    org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptRequest.class
+                                );
+                                validate(selected, selected.id());
+                                return get(store, selected.id());
+                            },
+                            org.opensearch.serverless.shell.ActionGate.identity(
+                                org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptResponse.class
+                            )
+                        );
+                    try (XContentBuilder builder = channel.newBuilder()) {
+                        response.toXContent(builder, request);
+                        channel.sendResponse(new BytesRestResponse(response.status(), builder));
+                    }
+                }
             } catch (org.opensearch.serverless.metadata.TemplateStore.TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_scripts", e.getMessage());
             } catch (IllegalArgumentException e) {
@@ -139,47 +176,24 @@ public final class StoredScriptHandler extends BaseRestHandler {
         });
     }
 
-    private void put(
-        org.opensearch.rest.RestChannel channel,
+    private org.opensearch.action.support.clustermanager.AcknowledgedResponse put(
         ServerlessNode serving,
         StoredScriptStore store,
         String id,
         String context,
-        String body
+        StoredScriptSource source
     ) throws IOException {
-        if (body == null || body.isBlank()) {
-            sendQuietly(
-                channel,
-                RestStatus.BAD_REQUEST,
-                "missing_body",
-                "a script body is required: {\"script\": {\"lang\": ..., \"source\": ...}}"
-            );
-            return;
-        }
-        final StoredScriptSource source;
-        try {
-            source = StoredScripts.parse(body);
-        } catch (Exception e) {
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", "could not parse the script: " + e.getMessage());
-            return;
+        if (source == null) {
+            throw new IllegalArgumentException("a stored script source is required");
         }
         // Compiled where it is stored, the way core does when a context is named: a script that does not
         // compile is refused here rather than on the first request that names it.
         final ScriptContext<?> named = context == null ? null : ScriptModule.CORE_CONTEXTS.get(context);
         if (context != null && named == null) {
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", "unknown script context [" + context + "]");
-            return;
+            throw new IllegalArgumentException("unknown script context [" + context + "]");
         }
         if (serving.scriptService().isLangSupported(source.getLang()) == false) {
-            // Refused where the operator is standing. This used to be swallowed with the compile failure
-            // below, so a script in a language no node can run was stored and failed on first use.
-            sendQuietly(
-                channel,
-                RestStatus.BAD_REQUEST,
-                "illegal_argument_exception",
-                "script_lang not supported [" + source.getLang() + "]"
-            );
-            return;
+            throw new IllegalArgumentException("script_lang not supported [" + source.getLang() + "]");
         }
         try {
             compile(serving, source, named == null ? org.opensearch.script.TemplateScript.CONTEXT : named);
@@ -188,18 +202,17 @@ public final class StoredScriptHandler extends BaseRestHandler {
                 // Named contexts are checked, and a mustache template has only one context; a painless
                 // script with no context named is stored unchecked, as core stores it, since it may be
                 // meant for any of them.
-                sendQuietly(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "illegal_argument_exception",
-                    "the script does not compile: " + (e.getMessage() == null ? e.toString() : e.getMessage())
-                );
-                return;
+                throw new IllegalArgumentException("the script does not compile: " + e.getMessage(), e);
             }
         }
-        store.put(id, body);
+        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            builder.startObject().field("script");
+            source.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+            builder.endObject();
+            store.put(id, org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString());
+        }
         serving.storedScripts().refresh(true);
-        acknowledge(channel);
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
     @SuppressWarnings({ "rawtypes", "unchecked" })
@@ -217,44 +230,56 @@ public final class StoredScriptHandler extends BaseRestHandler {
             );
     }
 
-    private void get(org.opensearch.rest.RestChannel channel, StoredScriptStore store, String id, ToXContent.Params params)
+    private static org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptResponse get(StoredScriptStore store, String id)
         throws IOException {
-        final Optional<String> stored = store.get(id);
-        // Core's GetStoredScriptResponse shape.
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("_id", id);
-            builder.field("found", stored.isPresent());
+        final var stored = store.get(id);
+        // The native response's value constructor is package-private; use its public XContent parser.
+        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            builder.startObject().field("_id", id).field("found", stored.isPresent());
             if (stored.isPresent()) {
                 builder.field("script");
-                StoredScripts.parse(stored.get()).toXContent(builder, params);
+                StoredScripts.parse(stored.get()).toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
             }
             builder.endObject();
-            channel.sendResponse(new BytesRestResponse(stored.isPresent() ? RestStatus.OK : RestStatus.NOT_FOUND, builder));
+            try (
+                var parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
+                    .createParser(
+                        org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
+                        org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                        org.opensearch.core.common.bytes.BytesReference.bytes(builder).streamInput()
+                    )
+            ) {
+                return org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptResponse.fromXContent(parser);
+            }
         }
     }
 
-    private void delete(org.opensearch.rest.RestChannel channel, ServerlessNode serving, StoredScriptStore store, String id)
-        throws IOException {
+    private static org.opensearch.action.support.clustermanager.AcknowledgedResponse delete(
+        ServerlessNode serving,
+        StoredScriptStore store,
+        String id
+    ) throws IOException {
         if (store.delete(id) == false) {
-            sendQuietly(
-                channel,
-                RestStatus.NOT_FOUND,
-                "resource_not_found_exception",
-                "stored script [" + id + "] does not exist and cannot be deleted"
-            );
-            return;
+            throw new org.opensearch.ResourceNotFoundException("stored script [" + id + "] does not exist and cannot be deleted");
         }
         serving.storedScripts().refresh(true);
-        acknowledge(channel);
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
-    private static void acknowledge(org.opensearch.rest.RestChannel channel) throws IOException {
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("acknowledged", true);
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+    private static <T> T require(org.opensearch.action.ActionRequest request, Class<T> type) {
+        if (type.isInstance(request) == false) {
+            throw new IllegalArgumentException("expected admitted request " + type.getSimpleName());
+        }
+        return type.cast(request);
+    }
+
+    private static void validate(org.opensearch.action.ActionRequest request, String id) {
+        final var invalid = request.validate();
+        if (invalid != null) {
+            throw new IllegalArgumentException(invalid.getMessage(), invalid);
+        }
+        if (id.startsWith("_")) {
+            throw new IllegalArgumentException("stored script ids beginning with an underscore are reserved for APIs");
         }
     }
 
