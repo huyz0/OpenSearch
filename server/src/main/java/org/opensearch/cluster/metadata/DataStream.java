@@ -96,11 +96,13 @@ public final class DataStream extends AbstractDiffable<DataStream> implements To
         this.indices = Collections.unmodifiableList(indices);
         this.generation = generation;
         assert indices.size() > 0;
-        assert indices.get(indices.size() - 1).getName().equals(getDefaultBackingIndexName(name, generation));
     }
 
     public DataStream(String name, TimestampField timeStampField, List<Index> indices) {
         this(name, timeStampField, indices, indices.size());
+        // Fresh streams use convention-named write indices. Explicit-generation metadata snapshots may
+        // retain legacy backing names; rollover validates the name of its new write index separately.
+        assert indices.get(indices.size() - 1).getName().equals(getDefaultBackingIndexName(name, indices.size()));
     }
 
     public String getName() {
