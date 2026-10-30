@@ -4419,9 +4419,13 @@ public final class ServerlessNode implements Closeable {
         return writeFenced.contains(shardId);
     }
 
-    private final Map<String, Object> mappingGrowthLocks = new java.util.concurrent.ConcurrentHashMap<>();
-    private final Map<String, java.util.Queue<org.opensearch.index.mapper.Mapping>> pendingMappingAdditions =
-        new java.util.concurrent.ConcurrentHashMap<>();
+    private static final class MappingGrowth {
+        private final java.util.Queue<org.opensearch.index.mapper.Mapping> pending = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        // Guarded by mappingGrowth.compute, never by this object's monitor.
+        private int users;
+    }
+
+    private final Map<org.opensearch.core.index.Index, MappingGrowth> mappingGrowth = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** How many compare-and-swaps one mapping growth attempts before failing the write. */
     private static final int MAPPING_GROWTH_ATTEMPTS = 5;
@@ -4444,7 +4448,7 @@ public final class ServerlessNode implements Closeable {
         if (plane == null || addition == null) {
             return;
         }
-        final String indexName = shardId.getIndexName();
+        final var index = shardId.getIndex();
         // Coalesced, per index, on this node. This is the one register write a data path performs, and
         // it used to be one compare-and-swap per document that named a new field: a bulk of a thousand
         // such documents across the write pool was a thousand swaps on one register, of which one won
@@ -4453,40 +4457,51 @@ public final class ServerlessNode implements Closeable {
         // all of them; a thread that finds its addition already drained by that leader has nothing left
         // to do. The rate is bounded by the field limit, which is the argument for allowing the write
         // here at all.
-        pendingMappingAdditions.computeIfAbsent(indexName, k -> new java.util.concurrent.ConcurrentLinkedQueue<>()).add(addition);
-        synchronized (mappingGrowthLocks.computeIfAbsent(indexName, k -> new Object())) {
-            final java.util.Queue<org.opensearch.index.mapper.Mapping> queue = pendingMappingAdditions.get(indexName);
-            final java.util.List<org.opensearch.index.mapper.Mapping> batch = new java.util.ArrayList<>();
-            org.opensearch.index.mapper.Mapping next;
-            while ((next = queue.poll()) != null) {
-                batch.add(next);
+        final MappingGrowth growth = mappingGrowth.compute(index, (key, existing) -> {
+            final MappingGrowth retained = existing == null ? new MappingGrowth() : existing;
+            retained.users++;
+            return retained;
+        });
+        try {
+            growth.pending.add(addition);
+            synchronized (growth) {
+                final java.util.List<org.opensearch.index.mapper.Mapping> batch = new java.util.ArrayList<>();
+                org.opensearch.index.mapper.Mapping next;
+                while ((next = growth.pending.poll()) != null) {
+                    batch.add(next);
+                }
+                if (batch.isEmpty()) {
+                    // Another participant already committed and applied this caller's addition.
+                    return;
+                }
+                try {
+                    growMappingBy(plane, index, batch);
+                } catch (MappingConflictException e) {
+                    // An incompatible addition must not poison every future growth.
+                    throw e;
+                } catch (Exception e) {
+                    // Waiting participants must retry the whole uncommitted batch.
+                    growth.pending.addAll(batch);
+                    throw e;
+                }
             }
-            if (batch.isEmpty()) {
-                // A leader that ran while this thread waited took this thread's addition into its own
-                // swap and applied the result here; the shard already has the field.
-                return;
-            }
-            try {
-                growMappingBy(plane, indexName, batch);
-            } catch (MappingConflictException e) {
-                // Not back on the queue: an addition that conflicts with the descriptor conflicts with every
-                // later one too, and queued it failed every growth of this index on this node after it.
-                throw e;
-            } catch (Exception e) {
-                // Whatever this leader was carrying for others goes back on the queue, so the next
-                // thread in tries again rather than every waiter returning as though it had succeeded.
-                queue.addAll(batch);
-                throw e;
-            }
+        } finally {
+            mappingGrowth.compute(index, (key, current) -> {
+                assert current == growth;
+                // Evict only once no caller can still enqueue or wait on this monitor. Any additions
+                // left then belong to failed requests; keeping them retains every departed index UUID.
+                return --growth.users == 0 ? null : growth;
+            });
         }
     }
 
     /** One index's mapping grown by a batch of additions: read, merge all of them, swap once, retry with backoff. */
     private void growMappingBy(
         org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
+        org.opensearch.core.index.Index index,
         java.util.List<org.opensearch.index.mapper.Mapping> additions
     ) throws java.io.IOException {
+        final String indexName = index.getName();
         for (int attempt = 0; attempt < MAPPING_GROWTH_ATTEMPTS; attempt++) {
             if (attempt > 0) {
                 // Exponential, jittered, capped: the register's other writers are other nodes doing the
@@ -4501,8 +4516,8 @@ public final class ServerlessNode implements Closeable {
             }
             final long generation = plane.descriptorGeneration(indexName);
             final var current = plane.describe(indexName);
-            if (current.isEmpty()) {
-                return;
+            if (current.isEmpty() || index.getUUID().equals(current.get().uuid()) == false) {
+                throw new java.io.IOException("cannot grow mapping for " + index + ": the index was deleted or recreated");
             }
             final String merged;
             final var mapperService = indicesService.createIndexMapperService(current.get().toIndexMetadata(java.util.Map.of()));
@@ -4545,7 +4560,7 @@ public final class ServerlessNode implements Closeable {
             }
             final var updated = current.get().withMapping(merged);
             if (plane.updateDescriptor(updated, generation).isPresent()) {
-                hosted.computeIfPresent(indexName, (k, v) -> updated);
+                hosted.computeIfPresent(indexName, (k, v) -> v.uuid().equals(index.getUUID()) ? updated : v);
                 reconciler.refreshMapping(indexName, updated);
                 return;
             }

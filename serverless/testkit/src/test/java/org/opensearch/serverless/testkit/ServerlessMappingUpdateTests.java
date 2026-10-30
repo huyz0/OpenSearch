@@ -59,6 +59,80 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
             .build();
     }
 
+    public void testDynamicMappingCannotPolluteARecreatedIndex() throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            final var original = new org.opensearch.serverless.cluster.IndexDescriptor("alpha", "uuid-growth-original", 1, "{}", null);
+            plane.createIndex(original);
+            try (var node = new ServerlessNode(nodeSettings("mapping-growth-incarnation"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                store.onNextRegisterSwap("indices/", "alpha", () -> {
+                    try {
+                        assertTrue(plane.deleteIndex("alpha"));
+                        plane.createIndex(
+                            new org.opensearch.serverless.cluster.IndexDescriptor("alpha", "uuid-growth-replacement", 1, "{}", null)
+                        );
+                    } catch (java.io.IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                });
+                expectThrows(java.io.IOException.class, () -> node.index(id, "old-document", "{\"old_only_field\":\"old\"}"));
+                assertTrue("the index changed at the mapping CAS", store.fired());
+                final var replacement = plane.describe("alpha").orElseThrow();
+                assertEquals("uuid-growth-replacement", replacement.uuid());
+                assertFalse(
+                    "old writes must not change replacement mappings: " + replacement.mapping(),
+                    replacement.mapping().contains("old_only_field")
+                );
+            }
+        }
+    }
+
+    public void testConcurrentMappingGrowthKeepsEveryAcknowledgedField() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            plane.createIndex(new org.opensearch.serverless.cluster.IndexDescriptor("alpha", "uuid-concurrent-growth", 8, "{}", null));
+            try (
+                var node = new ServerlessNode(nodeSettings("concurrent-mapping-growth"));
+                var workers = java.util.concurrent.Executors.newFixedThreadPool(8)
+            ) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var shards = new java.util.ArrayList<org.opensearch.core.index.shard.ShardId>();
+                for (int shard = 0; shard < 8; shard++) {
+                    shards.add(node.activateWriter(plane, "alpha", shard).orElseThrow());
+                }
+                final var start = new java.util.concurrent.CountDownLatch(1);
+                final var writes = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+                for (int shard = 0; shard < 8; shard++) {
+                    final int number = shard;
+                    writes.add(workers.submit(() -> {
+                        start.await();
+                        for (int doc = 0; doc < 8; doc++) {
+                            final String field = "field_" + number + "_" + doc;
+                            node.index(shards.get(number), field, "{\"" + field + "\":" + doc + "}");
+                        }
+                        return null;
+                    }));
+                }
+                start.countDown();
+                for (var write : writes) {
+                    write.get(30, java.util.concurrent.TimeUnit.SECONDS);
+                }
+                final String mapping = plane.describe("alpha").orElseThrow().mapping();
+                for (int shard = 0; shard < 8; shard++) {
+                    for (int doc = 0; doc < 8; doc++) {
+                        final String field = "field_" + shard + "_" + doc;
+                        assertTrue(field + " missing from " + mapping, mapping.contains("\"" + field + "\""));
+                        assertTrue(node.get(shards.get(shard), field).found());
+                    }
+                }
+            }
+        }
+    }
+
     private record Answer(int status, String body) {
         boolean has(String fragment) {
             return body.contains(fragment);
