@@ -25,7 +25,6 @@ import org.opensearch.action.index.IndexResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
-import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.threadpool.ThreadPool;
@@ -252,21 +251,23 @@ public final class ServerlessClient extends AbstractClient {
     private CreateIndexResponse createIndex(CreateIndexRequest request, MetadataPlane metadata) throws Exception {
         // The one action here that does not reach ShardOperations, so it carries its own gate call. A
         // plugin creating an index through the client is subject to the same filters a user is.
-        return node.get().actionGate().run(CreateIndexAction.NAME, request, () -> doCreateIndex(request, metadata));
+        return node.get().actionGate().run(CreateIndexAction.NAME, request, admitted -> {
+            if (admitted instanceof CreateIndexRequest selected) {
+                return doCreateIndex(selected, metadata);
+            }
+            throw new UnsupportedOperationException("create-index requires a native CreateIndexRequest");
+        }, ActionGate.identity(CreateIndexResponse.class));
     }
 
     private CreateIndexResponse doCreateIndex(CreateIndexRequest request, MetadataPlane metadata) throws Exception {
         if (metadata.describe(request.index()).isPresent()) {
             throw new org.opensearch.ResourceAlreadyExistsException(request.index());
         }
-        final int shards = request.settings().getAsInt("index.number_of_shards", 1);
-        final String mapping = request.mappings() == null || request.mappings().isEmpty() ? "{\"properties\":{}}" : request.mappings();
-        metadata.createIndex(
-            new IndexDescriptor(request.index(), org.opensearch.common.UUIDs.randomBase64UUID(), shards, mapping, null).createdAt(
-                metadata.clock().getAsLong(),
-                org.opensearch.Version.CURRENT.id
-            )
-        );
+        try {
+            org.opensearch.serverless.rest.IndexAdminHandler.createIndex(metadata, request);
+        } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
+            throw new org.opensearch.ResourceAlreadyExistsException(request.index());
+        }
         return new CreateIndexResponse(true, true, request.index());
     }
 

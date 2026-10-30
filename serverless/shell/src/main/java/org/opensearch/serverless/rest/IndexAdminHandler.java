@@ -536,6 +536,77 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * {@code dynamic} and the like.
      */
     /**
+     * Creates an index from a native request using the REST path's settings and template validation.
+     *
+     * @param metadata the metadata plane
+     * @param request the admitted native request
+     * @return the created descriptor
+     * @throws Exception if validation or metadata persistence fails
+     */
+    public static IndexDescriptor createIndex(MetadataPlane metadata, org.opensearch.action.admin.indices.create.CreateIndexRequest request)
+        throws Exception {
+        final var invalid = request.validate();
+        if (invalid != null) {
+            throw invalid;
+        }
+        if (request.context() != null) {
+            throw new org.opensearch.OpenSearchStatusException("create-index contexts are not supported", RestStatus.NOT_IMPLEMENTED);
+        }
+        if (request.aliases().isEmpty() == false) {
+            throw new org.opensearch.OpenSearchStatusException(
+                "aliases in a create-index request are not supported; create the index, then create the alias",
+                RestStatus.NOT_IMPLEMENTED
+            );
+        }
+        final Settings settings = Settings.builder().put(request.settings()).normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX).build();
+        final String mapping = nativeMapping(request.mappings());
+        try {
+            return createIndex(metadata, request.index(), CreateRequest.fromSettings(settings, mapping, 1));
+        } catch (RefusedException e) {
+            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), e.status);
+        } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
+            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+        }
+    }
+
+    private static String nativeMapping(String source) {
+        if (source == null || source.isEmpty()) {
+            return null;
+        }
+        try (
+            var parser = org.opensearch.common.xcontent.json.JsonXContent.jsonXContent.createParser(
+                org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
+                org.opensearch.core.xcontent.DeprecationHandler.IGNORE_DEPRECATIONS,
+                source
+            )
+        ) {
+            if (parser.nextToken() != org.opensearch.core.xcontent.XContentParser.Token.START_OBJECT) {
+                throw new IllegalArgumentException("mappings must be an object");
+            }
+            Map<String, Object> mapping = parser.mapOrdered();
+            if (parser.nextToken() != null) {
+                throw new IllegalArgumentException("trailing content after mappings");
+            }
+            // Native map-based builders wrap mappings in _doc; templates use the unwrapped shape.
+            final String type = org.opensearch.index.mapper.MapperService.SINGLE_MAPPING_NAME;
+            if (mapping.containsKey(type)) {
+                if (mapping.size() != 1 || mapping.get(type) instanceof Map == false) {
+                    throw new IllegalArgumentException("a typed mapping must contain one mapping object");
+                }
+                @SuppressWarnings("unchecked")
+                final Map<String, Object> unwrapped = (Map<String, Object>) mapping.get(type);
+                mapping = unwrapped;
+            }
+            try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+                builder.map(mapping);
+                return builder.toString();
+            }
+        } catch (IOException | RuntimeException e) {
+            throw new org.opensearch.OpenSearchStatusException("could not parse mappings: " + e.getMessage(), RestStatus.BAD_REQUEST, e);
+        }
+    }
+
+    /**
      * Creates an index from a request, with what matching templates contribute layered under it.
      *
      * <p>A caller who spelled out a mapping is not overruled by configuration they may not know exists.
@@ -868,6 +939,10 @@ public final class IndexAdminHandler extends BaseRestHandler {
                 throw new RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'settings' must be an object");
             }
 
+            return fromSettings(settings, mapping, fromQuery);
+        }
+
+        private static CreateRequest fromSettings(Settings settings, String mapping, int fromQuery) throws RefusedException {
             final String replicas = settings.get(IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
             if (replicas != null && "0".equals(replicas) == false) {
                 // Refused, and with the real reason. Accepting it would mean recording a replica count that
