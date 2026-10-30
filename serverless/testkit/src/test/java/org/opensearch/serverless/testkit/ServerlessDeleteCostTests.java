@@ -98,7 +98,8 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
      * idle index and for one with a writer holding its shard.
      *
      * <p>The writes are what the design changes: the tombstone path writes a marker and a tombstone at the
-     * delete and retains them when conditional deletion is unavailable. The conditional path writes one
+     * delete and retains them when conditional deletion is unavailable. An owned head costs one more CAS
+     * to release it without deleting a replacement's head. The conditional path writes one
      * reclaim intent and purges its bytes once. The logged totals measure both paths without assuming that
      * their different safety and retention guarantees always produce the same cost ordering.
      */
@@ -119,8 +120,8 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
                 conditionalTotal
             );
             assertEquals(
-                "the tombstone path writes a marker and a tombstone at the delete",
-                2L,
+                "the tombstone path writes a marker, a tombstone, and releases an owned head by CAS",
+                writer ? 3L : 2L,
                 (long) tombstoned.atDelete().getOrDefault("PutObject", 0L)
             );
             assertEquals("unsupported conditional deletion retains tombstones without further writes", Map.of(), tombstoned.deferred());
@@ -147,6 +148,13 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
         Map<String, Long> before = org.opensearch.repositories.s3.MinioBlobStores.requestCounts(store);
         assertTrue(plane.deleteIndex("doomed"));
         final Map<String, Long> atDelete = delta(before, org.opensearch.repositories.s3.MinioBlobStores.requestCounts(store));
+        if (conditional == false && writer) {
+            // Outside either measured interval: validate safety without charging the assertion's GET.
+            final var retained = plane.heads().read("doomed", 0).orElseThrow();
+            assertNull(retained.ownerNodeId());
+            assertEquals("uuid-doomed", retained.indexUuid());
+            assertEquals(1L, retained.term());
+        }
         before = org.opensearch.repositories.s3.MinioBlobStores.requestCounts(store);
         if (conditional) {
             clock.addAndGet(ReclaimQueue.DEFAULT_DELAY_MILLIS + 61_000L);
