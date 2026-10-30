@@ -94,10 +94,28 @@ public final class MultiSearchHandler extends BaseRestHandler {
          * One runnable line, with the defaults and refusals a lone {@code _search} applies.
          *
          * @param index the index expression
+         * @param options the execution options parsed for this line
          * @param source the parsed search
          * @param ignoreUnavailable the line's own ignore_unavailable
          * @return the line, refused if it must be
          */
+        static Sub of(
+            String index,
+            org.opensearch.action.search.SearchRequest options,
+            SearchSourceBuilder source,
+            boolean ignoreUnavailable
+        ) {
+            if (options != null
+                && (options.searchType() != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH
+                    || options.routing() != null
+                    || options.scroll() != null
+                    || options.pipeline() != null
+                    || (options.preference() != null && options.preference().startsWith("_shards")))) {
+                return refuse(index, RestStatus.NOT_IMPLEMENTED, "unsupported_search", "the search requests unsupported execution options");
+            }
+            return of(index, source, ignoreUnavailable);
+        }
+
         static Sub of(String index, SearchSourceBuilder source, boolean ignoreUnavailable) {
             SearchHandler.applyDefaults(source, false);
             final String unsupported = SearchHandler.whatCannotBeMerged(source);
@@ -152,7 +170,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
         request.param("max_concurrent_searches");
         request.param("max_concurrent_shard_requests");
         request.param("pre_filter_shard_size");
-        request.param("search_type");
+        final String defaultSearchType = request.param("search_type");
         request.param("ccs_minimize_roundtrips");
         final boolean requestIgnoreUnavailable = request.paramAsBoolean("ignore_unavailable", false);
         request.param("allow_no_indices");
@@ -189,7 +207,13 @@ public final class MultiSearchHandler extends BaseRestHandler {
         }
         final List<Sub> batch;
         try {
-            batch = parse(request.content().utf8ToString(), defaultIndex, requestIgnoreUnavailable, serving0.searchXContentRegistry());
+            batch = parse(
+                request.content().utf8ToString(),
+                defaultIndex,
+                defaultSearchType,
+                requestIgnoreUnavailable,
+                serving0.searchXContentRegistry()
+            );
         } catch (BadBatch e) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_request", e.getMessage())
@@ -341,8 +365,13 @@ public final class MultiSearchHandler extends BaseRestHandler {
         }
     }
 
-    private static List<Sub> parse(String body, String defaultIndex, boolean requestIgnoreUnavailable, NamedXContentRegistry registry)
-        throws BadBatch {
+    private static List<Sub> parse(
+        String body,
+        String defaultIndex,
+        String defaultSearchType,
+        boolean requestIgnoreUnavailable,
+        NamedXContentRegistry registry
+    ) throws BadBatch {
         final List<Sub> batch = new ArrayList<>();
         final String[] lines = body.split("\n");
         int at = 0;
@@ -359,13 +388,10 @@ public final class MultiSearchHandler extends BaseRestHandler {
             final String header = lines[at++];
             String index = defaultIndex;
             boolean ignoreUnavailable = requestIgnoreUnavailable;
-            String refusedFor = null;
+            final org.opensearch.action.search.SearchRequest options = new org.opensearch.action.search.SearchRequest();
             try (XContentParser parser = parser(header, NamedXContentRegistry.EMPTY)) {
                 final Map<String, Object> parsed = parser.map();
-                // Both spellings core accepts. The rest of the header is read for what it is: routing
-                // would change which shards are asked and is refused; preference, search_type,
-                // request_cache, allow_no_indices and expand_wildcards are hints with one possible answer
-                // here and are consumed without effect, the same as on a lone _search.
+                // Preserve execution choices so unsupported semantics are refused per search.
                 final Object named = parsed.containsKey("index") ? parsed.get("index") : parsed.get("indices");
                 if (named instanceof String one) {
                     index = one;
@@ -375,8 +401,17 @@ public final class MultiSearchHandler extends BaseRestHandler {
                 if (parsed.get("ignore_unavailable") != null) {
                     ignoreUnavailable = Boolean.parseBoolean(String.valueOf(parsed.get("ignore_unavailable")));
                 }
-                if (parsed.get("routing") != null) {
-                    refusedFor = "routing is not supported: a document here is placed by its id alone";
+                options.searchType(defaultSearchType);
+                for (Map.Entry<String, Object> entry : parsed.entrySet()) {
+                    final Object value = entry.getValue();
+                    final String text = value == null ? null : String.valueOf(value);
+                    switch (entry.getKey()) {
+                        case "search_type", "searchType" -> options.searchType(text);
+                        case "routing" -> options.routing(text);
+                        case "preference" -> options.preference(text);
+                        default -> {
+                        }
+                    }
                 }
             } catch (Exception e) {
                 throw new BadBatch("line " + at + ": the header must be an object naming the index");
@@ -391,10 +426,6 @@ public final class MultiSearchHandler extends BaseRestHandler {
                 );
                 continue;
             }
-            if (refusedFor != null) {
-                batch.add(Sub.refuse(index, RestStatus.NOT_IMPLEMENTED, "unsupported_search", refusedFor));
-                continue;
-            }
             // The node's own registry, not an empty one: a query body names aggregations, queries and
             // suggesters that only a populated registry can resolve. An empty registry fails every query
             // with "named objects are not supported", which looks like a malformed request and is not.
@@ -402,7 +433,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                 // The same defaults and refusals a lone _search makes. Without them collapse, suggest and
                 // profile were silently dropped inside a batch and refused outside one, and search_after
                 // went unvalidated -- two answers for one query depending on which endpoint carried it.
-                batch.add(Sub.of(index, SearchSourceBuilder.fromXContent(parser, true), ignoreUnavailable));
+                batch.add(Sub.of(index, options, SearchSourceBuilder.fromXContent(parser, true), ignoreUnavailable));
             } catch (Exception e) {
                 // The batch is well-formed; this query is not. That is this search's failure.
                 batch.add(
