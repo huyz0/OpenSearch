@@ -22,6 +22,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -440,6 +441,43 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
                 .build();
             final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
             return new Response(response.statusCode(), response.body());
+        }
+    }
+
+    public void testDataStreamCreationPreservesInheritedTimestampPrecision() throws Exception {
+        assertDataStreamTimestampPrecision(false);
+    }
+
+    public void testDataStreamRolloverPreservesInheritedTimestampPrecision() throws Exception {
+        assertDataStreamTimestampPrecision(true);
+    }
+
+    private void assertDataStreamTimestampPrecision(boolean rollover) throws Exception {
+        try (Fixture f = fixture("timestamp-precision")) {
+            final String template =
+                "{\"index_patterns\":[\"events*\"],\"data_stream\":{},\"template\":{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date_nanos\",\"format\":\"strict_date_optional_time_nanos\"}}}}}";
+            final Response stored = send(f.node(), "PUT", "/_index_template/events", template);
+            assertEquals(stored.body(), 200, stored.status());
+            final Response created = send(f.node(), "PUT", "/_data_stream/events", null);
+            assertEquals(created.body(), 200, created.status());
+            if (rollover) {
+                final Response rolled = send(f.node(), "POST", "/events/_rollover", null);
+                assertEquals(rolled.body(), 200, rolled.status());
+            }
+            final String name = rollover ? ".ds-events-000002" : ".ds-events-000001";
+            final var descriptor = f.plane().describe(name).orElseThrow();
+            final Map<String, Object> expected = Map.of(
+                "properties",
+                Map.of("@timestamp", Map.of("type", "date_nanos", "format", "strict_date_optional_time_nanos"))
+            );
+            assertEquals(
+                expected,
+                org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                    new org.opensearch.core.common.bytes.BytesArray(descriptor.mapping()),
+                    false,
+                    org.opensearch.common.xcontent.XContentType.JSON
+                ).v2()
+            );
         }
     }
 }

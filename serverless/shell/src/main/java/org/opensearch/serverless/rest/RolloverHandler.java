@@ -291,9 +291,7 @@ public final class RolloverHandler extends BaseRestHandler {
         // index it made. A stream's backing index inherits what the stream's own name matches, which is the
         // template that declared the stream -- see DataStreamHandler.create for why it cannot be resolved
         // against the backing name.
-        final IndexAdminHandler.CreateRequest create = record.dataStream()
-            ? DataStreamHandler.withTimestamp(ask.create(), record.timestampField())
-            : ask.create();
+        final IndexAdminHandler.CreateRequest create = ask.create();
         long newGeneration = record.generation() + 1;
         String createdUuid;
         try {
@@ -303,11 +301,16 @@ public final class RolloverHandler extends BaseRestHandler {
                     metadata.componentTemplates().all(),
                     ask.target()
                 );
+                final IndexAdminHandler.CreateRequest streamCreate = DataStreamHandler.withTimestamp(
+                    create,
+                    record.timestampField(),
+                    inherited
+                );
                 // A taken name is skipped by bumping the generation, as core does, rather than wedging the
                 // stream on a name something else holds.
                 for (int attempt = 0;; attempt++) {
                     try {
-                        createdUuid = IndexAdminHandler.createIndex(metadata, newName, create, inherited).uuid();
+                        createdUuid = IndexAdminHandler.createIndex(metadata, newName, streamCreate, inherited).uuid();
                         break;
                     } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
                         if (attempt >= 8) {
