@@ -233,4 +233,55 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             assertNull("and its head is given back for the next attempt", plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
         }
     }
+
+    public void testLegacyPrefixCannotOverwriteANewerSequencedWrite() throws Exception {
+        assertMixedReplay(
+            java.util.List.of(new WalRecord("logged", "{\"n\":1}"), new WalRecord("logged", "{\"n\":9}", 0L, 1L, 1L)),
+            "{\"n\":9}"
+        );
+    }
+
+    public void testLegacyPrefixCannotResurrectASequencedDelete() throws Exception {
+        assertMixedReplay(java.util.List.of(new WalRecord("logged", "{\"n\":1}"), WalRecord.deletion("logged", 0L, 1L, 1L)), null);
+    }
+
+    public void testLegacyDeletePrefixCannotEraseASequencedWrite() throws Exception {
+        assertMixedReplay(java.util.List.of(WalRecord.deletion("logged"), new WalRecord("logged", "{\"n\":9}", 0L, 1L, 1L)), "{\"n\":9}");
+    }
+
+    public void testLegacySuffixStillAppliesAfterASequencedWrite() throws Exception {
+        assertMixedReplay(
+            java.util.List.of(new WalRecord("logged", "{\"n\":1}", 0L, 1L, 1L), new WalRecord("logged", "{\"n\":9}")),
+            "{\"n\":9}"
+        );
+    }
+
+    private void assertMixedReplay(java.util.List<WalRecord> records, String expected) throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            final var descriptor = new IndexDescriptor("mixed", "uuid-mixed", 1, "{\"properties\":{\"n\":{\"type\":\"long\"}}}", null);
+            plane.createIndex(descriptor);
+            plane.walStore("mixed", descriptor.uuid(), 0).append(1L, records);
+            try (var node = new ServerlessNode(nodeSettings("mixed-replay-order"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var shard = node.activateWriter(plane, "mixed", 0).orElseThrow();
+                final var document = node.get(shard, "logged");
+                assertEquals(expected != null, document.found());
+                assertEquals(expected, document.source());
+            }
+        }
+    }
+
+    public void testMixedReplayRetainsUnrelatedLegacyDocuments() throws Exception {
+        assertMixedReplay(
+            java.util.List.of(new WalRecord("logged", "{\"n\":9}"), new WalRecord("other", "{\"n\":1}", 0L, 1L, 1L)),
+            "{\"n\":9}"
+        );
+    }
+
+    public void testLegacyDeleteSuffixStillAppliesAfterASequencedWrite() throws Exception {
+        assertMixedReplay(java.util.List.of(new WalRecord("logged", "{\"n\":1}", 0L, 1L, 1L), WalRecord.deletion("logged")), null);
+    }
 }
