@@ -115,13 +115,19 @@ public final class MultiGetHandler extends BaseRestHandler {
             );
         }
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
-            try {
+            try (var budget = new ResponseBudget(serving)) {
                 final MultiGetResponse response = serving.actionGate().run(MultiGetAction.NAME, ask, admitted -> {
                     if (admitted instanceof MultiGetRequest selected) {
-                        return fetch(serving, metadata, selected);
+                        return fetch(serving, metadata, selected, budget);
                     }
                     throw new OpenSearchStatusException("multi-get requires a native MultiGetRequest", RestStatus.NOT_IMPLEMENTED);
                 }, ActionGate.identity(MultiGetResponse.class));
+                long retained = 256L;
+                for (var item : response.getResponses()) {
+                    retained += ResponseMemory.of(item);
+                }
+                // A filter may return a cached response or replace the result, including in place.
+                budget.ensureAtLeast(retained);
                 try (var builder = channel.newBuilder()) {
                     response.toXContent(builder, request);
                     channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
@@ -136,7 +142,8 @@ public final class MultiGetHandler extends BaseRestHandler {
         });
     }
 
-    private static MultiGetResponse fetch(ServerlessNode serving, MetadataPlane metadata, MultiGetRequest request) throws Exception {
+    private static MultiGetResponse fetch(ServerlessNode serving, MetadataPlane metadata, MultiGetRequest request, ResponseBudget budget)
+        throws Exception {
         final var validation = request.validate();
         if (validation != null) {
             throw validation;
@@ -144,10 +151,15 @@ public final class MultiGetHandler extends BaseRestHandler {
         final ShardOperations operations = new ShardOperations(serving, metadata, true);
         final MultiGetItemResponse[] responses = new MultiGetItemResponse[request.getItems().size()];
         final List<Callable<Boolean>> tasks = new ArrayList<>(responses.length);
+        final var exhausted = new java.util.concurrent.atomic.AtomicReference<RuntimeException>();
         for (int i = 0; i < responses.length; i++) {
             final int position = i;
             final MultiGetRequest.Item item = request.getItems().get(i);
             tasks.add(() -> {
+                if (exhausted.get() != null) {
+                    return true;
+                }
+                final MultiGetItemResponse failed;
                 try {
                     if (serving.isSystemIndex(item.index())) {
                         throw new OpenSearchSecurityException(
@@ -169,21 +181,27 @@ public final class MultiGetHandler extends BaseRestHandler {
                         .preference(request.preference())
                         .realtime(request.realtime())
                         .refresh(request.refresh());
-                    responses[position] = new MultiGetItemResponse(operations.get(get), null);
+                    final var found = new MultiGetItemResponse(operations.get(get), null);
+                    budget.keep(found, () -> responses[position] = found);
+                    return true;
                 } catch (ShardOperations.NoSuchIndexException e) {
-                    responses[position] = failure(item, new IndexNotFoundException(item.index()));
+                    failed = failure(item, new IndexNotFoundException(item.index()));
                 } catch (ShardOperations.SystemIndexException e) {
-                    responses[position] = failure(
-                        item,
-                        new OpenSearchSecurityException("system_index: " + e.getMessage(), RestStatus.FORBIDDEN)
-                    );
+                    failed = failure(item, new OpenSearchSecurityException("system_index: " + e.getMessage(), RestStatus.FORBIDDEN));
                 } catch (ShardOperations.NotHereException e) {
-                    responses[position] = failure(
+                    failed = failure(
                         item,
                         new OpenSearchStatusException(e.restType(serving.localNode().getId()) + ": " + e.getMessage(), e.restStatus())
                     );
                 } catch (Exception e) {
-                    responses[position] = failure(item, e);
+                    failed = failure(item, e);
+                }
+                try {
+                    budget.keep(failed, () -> responses[position] = failed);
+                } catch (RuntimeException e) {
+                    // Even failure diagnostics must fit. Refuse the whole batch if they cannot, rather
+                    // than returning null slots or continuing to fetch data there is no room to retain.
+                    exhausted.compareAndSet(null, e);
                 }
                 return true;
             });
@@ -192,7 +210,15 @@ public final class MultiGetHandler extends BaseRestHandler {
             Fanout.run(serving.threadPool().executor(ThreadPool.Names.GET), Fanout.DEFAULT_CONCURRENCY, tasks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            budget.abandon(() -> java.util.Arrays.fill(responses, null));
             throw new IOException("interrupted while reading a multi-get", e);
+        } catch (RuntimeException | Error e) {
+            budget.abandon(() -> java.util.Arrays.fill(responses, null));
+            throw e;
+        }
+        if (exhausted.get() != null) {
+            budget.abandon(() -> java.util.Arrays.fill(responses, null));
+            throw exhausted.get();
         }
         return new MultiGetResponse(responses);
     }

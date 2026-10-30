@@ -264,91 +264,107 @@ public final class MultiSearchHandler extends BaseRestHandler {
         List<Sub> batch,
         org.opensearch.core.xcontent.ToXContent.Params params
     ) throws IOException {
-        final long startNanos = System.nanoTime();
-        final List<Item> items = new ArrayList<>();
-        for (Sub sub : batch) {
-            final long each = System.nanoTime();
-            try {
-                if (sub.status() != null) {
-                    items.add(new Item(null, false, List.of(), sub.status(), sub.type(), sub.reason()));
-                    continue;
-                }
-                // The same resolution a lone _search does, refusals included. This used to look each name
-                // up and silently drop the ones it could not find, so a line naming a misspelt index
-                // answered from the others and looked complete.
-                final SearchHandler.Resolution resolved = SearchHandler.resolveIndices(
-                    metadata,
-                    serving,
-                    sub.index(),
-                    sub.ignoreUnavailable()
-                );
-                if (resolved.refused()) {
-                    items.add(new Item(null, false, List.of(), resolved.status(), resolved.type(), resolved.reason()));
-                    continue;
-                }
-                // Under the same gate a lone _search runs under, so a privilege evaluator sees every line.
-                final var outcome = SearchHandler.gated(
-                    serving,
-                    resolved.indices().keySet(),
-                    sub.source(),
-                    sub.partialResults(),
-                    admitted -> SearchFanout.run(serving, metadata, resolved.indices(), admitted)
-                );
-                items.add(
-                    new Item(
-                        SearchHandler.toResponse(
-                            outcome,
-                            sub.source(),
-                            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - each),
+        try (var budget = new ResponseBudget(serving)) {
+            final long startNanos = System.nanoTime();
+            final List<Item> items = new ArrayList<>();
+            for (Sub sub : batch) {
+                final long each = System.nanoTime();
+                try {
+                    if (sub.status() != null) {
+                        keep(items, budget, new Item(null, false, List.of(), sub.status(), sub.type(), sub.reason()));
+                        continue;
+                    }
+                    // The same resolution a lone _search does, refusals included. This used to look each name
+                    // up and silently drop the ones it could not find, so a line naming a misspelt index
+                    // answered from the others and looked complete.
+                    final SearchHandler.Resolution resolved = SearchHandler.resolveIndices(
+                        metadata,
+                        serving,
+                        sub.index(),
+                        sub.ignoreUnavailable()
+                    );
+                    if (resolved.refused()) {
+                        keep(items, budget, new Item(null, false, List.of(), resolved.status(), resolved.type(), resolved.reason()));
+                        continue;
+                    }
+                    // Under the same gate a lone _search runs under, so a privilege evaluator sees every line.
+                    final var outcome = SearchHandler.gated(
+                        serving,
+                        resolved.indices().keySet(),
+                        sub.source(),
+                        sub.partialResults(),
+                        admitted -> SearchFanout.run(serving, metadata, resolved.indices(), admitted)
+                    );
+                    keep(
+                        items,
+                        budget,
+                        new Item(
+                            SearchHandler.toResponse(
+                                outcome,
+                                sub.source(),
+                                java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - each),
+                                null
+                            ),
+                            outcome.complete(),
+                            resolved.skipped(),
+                            null,
+                            null,
                             null
-                        ),
-                        outcome.complete(),
-                        resolved.skipped(),
-                        null,
-                        null,
-                        null
-                    )
-                );
-            } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
-                items.add(new Item(null, false, List.of(), RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage()));
-            } catch (Exception e) {
-                // This search's problem, not the batch's. The slot carries the failure so a caller
-                // pairing responses to requests by position still can -- with the failure's own status
-                // and core's own type name, so a breaker's 429 and a filter's 403 do not both arrive as a
-                // 500 that reads like the node broke.
-                final Throwable cause = org.opensearch.ExceptionsHelper.unwrapCause(e);
-                items.add(
-                    new Item(
-                        null,
-                        false,
-                        List.of(),
-                        org.opensearch.ExceptionsHelper.status(cause),
-                        org.opensearch.OpenSearchException.getExceptionName(cause),
-                        cause.getMessage() == null ? cause.toString() : cause.getMessage()
-                    )
-                );
-            }
-        }
-        // took first, then the responses, each carrying its own status: the order and the shape core's
-        // MultiSearchResponse writes, which a client's parser is built for.
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("took", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
-            builder.startArray("responses");
-            for (Item item : items) {
-                if (item.response() == null) {
-                    error(builder, item.status(), item.type(), item.reason());
-                    continue;
+                        )
+                    );
+                } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
+                    keep(items, budget, new Item(null, false, List.of(), RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage()));
+                } catch (Exception e) {
+                    // This search's problem, not the batch's. The slot carries the failure so a caller
+                    // pairing responses to requests by position still can -- with the failure's own status
+                    // and core's own type name, so a breaker's 429 and a filter's 403 do not both arrive as a
+                    // 500 that reads like the node broke.
+                    final Throwable cause = org.opensearch.ExceptionsHelper.unwrapCause(e);
+                    keep(
+                        items,
+                        budget,
+                        new Item(
+                            null,
+                            false,
+                            List.of(),
+                            org.opensearch.ExceptionsHelper.status(cause),
+                            org.opensearch.OpenSearchException.getExceptionName(cause),
+                            cause.getMessage() == null ? cause.toString() : cause.getMessage()
+                        )
+                    );
                 }
-                builder.startObject();
-                SearchHandler.renderInto(builder, item.skipped(), item.response(), item.complete(), params);
-                builder.field("status", item.response().status().getStatus());
-                builder.endObject();
             }
-            builder.endArray();
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            // took first, then the responses, each carrying its own status: the order and the shape core's
+            // MultiSearchResponse writes, which a client's parser is built for.
+            try (XContentBuilder builder = channel.newBuilder()) {
+                builder.startObject();
+                builder.field("took", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+                builder.startArray("responses");
+                for (Item item : items) {
+                    if (item.response() == null) {
+                        error(builder, item.status(), item.type(), item.reason());
+                        continue;
+                    }
+                    builder.startObject();
+                    SearchHandler.renderInto(builder, item.skipped(), item.response(), item.complete(), params);
+                    builder.field("status", item.response().status().getStatus());
+                    builder.endObject();
+                }
+                builder.endArray();
+                builder.endObject();
+                channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            }
         }
+    }
+
+    private static void keep(List<Item> items, ResponseBudget budget, Item item) {
+        long bytes = item.response() == null
+            ? 512L + 2L * (item.type().length() + item.reason().length())
+            : ResponseMemory.of(item.response());
+        for (String skipped : item.skipped()) {
+            bytes += 48L + 2L * skipped.length();
+        }
+        budget.keep(bytes, () -> items.add(item));
     }
 
     private static void error(XContentBuilder builder, RestStatus status, String type, String reason) throws IOException {
