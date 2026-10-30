@@ -198,6 +198,9 @@ public final class PointInTimeHandler extends BaseRestHandler {
             if (selected.getRouting() != null) {
                 throw unsupported("routing a PIT to a subset of shards is not supported");
             }
+            if (selected.getPreference() != null && selected.getPreference().isEmpty() == false) {
+                throw unsupported("PIT preferences are not supported: capture covers every shard of one concrete index");
+            }
             if (selected.getKeepAlive().millis() > MAX_KEEP_ALIVE_MILLIS) {
                 output.sendResponse(IndexAdminHandler.error(output, RestStatus.BAD_REQUEST, "keep_alive_too_long", keepAliveTooLong()));
                 return;

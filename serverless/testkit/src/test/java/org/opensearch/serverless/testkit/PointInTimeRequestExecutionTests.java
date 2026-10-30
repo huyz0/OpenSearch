@@ -298,4 +298,46 @@ public class PointInTimeRequestExecutionTests extends OpenSearchTestCase {
             return client.send(request, HttpResponse.BodyHandlers.ofString());
         }
     }
+
+    public void testCreateRefusesAnIgnoredUrlShardPreference() throws Exception {
+        withNode(new org.opensearch.plugins.Plugin() {
+        }, (node, metadata) -> {
+            metadata.createIndex(new IndexDescriptor("two-shards", "uuid-two-shards", 2, "{}", null));
+            for (int id = 0; id < 2; id++) {
+                final var shard = node.activateWriter(metadata, "two-shards", id).orElseThrow();
+                node.index(shard, "doc-" + id, "{}");
+                node.publishShard(shard, metadata.heads().read("two-shards", id).orElseThrow().term());
+            }
+            final var response = send(node, "POST", "/two-shards/_pit?keep_alive=30s&preference=_shards:0", null);
+            assertEquals(response.body(), 501, response.statusCode());
+            assertTrue(metadata.livePointsInTime(1000L).isEmpty());
+        });
+    }
+
+    public void testCreateRefusesAnIgnoredAdmittedShardPreference() throws Exception {
+        withNode(new PitFilterPlugin(CreatePitAction.NAME, request -> {
+            final var selected = new CreatePitRequest(TimeValue.timeValueSeconds(10), false, "public-index");
+            selected.setPreference("_shards:0");
+            return selected;
+        }), (node, metadata) -> {
+            final var response = send(node, "POST", "/private-index/_pit?keep_alive=30s", null);
+            assertEquals(response.body(), 501, response.statusCode());
+            assertTrue(metadata.livePointsInTime(1000L).isEmpty());
+        });
+    }
+
+    public void testCreateMayUseAnAdmittedRequestWithoutTheUrlPreference() throws Exception {
+        withNode(
+            new PitFilterPlugin(
+                CreatePitAction.NAME,
+                request -> new CreatePitRequest(TimeValue.timeValueSeconds(10), false, "public-index")
+            ),
+            (node, metadata) -> {
+                final var response = send(node, "POST", "/private-index/_pit?keep_alive=30s&preference=_shards:0", null);
+                assertEquals(response.body(), 200, response.statusCode());
+                final var pit = metadata.pointInTime((String) json(response.body()).get("pit_id")).orElseThrow();
+                assertEquals("public-index", pit.index());
+            }
+        );
+    }
 }
