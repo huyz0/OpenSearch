@@ -205,9 +205,9 @@ public final class DataStreamHandler extends BaseRestHandler {
             sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "[" + name + "] already exists");
             return;
         }
-        final TemplateResolver.Inherited inherited = TemplateResolver.resolve(
-            metadata.indexTemplates().all(),
-            metadata.componentTemplates().all(),
+        final TemplateResolver.Inherited inherited = TemplateResolver.resolveFromStores(
+            metadata.indexTemplates(),
+            metadata::componentTemplates,
             name
         );
         if (inherited.isDataStream() == false) {
@@ -272,6 +272,10 @@ public final class DataStreamHandler extends BaseRestHandler {
                 return;
             }
         }
+        final Map<String, String> templateNames = TemplateResolver.matchingTemplateNames(
+            metadata.indexTemplates(),
+            streams.stream().map(AliasRecord::name).toList()
+        );
         // Core's GetDataStreamAction shape.
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
@@ -291,11 +295,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                 builder.endArray();
                 builder.field("generation", stream.generation());
                 builder.field("status", "GREEN");
-                final String template = TemplateResolver.resolve(
-                    metadata.indexTemplates().all(),
-                    metadata.componentTemplates().all(),
-                    stream.name()
-                ).from();
+                final String template = templateNames.get(stream.name());
                 if (template != null) {
                     builder.field("template", template);
                 }

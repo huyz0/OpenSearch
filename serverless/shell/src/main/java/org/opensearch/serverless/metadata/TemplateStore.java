@@ -420,6 +420,96 @@ public final class TemplateStore {
     }
 
     /**
+     * Reads a configuration snapshot without retaining every body's source. Retrying starts the whole
+     * callback again, so an intermediate winner or partially merged result never survives a moved revision.
+     */
+    <T> T readView(org.opensearch.common.CheckedFunction<ReadView, T, IOException> work) throws IOException {
+        try {
+            return work.apply(new ReadView(readMarker()));
+        } catch (MissingContentException e) {
+            return work.apply(new ReadView(readMarker()));
+        }
+    }
+
+    /** Retains a complete small snapshot, dropping the candidate map as soon as its budget is exceeded. */
+    private final class BoundedSnapshot {
+        private final Marker marker;
+        private Map<String, String> contents = new TreeMap<>();
+        private long retained;
+
+        private BoundedSnapshot(Marker marker) {
+            this.marker = marker;
+        }
+
+        private void add(String name, String source) {
+            if (contents != null) {
+                retained += retainedBytes(name, source);
+                if (retained <= MAX_CACHED_BYTES) {
+                    contents.put(name, source);
+                } else {
+                    contents = null;
+                }
+            }
+        }
+
+        private void publish() {
+            cache.snapshot = contents == null
+                ? null
+                : new Snapshot(
+                    marker.version(),
+                    marker.legacy() ? Map.of() : Map.copyOf(marker.entries()),
+                    Collections.unmodifiableMap(contents)
+                );
+        }
+    }
+
+    /** One marker's names and immutable revisions, loaded only when the consumer needs them. */
+    final class ReadView {
+        private final Marker marker;
+
+        private ReadView(Marker marker) {
+            this.marker = marker;
+        }
+
+        Optional<String> get(String name) throws IOException {
+            Names.validateId(name, "template");
+            return TemplateStore.this.get(name, marker);
+        }
+
+        void forEach(org.opensearch.common.CheckedBiConsumer<String, String, IOException> consumer) throws IOException {
+            final Snapshot cached = cache.snapshot;
+            if (cached != null && cached.version() == marker.version()) {
+                for (var entry : cached.contents().entrySet()) {
+                    consumer.accept(entry.getKey(), entry.getValue());
+                }
+                return;
+            }
+            final BoundedSnapshot snapshot = new BoundedSnapshot(marker);
+            if (marker.legacy()) {
+                for (String blob : container.listBlobsByPrefix(LEGACY_PREFIX).keySet()) {
+                    if (blob.startsWith(LEGACY_PREFIX)) {
+                        final String name = blob.substring(LEGACY_PREFIX.length());
+                        final Optional<String> source = legacyGet(name);
+                        if (source.isPresent()) {
+                            consumer.accept(name, source.get());
+                            snapshot.add(name, source.get());
+                        }
+                    }
+                }
+            } else {
+                for (var entry : marker.entries().entrySet()) {
+                    final String source = TemplateStore.this.get(entry.getKey(), marker)
+                        .orElseThrow(() -> new MissingContentException(entry.getKey(), entry.getValue()));
+                    consumer.accept(entry.getKey(), source);
+                    snapshot.add(entry.getKey(), source);
+                }
+            }
+            // In particular, remember an empty legacy store, so each untemplated create does not LIST again.
+            snapshot.publish();
+        }
+    }
+
+    /**
      * Reads the templates whose names begin with a prefix, or all of them for an empty prefix.
      *
      * @param prefix the prefix, empty for all
