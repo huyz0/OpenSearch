@@ -4130,11 +4130,10 @@ public final class ServerlessNode implements Closeable {
             false
         );
         if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.FAILURE) {
-            // A conditional write that lost is a FAILURE carrying a VersionConflictEngineException rather
-            // than a thrown one -- s0-findings.md F5's trap in its sharpest form, since the caller asked
-            // a question and would otherwise be told the answer was yes.
-            if (result.getFailure() instanceof org.opensearch.index.engine.VersionConflictEngineException conflict) {
-                throw conflict;
+            // Core returns parsing and conditional-write failures as values. Preserve their native
+            // exceptions so a client error keeps its status instead of becoming a generic I/O error.
+            if (result.getFailure() instanceof RuntimeException failure) {
+                throw failure;
             }
         }
         if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.MAPPING_UPDATE_REQUIRED && mayGrowMapping) {
@@ -4147,7 +4146,7 @@ public final class ServerlessNode implements Closeable {
         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
             // s0-findings.md F5: this is a value, not a throw. A caller that ignores it indexes nothing
             // and reports no error.
-            throw new java.io.IOException("indexing " + id + " returned " + result.getResultType());
+            throw new java.io.IOException("indexing " + id + " returned " + result.getResultType(), result.getFailure());
         }
         appendOrRelease(
             shardId,
