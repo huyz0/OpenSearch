@@ -103,7 +103,11 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
         assumeEndpoint();
         final String bucket = freshBucket();
 
-        try (ServerlessBootstrap boot = ServerlessBootstrap.start(s3Settings("s3-node", bucket))) {
+        try (
+            ServerlessBootstrap boot = ServerlessBootstrap.start(
+                Settings.builder().put(s3Settings("s3-node", bucket)).put("serverless.roles", "ingest,search").build()
+            )
+        ) {
             final var http = boot.node().boundHttpAddress().publishAddress();
 
             assertEquals("index creation must reach the bucket", 200, send(http, "PUT", "/alpha?shards=1", MAPPING).status());
@@ -142,16 +146,21 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             assertEquals(200, send(http, "DELETE", "/_pit/" + pitId, null).status());
             assertTrue(boot.plane().pointInTime(pitId).isEmpty());
 
-            assertEquals(
-                200,
-                send(http, "PUT", "/_snapshot/backups", "{\"type\":\"fs\",\"settings\":{\"remote_store_index_shallow_copy\":true}}")
-                    .status()
-            );
+            assertEquals(200, send(http, "PUT", "/_snapshot/backups", "{\"type\":\"fs\"}").status());
             final Response captured = send(http, "PUT", "/_snapshot/backups/copied", "{\"indices\":\"alpha\"}");
-            assertEquals("snapshot capture must publish its conditional state: " + captured.body(), 200, captured.status());
+            assertEquals("standard snapshot copies must land in their unique namespace: " + captured.body(), 200, captured.status());
             final var capturedRecord = boot.plane().snapshot("backups", "copied").orElseThrow();
             assertNotNull(capturedRecord.storageGeneration());
-            assertTrue(capturedRecord.shallow());
+            final Response restored = send(
+                http,
+                "POST",
+                "/_snapshot/backups/copied/_restore",
+                "{\"rename_pattern\":\"alpha\",\"rename_replacement\":\"restored-alpha\"}"
+            );
+            assertEquals("the copied snapshot must restore over object-store I/O: " + restored.body(), 200, restored.status());
+            final Response restoredHit = send(http, "GET", "/restored-alpha/_search?q=msg:in-a-bucket", null);
+            assertEquals(restoredHit.body(), 200, restoredHit.status());
+            assertTrue(restoredHit.body(), restoredHit.body().contains("in-a-bucket"));
             assertEquals(200, send(http, "DELETE", "/_snapshot/backups/copied", null).status());
             assertTrue(boot.plane().snapshot("backups", "copied").isEmpty());
             assertTrue(boot.plane().liveSnapshots().isEmpty());

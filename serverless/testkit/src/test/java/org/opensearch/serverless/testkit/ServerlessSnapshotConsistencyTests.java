@@ -418,6 +418,48 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
         }
     }
 
+    public void testModernSnapshotCaptureNeedsNoSourceInventory() throws Exception {
+        copyWithoutSourceInventories(true);
+    }
+
+    public void testModernSnapshotRestoreNeedsNoCopiedInventory() throws Exception {
+        copyWithoutSourceInventories(false);
+    }
+
+    private void copyWithoutSourceInventories(boolean blockCapture) throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        try (var store = new org.opensearch.serverless.testkit.HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-copy-cost", 1, MAPPING, null));
+            try (ServerlessNode node = new ServerlessNode(nodeSettings("snapshot-copy-cost"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var loop = hold(node, plane, clock, "alpha", 1);
+                assertEquals(201, send(node, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"copied\",\"n\":1}").status());
+                loop.tick(clock.get());
+                assertFalse(plane.segmentPublisher("alpha", 0).readManifest().orElseThrow().lengths().isEmpty());
+                assertEquals(200, send(node, "PUT", "/_snapshot/backups", "{\"type\":\"fs\"}").status());
+                if (blockCapture) {
+                    store.failListingsUnder("segments/");
+                }
+                final var capture = send(node, "PUT", "/_snapshot/backups/s", "{\"indices\":\"alpha\"}");
+                assertEquals("captured manifest lengths already describe every file: " + capture.body(), 200, capture.status());
+                store.failListingsUnder("snapshot-data-v2/");
+                final var restore = send(
+                    node,
+                    "POST",
+                    "/_snapshot/backups/s/_restore",
+                    "{\"rename_pattern\":\"alpha\",\"rename_replacement\":\"restored\"}"
+                );
+                assertEquals("stored snapshot lengths must survive through restore: " + restore.body(), 200, restore.status());
+                assertFalse(plane.segmentPublisher("restored", 0).readManifest().orElseThrow().lengths().isEmpty());
+                final var found = send(node, "GET", "/restored/_doc/1", null);
+                assertEquals(200, found.status());
+                assertTrue(found.body(), found.body().contains("\"found\":true"));
+            }
+        }
+    }
+
     private BackgroundReconciler hold(ServerlessNode node, MetadataPlane plane, AtomicLong clock, String index, int shards)
         throws Exception {
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);

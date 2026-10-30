@@ -36,7 +36,6 @@ import org.opensearch.serverless.store.SegmentPublisher;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -941,33 +940,58 @@ public final class SnapshotHandler extends BaseRestHandler {
      */
     private CommitManifest copyShardBlobs(BlobStore blobStore, BlobPath sourceBase, BlobPath destBase, CommitManifest source)
         throws IOException {
-        // Term 1, not 0: a shard-head's term must be positive (s0-findings.md F4), and this manifest may
-        // end up opened as a reader if it is ever restored -- true even when this call is only copying
-        // into repository storage rather than a live shard, since that same manifest is what a later
-        // restore publishes verbatim at its own destination.
         final String destTermDir = SegmentPublisher.termSegment(1L);
         final BlobContainer destContainer = blobStore.blobContainer(destBase.add(destTermDir));
         final Map<String, String> destFiles = new LinkedHashMap<>();
-        final Map<String, Map<String, BlobMetadata>> sourceListings = new LinkedHashMap<>();
-        for (Map.Entry<String, String> file : source.files().entrySet()) {
-            final String fileName = file.getKey();
-            final String termDir = file.getValue();
-            final BlobContainer sourceContainer = blobStore.blobContainer(sourceBase.add(termDir));
-            Map<String, BlobMetadata> listing = sourceListings.get(termDir);
-            if (listing == null) {
-                listing = sourceContainer.listBlobs();
-                sourceListings.put(termDir, listing);
+        final Map<String, Long> lengths = new LinkedHashMap<>();
+        final Map<String, java.util.Set<String>> missingByTerm = new LinkedHashMap<>();
+        for (var file : source.files().entrySet()) {
+            final Long known = source.lengths().get(file.getKey());
+            if (known != null) {
+                if (known < 0L) {
+                    throw new IOException("snapshot contains a negative file length");
+                }
+                lengths.put(file.getKey(), known);
+            } else {
+                missingByTerm.computeIfAbsent(file.getValue(), ignored -> new java.util.HashSet<>()).add(file.getKey());
             }
-            final BlobMetadata sourceMeta = listing.get(fileName);
-            if (sourceMeta == null) {
-                throw new IOException("snapshot references a blob that no longer exists: " + termDir + "/" + fileName);
-            }
-            try (InputStream in = sourceContainer.readBlob(fileName)) {
-                destContainer.writeBlob(fileName, in, sourceMeta.length(), false);
-            }
-            destFiles.put(fileName, destTermDir);
         }
-        return new CommitManifest(1L, destFiles, null);
+        // Older manifests have no lengths. Page their term inventory rather than retaining every
+        // historical file in that term, and stop as soon as the captured files have been found.
+        for (var term : missingByTerm.entrySet()) {
+            final BlobContainer container = blobStore.blobContainer(sourceBase.add(term.getKey()));
+            String cursor = null;
+            while (term.getValue().isEmpty() == false) {
+                final var page = container.listBlobsByPrefix("", cursor, 1000);
+                for (BlobMetadata metadata : page) {
+                    if (term.getValue().remove(metadata.name())) {
+                        lengths.put(metadata.name(), metadata.length());
+                    }
+                }
+                if (page.size() < 1000) {
+                    break;
+                }
+                final String next = page.get(page.size() - 1).name();
+                if (next.equals(cursor)) {
+                    throw new IOException("snapshot source listing did not advance");
+                }
+                cursor = next;
+            }
+            if (term.getValue().isEmpty() == false) {
+                throw new IOException("snapshot references blobs that no longer exist in " + term.getKey());
+            }
+        }
+        for (var file : source.files().entrySet()) {
+            final String name = file.getKey();
+            final BlobContainer sourceContainer = blobStore.blobContainer(sourceBase.add(file.getValue()));
+            // S3 requires mark/reset for upload retries. Reopen a ranged read on reset rather
+            // than buffering a potentially multi-gigabyte segment in memory.
+            try (var input = new org.opensearch.serverless.store.RepeatableBlobInputStream(sourceContainer, name, lengths.get(name))) {
+                destContainer.writeBlob(name, input, lengths.get(name), false);
+            }
+            destFiles.put(name, destTermDir);
+        }
+        return new CommitManifest(1L, destFiles, null, lengths);
     }
 
     private static List<String> readIndices(Object field) {
