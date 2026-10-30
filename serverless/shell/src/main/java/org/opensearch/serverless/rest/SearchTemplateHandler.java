@@ -231,42 +231,48 @@ public final class SearchTemplateHandler extends BaseRestHandler {
                 )
             );
         }
-        final List<MultiSearchHandler.Sub> subs = new ArrayList<>();
-        for (SearchTemplateRequest template : batch.requests()) {
-            final SearchRequest line = template.getRequest();
-            final String index = line == null || line.indices().length == 0 ? request.param("index") : String.join(",", line.indices());
-            if (index == null) {
-                subs.add(
-                    MultiSearchHandler.Sub.refuse(
-                        null,
-                        RestStatus.BAD_REQUEST,
-                        "malformed_request",
-                        "no index given for this search and none in the path"
-                    )
-                );
-                continue;
-            }
-            try {
-                subs.add(
-                    MultiSearchHandler.Sub.of(
-                        index,
-                        parse(serving, render(serving, template), template),
-                        line != null && line.indicesOptions().ignoreUnavailable()
-                    )
-                );
-            } catch (Exception e) {
-                subs.add(
-                    MultiSearchHandler.Sub.refuse(
-                        index,
-                        RestStatus.BAD_REQUEST,
-                        "malformed_request",
-                        e.getMessage() == null ? e.toString() : e.getMessage()
-                    )
-                );
-            }
-        }
+        final String defaultIndex = request.param("index");
+        // Rendering stored templates can read object storage and must leave the HTTP worker first.
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
+                final List<MultiSearchHandler.Sub> subs = new ArrayList<>();
+                for (SearchTemplateRequest template : batch.requests()) {
+                    final SearchRequest line = template.getRequest();
+                    final String index = line == null || line.indices().length == 0 ? defaultIndex : String.join(",", line.indices());
+                    if (index == null) {
+                        subs.add(
+                            MultiSearchHandler.Sub.refuse(
+                                null,
+                                RestStatus.BAD_REQUEST,
+                                "malformed_request",
+                                "no index given for this search and none in the path"
+                            )
+                        );
+                        continue;
+                    }
+                    try {
+                        if (line != null && template.getSearchPipeline() != null) {
+                            line.pipeline(template.getSearchPipeline());
+                        }
+                        subs.add(
+                            MultiSearchHandler.Sub.of(
+                                index,
+                                line,
+                                parse(serving, render(serving, template), template),
+                                line != null && line.indicesOptions().ignoreUnavailable()
+                            )
+                        );
+                    } catch (Exception e) {
+                        subs.add(
+                            MultiSearchHandler.Sub.refuse(
+                                index,
+                                RestStatus.BAD_REQUEST,
+                                "malformed_request",
+                                e.getMessage() == null ? e.toString() : e.getMessage()
+                            )
+                        );
+                    }
+                }
                 multiSearch.answer(channel, metadata, serving, subs, request);
             } catch (Exception e) {
                 try {

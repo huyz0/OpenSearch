@@ -74,11 +74,26 @@ public final class RankEvalHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final String index = request.param("index");
-        // Hints; indices here resolve by one rule, and there is one search type.
+        // Index resolution options have one implementation here.
         request.param("ignore_unavailable");
         request.param("allow_no_indices");
         request.param("expand_wildcards");
-        request.param("search_type");
+        final org.opensearch.action.search.SearchType searchType;
+        try {
+            searchType = org.opensearch.action.search.SearchType.fromString(request.param("search_type"));
+        } catch (IllegalArgumentException e) {
+            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_request", e.getMessage()));
+        }
+        if (searchType != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_search",
+                    "DFS ranking evaluation is not supported: only query_then_fetch is available"
+                )
+            );
+        }
         final MetadataPlane metadata = plane.get();
         final ServerlessNode serving = node.get();
         if (metadata == null || serving == null) {
