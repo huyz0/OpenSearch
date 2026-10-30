@@ -20,7 +20,6 @@ import org.opensearch.transport.client.node.NodeClient;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
@@ -38,9 +37,8 @@ import java.util.function.Supplier;
  * {@code TemplateStore} refuses the thousand-and-first. Bounding an input is not the same as truncating an
  * answer, and it puts the cost on the operation that caused it rather than on index creation.
  *
- * <p><b>Templates are stored verbatim.</b> Parsing one into a typed model here would be a second account of a
- * shape OpenSearch defines, and the only parts this shell reads are the patterns, the priority and what is
- * composed.
+ * <p>Native template requests and responses pass through action filters. Admitted definitions are
+ * validated and stored in canonical JSON, so native parsing, filter policy and inheritance agree.
  */
 public final class TemplateHandler extends BaseRestHandler {
 
@@ -85,7 +83,8 @@ public final class TemplateHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final boolean component = request.path().startsWith("/_component_template");
         final String name = request.param("name");
-        final String body = request.hasContent() ? request.content().utf8ToString() : null;
+        final var content = request.hasContent() ? request.content() : org.opensearch.core.common.bytes.BytesArray.EMPTY;
+        final var mediaType = request.getMediaType() == null ? org.opensearch.common.xcontent.XContentType.JSON : request.getMediaType();
         final RestRequest.Method method = request.method();
         final boolean create = request.paramAsBoolean("create", false);
         // Hints: there is no cluster manager to time out against, and cause is a log annotation.
@@ -121,7 +120,7 @@ public final class TemplateHandler extends BaseRestHandler {
             );
         }
 
-        if ((method == RestRequest.Method.PUT || method == RestRequest.Method.POST) && (body == null || body.isBlank())) {
+        if ((method == RestRequest.Method.PUT || method == RestRequest.Method.POST) && content.length() == 0) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a template body is required")
             );
@@ -130,39 +129,133 @@ public final class TemplateHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 final TemplateStore store = component ? metadata.componentTemplates() : metadata.indexTemplates();
-                final String action = switch (method) {
-                    case PUT, POST -> component
-                        ? org.opensearch.action.admin.indices.template.put.PutComponentTemplateAction.NAME
-                        : org.opensearch.action.admin.indices.template.put.PutComposableIndexTemplateAction.NAME;
-                    case DELETE -> component
+                if (method == RestRequest.Method.PUT || method == RestRequest.Method.POST) {
+                    final org.opensearch.action.ActionRequest ask;
+                    final String action;
+                    if (component) {
+                        ask = new org.opensearch.action.admin.indices.template.put.PutComponentTemplateAction.Request(name).create(create)
+                            .componentTemplate(parse(content, mediaType, org.opensearch.cluster.metadata.ComponentTemplate::parse));
+                        action = org.opensearch.action.admin.indices.template.put.PutComponentTemplateAction.NAME;
+                    } else {
+                        ask = new org.opensearch.action.admin.indices.template.put.PutComposableIndexTemplateAction.Request(name).create(
+                            create
+                        ).indexTemplate(parse(content, mediaType, org.opensearch.cluster.metadata.ComposableIndexTemplate::parse));
+                        action = org.opensearch.action.admin.indices.template.put.PutComposableIndexTemplateAction.NAME;
+                    }
+                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                        if (component) {
+                            final var selected = require(
+                                admitted,
+                                org.opensearch.action.admin.indices.template.put.PutComponentTemplateAction.Request.class
+                            );
+                            validate(selected);
+                            concreteName(selected.name());
+                            return put(store, true, selected.name(), json(selected.componentTemplate()), selected.create());
+                        }
+                        final var selected = require(
+                            admitted,
+                            org.opensearch.action.admin.indices.template.put.PutComposableIndexTemplateAction.Request.class
+                        );
+                        validate(selected);
+                        concreteName(selected.name());
+                        return put(store, false, selected.name(), json(selected.indexTemplate()), selected.create());
+                    },
+                        org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
+                        )
+                    );
+                    render(channel, response, request);
+                } else if (method == RestRequest.Method.DELETE) {
+                    final org.opensearch.action.ActionRequest ask = component
+                        ? new org.opensearch.action.admin.indices.template.delete.DeleteComponentTemplateAction.Request(name)
+                        : new org.opensearch.action.admin.indices.template.delete.DeleteComposableIndexTemplateAction.Request(name);
+                    final String action = component
                         ? org.opensearch.action.admin.indices.template.delete.DeleteComponentTemplateAction.NAME
                         : org.opensearch.action.admin.indices.template.delete.DeleteComposableIndexTemplateAction.NAME;
-                    default -> component
-                        ? org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.NAME
-                        : org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.NAME;
-                };
-                IndexAdminHandler.gate(
-                    serving,
-                    action,
-                    new org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.Request(name),
-                    () -> {
-                        switch (method) {
-                            case PUT, POST -> put(channel, store, component, name, body, create);
-                            case GET -> get(channel, store, component, name);
-                            case HEAD -> head(channel, store, name);
-                            case DELETE -> delete(channel, store, name);
-                            default -> channel.sendResponse(
-                                IndexAdminHandler.error(
-                                    channel,
-                                    RestStatus.METHOD_NOT_ALLOWED,
-                                    "method_not_allowed",
-                                    method + " is not supported here"
-                                )
-                            );
-                        }
-                        return null;
+                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                        final String selected = component
+                            ? require(
+                                admitted,
+                                org.opensearch.action.admin.indices.template.delete.DeleteComponentTemplateAction.Request.class
+                            ).name()
+                            : require(
+                                admitted,
+                                org.opensearch.action.admin.indices.template.delete.DeleteComposableIndexTemplateAction.Request.class
+                            ).name();
+                        validate(admitted);
+                        concreteName(selected);
+                        return delete(store, selected);
+                    },
+                        org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
+                        )
+                    );
+                    render(channel, response, request);
+                } else if (component) {
+                    final var response = serving.actionGate()
+                        .run(
+                            org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.NAME,
+                            new org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.Request(name),
+                            admitted -> {
+                                final var selected = require(
+                                    admitted,
+                                    org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.Request.class
+                                );
+                                validate(selected);
+                                final Map<String, org.opensearch.cluster.metadata.ComponentTemplate> found =
+                                    new java.util.LinkedHashMap<>();
+                                for (var entry : get(store, selected.name()).entrySet()) {
+                                    found.put(
+                                        entry.getKey(),
+                                        parse(entry.getValue(), org.opensearch.cluster.metadata.ComponentTemplate::parse)
+                                    );
+                                }
+                                return new org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.Response(found);
+                            },
+                            org.opensearch.serverless.shell.ActionGate.identity(
+                                org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.Response.class
+                            )
+                        );
+                    if (method == RestRequest.Method.HEAD) {
+                        head(channel, response.getComponentTemplates().isEmpty() == false);
+                    } else {
+                        render(channel, response, request);
                     }
-                );
+                } else {
+                    final var response = serving.actionGate()
+                        .run(
+                            org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.NAME,
+                            new org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.Request(name),
+                            admitted -> {
+                                final var selected = require(
+                                    admitted,
+                                    org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.Request.class
+                                );
+                                validate(selected);
+                                final Map<String, org.opensearch.cluster.metadata.ComposableIndexTemplate> found =
+                                    new java.util.LinkedHashMap<>();
+                                for (var entry : get(store, selected.name()).entrySet()) {
+                                    found.put(
+                                        entry.getKey(),
+                                        parse(entry.getValue(), org.opensearch.cluster.metadata.ComposableIndexTemplate::parse)
+                                    );
+                                }
+                                return new org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.Response(
+                                    found
+                                );
+                            },
+                            org.opensearch.serverless.shell.ActionGate.identity(
+                                org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.Response.class
+                            )
+                        );
+                    if (method == RestRequest.Method.HEAD) {
+                        head(channel, response.indexTemplates().isEmpty() == false);
+                    } else {
+                        render(channel, response, request);
+                    }
+                }
+            } catch (IndexAdminHandler.RefusedException e) {
+                sendQuietly(channel, e.status, e.type, e.getMessage());
             } catch (TemplateStore.TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_templates", e.getMessage());
             } catch (IllegalArgumentException e) {
@@ -177,14 +270,13 @@ public final class TemplateHandler extends BaseRestHandler {
         });
     }
 
-    private void put(
-        org.opensearch.rest.RestChannel channel,
+    private org.opensearch.action.support.clustermanager.AcknowledgedResponse put(
         TemplateStore store,
         boolean component,
         String name,
         String body,
         boolean create
-    ) throws IOException {
+    ) throws IOException, IndexAdminHandler.RefusedException {
         final Map<String, Object> parsed;
         try {
             parsed = org.opensearch.common.xcontent.XContentHelper.convertToMap(
@@ -193,8 +285,11 @@ public final class TemplateHandler extends BaseRestHandler {
                 org.opensearch.common.xcontent.XContentType.JSON
             ).v2();
         } catch (Exception e) {
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not parse the template: " + e.getMessage());
-            return;
+            throw new IndexAdminHandler.RefusedException(
+                RestStatus.BAD_REQUEST,
+                "malformed_body",
+                "could not parse the template: " + e.getMessage()
+            );
         }
         if (component == false && parsed.get("index_patterns") == null) {
             // An index template with no patterns matches nothing, so storing one would be storing something
@@ -207,24 +302,25 @@ public final class TemplateHandler extends BaseRestHandler {
                     + "decides what it applies to"
             );
         }
-        // Stored verbatim and read selectively, so what the resolver does not read must be refused here
+        // Inheritance reads only supported sections, so the remaining sections must be refused here
         // rather than kept: a template carrying aliases round-tripped through GET looking honoured, and
         // never created one. version and _meta are stored and returned, which is all core does with them.
         if (parsed.get("template") instanceof Map<?, ?> template
             && template.get("aliases") instanceof Map<?, ?> aliases
             && aliases.isEmpty() == false) {
-            sendQuietly(
-                channel,
+            throw new IndexAdminHandler.RefusedException(
                 RestStatus.NOT_IMPLEMENTED,
                 "unsupported_template",
                 "template.aliases is not supported: aliases are not created with an index here. Create the index, "
                     + "then PUT /{index}/_alias/{name}"
             );
-            return;
         }
         if (parsed.get("data_stream") != null && (parsed.get("data_stream") instanceof Map<?, ?>) == false) {
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", "data_stream must be an object");
-            return;
+            throw new IndexAdminHandler.RefusedException(
+                RestStatus.BAD_REQUEST,
+                "illegal_argument_exception",
+                "data_stream must be an object"
+            );
         }
         if (parsed.get("template") instanceof Map<?, ?> template && template.get("settings") != null) {
             // The settings a template contributes are validated the way a create request's are, in every
@@ -232,8 +328,11 @@ public final class TemplateHandler extends BaseRestHandler {
             // failing the first index that inherits it. Replicas above zero and the pipeline settings are
             // refused for the reasons a create refuses them.
             if ((template.get("settings") instanceof Map<?, ?>) == false) {
-                sendQuietly(channel, RestStatus.BAD_REQUEST, "malformed_body", "template.settings must be an object");
-                return;
+                throw new IndexAdminHandler.RefusedException(
+                    RestStatus.BAD_REQUEST,
+                    "malformed_body",
+                    "template.settings must be an object"
+                );
             }
             final org.opensearch.common.settings.Settings settings;
             try {
@@ -244,90 +343,126 @@ public final class TemplateHandler extends BaseRestHandler {
                     .normalizePrefix(org.opensearch.cluster.metadata.IndexMetadata.INDEX_SETTING_PREFIX)
                     .build();
             } catch (Exception e) {
-                sendQuietly(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not read template.settings: " + e.getMessage());
-                return;
+                throw new IndexAdminHandler.RefusedException(
+                    RestStatus.BAD_REQUEST,
+                    "malformed_body",
+                    "could not read template.settings: " + e.getMessage()
+                );
             }
             final String replicas = settings.get(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
             if (replicas != null && "0".equals(replicas) == false) {
-                sendQuietly(
-                    channel,
+                throw new IndexAdminHandler.RefusedException(
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_setting",
                     "number_of_replicas is not supported: a shard has one writer and its durability comes from the "
                         + "object store, not from replica copies"
                 );
-                return;
             }
             try {
                 IndexAdminHandler.validateIndexSettings(settings, false);
             } catch (IndexAdminHandler.RefusedException e) {
-                sendQuietly(channel, e.status, e.type, e.getMessage());
-                return;
+                throw new IndexAdminHandler.RefusedException(e.status, e.type, e.getMessage());
             }
         }
         store.put(name, body, create);
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("acknowledged", true);
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
-    private void get(org.opensearch.rest.RestChannel channel, TemplateStore store, boolean component, String name) throws IOException {
-        final String key = component ? "component_templates" : "index_templates";
-        final String nameKey = component ? "name" : "name";
-        final Map<String, String> found;
+    private static Map<String, String> get(TemplateStore store, String name) throws IOException, IndexAdminHandler.RefusedException {
+        if (name != null && name.startsWith("_")) {
+            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "not_implemented", "reserved template API: " + name);
+        }
         if (name == null) {
-            found = store.all();
-        } else if (name.endsWith("*")) {
-            found = store.withPrefix(name.substring(0, name.length() - 1));
-        } else {
-            final Optional<String> one = store.get(name);
-            if (one.isEmpty()) {
-                sendQuietly(channel, RestStatus.NOT_FOUND, "template_missing", "no such template: " + name);
-                return;
-            }
-            found = Map.of(name, one.get());
+            return store.all();
         }
-
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.startArray(key);
-            for (Map.Entry<String, String> each : found.entrySet()) {
-                builder.startObject();
-                builder.field(nameKey, each.getKey());
-                // The stored JSON, handed back as it arrived. Re-serialising a parsed copy would risk
-                // returning something subtly different from what was stored, which on a configuration API is
-                // the difference between a round trip and a rewrite.
-                builder.rawField(
-                    component ? "component_template" : "index_template",
-                    new java.io.ByteArrayInputStream(each.getValue().getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-                    org.opensearch.common.xcontent.XContentType.JSON
-                );
-                builder.endObject();
-            }
-            builder.endArray();
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        if (name.endsWith("*")) {
+            return store.withPrefix(name.substring(0, name.length() - 1));
         }
+        final var one = store.get(name);
+        if (one.isEmpty()) {
+            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_FOUND, "template_missing", "no such template: " + name);
+        }
+        return Map.of(name, one.get());
     }
 
-    private void head(org.opensearch.rest.RestChannel channel, TemplateStore store, String name) throws IOException {
-        final boolean there = name != null && store.get(name).isPresent();
+    private static void head(org.opensearch.rest.RestChannel channel, boolean there) throws IOException {
         channel.sendResponse(new BytesRestResponse(there ? RestStatus.OK : RestStatus.NOT_FOUND, BytesRestResponse.TEXT_CONTENT_TYPE, ""));
     }
 
-    private void delete(org.opensearch.rest.RestChannel channel, TemplateStore store, String name) throws IOException {
+    private static org.opensearch.action.support.clustermanager.AcknowledgedResponse delete(TemplateStore store, String name)
+        throws IOException, IndexAdminHandler.RefusedException {
         if (store.delete(name) == false) {
-            sendQuietly(channel, RestStatus.NOT_FOUND, "template_missing", "no such template: " + name);
-            return;
+            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_FOUND, "template_missing", "no such template: " + name);
         }
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
+    }
+
+    private static void render(
+        org.opensearch.rest.RestChannel channel,
+        org.opensearch.core.xcontent.ToXContent response,
+        org.opensearch.core.xcontent.ToXContent.Params params
+    ) throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("acknowledged", true);
-            builder.endObject();
+            response.toXContent(builder, params);
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        }
+    }
+
+    private static String json(org.opensearch.core.xcontent.ToXContent value) throws IOException {
+        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            value.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+            return org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
+        }
+    }
+
+    private static <T> T parse(
+        org.opensearch.core.common.bytes.BytesReference content,
+        org.opensearch.core.xcontent.MediaType mediaType,
+        org.opensearch.common.CheckedFunction<org.opensearch.core.xcontent.XContentParser, T, IOException> reader
+    ) throws IOException {
+        try (
+            var parser = mediaType.xContent()
+                .createParser(
+                    org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
+                    org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                    content.streamInput()
+                )
+        ) {
+            final T value = reader.apply(parser);
+            if (parser.nextToken() != null) {
+                throw new IllegalArgumentException("trailing content after template definition");
+            }
+            return value;
+        }
+    }
+
+    private static <T> T parse(
+        String content,
+        org.opensearch.common.CheckedFunction<org.opensearch.core.xcontent.XContentParser, T, IOException> reader
+    ) throws IOException {
+        return parse(new org.opensearch.core.common.bytes.BytesArray(content), org.opensearch.common.xcontent.XContentType.JSON, reader);
+    }
+
+    private static <T> T require(org.opensearch.action.ActionRequest request, Class<T> type) {
+        if (type.isInstance(request) == false) {
+            throw new org.opensearch.OpenSearchStatusException(
+                "template action requires " + type.getSimpleName(),
+                RestStatus.NOT_IMPLEMENTED
+            );
+        }
+        return type.cast(request);
+    }
+
+    private static void validate(org.opensearch.action.ActionRequest request) {
+        final var invalid = request.validate();
+        if (invalid != null) {
+            throw new IllegalArgumentException(invalid.getMessage(), invalid);
+        }
+    }
+
+    private static void concreteName(String name) {
+        if (name == null || name.isBlank() || name.indexOf('*') >= 0 || name.indexOf('?') >= 0 || name.startsWith("_")) {
+            throw new org.opensearch.OpenSearchStatusException("template mutations require one concrete name", RestStatus.NOT_IMPLEMENTED);
         }
     }
 
