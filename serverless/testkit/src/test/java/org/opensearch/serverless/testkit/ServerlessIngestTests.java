@@ -141,6 +141,44 @@ public class ServerlessIngestTests extends OpenSearchTestCase {
         }
     }
 
+    public void testCachedPipelineSeesStoredScriptUpdatesAndDeletion() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        try (ServerlessNode node = running(plane(clock, createTempDir()), clock, "cached-stored-script")) {
+            assertNotNull(node);
+            final String scriptPath = "/_scripts/transform/" + org.opensearch.script.IngestScript.CONTEXT.name;
+            assertEquals(200, call("PUT", scriptPath, "{\"script\":{\"lang\":\"painless\",\"source\":\"ctx.tag = 'before'\"}}").status());
+            assertEquals(200, call("PUT", "/_ingest/pipeline/stored", "{\"processors\":[{\"script\":{\"id\":\"transform\"}}]}").status());
+            assertEquals(201, call("PUT", "/alpha/_doc/before?pipeline=stored&refresh=true", "{}").status());
+            assertTrue(call("GET", "/alpha/_doc/before", null).has("\"tag\":\"before\""));
+            assertEquals(200, call("PUT", scriptPath, "{\"script\":{\"lang\":\"painless\",\"source\":\"ctx.tag = 'after'\"}}").status());
+            assertEquals(201, call("PUT", "/alpha/_doc/after?pipeline=stored&refresh=true", "{}").status());
+            assertTrue(call("GET", "/alpha/_doc/after", null).has("\"tag\":\"after\""));
+            assertEquals(200, call("DELETE", "/_scripts/transform", null).status());
+            final Answer refused = call("PUT", "/alpha/_doc/deleted-script?pipeline=stored", "{}");
+            assertEquals(refused.body(), 400, refused.status());
+            assertEquals(404, call("GET", "/alpha/_doc/deleted-script", null).status());
+        }
+    }
+
+    public void testCachedConditionalProcessorSeesStoredScriptUpdates() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        try (ServerlessNode node = running(plane(clock, createTempDir()), clock, "cached-stored-condition")) {
+            assertNotNull(node);
+            final String scriptPath = "/_scripts/condition/" + org.opensearch.script.IngestConditionalScript.CONTEXT.name;
+            assertEquals(200, call("PUT", scriptPath, "{\"script\":{\"lang\":\"painless\",\"source\":\"return false\"}}").status());
+            assertEquals(
+                200,
+                call("PUT", "/_ingest/pipeline/conditional", "{\"processors\":[{\"drop\":{\"if\":{\"id\":\"condition\"}}}]}").status()
+            );
+            assertEquals(201, call("PUT", "/alpha/_doc/kept?pipeline=conditional", "{}").status());
+            assertEquals(200, call("PUT", scriptPath, "{\"script\":{\"lang\":\"painless\",\"source\":\"return true\"}}").status());
+            final Answer dropped = call("PUT", "/alpha/_doc/dropped?pipeline=conditional", "{}");
+            assertEquals(dropped.body(), 200, dropped.status());
+            assertTrue(dropped.body(), dropped.has("dropped_by_pipeline"));
+            assertEquals(404, call("GET", "/alpha/_doc/dropped", null).status());
+        }
+    }
+
     /** A pipeline is stored, read back verbatim, and removed. */
     public void testAPipelineRoundTrips() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
