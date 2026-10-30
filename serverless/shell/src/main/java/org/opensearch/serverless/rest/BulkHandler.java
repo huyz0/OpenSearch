@@ -49,11 +49,10 @@ import java.util.function.Supplier;
  * A single request may therefore touch several shards on several nodes and still cost one append per
  * shard.
  *
- * <p><b>Unsupported actions are refused per item, not quietly reinterpreted.</b> {@code create} means
- * "fail if this document exists" and {@code update} means a partial merge; neither can be honoured
- * without version-conditional writes, which this system does not have. Treating them as {@code index}
- * would be the failure mode D2 exists to prevent — a request that is accepted and means something other
- * than what it says. They are rejected individually, so the rest of the batch still lands.
+ * <p><b>Unsupported actions are refused per item.</b> {@code create} uses the engine's fail-if-present
+ * operation. A partial {@code update} requires reading the current document and is refused in a batch;
+ * callers can use the single-document update endpoint. Versioning and condition fields are validated
+ * before dispatch so they cannot silently become unconditional writes.
  *
  * <p><b>Groups are dispatched together.</b> A batch spanning three shards is one round trip's worth of
  * latency rather than three, because paying per shard instead of per document is the same mistake batching
@@ -593,7 +592,7 @@ public final class BulkHandler extends BaseRestHandler {
                 builder.startObject();
                 // The action the caller wrote, not a normalised one: a client matching items to the
                 // actions it sent looks up this key.
-                builder.startObject(item.operation.isDeletion() ? "delete" : item.requireAbsent ? "create" : "index");
+                builder.startObject("index".equals(item.action) && item.requireAbsent ? "create" : item.action);
                 // The backing index once the item was routed, as core reports it and as the single-document
                 // path reports it; the name the caller wrote until then, since nothing else is known.
                 builder.field("_index", item.writtenIndex != null ? item.writtenIndex : item.index);
@@ -653,6 +652,10 @@ public final class BulkHandler extends BaseRestHandler {
         final List<byte[]> lines = split(body);
         int line = 0;
         while (line < lines.size()) {
+            if (new String(lines.get(line), StandardCharsets.UTF_8).isBlank()) {
+                line++;
+                continue;
+            }
             final Action action = parseAction(lines.get(line), line + 1, defaultIndex);
             line++;
             if (action.needsSource) {
@@ -667,7 +670,7 @@ public final class BulkHandler extends BaseRestHandler {
         return items;
     }
 
-    /** Splits on newlines, dropping blank lines: a serialized action or source is never blank. */
+    /** Splits on newlines, retaining empty sources so the next action cannot become a document. */
     private static List<byte[]> split(byte[] body) {
         final List<byte[]> lines = new ArrayList<>();
         int start = 0;
@@ -680,7 +683,7 @@ public final class BulkHandler extends BaseRestHandler {
             if (end > start && body[end - 1] == '\r') {
                 end--;
             }
-            if (end > start && new String(body, start, end - start, StandardCharsets.UTF_8).isBlank() == false) {
+            if (i < body.length || end > start) {
                 final byte[] copy = new byte[end - start];
                 System.arraycopy(body, start, copy, 0, end - start);
                 lines.add(copy);
@@ -699,7 +702,7 @@ public final class BulkHandler extends BaseRestHandler {
      * system to order writes by a number the caller maintains and it does not keep — the same refusal
      * {@code PUT /{index}/_doc/{id}} makes, for the same reason.
      */
-    private static final java.util.Set<String> EXTERNAL_VERSION_FIELDS = java.util.Set.of("_version", "version_type");
+    private static final java.util.Set<String> EXTERNAL_VERSION_FIELDS = java.util.Set.of("version", "_version", "version_type");
 
     /**
      * The names a condition is <em>not</em> spelled with on an action line.
@@ -734,10 +737,12 @@ public final class BulkHandler extends BaseRestHandler {
                 if (token == XContentParser.Token.FIELD_NAME) {
                     field = parser.currentName();
                 } else if (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY) {
-                    // A nested value has no meaning on an action line. Skipped whole: this walker is flat,
-                    // and {"index":{"_id":"1","x":{"_id":"2"}}} used to overwrite _id with the inner one
-                    // and stop at the inner object's end.
-                    parser.skipChildren();
+                    if ("update".equals(action.name) && "_source".equals(field)) {
+                        // A valid update-only option; the action itself is refused per item below.
+                        parser.skipChildren();
+                    } else {
+                        throw new BadRequest("line " + lineNumber + ": expected a scalar value for [" + field + "]");
+                    }
                 } else if (token.isValue()) {
                     if ("_index".equals(field)) {
                         action.index = parser.text();
@@ -764,8 +769,17 @@ public final class BulkHandler extends BaseRestHandler {
                         action.ifSeqNo = parser.longValue();
                     } else if ("if_primary_term".equals(field)) {
                         action.ifPrimaryTerm = parser.longValue();
+                    } else if ("update".equals(action.name) && ("retry_on_conflict".equals(field) || "_source".equals(field))) {
+                        // Consumed only for the unsupported update action.
+                    } else {
+                        throw new BadRequest("line " + lineNumber + ": unknown action metadata [" + field + "]");
                     }
                 }
+            }
+            if (token != XContentParser.Token.END_OBJECT
+                || parser.nextToken() != XContentParser.Token.END_OBJECT
+                || parser.nextToken() != null) {
+                throw new BadRequest("line " + lineNumber + ": expected exactly one complete action");
             }
             return action;
         } catch (org.opensearch.core.xcontent.XContentParseException e) {
@@ -802,10 +816,11 @@ public final class BulkHandler extends BaseRestHandler {
         }
 
         Item toItem() {
-            // An id is generated when none is given, the same as classic. It has to exist before the
-            // item does, because routing is a function of it.
-            final String documentId = id != null ? id : UUIDs.base64UUID();
+            // Only index/create may generate an id. A missing delete id is a failed item and must
+            // never become a deletion of a newly generated, unrelated id.
+            final String documentId = id != null ? id : "delete".equals(name) || "update".equals(name) ? "" : UUIDs.base64UUID();
             final Item item = new Item(
+                name,
                 index,
                 "delete".equals(name) ? WalRecord.deletion(documentId) : new WalRecord(documentId, source == null ? "" : source)
             );
@@ -813,7 +828,11 @@ public final class BulkHandler extends BaseRestHandler {
             item.ifSeqNo = ifSeqNo;
             item.ifPrimaryTerm = ifPrimaryTerm;
             item.pipeline = pipeline;
-            if (opType != null && "create".equals(opType) == false && "index".equals(opType) == false) {
+            if (("delete".equals(name) && (id == null || id.isEmpty())) || (id != null && id.isEmpty())) {
+                item.fail(RestStatus.BAD_REQUEST, "missing_id", "this operation requires a nonempty document id");
+            } else if (opType != null && "index".equals(name) == false) {
+                item.fail(RestStatus.BAD_REQUEST, "bad_request", "op_type is an option of the index action");
+            } else if (opType != null && "create".equals(opType) == false && "index".equals(opType) == false) {
                 item.fail(RestStatus.BAD_REQUEST, "bad_request", "op_type must be create or index, not [" + opType + "]");
             } else if (routing != null) {
                 item.fail(
@@ -860,21 +879,31 @@ public final class BulkHandler extends BaseRestHandler {
                         + "' is what a bulk response reports, not what a request asks with. A condition is "
                         + "spelled if_seq_no and if_primary_term on the action line."
                 );
-            } else if ((ifSeqNo == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO) != (ifPrimaryTerm == 0L)) {
-                item.fail(
-                    RestStatus.BAD_REQUEST,
-                    "invalid_condition",
-                    "if_seq_no and if_primary_term must be supplied together on '" + documentId + "'"
-                );
-            } else if (("index".equals(name) || "create".equals(name)) && (source == null || source.isBlank())) {
-                item.fail(RestStatus.BAD_REQUEST, "missing_source", "the document body for '" + documentId + "' was empty");
-            }
+            } else if ((ifSeqNo < 0L && ifSeqNo != org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO)
+                || ifPrimaryTerm < 0L
+                || (item.requireAbsent
+                    && (ifSeqNo != org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO || ifPrimaryTerm != 0L))) {
+                        item.fail(
+                            RestStatus.BAD_REQUEST,
+                            "invalid_condition",
+                            "invalid sequence condition or compare-and-set on a create action"
+                        );
+                    } else if ((ifSeqNo == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO) != (ifPrimaryTerm == 0L)) {
+                        item.fail(
+                            RestStatus.BAD_REQUEST,
+                            "invalid_condition",
+                            "if_seq_no and if_primary_term must be supplied together on '" + documentId + "'"
+                        );
+                    } else if (("index".equals(name) || "create".equals(name)) && (source == null || source.isBlank())) {
+                        item.fail(RestStatus.BAD_REQUEST, "missing_source", "the document body for '" + documentId + "' was empty");
+                    }
             return item;
         }
     }
 
     /** One operation and, eventually, what became of it. */
     private static final class Item {
+        private final String action;
         private final String index;
         private String writtenIndex;
         private String writtenUuid;
@@ -895,7 +924,8 @@ public final class BulkHandler extends BaseRestHandler {
         private long ifSeqNo = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
         private long ifPrimaryTerm = 0L;
 
-        Item(String index, WalRecord operation) {
+        Item(String action, String index, WalRecord operation) {
+            this.action = action;
             this.index = index;
             this.operation = operation;
         }
