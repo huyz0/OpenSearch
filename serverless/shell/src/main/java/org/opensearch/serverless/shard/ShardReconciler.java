@@ -796,9 +796,28 @@ public final class ShardReconciler {
         final java.util.List<org.opensearch.serverless.store.WalRecord> records = alreadyRead != null
             ? alreadyRead
             : wal(shardId).replayableAfterFencing();
-        int replayed = 0;
+        // Sequenced operations have already been recovered by the engine. A legacy operation that
+        // precedes a sequenced operation for the same document must not overwrite that newer state.
+        // Track only IDs present in the legacy portion, keeping the common all-sequenced path cheap.
+        final java.util.Map<String, Integer> lastModernForLegacy = new java.util.HashMap<>();
         for (org.opensearch.serverless.store.WalRecord record : records) {
-            if (record.hasSequenceIdentity()) {
+            if (record.hasSequenceIdentity() == false) {
+                lastModernForLegacy.put(record.id(), -1);
+            }
+        }
+        if (lastModernForLegacy.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < records.size(); i++) {
+            final org.opensearch.serverless.store.WalRecord record = records.get(i);
+            if (record.hasSequenceIdentity() && lastModernForLegacy.containsKey(record.id())) {
+                lastModernForLegacy.put(record.id(), i);
+            }
+        }
+        int replayed = 0;
+        for (int i = 0; i < records.size(); i++) {
+            final org.opensearch.serverless.store.WalRecord record = records.get(i);
+            if (record.hasSequenceIdentity() || lastModernForLegacy.get(record.id()) > i) {
                 continue;
             }
             if (record.isDeletion()) {
