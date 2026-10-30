@@ -28,7 +28,6 @@ import java.util.Optional;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.function.Supplier;
-import java.util.regex.Pattern;
 
 /**
  * {@code GET|POST /{index}/_field_caps} — what a client can query, before it queries it.
@@ -120,7 +119,10 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                         )
                     );
                 }
-                if (body.get("fields") instanceof List<?> named && named.isEmpty() == false) {
+                if (body.get("fields") instanceof List<?> named) {
+                    if (named.isEmpty() || named.stream().anyMatch(field -> field instanceof String == false)) {
+                        throw new IllegalArgumentException("fields must be a nonempty array of strings");
+                    }
                     fields = String.join(",", named.stream().map(String::valueOf).toList());
                 } else if (body.get("fields") instanceof String one) {
                     fields = one;
@@ -200,12 +202,15 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
             return;
         }
 
-        final List<Pattern> wanted = compile(fields);
+        final String[] wanted = org.opensearch.core.common.Strings.splitStringByCommaToArray(fields);
         // field -> type -> the indices mapping it that way. Sorted so the answer is stable across calls,
         // which matters for a response a client may diff.
         final Map<String, Map<String, TreeSet<String>>> capabilities = new TreeMap<>();
         final Map<String, Boolean> searchable = new LinkedHashMap<>();
         final Map<String, Boolean> aggregatable = new LinkedHashMap<>();
+        final Map<String, TreeSet<String>> nonSearchable = new TreeMap<>();
+        final Map<String, TreeSet<String>> nonAggregatable = new TreeMap<>();
+        final Map<String, Map<String, TreeSet<String>>> fieldMetadata = new TreeMap<>();
         final List<String> answered = new ArrayList<>();
         final java.util.Set<String> metadataFields = new java.util.HashSet<>();
 
@@ -233,22 +238,40 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                         MapperService.MergeReason.MAPPING_RECOVERY
                     );
                 }
-                for (MappedFieldType type : mapperService.fieldTypes()) {
-                    if (matches(wanted, type.name()) == false) {
+                final TreeSet<String> fieldNames = new TreeSet<>();
+                for (String pattern : wanted) {
+                    // Core's matcher includes field aliases and avoids regex backtracking.
+                    fieldNames.addAll(mapperService.simpleMatchToFullName(pattern));
+                }
+                final java.util.function.Predicate<String> visible = serving.indicesService().getFieldFilter().apply(name);
+                for (String fieldName : fieldNames) {
+                    final MappedFieldType type = mapperService.fieldType(fieldName);
+                    if (type == null || (mapperService.isMetadataField(fieldName) == false && visible.test(type.name()) == false)) {
                         continue;
                     }
                     // familyTypeName, not typeName: OpenSearch reports the family a field belongs to, so a
                     // specialised keyword answers as the thing a client can actually act on.
-                    capabilities.computeIfAbsent(type.name(), key -> new TreeMap<>())
+                    capabilities.computeIfAbsent(fieldName, key -> new TreeMap<>())
                         .computeIfAbsent(type.familyTypeName(), key -> new TreeSet<>())
                         .add(name);
-                    final String key = type.name() + " " + type.familyTypeName();
+                    final String key = fieldName + " " + type.familyTypeName();
                     searchable.merge(key, type.isSearchable(), Boolean::logicalAnd);
                     aggregatable.merge(key, type.isAggregatable(), Boolean::logicalAnd);
+                    if (type.isSearchable() == false) {
+                        nonSearchable.computeIfAbsent(key, ignored -> new TreeSet<>()).add(name);
+                    }
+                    if (type.isAggregatable() == false) {
+                        nonAggregatable.computeIfAbsent(key, ignored -> new TreeSet<>()).add(name);
+                    }
+                    for (Map.Entry<String, String> entry : type.meta().entrySet()) {
+                        fieldMetadata.computeIfAbsent(key, ignored -> new TreeMap<>())
+                            .computeIfAbsent(entry.getKey(), ignored -> new TreeSet<>())
+                            .add(entry.getValue());
+                    }
                     // Flagged, as OpenSearch flags them. A caller asking fields=* gets _id, _index, _seq_no
                     // and the rest, and needs to be able to tell them from the fields it put there itself.
-                    if (mapperService.isMetadataField(type.name())) {
-                        metadataFields.add(type.name());
+                    if (mapperService.isMetadataField(fieldName)) {
+                        metadataFields.add(fieldName);
                     }
                 }
             } finally {
@@ -275,6 +298,17 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                     // silently matches nothing in another is worse than being told it cannot be run.
                     builder.field("searchable", searchable.getOrDefault(key, Boolean.FALSE));
                     builder.field("aggregatable", aggregatable.getOrDefault(key, Boolean.FALSE));
+                    final TreeSet<String> cannotSearch = nonSearchable.get(key);
+                    if (cannotSearch != null && cannotSearch.size() < type.getValue().size()) {
+                        builder.field("non_searchable_indices", cannotSearch);
+                    }
+                    final TreeSet<String> cannotAggregate = nonAggregatable.get(key);
+                    if (cannotAggregate != null && cannotAggregate.size() < type.getValue().size()) {
+                        builder.field("non_aggregatable_indices", cannotAggregate);
+                    }
+                    if (fieldMetadata.containsKey(key)) {
+                        builder.field("meta", fieldMetadata.get(key));
+                    }
                     if (metadataFields.contains(field.getKey())) {
                         builder.field("metadata_field", true);
                     }
@@ -295,35 +329,6 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
-    }
-
-    private static List<Pattern> compile(String fields) {
-        final List<Pattern> patterns = new ArrayList<>();
-        for (String each : fields.split(",")) {
-            final String field = each.trim();
-            if (field.isEmpty()) {
-                continue;
-            }
-            final StringBuilder regex = new StringBuilder();
-            for (char character : field.toCharArray()) {
-                if (character == '*') {
-                    regex.append(".*");
-                } else {
-                    regex.append(Pattern.quote(String.valueOf(character)));
-                }
-            }
-            patterns.add(Pattern.compile(regex.toString()));
-        }
-        return patterns;
-    }
-
-    private static boolean matches(List<Pattern> wanted, String field) {
-        for (Pattern pattern : wanted) {
-            if (pattern.matcher(field).matches()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
