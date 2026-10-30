@@ -318,6 +318,41 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         assertBulkParsingRefused("{\"index\":{\"_id\":\"conditional\",\"if_seq_no\":-1,\"if_primary_term\":1}}\n{\"n\":9}\n", 200, "index");
     }
 
+    public void testUnknownBulkActionsAreRejectedAsMalformedRequests() throws Exception {
+        final String body = "{\"frobnicate\":{\"_id\":\"conditional\"}}\n";
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new org.opensearch.action.bulk.BulkRequest().add(
+                new org.opensearch.core.common.bytes.BytesArray(body),
+                "alpha",
+                org.opensearch.common.xcontent.XContentType.JSON
+            )
+        );
+        assertBulkParsingRefused(body, 400, null);
+    }
+
+    public void testBulkWithoutAnyIndexIsRejectedBeforeDispatch() throws Exception {
+        final String body = "{\"index\":{\"_id\":\"conditional\"}}\n{\"n\":9}\n";
+        final var nativeRequest = new org.opensearch.action.bulk.BulkRequest().add(
+            new org.opensearch.core.common.bytes.BytesArray(body),
+            null,
+            org.opensearch.common.xcontent.XContentType.JSON
+        );
+        assertNotNull("core refuses an index-less bulk request during validation", nativeRequest.validate());
+        final var clock = new AtomicLong(1_000L);
+        final var plane = freshIndex(clock, createTempDir(), 1);
+        try (var node = new ServerlessNode(nodeSettings("bulk-missing-index"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final var loop = new BackgroundReconciler(node, plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            final Response response = send(node, "POST", "/_bulk?refresh=true", body);
+            assertEquals(response.body(), 400, response.status());
+            assertEquals(0, hits(node, "n", "9"));
+        }
+    }
+
     private void assertBulkParsingRefused(String body, int status, String action) throws Exception {
         final var clock = new AtomicLong(1_000L);
         final var plane = freshIndex(clock, createTempDir(), 1);

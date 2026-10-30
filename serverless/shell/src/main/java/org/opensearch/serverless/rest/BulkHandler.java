@@ -67,6 +67,8 @@ import java.util.function.Supplier;
  */
 public final class BulkHandler extends BaseRestHandler {
 
+    private static final java.util.Set<String> ACTION_NAMES = java.util.Set.of("index", "create", "delete", "update");
+
     private final Supplier<ServerlessNode> node;
     private final Supplier<MetadataPlane> plane;
 
@@ -664,6 +666,9 @@ public final class BulkHandler extends BaseRestHandler {
                 continue;
             }
             final Action action = parseAction(lines.get(line), line + 1, defaultIndex);
+            if (action.index == null || action.index.isBlank()) {
+                throw new BadRequest("line " + (line + 1) + ": an index is required in the action or request path");
+            }
             line++;
             if (action.needsSource) {
                 if (line >= lines.size()) {
@@ -734,7 +739,11 @@ public final class BulkHandler extends BaseRestHandler {
             if (parser.nextToken() != XContentParser.Token.FIELD_NAME) {
                 throw new BadRequest("line " + lineNumber + ": expected an action name");
             }
-            final Action action = new Action(parser.currentName(), defaultIndex);
+            final String actionName = parser.currentName();
+            if (ACTION_NAMES.contains(actionName) == false) {
+                throw new BadRequest("line " + lineNumber + ": unknown bulk action [" + actionName + "]");
+            }
+            final Action action = new Action(actionName, defaultIndex);
             if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
                 throw new BadRequest("line " + lineNumber + ": action '" + action.name + "' must be followed by an object");
             }
