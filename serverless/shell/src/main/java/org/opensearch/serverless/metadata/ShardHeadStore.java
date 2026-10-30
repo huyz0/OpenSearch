@@ -261,6 +261,30 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or written
      */
     public boolean release(String indexName, int shardId, String nodeId, long expectedTerm) throws IOException {
+        return release(indexName, shardId, nodeId, expectedTerm, null, null);
+    }
+
+    /**
+     * Releases exactly the writer incarnation observed by the caller. Index recreation can reuse a
+     * term and process restarts can reuse a stable node ID, so neither alone identifies the writer.
+     *
+     * @param indexName the index name
+     * @param shardId the shard
+     * @param nodeId the stable owner ID
+     * @param expectedTerm the owned term
+     * @param expectedIndexUuid the index incarnation, or null for legacy callers
+     * @param expectedEphemeralId the process incarnation, or null for legacy callers
+     * @return whether this writer released its own head
+     * @throws IOException if the backing store fails
+     */
+    public boolean release(
+        String indexName,
+        int shardId,
+        String nodeId,
+        long expectedTerm,
+        String expectedIndexUuid,
+        String expectedEphemeralId
+    ) throws IOException {
         final String name = RegisterMap.shardHeadBlob(indexName, shardId);
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
@@ -274,6 +298,12 @@ public final class ShardHeadStore {
             return false;
         }
         if (expectedTerm >= 0L && current.term() != expectedTerm) {
+            return false;
+        }
+        if ((expectedIndexUuid != null && current.indexUuid() != null && expectedIndexUuid.equals(current.indexUuid()) == false)
+            || (expectedEphemeralId != null
+                && current.ownerEphemeralId() != null
+                && expectedEphemeralId.equals(current.ownerEphemeralId()) == false)) {
             return false;
         }
         // Unowned, but still this incarnation's: the uuid is kept so the next acquirer of a recreated

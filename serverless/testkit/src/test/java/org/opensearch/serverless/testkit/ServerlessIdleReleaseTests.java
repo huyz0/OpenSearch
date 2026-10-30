@@ -230,6 +230,68 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
         }
     }
 
+    public void testIdleReleaseCannotGiveAwayANewerProcessHead() throws Exception {
+        idleReleasePreservesReplacement(false, false);
+    }
+
+    public void testIdleReleaseBindsTheTermObservedBeforeTheStoreRoundTrip() throws Exception {
+        idleReleasePreservesReplacement(true, false);
+    }
+
+    public void testIdleReleaseBindsTheIndexUuidEvenWhenItsTermIsReused() throws Exception {
+        idleReleasePreservesReplacement(true, true);
+    }
+
+    private void idleReleasePreservesReplacement(boolean replaceDuringRead, boolean recreatedIndex) throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+            try (ServerlessNode node = new ServerlessNode(nodeSettings("idle-old-process", "ingest"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var loop = new BackgroundReconciler(node, plane).setIdleAfterMillis(IDLE_AFTER);
+                loop.want("alpha", 0);
+                loop.tick(clock.get());
+                final var old = plane.heads().read("alpha", 0).orElseThrow();
+                final var replacement = new org.opensearch.serverless.metadata.ShardHead(
+                    "alpha",
+                    0,
+                    recreatedIndex ? old.term() : old.term() + 1,
+                    node.localNode().getId(),
+                    recreatedIndex ? node.localNode().getEphemeralId() : "replacement-process",
+                    1_000_000L,
+                    recreatedIndex ? "uuid-alpha-recreated" : "uuid-alpha-00000000"
+                );
+                final Runnable replace = () -> {
+                    try {
+                        final var heads = store.blobContainer(org.opensearch.serverless.metadata.RegisterMap.shards(BlobPath.cleanPath()));
+                        final String key = org.opensearch.serverless.metadata.RegisterMap.shardHeadBlob("alpha", 0);
+                        final var value = heads.readRegister(key).orElseThrow();
+                        assertTrue(heads.compareAndSwapRegister(key, value.generation(), replacement.toBytes()).applied());
+                    } catch (java.io.IOException failure) {
+                        throw new java.io.UncheckedIOException(failure);
+                    }
+                };
+                if (replaceDuringRead) {
+                    store.onNextRegisterRead("shards", org.opensearch.serverless.metadata.RegisterMap.shardHeadBlob("alpha", 0), replace);
+                } else {
+                    replace.run();
+                }
+                clock.addAndGet(IDLE_AFTER + 1);
+                assertTrue("the old process must leave the replacement head alone", loop.releaseIdle(clock.get()).isEmpty());
+                final var remaining = plane.heads().read("alpha", 0).orElseThrow();
+                assertEquals(replacement.term(), remaining.term());
+                assertEquals(replacement.ownerEphemeralId(), remaining.ownerEphemeralId());
+                assertEquals(replacement.indexUuid(), remaining.indexUuid());
+                assertEquals(node.localNode().getId(), remaining.ownerNodeId());
+                if (replaceDuringRead) {
+                    assertTrue(store.fired());
+                }
+            }
+        }
+    }
+
     /** Opens the shard fresh from the object store alone and counts what is there. */
     private long documentsInThePublishedCommit(MetadataPlane plane, String name) throws Exception {
         try (ServerlessNode verifier = new ServerlessNode(nodeSettings(name, "search"))) {
