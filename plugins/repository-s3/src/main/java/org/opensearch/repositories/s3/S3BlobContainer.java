@@ -1266,13 +1266,23 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             // S3-compatible endpoint (including the fixture this is verified against) returns the
             // error body needed for the SDK to unmarshal that specific type, so a bare 404 must be
             // treated as absence too rather than surfacing as a generic failure.
-            if (e.statusCode() == 404) {
+            if (isMissingRegister(e)) {
+                forget(blobName);
                 return Optional.empty();
             }
             throw new IOException("Unable to read register [" + blobName + "]", e);
         } catch (SdkException e) {
             throw new IOException("Unable to read register [" + blobName + "]", e);
         }
+    }
+
+    /** Accepts missing-key and legacy unlabelled 404 responses, while preserving bucket and service errors. */
+    private static boolean isMissingRegister(S3Exception failure) {
+        if (failure.statusCode() != 404) {
+            return false;
+        }
+        final String code = failure.awsErrorDetails() == null ? null : failure.awsErrorDetails().errorCode();
+        return code == null || code.isEmpty() || "NoSuchKey".equals(code);
     }
 
     /**
@@ -1317,7 +1327,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 currentGeneration = BlobRegister.ABSENT_GENERATION;
             } catch (S3Exception e) {
                 // See readRegister: a bare 404 (not a properly-typed NoSuchKeyException) also means absent.
-                if (e.statusCode() != 404) {
+                if (isMissingRegister(e) == false) {
                     throw e;
                 }
                 currentETag = null;
@@ -1353,29 +1363,9 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 return BlobRegisterCasResult.applied(newGeneration);
             } catch (S3Exception e) {
                 forget(blobName);
-                // Three status codes, one meaning: the conditional write did not happen, so somebody else
-                // got there first. Reporting a conflict rather than a wrapped exception is what lets the
-                // caller re-read and retry as normal, and it is safe for all three because none of them
-                // can be returned for a write that landed.
-                //
-                // 412 is the ordinary lost race. The other two are documented outcomes of the same races
-                // and were being thrown as store failures, which is a different thing entirely: a lost
-                // acquisition arriving as an IOException reads as "the object store is broken" rather than
-                // "someone else owns this shard now".
-                //
-                // 409 Conflict: "You can also receive a 409 Conflict response in the case of concurrent
-                // requests." 404 Not Found: "You will receive a 404 Not Found response if a concurrent
-                // delete request to an object succeeds before a conditional write operation on that object
-                // completes, as the object key no longer exists" -- and likewise when the current version
-                // is a delete marker. Registers here are deleted routinely (an index delete removes shard
-                // heads, a tombstone sweep removes descriptors, a node release removes its lease), so a
-                // compare-and-swap racing one of those is an ordinary event and not an exceptional one.
-                //
-                // See https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html
-                // ("Conditional write behavior"). Grounded in the specification rather than observed: the
-                // conformance endpoints this suite runs against do not produce 409 or 404 for these races,
-                // which is exactly why reading the contract was worth doing.
-                if (e.statusCode() == 412 || e.statusCode() == 409 || e.statusCode() == 404) {
+                // A transient conflict does not prove that the precondition was unmet. Use the same
+                // distinction as versioned writes, preserving service errors as IO failures.
+                if (isConditionFailure(e, currentETag != null)) {
                     return BlobRegisterCasResult.conflict(BlobRegisterCasResult.UNKNOWN_GENERATION);
                 }
                 throw e;
@@ -1424,12 +1414,8 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 remember(blobName, newGeneration, written.eTag());
                 return BlobRegisterCasResult.applied(newGeneration);
             } catch (S3Exception e) {
-                // 412 is the name already being taken, which is what this call is for. 409 is the same
-                // answer under concurrency -- "a 409 Conflict response in the case of concurrent requests
-                // if a delete request to an object succeeds before a conditional write operation on that
-                // object completes" -- and it too means this create did not happen, which is all a caller
-                // needs to know. See the note in compareAndSwapRegister.
-                if (e.statusCode() == 412 || e.statusCode() == 409) {
+                // Only a definitively unmet precondition means somebody already owns the name.
+                if (isConditionFailure(e, false)) {
                     return BlobRegisterCasResult.conflict(BlobRegisterCasResult.UNKNOWN_GENERATION);
                 }
                 throw e;
@@ -1543,8 +1529,8 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             return BlobRegisterCasResult.applied(newGeneration);
         } catch (S3Exception e) {
             forget(blobName);
-            // The same three codes, and the same meaning, as in compareAndSwapRegister.
-            if (e.statusCode() == 412 || e.statusCode() == 409 || e.statusCode() == 404) {
+            // The same definitive precondition failures as a versioned If-Match write.
+            if (isConditionFailure(e, true)) {
                 return BlobRegisterCasResult.conflict(BlobRegisterCasResult.UNKNOWN_GENERATION);
             }
             throw new IOException("Unable to CAS register [" + blobName + "]", e);

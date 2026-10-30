@@ -82,4 +82,100 @@ public class S3RegisterConflictTests extends OpenSearchTestCase {
         assertEquals(org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION, result.currentGeneration());
         verify(client, times(0)).getObject(any(GetObjectRequest.class));
     }
+
+    private S3Client rejectingClient(int status, String code) {
+        final var client = mock(S3Client.class);
+        when(client.getObject(any(GetObjectRequest.class))).thenThrow(NoSuchKeyException.builder().statusCode(404).build());
+        when(client.putObject(any(PutObjectRequest.class), any(RequestBody.class))).thenThrow(registerError(status, code));
+        return client;
+    }
+
+    private static S3Exception registerError(int status, String code) {
+        final S3Exception.Builder builder = S3Exception.builder();
+        builder.statusCode(status);
+        builder.awsErrorDetails(software.amazon.awssdk.awscore.exception.AwsErrorDetails.builder().errorCode(code).build());
+        return (S3Exception) builder.build();
+    }
+
+    private S3BlobContainer observedContainer(S3Client client) throws Exception {
+        final byte[] content = ByteBuffer.allocate(Long.BYTES + 1).putLong(7L).put((byte) 'x').array();
+        when(client.getObject(any(GetObjectRequest.class))).thenReturn(
+            new ResponseInputStream<>(GetObjectResponse.builder().eTag("observed").build(), new ByteArrayInputStream(content))
+        ).thenThrow(NoSuchKeyException.builder().statusCode(404).build());
+        final var container = container(client);
+        assertEquals(7L, container.readRegister("head").orElseThrow().generation());
+        return container;
+    }
+
+    public void testColdRegisterCasDoesNotRefuseOnOperationAborted() {
+        final var client = rejectingClient(409, "OperationAborted");
+        expectThrows(java.io.IOException.class, () -> container(client).compareAndSwapRegister("head", 0L, new BytesArray("next")));
+    }
+
+    public void testColdRegisterCasDoesNotRefuseOnUnresolvedConditionalRequest() {
+        final var client = rejectingClient(409, "ConditionalRequestConflict");
+        expectThrows(java.io.IOException.class, () -> container(client).compareAndSwapRegister("head", 0L, new BytesArray("next")));
+    }
+
+    public void testWarmRegisterCasDoesNotRefuseOnOperationAborted() throws Exception {
+        final var client = rejectingClient(409, "OperationAborted");
+        final var container = observedContainer(client);
+        expectThrows(java.io.IOException.class, () -> container.compareAndSwapRegister("head", 7L, new BytesArray("next")));
+    }
+
+    public void testDirectRegisterCreateDoesNotRefuseOnOperationAborted() {
+        final var client = rejectingClient(409, "OperationAborted");
+        expectThrows(java.io.IOException.class, () -> container(client).createRegisterIfAbsent("head", new BytesArray("next")));
+    }
+
+    public void testColdRegisterCasDoesNotHideMissingBucket() {
+        final var client = rejectingClient(404, "NoSuchBucket");
+        expectThrows(java.io.IOException.class, () -> container(client).compareAndSwapRegister("head", 0L, new BytesArray("next")));
+    }
+
+    public void testWarmRegisterCasDoesNotHideMissingBucket() throws Exception {
+        final var client = rejectingClient(404, "NoSuchBucket");
+        final var container = observedContainer(client);
+        expectThrows(java.io.IOException.class, () -> container.compareAndSwapRegister("head", 7L, new BytesArray("next")));
+    }
+
+    public void testReadRegisterDoesNotHideMissingBucket() {
+        final var client = rejectingClient(412, "PreconditionFailed");
+        when(client.getObject(any(GetObjectRequest.class))).thenThrow(registerError(404, "NoSuchBucket"));
+        expectThrows(java.io.IOException.class, () -> container(client).readRegister("head"));
+    }
+
+    public void testColdRegisterCasInitialReadDoesNotHideMissingBucket() {
+        final var client = rejectingClient(412, "PreconditionFailed");
+        when(client.getObject(any(GetObjectRequest.class))).thenThrow(registerError(404, "NoSuchBucket"));
+        expectThrows(java.io.IOException.class, () -> container(client).compareAndSwapRegister("head", 7L, new BytesArray("next")));
+    }
+
+    public void testWarmRegisterCasRecognizesAnActuallyDeletedKey() throws Exception {
+        final var client = rejectingClient(404, "NoSuchKey");
+        final var result = observedContainer(client).compareAndSwapRegister("head", 7L, new BytesArray("next"));
+        assertFalse(result.applied());
+        assertEquals(org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION, result.currentGeneration());
+    }
+
+    public void testExplicit409PreconditionFailureIsStillARefusal() throws Exception {
+        final var client = rejectingClient(409, "PreconditionFailed");
+        final var result = container(client).createRegisterIfAbsent("head", new BytesArray("next"));
+        assertFalse(result.applied());
+        assertEquals(org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION, result.currentGeneration());
+    }
+
+    public void testBare404StillMeansMissingRegister() throws Exception {
+        final var client = rejectingClient(412, "PreconditionFailed");
+        when(client.getObject(any(GetObjectRequest.class))).thenThrow(S3Exception.builder().statusCode(404).build());
+        assertTrue(container(client).readRegister("head").isEmpty());
+    }
+
+    public void testInitialReadOfDeletedKeyReportsKnownAbsence() throws Exception {
+        final var client = rejectingClient(412, "PreconditionFailed");
+        final var result = container(client).compareAndSwapRegister("head", 7L, new BytesArray("next"));
+        assertFalse(result.applied());
+        assertEquals(0L, result.currentGeneration());
+    }
+
 }
