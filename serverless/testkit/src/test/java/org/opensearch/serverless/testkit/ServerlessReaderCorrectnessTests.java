@@ -403,6 +403,11 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
         }
 
         @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
+        }
+
+        @Override
         public BlobContainer blobContainer(BlobPath path) {
             return new Flaky(delegate.blobContainer(path));
         }

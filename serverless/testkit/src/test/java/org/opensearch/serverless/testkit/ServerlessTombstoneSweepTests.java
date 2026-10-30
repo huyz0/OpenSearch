@@ -412,6 +412,11 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         }
 
         @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
+        }
+
+        @Override
         public BlobContainer blobContainer(BlobPath path) {
             final BlobContainer inner = delegate.blobContainer(path);
             if (path.equals(RegisterMap.indices(BlobPath.cleanPath())) == false) {

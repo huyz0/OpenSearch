@@ -45,6 +45,10 @@ processes sharing a filesystem store to the same register protocol. Reads need
 no coordination writes, including when reading older registers on a read-only store.
 Filesystem put-if-absent writes require hard link support so the final name never
 exposes a partly written blob; unsupported filesystems fail the write explicitly.
+Index creation checks filesystem component lengths before publishing the descriptor.
+The shard directory includes the index name, UUID and shard number, so its combined
+length must fit 255 UTF-8 bytes (255 UTF-16 units on Windows). Object stores retain
+their own key limits; this check adds no storage requests.
 
 **Both engine hooks are needed, not just the method.** `ServerlessWriterEngine` overrides
 `engineRecoveryOperations` to replay its object-store write-ahead log during recovery, and

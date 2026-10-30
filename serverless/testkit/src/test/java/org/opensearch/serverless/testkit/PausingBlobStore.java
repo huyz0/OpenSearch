@@ -83,6 +83,11 @@ public final class PausingBlobStore implements BlobStore {
     }
 
     @Override
+    public void validateKey(BlobPath path, String blobName) {
+        delegate.validateKey(path, blobName);
+    }
+
+    @Override
     public BlobContainer blobContainer(BlobPath path) {
         return new Pausing(delegate.blobContainer(path));
     }

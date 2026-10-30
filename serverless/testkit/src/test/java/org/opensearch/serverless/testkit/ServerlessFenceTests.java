@@ -385,6 +385,11 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
 
         final BlobStore store = new BlobStore() {
             @Override
+            public void validateKey(BlobPath path, String blobName) {
+                backing.validateKey(path, blobName);
+            }
+
+            @Override
             public BlobContainer blobContainer(BlobPath path) {
                 final BlobContainer inner = backing.blobContainer(path);
                 if (path.buildAsString().endsWith("seals/") == false) {
@@ -620,6 +625,11 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
                     }
                 }
             }
+        }
+
+        @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
         }
 
         @Override

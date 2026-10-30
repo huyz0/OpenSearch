@@ -193,6 +193,11 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
         }
 
         @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
+        }
+
+        @Override
         public BlobContainer blobContainer(BlobPath path) {
             final BlobContainer real = delegate.blobContainer(path);
             if (where.test(path) == false) {

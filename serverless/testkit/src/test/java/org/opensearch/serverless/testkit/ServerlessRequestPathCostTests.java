@@ -177,6 +177,11 @@ public class ServerlessRequestPathCostTests extends OpenSearchTestCase {
         }
 
         @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
+        }
+
+        @Override
         public BlobContainer blobContainer(BlobPath path) {
             final BlobContainer inner = delegate.blobContainer(path);
             final boolean descriptors = path.equals(RegisterMap.indices(BlobPath.cleanPath()));
