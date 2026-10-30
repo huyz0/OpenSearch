@@ -230,6 +230,7 @@ public final class DataStreamHandler extends BaseRestHandler {
         final org.opensearch.serverless.cluster.IndexDescriptor created;
         try {
             created = IndexAdminHandler.createIndex(
+                serving,
                 metadata,
                 backing,
                 withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), inherited.timestampField(), inherited),

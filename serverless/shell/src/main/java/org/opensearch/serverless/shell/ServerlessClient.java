@@ -264,7 +264,7 @@ public final class ServerlessClient extends AbstractClient {
             throw new org.opensearch.ResourceAlreadyExistsException(request.index());
         }
         try {
-            org.opensearch.serverless.rest.IndexAdminHandler.createIndex(metadata, request);
+            org.opensearch.serverless.rest.IndexAdminHandler.createIndex(node.get(), metadata, request);
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             throw new org.opensearch.ResourceAlreadyExistsException(request.index());
         }

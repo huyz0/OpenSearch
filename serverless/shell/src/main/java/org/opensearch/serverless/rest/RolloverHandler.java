@@ -310,7 +310,7 @@ public final class RolloverHandler extends BaseRestHandler {
                 // stream on a name something else holds.
                 for (int attempt = 0;; attempt++) {
                     try {
-                        createdUuid = IndexAdminHandler.createIndex(metadata, newName, streamCreate, inherited).uuid();
+                        createdUuid = IndexAdminHandler.createIndex(serving, metadata, newName, streamCreate, inherited).uuid();
                         break;
                     } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
                         if (attempt >= 8) {
@@ -321,7 +321,7 @@ public final class RolloverHandler extends BaseRestHandler {
                     }
                 }
             } else {
-                createdUuid = IndexAdminHandler.createIndex(metadata, newName, create).uuid();
+                createdUuid = IndexAdminHandler.createIndex(serving, metadata, newName, create).uuid();
             }
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "index [" + newName + "] already exists");
