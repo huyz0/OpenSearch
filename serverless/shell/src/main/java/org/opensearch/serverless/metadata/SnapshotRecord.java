@@ -33,15 +33,10 @@ import java.util.Map;
  * pointer could still mean later. Unlike a point in time, this has no expiry — a snapshot is kept until
  * deleted, which is the whole difference between a paging cursor and a backup.
  *
- * <p><b>Taking one costs no data movement.</b> Every file a captured commit names was already durable in
- * the object store before this record existed; freezing it is one metadata write per index, referencing
- * blobs that already exist rather than copying them — the same reason a {@link PointInTime} is cheap to
- * take. What is not free is <em>restoring</em> one: this shell's shard storage is keyed by the index's own
- * uuid ({@code RegisterMap#shardData}), and a manifest's blob paths are relative to that uuid's own
- * container, so a restore into a new index (a new uuid, by construction — see M32's index-deletion notes
- * for why reusing one is the bug this design specifically closed) has to copy the referenced blobs into the
- * new index's own storage. The snapshot stays shallow; the restore does the one copy the uuid-keying
- * invariant makes unavoidable.
+ * <p><b>Shallow snapshots pin existing blobs; standard snapshots copy them.</b> A shallow snapshot
+ * keeps the captured index's storage alive. A standard snapshot copies into its own storage lifetime,
+ * so later index deletion cannot affect it. Restoring either mode copies the captured files into the
+ * restored index's fresh uuid, preserving the separation between index incarnations.
  *
  * <p><b>An index entry with a shard count and no {@code shards} is a capture in progress</b> (see
  * {@code MetadataPlane.capturing}): the record is written naming every index before any manifest is
@@ -53,6 +48,7 @@ public final class SnapshotRecord {
     private final String repo;
     private final String name;
     private final String uuid;
+    private final String storageGeneration;
     private final boolean shallow;
     private final long startTimeMillis;
     private final long endTimeMillis;
@@ -63,9 +59,7 @@ public final class SnapshotRecord {
      *
      * @param repo the repository it belongs to
      * @param name the snapshot's name within that repository
-     * @param uuid a fresh identifier, the way {@code SnapshotInfo#snapshotId} carries one on real
-     *     OpenSearch — this shell's snapshots are named uniquely per repository already, so nothing here
-     *     resolves by uuid; it exists so a response can carry one for a client that expects to see it
+     * @param uuid the fresh identifier returned to clients and retained through capture completion
      * @param shallow whether this snapshot referenced its shards' live blobs rather than copying them —
      *     decided once, from the repository's {@link RepositoryDescriptor#shallowByDefault()} at the
      *     moment this snapshot was taken, and fixed from then on regardless of later repository changes
@@ -82,6 +76,20 @@ public final class SnapshotRecord {
         long endTimeMillis,
         Map<String, SnapshottedIndex> indices
     ) {
+        this(repo, name, uuid, shallow, startTimeMillis, endTimeMillis, indices, null);
+    }
+
+    private SnapshotRecord(
+        String repo,
+        String name,
+        String uuid,
+        boolean shallow,
+        long startTimeMillis,
+        long endTimeMillis,
+        Map<String, SnapshottedIndex> indices,
+        String storageGeneration
+    ) {
+        this.storageGeneration = storageGeneration;
         this.repo = repo;
         this.name = name;
         this.uuid = uuid;
@@ -89,6 +97,28 @@ public final class SnapshotRecord {
         this.startTimeMillis = startTimeMillis;
         this.endTimeMillis = endTimeMillis;
         this.indices = Map.copyOf(indices);
+    }
+
+    /**
+     * Returns the unique storage lifetime, or null for a legacy snapshot stored by name.
+     *
+     * @return the storage generation
+     */
+    public String storageGeneration() {
+        return storageGeneration;
+    }
+
+    /**
+     * Copies the record with the storage lifetime assigned when the snapshot name was reserved.
+     *
+     * @param generation the storage lifetime, or null for legacy storage
+     * @return the record with that lifetime
+     */
+    public SnapshotRecord withStorageGeneration(String generation) {
+        if (generation != null && PointInTime.looksLikeAnId(generation) == false) {
+            throw new IllegalArgumentException("invalid snapshot storage generation");
+        }
+        return new SnapshotRecord(repo, name, uuid, shallow, startTimeMillis, endTimeMillis, indices, generation);
     }
 
     /** One index as a snapshot captured it: its shape, and every shard's commit. */
@@ -307,6 +337,9 @@ public final class SnapshotRecord {
             builder.field("repo", repo);
             builder.field("name", name);
             builder.field("uuid", uuid);
+            if (storageGeneration != null) {
+                builder.field("storage_generation", storageGeneration);
+            }
             builder.field("shallow", shallow);
             builder.field("start_time_in_millis", startTimeMillis);
             builder.field("end_time_in_millis", endTimeMillis);
@@ -433,7 +466,13 @@ public final class SnapshotRecord {
                     new SnapshottedIndex(indexUuid, (int) shardCount, (String) mapping, settings, shards)
                 );
             }
-            return new SnapshotRecord(repo, name, uuid, shallow, startTime, endTime, indices);
+            final String generation = body.containsKey("storage_generation")
+                ? requiredString(body.get("storage_generation"), "storage_generation")
+                : null;
+            if (generation != null && PointInTime.looksLikeAnId(generation) == false) {
+                throw malformed("invalid storage generation");
+            }
+            return new SnapshotRecord(repo, name, uuid, shallow, startTime, endTime, indices).withStorageGeneration(generation);
         }
     }
 

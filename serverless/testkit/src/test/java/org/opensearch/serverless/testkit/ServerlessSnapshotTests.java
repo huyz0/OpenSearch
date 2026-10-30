@@ -504,7 +504,12 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
 
             final var container = plane.blobStore()
                 .blobContainer(
-                    org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(plane.basePath(), "backups", "gone-soon", "cleanup", 0)
+                    org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(
+                        plane.basePath(),
+                        plane.snapshot("backups", "gone-soon").orElseThrow(),
+                        "cleanup",
+                        0
+                    )
                 );
             // "t=1" is a child container (segments live under it), not a blob of this one -- children()
             // is the listing that sees it, the same way GarbageCollector's own sweep enumerates term dirs.

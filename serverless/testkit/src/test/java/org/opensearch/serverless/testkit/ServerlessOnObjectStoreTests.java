@@ -126,6 +126,35 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
                 TimeUnit.SECONDS
             );
             assertTrue("and hold its lease there", boot.plane().membership().read(boot.node().localNode().getId()).isPresent());
+
+            final Response frozen = send(http, "POST", "/alpha/_pit?keep_alive=1m", null);
+            assertEquals("PIT capture must use durable conditional state: " + frozen.body(), 200, frozen.status());
+            final var frozenBody = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                new org.opensearch.core.common.bytes.BytesArray(frozen.body()),
+                false,
+                org.opensearch.common.xcontent.XContentType.JSON
+            ).v2();
+            final String pitId = (String) frozenBody.get("pit_id");
+            final var pin = boot.plane().pointInTime(pitId).orElseThrow();
+            assertTrue(boot.plane().extendPointInTime(pin.withExpiry(pin.expiresAtMillis() + 60_000L), pin.expiresAtMillis()));
+            assertFalse(boot.plane().extendPointInTime(pin.withExpiry(pin.expiresAtMillis() + 120_000L), pin.expiresAtMillis()));
+            assertEquals(200, send(http, "POST", "/alpha/_search?pit=" + pitId, "{\"query\":{\"match_all\":{}}}").status());
+            assertEquals(200, send(http, "DELETE", "/_pit/" + pitId, null).status());
+            assertTrue(boot.plane().pointInTime(pitId).isEmpty());
+
+            assertEquals(
+                200,
+                send(http, "PUT", "/_snapshot/backups", "{\"type\":\"fs\",\"settings\":{\"remote_store_index_shallow_copy\":true}}")
+                    .status()
+            );
+            final Response captured = send(http, "PUT", "/_snapshot/backups/copied", "{\"indices\":\"alpha\"}");
+            assertEquals("snapshot capture must publish its conditional state: " + captured.body(), 200, captured.status());
+            final var capturedRecord = boot.plane().snapshot("backups", "copied").orElseThrow();
+            assertNotNull(capturedRecord.storageGeneration());
+            assertTrue(capturedRecord.shallow());
+            assertEquals(200, send(http, "DELETE", "/_snapshot/backups/copied", null).status());
+            assertTrue(boot.plane().snapshot("backups", "copied").isEmpty());
+            assertTrue(boot.plane().liveSnapshots().isEmpty());
         }
     }
 

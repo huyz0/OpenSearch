@@ -154,3 +154,10 @@ and keep-alive through these registers. Released IDs retain a compact tombstone
 so delayed requests cannot revive them; active listings do not scan this history.
 Do not delete these state records while requests from that deployment can still
 run. The extra retained object per PIT is a storage cost of this guarantee.
+
+Snapshot names now arbitrate capture completion and deletion in `snapshot-states`.
+Each new capture receives a unique discovery marker and a unique copied-data root
+under `snapshot-data-v2`; reusing a snapshot name cannot reuse or delete the prior
+capture's files. Legacy name-based snapshot records and copies remain readable.
+Upgrade all nodes together, since older writers do not consult these state heads.
+Deleted names retain compact state tombstones outside active snapshot listings.
