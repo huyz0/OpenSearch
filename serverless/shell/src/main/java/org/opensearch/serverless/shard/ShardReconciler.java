@@ -1196,9 +1196,15 @@ public final class ShardReconciler {
      * closed reader, which looks like corruption and is a scheduling choice.
      *
      * @param shardId the shard
+     * @throws org.opensearch.index.shard.IndexShardClosedException if it closed before admission
      */
     public void enter(ShardId shardId) {
-        inFlight.computeIfAbsent(shardId, ignored -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();
+        synchronized (lifecycle(shardId)) {
+            if (open.containsKey(shardId) == false) {
+                throw new org.opensearch.index.shard.IndexShardClosedException(shardId);
+            }
+            inFlight.computeIfAbsent(shardId, ignored -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();
+        }
     }
 
     /**
@@ -1207,9 +1213,11 @@ public final class ShardReconciler {
      * @param shardId the shard
      */
     public void exit(ShardId shardId) {
-        final java.util.concurrent.atomic.AtomicInteger count = inFlight.get(shardId);
-        if (count != null && count.decrementAndGet() <= 0) {
-            inFlight.remove(shardId, count);
+        synchronized (lifecycle(shardId)) {
+            final java.util.concurrent.atomic.AtomicInteger count = inFlight.get(shardId);
+            if (count != null && count.decrementAndGet() <= 0) {
+                inFlight.remove(shardId, count);
+            }
         }
     }
 
