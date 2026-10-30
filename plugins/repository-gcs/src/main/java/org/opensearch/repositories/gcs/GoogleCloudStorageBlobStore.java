@@ -199,7 +199,7 @@ class GoogleCloudStorageBlobStore implements BlobStore {
         final List<BlobListOption> options = new ArrayList<>();
         options.add(BlobListOption.currentDirectory());
         options.add(BlobListOption.prefix(pathPrefix));
-        options.add(BlobListOption.pageSize(Math.min(limit + 1, 1000)));
+        options.add(BlobListOption.pageSize(Math.min((long) limit + 1L, 1000L)));
         if (startAfter != null) {
             options.add(BlobListOption.startOffset(buildKey(path, startAfter)));
         }
@@ -209,7 +209,9 @@ class GoogleCloudStorageBlobStore implements BlobStore {
                     continue;
                 }
                 final String suffixName = blob.getName().substring(path.length());
-                if (startAfter != null && suffixName.compareTo(startAfter) <= 0) {
+                // The provider already applied its UTF-8 startOffset. Java compares UTF-16
+                // code units, which reverses some supplementary/BMP names and would skip blobs.
+                if (suffixName.equals(startAfter)) {
                     continue;
                 }
                 page.add(new PlainBlobMetadata(suffixName, blob.getSize()));
@@ -231,7 +233,7 @@ class GoogleCloudStorageBlobStore implements BlobStore {
         final List<BlobListOption> options = new ArrayList<>();
         options.add(BlobListOption.currentDirectory());
         options.add(BlobListOption.prefix(pathStr));
-        options.add(BlobListOption.pageSize(Math.min(limit + 1, 1000)));
+        options.add(BlobListOption.pageSize(Math.min((long) limit + 1L, 1000L)));
         if (startAfter != null) {
             // Past the cursor's own subtree: '0' follows '/'.
             options.add(BlobListOption.startOffset(pathStr + startAfter + "0"));
@@ -242,7 +244,8 @@ class GoogleCloudStorageBlobStore implements BlobStore {
                     continue;
                 }
                 final String name = blob.getName().substring(pathStr.length(), blob.getName().length() - 1);
-                if (name.isEmpty() || (startAfter != null && BlobContainer.CHILD_KEY_ORDER.compare(name, startAfter) <= 0)) {
+                // startOffset is already past the subtree in the provider's own key order.
+                if (name.isEmpty() || name.equals(startAfter)) {
                     continue;
                 }
                 page.put(name, new GoogleCloudStorageBlobContainer(path.add(name), this));
