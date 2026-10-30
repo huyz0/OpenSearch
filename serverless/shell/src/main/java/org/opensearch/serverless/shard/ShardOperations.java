@@ -767,8 +767,13 @@ public final class ShardOperations {
      * realtime one. If the shard is not taken in time -- another node won it, or this one is full -- the caller is
      * told to retry, which is true: the takeover is under way.
      */
-    private Read readOnceTaken(String index, String id, int shard, org.opensearch.serverless.shell.ShardBehindLogException behind)
-        throws IOException {
+    private Read readOnceTaken(
+        String index,
+        String id,
+        int shard,
+        String expectedUuid,
+        org.opensearch.serverless.shell.ShardBehindLogException behind
+    ) throws IOException {
         if (node.takeoverBelongsElsewhere(plane, index, shard)) {
             // A dead member's shard another survivor is named to take: asking for it here queued it on every survivor
             // a get reached. The caller retries, and finds it taken there.
@@ -784,6 +789,9 @@ public final class ShardOperations {
             behind.addSuppressed(e);
         }
         if (taken.isPresent() && node.reconciler().isReader(taken.get()) == false) {
+            if (expectedUuid.equals(taken.get().getIndex().getUUID()) == false) {
+                throw new org.opensearch.serverless.shell.StaleIncarnationException(new ShardId(index, expectedUuid, shard));
+            }
             return new Read(node.get(taken.get(), id), node.localNode().getId(), true, taken.get());
         }
         throw NotHereException.behindLog(behind);
@@ -806,7 +814,7 @@ public final class ShardOperations {
             // refusal, which exists for a different reader -- the search fan-out, where "unpublished"
             // must not collapse into "empty" because a live writer really might be mid-first-publish.
             // Here the owner check already ruled that out.
-            if (plane.segmentPublisher(index, placement.shard()).readManifest().isEmpty()) {
+            if (plane.segmentPublisher(index, placement.uuid(), placement.shard()).readManifest().isEmpty()) {
                 return new Read(
                     org.opensearch.serverless.shell.ServerlessNode.Document.absent(id),
                     node.localNode().getId(),
@@ -815,10 +823,10 @@ public final class ShardOperations {
                 );
             }
             try {
-                final var shardId = node.serveAsReader(plane, index, placement.shard());
+                final var shardId = node.serveAsReader(plane, index, placement.shard(), placement.uuid());
                 return new Read(node.get(shardId, id), node.localNode().getId(), false, shardId);
             } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
-                return readOnceTaken(index, id, placement.shard(), behind);
+                return readOnceTaken(index, id, placement.shard(), placement.uuid(), behind);
             } catch (IOException e) {
                 throw e;
             } catch (Exception e) {
@@ -923,11 +931,11 @@ public final class ShardOperations {
             // Nobody owns it, so the published commit is the current state -- except before the first publish,
             // where there is no commit to open and no writer about to make one. The same case doGet handles,
             // and the same answer: a document that has never existed, rather than a failure.
-            if (plane.segmentPublisher(index, placement.shard()).readManifest().isEmpty()) {
+            if (plane.segmentPublisher(index, placement.uuid(), placement.shard()).readManifest().isEmpty()) {
                 return new Explained(false, null, node.localNode().getId(), false);
             }
             try {
-                final var shardId = node.serveAsReader(plane, index, placement.shard());
+                final var shardId = node.serveAsReader(plane, index, placement.shard(), placement.uuid());
                 final ShardExplain.Outcome outcome = node.explain(shardId, id, query);
                 return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), false);
             } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {

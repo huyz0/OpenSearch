@@ -351,10 +351,7 @@ public final class ShardRouter {
             // Open it. This is the property that makes placement a hint rather than a requirement: a
             // node asked for a shard it does not have fetches the manifest and serves, so a stale or
             // unlucky routing decision costs a cold read and never a wrong answer.
-            shardId = node.serveAsReader(plane.get(), request.index(), request.shard());
-            if (request.indexUuid() != null && request.indexUuid().equals(shardId.getIndex().getUUID()) == false) {
-                throw new IllegalStateException("index [" + request.index() + "] was recreated while this search was in flight");
-            }
+            shardId = node.serveAsReader(plane.get(), request.index(), request.shard(), request.indexUuid());
         } else {
             // Open already, perhaps as a reader whose writer has since died: checked like a fresh one.
             node.ensureReaderCurrent(plane.get(), request.index(), request.shard(), shardId);

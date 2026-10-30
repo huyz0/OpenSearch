@@ -1074,7 +1074,7 @@ public final class SearchFanout {
         if (serving.localNode().getId().equals(target)) {
             // We are the placement for this shard but do not hold it yet. Open it here rather
             // than asking ourselves over the network.
-            final ShardId opened = serving.serveAsReader(metadata, index, shard);
+            final ShardId opened = serving.serveAsReader(metadata, index, shard, descriptor.uuid());
             serving.markUsed(opened);
             return new ShardAnswer(queryHere(serving, opened, perShard, nowInMillis));
         }
