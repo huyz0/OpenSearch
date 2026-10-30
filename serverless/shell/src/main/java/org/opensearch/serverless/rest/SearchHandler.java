@@ -1021,7 +1021,14 @@ public final class SearchHandler extends BaseRestHandler {
                     if (unsupported != null || accepted.pointInTimeBuilder() != null) {
                         throw unsupportedFilterRewrite(unsupported == null ? "adding a point in time after planning" : unsupported);
                     }
-                    return work.apply(accepted);
+                    final T result = work.apply(accepted);
+                    if (result instanceof org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome) {
+                        outcome.withTotalHitsTracking(
+                            accepted.trackTotalHitsUpTo() == null
+                                || accepted.trackTotalHitsUpTo() != org.opensearch.search.internal.SearchContext.TRACK_TOTAL_HITS_DISABLED
+                        );
+                    }
+                    return result;
                 },
                 searchView()
             );
@@ -1080,19 +1087,18 @@ public final class SearchHandler extends BaseRestHandler {
                     if (response instanceof org.opensearch.action.search.SearchResponse answered) {
                         final org.apache.lucene.search.TotalHits total = answered.getHits().getTotalHits();
                         return new org.opensearch.serverless.shard.ShardOperations.SearchOutcome(
-                            total == null ? (original == null ? 0L : original.total()) : total.value(),
+                            total == null ? 0L : total.value(),
                             java.util.List.of(answered.getHits().getHits()),
                             original == null ? answered.getTotalShards() : original.shards(),
                             original == null ? answered.getSuccessfulShards() : original.answered(),
                             (org.opensearch.search.aggregations.InternalAggregations) answered.getAggregations(),
-                            total == null
-                                ? (original == null ? org.apache.lucene.search.TotalHits.Relation.EQUAL_TO : original.relation())
-                                : total.relation(),
+                            total == null ? org.apache.lucene.search.TotalHits.Relation.EQUAL_TO : total.relation(),
                             answered.getHits().getMaxScore(),
                             original == null ? answered.isTimedOut() : original.timedOut(),
                             original == null ? answered.isTerminatedEarly() : original.terminatedEarly(),
                             original == null ? java.util.List.of(answered.getShardFailures()) : original.failures()
-                        ).withSkipped(original == null ? answered.getSkippedShards() : original.skipped());
+                        ).withSkipped(original == null ? answered.getSkippedShards() : original.skipped())
+                            .withTotalHitsTracking(total != null);
                     }
                     // A filter that replaced the response with something that is not a search answer.
                     // Taking the original would silently undo whatever it meant to do, so this refuses
@@ -1350,9 +1356,11 @@ public final class SearchHandler extends BaseRestHandler {
         long tookMillis,
         String pitId
     ) {
-        final boolean tracked = source == null
-            || source.trackTotalHitsUpTo() == null
-            || source.trackTotalHitsUpTo() != org.opensearch.search.internal.SearchContext.TRACK_TOTAL_HITS_DISABLED;
+        final boolean tracked = outcome.tracksTotalHits() == null
+            ? source == null
+                || source.trackTotalHitsUpTo() == null
+                || source.trackTotalHitsUpTo() != org.opensearch.search.internal.SearchContext.TRACK_TOTAL_HITS_DISABLED
+            : outcome.tracksTotalHits();
         final org.opensearch.search.SearchHits hits = new org.opensearch.search.SearchHits(
             outcome.hits().toArray(new SearchHit[0]),
             tracked ? new org.apache.lucene.search.TotalHits(outcome.total(), outcome.relation()) : null,
@@ -1433,6 +1441,9 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         org.opensearch.core.xcontent.ToXContent.Params params
     ) throws IOException {
+        if (response.getHits().getTotalHits() == null) {
+            throw unsupportedFilterRewrite("the total hits were removed from a count response");
+        }
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             if (source.terminateAfter() != org.opensearch.search.internal.SearchContext.DEFAULT_TERMINATE_AFTER) {
