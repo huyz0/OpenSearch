@@ -86,6 +86,8 @@ public class ServerlessSortTests extends OpenSearchTestCase {
                     assertEquals(201, send(node, "PUT", "/mixed-" + i + "/_doc/doc?refresh=true", "{\"rank\":10}").status());
                 }
                 final var breaker = node.circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST);
+                // HTTP response buffers use this breaker too and are released by Netty's write callback.
+                assertBusy(() -> assertEquals(0L, breaker.getUsed()));
                 final long before = breaker.getUsed();
                 for (int attempt = 0; attempt < 3; attempt++) {
                     final Response refused = send(
@@ -95,7 +97,7 @@ public class ServerlessSortTests extends OpenSearchTestCase {
                         "{\"size\":1,\"sort\":[{\"rank\":\"asc\"}]}"
                     );
                     assertEquals("incompatible values have no valid common order: " + refused.body(), 400, refused.status());
-                    assertEquals("failed merges must release every shard's reservation", before, breaker.getUsed());
+                    assertBusy(() -> assertEquals("failed merges must release every shard's reservation", before, breaker.getUsed()));
                 }
                 final Response healthy = send(node, "POST", "/mixed-0/_search", "{\"sort\":[{\"rank\":\"asc\"}]}");
                 assertEquals(healthy.body(), 200, healthy.status());
