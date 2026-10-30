@@ -265,6 +265,45 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns the authoritative snapshot-name registers, excluded from active discovery listings.
+     *
+     * @param base the deployment base
+     * @return snapshot state path
+     */
+    public static BlobPath snapshotStates(BlobPath base) {
+        return base.add("snapshot-states");
+    }
+
+    /**
+     * Returns one snapshot lifetime's copied data root.
+     *
+     * @param base the deployment base
+     * @param generation the unique storage lifetime
+     * @return the lifetime's storage path
+     */
+    public static BlobPath snapshotData(BlobPath base, String generation) {
+        if (PointInTime.looksLikeAnId(generation) == false) {
+            throw new IllegalArgumentException("invalid snapshot storage generation");
+        }
+        return base.add("snapshot-data-v2").add(generation);
+    }
+
+    /**
+     * Resolves copied shard storage, retaining name-based paths for legacy records.
+     *
+     * @param base the deployment base
+     * @param snapshot the captured record
+     * @param index the captured index name
+     * @param shard the captured shard
+     * @return its copied data path
+     */
+    public static BlobPath snapshotShardData(BlobPath base, SnapshotRecord snapshot, String index, int shard) {
+        return snapshot.storageGeneration() == null
+            ? snapshotShardData(base, snapshot.repo(), snapshot.name(), index, shard)
+            : snapshotData(base, snapshot.storageGeneration()).add(index).add(Integer.toString(shard));
+    }
+
+    /**
      * Returns the blob name one snapshot is stored under: a repository and a name, joined the same way a
      * shard-head joins an index name and a shard number.
      *
@@ -277,8 +316,8 @@ public final class RegisterMap {
     }
 
     /**
-     * Returns the container path a standard (non-shallow) snapshot copies one captured shard's segment
-     * files into.
+     * Returns the legacy name-based path for one captured shard. New captures use
+     * {@link #snapshotShardData(BlobPath, SnapshotRecord, String, int)} and a unique storage lifetime.
      *
      * <p>A shallow snapshot references a live shard's own blobs directly ({@link #shardData}), which is
      * what makes it free to take and what makes it depend on that shard's own storage continuing to exist.

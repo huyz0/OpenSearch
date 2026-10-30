@@ -421,7 +421,9 @@ public final class SnapshotHandler extends BaseRestHandler {
                 )
             );
         }
-        metadata.createSnapshot(new SnapshotRecord(repo, snapshot, snapshotUuid, shallow, startTime, startTime, provisional));
+        final SnapshotRecord reservation = metadata.createSnapshot(
+            new SnapshotRecord(repo, snapshot, snapshotUuid, shallow, startTime, startTime, provisional)
+        );
 
         try {
             // The provisional pin is visible before verifying the incarnation. An orphan sweep that
@@ -461,13 +463,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                     stored = new LinkedHashMap<>();
                     for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
                         final BlobPath sourceBase = RegisterMap.shardData(metadata.basePath(), trimmed, descriptor.uuid(), shard.getKey());
-                        final BlobPath destBase = RegisterMap.snapshotShardData(
-                            metadata.basePath(),
-                            repo,
-                            snapshot,
-                            trimmed,
-                            shard.getKey()
-                        );
+                        final BlobPath destBase = RegisterMap.snapshotShardData(metadata.basePath(), reservation, trimmed, shard.getKey());
                         stored.put(shard.getKey(), copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue()));
                     }
                 }
@@ -484,28 +480,23 @@ public final class SnapshotHandler extends BaseRestHandler {
             }
 
             final long endTime = metadata.clock().getAsLong();
-            final SnapshotRecord finished = new SnapshotRecord(repo, snapshot, snapshotUuid, shallow, startTime, endTime, captured);
+            final SnapshotRecord finished = new SnapshotRecord(repo, snapshot, snapshotUuid, shallow, startTime, endTime, captured)
+                .withStorageGeneration(reservation.storageGeneration());
             metadata.finishSnapshot(finished);
             return finished;
         } catch (Exception e) {
             // The provisional record, and whatever a standard repository had copied so far. The record
             // names no shards yet, so deleting it alone would leave the copies unnamed and unreachable.
             try {
-                metadata.deleteSnapshot(repo, snapshot);
+                metadata.deleteSnapshot(reservation);
             } catch (Exception cleanup) {
                 e.addSuppressed(cleanup);
             }
             if (shallow == false) {
-                for (Map.Entry<String, IndexDescriptor> index : described.entrySet()) {
-                    for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
-                        try {
-                            blobStore.blobContainer(
-                                RegisterMap.snapshotShardData(metadata.basePath(), repo, snapshot, index.getKey(), shard)
-                            ).delete();
-                        } catch (Exception cleanup) {
-                            e.addSuppressed(cleanup);
-                        }
-                    }
+                try {
+                    blobStore.blobContainer(RegisterMap.snapshotData(metadata.basePath(), reservation.storageGeneration())).delete();
+                } catch (Exception cleanup) {
+                    e.addSuppressed(cleanup);
                 }
             }
             throw e;
@@ -803,7 +794,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                 for (Map.Entry<Integer, CommitManifest> shard : capturedIndex.shards().entrySet()) {
                     final BlobPath sourceBase = record.shallow()
                         ? RegisterMap.shardData(metadata.basePath(), restoring.getKey(), capturedIndex.uuid(), shard.getKey())
-                        : RegisterMap.snapshotShardData(metadata.basePath(), repo, snapshot, restoring.getKey(), shard.getKey());
+                        : RegisterMap.snapshotShardData(metadata.basePath(), record, restoring.getKey(), shard.getKey());
                     final BlobPath destBase = RegisterMap.shardData(metadata.basePath(), restoring.getValue(), newUuid, shard.getKey());
                     final CommitManifest restored = copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue());
                     // Entered before the manifest lands, with a digest that rules nothing out: a restored index holds
