@@ -549,6 +549,17 @@ public final class IndexAdminHandler extends BaseRestHandler {
         MetadataPlane metadata,
         org.opensearch.action.admin.indices.create.CreateIndexRequest request
     ) throws Exception {
+        try {
+            return createIndex(serving, metadata, request.index(), fromNative(request));
+        } catch (RefusedException e) {
+            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), e.status);
+        } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
+            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+        }
+    }
+
+    /** Shared native creation payload validation for create-index and rollover. */
+    static CreateRequest fromNative(org.opensearch.action.admin.indices.create.CreateIndexRequest request) throws RefusedException {
         final var invalid = request.validate();
         if (invalid != null) {
             throw invalid;
@@ -564,13 +575,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         }
         final Settings settings = Settings.builder().put(request.settings()).normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX).build();
         final String mapping = normalizeMapping(request.mappings());
-        try {
-            return createIndex(serving, metadata, request.index(), CreateRequest.fromSettings(settings, mapping, 1));
-        } catch (RefusedException e) {
-            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), e.status);
-        } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
-            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
-        }
+        return CreateRequest.fromSettings(settings, mapping, 1);
     }
 
     private static String normalizeMapping(String source) {
