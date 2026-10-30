@@ -234,6 +234,7 @@ public final class ServerlessClient extends AbstractClient {
         final long startNanos = System.nanoTime();
         final var outcome = org.opensearch.serverless.rest.SearchHandler.gated(
             serving,
+            request,
             resolved.indices().keySet(),
             source,
             admitted -> org.opensearch.serverless.rest.SearchFanout.run(serving, metadata, resolved.indices(), admitted)

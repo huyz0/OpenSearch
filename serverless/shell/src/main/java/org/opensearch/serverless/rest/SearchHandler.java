@@ -272,6 +272,26 @@ public final class SearchHandler extends BaseRestHandler {
         // to ask at once -- and are consumed without effect: there is one copy of every shard here, the
         // fan-out's width is fixed, and a hint that cannot be followed is not a reason to refuse the
         // search that carried it.
+        if (searchRequest.searchType() != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_search",
+                    "DFS searches are not supported: only query_then_fetch is available"
+                )
+            );
+        }
+        if (selectsShards(searchRequest.preference())) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "unsupported_search",
+                    "shard-selecting search preferences are not supported"
+                )
+            );
+        }
         if (searchRequest.scroll() != null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
@@ -991,14 +1011,42 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
     ) throws IOException {
+        return gated(serving, null, indices, source, work);
+    }
+
+    /**
+     * Runs filters over a native request while preserving its options and resolved authorization scope.
+     *
+     * @param serving the serving node
+     * @param nativeRequest the original native request, or null for an already planned REST request
+     * @param indices every resolved index the search covers
+     * @param source the planned source
+     * @param work the search receiving the admitted source
+     * @param <T> the result type
+     * @return the filtered search result
+     * @throws IOException if the search fails
+     */
+    public static <T> T gated(
+        ServerlessNode serving,
+        org.opensearch.action.search.SearchRequest nativeRequest,
+        java.util.Collection<String> indices,
+        SearchSourceBuilder source,
+        org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
+    ) throws IOException {
         final var gate = serving.actionGate();
         final java.util.Set<String> resolvedScope = gate.isEmpty() ? null : java.util.Set.copyOf(indices);
+        final var visible = nativeRequest == null
+            ? new org.opensearch.action.search.SearchRequest(indices.toArray(new String[0]), source)
+            : new org.opensearch.action.search.SearchRequest(nativeRequest).indices(indices.toArray(new String[0]))
+                .source(source)
+                // Core's copy constructor omits the named pipeline.
+                .pipeline(nativeRequest.pipeline());
         try {
             return gate.run(
                 org.opensearch.action.search.SearchAction.NAME,
                 // Every index the search covers, so a filter evaluating privileges sees all of them
                 // rather than the first one named.
-                new org.opensearch.action.search.SearchRequest(indices.toArray(new String[0]), source),
+                visible,
                 // The source as the filters left it: a document-level security query a filter folded
                 // into the request reaches every shard, rather than being silently ignored.
                 admitted -> {
@@ -1013,10 +1061,20 @@ public final class SearchHandler extends BaseRestHandler {
                     if (rewritten.searchType() != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH
                         || rewritten.routing() != null
                         || rewritten.scroll() != null
-                        || rewritten.pipeline() != null) {
-                        throw unsupportedFilterRewrite("the rewritten search requests unsupported execution options");
+                        || rewritten.pipeline() != null
+                        || selectsShards(rewritten.preference())) {
+                        throw new org.opensearch.OpenSearchStatusException(
+                            "the search requests unsupported execution options",
+                            RestStatus.NOT_IMPLEMENTED
+                        );
                     }
                     final SearchSourceBuilder accepted = rewritten.source() == null ? new SearchSourceBuilder() : rewritten.source();
+                    if (nativeRequest != null && accepted.searchPipelineSource() != null) {
+                        throw new org.opensearch.OpenSearchStatusException(
+                            "native inline search pipelines are not supported",
+                            RestStatus.NOT_IMPLEMENTED
+                        );
+                    }
                     final String unsupported = whatCannotBeMerged(accepted);
                     if (unsupported != null || accepted.pointInTimeBuilder() != null) {
                         throw unsupportedFilterRewrite(unsupported == null ? "adding a point in time after planning" : unsupported);
@@ -1037,6 +1095,10 @@ public final class SearchHandler extends BaseRestHandler {
         } catch (Exception e) {
             throw new IOException(e);
         }
+    }
+
+    private static boolean selectsShards(String preference) {
+        return preference != null && preference.startsWith("_shards");
     }
 
     private static org.opensearch.OpenSearchStatusException unsupportedFilterRewrite(String reason) {
