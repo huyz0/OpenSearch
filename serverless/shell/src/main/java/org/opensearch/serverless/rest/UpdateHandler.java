@@ -21,7 +21,6 @@ import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.Map;
 import java.util.function.Supplier;
 
 /**
@@ -61,7 +60,7 @@ public final class UpdateHandler extends BaseRestHandler {
         // into a 400 about an unconsumed parameter.
         final String index = request.param("index");
         final String id = request.param("id");
-        final boolean refresh = IndexAdminHandler.refresh(request);
+        final var refreshPolicy = org.opensearch.action.support.WriteRequest.RefreshPolicy.parse(request.param("refresh", "false"));
         final String ifSeqNoParam = request.param("if_seq_no");
         final String ifPrimaryTermParam = request.param("if_primary_term");
         final String version = request.param("version");
@@ -73,8 +72,8 @@ public final class UpdateHandler extends BaseRestHandler {
         final org.opensearch.search.fetch.subphase.FetchSourceContext wantSource = org.opensearch.search.fetch.subphase.FetchSourceContext
             .parseFromRestRequest(request);
         // Hints with one possible answer here; see DocumentHandler.
-        request.param("timeout");
-        request.param("wait_for_active_shards");
+        final String timeout = request.param("timeout");
+        final var activeShards = org.opensearch.action.support.ActiveShardCount.parseString(request.param("wait_for_active_shards"));
         request.param("lang");
 
         final MetadataPlane metadata = plane.get();
@@ -141,7 +140,12 @@ public final class UpdateHandler extends BaseRestHandler {
             );
         }
         final var parsed = new org.opensearch.action.update.UpdateRequest(index, id).detectNoop(detectNoopParam)
-            .retryOnConflict(retryOnConflict);
+            .retryOnConflict(retryOnConflict)
+            .setRefreshPolicy(refreshPolicy)
+            .waitForActiveShards(activeShards);
+        if (timeout != null) {
+            parsed.timeout(timeout);
+        }
         if (retryOnConflict < 0) {
             throw new IllegalArgumentException("retry_on_conflict must be non negative");
         }
@@ -176,45 +180,13 @@ public final class UpdateHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_write", "_source on an update is not supported")
             );
         }
-        final Map<String, Object> doc = parsed.doc() == null ? null : parsed.doc().sourceAsMap();
-        final Map<String, Object> upsert = parsed.upsertRequest() == null ? null : parsed.upsertRequest().sourceAsMap();
-        final long ifSeqNo = parsed.ifSeqNo();
-        final long ifPrimaryTerm = parsed.ifPrimaryTerm();
         final ServerlessNode serving = node.get();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             final var operations = new ShardOperations(serving, metadata, true);
             try {
-                ShardOperations.UpdateOutcome outcome = null;
-                // retry_on_conflict, honoured the way core honours it: an unconditional update is a read
-                // followed by a compare-and-swap against what was read, and a lost race is retried from a
-                // fresh read up to the count the caller allowed. A caller who passed their own condition
-                // gets exactly one attempt, since retrying would be retrying against a token they chose.
-                final long attempts = 1L + retryOnConflict;
-                for (long attempt = 0; attempt < attempts; attempt++) {
-                    try {
-                        outcome = operations.update(
-                            index,
-                            id,
-                            doc,
-                            upsert,
-                            parsed.docAsUpsert(),
-                            parsed.detectNoop(),
-                            refresh,
-                            ifSeqNo,
-                            ifPrimaryTerm,
-                            parsed.script(),
-                            parsed.scriptedUpsert()
-                        );
-                        break;
-                    } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
-                        if (attempt == attempts - 1) {
-                            throw e;
-                        }
-                    }
-                }
-                respond(channel, index, id, outcome);
+                respond(channel, operations.update(parsed));
             } catch (ShardOperations.NoSuchIndexException e) {
-                sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
+                sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + e.index());
             } catch (ShardOperations.DocumentMissingException e) {
                 sendError(channel, RestStatus.NOT_FOUND, "document_missing_exception", e.getMessage());
             } catch (ShardOperations.SystemIndexException e) {
@@ -243,26 +215,18 @@ public final class UpdateHandler extends BaseRestHandler {
         }
     }
 
-    private void respond(org.opensearch.rest.RestChannel channel, String index, String id, ShardOperations.UpdateOutcome outcome)
-        throws IOException {
+    private void respond(org.opensearch.rest.RestChannel channel, ShardOperations.UpdateOutcome outcome) throws IOException {
+        final var response = outcome.response();
         try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("_index", index);
-            builder.field("_id", id);
-            builder.field("result", outcome.result());
-            builder.field("_version", outcome.version());
-            builder.field("_seq_no", outcome.seqNo());
-            builder.field("_primary_term", outcome.primaryTerm());
-            builder.startObject("_shards");
-            builder.field("total", 1);
-            builder.field("successful", 1);
-            builder.field("failed", 0);
-            builder.endObject();
-            builder.field("_node", outcome.servedBy());
-            builder.endObject();
-            // 201 when the upsert created the document, 200 otherwise -- what core's DocWriteResponse
-            // answers, and what a client that branches on the status before reading "result" expects.
-            channel.sendResponse(new BytesRestResponse("created".equals(outcome.result()) ? RestStatus.CREATED : RestStatus.OK, builder));
+            if (outcome.servedBy() == null) {
+                response.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+            } else {
+                builder.startObject();
+                response.innerToXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+                builder.field("_node", outcome.servedBy());
+                builder.endObject();
+            }
+            channel.sendResponse(new BytesRestResponse(response.status(), builder));
         }
     }
 }
