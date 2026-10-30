@@ -1115,6 +1115,9 @@ public final class SearchHandler extends BaseRestHandler {
                     if (unsupported != null || accepted.pointInTimeBuilder() != null) {
                         throw unsupportedFilterRewrite(unsupported == null ? "adding a point in time after planning" : unsupported);
                     }
+                    if (rewritten.allowPartialSearchResults() == null) {
+                        rewritten.allowPartialSearchResults(serving.searchService().defaultAllowPartialSearchResults());
+                    }
                     final T result = work.apply(accepted);
                     if (result instanceof org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome) {
                         if (Boolean.FALSE.equals(rewritten.allowPartialSearchResults()) && outcome.failures().isEmpty() == false) {
