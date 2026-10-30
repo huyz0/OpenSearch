@@ -806,17 +806,18 @@ public final class ShardReconciler {
                 // correct: a document written, deleted, and written again must end up present, and a
                 // document written and deleted must end up gone. Applying all the writes and then all
                 // the deletes would get the first case wrong.
-                shard.applyDeleteOperationOnPrimary(
+                final var result = shard.applyDeleteOperationOnPrimary(
                     org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
                     record.id(),
                     org.opensearch.index.VersionType.INTERNAL,
                     org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
                     0
                 );
+                ensureLegacyReplaySucceeded(record, result);
                 replayed++;
                 continue;
             }
-            shard.applyIndexOperationOnPrimary(
+            final var result = shard.applyIndexOperationOnPrimary(
                 org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
                 org.opensearch.index.VersionType.INTERNAL,
                 new org.opensearch.index.mapper.SourceToParse(
@@ -830,6 +831,7 @@ public final class ShardReconciler {
                 org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
                 false
             );
+            ensureLegacyReplaySucceeded(record, result);
             replayed++;
         }
         if (replayed > 0) {
@@ -837,6 +839,20 @@ public final class ShardReconciler {
             // until synced; the object-store log is the durability, this gives the page back.
             shard.sync();
             shard.refresh("serverless-wal-replay");
+        }
+    }
+
+    private static void ensureLegacyReplaySucceeded(
+        org.opensearch.serverless.store.WalRecord record,
+        org.opensearch.index.engine.Engine.Result result
+    ) throws IOException {
+        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
+            // A per-document failure is returned, not thrown. Continuing recovery would publish a
+            // commit without this logged operation and eventually truncate the only durable copy.
+            throw new IOException(
+                "could not replay legacy logged operation [" + record.id() + "]: " + result.getResultType(),
+                result.getFailure()
+            );
         }
     }
 

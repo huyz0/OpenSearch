@@ -50,6 +50,46 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             .build();
     }
 
+    public void testLegacyReplayRefusesAnInvalidLoggedDocument() throws Exception {
+        assertLegacyReplay("{\"properties\":{\"n\":{\"type\":\"long\"}}}", "{\"n\":\"not a number\"}", false);
+    }
+
+    public void testLegacyReplayRefusesAnUnappliedMappingUpdate() throws Exception {
+        assertLegacyReplay("{\"properties\":{}}", "{\"unmapped\":\"logged\"}", false);
+    }
+
+    public void testLegacyReplayStillAppliesValidLoggedOperations() throws Exception {
+        assertLegacyReplay("{\"properties\":{\"n\":{\"type\":\"long\"}}}", "{\"n\":7}", true);
+    }
+
+    private void assertLegacyReplay(String mapping, String source, boolean succeeds) throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            final var descriptor = new IndexDescriptor("legacy", "uuid-legacy", 1, mapping, null);
+            plane.createIndex(descriptor);
+            plane.walStore("legacy", descriptor.uuid(), 0).append(1L, new WalRecord("logged", source));
+            try (var node = new ServerlessNode(nodeSettings("legacy-replay-result"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                if (succeeds) {
+                    final var shard = node.activateWriter(plane, "legacy", 0).orElseThrow();
+                    assertTrue("a valid old record is still replayed", node.get(shard, "logged").found());
+                } else {
+                    expectThrows(Exception.class, () -> node.activateWriter(plane, "legacy", 0));
+                    assertTrue("a rejected logged operation must prevent activation", node.reconciler().openShards().isEmpty());
+                    assertTrue(
+                        "the log must remain available for repair and retry",
+                        plane.walStore("legacy", descriptor.uuid(), 0)
+                            .replayableAfterFencing()
+                            .stream()
+                            .anyMatch(record -> record.id().equals("logged"))
+                    );
+                }
+            }
+        }
+    }
+
     public void testAShardWhoseLogCollidesWithItsCommitRefusesToOpen() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
