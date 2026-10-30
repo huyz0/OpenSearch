@@ -26,7 +26,9 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -234,10 +236,16 @@ public final class TemplateStore {
 
     private Map<String, String> adoptLegacy(Map<String, String> sources) throws IOException {
         final Map<String, String> entries = new LinkedHashMap<>();
+        final Map<String, String> bySource = new HashMap<>();
         for (Map.Entry<String, String> each : sources.entrySet()) {
             // Adoption only publishes at the old marker generation. A losing migration retries from
             // the indexed marker, so it can never add these keys after another writer removes them.
-            entries.put(each.getKey(), writeContent(each.getValue(), false));
+            String key = bySource.get(each.getValue());
+            if (key == null) {
+                key = writeContent(each.getValue(), false);
+                bySource.put(each.getValue(), key);
+            }
+            entries.put(each.getKey(), key);
         }
         return entries;
     }
@@ -556,8 +564,35 @@ public final class TemplateStore {
     private String writeContent(String source, boolean revision) throws IOException {
         final byte[] bytes = source.getBytes(StandardCharsets.UTF_8);
         final String hash = sha256(bytes) + (revision ? "-" + org.opensearch.common.UUIDs.randomBase64UUID() : "");
-        container.writeBlob(CONTENT_PREFIX + hash, new java.io.ByteArrayInputStream(bytes), bytes.length, false);
+        try {
+            container.writeBlob(CONTENT_PREFIX + hash, new java.io.ByteArrayInputStream(bytes), bytes.length, true);
+        } catch (java.nio.file.FileAlreadyExistsException alreadyPresent) {
+            if (storedContentEquals(CONTENT_PREFIX + hash, bytes) == false) {
+                if (revision) {
+                    throw new IOException("immutable template revision has conflicting content", alreadyPresent);
+                }
+                // An older filesystem writer may have crashed during an in-place adoption. Keep
+                // that object untouched and publish complete bytes under a fresh revision instead.
+                return writeContent(source, true);
+            }
+        }
         return hash;
+    }
+
+    private boolean storedContentEquals(String blob, byte[] expected) throws IOException {
+        try (InputStream input = container.readBlob(blob)) {
+            final byte[] buffer = new byte[8192];
+            int offset = 0;
+            for (int read; (read = input.read(buffer)) != -1;) {
+                if (read > expected.length - offset || Arrays.equals(expected, offset, offset + read, buffer, 0, read) == false) {
+                    return false;
+                }
+                offset += read;
+            }
+            return offset == expected.length;
+        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException missing) {
+            return false;
+        }
     }
 
     private static long retainedBytes(String key, String value) {
