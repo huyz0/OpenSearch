@@ -43,7 +43,7 @@ import java.util.function.Supplier;
  * expect without the machinery behind it coming back.
  *
  * <p><b>An allowlist, and it refuses out loud.</b> Supported actions are the ones a plugin needs to keep
- * state in an index: index, get, delete and create-index. Everything else throws, naming the action. That
+ * state in an index: index, get, delete, search and create-index. Everything else throws, naming the action. That
  * is D2 applied one layer down — an unimplemented endpoint returns 501 with a reason rather than an empty
  * success, and an unimplemented action does the same rather than quietly returning a default-constructed
  * response, which for a search would be "no results" and for a delete would be "done".

@@ -612,10 +612,16 @@ public final class ShardOperations {
             throw validation;
         }
         if (request.routing() != null) {
-            throw new UnsupportedOperationException("routing is not supported: documents are placed by their id");
+            throw new org.opensearch.OpenSearchStatusException(
+                "routing is not supported: documents are placed by their id",
+                org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
+            );
         }
         if (request.storedFields() != null) {
-            throw new UnsupportedOperationException("stored_fields is not supported");
+            throw new org.opensearch.OpenSearchStatusException(
+                "stored_fields is not supported",
+                org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
+            );
         }
         final Read read = doGet(request.index(), request.id());
         final var document = read.document();
@@ -1677,7 +1683,10 @@ public final class ShardOperations {
                 throw validation;
             }
             if (accepted.indices().length != 1 || accepted.getRouting() != null) {
-                throw new UnsupportedOperationException("delete-by-query requires one concrete index and no routing");
+                throw new org.opensearch.OpenSearchStatusException(
+                    "delete-by-query requires one concrete index and no routing",
+                    org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
+                );
             }
             final var search = accepted.getSearchRequest();
             final var acceptedQuery = search.source().query();
@@ -1689,8 +1698,9 @@ public final class ShardOperations {
                 || accepted.getSlices() != 1
                 || accepted.getRequestsPerSecond() != Float.POSITIVE_INFINITY
                 || accepted.getShouldStoreResult()) {
-                throw new UnsupportedOperationException(
-                    "delete-by-query search options, slicing, throttling and stored tasks are not supported"
+                throw new org.opensearch.OpenSearchStatusException(
+                    "delete-by-query search options, slicing, throttling and stored tasks are not supported",
+                    org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
                 );
             }
             final long started = System.nanoTime();
