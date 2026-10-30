@@ -441,14 +441,14 @@ public final class ServerlessBootstrap implements Closeable {
      * Stops the drivers, then the node.
      *
      * <p>In that order, and it is not tidiness: a driver that ran against a closing node would try to
-     * publish or renew through a half-shut data plane. Stopping the clocks first means everything after
-     * this point is quiescent.
+     * publish or renew through a half-shut data plane. Draining the loop and scheduler first makes the handover
+     * quiescent.
      */
     @Override
     public void close() {
-        // Stop the clocks first, and it is not tidiness: a driver running against a closing node would
-        // publish or renew through a half-shut data plane, and a renewal racing the release below would
-        // put the lease back after we dropped it.
+        // Stop admission and drain the loop before handover. Scheduled callbacks then become no-ops,
+        // and settling queued activations lets a scheduler pass waiting on them finish as well.
+        loop.close();
         scheduler.close();
         try {
             // Publish and release what this node owns, so its shards are claimable at a fresh term the
@@ -460,7 +460,6 @@ public final class ServerlessBootstrap implements Closeable {
         } catch (Exception e) {
             logger.warn("could not hand over this node's shards; peers will take them over when the lease lapses", e);
         }
-        loop.close();
         try {
             // Drop the lease rather than let it lapse. Without this a node that shut down cleanly stays
             // alive to every peer for a full TTL: its shards are unowned and unclaimable that whole time,

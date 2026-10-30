@@ -80,6 +80,168 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         );
     }
 
+    public void testClosedSchedulerCannotStartStoreWork() throws Exception {
+        try (var store = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var clock = new AtomicLong(1000L);
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-closed-scheduler", 1, MAPPING, null));
+            try (var node = new ServerlessNode(nodeSettings("closed-driver"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                try (var loop = new BackgroundReconciler(node, plane); var scheduler = edgesOnly(node, loop, clock, TimeValue.ZERO)) {
+                    loop.want("alpha", 0);
+                    scheduler.close();
+                    store.reset();
+                    scheduler.renewNow();
+                    scheduler.publishNow();
+                    scheduler.activateNow();
+                    scheduler.backstopNow();
+                    scheduler.janitorNow();
+                    assertEquals(store.breakdown(), 0L, store.reads());
+                    assertEquals(store.breakdown(), 0L, store.writes());
+                    assertTrue(node.reconciler().openShards().isEmpty());
+                }
+            }
+        }
+    }
+
+    public void testClosedLoopCannotActivateNewShards() throws Exception {
+        final var clock = new AtomicLong(1000L);
+        final var plane = freshIndex(clock, createTempDir(), 1);
+        try (var node = new ServerlessNode(nodeSettings("closed-loop"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            try (var loop = new BackgroundReconciler(node, plane)) {
+                loop.setDemandDrivenActivation(true);
+                loop.close();
+                assertTrue(loop.activateForRequest("alpha", 0).get(30, java.util.concurrent.TimeUnit.SECONDS).isEmpty());
+                assertTrue(node.reconciler().openShards().isEmpty());
+            }
+        }
+    }
+
+    public void testSchedulerCloseDrainsAnActiveRenewal() throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var clock = new AtomicLong(1000L);
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            try (
+                var node = new ServerlessNode(nodeSettings("closing-renewal"));
+                var workers = java.util.concurrent.Executors.newFixedThreadPool(2)
+            ) {
+                node.start();
+                node.setMetadataPlane(plane);
+                try (var loop = new BackgroundReconciler(node, plane); var scheduler = edgesOnly(node, loop, clock, TimeValue.ZERO)) {
+                    loop.renewLease();
+                    final var entered = new java.util.concurrent.CountDownLatch(1);
+                    final var release = new java.util.concurrent.CountDownLatch(1);
+                    store.onNextRegisterSwap("cluster/members/", "lease-" + node.localNode().getId(), () -> {
+                        entered.countDown();
+                        try {
+                            assertTrue(release.await(30, java.util.concurrent.TimeUnit.SECONDS));
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(e);
+                        }
+                    });
+                    final var renewal = workers.submit(scheduler::renewNow);
+                    final var closer = new java.util.concurrent.atomic.AtomicReference<Thread>();
+                    try {
+                        assertTrue(entered.await(30, java.util.concurrent.TimeUnit.SECONDS));
+                        final var closing = workers.submit(() -> {
+                            closer.set(Thread.currentThread());
+                            scheduler.close();
+                        });
+                        assertBusy(
+                            () -> assertTrue(closing.isDone() || (closer.get() != null && closer.get().getState() == Thread.State.WAITING))
+                        );
+                        assertFalse("close cannot return while the lease PUT can still land", closing.isDone());
+                        release.countDown();
+                        closing.get(30, java.util.concurrent.TimeUnit.SECONDS);
+                        renewal.get(30, java.util.concurrent.TimeUnit.SECONDS);
+                    } finally {
+                        release.countDown();
+                    }
+                }
+            }
+        }
+    }
+
+    public void testRejectedActivationDoesNotRunInline() throws Exception {
+        final var clock = new AtomicLong(1000L);
+        final var plane = freshIndex(clock, createTempDir(), 1);
+        try (var node = new ServerlessNode(nodeSettings("rejected-activation"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            try (var loop = new BackgroundReconciler(node, plane)) {
+                loop.setDemandDrivenActivation(true);
+                node.threadPool().executor(ServerlessNode.ACTIVATION_POOL).shutdown();
+                final var result = loop.activateForRequest("alpha", 0);
+                final var failure = expectThrows(
+                    java.util.concurrent.ExecutionException.class,
+                    () -> result.get(30, java.util.concurrent.TimeUnit.SECONDS)
+                );
+                assertTrue(failure.getCause().toString(), failure.getCause() instanceof java.util.concurrent.RejectedExecutionException);
+                assertTrue("a rejected worker must not acquire a shard on its caller", node.reconciler().openShards().isEmpty());
+            }
+        }
+    }
+
+    public void testLoopCloseSettlesQueuedActivationsBeforeDrainingWorkers() throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-closing-alpha", 1, MAPPING, null));
+            plane.createIndex(new IndexDescriptor("beta", "uuid-closing-beta", 1, MAPPING, null));
+            try (
+                var node = new ServerlessNode(nodeSettings("closing-activation-queue"));
+                var closer = java.util.concurrent.Executors.newSingleThreadExecutor()
+            ) {
+                node.start();
+                node.setMetadataPlane(plane);
+                try (var loop = new BackgroundReconciler(node, plane)) {
+                    loop.setDemandDrivenActivation(true).setAdaptiveActivation(false).setActivationConcurrency(1);
+                    final var entered = new java.util.concurrent.CountDownLatch(1);
+                    final var release = new java.util.concurrent.CountDownLatch(1);
+                    store.onNextRegisterRead("indices/", "alpha", () -> {
+                        entered.countDown();
+                        try {
+                            assertTrue(release.await(30, java.util.concurrent.TimeUnit.SECONDS));
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(e);
+                        }
+                    });
+                    final var running = loop.activateForRequest("alpha", 0);
+                    try {
+                        assertTrue(entered.await(30, java.util.concurrent.TimeUnit.SECONDS));
+                        final var queued = loop.activateForRequest("beta", 0);
+                        assertFalse(queued.isDone());
+                        final var closingThread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+                        final var closing = closer.submit(() -> {
+                            closingThread.set(Thread.currentThread());
+                            loop.close();
+                        });
+                        assertBusy(() -> assertTrue("queued callers must be settled before waiting for active I/O", queued.isDone()));
+                        assertTrue(queued.get(30, java.util.concurrent.TimeUnit.SECONDS).isEmpty());
+                        assertBusy(
+                            () -> assertTrue(
+                                closing.isDone() || (closingThread.get() != null && closingThread.get().getState() == Thread.State.WAITING)
+                            )
+                        );
+                        assertFalse("close must still drain the active store operation", closing.isDone());
+                        release.countDown();
+                        closing.get(30, java.util.concurrent.TimeUnit.SECONDS);
+                        running.get(30, java.util.concurrent.TimeUnit.SECONDS);
+                        assertTrue(node.reconciler().openShards().stream().noneMatch(id -> id.getIndexName().equals("beta")));
+                        loop.handOverAll();
+                        assertTrue("handover remains available after draining the loop", node.reconciler().openShards().isEmpty());
+                    } finally {
+                        release.countDown();
+                    }
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- publish is an edge
 
     /**
