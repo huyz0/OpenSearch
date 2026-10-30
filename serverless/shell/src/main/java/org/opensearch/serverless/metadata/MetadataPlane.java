@@ -2116,22 +2116,44 @@ public final class MetadataPlane {
          */
         public static TransportSecrets parse(String stored) throws IOException {
             final String trimmed = stored.trim();
+            if (trimmed.isEmpty()) {
+                throw new IOException("malformed transport-secret register: blank secret");
+            }
             if (trimmed.startsWith("{") == false) {
                 return new TransportSecrets(1L, trimmed, null, 0L);
             }
-            final java.util.Map<String, Object> body = org.opensearch.common.xcontent.XContentHelper.convertToMap(
-                new org.opensearch.core.common.bytes.BytesArray(trimmed.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-                false,
-                org.opensearch.common.xcontent.XContentType.JSON
-            ).v2();
+            final java.util.Map<String, Object> body;
+            try (
+                var parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
+                    .createParser(
+                        org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
+                        org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                        trimmed
+                    )
+            ) {
+                if (parser.nextToken() != org.opensearch.core.xcontent.XContentParser.Token.START_OBJECT) {
+                    throw new IOException("expected an object");
+                }
+                body = parser.map();
+                if (parser.nextToken() != null) {
+                    throw new IOException("trailing content");
+                }
+            } catch (IOException | RuntimeException malformed) {
+                // Parser messages and their causes can contain the register's secret bytes.
+                throw new IOException("malformed transport-secret register: invalid JSON");
+            }
             final Object current = body.get("current");
-            if (current == null) {
-                throw new IOException("malformed transport-secret register: no current secret");
+            final Object previous = body.get("previous");
+            if (current instanceof String == false || ((String) current).isBlank()) {
+                throw new IOException("malformed transport-secret register: current must be a nonblank string");
+            }
+            if (previous != null && (previous instanceof String == false || ((String) previous).isBlank())) {
+                throw new IOException("malformed transport-secret register: previous must be a nonblank string");
             }
             return new TransportSecrets(
                 body.get("generation") instanceof Number n ? n.longValue() : 1L,
-                String.valueOf(current),
-                body.get("previous") == null ? null : String.valueOf(body.get("previous")),
+                (String) current,
+                (String) previous,
                 body.get("rotated_at") instanceof Number n ? n.longValue() : 0L
             );
         }
