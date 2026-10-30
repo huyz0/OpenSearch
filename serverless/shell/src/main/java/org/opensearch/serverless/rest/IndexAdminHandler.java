@@ -246,7 +246,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                             org.opensearch.action.admin.indices.create.CreateIndexAction.NAME,
                             new org.opensearch.action.admin.indices.create.CreateIndexRequest(index),
                             () -> {
-                                resolvedShards.set(createIndex(metadata, index, create).numberOfShards());
+                                resolvedShards.set(createIndex(node.get(), metadata, index, create).numberOfShards());
                                 return null;
                             }
                         );
@@ -538,13 +538,17 @@ public final class IndexAdminHandler extends BaseRestHandler {
     /**
      * Creates an index from a native request using the REST path's settings and template validation.
      *
+     * @param serving the node supplying plugin-aware mapper validation
      * @param metadata the metadata plane
      * @param request the admitted native request
      * @return the created descriptor
      * @throws Exception if validation or metadata persistence fails
      */
-    public static IndexDescriptor createIndex(MetadataPlane metadata, org.opensearch.action.admin.indices.create.CreateIndexRequest request)
-        throws Exception {
+    public static IndexDescriptor createIndex(
+        org.opensearch.serverless.shell.ServerlessNode serving,
+        MetadataPlane metadata,
+        org.opensearch.action.admin.indices.create.CreateIndexRequest request
+    ) throws Exception {
         final var invalid = request.validate();
         if (invalid != null) {
             throw invalid;
@@ -559,9 +563,9 @@ public final class IndexAdminHandler extends BaseRestHandler {
             );
         }
         final Settings settings = Settings.builder().put(request.settings()).normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX).build();
-        final String mapping = nativeMapping(request.mappings());
+        final String mapping = normalizeMapping(request.mappings());
         try {
-            return createIndex(metadata, request.index(), CreateRequest.fromSettings(settings, mapping, 1));
+            return createIndex(serving, metadata, request.index(), CreateRequest.fromSettings(settings, mapping, 1));
         } catch (RefusedException e) {
             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), e.status);
         } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
@@ -569,7 +573,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         }
     }
 
-    private static String nativeMapping(String source) {
+    private static String normalizeMapping(String source) {
         if (source == null || source.isEmpty()) {
             return null;
         }
@@ -612,14 +616,21 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * <p>A caller who spelled out a mapping is not overruled by configuration they may not know exists.
      * Shared with rollover and data streams, which create indices the same way from a body of their own.
      *
+     * @param serving the node supplying plugin-aware mapper validation
      * @param metadata the metadata plane
      * @param index the name
      * @param create the request
      * @return the descriptor as created
      * @throws IOException if a register cannot be read or written
      */
-    static IndexDescriptor createIndex(MetadataPlane metadata, String index, CreateRequest create) throws IOException, RefusedException {
+    static IndexDescriptor createIndex(
+        org.opensearch.serverless.shell.ServerlessNode serving,
+        MetadataPlane metadata,
+        String index,
+        CreateRequest create
+    ) throws IOException, RefusedException {
         return createIndex(
+            serving,
             metadata,
             index,
             create,
@@ -639,6 +650,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * for the stream matches; what it inherits is what the <em>stream's</em> name matches, so the caller
      * resolves against that and hands the result here.
      *
+     * @param serving the node supplying plugin-aware mapper validation
      * @param metadata the metadata plane
      * @param index the name
      * @param create the request
@@ -648,6 +660,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * @throws RefusedException if the merged settings are ones core would refuse, or this design cannot honour
      */
     static IndexDescriptor createIndex(
+        org.opensearch.serverless.shell.ServerlessNode serving,
         MetadataPlane metadata,
         String index,
         CreateRequest create,
@@ -665,6 +678,25 @@ public final class IndexAdminHandler extends BaseRestHandler {
             CreateRequest.mappingWith(create.mapping, inherited),
             settings
         ).createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id);
+        if (serving == null) {
+            throw new RefusedException(RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable");
+        }
+        // Validate the final mapping and analysis configuration with this node's actual plugin registry.
+        // The administrative factory creates no registered IndexService, shard, or on-disk index.
+        final var candidate = descriptor.toIndexMetadata(Map.of());
+        try (var mapper = serving.indicesService().createIndexMapperService(candidate)) {
+            mapper.merge(candidate, org.opensearch.index.mapper.MapperService.MergeReason.INDEX_TEMPLATE);
+            final var validatedSettings = mapper.getIndexSettings();
+            if (validatedSettings.getIndexSortConfig().hasIndexSort()) {
+                final var noCache = new org.opensearch.index.fielddata.IndexFieldDataCache.None();
+                validatedSettings.getIndexSortConfig()
+                    .buildIndexSort(
+                        validatedSettings.shouldWidenIndexSortType(),
+                        mapper::fieldType,
+                        (field, lookup) -> field.fielddataBuilder(index, lookup).build(noCache, serving.circuitBreakerService())
+                    );
+            }
+        }
         metadata.createIndex(descriptor);
         return descriptor;
     }
@@ -802,6 +834,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
          */
         static String mappingWith(String requested, org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited)
             throws IOException {
+            requested = normalizeMapping(requested);
             if (inherited.mappings().isEmpty()) {
                 return requested;
             }
