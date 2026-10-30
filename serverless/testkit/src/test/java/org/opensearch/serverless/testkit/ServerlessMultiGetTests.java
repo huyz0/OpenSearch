@@ -338,4 +338,62 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
             return new Response(response.statusCode(), response.body());
         }
     }
+
+    public void testPerDocumentStringSourceSelector() throws Exception {
+        assertNativeMgetSelection("{\"docs\":[{\"_id\":\"1\",\"_source\":\"msg\"}]}", 200, true, false, false);
+    }
+
+    public void testPerDocumentScalarSourceIncludes() throws Exception {
+        assertNativeMgetSelection("{\"docs\":[{\"_id\":\"1\",\"_source\":{\"includes\":\"msg\"}}]}", 200, true, false, false);
+    }
+
+    public void testPerDocumentScalarSourceExcludes() throws Exception {
+        assertNativeMgetSelection("{\"docs\":[{\"_id\":\"1\",\"_source\":{\"excludes\":\"big\"}}]}", 200, true, true, false);
+    }
+
+    public void testInvalidPerDocumentSourceIsRefused() throws Exception {
+        assertNativeMgetSelection("{\"docs\":[{\"_id\":\"1\",\"_source\":17}]}", 400, false, false, false);
+    }
+
+    public void testNullIdsAreRefused() throws Exception {
+        assertNativeMgetSelection("{\"ids\":[null]}", 400, false, false, false);
+    }
+
+    public void testMultiGetRejectsTrailingContent() throws Exception {
+        assertNativeMgetSelection("{\"ids\":[\"1\"]} {\"ids\":[\"2\"]}", 400, false, false, false);
+    }
+
+    public void testMultiGetVersionMismatchDoesNotReturnTheSource() throws Exception {
+        assertNativeMgetSelection("{\"docs\":[{\"_id\":\"1\",\"version\":999}]}", 200, false, false, false);
+    }
+
+    public void testMultiGetMatchingVersionReturnsTheDocument() throws Exception {
+        assertNativeMgetSelection("{\"docs\":[{\"_id\":\"1\",\"version\":1}]}", 200, true, true, true);
+    }
+
+    private void assertNativeMgetSelection(String body, int status, boolean msg, boolean tag, boolean big) throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane metadata = plane(clock);
+        metadata.createIndex(new IndexDescriptor("shaped", "uuid-shaped-0000000", 1, WIDE_MAPPING, null));
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-native-shape"))) {
+            node.start();
+            node.setMetadataPlane(metadata);
+            hold(node, metadata, clock, 1, "shaped");
+            final Response written = send(
+                node,
+                "PUT",
+                "/shaped/_doc/1?refresh=true",
+                "{\"msg\":\"visible-value\",\"tag\":\"tag-value\",\"big\":\"padding-value\"}"
+            );
+            assertEquals(written.body(), 201, written.status());
+            final Response response = send(node, "POST", "/shaped/_mget", body);
+            assertEquals(response.body(), status, response.status());
+            assertEquals(response.body(), msg, response.body().contains("visible-value"));
+            assertEquals(response.body(), tag, response.body().contains("tag-value"));
+            assertEquals(response.body(), big, response.body().contains("padding-value"));
+            if (body.contains("999")) {
+                assertTrue(response.body(), response.body().contains("version_conflict_engine_exception"));
+            }
+        }
+    }
 }
