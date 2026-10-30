@@ -80,33 +80,21 @@ public final class DataStreamHandler extends BaseRestHandler {
 
     /** A create request with the timestamp field mapped as a date, over whatever else it carried. */
     static IndexAdminHandler.CreateRequest withTimestamp(IndexAdminHandler.CreateRequest create, String timestampField) {
-        final String stamp = "{\"properties\":{\"" + timestampField + "\":{\"type\":\"date\"}}}";
-        if (create.mapping == null) {
-            return new IndexAdminHandler.CreateRequest(create.shards, stamp, create.settings == null ? Settings.EMPTY : create.settings);
-        }
+        final Map<String, Object> merged = new LinkedHashMap<>(Map.of("properties", Map.of(timestampField, Map.of("type", "date"))));
         try {
-            final Map<String, Object> merged = new LinkedHashMap<>(
-                org.opensearch.common.xcontent.XContentHelper.convertToMap(
-                    new org.opensearch.core.common.bytes.BytesArray(stamp.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-                    false,
-                    org.opensearch.common.xcontent.XContentType.JSON
-                ).v2()
-            );
-            TemplateResolver.mergeMappings(
-                merged,
-                org.opensearch.common.xcontent.XContentHelper.convertToMap(
-                    new org.opensearch.core.common.bytes.BytesArray(create.mapping.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
-                    false,
-                    org.opensearch.common.xcontent.XContentType.JSON
-                ).v2()
-            );
+            if (create.mapping != null) {
+                TemplateResolver.mergeMappings(
+                    merged,
+                    org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                        new org.opensearch.core.common.bytes.BytesArray(create.mapping),
+                        false,
+                        org.opensearch.common.xcontent.XContentType.JSON
+                    ).v2()
+                );
+            }
             try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
                 builder.map(merged);
-                return new IndexAdminHandler.CreateRequest(
-                    create.shards,
-                    org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString(),
-                    create.settings == null ? Settings.EMPTY : create.settings
-                );
+                return create.withMapping(org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString());
             }
         } catch (IOException e) {
             throw new IllegalArgumentException("could not merge the timestamp mapping: " + e.getMessage(), e);

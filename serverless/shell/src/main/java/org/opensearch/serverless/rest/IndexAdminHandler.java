@@ -785,6 +785,10 @@ public final class IndexAdminHandler extends BaseRestHandler {
             this.explicitShards = explicitShards;
         }
 
+        CreateRequest withMapping(String updatedMapping) {
+            return new CreateRequest(shards, updatedMapping, settings, explicitShards);
+        }
+
         static CreateRequest parse(RestRequest request) throws RefusedException {
             final int fromQuery = request.paramAsInt("shards", 1);
             if (request.hasContent() == false) {
