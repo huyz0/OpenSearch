@@ -273,6 +273,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                     fieldNames.addAll(mapperService.simpleMatchToFullName(pattern));
                 }
                 final java.util.function.Predicate<String> visible = serving.indicesService().getFieldFilter().apply(name);
+                final java.util.Set<String> objectPaths = new java.util.HashSet<>();
                 for (String fieldName : fieldNames) {
                     final MappedFieldType type = mapperService.fieldType(fieldName);
                     if (type == null || (mapperService.isMetadataField(fieldName) == false && visible.test(type.name()) == false)) {
@@ -302,6 +303,30 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                     if (mapperService.isMetadataField(fieldName)) {
                         metadataFields.add(fieldName);
                     }
+                    // Core also reports the object paths of each visible selected field, including
+                    // an alias's underlying path. Multi-field parents remain ordinary mapped fields.
+                    int dot = type.name().lastIndexOf('.');
+                    while (dot >= 0) {
+                        final String parent = type.name().substring(0, dot);
+                        if (objectPaths.add(parent) == false) {
+                            break;
+                        }
+                        if (mapperService.fieldType(parent) == null) {
+                            final var object = mapperService.getObjectMapper(parent);
+                            // Literal dotted names under disable_objects need not have object mappers.
+                            if (object != null) {
+                                final String parentType = object.nested().isNested() ? "nested" : "object";
+                                capabilities.computeIfAbsent(parent, ignored -> new TreeMap<>())
+                                    .computeIfAbsent(parentType, ignored -> new TreeSet<>())
+                                    .add(name);
+                                final String parentKey = parent + " " + parentType;
+                                searchable.put(parentKey, false);
+                                aggregatable.put(parentKey, false);
+                            }
+                        }
+                        dot = parent.lastIndexOf('.');
+                    }
+
                 }
             } finally {
                 mapperService.close();

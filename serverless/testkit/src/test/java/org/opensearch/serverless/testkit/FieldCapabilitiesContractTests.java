@@ -98,7 +98,9 @@ public class FieldCapabilitiesContractTests extends OpenSearchTestCase {
     public static final class HiddenTitlePlugin extends org.opensearch.plugins.Plugin implements org.opensearch.plugins.MapperPlugin {
         @Override
         public java.util.function.Function<String, java.util.function.Predicate<String>> getFieldFilter() {
-            return index -> field -> field.equals("title") == false;
+            return index -> field -> field.equals("title") == false
+                && field.equals("obj.leaf") == false
+                && field.equals("nested.n") == false;
         }
     }
 
@@ -110,6 +112,50 @@ public class FieldCapabilitiesContractTests extends OpenSearchTestCase {
             assertFalse(answer.body(), fields.containsKey("title"));
             assertFalse(answer.body(), fields.containsKey("title_alias"));
             assertTrue(answer.body(), fields.containsKey("_id"));
+        });
+    }
+
+    public void testObjectParentIsReportedForASelectedChild() throws Exception {
+        withNode(node -> {
+            final var answer = send(node, "/enabled/_field_caps?fields=obj.leaf", "{}");
+            assertEquals(answer.body(), 200, answer.statusCode());
+            final var fields = object(json(answer.body()).get("fields"));
+            assertEquals(java.util.Set.of("obj", "obj.leaf"), fields.keySet());
+            final var parent = object(object(fields.get("obj")).get("object"));
+            assertEquals(false, parent.get("searchable"));
+            assertEquals(false, parent.get("aggregatable"));
+        });
+    }
+
+    public void testNestedParentIsReportedForASelectedChild() throws Exception {
+        withNode(node -> {
+            final var answer = send(node, "/enabled/_field_caps?fields=nested.n", "{}");
+            assertEquals(answer.body(), 200, answer.statusCode());
+            final var fields = object(json(answer.body()).get("fields"));
+            assertEquals(java.util.Set.of("nested", "nested.n"), fields.keySet());
+            final var parent = object(object(fields.get("nested")).get("nested"));
+            assertEquals(false, parent.get("searchable"));
+            assertEquals(false, parent.get("aggregatable"));
+        });
+    }
+
+    public void testSelectedAliasReportsItsUnderlyingObjectParent() throws Exception {
+        withNode(node -> {
+            final var answer = send(node, "/enabled/_field_caps?fields=obj_alias", "{}");
+            assertEquals(answer.body(), 200, answer.statusCode());
+            final var fields = object(json(answer.body()).get("fields"));
+            assertEquals(java.util.Set.of("obj", "obj_alias"), fields.keySet());
+        });
+    }
+
+    public void testHiddenChildrenDoNotRevealTheirObjectPaths() throws Exception {
+        withNode(new HiddenTitlePlugin(), node -> {
+            final var answer = send(node, "/enabled/_field_caps?fields=*", "{}");
+            assertEquals(answer.body(), 200, answer.statusCode());
+            final var fields = object(json(answer.body()).get("fields"));
+            assertFalse(answer.body(), fields.containsKey("obj"));
+            assertFalse(answer.body(), fields.containsKey("nested"));
+            assertFalse(answer.body(), fields.containsKey("obj_alias"));
         });
     }
 
@@ -133,15 +179,15 @@ public class FieldCapabilitiesContractTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
                 node.start();
                 node.setMetadataPlane(metadata);
-                metadata.createIndex(
-                    new IndexDescriptor(
-                        "enabled",
-                        "uuid-enabled",
-                        3,
-                        "{\"properties\":{\"title\":{\"type\":\"keyword\",\"meta\":{\"owner\":\"search\"}},\"title_alias\":{\"type\":\"alias\",\"path\":\"title\"}}}",
-                        null
-                    )
-                );
+                metadata.createIndex(new IndexDescriptor("enabled", "uuid-enabled", 3, """
+                    {"properties": {
+                      "title": {"type":"keyword", "meta":{"owner":"search"}},
+                      "title_alias": {"type":"alias", "path":"title"},
+                      "obj": {"properties":{"leaf":{"type":"keyword"}}},
+                      "obj_alias": {"type":"alias", "path":"obj.leaf"},
+                      "nested": {"type":"nested", "properties":{"n":{"type":"long"}}}
+                    }}
+                    """, null));
                 metadata.createIndex(
                     new IndexDescriptor(
                         "disabled",
