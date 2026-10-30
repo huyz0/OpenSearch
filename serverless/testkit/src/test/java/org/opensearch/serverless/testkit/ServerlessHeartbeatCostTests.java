@@ -71,6 +71,9 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
             loop.want("alpha", shard);
         }
         loop.tick(clock.get());
+        // The first pass launches independent cleanup. Finish that setup before measuring only a
+        // renewal or head scan; otherwise its membership reads race the counter reset.
+        loop.reclaimSweep().get(30, java.util.concurrent.TimeUnit.SECONDS);
         assertEquals("every shard must be held before anything is measured", shards, node.reconciler().openShards().size());
         return loop;
     }

@@ -513,16 +513,26 @@ public final class GarbageCollector {
      */
     public int collectReclaims(MetadataPlane plane, long nowMillis, String selfId) throws IOException {
         final java.util.Set<String> members = new java.util.TreeSet<>();
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().refreshIfOlderThan(plane.leaseTtlMillis() / 2)) {
-            members.add(lease.nodeId());
+        try {
+            return plane.reclaimQueue().drain(nowMillis, bucket -> {
+                // Ownership matters only once a bucket is due. An empty queue must not read every
+                // member's lease merely to discover that there is no cleanup work.
+                if (members.isEmpty()) {
+                    try {
+                        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership()
+                            .refreshIfOlderThan(plane.leaseTtlMillis() / 2)) {
+                            members.add(lease.nodeId());
+                        }
+                    } catch (IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                    members.add(selfId);
+                }
+                return selfId.equals(org.opensearch.serverless.cluster.Rendezvous.owner("reclaim/" + bucket, members));
+            }, plane::reclaim);
+        } catch (java.io.UncheckedIOException e) {
+            throw e.getCause();
         }
-        members.add(selfId);
-        return plane.reclaimQueue()
-            .drain(
-                nowMillis,
-                bucket -> selfId.equals(org.opensearch.serverless.cluster.Rendezvous.owner("reclaim/" + bucket, members)),
-                plane::reclaim
-            );
     }
 
     /**
