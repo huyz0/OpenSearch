@@ -119,6 +119,11 @@ public final class MetadataPlane {
         this.base = base;
         this.leaseTtlMillis = leaseTtlMillis;
         this.clock = clock;
+        this.pointInTimeStore = new PointInTimeStore(
+            blobStore.blobContainer(RegisterMap.pointsInTime(base)),
+            blobStore.blobContainer(RegisterMap.pointInTimeStates(base)),
+            clock
+        );
     }
 
     /**
@@ -1018,7 +1023,7 @@ public final class MetadataPlane {
      * @throws IOException if the write fails
      */
     public void createPointInTime(PointInTime pit) throws IOException {
-        writePointInTime(pit, true);
+        pointInTimeStore.create(pit);
     }
 
     /**
@@ -1036,7 +1041,7 @@ public final class MetadataPlane {
         if (pit.isCapturing() == false) {
             throw new IllegalArgumentException("a capture marker must name an index and hold no shards: " + pit.id());
         }
-        writePointInTime(pit, true);
+        pointInTimeStore.create(pit);
         try {
             verifyCaptureIncarnation(pit.index(), pit.indexUuid());
         } catch (IOException | RuntimeException e) {
@@ -1074,13 +1079,7 @@ public final class MetadataPlane {
      * @throws IOException if the write fails
      */
     public void finishPointInTime(PointInTime pit) throws IOException {
-        writePointInTime(pit, false);
-    }
-
-    private void writePointInTime(PointInTime pit, boolean failIfAlreadyExists) throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
-        final var bytes = pit.toBytes();
-        container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), failIfAlreadyExists);
+        pointInTimeStore.finish(pit);
     }
 
     /**
@@ -1094,47 +1093,21 @@ public final class MetadataPlane {
      * @throws IOException if the write fails
      */
     public void extendPointInTime(PointInTime pit) throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
-        final var bytes = pit.toBytes();
-        container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), false);
+        if (pointInTimeStore.extend(pit, null) == false) {
+            throw new IOException("point in time is no longer active");
+        }
     }
 
     /**
-     * Moves a frozen view's deadline later, only if the view still exists and its deadline is the one the
-     * caller read.
+     * Atomically extends the view if its deadline still matches the caller's observation.
      *
-     * <p>The unconditional form is a blind overwrite: a page that read the record just before a release
-     * and wrote it back just after resurrected the view for another hour, files pinned and every node's
-     * {@code closeReleasedViews} kept waiting on a record that should have been gone. This re-reads the
-     * record and writes only when it is there and its stored deadline equals the expectation, so a
-     * released view stays released and two extensions do not silently overwrite each other.
-     *
-     * <p>Not a register: the record has to stay a plain blob, because the collector and the reaper find
-     * views by listing this container and read them with {@code readBlob}, which a register is not
-     * guaranteed to serve on every store. The window between the re-read and the overwrite is therefore
-     * the one an object store with no conditional overwrite leaves; it is a fraction of the width of the
-     * blind write, and it is stated rather than hidden.
-     *
-     * @param pit the view, carrying its new deadline
-     * @param expectedExpiresAtMillis the deadline the caller read
-     * @return true if the extension was written; false if the view is gone or its deadline moved
-     * @throws IOException if the read or the write fails
+     * @param pit the view with its new deadline
+     * @param expectedExpiresAtMillis the deadline observed by the caller
+     * @return whether this extension won
+     * @throws IOException if the backing store fails
      */
     public boolean extendPointInTime(PointInTime pit, long expectedExpiresAtMillis) throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
-        final PointInTime stored;
-        try (java.io.InputStream in = container.readBlob(pit.id())) {
-            stored = PointInTime.fromStream(in);
-        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
-            // Released: an extension of a view that is gone must not bring it back.
-            return false;
-        }
-        if (stored.expiresAtMillis() != expectedExpiresAtMillis) {
-            return false;
-        }
-        final var bytes = pit.toBytes();
-        container.writeBlob(pit.id(), bytes.streamInput(), bytes.length(), false);
-        return true;
+        return pointInTimeStore.extend(pit, expectedExpiresAtMillis);
     }
 
     /**
@@ -1145,23 +1118,7 @@ public final class MetadataPlane {
      * @throws IOException if the read fails
      */
     public java.util.Optional<PointInTime> pointInTime(String id) throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
-        if (container.blobExists(id) == false) {
-            return java.util.Optional.empty();
-        }
-        try (java.io.InputStream in = container.readBlob(id)) {
-            final PointInTime read = PointInTime.fromStream(in);
-            if (read.isCapturing()) {
-                // A freeze that has not finished is not a view yet: it names no shard, and a search
-                // against it would find nothing and report the nothing as a complete answer, because
-                // "every shard answered" is trivially true of no shards. Absent until it is real.
-                return java.util.Optional.empty();
-            }
-            return java.util.Optional.of(read);
-        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
-            // Released between the check and the read, which is ordinary rather than exceptional.
-            return java.util.Optional.empty();
-        }
+        return pointInTimeStore.read(id);
     }
 
     /**
@@ -1172,54 +1129,21 @@ public final class MetadataPlane {
      * @throws IOException if the delete fails
      */
     public boolean releasePointInTime(String id) throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
-        if (container.blobExists(id) == false) {
-            return false;
-        }
-        container.deleteBlobsIgnoringIfNotExists(java.util.List.of(id));
-        return true;
+        return pointInTimeStore.release(id);
     }
 
     /**
      * Reads every frozen view that has not expired.
      *
-     * <p>For the collector, which has to know what is being held before it deletes anything. Expired ones
-     * are skipped rather than deleted here: deciding they are gone and removing them are two different
-     * jobs, and doing both in a method a sweep calls would mean a read path with a side effect.
+     * <p>Expiry is claimed atomically before excluding a view, so a keep-alive acknowledged on
+     * another node cannot lose its files to a collector using a stale deadline.
      *
      * @param nowMillis the current time
      * @return the live views
      * @throws IOException if listing or reading fails
      */
     public java.util.List<PointInTime> livePointsInTime(long nowMillis) throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
-        final java.util.List<PointInTime> live = new java.util.ArrayList<>();
-        for (String name : container.listBlobs().keySet()) {
-            if (PointInTime.looksLikeAnId(name) == false) {
-                // Not a name this system mints, so not a record of ours. Ignored rather than treated as a
-                // pin: one stray object in this container -- a console upload, a backup tool, a test
-                // filesystem's scratch file -- would otherwise turn off the garbage collector for the whole
-                // deployment, and do it silently. Found by a test filesystem doing exactly that.
-                LOGGER.warn("ignoring [" + name + "] in the points-in-time container: it is not a name this system writes");
-                continue;
-            }
-            try (java.io.InputStream in = container.readBlob(name)) {
-                final PointInTime pit = PointInTime.fromStream(in);
-                if (pit.expiredAt(nowMillis) == false) {
-                    live.add(pit);
-                }
-            } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
-                // A release after discovery is ordinary. It no longer protects any files.
-            } catch (Exception e) {
-                // A view the collector cannot read is one it must assume is holding something, because the
-                // alternative is deleting files somebody is paging through. A half-written record still has
-                // the name we gave it, so this is the case that treatment exists for. Treated as live and
-                // left for a human, rather than swept because it was unreadable.
-                LOGGER.warn("could not read the point in time " + name + "; treating it as live", e);
-                live.add(new PointInTime(name, "", Long.MAX_VALUE, java.util.Map.of()));
-            }
-        }
-        return live;
+        return pointInTimeStore.live(nowMillis);
     }
 
     /**
@@ -1230,40 +1154,10 @@ public final class MetadataPlane {
      * @throws IOException if listing or deleting fails
      */
     public int reapPointsInTime(long nowMillis) throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.pointsInTime(base));
-        final java.util.List<String> expired = new java.util.ArrayList<>();
-        for (String name : container.listBlobs().keySet()) {
-            if (PointInTime.looksLikeAnId(name) == false) {
-                // Not ours to read and not ours to delete. The sweep says so once, in the log, and leaves
-                // it exactly where it is.
-                continue;
-            }
-            try (java.io.InputStream in = container.readBlob(name)) {
-                if (PointInTime.fromStream(in).expiredAt(nowMillis)) {
-                    expired.add(name);
-                }
-            } catch (Exception e) {
-                LOGGER.warn("could not read the point in time " + name + "; leaving it alone", e);
-            }
-        }
-        // Re-read each candidate just before deleting it: a search on another node may have extended
-        // the view between the first read and now, and a caller told an extension succeeded must not
-        // lose the view on its next page.
-        final java.util.List<String> stillExpired = new java.util.ArrayList<>();
-        for (String name : expired) {
-            try (java.io.InputStream in = container.readBlob(name)) {
-                if (PointInTime.fromStream(in).expiredAt(nowMillis)) {
-                    stillExpired.add(name);
-                }
-            } catch (Exception e) {
-                // Gone already, or unreadable: either way not this pass's to delete.
-            }
-        }
-        if (stillExpired.isEmpty() == false) {
-            container.deleteBlobsIgnoringIfNotExists(stillExpired);
-        }
-        return stillExpired.size();
+        return pointInTimeStore.reap(nowMillis);
     }
+
+    private final PointInTimeStore pointInTimeStore;
 
     private final DigestRollups rollups;
 

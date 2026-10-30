@@ -146,3 +146,11 @@ Header order does not affect authentication.
 Unknown secret generations trigger at most one secret-store probe per node per
 second. Requests waiting for a probe receive a retryable 429, so a forged generation
 cannot force a store read per frame or turn a brief key-rotation delay into a 403.
+
+PIT lifecycle state uses compare-and-swap registers in `pit-states`, separate
+from active discovery markers in `pits`. Existing plain records are adopted on
+first access. Upgrade all nodes together: older nodes do not arbitrate release
+and keep-alive through these registers. Released IDs retain a compact tombstone
+so delayed requests cannot revive them; active listings do not scan this history.
+Do not delete these state records while requests from that deployment can still
+run. The extra retained object per PIT is a storage cost of this guarantee.
