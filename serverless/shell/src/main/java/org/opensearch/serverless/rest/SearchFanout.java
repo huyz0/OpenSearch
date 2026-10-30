@@ -476,15 +476,6 @@ public final class SearchFanout {
         return serving.circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST);
     }
 
-    /** The bytes a hit holds on the coordinator: its id and its source, which is what a wide window costs. */
-    private static long bytesOf(List<SearchHit> hits) {
-        long bytes = 0L;
-        for (SearchHit hit : hits) {
-            bytes += (hit.getId() == null ? 0L : hit.getId().length()) + (hit.getSourceRef() == null ? 0L : hit.getSourceRef().length());
-        }
-        return bytes;
-    }
-
     /**
      * Charges each shard's answer to the request breaker as it arrives, before the fan-out keeps it.
      *
@@ -508,8 +499,16 @@ public final class SearchFanout {
         }
 
         ShardAnswer admit(ShardAnswer answer) {
-            final long bytes = bytesOf(answer.hits);
+            if (abandoned.get()) {
+                answer.release(serving);
+                throw new IllegalStateException("the search gave up waiting before this shard answered");
+            }
+            final long hitBytes = ResponseMemory.hits(answer.hits);
+            final long aggregationBytes = answer.aggregations == null ? 0L : ResponseMemory.of(answer.aggregations);
+            final long bytes = hitBytes + aggregationBytes;
             breaker(serving).addEstimateBytesAndMaybeBreak(bytes, "serverless_search_merge");
+            answer.hitBytes = hitBytes;
+            answer.aggregationBytes = aggregationBytes;
             answer.reserved.set(bytes);
             admitted.add(answer);
             if (abandoned.get()) {
@@ -541,7 +540,7 @@ public final class SearchFanout {
 
         /** Re-counts the reservation against what the pile still holds, after a trim threw hits away. */
         private void settle(ServerlessNode serving) {
-            final long retained = bytesOf(hits);
+            final long retained = hitBytes + aggregationBytes;
             if (retained < reserved) {
                 breaker(serving).addWithoutBreaking(retained - reserved);
                 reserved = retained;
@@ -549,6 +548,8 @@ public final class SearchFanout {
         }
 
         private long total;
+        private long hitBytes;
+        private long aggregationBytes;
         private int answered;
         private org.apache.lucene.search.TotalHits.Relation relation = org.apache.lucene.search.TotalHits.Relation.EQUAL_TO;
         private float maxScore = Float.NaN;
@@ -616,13 +617,19 @@ public final class SearchFanout {
                 // large for this node was a 429 before it was kept; the reservation moves to the pile here
                 // and is given back when the pile is.
                 merged.reserved += answer.reserved.getAndSet(0L);
+                merged.hitBytes += answer.hitBytes;
+                merged.aggregationBytes += answer.aggregationBytes;
                 merged.hits.addAll(answer.hits);
                 // The fan-out and its admission tracker still retain the answer object. Transfer the
                 // payload too, so trimming the merge really releases the references being uncharged.
                 answer.hits = List.of();
                 if (merged.hits.size() > 2 * window) {
                     merged.hits.sort(order);
-                    merged.hits.subList(window, merged.hits.size()).clear();
+                    final var discarded = merged.hits.subList(window, merged.hits.size());
+                    // Each discarded hit is visited at most once more. Retained large fields and
+                    // aggregation trees are not walked again for every incoming shard.
+                    merged.hitBytes -= ResponseMemory.hits(discarded);
+                    discarded.clear();
                     merged.settle(serving);
                 }
                 absorbInto(merged, answer);
@@ -847,6 +854,8 @@ public final class SearchFanout {
     private static final class ShardAnswer {
         private final long total;
         private List<SearchHit> hits;
+        private long hitBytes;
+        private long aggregationBytes;
         private org.opensearch.search.aggregations.InternalAggregations aggregations;
         private final org.apache.lucene.search.TotalHits.Relation relation;
         private final float maxScore;

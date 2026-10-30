@@ -97,7 +97,8 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
 
             // And the node is still there. A breaker that took the node down with the request would be a
             // more expensive way of doing the thing it exists to prevent.
-            final Response after = send(node, "POST", "/bounded/_search", "{\"query\":{\"match_all\":{}}}");
+            // Counting stays within this deliberately tiny budget; retaining five native hits does not.
+            final Response after = send(node, "POST", "/bounded/_search", "{\"size\":0,\"query\":{\"match_all\":{}}}");
             assertEquals("the node must still serve ordinary searches: " + after.body(), 200, after.status());
             assertTrue(after.body().contains("\"value\":5"));
         }
