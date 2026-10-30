@@ -40,6 +40,7 @@ public final class HookedBlobStore implements BlobStore {
 
     private final BlobStore delegate;
     private final AtomicReference<Hook> swapHook = new AtomicReference<>();
+    private final AtomicReference<Hook> afterSwapHook = new AtomicReference<>();
     private final AtomicReference<Hook> deleteHook = new AtomicReference<>();
     private final AtomicReference<Hook> armed = new AtomicReference<>();
     private final AtomicReference<Hook> listingHook = new AtomicReference<>();
@@ -157,6 +158,12 @@ public final class HookedBlobStore implements BlobStore {
     public void onNextRegisterSwap(String pathContains, String blobName, Runnable action) {
         fired = false;
         swapHook.set(new Hook(pathContains, blobName, action));
+    }
+
+    /** Runs once after a matching register CAS succeeds, before its caller receives the acknowledgement. */
+    public void onNextRegisterSwapAfter(String pathContains, String blobName, Runnable action) {
+        fired = false;
+        afterSwapHook.set(new Hook(pathContains, blobName, action));
     }
 
     /** Runs an action immediately before deleting the named blob in the matching container. */
@@ -352,7 +359,17 @@ public final class HookedBlobStore implements BlobStore {
                 hook.action().run();
                 fired = true;
             }
-            return inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            final BlobRegisterCasResult result = inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            final Hook after = afterSwapHook.get();
+            if (result.applied()
+                && after != null
+                && after.blobName().equals(blobName)
+                && inner.path().buildAsString().contains(after.pathContains())
+                && afterSwapHook.compareAndSet(after, null)) {
+                after.action().run();
+                fired = true;
+            }
+            return result;
         }
     }
 }

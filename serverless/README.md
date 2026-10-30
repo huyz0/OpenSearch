@@ -161,3 +161,11 @@ under `snapshot-data-v2`; reusing a snapshot name cannot reuse or delete the pri
 capture's files. Legacy name-based snapshot records and copies remain readable.
 Upgrade all nodes together, since older writers do not consult these state heads.
 Deleted names retain compact state tombstones outside active snapshot listings.
+
+When the backend does not pass the conditional-delete probe, index deletion
+releases matching shard heads with compare-and-swap instead of deleting head
+keys by name. This preserves a concurrently recreated index's writer and keeps
+terms increasing. The fallback reads each shard head and swaps each matching
+owned head; it retains one small unowned head per previously activated shard
+of a historical index name. Reusing the name overwrites those heads. Backends
+with verified conditional deletion continue removing unchanged heads outright.

@@ -426,7 +426,7 @@ public final class MetadataPlane {
         if (conditional) {
             heads.deleteIfUnchanged(owned);
         } else {
-            heads.deleteAllFor(indexName, descriptor.get().numberOfShards());
+            heads.releaseAllOf(indexName, descriptor.get().numberOfShards(), descriptor.get().uuid());
         }
         // The aliases that named it stop naming it, as core's delete does. Left in place, the alias
         // record still listed the name while the new index of that name (created with an empty hint) said

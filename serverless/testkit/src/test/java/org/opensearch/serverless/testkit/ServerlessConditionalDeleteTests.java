@@ -191,6 +191,47 @@ public class ServerlessConditionalDeleteTests extends OpenSearchTestCase {
         assertTrue(plane.describe("alpha").isEmpty());
     }
 
+    public void testTombstoneDeleteReleasesHeadsWithoutResettingTheirTerms() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            plane.descriptors().setConditionalDelete(false);
+            plane.createIndex(index("alpha", "uuid-head-old"));
+            final var old = plane.heads().acquire("alpha", 0, "old-writer", "old-process", "uuid-head-old");
+            assertTrue(old.acquired());
+            assertTrue(plane.deleteIndex("alpha"));
+            final var released = plane.heads().read("alpha", 0).orElseThrow();
+            assertNull(released.ownerNodeId());
+            assertEquals(old.head().term(), released.term());
+            plane.createIndex(index("alpha", "uuid-head-new"));
+            final var fresh = plane.heads().acquire("alpha", 0, "new-writer", "new-process", "uuid-head-new");
+            assertTrue(fresh.acquired());
+            assertTrue(fresh.head().term() > old.head().term());
+        }
+    }
+
+    public void testTombstoneDeleteCannotEraseARecreatedWriterHead() throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            plane.descriptors().setConditionalDelete(false);
+            plane.createIndex(index("alpha", "uuid-head-old"));
+            assertTrue(plane.heads().acquire("alpha", 0, "old-writer", "old-process", "uuid-head-old").acquired());
+            store.onNextRegisterSwapAfter("indices/", "alpha", () -> {
+                try {
+                    plane.createIndex(index("alpha", "uuid-head-new"));
+                    assertTrue(plane.heads().acquire("alpha", 0, "new-writer", "new-process", "uuid-head-new").acquired());
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            });
+            assertTrue(plane.deleteIndex("alpha"));
+            assertTrue("the new owner acquired after the descriptor was deleted", store.fired());
+            final var head = plane.heads().read("alpha", 0);
+            assertTrue("a name-based cleanup must not erase the replacement writer's head", head.isPresent());
+            assertEquals("uuid-head-new", head.orElseThrow().indexUuid());
+            assertEquals("new-writer", head.orElseThrow().ownerNodeId());
+        }
+    }
+
     private static int drain(MetadataPlane plane, long now) throws IOException {
         return plane.reclaimQueue().drain(now, bucket -> true, plane::reclaim);
     }
