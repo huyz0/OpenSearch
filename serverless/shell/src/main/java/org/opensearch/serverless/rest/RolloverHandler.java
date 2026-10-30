@@ -255,7 +255,7 @@ public final class RolloverHandler extends BaseRestHandler {
         if (ask.newIndex() != null) {
             newName = ask.newIndex();
         } else if (record.dataStream()) {
-            newName = DataStreamHandler.backingIndexName(ask.target(), record.generation() + 1);
+            newName = DataStreamHandler.backingIndexName(ask.target(), incrementCounter(record.generation(), "rollover generation"));
         } else {
             newName = nextName(oldName);
             if (newName == null) {
@@ -323,7 +323,7 @@ public final class RolloverHandler extends BaseRestHandler {
         // template that declared the stream -- see DataStreamHandler.create for why it cannot be resolved
         // against the backing name.
         final IndexAdminHandler.CreateRequest create = ask.create();
-        long newGeneration = record.generation() + 1;
+        long newGeneration = incrementCounter(record.generation(), "rollover generation");
         String createdUuid;
         try {
             if (record.dataStream()) {
@@ -347,7 +347,7 @@ public final class RolloverHandler extends BaseRestHandler {
                         if (attempt >= 8) {
                             throw e;
                         }
-                        newGeneration++;
+                        newGeneration = incrementCounter(newGeneration, "data stream generation");
                         newName = DataStreamHandler.backingIndexName(ask.target(), newGeneration);
                     }
                 }
@@ -392,6 +392,14 @@ public final class RolloverHandler extends BaseRestHandler {
         return new RolloverResponse(oldName, newName, met, false, true, true, true);
     }
 
+    private static long incrementCounter(long current, String counter) {
+        try {
+            return Math.incrementExact(current);
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException(counter + " is exhausted at [" + current + "]", e);
+        }
+    }
+
     /** Core's naming rule: a trailing number, incremented, padded to six digits. */
     static String nextName(String name) {
         final int dash = name.lastIndexOf('-');
@@ -402,7 +410,11 @@ public final class RolloverHandler extends BaseRestHandler {
         if (digits.chars().allMatch(Character::isDigit) == false) {
             return null;
         }
-        return name.substring(0, dash + 1) + String.format(Locale.ROOT, "%06d", Long.parseLong(digits) + 1);
+        return name.substring(0, dash + 1) + String.format(
+            Locale.ROOT,
+            "%06d",
+            incrementCounter(Long.parseLong(digits), "numeric index suffix")
+        );
     }
 
 }
