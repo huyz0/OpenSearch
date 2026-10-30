@@ -426,6 +426,56 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
         }
     }
 
+    public void testAdmittedDocumentIdIsRoutedBeforeForwardingWithOneAdmission() throws Exception {
+        for (int originalShard : new int[] { 0, 1 }) {
+            final AtomicLong clock = new AtomicLong(1_000L);
+            final MetadataPlane metadata = plane(clock);
+            final var descriptor = new IndexDescriptor("alpha", "uuid-alpha-policy", 2, MAPPING, null);
+            metadata.createIndex(descriptor);
+            final String original = idRoutingTo(descriptor, originalShard);
+            final int chosenShard = 1 - originalShard;
+            final String chosen = idRoutingTo(descriptor, chosenShard);
+            final var admissions = new java.util.concurrent.atomic.AtomicInteger();
+            final var ownerAdmissions = new java.util.concurrent.atomic.AtomicInteger();
+            final var policy = new PolicyFilterPlugin(org.opensearch.action.index.IndexAction.NAME, request -> {
+                admissions.incrementAndGet();
+                assertEquals(original, ((org.opensearch.action.index.IndexRequest) request).id());
+                return new org.opensearch.action.index.IndexRequest("alpha").id(chosen)
+                    .source(java.util.Map.of("msg", "safe", "n", 7))
+                    .setRefreshPolicy(org.opensearch.action.support.WriteRequest.RefreshPolicy.IMMEDIATE);
+            }, response -> {
+                final var written = (org.opensearch.action.index.IndexResponse) response;
+                assertEquals(chosen, written.getId());
+                assertEquals(new ShardId("alpha", descriptor.uuid(), chosenShard), written.getShardId());
+                return response;
+            }, null);
+            final var ownerPolicy = PolicyFilterPlugin.request(org.opensearch.action.index.IndexAction.NAME, request -> {
+                ownerAdmissions.incrementAndGet();
+                return request;
+            });
+            try (
+                Pair pair = new Pair(
+                    new ServerlessNode(nodeSettings("policy-coordinator-" + originalShard), List.of(policy)),
+                    new ServerlessNode(nodeSettings("policy-owner-" + originalShard), List.of(ownerPolicy)),
+                    metadata,
+                    clock
+                )
+            ) {
+                final var result = send(pair.a, "PUT", "/alpha/_doc/" + original, "{\"msg\":\"unsafe\",\"n\":1}");
+                assertEquals(result.body(), 201, result.status());
+                assertEquals(1, admissions.get());
+                assertEquals("an internal forward must not authorize the public operation twice", 0, ownerAdmissions.get());
+                assertTrue(result.body(), result.body().contains("\"_id\":\"" + chosen + "\""));
+                final String owner = chosenShard == 1 ? pair.b.localNode().getId() : pair.a.localNode().getId();
+                assertTrue(result.body(), result.body().contains("\"_node\":\"" + owner + "\""));
+                assertEquals(404, send(pair.a, "GET", "/alpha/_doc/" + original, null).status());
+                final var stored = send(pair.a, "GET", "/alpha/_doc/" + chosen, null);
+                assertEquals(stored.body(), 200, stored.status());
+                assertTrue(stored.body(), stored.body().contains("safe"));
+            }
+        }
+    }
+
     private static String idRoutingTo(IndexDescriptor descriptor, int shard) {
         for (int i = 0;; i++) {
             final String candidate = "aimed-" + i;
