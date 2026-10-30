@@ -1005,6 +1005,27 @@ public abstract class Engine implements LifecycleAware, Closeable {
         return List.of();
     }
 
+    /** A closeable, ordered view of additional recovery operations; large histories can stream from disk. */
+    public Translog.Snapshot engineRecoverySnapshot() throws IOException {
+        final List<Translog.Operation> operations = engineRecoveryOperations();
+        return new Translog.Snapshot() {
+            private int index;
+
+            @Override
+            public int totalOperations() {
+                return operations.size();
+            }
+
+            @Override
+            public Translog.Operation next() {
+                return index < operations.size() ? operations.get(index++) : null;
+            }
+
+            @Override
+            public void close() {}
+        };
+    }
+
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
         TranslogDeletionPolicy customTranslogDeletionPolicy = null;
         if (engineConfig.getCustomTranslogDeletionPolicyFactory() != null) {

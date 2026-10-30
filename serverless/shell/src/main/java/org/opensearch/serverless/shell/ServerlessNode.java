@@ -1230,7 +1230,32 @@ public final class ServerlessNode implements Closeable {
             // sequence numbers survive. See ServerlessWriterEngine for why replay cannot happen later.
             final org.opensearch.index.engine.EngineFactory writer = config -> new org.opensearch.serverless.engine.ServerlessWriterEngine(
                 config,
-                shardId -> reconciler == null ? java.util.List.of() : reconciler.replayRecordsFor(shardId)
+                new org.opensearch.serverless.engine.ServerlessWriterEngine.ReplayLog() {
+                    @Override
+                    public java.util.List<org.opensearch.serverless.store.WalRecord> recordsFor(
+                        org.opensearch.core.index.shard.ShardId shardId
+                    ) throws java.io.IOException {
+                        return reconciler == null ? java.util.List.of() : reconciler.replayRecordsFor(shardId);
+                    }
+
+                    @Override
+                    public void forEachRecord(
+                        org.opensearch.core.index.shard.ShardId shardId,
+                        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, java.io.IOException> consumer
+                    ) throws java.io.IOException {
+                        if (reconciler != null) {
+                            reconciler.forEachReplayRecord(shardId, consumer);
+                        }
+                    }
+
+                    @Override
+                    public boolean replayed(
+                        org.opensearch.core.index.shard.ShardId shardId,
+                        org.opensearch.serverless.engine.ReplaySpool spool
+                    ) throws java.io.IOException {
+                        return reconciler != null && reconciler.retainReplay(shardId, spool);
+                    }
+                }
             );
             return java.util.List.of(indexSettings -> java.util.Optional.of(writer));
         }

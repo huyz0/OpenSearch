@@ -3327,7 +3327,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     /**
-     * Replays whatever {@link Engine#engineRecoveryOperations()} returns -- empty for every engine
+     * Replays whatever {@link Engine#engineRecoverySnapshot()} returns -- empty for every engine
      * whose durability is local translog alone (the default), non-empty only for an engine backed
      * by an additional durability mechanism (e.g. a write-ahead log mirrored to remote storage)
      * that overrides it. Runs through the identical {@link #runTranslogRecovery} /
@@ -3341,41 +3341,18 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         if (!(indexer instanceof EngineBackedIndexer)) {
             return;
         }
-        List<Translog.Operation> additionalOperations = ((EngineBackedIndexer) indexer).getEngine().engineRecoveryOperations();
-        if (additionalOperations.isEmpty()) {
-            return;
+        try (Translog.Snapshot snapshot = ((EngineBackedIndexer) indexer).getEngine().engineRecoverySnapshot()) {
+            if (snapshot.totalOperations() == 0) {
+                return;
+            }
+            translogRecoveryStats.totalOperations(translogRecoveryStats.totalOperations() + snapshot.totalOperations());
+            runTranslogRecovery(
+                indexer,
+                snapshot,
+                Engine.Operation.Origin.LOCAL_TRANSLOG_RECOVERY,
+                translogRecoveryStats::incrementRecoveredOperations
+            );
         }
-        Translog.Snapshot snapshot = new ListBackedTranslogSnapshot(additionalOperations);
-        translogRecoveryStats.totalOperations(translogRecoveryStats.totalOperations() + snapshot.totalOperations());
-        runTranslogRecovery(
-            indexer,
-            snapshot,
-            Engine.Operation.Origin.LOCAL_TRANSLOG_RECOVERY,
-            translogRecoveryStats::incrementRecoveredOperations
-        );
-    }
-
-    /** A {@link Translog.Snapshot} over an already-in-memory, already-ordered list of operations -- what {@link #recoverAdditionalEngineOperations} needs to feed {@link #runTranslogRecovery} the same way a real translog file's snapshot would. */
-    private static final class ListBackedTranslogSnapshot implements Translog.Snapshot {
-        private final List<Translog.Operation> operations;
-        private int index = 0;
-
-        ListBackedTranslogSnapshot(List<Translog.Operation> operations) {
-            this.operations = operations;
-        }
-
-        @Override
-        public int totalOperations() {
-            return operations.size();
-        }
-
-        @Override
-        public Translog.Operation next() {
-            return index < operations.size() ? operations.get(index++) : null;
-        }
-
-        @Override
-        public void close() {}
     }
 
     /**

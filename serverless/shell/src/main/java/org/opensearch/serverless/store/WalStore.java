@@ -457,16 +457,25 @@ public final class WalStore {
      * @throws IOException if listing or reading fails
      */
     public List<WalRecord> replayableAfterFencing() throws IOException {
+        final List<WalRecord> records = new ArrayList<>();
+        forEachReplayableAfterFencing(records::add);
+        return records;
+    }
+
+    /** Reads fenced history without retaining decoded records between read windows. */
+    public void forEachReplayableAfterFencing(org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer) throws IOException {
         // One listing of the log's root says which terms exist and whether any legacy seal does: the seals
         // directory is listed only when it is there, which on a log begun after fences is never.
         final Map<String, BlobContainer> children = blobStore.blobContainer(shardBase.add("wal")).children();
         if (children.containsKey(SEALS) == false) {
-            return replayable(null, liveTerms(children));
+            replayable(null, liveTerms(children), consumer);
+            return;
         }
         final BlobContainer sealsContainer = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
         final List<String> sealNames = sealNamesIn(sealsContainer.listBlobs().keySet());
         if (sealNames.isEmpty()) {
-            return replayable(null);
+            replayable(null, termsInOrder(), consumer);
+            return;
         }
         final Map<Long, String> sealed = mergeSeals(sealsContainer, sealNames);
         final long sealedBelow = highestSealedTerm(sealNames);
@@ -475,7 +484,7 @@ public final class WalStore {
             // Above the last legacy seal, unbounded; at or below it, what that seal recorded.
             cutoff.put(term, term >= sealedBelow ? null : sealed.getOrDefault(term, ""));
         }
-        return replayable(cutoff);
+        replayable(cutoff, termsInOrder(), consumer);
     }
 
     private static String name(long ordinal) {
@@ -549,6 +558,15 @@ public final class WalStore {
 
     private List<WalRecord> replayable(Map<Long, String> cutoff, Map<Long, BlobContainer> terms) throws IOException {
         final List<WalRecord> records = new ArrayList<>();
+        replayable(cutoff, terms, records::add);
+        return records;
+    }
+
+    private void replayable(
+        Map<Long, String> cutoff,
+        Map<Long, BlobContainer> terms,
+        org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer
+    ) throws IOException {
         for (Map.Entry<Long, BlobContainer> entry : terms.entrySet()) {
             final BlobContainer container = entry.getValue();
             if (cutoff != null && cutoff.containsKey(entry.getKey()) == false) {
@@ -582,7 +600,7 @@ public final class WalStore {
                 for (int i = 0; i < selected.size(); i++) {
                     final String name = selected.get(i);
                     try {
-                        records.addAll(parseBatch(bodies.get(i)));
+                        parseBatch(bodies.get(i), consumer);
                     } catch (IOException e) {
                         // Preserve the failing blob's identity and stop before reading another window.
                         throw new IOException("unreadable WAL record at " + container.path().buildAsString() + name, e);
@@ -593,7 +611,6 @@ public final class WalStore {
                 start = end;
             }
         }
-        return records;
     }
 
     /**
@@ -899,17 +916,21 @@ public final class WalStore {
      */
     private static List<WalRecord> parseBatch(byte[] blob) throws IOException {
         final List<WalRecord> records = new ArrayList<>();
+        parseBatch(blob, records::add);
+        return records;
+    }
+
+    private static void parseBatch(byte[] blob, org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer) throws IOException {
         int start = 0;
         for (int i = 0; i <= blob.length; i++) {
             if (i != blob.length && blob[i] != '\n') {
                 continue;
             }
             if (i > start) {
-                records.add(WalRecord.fromStream(new java.io.ByteArrayInputStream(blob, start, i - start)));
+                consumer.accept(WalRecord.fromStream(new java.io.ByteArrayInputStream(blob, start, i - start)));
             }
             start = i + 1;
         }
-        return records;
     }
 
     /**
