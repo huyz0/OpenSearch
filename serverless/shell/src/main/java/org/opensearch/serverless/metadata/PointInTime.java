@@ -339,55 +339,90 @@ public final class PointInTime {
             XContentParser parser = XContentType.JSON.xContent()
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
         ) {
+            if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
+                throw malformed("expected an object");
+            }
             final var body = parser.map();
-            final Object id = body.get("id");
-            final Object index = body.get("index");
-            final Object expiresAt = body.get("expires_at");
-            if (id == null || index == null || expiresAt == null) {
-                throw new IOException("malformed point in time: missing a required field");
+            if (parser.nextToken() != null) {
+                throw malformed("trailing content");
             }
-            // Optional: a record written before the uuid was recorded has none, and reads as before.
-            final Object indexUuid = body.get("index_uuid");
+            final String id = requiredString(body.get("id"), "id");
+            final String index = requiredString(body.get("index"), "index");
+            final String indexUuid = body.containsKey("index_uuid") ? requiredString(body.get("index_uuid"), "index_uuid") : null;
+            final long expiry = requiredLong(body.get("expires_at"), "expires_at");
+            if (expiry < 0) {
+                throw malformed("negative expiry");
+            }
+            if (body.containsKey("capturing") && body.get("capturing") instanceof Boolean == false) {
+                throw malformed("capturing must be a boolean");
+            }
+            final boolean capturing = Boolean.TRUE.equals(body.get("capturing"));
+            if (body.get("shards") instanceof List<?> == false) {
+                throw malformed("shards must be an array");
+            }
             final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
-            if (body.get("shards") instanceof List<?> listed) {
-                for (Object entry : listed) {
-                    if ((entry instanceof Map<?, ?>) == false) {
-                        throw new IOException("malformed point in time: a shard entry is not an object");
-                    }
-                    final Map<?, ?> shard = (Map<?, ?>) entry;
-                    final Map<String, String> files = new LinkedHashMap<>();
-                    if (shard.get("files") instanceof Map<?, ?> named) {
-                        for (Map.Entry<?, ?> file : named.entrySet()) {
-                            files.put(String.valueOf(file.getKey()), String.valueOf(file.getValue()));
-                        }
-                    }
-                    final Map<String, Long> lengths = new LinkedHashMap<>();
-                    if (shard.get("lengths") instanceof Map<?, ?> known) {
-                        for (Map.Entry<?, ?> length : known.entrySet()) {
-                            lengths.put(String.valueOf(length.getKey()), Long.parseLong(String.valueOf(length.getValue())));
-                        }
-                    }
-                    shards.put(
-                        Integer.parseInt(String.valueOf(shard.get("shard"))),
-                        new CommitManifest(Long.parseLong(String.valueOf(shard.get("term"))), files, null, lengths)
-                    );
+            for (Object entry : (List<?>) body.get("shards")) {
+                if (entry instanceof Map<?, ?> == false) {
+                    throw malformed("a shard entry is not an object");
                 }
+                final Map<?, ?> shard = (Map<?, ?>) entry;
+                final long number = requiredLong(shard.get("shard"), "shard");
+                if (number < 0
+                    || number >= org.opensearch.serverless.cluster.IndexDescriptor.MAX_SHARDS
+                    || shards.containsKey((int) number)) {
+                    throw malformed("invalid or duplicate shard number");
+                }
+                final long term = requiredLong(shard.get("term"), "term");
+                if (term < 0 || shard.get("files") instanceof Map<?, ?> == false) {
+                    throw malformed("a shard must contain its term and files object");
+                }
+                final Map<String, String> files = new LinkedHashMap<>();
+                for (Map.Entry<?, ?> file : ((Map<?, ?>) shard.get("files")).entrySet()) {
+                    files.put(requiredString(file.getKey(), "file name"), requiredString(file.getValue(), "file location"));
+                }
+                final Map<String, Long> lengths = new LinkedHashMap<>();
+                if (shard.containsKey("lengths")) {
+                    if (shard.get("lengths") instanceof Map<?, ?> == false) {
+                        throw malformed("lengths must be an object");
+                    }
+                    for (Map.Entry<?, ?> length : ((Map<?, ?>) shard.get("lengths")).entrySet()) {
+                        final String file = requiredString(length.getKey(), "file name");
+                        final long size = requiredLong(length.getValue(), "file length");
+                        if (size < 0 || files.containsKey(file) == false) {
+                            throw malformed("length must be nonnegative and name a captured file");
+                        }
+                        lengths.put(file, size);
+                    }
+                }
+                shards.put((int) number, new CommitManifest(term, files, null, lengths));
             }
-            final boolean capturing = Boolean.parseBoolean(String.valueOf(body.get("capturing")));
-            if (shards.isEmpty() && capturing == false) {
-                // A finished view that froze nothing is malformed, and stays so. A capture marker is the
-                // one record that legitimately holds none: it is written before the manifests are read.
-                throw new IOException("malformed point in time: it froze no shards");
+            if ((shards.isEmpty() && capturing == false) || (capturing && shards.isEmpty() == false)) {
+                throw malformed("finished views must hold shards; capture markers must not");
             }
-            return new PointInTime(
-                id.toString(),
-                index.toString(),
-                indexUuid == null ? null : indexUuid.toString(),
-                Long.parseLong(String.valueOf(expiresAt)),
-                shards,
-                capturing
-            );
+            return new PointInTime(id, index, indexUuid, expiry, shards, capturing);
         }
+    }
+
+    private static IOException malformed(String reason) {
+        return new IOException("malformed point in time: " + reason);
+    }
+
+    private static String requiredString(Object value, String field) throws IOException {
+        if (value instanceof String text && text.isEmpty() == false) {
+            return text;
+        }
+        throw malformed(field + " must be a nonempty string");
+    }
+
+    private static long requiredLong(Object value, String field) throws IOException {
+        if (value instanceof Number || value instanceof String) {
+            try {
+                return Long.parseLong(value.toString());
+            } catch (NumberFormatException invalid) {
+                throw malformed(field + " must be an integer");
+            }
+        }
+        throw malformed(field + " must be an integer");
     }
 
     /**
