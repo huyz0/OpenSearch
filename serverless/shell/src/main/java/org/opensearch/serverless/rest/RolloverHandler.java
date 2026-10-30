@@ -50,6 +50,8 @@ import java.util.function.Supplier;
  */
 public final class RolloverHandler extends BaseRestHandler {
 
+    private static final java.util.Set<String> BODY_FIELDS = java.util.Set.of("conditions", "settings", "mappings", "aliases");
+
     private final Supplier<ServerlessNode> node;
     private final Supplier<MetadataPlane> plane;
 
@@ -111,6 +113,19 @@ public final class RolloverHandler extends BaseRestHandler {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "the body is not a JSON object")
             );
+        }
+        // Core accepts these four object-valued fields. A malformed or misspelled conditions block
+        // must not become an empty map, which means an unconditional rollover.
+        for (Map.Entry<String, Object> field : body.entrySet()) {
+            final String reason;
+            if (BODY_FIELDS.contains(field.getKey()) == false) {
+                reason = "unknown rollover field [" + field.getKey() + "]";
+            } else if (field.getValue() instanceof Map<?, ?> == false) {
+                reason = "rollover field [" + field.getKey() + "] must be an object";
+            } else {
+                continue;
+            }
+            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_body", reason));
         }
         final Map<String, Object> conditions = body.get("conditions") instanceof Map<?, ?> given ? castMap(given) : Map.of();
         for (String key : conditions.keySet()) {
