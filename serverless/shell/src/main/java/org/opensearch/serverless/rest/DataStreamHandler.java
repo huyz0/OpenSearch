@@ -446,6 +446,11 @@ public final class DataStreamHandler extends BaseRestHandler {
         // and only the indices the record this deleted actually named. A rollover landing between the read
         // and the delete used to leave a live record over deleted backing indices, with a 200 to the caller.
         final AliasRecord record = found.get().alias();
+        final List<org.opensearch.core.index.Index> backings = new java.util.ArrayList<>(record.indices().size());
+        for (String backing : record.indices()) {
+            metadata.describe(backing)
+                .ifPresent(descriptor -> backings.add(new org.opensearch.core.index.Index(backing, descriptor.uuid())));
+        }
         if (metadata.deleteAlias(record, found.get().generation()) == false) {
             throw new IndexAdminHandler.RefusedException(
                 RestStatus.CONFLICT,
@@ -453,8 +458,9 @@ public final class DataStreamHandler extends BaseRestHandler {
                 "data stream [" + name + "] was changed concurrently; nothing was deleted, retry"
             );
         }
-        for (String backing : record.indices()) {
-            metadata.deleteIndex(backing);
+        for (org.opensearch.core.index.Index backing : backings) {
+            // A name can be reused after the stream is unpublished; only its captured incarnation belongs to this delete.
+            metadata.deleteIndex(backing.getName(), backing.getUUID());
         }
 
     }

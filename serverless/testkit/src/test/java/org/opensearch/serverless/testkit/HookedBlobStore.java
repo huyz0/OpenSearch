@@ -41,6 +41,7 @@ public final class HookedBlobStore implements BlobStore {
     private final BlobStore delegate;
     private final AtomicReference<Hook> swapHook = new AtomicReference<>();
     private final AtomicReference<Hook> afterSwapHook = new AtomicReference<>();
+    private final AtomicReference<Hook> afterRegisterDeleteHook = new AtomicReference<>();
     private final AtomicReference<Hook> deleteHook = new AtomicReference<>();
     private final AtomicReference<Hook> armed = new AtomicReference<>();
     private final AtomicReference<Hook> listingHook = new AtomicReference<>();
@@ -164,6 +165,12 @@ public final class HookedBlobStore implements BlobStore {
     public void onNextRegisterSwapAfter(String pathContains, String blobName, Runnable action) {
         fired = false;
         afterSwapHook.set(new Hook(pathContains, blobName, action));
+    }
+
+    /** Runs once after a matching conditional register delete succeeds, before its caller receives the acknowledgement. */
+    public void onNextRegisterDeleteAfter(String pathContains, String blobName, Runnable action) {
+        fired = false;
+        afterRegisterDeleteHook.set(new Hook(pathContains, blobName, action));
     }
 
     /** Runs an action immediately before deleting the named blob in the matching container. */
@@ -349,7 +356,17 @@ public final class HookedBlobStore implements BlobStore {
 
         @Override
         public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
-            return inner.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+            final boolean deleted = inner.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+            final Hook after = afterRegisterDeleteHook.get();
+            if (deleted
+                && after != null
+                && after.blobName().equals(blobName)
+                && inner.path().buildAsString().contains(after.pathContains())
+                && afterRegisterDeleteHook.compareAndSet(after, null)) {
+                after.action().run();
+                fired = true;
+            }
+            return deleted;
         }
 
         @Override
