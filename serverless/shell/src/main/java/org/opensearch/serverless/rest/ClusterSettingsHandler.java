@@ -8,10 +8,12 @@
 
 package org.opensearch.serverless.rest;
 
+import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsAction;
+import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest;
+import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
@@ -112,57 +114,68 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
             };
         }
 
-        // PUT. Every parameter and the body read before any early return, or BaseRestHandler turns a
-        // deliberate refusal into a 400 about an unconsumed parameter.
-        final Map<String, Object> body;
-        try (XContentParser parser = request.contentOrSourceParamParser()) {
-            body = parser.map();
-        }
-        final Object persistentField = body.get("persistent");
-        final Object transientField = body.get("transient");
-        if (transientField instanceof Map<?, ?> transientMap && transientMap.isEmpty() == false) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_write",
-                    "transient settings are not supported; use persistent. There is no cluster manager and no restart "
-                        + "to reset a transient setting on, which is the only reason to want one."
-                )
-            );
-        }
-        if ((persistentField instanceof Map) == false) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "missing_persistent",
-                    "a settings update needs a 'persistent' object"
-                )
-            );
-        }
-        final Map<String, Object> flat = ClusterConfig.flatten((Map<String, Object>) persistentField);
-        final String listKey = ClusterConfig.firstListValue(flat);
-        if (listKey != null) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_write",
-                    "'" + listKey + "' is a list; list-valued settings are not supported on this register"
-                )
-            );
-        }
-
+        final var content = request.hasContent() ? request.content() : null;
+        final var mediaType = request.getMediaType();
         final ServerlessNode serving = node.get();
-        // Off the transport thread: the update is a compare-and-swap against the object store, retried
-        // under contention, and every other write on this surface already learned not to block the thread
-        // that should be reading the next request on remote IO. This one had not, yet -- found by the
-        // filter-surface sweep tripping core's own "not a transport thread" assertion.
+        if (serving == null) {
+            return channel -> channel.sendResponse(
+                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable")
+            );
+        }
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
             try {
-                final Settings written = gated(serving, () -> metadata.clusterConfig().update(flat));
-                respond(channel, written, true);
+                if (content == null) {
+                    throw new IllegalArgumentException("a settings update needs a 'persistent' object");
+                }
+                final Map<String, Object> body;
+                try (
+                    var parser = mediaType.xContent()
+                        .createParser(
+                            org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
+                            org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                            content.streamInput()
+                        )
+                ) {
+                    body = parser.map();
+                }
+                if (body.get("persistent") instanceof Map == false) {
+                    throw new IllegalArgumentException("a settings update needs a 'persistent' object");
+                }
+                if (body.containsKey("transient") && body.get("transient") instanceof Map == false) {
+                    throw new IllegalArgumentException("'transient' settings must be an object");
+                }
+                final var nativeRequest = new ClusterUpdateSettingsRequest().persistentSettings(
+                    (Map<String, Object>) body.get("persistent")
+                );
+                if (body.get("transient") instanceof Map<?, ?> transientSettings) {
+                    nativeRequest.transientSettings((Map<String, Object>) transientSettings);
+                }
+                final var result = serving.actionGate().run(ClusterUpdateSettingsAction.NAME, nativeRequest, admitted -> {
+                    final var selected = (ClusterUpdateSettingsRequest) admitted;
+                    final var invalid = selected.validate();
+                    if (invalid != null) {
+                        throw invalid;
+                    }
+                    if (selected.transientSettings().isEmpty() == false) {
+                        throw new org.opensearch.OpenSearchStatusException(
+                            "transient settings are not supported; use persistent",
+                            RestStatus.NOT_IMPLEMENTED
+                        );
+                    }
+                    final Map<String, Object> flat = settingsMap(selected.persistentSettings());
+                    final String listKey = ClusterConfig.firstListValue(flat);
+                    if (listKey != null) {
+                        throw new org.opensearch.OpenSearchStatusException(
+                            "'" + listKey + "' is a list; list-valued settings are not supported on this register",
+                            RestStatus.NOT_IMPLEMENTED
+                        );
+                    }
+                    return nativeResponse(metadata.clusterConfig().update(flat));
+                }, org.opensearch.serverless.shell.ActionGate.identity(ClusterUpdateSettingsResponse.class));
+                try (var builder = channel.newBuilder()) {
+                    result.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                }
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -173,17 +186,41 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         });
     }
 
-    private static Settings gated(ServerlessNode serving, org.opensearch.common.CheckedSupplier<Settings, Exception> work)
-        throws Exception {
-        if (serving == null) {
-            return work.get();
+    /** Serializes through the public Settings API so lists and null removals retain their types. */
+    private static Map<String, Object> settingsMap(Settings settings) throws IOException {
+        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            builder.startObject();
+            settings.toXContent(builder, new org.opensearch.core.xcontent.ToXContent.MapParams(Map.of("flat_settings", "true")));
+            builder.endObject();
+            return org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                org.opensearch.core.common.bytes.BytesReference.bytes(builder),
+                true,
+                org.opensearch.common.xcontent.XContentType.JSON
+            ).v2();
         }
-        return serving.actionGate()
-            .run(
-                org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsAction.NAME,
-                new org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest(),
-                work
-            );
+    }
+
+    private static ClusterUpdateSettingsResponse nativeResponse(Settings settings) throws IOException {
+        // Core's value constructor is package private; the public parser builds the native response.
+        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            builder.startObject();
+            builder.field("acknowledged", true);
+            builder.startObject("persistent");
+            settings.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+            builder.endObject();
+            builder.startObject("transient").endObject();
+            builder.endObject();
+            try (
+                var parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
+                    .createParser(
+                        org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
+                        org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                        org.opensearch.core.common.bytes.BytesReference.bytes(builder).streamInput()
+                    )
+            ) {
+                return ClusterUpdateSettingsResponse.fromXContent(parser);
+            }
+        }
     }
 
     private void respond(org.opensearch.rest.RestChannel channel, Settings settings, boolean acknowledged) throws IOException {

@@ -35,8 +35,8 @@ import java.util.Map;
  * and which need a restart. Building that here would mean either faking a registry this shell does not
  * have or reaching into core's, and either way inventing a guarantee — "this key is known and this value
  * is legal" — that nobody has actually checked. This register holds whatever an operator puts in it and
- * hands back whatever is there. Validating it is a plugin's job, or an operator's, same as an index's
- * mapping JSON is stored without this shell checking it against Lucene's own field-type rules.
+ * hands back whatever is there. Validating these setting definitions is a plugin's job, or an
+ * operator's; persisting a key does not apply it to a runtime settings service.
  *
  * <p><b>Only {@code persistent}, never {@code transient}.</b> Not an oversight: transient cluster settings
  * are a footgun even where they exist — silently reset on a full restart, and the source of the exact
@@ -45,11 +45,10 @@ import java.util.Map;
  * manager, no restart to reset anything on," and it is to not offer the half that was never well-defined
  * here to begin with.
  *
- * <p><b>Scalar values only.</b> A list-valued setting cannot be told apart from an explicit removal
- * through {@link Settings}'s public surface without reaching into its internals — {@code getAsList}
- * returns a non-null answer for a plain scalar too, by design, so it cannot be used to detect a genuine
- * list. Rather than risk silently dropping a list on the next update that touches any key, list values are
- * refused at the door. Nothing here needs one yet.
+ * <p><b>Scalar values only.</b> This register stores scalar strings and explicit null removals.
+ * List values are refused before merging, including lists introduced by action filters, so an update
+ * cannot accidentally turn a list into a scalar string. Native settings are serialized through their
+ * public XContent API when checking this constraint, which preserves lists and nulls.
  */
 public final class ClusterConfig {
 
