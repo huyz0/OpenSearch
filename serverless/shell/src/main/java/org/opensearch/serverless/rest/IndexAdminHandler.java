@@ -639,9 +639,9 @@ public final class IndexAdminHandler extends BaseRestHandler {
             metadata,
             index,
             create,
-            org.opensearch.serverless.metadata.TemplateResolver.resolve(
-                metadata.indexTemplates().all(),
-                metadata.componentTemplates().all(),
+            org.opensearch.serverless.metadata.TemplateResolver.resolveFromStores(
+                metadata.indexTemplates(),
+                metadata::componentTemplates,
                 index
             )
         );

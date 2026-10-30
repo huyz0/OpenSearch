@@ -327,9 +327,9 @@ public final class RolloverHandler extends BaseRestHandler {
         String createdUuid;
         try {
             if (record.dataStream()) {
-                final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolve(
-                    metadata.indexTemplates().all(),
-                    metadata.componentTemplates().all(),
+                final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolveFromStores(
+                    metadata.indexTemplates(),
+                    metadata::componentTemplates,
                     ask.target()
                 );
                 final IndexAdminHandler.CreateRequest streamCreate = DataStreamHandler.withTimestamp(

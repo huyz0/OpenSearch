@@ -114,46 +114,140 @@ public final class TemplateResolver {
      */
     public static Inherited resolve(Map<String, String> indexTemplates, Map<String, String> componentTemplates, String indexName)
         throws IOException {
-        String winner = null;
-        Map<String, Object> winning = null;
-        long best = Long.MIN_VALUE;
+        final Winner choice = new Winner(indexName);
+        for (var entry : indexTemplates.entrySet()) {
+            choice.consider(entry.getKey(), entry.getValue());
+        }
+        return inherit(choice, name -> componentTemplates.get(name));
+    }
 
-        for (Map.Entry<String, String> each : indexTemplates.entrySet()) {
-            final Map<String, Object> template = parse(each.getKey(), each.getValue());
-            if (matches(template, indexName) == false) {
-                continue;
+    /**
+     * Selects a template with bounded body retention, then reads only components it references.
+     * @param indexTemplates the index-template store
+     * @param componentTemplates the component-template store
+     * @param indexName the index being created
+     * @return the selected template's settings and mappings
+     * @throws IOException if a relevant configuration revision cannot be read
+     */
+    public static Inherited resolveFromStores(
+        TemplateStore indexTemplates,
+        java.util.function.Supplier<TemplateStore> componentTemplates,
+        String indexName
+    ) throws IOException {
+        final Winner choice = indexTemplates.readView(view -> {
+            final Winner selected = new Winner(indexName);
+            view.forEach(selected::consider);
+            return selected;
+        });
+        if (choice.winning == null || list(choice.winning.get("composed_of")).isEmpty()) {
+            return inherit(choice, name -> null);
+        }
+        return componentTemplates.get().readView(view -> inherit(choice, name -> view.get(name).orElse(null)));
+    }
+
+    /**
+     * Finds template names for a batch of indices without reading components or retaining parsed bodies.
+     * @param templates the index-template store
+     * @param indices the indices whose matching template names are needed
+     * @return only names with a matching template
+     * @throws IOException if the index-template snapshot cannot be read
+     */
+    public static Map<String, String> matchingTemplateNames(TemplateStore templates, java.util.Collection<String> indices)
+        throws IOException {
+        if (indices.isEmpty()) {
+            return Map.of();
+        }
+        return templates.readView(view -> {
+            final Map<String, NameMatch> matches = new LinkedHashMap<>();
+            for (String index : indices) {
+                matches.putIfAbsent(index, new NameMatch());
             }
-            final long priority = priority(template);
-            // Ties broken by name, so the same set of templates always produces the same answer rather than
-            // whichever the store happened to list first.
-            if (priority > best || (priority == best && winner != null && each.getKey().compareTo(winner) < 0)) {
-                best = priority;
-                winner = each.getKey();
-                winning = template;
+            view.forEach((name, source) -> {
+                final Map<String, Object> template = parse(name, source);
+                Long priority = null;
+                for (var entry : matches.entrySet()) {
+                    if (matches(template, entry.getKey())) {
+                        if (priority == null) {
+                            priority = priority(template);
+                        }
+                        final NameMatch current = entry.getValue();
+                        if (better(priority, name, current.priority, current.name)) {
+                            current.priority = priority;
+                            current.name = name;
+                        }
+                    }
+                }
+            });
+            final Map<String, String> names = new LinkedHashMap<>();
+            for (var entry : matches.entrySet()) {
+                if (entry.getValue().name != null) {
+                    names.put(entry.getKey(), entry.getValue().name);
+                }
             }
+            return names;
+        });
+    }
+
+    private static final class NameMatch {
+        private long priority = Long.MIN_VALUE;
+        private String name;
+    }
+
+    private static final class Winner {
+        private final String indexName;
+        private String name;
+        private Map<String, Object> winning;
+        private long best = Long.MIN_VALUE;
+
+        private Winner(String indexName) {
+            this.indexName = indexName;
         }
 
-        if (winning == null) {
+        private void consider(String candidate, String source) throws IOException {
+            final Map<String, Object> template = parse(candidate, source);
+            if (matches(template, indexName)) {
+                final long priority = priority(template);
+                if (better(priority, candidate, best, name)) {
+                    best = priority;
+                    name = candidate;
+                    winning = template;
+                }
+            }
+        }
+    }
+
+    /** Ties break by name, independent of the backend's traversal order. */
+    private static boolean better(long priority, String name, long best, String current) {
+        return priority > best || (priority == best && current != null && name.compareTo(current) < 0);
+    }
+
+    private static Inherited inherit(Winner choice, org.opensearch.common.CheckedFunction<String, String, IOException> componentSource)
+        throws IOException {
+        if (choice.winning == null) {
             return new Inherited(Map.of(), Map.of(), null);
         }
-
         final Map<String, Object> settings = new LinkedHashMap<>();
         final Map<String, Object> mappings = new LinkedHashMap<>();
 
-        for (Object name : list(winning.get("composed_of"))) {
+        for (Object name : list(choice.winning.get("composed_of"))) {
             final String component = String.valueOf(name);
-            final String source = componentTemplates.get(component);
+            final String source = componentSource.apply(component);
             if (source == null) {
                 // Named and absent. Reported rather than skipped: an index quietly created without the
                 // analysis settings a component was supposed to contribute is the kind of wrong answer that
                 // shows up much later as a query matching nothing.
-                throw new MissingComponentException(winner, component);
+                throw new MissingComponentException(choice.name, component);
             }
             merge(settings, mappings, parse(component, source));
         }
-        merge(settings, mappings, winning);
+        merge(settings, mappings, choice.winning);
 
-        return new Inherited(settings, mappings, winner, winning.get("data_stream") instanceof Map<?, ?> block ? cast(block) : null);
+        return new Inherited(
+            settings,
+            mappings,
+            choice.name,
+            choice.winning.get("data_stream") instanceof Map<?, ?> block ? cast(block) : null
+        );
     }
 
     /** Pulls the {@code template} block's settings and mappings into the accumulators. */
