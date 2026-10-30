@@ -54,6 +54,36 @@ public class LinearizabilityCheckerTests extends OpenSearchTestCase {
         assertFalse(why + " -- but the checker accepted it, so it would accept a broken provider too", verdict.linearizable());
     }
 
+    public void testUnknownStaleSwapRefusalCanBeLinearized() {
+        sequential(new RegisterHistory.Cas(2L, "ignored", false, org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION));
+        assertLinearizable();
+    }
+
+    public void testUnknownCreateRefusalCanBeLinearized() {
+        sequential(new RegisterHistory.Create("ignored", false, org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION));
+        assertLinearizable();
+    }
+
+    public void testUnknownDoesNotExcuseRefusingTheCurrentGeneration() {
+        sequential(new RegisterHistory.Cas(1L, "ignored", false, org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION));
+        assertNotLinearizable("an unknown generation does not permit a refused matching CAS");
+    }
+
+    public void testUnknownIsNotAnAppliedSwapGeneration() {
+        sequential(new RegisterHistory.Cas(1L, "changed", true, org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION));
+        assertNotLinearizable("unknown cannot become a register's generation");
+    }
+
+    public void testUnknownIsNotAnAppliedCreateGeneration() {
+        sequential(new RegisterHistory.Create("changed", true, org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION));
+        assertFalse(LinearizabilityChecker.check(history, 0L, null).linearizable());
+    }
+
+    public void testAbsenceIsNotAnUnknownCasConflict() {
+        sequential(new RegisterHistory.Cas(0L, "ignored", false, 0L));
+        assertNotLinearizable("a refused create-style CAS cannot claim absence at its conflict");
+    }
+
     /** The ordinary case: one writer, one reader, nothing surprising. */
     public void testAnHonestSequentialHistoryIsAccepted() {
         sequential(new RegisterHistory.Read(1L, "v0"));
