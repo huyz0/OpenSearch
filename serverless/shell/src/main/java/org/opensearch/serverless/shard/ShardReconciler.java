@@ -503,17 +503,38 @@ public final class ShardReconciler {
         final java.util.List<org.opensearch.serverless.store.WalRecord> records = wal.replayableAfterFencing();
         writerOpenNanos[WRITER_OPEN_PHASES.indexOf("log_read")].addAndGet(System.nanoTime() - readingAt);
         logRecordsRead.addAndGet(records.size());
-        // Kept for the pass after recovery, which applies the records without sequence identity: the log was
-        // fenced before either read, so nothing can have landed in between, and reading it twice was a listing
-        // per term and a GET per record paid again on every open.
-        replayedRecords.put(shardId, records);
         return records;
     }
 
-    /** The records recovery just replayed, per shard, for the pass that follows it in the same open. */
-    private final java.util.concurrent.ConcurrentHashMap<
-        ShardId,
-        java.util.List<org.opensearch.serverless.store.WalRecord>> replayedRecords = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Streams a fenced log once; the engine retains only a disposable local spool. */
+    public void forEachReplayRecord(
+        ShardId shardId,
+        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
+    ) throws IOException {
+        final var log = pendingReplay.get(shardId);
+        if (log == null) {
+            return;
+        }
+        final long readingAt = System.nanoTime();
+        try {
+            log.forEachReplayableAfterFencing(record -> {
+                consumer.accept(record);
+                logRecordsRead.incrementAndGet();
+            });
+        } finally {
+            writerOpenNanos[WRITER_OPEN_PHASES.indexOf("log_read")].addAndGet(System.nanoTime() - readingAt);
+        }
+    }
+
+    public boolean retainReplay(ShardId shardId, org.opensearch.serverless.engine.ReplaySpool spool) throws IOException {
+        if (replayedRecords.putIfAbsent(shardId, spool) != null) {
+            throw new IOException("replay already retained for " + shardId);
+        }
+        return true;
+    }
+
+    private final java.util.concurrent.ConcurrentHashMap<ShardId, org.opensearch.serverless.engine.ReplaySpool> replayedRecords =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Per index and shard, the term at which a takeover has just fenced every older term of the log. */
     private final java.util.concurrent.ConcurrentHashMap<String, Long> olderTermsFenced = new java.util.concurrent.ConcurrentHashMap<>();
@@ -731,7 +752,10 @@ public final class ShardReconciler {
                 open.put(shardId, shard);
                 return shard;
             } finally {
-                replayedRecords.remove(shardId);
+                final var remainingReplay = replayedRecords.remove(shardId);
+                if (remainingReplay != null) {
+                    remainingReplay.close();
+                }
             }
         } catch (Exception e) {
             // Service creation can succeed before mapping, manifest lookup or shard creation fails.
@@ -812,72 +836,56 @@ public final class ShardReconciler {
      * silent data loss.
      */
     private void replayRecordsWithoutSequenceIdentity(IndexShard shard, ShardId shardId) throws IOException {
-        final java.util.List<org.opensearch.serverless.store.WalRecord> alreadyRead = replayedRecords.remove(shardId);
-        final java.util.List<org.opensearch.serverless.store.WalRecord> records = alreadyRead != null
-            ? alreadyRead
-            : wal(shardId).replayableAfterFencing();
-        // Sequenced operations have already been recovered by the engine. A legacy operation that
-        // precedes a sequenced operation for the same document must not overwrite that newer state.
-        // Track only IDs present in the legacy portion, keeping the common all-sequenced path cheap.
-        final java.util.Map<String, Integer> lastModernForLegacy = new java.util.HashMap<>();
-        for (org.opensearch.serverless.store.WalRecord record : records) {
-            if (record.hasSequenceIdentity() == false) {
-                lastModernForLegacy.put(record.id(), -1);
-            }
-        }
-        if (lastModernForLegacy.isEmpty()) {
-            return;
-        }
-        for (int i = 0; i < records.size(); i++) {
-            final org.opensearch.serverless.store.WalRecord record = records.get(i);
-            if (record.hasSequenceIdentity() && lastModernForLegacy.containsKey(record.id())) {
-                lastModernForLegacy.put(record.id(), i);
-            }
-        }
-        int replayed = 0;
-        for (int i = 0; i < records.size(); i++) {
-            final org.opensearch.serverless.store.WalRecord record = records.get(i);
-            if (record.hasSequenceIdentity() || lastModernForLegacy.get(record.id()) > i) {
-                continue;
-            }
-            if (record.isDeletion()) {
-                // Replayed in order with the writes, which is the only thing that makes the result
-                // correct: a document written, deleted, and written again must end up present, and a
-                // document written and deleted must end up gone. Applying all the writes and then all
-                // the deletes would get the first case wrong.
-                final var result = shard.applyDeleteOperationOnPrimary(
+        final var retained = replayedRecords.remove(shardId);
+        try (
+            var spool = retained != null
+                ? retained
+                : org.opensearch.serverless.engine.ReplaySpool.captureExclusive(
+                    shard.shardPath().getDataPath().resolve("wal-replay"),
+                    consumer -> wal(shardId).forEachReplayableAfterFencing(consumer)
+                )
+        ) {
+            final int[] replayed = { 0 };
+            spool.forEachLegacy(record -> {
+                if (record.isDeletion()) {
+                    // Replayed in order with the writes, which is the only thing that makes the result
+                    // correct: a document written, deleted, and written again must end up present, and a
+                    // document written and deleted must end up gone. Applying all the writes and then all
+                    // the deletes would get the first case wrong.
+                    final var result = shard.applyDeleteOperationOnPrimary(
+                        org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                        record.id(),
+                        org.opensearch.index.VersionType.INTERNAL,
+                        org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        0
+                    );
+                    ensureLegacyReplaySucceeded(record, result);
+                    replayed[0]++;
+                    return;
+                }
+                final var result = shard.applyIndexOperationOnPrimary(
                     org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                    record.id(),
                     org.opensearch.index.VersionType.INTERNAL,
+                    new org.opensearch.index.mapper.SourceToParse(
+                        shardId.getIndexName(),
+                        record.id(),
+                        new org.opensearch.core.common.bytes.BytesArray(record.source()),
+                        org.opensearch.common.xcontent.XContentType.JSON
+                    ),
                     org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                    0
+                    0,
+                    org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+                    false
                 );
                 ensureLegacyReplaySucceeded(record, result);
-                replayed++;
-                continue;
+                replayed[0]++;
+            });
+            if (replayed[0] > 0) {
+                // The replayed operations sit in the translog's write buffer, a page charged to the request breaker,
+                // until synced; the object-store log is the durability, this gives the page back.
+                shard.sync();
+                shard.refresh("serverless-wal-replay");
             }
-            final var result = shard.applyIndexOperationOnPrimary(
-                org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                org.opensearch.index.VersionType.INTERNAL,
-                new org.opensearch.index.mapper.SourceToParse(
-                    shardId.getIndexName(),
-                    record.id(),
-                    new org.opensearch.core.common.bytes.BytesArray(record.source()),
-                    org.opensearch.common.xcontent.XContentType.JSON
-                ),
-                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                0,
-                org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
-                false
-            );
-            ensureLegacyReplaySucceeded(record, result);
-            replayed++;
-        }
-        if (replayed > 0) {
-            // The replayed operations sit in the translog's write buffer, a page charged to the request breaker,
-            // until synced; the object-store log is the durability, this gives the page back.
-            shard.sync();
-            shard.refresh("serverless-wal-replay");
         }
     }
 

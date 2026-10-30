@@ -17,8 +17,6 @@ import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.serverless.store.WalStore;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -33,7 +31,7 @@ import java.util.List;
  * accepts a caller-supplied sequence number under a recovery origin, which in turn is only legal while
  * the shard is still RECOVERING — a window that closes before the reconciler ever regains control.
  *
- * <p>{@link org.opensearch.index.engine.Engine#engineRecoveryOperations()} is the seam core provides for
+ * <p>{@link org.opensearch.index.engine.Engine#engineRecoverySnapshot()} is the seam core provides for
  * exactly this, and its own documentation describes exactly this case. {@code IndexShard} calls it inside
  * recovery and feeds the result through {@code runTranslogRecovery} under
  * {@code Origin.LOCAL_TRANSLOG_RECOVERY}, which preserves each operation's sequence number, primary term
@@ -64,6 +62,18 @@ public final class ServerlessWriterEngine extends InternalEngine {
          * @throws IOException if the log cannot be read
          */
         List<WalRecord> recordsFor(ShardId shardId) throws IOException;
+
+        default void forEachRecord(ShardId shardId, org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer)
+            throws IOException {
+            for (WalRecord record : recordsFor(shardId)) {
+                consumer.accept(record);
+            }
+        }
+
+        /** True transfers ownership until the reconciler completes legacy replay. */
+        default boolean replayed(ShardId shardId, ReplaySpool spool) throws IOException {
+            return false;
+        }
     }
 
     private final ReplayLog replayLog;
@@ -95,7 +105,7 @@ public final class ServerlessWriterEngine extends InternalEngine {
      * whose sequence number a different live document holds is a proven collision, and the open is refused. A shard
      * that will not open is an outage someone sees; a shard opened without an acknowledged write is a loss nobody does.
      */
-    private void reportReplay(ShardId shardId, List<Translog.Operation> operations) {
+    private void reportReplay(ShardId shardId, Translog.Snapshot operations) {
         final long processed = getProcessedLocalCheckpoint();
         long min = Long.MAX_VALUE;
         long max = -1L;
@@ -103,42 +113,13 @@ public final class ServerlessWriterEngine extends InternalEngine {
         int atOrBelow = 0;
         int skippedAbsent = 0;
         String collision = null;
-        // Two operations in the log itself under one sequence number: core applies the first and skips the second,
-        // and the publish after this open trims the record. A fleet run lost three acknowledged writes so, when a
-        // writer's record landed past its successor's fence. The same operation twice -- a record kept for a fence
-        // and replayed again -- has identical contents, and is not one.
-        final java.util.Map<Long, Translog.Operation> bySeqNo = new java.util.HashMap<>();
-        for (Translog.Operation operation : operations) {
-            final Translog.Operation earlier = bySeqNo.putIfAbsent(operation.seqNo(), operation);
-            // Compare the complete operation, including source and version. Delete.equals does not
-            // include the document ID, so check that separately as well. Retain references to the
-            // existing operations rather than allocating an identity string for every WAL record.
-            if (earlier != null
-                && (earlier.equals(operation) == false || identityOf(earlier).equals(identityOf(operation)) == false)
-                && collision == null) {
-                collision = "seqNo "
-                    + operation.seqNo()
-                    + " has conflicting operations: "
-                    + earlier.opType()
-                    + " "
-                    + identityOf(earlier)
-                    + " term "
-                    + earlier.primaryTerm()
-                    + ", and "
-                    + operation.opType()
-                    + " "
-                    + identityOf(operation)
-                    + " term "
-                    + operation.primaryTerm()
-                    + " (operation contents differ)";
-                logger.error("{} replay would drop an acknowledged operation: {}", shardId, collision);
-            }
-        }
         try (org.opensearch.index.engine.Engine.Searcher searcher = acquireSearcher("serverless-replay-check", SearcherScope.INTERNAL)) {
-            for (Translog.Operation operation : operations) {
+            for (Translog.Operation operation; (operation = operations.next()) != null;) {
                 min = Math.min(min, operation.seqNo());
                 max = Math.max(max, operation.seqNo());
-                terms.add(operation.primaryTerm());
+                if (terms.size() < 32) {
+                    terms.add(operation.primaryTerm());
+                }
                 if (operation.seqNo() > processed || operation instanceof Translog.Index == false) {
                     continue;
                 }
@@ -191,25 +172,14 @@ public final class ServerlessWriterEngine extends InternalEngine {
         logger.debug(
             "{} replaying {} records (seqNo {}..{}, terms {}) over a commit processed through {}; {} at or below it, {} absent from it",
             shardId,
-            operations.size(),
-            operations.isEmpty() ? "-" : min,
-            operations.isEmpty() ? "-" : max,
+            operations.totalOperations(),
+            operations.totalOperations() == 0 ? "-" : min,
+            operations.totalOperations() == 0 ? "-" : max,
             terms,
             processed,
             atOrBelow,
             skippedAbsent
         );
-    }
-
-    /** The document an operation is about, or "-" for one about none. */
-    private static String identityOf(Translog.Operation operation) {
-        if (operation instanceof Translog.Index index) {
-            return index.id();
-        }
-        if (operation instanceof Translog.Delete delete) {
-            return delete.id();
-        }
-        return "-";
     }
 
     /** The id of the live document holding a sequence number in the commit, or null if none does. */
@@ -231,60 +201,64 @@ public final class ServerlessWriterEngine extends InternalEngine {
     }
 
     @Override
-    public List<Translog.Operation> engineRecoveryOperations() {
+    public Translog.Snapshot engineRecoverySnapshot() throws IOException {
         if (replayLog == null) {
-            return List.of();
+            return super.engineRecoverySnapshot();
         }
         final ShardId shardId = config().getShardId();
+        final ReplaySpool spool = ReplaySpool.captureExclusive(
+            config().getTranslogConfig().getTranslogPath().getParent().resolve("wal-replay"),
+            consumer -> replayLog.forEachRecord(shardId, consumer)
+        );
+        Translog.Snapshot snapshot = null;
+        boolean returned = false;
         try {
-            final List<Translog.Operation> operations = new ArrayList<>();
-            long highest = org.opensearch.index.seqno.SequenceNumbers.NO_OPS_PERFORMED;
-            for (WalRecord record : replayLog.recordsFor(shardId)) {
-                if (record.hasSequenceIdentity() == false) {
-                    // Written before the log carried sequence numbers. It cannot be replayed as the
-                    // operation it was, because the record does not say which operation that is. Left for
-                    // ShardReconciler to replay the old way, as a fresh primary operation, rather than
-                    // dropped -- losing an acknowledged write to a format change would be far worse than
-                    // replaying it with a new sequence number, which is all this ever did before.
-                    continue;
+            try (var check = spool.snapshot()) {
+                reportReplay(shardId, check);
+            }
+            if (spool.modernCount() > 0) {
+                // Replayed operations can overwrite restored documents. Disable the append-only fast
+                // path through the entire replay before core applies any of those operations.
+                advanceMaxSeqNoOfUpdatesOrDeletes(spool.highestSeqNo());
+            }
+            snapshot = spool.snapshot();
+            if (replayLog.replayed(shardId, spool)) {
+                returned = true;
+                return snapshot;
+            }
+            final Translog.Snapshot replay = snapshot;
+            final Translog.Snapshot owned = new Translog.Snapshot() {
+                @Override
+                public int totalOperations() {
+                    return replay.totalOperations();
                 }
-                highest = Math.max(highest, record.seqNo());
-                if (record.isDeletion()) {
-                    operations.add(new Translog.Delete(record.id(), record.seqNo(), record.primaryTerm(), record.version()));
-                } else {
-                    operations.add(
-                        new Translog.Index(
-                            record.id(),
-                            record.seqNo(),
-                            record.primaryTerm(),
-                            record.version(),
-                            record.source().getBytes(StandardCharsets.UTF_8),
-                            null,
-                            -1
-                        )
-                    );
+
+                @Override
+                public Translog.Operation next() throws IOException {
+                    return replay.next();
+                }
+
+                @Override
+                public void close() throws IOException {
+                    try {
+                        replay.close();
+                    } finally {
+                        spool.close();
+                    }
+                }
+            };
+            returned = true;
+            return owned;
+        } finally {
+            if (returned == false) {
+                try {
+                    if (snapshot != null) {
+                        snapshot.close();
+                    }
+                } finally {
+                    spool.close();
                 }
             }
-            reportReplay(shardId, operations);
-            if (operations.isEmpty() == false) {
-                // Raise the update-or-delete watermark to cover what is about to be replayed, before it
-                // is replayed. The engine's append-only fast path is only sound while every operation it
-                // sees sits above this mark, and these operations do not: a replayed record may well
-                // overwrite or delete a document that is already in the restored commit. Peer recovery in
-                // classic OpenSearch raises the same watermark for the same reason before replaying a
-                // primary's history, and without it the engine asserts -- which is how this surfaced.
-                //
-                // Deliberately the overall maximum rather than a narrower "which of these were updates"
-                // count: setting it too high only forgoes an optimisation, while setting it too low is a
-                // correctness bug that shows up as a lost overwrite.
-                advanceMaxSeqNoOfUpdatesOrDeletes(highest);
-            }
-            return operations;
-        } catch (IOException e) {
-            // Not swallowed into an empty list. An unreadable log during recovery means the shard cannot
-            // be rebuilt to the state its predecessor acknowledged, and opening it anyway would serve a
-            // silently truncated index.
-            throw new EngineException(shardId, "could not read the write-ahead log for replay", e);
         }
     }
 }

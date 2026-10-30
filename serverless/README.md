@@ -9,22 +9,20 @@ This branch is built directly on `opensearch-project/OpenSearch` `main`.
 
 ## What it costs core
 
-Six files, 615 lines, all additive.
+Nine production files in core, with 710 added lines and 20 removed relative to the
+branch's upstream base. Cloud repository implementations remain outside core.
 
-| File | Lines | Why |
+| File | Added / removed | Why |
 | --- | --- | --- |
-| `common/blobstore/BlobRegister.java` | 68 | the compare-and-swap register, and the random generation a register starts at |
-| `common/blobstore/BlobRegisterCasResult.java` | 53 | its outcome |
-| `common/blobstore/BlobContainer.java` | 157 | `readRegister`, `compareAndSwapRegister`, `createRegisterIfAbsent`, `deleteRegisterIfUnchanged`; and the paged listings `listBlobsByPrefix(prefix, startAfter, limit)` and `children(startAfter, limit)`, with defaults that list everything and sort |
-| `common/blobstore/fs/FsBlobContainer.java` | 264 | the filesystem implementation of all of it |
-| `index/engine/Engine.java` | 19 | `engineRecoveryOperations()` |
-| `index/shard/IndexShard.java` | 54 | `recoverAdditionalEngineOperations`, which replays them |
-
-It was 408 until an audit of what core actually needs. `Engine` also carried
-`globalCheckpointSupplierForCombinedDeletionPolicy`, a hook nothing overrode and nothing
-called -- `InternalEngine` still passes the supplier inline, so it was never even wired to
-its own default. `BlobRegister` was a hand-written value class whose `equals` and `hashCode`
-were exactly what a record generates. Neither removal changed a call site.
+| `common/blobstore/BlobRegister.java` | 68 / 0 | the compare-and-swap register and its random initial generation |
+| `common/blobstore/BlobRegisterCasResult.java` | 60 / 0 | its conditional-write outcome |
+| `common/blobstore/BlobContainer.java` | 166 / 0 | register operations and paged listing defaults |
+| `common/blobstore/BlobStore.java` | 10 / 0 | storage-specific key validation before publishing descriptors |
+| `common/blobstore/fs/FsBlobContainer.java` | 310 / 19 | atomic filesystem blobs, registers, locking and listings |
+| `common/blobstore/fs/FsBlobStore.java` | 22 / 0 | filesystem component-length validation |
+| `index/engine/Engine.java` | 40 / 0 | list and streaming snapshot hooks for additional recovery operations |
+| `index/shard/IndexShard.java` | 31 / 0 | replaying and closing that snapshot during recovery |
+| `cluster/metadata/DataStream.java` | 3 / 1 | preserving explicit backing-index snapshots while checking fresh names at creation |
 
 `BlobRegisterCasResult` stays a class deliberately. A record's canonical constructor cannot
 be less accessible than the record, so making it one would expose
@@ -51,13 +49,23 @@ length must fit 255 UTF-8 bytes (255 UTF-16 units on Windows). Object stores ret
 their own key limits; this check adds no storage requests.
 
 **Both engine hooks are needed, not just the method.** `ServerlessWriterEngine` overrides
-`engineRecoveryOperations` to replay its object-store write-ahead log during recovery, and
+`engineRecoverySnapshot` to replay its object-store write-ahead log during recovery, and
 `IndexShard` is what actually runs it, through the same `runTranslogRecovery` path local
 translog recovery uses. Reverting `IndexShard` alone compiles perfectly and fails 21 tests --
 durability, fencing, deletes, sequence numbers -- because nothing replays the log. Easy to
 miss twice over: the method hangs off a class core already had, so a survey comparing
 imported *classes* does not see it, and the call site is in a third class that names neither
 the shell nor the engine.
+
+Recovery streams fenced WAL records into a disposable local spool instead of retaining all
+sources and native operations on the heap. Duplicate sequence identities are validated before
+replay, with a 16 MiB external-sort buffer when history is out of order; increasing sequences
+need no sort. Legacy operations retain their original ordering and are skipped only when a
+later sequenced operation supersedes the same document. Record checksums and checksummed
+supersession metadata make local corruption fail activation. Temporary files are removed on
+success or failure, and the next exclusive engine open reclaims an interrupted spool. This
+adds local disk work without another object-store read pass. Existing engines overriding the
+list hook remain supported by the default snapshot adapter.
 
 ## One coupling worth naming
 
