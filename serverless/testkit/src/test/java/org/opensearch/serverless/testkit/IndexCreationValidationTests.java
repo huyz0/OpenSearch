@@ -204,4 +204,28 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
             }
         });
     }
+
+    public void testDataStreamTimestampMustHaveADateMapping() throws Exception {
+        assertDataStreamTimestampSchema("{\"type\":\"keyword\"}");
+    }
+
+    public void testDataStreamTimestampMustHaveDocValues() throws Exception {
+        assertDataStreamTimestampSchema("{\"type\":\"date\",\"doc_values\":false}");
+    }
+
+    private void assertDataStreamTimestampSchema(String definition) throws Exception {
+        withNode((node, metadata) -> {
+            metadata.indexTemplates()
+                .put(
+                    "events",
+                    "{\"index_patterns\":[\"events*\"],\"data_stream\":{},\"template\":{\"mappings\":{\"properties\":{\"@timestamp\":"
+                        + definition
+                        + "}}}}"
+                );
+            final var response = send(node, "PUT", "/_data_stream/events", null);
+            assertEquals(response.body(), 400, response.statusCode());
+            assertTrue(metadata.describe(".ds-events-000001").isEmpty());
+            assertNull(metadata.resolve("events").alias());
+        });
+    }
 }

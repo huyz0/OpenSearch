@@ -686,6 +686,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         final var candidate = descriptor.toIndexMetadata(Map.of());
         try (var mapper = serving.indicesService().createIndexMapperService(candidate)) {
             mapper.merge(candidate, org.opensearch.index.mapper.MapperService.MergeReason.INDEX_TEMPLATE);
+            validateTimestampMapping(mapper, candidate, descriptor.mapping());
             final var validatedSettings = mapper.getIndexSettings();
             if (validatedSettings.getIndexSortConfig().hasIndexSort()) {
                 final var noCache = new org.opensearch.index.fielddata.IndexFieldDataCache.None();
@@ -699,6 +700,38 @@ public final class IndexAdminHandler extends BaseRestHandler {
         }
         metadata.createIndex(descriptor);
         return descriptor;
+    }
+
+    private static void validateTimestampMapping(org.opensearch.index.mapper.MapperService mapper, IndexMetadata candidate, String source) {
+        final String metadataField = org.opensearch.index.mapper.DataStreamFieldMapper.NAME;
+        if (source == null || source.contains(metadataField) == false) {
+            return;
+        }
+        final Object declared = candidate.mapping().sourceAsMap().get(metadataField);
+        if (declared instanceof Map<?, ?> == false) {
+            return;
+        }
+        final Map<?, ?> guard = (Map<?, ?>) declared;
+        if (Boolean.parseBoolean(String.valueOf(guard.get("enabled"))) == false) {
+            return;
+        }
+        String name = org.opensearch.index.mapper.DataStreamFieldMapper.Defaults.TIMESTAMP_FIELD.getName();
+        final Object selected = guard.get("timestamp_field");
+        if (selected instanceof Map<?, ?> named) {
+            if (named.get("name") instanceof String == false || ((String) named.get("name")).isEmpty()) {
+                throw new org.opensearch.index.mapper.MapperParsingException("data stream timestamp field requires a name");
+            }
+            name = (String) named.get("name");
+        }
+        final var field = mapper.fieldType(name);
+        if (field instanceof org.opensearch.index.mapper.DateFieldMapper.DateFieldType == false || field.name().equals(name) == false) {
+            throw new org.opensearch.index.mapper.MapperParsingException(
+                "data stream timestamp field [" + name + "] must be a date or date_nanos field"
+            );
+        }
+        if (mapper.getIndexSettings().isPluggableDataFormatEnabled() == false && field.hasDocValues() == false) {
+            throw new org.opensearch.index.mapper.MapperParsingException("data stream timestamp field [" + name + "] requires doc values");
+        }
     }
 
     /**
