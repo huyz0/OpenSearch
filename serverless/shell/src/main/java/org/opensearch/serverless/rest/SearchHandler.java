@@ -1081,6 +1081,13 @@ public final class SearchHandler extends BaseRestHandler {
                     }
                     final T result = work.apply(accepted);
                     if (result instanceof org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome) {
+                        if (Boolean.FALSE.equals(rewritten.allowPartialSearchResults()) && outcome.failures().isEmpty() == false) {
+                            final Throwable cause = outcome.failures().get(0).getCause();
+                            if (cause instanceof Exception failure) {
+                                throw failure;
+                            }
+                            throw new IOException("search shard failed", cause);
+                        }
                         outcome.withTotalHitsTracking(
                             accepted.trackTotalHitsUpTo() == null
                                 || accepted.trackTotalHitsUpTo() != org.opensearch.search.internal.SearchContext.TRACK_TOTAL_HITS_DISABLED
