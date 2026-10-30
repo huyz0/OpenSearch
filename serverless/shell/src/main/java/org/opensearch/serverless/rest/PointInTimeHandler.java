@@ -114,113 +114,136 @@ public final class PointInTimeHandler extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        final String index = request.param("index");
-        final String id = request.param("id");
-        final boolean all = request.path().endsWith("/_all");
-        final long keepAlive = request.paramAsTime(
-            "keep_alive",
-            org.opensearch.common.unit.TimeValue.timeValueMillis(DEFAULT_KEEP_ALIVE_MILLIS)
-        ).millis();
-        // Hints core's create action takes and this one has nothing to do with: there is one copy of each
-        // shard, placed by id, and a view either freezes every shard's commit or is refused.
-        request.param("preference");
-        request.param("routing");
-        request.param("allow_partial_pit_creation");
-        request.param("expand_wildcards");
-
         final MetadataPlane metadata = plane.get();
-        if (metadata == null) {
+        final ServerlessNode serving = node.get();
+        if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        final ServerlessNode serving = node.get();
-
         if (request.method() == RestRequest.Method.GET) {
-            return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
-                try {
-                    IndexAdminHandler.gate(
-                        serving,
-                        org.opensearch.action.search.GetAllPitsAction.NAME,
-                        new org.opensearch.action.search.GetAllPitNodesRequest(new org.opensearch.cluster.node.DiscoveryNode[0]),
-                        () -> {
-                            list(channel, metadata);
-                            return null;
-                        }
-                    );
-                } catch (Exception e) {
-                    report(channel, e);
+            final var ask = new org.opensearch.action.search.GetAllPitNodesRequest(new org.opensearch.cluster.node.DiscoveryNode[0]);
+            return channel -> dispatch(channel, serving, org.opensearch.action.search.GetAllPitsAction.NAME, ask, (admitted, output) -> {
+                if (admitted instanceof org.opensearch.action.search.GetAllPitNodesRequest == false) {
+                    throw unsupported("PIT listing requires GetAllPitNodesRequest");
                 }
+                final var selected = (org.opensearch.action.search.GetAllPitNodesRequest) admitted;
+                if ((selected.nodesIds() != null && selected.nodesIds().length != 0)
+                    || (selected.concreteNodes() != null && selected.concreteNodes().length != 0)) {
+                    throw unsupported("PIT records are deployment-wide; node-scoped listing is not supported");
+                }
+                list(output, metadata);
             });
         }
         if (request.method() == RestRequest.Method.DELETE) {
-            final List<String> ids = new java.util.ArrayList<>();
-            if (id != null) {
-                ids.add(id);
-            } else if (all == false) {
-                // Core's shape: {"pit_id": ["...", "..."]}.
+            final String id = request.param("id");
+            final boolean all = request.path().endsWith("/_all");
+            final var ask = new org.opensearch.action.search.DeletePitRequest();
+            if (all) {
+                ask.clearAndSetPitIds(List.of("_all"));
+            } else if (id != null) {
+                ask.clearAndSetPitIds(List.of(id));
+            } else {
                 if (request.hasContent() == false) {
-                    return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.BAD_REQUEST,
-                            "missing_body",
-                            "name the views to release in a pit_id array, or delete _all"
-                        )
-                    );
+                    throw new IllegalArgumentException("name the views to release in a pit_id array, or delete _all");
                 }
                 try (var parser = request.contentParser()) {
-                    final Object named = parser.map().get("pit_id");
-                    if (named instanceof List<?> many) {
-                        for (Object each : many) {
-                            ids.add(String.valueOf(each));
-                        }
-                    } else if (named instanceof String one) {
-                        ids.add(one);
+                    ask.fromXContent(parser);
+                    if (parser.nextToken() != null) {
+                        throw new IllegalArgumentException("unexpected content after the PIT deletion request");
                     }
-                }
-                if (ids.isEmpty()) {
-                    return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "pit_id must name at least one view")
-                    );
                 }
             }
-            return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
-                try {
-                    IndexAdminHandler.gate(
-                        serving,
-                        org.opensearch.action.search.DeletePitAction.NAME,
-                        new org.opensearch.action.search.DeletePitRequest(all ? List.of("_all") : ids),
-                        () -> {
-                            release(channel, serving, metadata, all ? null : ids);
-                            return null;
-                        }
-                    );
-                } catch (Exception e) {
-                    report(channel, e);
+            return channel -> dispatch(channel, serving, org.opensearch.action.search.DeletePitAction.NAME, ask, (admitted, output) -> {
+                if (admitted instanceof org.opensearch.action.search.DeletePitRequest == false) {
+                    throw unsupported("PIT deletion requires DeletePitRequest");
                 }
+                final var selected = (org.opensearch.action.search.DeletePitRequest) admitted;
+                final var invalid = selected.validate();
+                if (invalid != null) {
+                    throw invalid;
+                }
+                final List<String> ids = List.copyOf(selected.getPitIds());
+                release(output, serving, metadata, ids.contains("_all") ? null : ids);
             });
         }
-        if (keepAlive > MAX_KEEP_ALIVE_MILLIS) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "keep_alive_too_long", keepAliveTooLong())
-            );
-        }
-        return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+        final long keepAlive = request.paramAsTime(
+            "keep_alive",
+            org.opensearch.common.unit.TimeValue.timeValueMillis(DEFAULT_KEEP_ALIVE_MILLIS)
+        ).millis();
+        final var ask = new org.opensearch.action.search.CreatePitRequest(
+            org.opensearch.common.unit.TimeValue.timeValueMillis(keepAlive),
+            request.paramAsBoolean("allow_partial_pit_creation", false),
+            org.opensearch.core.common.Strings.splitStringByCommaToArray(request.param("index"))
+        );
+        ask.setRouting(request.param("routing"));
+        ask.setPreference(request.param("preference"));
+        ask.setIndicesOptions(org.opensearch.action.support.IndicesOptions.fromRequest(request, ask.getIndicesOptions()));
+        return channel -> dispatch(channel, serving, org.opensearch.action.search.CreatePitAction.NAME, ask, (admitted, output) -> {
+            if (admitted instanceof org.opensearch.action.search.CreatePitRequest == false) {
+                throw unsupported("PIT creation requires CreatePitRequest");
+            }
+            final var selected = (org.opensearch.action.search.CreatePitRequest) admitted;
+            final var invalid = selected.validate();
+            if (invalid != null) {
+                throw invalid;
+            }
+            if (selected.getIndices() == null || selected.getIndices().length != 1 || selected.getIndices()[0] == null) {
+                throw unsupported("a point in time here requires one concrete index");
+            }
+            if (serving.isSystemIndex(selected.getIndices()[0])) {
+                output.sendResponse(SystemIndices.refusal(output, selected.getIndices()[0]));
+                return;
+            }
+            if (selected.getRouting() != null) {
+                throw unsupported("routing a PIT to a subset of shards is not supported");
+            }
+            if (selected.getKeepAlive().millis() > MAX_KEEP_ALIVE_MILLIS) {
+                output.sendResponse(IndexAdminHandler.error(output, RestStatus.BAD_REQUEST, "keep_alive_too_long", keepAliveTooLong()));
+                return;
+            }
+            freeze(output, metadata, selected.getIndices()[0], selected.getKeepAlive().millis(), request);
+        });
+    }
+
+    private static org.opensearch.OpenSearchStatusException unsupported(String reason) {
+        return new org.opensearch.OpenSearchStatusException(reason, RestStatus.NOT_IMPLEMENTED);
+    }
+
+    private void dispatch(
+        org.opensearch.rest.RestChannel channel,
+        ServerlessNode serving,
+        String action,
+        org.opensearch.action.ActionRequest request,
+        org.opensearch.common.CheckedBiConsumer<org.opensearch.action.ActionRequest, org.opensearch.rest.RestChannel, Exception> work
+    ) {
+        serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                IndexAdminHandler.gate(
-                    serving,
-                    org.opensearch.action.search.CreatePitAction.NAME,
-                    new org.opensearch.action.search.CreatePitRequest(
-                        org.opensearch.common.unit.TimeValue.timeValueMillis(keepAlive),
-                        false,
-                        index
-                    ),
-                    () -> {
-                        freeze(channel, metadata, index, keepAlive, request);
-                        return null;
+                final var opaque = org.opensearch.serverless.shell.ActionGate.<org.opensearch.rest.RestResponse>opaque();
+                final var view = new org.opensearch.serverless.shell.ActionGate.ResponseView<org.opensearch.rest.RestResponse>() {
+                    @Override
+                    public org.opensearch.core.action.ActionResponse show(org.opensearch.rest.RestResponse result) {
+                        return opaque.show(result);
                     }
-                );
+
+                    @Override
+                    public org.opensearch.rest.RestResponse read(
+                        org.opensearch.core.action.ActionResponse response,
+                        org.opensearch.rest.RestResponse original
+                    ) {
+                        if (original == null || response instanceof org.opensearch.serverless.shell.ActionGate.Admitted == false) {
+                            throw unsupported("cached or rewritten native PIT responses are not supported by this endpoint");
+                        }
+                        return original;
+                    }
+                };
+                final var response = serving.actionGate().run(action, request, admitted -> {
+                    final var pending = new PendingRestChannel(channel);
+                    work.accept(admitted, pending);
+                    return pending.response();
+                }, view);
+                // An after-work filter may still refuse; no bytes reach HTTP before the chain completes.
+                channel.sendResponse(response);
             } catch (Exception e) {
                 report(channel, e);
             }
