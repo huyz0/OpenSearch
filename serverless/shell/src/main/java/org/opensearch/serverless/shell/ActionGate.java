@@ -45,9 +45,9 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@link ResponseView}; adapters without a native response use {@link Admitted} and explicitly refuse
  * cached or rewritten results they cannot apply.
  *
- * <p><b>Synchronous by construction.</b> The shell's operations block, so the chain is driven to completion
- * on the calling thread. That thread is never a transport thread — every call site already dispatched — but
- * it does mean an {@code ActionFilter} that answers asynchronously holds a worker until it does.
+ * <p><b>Blocking and asynchronous adapters.</b> Blocking operations drive the chain to completion on their
+ * worker thread. Callback operations use {@link #runAsync} so forwarding or an asynchronous filter does
+ * not hold that worker while it waits. Neither adapter runs blocking work on a transport thread.
  *
  * <p><b>Indices are reported as unresolved</b>, via {@link ActionRequestMetadata#empty()}. That is the truth
  * rather than a shortcut: a node cannot resolve an index expression here, for the reasons set out in
@@ -268,4 +268,58 @@ public final class ActionGate {
         }
         return view.read(answered, result.get());
     }
+
+    /**
+     * Runs asynchronous work through the filters without holding a worker while it completes.
+     *
+     * @param action the action name
+     * @param request the caller's request
+     * @param work starts work using the admitted request and completes its listener
+     * @param view exposes the native result and reads the filtered response
+     * @param completion receives the result after the entire chain finishes
+     * @param <T> the operation result
+     */
+    public <T> void runAsync(
+        String action,
+        ActionRequest request,
+        org.opensearch.common.CheckedBiConsumer<ActionRequest, org.opensearch.core.action.ActionListener<T>, Exception> work,
+        ResponseView<T> view,
+        org.opensearch.core.action.ActionListener<T> completion
+    ) {
+        if (filters.isEmpty()) {
+            try {
+                work.accept(request, completion);
+            } catch (Exception e) {
+                completion.onFailure(e);
+            }
+            return;
+        }
+        final AtomicReference<T> original = new AtomicReference<>();
+        ActionFilterChain<ActionRequest, ActionResponse> chain = (task, name, admitted, listener) -> {
+            try {
+                work.accept(admitted, org.opensearch.core.action.ActionListener.wrap(result -> {
+                    original.set(result);
+                    listener.onResponse(view.show(result));
+                }, listener::onFailure));
+            } catch (Exception e) {
+                listener.onFailure(e);
+            }
+        };
+        for (int i = filters.size() - 1; i >= 0; i--) {
+            final ActionFilter filter = filters.get(i);
+            final ActionFilterChain<ActionRequest, ActionResponse> next = chain;
+            chain = (task, name, admitted, listener) -> filter.apply(task, name, admitted, ActionRequestMetadata.empty(), listener, next);
+        }
+        final var finished = org.opensearch.core.action.ActionListener.<ActionResponse>wrap(
+            answered -> completion.onResponse(view.read(answered, original.get())),
+            completion::onFailure
+        );
+        try {
+            final Task task = new Task(0L, "serverless", action, "", TaskId.EMPTY_TASK_ID, Map.of());
+            chain.proceed(task, action, request, finished);
+        } catch (Exception e) {
+            finished.onFailure(e);
+        }
+    }
+
 }
