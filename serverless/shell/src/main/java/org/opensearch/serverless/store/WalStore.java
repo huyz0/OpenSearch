@@ -297,6 +297,10 @@ public final class WalStore {
             throw new IOException("this log writer stopped appending to term " + term + " after an earlier append failed or it was fenced");
         }
         seed(term);
+        if (ordinal.get() == Long.MAX_VALUE) {
+            poisoned = true;
+            throw new IOException("WAL ordinal exhausted for term " + term);
+        }
         final String name = String.format(java.util.Locale.ROOT, "%020d", ordinal.incrementAndGet());
         // Refused on collision, never overwritten. A store instance is rebuilt on every local release of a
         // shard, and a shard reopened at the same term replayed records 1..N and then appended its next
@@ -394,6 +398,9 @@ public final class WalStore {
                         ownFences.add(blob.getKey());
                     }
                 }
+            }
+            if (highest == Long.MAX_VALUE) {
+                throw new IOException("cannot fence exhausted WAL term " + term);
             }
             final long slot = highest + 1;
             try {
