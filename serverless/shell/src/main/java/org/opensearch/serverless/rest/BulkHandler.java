@@ -8,6 +8,19 @@
 
 package org.opensearch.serverless.rest;
 
+import org.opensearch.action.DocWriteRequest;
+import org.opensearch.action.DocWriteResponse;
+import org.opensearch.action.bulk.BulkAction;
+import org.opensearch.action.bulk.BulkItemResponse;
+import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
+import org.opensearch.action.delete.DeleteRequest;
+import org.opensearch.action.delete.DeleteResponse;
+import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.index.IndexResponse;
+import org.opensearch.action.support.WriteRequest;
+import org.opensearch.action.update.UpdateRequest;
+import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.index.shard.ShardId;
@@ -16,10 +29,12 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.VersionType;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shell.ActionGate;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.transport.client.node.NodeClient;
@@ -104,7 +119,10 @@ public final class BulkHandler extends BaseRestHandler {
         // parameters were not all consumed, which would turn a deliberate refusal into a 400 about
         // something else.
         final String defaultIndex = request.param("index");
-        final boolean refresh = IndexAdminHandler.refresh(request);
+        final var refreshPolicy = WriteRequest.RefreshPolicy.parse(request.param("refresh", "false"));
+        final boolean refresh = refreshPolicy != WriteRequest.RefreshPolicy.NONE;
+        final String timeout = request.param("timeout");
+        final var activeShards = org.opensearch.action.support.ActiveShardCount.parseString(request.param("wait_for_active_shards"));
         final String defaultPipeline = request.param("pipeline");
         final String routing = request.param("routing");
         final boolean requireAlias = request.paramAsBoolean("require_alias", false);
@@ -193,21 +211,42 @@ public final class BulkHandler extends BaseRestHandler {
                 org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
-                route(serving, metadata, items);
-                shape(serving, metadata, items);
-                // One gate call for the whole batch, under the bulk action, rather than one per item.
-                //
-                // A privilege evaluator written for OpenSearch expects to see indices:data/write/bulk with
-                // a BulkRequest whose indices() covers the batch; filtering each document under
-                // indices:data/write/index instead would be stricter but would show a filter an action name
-                // it never registered for, which for a filter that only guards bulk is a hole rather than a
-                // difference. The request is built from the items that survived routing, so a filter sees
-                // the indices actually about to be written.
-                serving.actionGate().run(org.opensearch.action.bulk.BulkAction.NAME, bulkRequestFor(items), () -> {
+                if (serving.actionGate().isEmpty()) {
+                    // The usual path needs no second UTF-8 source encoding or native response objects.
+                    route(serving, metadata, items);
+                    shape(serving, metadata, items);
                     dispatch(serving, items, refresh);
-                    return null;
-                });
-                respond(channel, items, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt), refresh);
+                    respond(channel, items, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt), refresh);
+                } else {
+                    final NativeBatch batch = bulkRequestFor(items, refreshPolicy, defaultPipeline);
+                    batch.request().waitForActiveShards(activeShards);
+                    if (timeout != null) {
+                        batch.request().timeout(timeout);
+                    }
+                    final var result = serving.actionGate().run(BulkAction.NAME, batch.request(), admitted -> {
+                        final var selected = (BulkRequest) admitted;
+                        if (selected.waitForActiveShards().equals(org.opensearch.action.support.ActiveShardCount.DEFAULT) == false
+                            && selected.waitForActiveShards().equals(org.opensearch.action.support.ActiveShardCount.NONE) == false
+                            && selected.waitForActiveShards().equals(org.opensearch.action.support.ActiveShardCount.ONE) == false
+                            && selected.waitForActiveShards().equals(org.opensearch.action.support.ActiveShardCount.ALL) == false) {
+                            throw new org.opensearch.OpenSearchStatusException(
+                                "bulk active-shard requirements are not supported",
+                                RestStatus.NOT_IMPLEMENTED
+                            );
+                        }
+                        final List<Item> admittedItems = admittedItems(selected, batch.rejected());
+                        route(serving, metadata, admittedItems);
+                        shape(serving, metadata, admittedItems);
+                        final boolean selectedRefresh = selected.getRefreshPolicy() != WriteRequest.RefreshPolicy.NONE;
+                        dispatch(serving, admittedItems, selectedRefresh);
+                        return nativeResult(
+                            admittedItems,
+                            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt),
+                            selectedRefresh
+                        );
+                    }, bulkResponseView());
+                    respondNative(channel, result);
+                }
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -218,31 +257,224 @@ public final class BulkHandler extends BaseRestHandler {
         });
     }
 
+    private record NativeBatch(BulkRequest request, Map<DocWriteRequest<?>, Item> rejected) {
+    }
+
+    private record NativeResult(BulkResponse response, Map<BulkItemResponse, Item> extensions) {
+    }
+
+    /** Gives filters the actual inputs before any ingest configuration is read or executed. */
+    private static NativeBatch bulkRequestFor(List<Item> items, WriteRequest.RefreshPolicy refreshPolicy, String pipeline) {
+        final var request = new BulkRequest().pipeline(pipeline).setRefreshPolicy(refreshPolicy);
+        final Map<DocWriteRequest<?>, Item> rejected = new java.util.IdentityHashMap<>();
+        for (Item item : items) {
+            final DocWriteRequest<?> write;
+            if ("update".equals(item.action)) {
+                // Update is explicitly refused by this surface; it must still have the correct native type.
+                write = new UpdateRequest(item.index, item.operation.id());
+            } else if (item.operation.isDeletion()) {
+                final var delete = new DeleteRequest(item.index, item.operation.id());
+                if (item.ifSeqNo >= 0L && item.ifPrimaryTerm > 0L) {
+                    delete.setIfSeqNo(item.ifSeqNo).setIfPrimaryTerm(item.ifPrimaryTerm);
+                }
+                write = delete;
+            } else {
+                final var index = new IndexRequest(item.index).id(item.operation.id())
+                    .source(item.operation.source(), XContentType.JSON)
+                    .opType(item.requireAbsent ? DocWriteRequest.OpType.CREATE : DocWriteRequest.OpType.INDEX)
+                    .setPipeline(item.pipeline);
+                if (item.ifSeqNo >= 0L && item.ifPrimaryTerm > 0L) {
+                    index.setIfSeqNo(item.ifSeqNo).setIfPrimaryTerm(item.ifPrimaryTerm);
+                }
+                write = index;
+            }
+            request.add(write);
+            if (item.failed()) {
+                rejected.put(write, item);
+            }
+        }
+        return new NativeBatch(request, rejected);
+    }
+
+    private static List<Item> admittedItems(BulkRequest request, Map<DocWriteRequest<?>, Item> rejected) throws IOException {
+        final List<Item> items = new ArrayList<>(request.numberOfActions());
+        for (DocWriteRequest<?> write : request.requests()) {
+            final Item refused = rejected.get(write);
+            if (refused != null) {
+                // Parsing failures cannot turn into writes merely because a filter changes another item.
+                items.add(refused);
+                continue;
+            }
+            final Action action = new Action(write.opType().getLowercase(), write.index());
+            action.id = write.id();
+            action.ifSeqNo = write.ifSeqNo();
+            action.ifPrimaryTerm = write.ifPrimaryTerm();
+            action.routing = write.routing();
+            action.requireAlias = write.isRequireAlias();
+            if (write instanceof IndexRequest index) {
+                action.source = index.source() == null
+                    ? ""
+                    : org.opensearch.common.xcontent.XContentHelper.convertToJson(index.source(), false, false, index.getContentType());
+                action.pipeline = index.getPipeline() == null ? request.pipeline() : index.getPipeline();
+            }
+            final long version = write.version();
+            final boolean defaultVersion = version == org.opensearch.common.lucene.uid.Versions.MATCH_ANY
+                || (write.opType() == DocWriteRequest.OpType.CREATE && version == org.opensearch.common.lucene.uid.Versions.MATCH_DELETED);
+            if (write.versionType() != VersionType.INTERNAL || defaultVersion == false) {
+                action.conditional = "version";
+            }
+            final Item item = action.toItem();
+            if (write instanceof IndexRequest index) {
+                if (index.getFinalPipeline() != null) {
+                    item.fail(
+                        RestStatus.NOT_IMPLEMENTED,
+                        "unsupported_action",
+                        "an explicit native final pipeline is not supported; configure index.final_pipeline"
+                    );
+                }
+                if (index.id() == null) {
+                    index.id(item.operation.id());
+                }
+            }
+            items.add(item);
+        }
+        return items;
+    }
+
+    private static NativeResult nativeResult(List<Item> items, long took, boolean refreshed) {
+        final var responses = new BulkItemResponse[items.size()];
+        final Map<BulkItemResponse, Item> extensions = new java.util.IdentityHashMap<>();
+        for (int i = 0; i < items.size(); i++) {
+            final Item item = items.get(i);
+            final var op = DocWriteRequest.OpType.fromString("index".equals(item.action) && item.requireAbsent ? "create" : item.action);
+            final String index = item.writtenIndex == null ? item.index : item.writtenIndex;
+            if (item.failed()) {
+                responses[i] = new BulkItemResponse(
+                    i,
+                    op,
+                    new BulkItemResponse.Failure(
+                        index,
+                        item.operation.id(),
+                        new org.opensearch.OpenSearchStatusException(item.errorReason, item.status),
+                        item.status
+                    )
+                );
+            } else {
+                final var shardId = new ShardId(index, item.writtenUuid, item.shard);
+                final DocWriteResponse response;
+                if ("noop".equals(item.result)) {
+                    // Core uses UpdateResponse for an ingest drop even when the input operation is index/create.
+                    response = new UpdateResponse(
+                        shardId,
+                        item.operation.id(),
+                        item.seqNo,
+                        item.primaryTerm,
+                        item.version,
+                        DocWriteResponse.Result.NOOP
+                    );
+                } else if (item.operation.isDeletion()) {
+                    response = new DeleteResponse(
+                        shardId,
+                        item.operation.id(),
+                        item.seqNo,
+                        item.primaryTerm,
+                        item.version,
+                        "deleted".equals(item.result)
+                    );
+                } else {
+                    response = new IndexResponse(
+                        shardId,
+                        item.operation.id(),
+                        item.seqNo,
+                        item.primaryTerm,
+                        item.version,
+                        "created".equals(item.result)
+                    );
+                }
+                if ("noop".equals(item.result) == false) {
+                    response.setShardInfo(new org.opensearch.action.support.replication.ReplicationResponse.ShardInfo(1, 1));
+                    response.setForcedRefresh(refreshed);
+                }
+                responses[i] = new BulkItemResponse(i, op, response);
+            }
+            extensions.put(responses[i], item);
+        }
+        return new NativeResult(new BulkResponse(responses, took), extensions);
+    }
+
+    private static ActionGate.ResponseView<NativeResult> bulkResponseView() {
+        return new ActionGate.ResponseView<>() {
+            @Override
+            public org.opensearch.core.action.ActionResponse show(NativeResult result) {
+                return result.response();
+            }
+
+            @Override
+            public NativeResult read(org.opensearch.core.action.ActionResponse response, NativeResult original) {
+                return new NativeResult(
+                    (BulkResponse) response,
+                    original != null && response == original.response() ? original.extensions() : Map.of()
+                );
+            }
+        };
+    }
+
+    /** Renders the filtered native fields, retaining extension fields only for unchanged item identities. */
+    private static void respondNative(org.opensearch.rest.RestChannel channel, NativeResult result) throws IOException {
+        if (result.extensions().isEmpty()) {
+            try (var builder = channel.newBuilder()) {
+                result.response().toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+                channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            }
+            return;
+        }
+        try (var builder = channel.newBuilder()) {
+            builder.startObject();
+            builder.field("took", result.response().getTook().millis());
+            if (result.response().getIngestTookInMillis() != BulkResponse.NO_INGEST_TOOK) {
+                builder.field("ingest_took", result.response().getIngestTookInMillis());
+            }
+            builder.field("errors", result.response().hasFailures());
+            builder.startArray("items");
+            for (BulkItemResponse response : result.response().getItems()) {
+                final Item extension = result.extensions().get(response);
+                if (extension == null) {
+                    response.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+                    continue;
+                }
+                builder.startObject();
+                builder.startObject(response.getOpType().getLowercase());
+                if (response.isFailed()) {
+                    builder.field("_index", response.getIndex());
+                    builder.field("_id", response.getId());
+                    builder.field("status", response.status().getStatus());
+                    builder.startObject("error");
+                    builder.field("type", extension.errorType);
+                    builder.field("reason", extension.errorReason);
+                    builder.endObject();
+                } else {
+                    response.getResponse().innerToXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+                    builder.field("status", response.status().getStatus());
+                    if ("noop".equals(extension.result) == false) {
+                        builder.field("_node", extension.nodeId);
+                        builder.field("durable", "write-ahead log");
+                    }
+                }
+                if (extension.shard >= 0) {
+                    builder.field("_shard", extension.shard);
+                }
+                builder.endObject();
+                builder.endObject();
+            }
+            builder.endArray();
+            builder.endObject();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        }
+    }
+
     /**
      * Decides, per item, which shard it belongs to and who owns it — or records why it cannot be placed.
      */
-    /**
-     * Describes the batch to an action filter, in the request type a filter expects.
-     *
-     * <p>Only what a filter needs: which indices, and which operations. Sources are not copied — a bulk of
-     * ten thousand documents would be duplicated in memory to tell a privilege evaluator something it does
-     * not read.
-     */
-    private static org.opensearch.action.bulk.BulkRequest bulkRequestFor(List<Item> items) {
-        final org.opensearch.action.bulk.BulkRequest request = new org.opensearch.action.bulk.BulkRequest();
-        for (Item item : items) {
-            if (item.failed() || item.index == null) {
-                continue;
-            }
-            if (item.operation.isDeletion()) {
-                request.add(new org.opensearch.action.delete.DeleteRequest(item.index, item.operation.id()));
-            } else {
-                request.add(new org.opensearch.action.index.IndexRequest(item.index).id(item.operation.id()));
-            }
-        }
-        return request;
-    }
-
     private void route(ServerlessNode serving, MetadataPlane metadata, List<Item> items) throws IOException {
         final Map<String, Optional<MetadataPlane.WriteTarget>> targets = new HashMap<>();
         final java.util.Set<String> failures = new java.util.HashSet<>();
