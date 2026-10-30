@@ -123,9 +123,18 @@ public final class RepositoryHandler extends BaseRestHandler {
             });
         }
         if (repoParam == null || "_all".equals(repoParam) || "*".equals(repoParam)) {
-            // GET /_snapshot, GET /_snapshot/_all and GET /_snapshot/* are the same request on real
-            // OpenSearch: every repository, unfiltered. request.method() is always GET here -- no route
-            // above registers PUT/POST/DELETE without {repo}.
+            // These selectors list repositories only on GET. The {repo} routes also match mutations;
+            // answering those with a listing would falsely acknowledge work that never happened.
+            if (request.method() != RestRequest.Method.GET) {
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.BAD_REQUEST,
+                        "illegal_argument_exception",
+                        "repository mutations require one concrete repository name"
+                    )
+                );
+            }
             return channel -> dispatch(channel, () -> handleList(channel, metadata, null));
         }
         if (repoParam.startsWith("_")) {
