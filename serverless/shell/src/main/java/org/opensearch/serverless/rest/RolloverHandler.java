@@ -295,6 +295,7 @@ public final class RolloverHandler extends BaseRestHandler {
             ? DataStreamHandler.withTimestamp(ask.create(), record.timestampField())
             : ask.create();
         long newGeneration = record.generation() + 1;
+        String createdUuid;
         try {
             if (record.dataStream()) {
                 final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolve(
@@ -306,7 +307,7 @@ public final class RolloverHandler extends BaseRestHandler {
                 // stream on a name something else holds.
                 for (int attempt = 0;; attempt++) {
                     try {
-                        IndexAdminHandler.createIndex(metadata, newName, create, inherited);
+                        createdUuid = IndexAdminHandler.createIndex(metadata, newName, create, inherited).uuid();
                         break;
                     } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
                         if (attempt >= 8) {
@@ -317,7 +318,7 @@ public final class RolloverHandler extends BaseRestHandler {
                     }
                 }
             } else {
-                IndexAdminHandler.createIndex(metadata, newName, create);
+                createdUuid = IndexAdminHandler.createIndex(metadata, newName, create).uuid();
             }
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "index [" + newName + "] already exists");
@@ -339,7 +340,9 @@ public final class RolloverHandler extends BaseRestHandler {
             // find it taken -- and the answer has to say which of the two outcomes this is.
             String left = "the index [" + newName + "] created for it was removed";
             try {
-                metadata.deleteIndex(newName);
+                if (metadata.deleteIndex(newName, createdUuid) == false) {
+                    left = "the index [" + newName + "] changed concurrently and was not removed by this rollback";
+                }
             } catch (Exception e) {
                 logger.warn("could not remove the index [" + newName + "] created by a rollover that lost its swap", e);
                 left = "the index [" + newName + "] was created and not adopted, and could not be removed: " + e.getMessage();
