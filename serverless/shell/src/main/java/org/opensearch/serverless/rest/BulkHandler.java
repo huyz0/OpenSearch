@@ -243,6 +243,7 @@ public final class BulkHandler extends BaseRestHandler {
 
     private void route(ServerlessNode serving, MetadataPlane metadata, List<Item> items) throws IOException {
         final Map<String, Optional<MetadataPlane.WriteTarget>> targets = new HashMap<>();
+        final java.util.Set<String> failures = new java.util.HashSet<>();
         for (Item item : items) {
             if (item.failed()) {
                 continue;
@@ -268,9 +269,14 @@ public final class BulkHandler extends BaseRestHandler {
                 try {
                     return metadata.writeTarget(name);
                 } catch (IOException e) {
+                    failures.add(name);
                     return Optional.empty();
                 }
             });
+            if (failures.contains(item.index)) {
+                item.fail(RestStatus.SERVICE_UNAVAILABLE, "metadata_unavailable", "could not resolve index [" + item.index + "]; retry");
+                continue;
+            }
             if (target.isEmpty()) {
                 item.fail(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + item.index);
                 continue;
