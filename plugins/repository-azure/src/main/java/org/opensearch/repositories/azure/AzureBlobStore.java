@@ -559,8 +559,8 @@ public class AzureBlobStore implements BlobStore {
             final boolean ifNoneMatchConflict = e.getStatusCode() == HttpURLConnection.HTTP_CONFLICT
                 && BlobErrorCode.BLOB_ALREADY_EXISTS.equals(e.getErrorCode());
             if (ifMatchConflict || ifNoneMatchConflict) {
-                long actualGeneration = readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-                return BlobRegisterCasResult.conflict(actualGeneration);
+                // A subsequent read may describe a different state from the conditional failure.
+                return BlobRegisterCasResult.conflict(BlobRegisterCasResult.UNKNOWN_GENERATION);
             }
             throw e;
         }

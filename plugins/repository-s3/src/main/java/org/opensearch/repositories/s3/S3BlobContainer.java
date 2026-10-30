@@ -1376,9 +1376,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 // conformance endpoints this suite runs against do not produce 409 or 404 for these races,
                 // which is exactly why reading the contract was worth doing.
                 if (e.statusCode() == 412 || e.statusCode() == 409 || e.statusCode() == 404) {
-                    return BlobRegisterCasResult.conflict(
-                        readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION)
-                    );
+                    return BlobRegisterCasResult.conflict(BlobRegisterCasResult.UNKNOWN_GENERATION);
                 }
                 throw e;
             }
@@ -1397,7 +1395,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
      * {@code compareAndSwapRegister} already says the conditional write is the authoritative guard and
      * the read is "purely as a fast-fail", so dropping it costs no safety.
      *
-     * <p>Conflict reports {@link BlobRegister#ABSENT_GENERATION} rather than reading to find the real
+     * <p>Conflict reports {@link BlobRegisterCasResult#UNKNOWN_GENERATION} rather than reading to find the real
      * generation, because a caller that lost a create race wants to know it lost, and paying a round trip
      * to decorate that would reintroduce the cost this exists to remove. A caller that needs the winning
      * value reads it itself, on a path that by definition is not the common one.
@@ -1432,7 +1430,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 // object completes" -- and it too means this create did not happen, which is all a caller
                 // needs to know. See the note in compareAndSwapRegister.
                 if (e.statusCode() == 412 || e.statusCode() == 409) {
-                    return BlobRegisterCasResult.conflict(BlobRegister.ABSENT_GENERATION);
+                    return BlobRegisterCasResult.conflict(BlobRegisterCasResult.UNKNOWN_GENERATION);
                 }
                 throw e;
             }
@@ -1547,9 +1545,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             forget(blobName);
             // The same three codes, and the same meaning, as in compareAndSwapRegister.
             if (e.statusCode() == 412 || e.statusCode() == 409 || e.statusCode() == 404) {
-                return BlobRegisterCasResult.conflict(
-                    readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION)
-                );
+                return BlobRegisterCasResult.conflict(BlobRegisterCasResult.UNKNOWN_GENERATION);
             }
             throw new IOException("Unable to CAS register [" + blobName + "]", e);
         } catch (SdkException e) {

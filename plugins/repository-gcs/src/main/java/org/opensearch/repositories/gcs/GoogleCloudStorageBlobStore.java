@@ -576,10 +576,9 @@ class GoogleCloudStorageBlobStore implements BlobStore {
             return BlobRegisterCasResult.applied(written.getGeneration());
         } catch (final StorageException e) {
             if (e.getCode() == HTTP_PRECON_FAILED) {
-                // Someone raced us; report a conflict with the real current generation rather than
-                // a wrapped exception so the caller re-reads and retries as normal.
-                long actualGeneration = readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-                return BlobRegisterCasResult.conflict(actualGeneration);
+                // Someone raced us. The backend did not return the conflicting generation.
+                // A subsequent read may describe a different state from the conditional failure.
+                return BlobRegisterCasResult.conflict(BlobRegisterCasResult.UNKNOWN_GENERATION);
             }
             throw e;
         }

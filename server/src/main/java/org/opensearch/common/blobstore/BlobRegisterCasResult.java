@@ -13,13 +13,17 @@ import org.opensearch.common.annotation.ExperimentalApi;
 /**
  * The outcome of a {@link BlobContainer#compareAndSwapRegister} attempt: either the write applied
  * ({@link #applied()} is {@code true} and {@link #currentGeneration()} is the new generation), or
- * it lost the race and {@link #currentGeneration()} reports what the register is actually at now
- * so the caller can re-read and retry rather than guessing.
+ * it lost the race and {@link #currentGeneration()} reports an observed conflicting generation or
+ * {@link #UNKNOWN_GENERATION} when the backend cannot report that generation atomically. A later read
+ * may observe a different state, so callers must read the current value before making a new decision.
  *
  * @opensearch.experimental
  */
 @ExperimentalApi
 public final class BlobRegisterCasResult {
+
+    /** A refused write whose conflicting generation was not returned by the backend; never a valid stored generation. */
+    public static final long UNKNOWN_GENERATION = -1L;
 
     private final boolean applied;
     private final long currentGeneration;
@@ -41,7 +45,10 @@ public final class BlobRegisterCasResult {
         return applied;
     }
 
-    /** The generation now stored in the register: the new one if {@link #applied()}, otherwise the one that caused the conflict. */
+    /**
+     * The new generation if applied; otherwise an observed conflicting generation or {@link #UNKNOWN_GENERATION}.
+     * A conflict does not require a subsequent read, whose result could describe a different state.
+     */
     public long currentGeneration() {
         return currentGeneration;
     }

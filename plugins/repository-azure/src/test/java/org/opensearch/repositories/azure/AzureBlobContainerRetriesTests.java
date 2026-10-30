@@ -195,6 +195,35 @@ public class AzureBlobContainerRetriesTests extends OpenSearchTestCase {
         return new AzureBlobContainer(BlobPath.cleanPath(), new AzureBlobStore(repositoryMetadata, service, threadPool), threadPool);
     }
 
+    public void testRegisterConflictDoesNotClaimLaterAbsence() throws Exception {
+        final var reads = new java.util.concurrent.atomic.AtomicInteger();
+        httpServer.createContext("/container/register-conflict", exchange -> {
+            try {
+                Streams.readFully(exchange.getRequestBody());
+                if ("GET".equals(exchange.getRequestMethod())) {
+                    reads.incrementAndGet();
+                    exchange.sendResponseHeaders(404, -1);
+                } else if ("PUT".equals(exchange.getRequestMethod())) {
+                    assertEquals("*", exchange.getRequestHeaders().getFirst("If-None-Match"));
+                    exchange.getResponseHeaders().add("x-ms-error-code", "ConditionNotMet");
+                    exchange.sendResponseHeaders(412, -1);
+                } else {
+                    throw new AssertionError(exchange.getRequestMethod());
+                }
+            } finally {
+                exchange.close();
+            }
+        });
+        final var result = createBlobContainer(1).compareAndSwapRegister(
+            "register-conflict",
+            0L,
+            new org.opensearch.core.common.bytes.BytesArray("next")
+        );
+        assertFalse(result.applied());
+        assertEquals(org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION, result.currentGeneration());
+        assertEquals("no follow-up read can describe the generation at the failed conditional PUT", 1, reads.get());
+    }
+
     public void testReadNonexistentBlobThrowsNoSuchFileException() {
         final BlobContainer blobContainer = createBlobContainer(between(1, 5));
         final Exception exception = expectThrows(NoSuchFileException.class, () -> {

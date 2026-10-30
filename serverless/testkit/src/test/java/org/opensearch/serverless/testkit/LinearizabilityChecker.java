@@ -173,12 +173,15 @@ public final class LinearizabilityChecker {
         if (op instanceof RegisterHistory.Create create) {
             if (absent) {
                 // Nothing there: it must have created, at a generation that means present.
-                return create.applied() && create.currentGeneration() != ABSENT
+                return create.applied() && create.currentGeneration() > ABSENT
                     ? new State(create.currentGeneration(), create.value())
                     : null;
             }
             // Something there: refused, reporting either what is stored or nothing at all.
-            if (create.applied() || (create.currentGeneration() != ABSENT && create.currentGeneration() != state.generation())) {
+            if (create.applied()
+                || (create.currentGeneration() != ABSENT
+                    && create.currentGeneration() != org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION
+                    && create.currentGeneration() != state.generation())) {
                 return null;
             }
             return state;
@@ -198,8 +201,8 @@ public final class LinearizabilityChecker {
                 // It swapped against what was there and was refused: no correct register does that.
                 return null;
             }
-            if (cas.currentGeneration() == state.generation()) {
-                // Applied, and the generation did not move. A generation that can repeat is a fence a
+            if (cas.currentGeneration() <= ABSENT || cas.currentGeneration() == state.generation()) {
+                // Applied with an invalid or unchanged generation. A generation that can repeat is a fence a
                 // zombie can walk back through.
                 return null;
             }
@@ -210,7 +213,8 @@ public final class LinearizabilityChecker {
             // failure: it is how two nodes come to believe they own one shard.
             return null;
         }
-        if (cas.currentGeneration() != state.generation()) {
+        if (cas.currentGeneration() != org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION
+            && cas.currentGeneration() != state.generation()) {
             // It lost, and reported a generation that was not the one stored. A caller re-reads on this
             // number; a wrong one sends it to swap against something that was never there.
             return null;

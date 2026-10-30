@@ -60,6 +60,21 @@ import static org.mockito.Mockito.when;
 
 public class GoogleCloudStorageBlobStoreContainerTests extends OpenSearchTestCase {
 
+    public void testRegisterConflictDoesNotClaimLaterAbsence() throws Exception {
+        final Storage storage = mock(Storage.class);
+        when(storage.get("bucket")).thenReturn(mock(Bucket.class));
+        when(storage.create(any(com.google.cloud.storage.BlobInfo.class), any(byte[].class), any(Storage.BlobTargetOption[].class)))
+            .thenThrow(new StorageException(412, "condition failed"));
+        final GoogleCloudStorageService service = mock(GoogleCloudStorageService.class);
+        when(service.client(any(String.class), any(String.class), any(GoogleCloudStorageOperationsStats.class))).thenReturn(storage);
+        try (var store = new GoogleCloudStorageBlobStore("bucket", "test", "repo", service, 1024)) {
+            final var result = store.compareAndSwapRegister("head", 0L, new org.opensearch.core.common.bytes.BytesArray("next"));
+            assertFalse(result.applied());
+            assertEquals(org.opensearch.common.blobstore.BlobRegisterCasResult.UNKNOWN_GENERATION, result.currentGeneration());
+            org.mockito.Mockito.verify(storage, org.mockito.Mockito.never()).get(any(BlobId.class));
+        }
+    }
+
     @SuppressWarnings("unchecked")
     public void testDeleteBlobsIgnoringIfNotExistsThrowsIOException() throws Exception {
         final List<String> blobs = Arrays.asList("blobA", "blobB");

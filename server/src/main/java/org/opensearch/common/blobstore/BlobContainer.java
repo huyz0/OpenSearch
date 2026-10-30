@@ -527,7 +527,8 @@ public interface BlobContainer {
      * generation preconditions, Azure ETag If-Match); {@link org.opensearch.common.blobstore.fs.FsBlobContainer}
      * implements it with real local-filesystem atomicity for filesystem repositories and tests.
      *
-     * @return whether the write applied, and either way the generation now actually stored.
+     * @return whether the write applied, and its new generation on success; on refusal an observed conflicting generation
+     *     or {@link BlobRegisterCasResult#UNKNOWN_GENERATION} if the backend cannot report it atomically.
      * @throws UnsupportedOperationException if this blob container does not implement register semantics.
      */
     default BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
@@ -549,10 +550,10 @@ public interface BlobContainer {
      * cluster-wide serialisation behind it. Two round trips instead of one is a factor of two on the one
      * operation expected to run at a hundred million.
      *
-     * <p>Implementations may leave the conflicting generation as
-     * {@link BlobRegister#ABSENT_GENERATION} rather than pay a read to discover it, so callers that need
-     * the current value on conflict should read it themselves. The applied case is authoritative either
-     * way.
+     * <p>Implementations may report {@link BlobRegisterCasResult#UNKNOWN_GENERATION} on conflict rather than pay
+     * a read that could describe a later state. For compatibility, a refused create may also report the legacy
+     * unknown value {@link BlobRegister#ABSENT_GENERATION}. Callers that need the current value must read it.
+     * The applied case always reports the newly stored generation.
      *
      * @return whether this caller created the register.
      * @throws UnsupportedOperationException if this blob container does not implement register semantics.
