@@ -130,6 +130,16 @@ public final class RegisterMap {
     }
 
     /**
+     * Returns authoritative PIT state, including compact released-ID tombstones.
+     *
+     * @param base the deployment's base path
+     * @return the PIT state container, excluded from active view listings
+     */
+    public static BlobPath pointInTimeStates(BlobPath base) {
+        return base.add("pit-states");
+    }
+
+    /**
      * Returns the container path holding node leases.
      *
      * @param base the deployment's base path
