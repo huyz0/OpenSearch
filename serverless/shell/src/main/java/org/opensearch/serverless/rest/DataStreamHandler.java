@@ -101,6 +101,12 @@ public final class DataStreamHandler extends BaseRestHandler {
                     ).v2()
                 );
             }
+            // Enforce the same document invariant on every write path through core's own mapper.
+            // Install this after the supplied mapping so a template cannot turn validation off.
+            merged.put(
+                org.opensearch.index.mapper.DataStreamFieldMapper.NAME,
+                Map.of("enabled", true, "timestamp_field", Map.of("name", timestampField))
+            );
             try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
                 builder.map(merged);
                 return create.withMapping(org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString());
