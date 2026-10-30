@@ -1253,15 +1253,36 @@ public final class ShardOperations {
      * @param id the document id
      * @param source the document body
      * @param refresh whether to make it visible to search before returning
-     * @return the node that performed the write
+     * @return the node that performed the write, or null when a filter supplies a cached response without executing it
      * @throws IOException if the write fails or no node can take it
      */
     public String index(String index, String id, String source, boolean refresh) throws IOException {
+        final var request = new org.opensearch.action.index.IndexRequest(index).id(id)
+            .source(source, org.opensearch.common.xcontent.XContentType.JSON)
+            .setRefreshPolicy(
+                refresh
+                    ? org.opensearch.action.support.WriteRequest.RefreshPolicy.IMMEDIATE
+                    : org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE
+            );
         return gated(
             org.opensearch.action.index.IndexAction.NAME,
-            new org.opensearch.action.index.IndexRequest(index).id(id).source(source, org.opensearch.common.xcontent.XContentType.JSON),
-            () -> write(index, id, source, refresh, false)
-        );
+            request,
+            admitted -> executeNativeIndex((org.opensearch.action.index.IndexRequest) admitted),
+            new org.opensearch.serverless.shell.ActionGate.ResponseView<NativeIndexResult>() {
+                @Override
+                public org.opensearch.core.action.ActionResponse show(NativeIndexResult result) {
+                    return result.response();
+                }
+
+                @Override
+                public NativeIndexResult read(org.opensearch.core.action.ActionResponse response, NativeIndexResult original) {
+                    return new NativeIndexResult(
+                        (org.opensearch.action.index.IndexResponse) response,
+                        original == null ? null : original.servedBy()
+                    );
+                }
+            }
+        ).servedBy();
     }
 
     /**
@@ -1276,61 +1297,64 @@ public final class ShardOperations {
             org.opensearch.action.index.IndexAction.NAME,
             request,
             org.opensearch.action.index.IndexResponse.class,
-            admitted -> {
-                final var accepted = (org.opensearch.action.index.IndexRequest) admitted;
-                final var invalid = accepted.validate();
-                if (invalid != null) {
-                    throw invalid;
-                }
-                final boolean create = accepted.opType() == org.opensearch.action.DocWriteRequest.OpType.CREATE;
-                validateNativeWrite(accepted.routing(), accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), create);
-                if (accepted.isRequireAlias()) {
-                    throw new UnsupportedOperationException("require_alias is not supported through the native Client");
-                }
-                final var descriptor = describeOnce(accepted.index()).orElseThrow(() -> new NoSuchIndexException(accepted.index()));
-                if (org.opensearch.serverless.ingest.IngestPipelines.pipelinesFor(accepted.getPipeline(), descriptor.extraSettings())
-                    .isEmpty() == false
-                    || (accepted.getFinalPipeline() != null && "_none".equals(accepted.getFinalPipeline()) == false)) {
-                    throw new UnsupportedOperationException(
-                        "ingest pipelines require the REST write API; the native Client cannot apply them"
-                    );
-                }
-                final String id = accepted.id() == null ? org.opensearch.common.UUIDs.base64UUID() : accepted.id();
-                accepted.id(id);
-                final String source = org.opensearch.common.xcontent.XContentHelper.convertToJson(
-                    accepted.source(),
-                    false,
-                    accepted.getContentType()
-                );
-                final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
-                try (
-                    var ignored = node.indexingPressure()
-                        .markCoordinatingOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(id, source), false)
-                ) {
-                    final Written written = written(
-                        accepted.index(),
-                        id,
-                        source,
-                        refresh,
-                        false,
-                        accepted.ifSeqNo(),
-                        accepted.ifPrimaryTerm(),
-                        create
-                    );
-                    final var outcome = written.outcome();
-                    final var response = new org.opensearch.action.index.IndexResponse(
-                        written.shardId,
-                        id,
-                        outcome.seqNo(),
-                        outcome.primaryTerm(),
-                        outcome.version(),
-                        outcome.created()
-                    );
-                    completeNativeWriteResponse(response, refresh);
-                    return response;
-                }
-            }
+            admitted -> executeNativeIndex((org.opensearch.action.index.IndexRequest) admitted).response()
         );
+    }
+
+    private record NativeIndexResult(org.opensearch.action.index.IndexResponse response, String servedBy) {
+    }
+
+    /** Executes an admitted native index request without running its filters a second time. */
+    private NativeIndexResult executeNativeIndex(org.opensearch.action.index.IndexRequest accepted) throws IOException {
+        final var invalid = accepted.validate();
+        if (invalid != null) {
+            throw invalid;
+        }
+        final boolean create = accepted.opType() == org.opensearch.action.DocWriteRequest.OpType.CREATE;
+        validateNativeWrite(accepted.routing(), accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), create);
+        if (accepted.isRequireAlias()) {
+            throw new UnsupportedOperationException("require_alias is not supported through the native Client");
+        }
+        final var descriptor = describeOnce(accepted.index()).orElseThrow(() -> new NoSuchIndexException(accepted.index()));
+        if (org.opensearch.serverless.ingest.IngestPipelines.pipelinesFor(accepted.getPipeline(), descriptor.extraSettings())
+            .isEmpty() == false
+            || (accepted.getFinalPipeline() != null && "_none".equals(accepted.getFinalPipeline()) == false)) {
+            throw new UnsupportedOperationException("ingest pipelines require the REST write API; the native Client cannot apply them");
+        }
+        final String id = accepted.id() == null ? org.opensearch.common.UUIDs.base64UUID() : accepted.id();
+        accepted.id(id);
+        final String source = org.opensearch.common.xcontent.XContentHelper.convertToJson(
+            accepted.source(),
+            false,
+            accepted.getContentType()
+        );
+        final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
+        try (
+            var ignored = node.indexingPressure()
+                .markCoordinatingOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(id, source), false)
+        ) {
+            final Written written = written(
+                accepted.index(),
+                id,
+                source,
+                refresh,
+                false,
+                accepted.ifSeqNo(),
+                accepted.ifPrimaryTerm(),
+                create
+            );
+            final var outcome = written.outcome();
+            final var response = new org.opensearch.action.index.IndexResponse(
+                written.shardId,
+                id,
+                outcome.seqNo(),
+                outcome.primaryTerm(),
+                outcome.version(),
+                outcome.created()
+            );
+            completeNativeWriteResponse(response, refresh);
+            return new NativeIndexResult(response, written.servedBy());
+        }
     }
 
     /**
@@ -1435,11 +1459,12 @@ public final class ShardOperations {
      * @throws IOException if the delete fails or no node can take it
      */
     public boolean delete(String index, String id, boolean refresh) throws IOException {
-        return gated(
-            org.opensearch.action.delete.DeleteAction.NAME,
-            new org.opensearch.action.delete.DeleteRequest(index, id),
-            () -> doDelete(index, id, refresh)
+        final var request = new org.opensearch.action.delete.DeleteRequest(index, id).setRefreshPolicy(
+            refresh
+                ? org.opensearch.action.support.WriteRequest.RefreshPolicy.IMMEDIATE
+                : org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE
         );
+        return delete(request).getResult() == org.opensearch.action.DocWriteResponse.Result.DELETED;
     }
 
     /** How many a delete-by-query operation visited and how many it actually removed. */
@@ -2074,10 +2099,6 @@ public final class ShardOperations {
             return doDelete(index, id, refresh);
         }
         return written(index, id, "", refresh, true, seqNo, primaryTerm).outcome().found();
-    }
-
-    private String write(String index, String id, String source, boolean refresh, boolean deletion) throws IOException {
-        return written(index, id, source, refresh, deletion, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L).servedBy();
     }
 
     /** Who served a write, and what the engine assigned it. */
