@@ -745,10 +745,17 @@ public final class MetadataPlane {
     public static final long DEFAULT_ROUTING_CACHE_MILLIS = 1_000L;
 
     /** A resolution and when it was read. */
-    private record CachedResolution(DescriptorStore.Resolution resolution, long atMillis, long readStartedNanos) {
+    private record CachedResolution(DescriptorStore.Resolution resolution, long atMillis, long readStartedNanos, long weight) {
     }
 
-    private final Map<String, CachedResolution> routingCache = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Approximate retained memory budget, including the lazily rendered routing metadata. */
+    public static final long DEFAULT_ROUTING_CACHE_MAXIMUM_WEIGHT = 64L * 1024 * 1024;
+
+    private final org.opensearch.common.cache.Cache<String, CachedResolution> routingCache = org.opensearch.common.cache.CacheBuilder.<
+        String,
+        CachedResolution>builder().setMaximumWeight(DEFAULT_ROUTING_CACHE_MAXIMUM_WEIGHT).weigher((name, value) -> value.weight()).build();
+    private final Object routingCacheMutation = new Object();
+    private long routingCacheEpoch;
     private volatile long routingCacheMillis = DEFAULT_ROUTING_CACHE_MILLIS;
 
     /**
@@ -791,13 +798,28 @@ public final class MetadataPlane {
         if (seen != null && now - seen.atMillis() <= routingCacheMillis) {
             return seen.resolution();
         }
+        final long epoch;
+        synchronized (routingCacheMutation) {
+            epoch = routingCacheEpoch;
+        }
         final long readStartedNanos = System.nanoTime();
         final DescriptorStore.Resolution fresh = descriptors.resolve(name);
-        if (fresh.absent()) {
-            routingCache.remove(name);
-        } else {
-            routingCache.put(name, new CachedResolution(fresh, now, readStartedNanos));
-            pruneRoutingCache(now);
+        synchronized (routingCacheMutation) {
+            // A read started before a local mutation must not republish the invalidated value.
+            if (epoch == routingCacheEpoch) {
+                if (fresh.absent()) {
+                    routingCache.invalidate(name);
+                } else {
+                    final long weight = routingCacheWeight(name, fresh);
+                    if (weight <= routingCache.getMaximumWeight()) {
+                        routingCache.put(name, new CachedResolution(fresh, now, readStartedNanos, weight));
+                    } else {
+                        // A one-off large mapping must not evict every useful small resolution.
+                        routingCache.invalidate(name);
+                    }
+                    pruneRoutingCache(now);
+                }
+            }
         }
         return fresh;
     }
@@ -855,13 +877,18 @@ public final class MetadataPlane {
 
     private void pruneRoutingCache(long now) {
         // At most once per window: a walk per insert would make a busy coordinator pay for its own cache.
-        if (routingCache.size() <= routingCachePruneAbove
+        if (routingCache.count() <= routingCachePruneAbove
             || (routingCachePrunedAt != Long.MIN_VALUE && now - routingCachePrunedAt < routingCacheMillis)) {
             return;
         }
         routingCachePrunedAt = now;
         final long window = routingCacheMillis;
-        routingCache.values().removeIf(seen -> now - seen.atMillis() > window);
+        for (String name : routingCache.keysSnapshot()) {
+            final CachedResolution seen = routingCache.get(name);
+            if (seen != null && now - seen.atMillis() > window) {
+                routingCache.invalidate(name, seen);
+            }
+        }
     }
 
     /**
@@ -870,7 +897,7 @@ public final class MetadataPlane {
      * @return the entry count
      */
     public int routingCacheSize() {
-        return routingCache.size();
+        return routingCache.count();
     }
 
     /**
@@ -884,7 +911,51 @@ public final class MetadataPlane {
      * @param name the index or alias name
      */
     public void forgetRouting(String name) {
-        routingCache.remove(name);
+        synchronized (routingCacheMutation) {
+            routingCacheEpoch++;
+            routingCache.invalidate(name);
+        }
+    }
+
+    /**
+     * Sets the approximate retained-memory budget for routing resolutions.
+     *
+     * @param bytes the budget; an individual resolution exceeding it is not retained
+     * @return this plane
+     */
+    public MetadataPlane setRoutingCacheMaximumWeight(long bytes) {
+        synchronized (routingCacheMutation) {
+            routingCache.setMaximumWeight(bytes);
+            routingCache.refresh();
+        }
+        return this;
+    }
+
+    private static long routingCacheWeight(String name, DescriptorStore.Resolution resolution) {
+        // Include a fixed object/entry allowance and headroom for parsed routing metadata. Counting
+        // only names would leave a handful of large mappings or aliases able to exhaust the heap.
+        long weight = 4096L + 2L * name.length();
+        final IndexDescriptor index = resolution.index();
+        if (index != null) {
+            weight += 256L * index.numberOfShards() + 2L * (index.name().length() + index.uuid().length());
+            if (index.mapping() != null) {
+                weight += 16L * index.mapping().length();
+            }
+            for (String key : index.extraSettings().keySet()) {
+                weight += 128L + 16L * (key.length() + index.extraSettings().get(key, "").length());
+            }
+            for (String alias : index.aliasedBy()) {
+                weight += 64L + 2L * alias.length();
+            }
+        }
+        final var alias = resolution.alias();
+        if (alias != null) {
+            weight += 2L * alias.name().length();
+            for (String member : alias.indices()) {
+                weight += 64L + 2L * member.length();
+            }
+        }
+        return weight;
     }
 
     /**

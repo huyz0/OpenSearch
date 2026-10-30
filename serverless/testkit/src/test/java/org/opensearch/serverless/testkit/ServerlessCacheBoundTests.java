@@ -55,6 +55,58 @@ public class ServerlessCacheBoundTests extends OpenSearchTestCase {
         assertEquals("and the name just resolved is still served", "uuid-idx-0", plane.describeForRouting("idx-0").orElseThrow().uuid());
     }
 
+    public void testFreshRoutingEntriesHaveAHardBudget() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1_000L, TTL).setRoutingCacheMaximumWeight(64L * 1024);
+            for (int i = 0; i < 100; i++) {
+                final String name = "bounded-" + i;
+                plane.createIndex(new IndexDescriptor(name, "uuid-" + i, 1, MAPPING, null));
+                assertEquals(name, plane.resolveForRouting(name).index().name());
+            }
+            assertTrue("fresh resolutions must also be bounded: " + plane.routingCacheSize(), plane.routingCacheSize() <= 16);
+            assertEquals("the most recent entry stays warm", "bounded-99", plane.resolveForRouting("bounded-99").index().name());
+        }
+    }
+
+    public void testAnOversizedMappingIsResolvedWithoutRetention() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1_000L, TTL).setRoutingCacheMaximumWeight(64L * 1024);
+            final String mapping = "{\"_meta\":{\"description\":\"" + "x".repeat(10_000) + "\"}}";
+            plane.createIndex(new IndexDescriptor("large", "uuid-large", 1, mapping, null));
+            assertEquals(mapping, plane.resolveForRouting("large").index().mapping());
+            assertEquals("an oversized resolution must not remain resident", 0, plane.routingCacheSize());
+            assertTrue(plane.readConfirmingIncarnation("large", "uuid-large").isEmpty());
+        }
+    }
+
+    public void testAnOldLookupCannotRestoreAnInvalidatedResolution() throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1_000L, TTL);
+            plane.createIndex(new IndexDescriptor("changing", "uuid-changing", 1, MAPPING, null));
+            store.onNextRegisterRead("indices", "changing", () -> plane.forgetRouting("changing"));
+            assertEquals("changing", plane.resolveForRouting("changing").index().name());
+            assertTrue("invalidate while the old read is in flight", store.fired());
+            assertEquals("the old result must not undo invalidation", 0, plane.routingCacheSize());
+            assertEquals("changing", plane.resolveForRouting("changing").index().name());
+            assertEquals("a later read can be cached", 1, plane.routingCacheSize());
+        }
+    }
+
+    public void testAnOversizedLookupDoesNotEvictWarmSmallEntries() throws Exception {
+        try (var counter = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(counter, BlobPath.cleanPath(), () -> 1_000L, TTL).setRoutingCacheMaximumWeight(64L * 1024);
+            plane.createIndex(new IndexDescriptor("small", "uuid-small", 1, MAPPING, null));
+            plane.createIndex(
+                new IndexDescriptor("large", "uuid-large", 1, "{\"_meta\":{\"description\":\"" + "x".repeat(10_000) + "\"}}", null)
+            );
+            plane.resolveForRouting("small");
+            plane.resolveForRouting("large");
+            counter.reset();
+            assertEquals("small", plane.resolveForRouting("small").index().name());
+            assertEquals(counter.breakdown(), 0L, counter.registerReads());
+        }
+    }
+
     /** Head sightings older than a lease are dropped once past the threshold; a fresh one is kept. */
     public void testHeadSightingsKeepOnlyWhatIsRecent() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
