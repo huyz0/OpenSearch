@@ -71,6 +71,49 @@ public class ServerlessActivationTests extends OpenSearchTestCase {
         return new ReconcileScheduler(loop, node.threadPool(), clock::get, TimeValue.timeValueHours(1), TimeValue.timeValueHours(1), null);
     }
 
+    public void testOpeningAWriterCannotUseARecreatedIndexHead() throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-open-original", 1, MAPPING, null));
+            plane.rollups().widen("alpha", "uuid-open-original", 1, 0, org.opensearch.serverless.store.PruningDigest.EMPTY);
+            final var rollups = store.blobContainer(
+                org.opensearch.serverless.metadata.RegisterMap.rollups(BlobPath.cleanPath())
+                    .add(org.opensearch.serverless.metadata.DigestRollups.group("alpha"))
+            );
+            final String bucket = rollups.listBlobs()
+                .keySet()
+                .stream()
+                .filter(name -> name.matches("[0-9a-f]{2}"))
+                .findFirst()
+                .orElseThrow();
+            try (var node = new ServerlessNode(nodeSettings("writer-open-incarnation"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                store.onNextRegisterSwapAfter(rollups.path().buildAsString(), bucket, () -> {
+                    try {
+                        assertTrue(plane.deleteIndex("alpha"));
+                        plane.createIndex(new IndexDescriptor("alpha", "uuid-open-replacement", 1, MAPPING, null));
+                        final var fresh = plane.heads()
+                            .acquire("alpha", 0, node.localNode().getId(), node.localNode().getEphemeralId(), "uuid-open-replacement");
+                        assertTrue(fresh.acquired());
+                        assertEquals("the new head reuses the deleted head's term", 1L, fresh.head().term());
+                    } catch (java.io.IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                });
+                expectThrows(java.io.IOException.class, () -> node.activateWriter(plane, "alpha", 0));
+                assertTrue("recreation happened after acquisition and before engine recovery", store.fired());
+                final var head = plane.heads().read("alpha", 0).orElseThrow();
+                assertEquals("uuid-open-replacement", head.indexUuid());
+                assertEquals(node.localNode().getId(), head.ownerNodeId());
+                final var opened = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                assertEquals("uuid-open-replacement", opened.getIndex().getUUID());
+                node.index(opened, "doc", "{\"msg\":\"new lifetime\"}");
+                assertTrue(node.get(opened, "doc").found());
+            }
+        }
+    }
+
     /** The first write to a shard nobody holds is acknowledged in one request: it waits for the activation it caused. */
     public void testAFirstWriteWaitsForItsShardInsteadOfBeingSentAway() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

@@ -3159,6 +3159,7 @@ public final class ServerlessNode implements Closeable {
             final var head = plane.heads().read(id.getIndexName(), id.id());
             return head.isPresent()
                 && head.get().term() == term
+                && (head.get().indexUuid() == null || id.getIndex().getUUID().equals(head.get().indexUuid()))
                 && localNode.getId().equals(head.get().ownerNodeId())
                 && (head.get().ownerEphemeralId() == null || localNode.getEphemeralId().equals(head.get().ownerEphemeralId()));
         } catch (java.io.IOException e) {
