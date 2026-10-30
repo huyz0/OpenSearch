@@ -606,8 +606,8 @@ public final class SearchFanout {
         // coordinator two windows of hits rather than a window per shard -- and the breaker is told, since
         // a reservation that kept counting the hits a trim threw away was a bound on nothing.
         final int window = Math.max(1, Math.max(0, source.from()) + Math.max(0, source.size()));
-        final java.util.Comparator<SearchHit> order = order(source);
         try {
+            final java.util.Comparator<SearchHit> order = order(source);
             for (ShardAnswer answer : answers) {
                 if (answer == null) {
                     continue;
@@ -617,6 +617,9 @@ public final class SearchFanout {
                 // and is given back when the pile is.
                 merged.reserved += answer.reserved.getAndSet(0L);
                 merged.hits.addAll(answer.hits);
+                // The fan-out and its admission tracker still retain the answer object. Transfer the
+                // payload too, so trimming the merge really releases the references being uncharged.
+                answer.hits = List.of();
                 if (merged.hits.size() > 2 * window) {
                     merged.hits.sort(order);
                     merged.hits.subList(window, merged.hits.size()).clear();
@@ -624,8 +627,14 @@ public final class SearchFanout {
                 }
                 absorbInto(merged, answer);
             }
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | Error e) {
             merged.release(serving);
+            // A failure partway through a merge must also release answers not transferred yet.
+            for (ShardAnswer answer : answers) {
+                if (answer != null) {
+                    answer.release(serving);
+                }
+            }
             throw e;
         }
         return merged;
@@ -657,6 +666,7 @@ public final class SearchFanout {
         merged.total += answer.total;
         if (answer.aggregations != null) {
             merged.aggregations.add(answer.aggregations);
+            answer.aggregations = null;
         }
         if (answer.relation == org.apache.lucene.search.TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO) {
             merged.relation = org.apache.lucene.search.TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
@@ -821,14 +831,11 @@ public final class SearchFanout {
         if (left instanceof Comparable comparable && left.getClass() == right.getClass()) {
             return comparable.compareTo(right);
         }
-        if (left instanceof Number l && right instanceof Number r) {
-            // A long from one index and a double from another are still numbers, and comparing their
-            // rendered forms put "10" before "9.5".
-            return Double.compare(l.doubleValue(), r.doubleValue());
-        }
-        // Different types for the same key means the shards disagree about the field. Ordering them by
-        // their rendered form is arbitrary but stable, which beats an exception in the middle of a merge.
-        return String.valueOf(left).compareTo(String.valueOf(right));
+        // A common representation is required for a valid merge. String ordering invents an order
+        // for incompatible fields, and coercing longs to doubles can lose integer precision.
+        throw new IllegalArgumentException(
+            "cannot merge incompatible sort values across indices; use consistent field mappings or numeric_type for numeric sorts"
+        );
     }
 
     /** An unscored hit sorts last rather than unpredictably. */
@@ -839,8 +846,8 @@ public final class SearchFanout {
     /** One shard's contribution: what it matched, and what it returned. */
     private static final class ShardAnswer {
         private final long total;
-        private final List<SearchHit> hits;
-        private final org.opensearch.search.aggregations.InternalAggregations aggregations;
+        private List<SearchHit> hits;
+        private org.opensearch.search.aggregations.InternalAggregations aggregations;
         private final org.apache.lucene.search.TotalHits.Relation relation;
         private final float maxScore;
         private final boolean timedOut;
@@ -854,6 +861,8 @@ public final class SearchFanout {
             if (held > 0) {
                 breaker(serving).addWithoutBreaking(-held);
             }
+            hits = List.of();
+            aggregations = null;
         }
 
         ShardAnswer(org.opensearch.serverless.shard.ShardQuery.Result result) {

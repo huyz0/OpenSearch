@@ -65,6 +65,44 @@ public class ServerlessSortTests extends OpenSearchTestCase {
             .build();
     }
 
+    public void testIncompatibleSortTypesAreRefusedWithoutLeakingTheBreaker() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            try (var node = new ServerlessNode(nodeSettings("sort-mixed-types"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var loop = new BackgroundReconciler(node, plane);
+                for (int i = 0; i < 4; i++) {
+                    final String name = "mixed-" + i;
+                    final String type = i % 2 == 0 ? "long" : "keyword";
+                    plane.createIndex(
+                        new IndexDescriptor(name, "uuid-" + name, 1, "{\"properties\":{\"rank\":{\"type\":\"" + type + "\"}}}", null)
+                    );
+                    loop.want(name, 0);
+                }
+                loop.tick(clock.get());
+                for (int i = 0; i < 4; i++) {
+                    assertEquals(201, send(node, "PUT", "/mixed-" + i + "/_doc/doc?refresh=true", "{\"rank\":10}").status());
+                }
+                final var breaker = node.circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST);
+                final long before = breaker.getUsed();
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    final Response refused = send(
+                        node,
+                        "POST",
+                        "/mixed-0,mixed-1,mixed-2,mixed-3/_search",
+                        "{\"size\":1,\"sort\":[{\"rank\":\"asc\"}]}"
+                    );
+                    assertEquals("incompatible values have no valid common order: " + refused.body(), 400, refused.status());
+                    assertEquals("failed merges must release every shard's reservation", before, breaker.getUsed());
+                }
+                final Response healthy = send(node, "POST", "/mixed-0/_search", "{\"sort\":[{\"rank\":\"asc\"}]}");
+                assertEquals(healthy.body(), 200, healthy.status());
+            }
+        }
+    }
+
     /** Ascending and descending on a numeric field, across three shards. */
     public void testANumericSortOrdersHitsAcrossShards() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
