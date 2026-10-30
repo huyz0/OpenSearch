@@ -1474,16 +1474,68 @@ public final class ShardOperations {
         private final long deleted;
         private final long versionConflicts;
         private final String abortedOn;
+        private final org.opensearch.index.reindex.BulkByScrollResponse response;
+        private final org.opensearch.index.engine.VersionConflictEngineException conflict;
 
         DeleteByQueryOutcome(long matched, long deleted) {
             this(matched, deleted, 0L, null);
         }
 
         DeleteByQueryOutcome(long matched, long deleted, long versionConflicts, String abortedOn) {
+            this(matched, deleted, versionConflicts, abortedOn, null, null);
+        }
+
+        private DeleteByQueryOutcome(
+            long matched,
+            long deleted,
+            long versionConflicts,
+            String abortedOn,
+            org.opensearch.index.reindex.BulkByScrollResponse response,
+            org.opensearch.index.engine.VersionConflictEngineException conflict
+        ) {
+            this.response = response;
+            this.conflict = conflict;
             this.versionConflicts = versionConflicts;
             this.abortedOn = abortedOn;
             this.matched = matched;
             this.deleted = deleted;
+        }
+
+        /** Returns the native result as the action filters left it.
+         * @return the response, including failures, timing and counters
+         */
+        public org.opensearch.index.reindex.BulkByScrollResponse response() {
+            return response;
+        }
+
+        private DeleteByQueryOutcome withResponse(String index, long nanos) {
+            final var status = new org.opensearch.index.reindex.BulkByScrollTask.Status(
+                null,
+                matched,
+                0L,
+                0L,
+                deleted,
+                matched == 0 ? 0 : 1,
+                versionConflicts,
+                0L,
+                0L,
+                0L,
+                org.opensearch.common.unit.TimeValue.ZERO,
+                Float.POSITIVE_INFINITY,
+                null,
+                org.opensearch.common.unit.TimeValue.ZERO
+            );
+            final java.util.List<org.opensearch.action.bulk.BulkItemResponse.Failure> failures = conflict == null
+                ? java.util.List.of()
+                : java.util.List.of(new org.opensearch.action.bulk.BulkItemResponse.Failure(index, abortedOn, conflict));
+            final var nativeResponse = new org.opensearch.index.reindex.BulkByScrollResponse(
+                org.opensearch.common.unit.TimeValue.timeValueNanos(nanos),
+                status,
+                failures,
+                java.util.List.of(),
+                false
+            );
+            return new DeleteByQueryOutcome(matched, deleted, versionConflicts, abortedOn, nativeResponse, conflict);
         }
 
         /**
@@ -1492,7 +1544,7 @@ public final class ShardOperations {
          * @return the count
          */
         public long matched() {
-            return matched;
+            return response == null ? matched : response.getTotal();
         }
 
         /**
@@ -1501,7 +1553,7 @@ public final class ShardOperations {
          * @return the count
          */
         public long versionConflicts() {
-            return versionConflicts;
+            return response == null ? versionConflicts : response.getVersionConflicts();
         }
 
         /**
@@ -1510,7 +1562,15 @@ public final class ShardOperations {
          * @return the id, or null
          */
         public String abortedOn() {
-            return abortedOn;
+            if (response == null) {
+                return abortedOn;
+            }
+            for (var failure : response.getBulkFailures()) {
+                if (failure.getStatus() == org.opensearch.core.rest.RestStatus.CONFLICT) {
+                    return failure.getId();
+                }
+            }
+            return null;
         }
 
         /**
@@ -1523,7 +1583,7 @@ public final class ShardOperations {
          * @return the count
          */
         public long deleted() {
-            return deleted;
+            return response == null ? deleted : response.getDeleted();
         }
     }
 
@@ -1551,9 +1611,8 @@ public final class ShardOperations {
      * gives without needing to be meaningful across shards at all.
      *
      * <p><b>Deletes go to live state, not the frozen view.</b> Matching is frozen; deleting is not — each
-     * matched id is removed through the ordinary write path. A document rewritten between the query
-     * freezing and its delete reaching the shard is still deleted: there is no version check to make that a
-     * conflict, the same as everywhere else on this surface.
+     * matched id is removed through the ordinary write path, conditional on the sequence identity the
+     * frozen view saw. A document rewritten since that view is a version conflict and is left alone.
      *
      * <p><b>Gated once, under {@code indices:data/write/delete/byquery}</b>, not once per document under
      * {@code indices:data/write/delete} — the same reasoning {@code BulkHandler} gives for gating a whole
@@ -1631,7 +1690,8 @@ public final class ShardOperations {
                     "delete-by-query search options, slicing, throttling and stored tasks are not supported"
                 );
             }
-            return doDeleteByQuery(
+            final long started = System.nanoTime();
+            final var result = doDeleteByQuery(
                 accepted.indices()[0],
                 acceptedQuery,
                 accepted.getMaxDocs() == org.opensearch.index.reindex.AbstractBulkByScrollRequest.MAX_DOCS_ALL_MATCHES
@@ -1640,7 +1700,36 @@ public final class ShardOperations {
                 accepted.isRefresh(),
                 accepted.isAbortOnVersionConflict()
             );
-        }, org.opensearch.serverless.shell.ActionGate.opaque());
+            return result.withResponse(accepted.indices()[0], System.nanoTime() - started);
+        }, new org.opensearch.serverless.shell.ActionGate.ResponseView<DeleteByQueryOutcome>() {
+            @Override
+            public org.opensearch.core.action.ActionResponse show(DeleteByQueryOutcome result) {
+                return result.response();
+            }
+
+            @Override
+            public DeleteByQueryOutcome read(org.opensearch.core.action.ActionResponse response, DeleteByQueryOutcome original) {
+                final var answered = (org.opensearch.index.reindex.BulkByScrollResponse) response;
+                if (original != null && answered == original.response()) {
+                    return original;
+                }
+                final String abortedOn = answered.getBulkFailures()
+                    .stream()
+                    .filter(failure -> failure.getStatus() == org.opensearch.core.rest.RestStatus.CONFLICT)
+                    .map(org.opensearch.action.bulk.BulkItemResponse.Failure::getId)
+                    .filter(java.util.Objects::nonNull)
+                    .findFirst()
+                    .orElse(null);
+                return new DeleteByQueryOutcome(
+                    answered.getTotal(),
+                    answered.getDeleted(),
+                    answered.getVersionConflicts(),
+                    abortedOn,
+                    answered,
+                    null
+                );
+            }
+        });
     }
 
     private DeleteByQueryOutcome doDeleteByQuery(
@@ -1733,7 +1822,7 @@ public final class ShardOperations {
                                 // and counted, rather than deleted regardless.
                                 conflicts++;
                                 if (abortOnConflict) {
-                                    return new DeleteByQueryOutcome(visited, deleted, conflicts, hit.getId());
+                                    return new DeleteByQueryOutcome(visited, deleted, conflicts, hit.getId(), null, e);
                                 }
                             }
                         }

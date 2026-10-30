@@ -33,8 +33,8 @@ import java.util.function.Supplier;
  * frozen and deleting is not, and why it walks one shard at a time by {@code _doc} order rather than
  * through the cross-shard {@code search_after} merge {@code _search} uses.
  *
- * <p><b>Only {@code query}, and it is required.</b> No {@code script} — no engine is registered, the same
- * as everywhere else. No {@code sort}, {@code size} or {@code aggs} — this endpoint chooses how it walks
+ * <p><b>Only {@code query}, and it is required.</b> No {@code script}: this endpoint deletes matches
+ * rather than running update scripts. No {@code sort}, {@code size} or {@code aggs} — it chooses how it walks
  * a shard and does not offer a caller a window into that. No implicit {@code match_all}: a caller who
  * means to delete everything says so, explicitly, with {@code {"query":{"match_all":{}}}}.
  */
@@ -223,14 +223,13 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         boolean refresh,
         boolean abortOnConflict
     ) {
-        final long startNanos = System.nanoTime();
         serving.threadPool().executor(ThreadPool.Names.WRITE).execute(() -> {
             try {
                 final var operations = new ShardOperations(serving, metadata, true);
                 final var outcome = operations.deleteByQuery(index, query, maxDocs, refresh, abortOnConflict);
-                respond(channel, index, outcome, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+                respond(channel, outcome);
             } catch (ShardOperations.NoSuchIndexException e) {
-                sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
+                sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + e.index());
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -298,56 +297,32 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         }
     }
 
-    /**
-     * Writes the answer in core's {@code BulkByScrollResponse} shape.
-     *
-     * <p>Every field a classic response carries, with the value this implementation actually has for it:
-     * the operation runs inline, in one pass, unthrottled, and a document changed under it is deleted
-     * rather than counted as a conflict, so the counters that describe throttling and retries are the
-     * zeros they truly are rather than absent. {@code matched} is this shell's older name for
-     * {@code total} and stays for the callers that read it.
-     */
-    private void respond(
-        org.opensearch.rest.RestChannel channel,
-        String index,
-        ShardOperations.DeleteByQueryOutcome outcome,
-        long tookMillis
-    ) throws IOException {
-        final long matched = outcome.matched();
+    /** Renders the result after the response filters, preserving the legacy matched counter. */
+    private void respond(org.opensearch.rest.RestChannel channel, ShardOperations.DeleteByQueryOutcome outcome) throws IOException {
+        final var response = outcome.response();
+        RestStatus status = response.isTimedOut() ? RestStatus.REQUEST_TIMEOUT : RestStatus.OK;
+        for (var failure : response.getBulkFailures()) {
+            if (failure.getStatus().getStatus() > status.getStatus()) {
+                status = failure.getStatus();
+            }
+        }
+        for (var failure : response.getSearchFailures()) {
+            if (failure.getStatus().getStatus() > status.getStatus()) {
+                status = failure.getStatus();
+            }
+        }
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
-            builder.field("took", tookMillis);
-            builder.field("timed_out", false);
-            builder.field("total", matched);
-            builder.field("matched", matched);
-            builder.field("deleted", outcome.deleted());
-            builder.field("batches", matched == 0 ? 0 : 1);
-            builder.field("version_conflicts", outcome.versionConflicts());
-            builder.field("noops", 0);
-            builder.startObject("retries");
-            builder.field("bulk", 0);
-            builder.field("search", 0);
+            response.toXContent(
+                builder,
+                new org.opensearch.core.xcontent.ToXContent.DelegatingMapParams(
+                    java.util.Map.of("include_created", "false", "include_updated", "false"),
+                    channel.request()
+                )
+            );
+            builder.field("matched", response.getTotal());
             builder.endObject();
-            builder.field("throttled_millis", 0);
-            builder.field("requests_per_second", -1.0f);
-            builder.field("throttled_until_millis", 0);
-            builder.startArray("failures");
-            if (outcome.abortedOn() != null) {
-                // Core's shape for the conflict that stopped the operation under conflicts=abort.
-                builder.startObject();
-                builder.field("index", index);
-                builder.field("id", outcome.abortedOn());
-                builder.startObject("cause");
-                builder.field("type", "version_conflict_engine_exception");
-                builder.field("reason", "[" + outcome.abortedOn() + "]: version conflict, the document changed after the query was taken");
-                builder.field("index", index);
-                builder.endObject();
-                builder.field("status", RestStatus.CONFLICT.getStatus());
-                builder.endObject();
-            }
-            builder.endArray();
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(outcome.abortedOn() == null ? RestStatus.OK : RestStatus.CONFLICT, builder));
+            channel.sendResponse(new BytesRestResponse(status, builder));
         }
     }
 }
