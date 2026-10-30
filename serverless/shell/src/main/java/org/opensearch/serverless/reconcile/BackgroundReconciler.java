@@ -1163,12 +1163,20 @@ public final class BackgroundReconciler implements Closeable {
 
     /** The body of {@link #letGo} for a writer, run while the shard's fence is held. */
     private boolean letGoFenced(ShardId shardId, String reason) throws Exception {
-        final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
-        if (head.isEmpty() || node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
-            // Not ours any more; renewLeases will deal with it and this must not race it.
+        final var shard = node.reconciler().shard(shardId);
+        if (shard == null || node.reconciler().isReader(shardId)) {
             return false;
         }
-        final var shard = node.reconciler().shard(shardId);
+        final long ownedTerm = shard.getOperationPrimaryTerm();
+        final var head = plane.heads().read(shardId.getIndexName(), shardId.id());
+        if (head.isEmpty()
+            || node.localNode().getId().equals(head.get().ownerNodeId()) == false
+            || head.get().term() != ownedTerm
+            || (head.get().ownerEphemeralId() != null && node.localNode().getEphemeralId().equals(head.get().ownerEphemeralId()) == false)
+            || (head.get().indexUuid() != null && shardId.getIndex().getUUID().equals(head.get().indexUuid()) == false)) {
+            // A stable node ID may now belong to a different process or index lifetime.
+            return false;
+        }
         final long maxSeqNo = shard == null ? -1L : shard.seqNoStats().getMaxSeqNo();
         // Publish only when there is something the last publish did not cover. An unconditional publish
         // here forced a fresh commit, uploaded a new segments_N and swapped the manifest on a shard
@@ -1186,7 +1194,15 @@ public final class BackgroundReconciler implements Closeable {
                 node.publishShard(shardId, head.get().term());
             }
         }
-        if (plane.heads().release(shardId.getIndexName(), shardId.id(), node.localNode().getId()) == false) {
+        if (plane.heads()
+            .release(
+                shardId.getIndexName(),
+                shardId.id(),
+                node.localNode().getId(),
+                ownedTerm,
+                shardId.getIndex().getUUID(),
+                node.localNode().getEphemeralId()
+            ) == false) {
             // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
             // closing it while the head still points here is the one outcome to avoid.
             logger.warn("could not release the head for {}; keeping it open", shardId);

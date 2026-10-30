@@ -2987,7 +2987,15 @@ public final class ServerlessNode implements Closeable {
             // head back, so the next node to ask -- possibly this one -- acquires cleanly.
             writerAssignments.remove(shardKey(indexName, shardNumber));
             try {
-                plane.heads().release(indexName, shardNumber, localNode.getId(), assignment.term());
+                plane.heads()
+                    .release(
+                        indexName,
+                        shardNumber,
+                        localNode.getId(),
+                        assignment.term(),
+                        described.get().uuid(),
+                        localNode.getEphemeralId()
+                    );
                 plane.forgetAssignment(localNode.getId(), indexName, shardNumber);
             } catch (Exception giveBack) {
                 e.addSuppressed(giveBack);
@@ -3100,7 +3108,15 @@ public final class ServerlessNode implements Closeable {
             headsToGiveBack.entrySet()
         )) {
             try {
-                plane.heads().release(lost.getKey().getIndexName(), lost.getKey().id(), localNode.getId(), lost.getValue());
+                plane.heads()
+                    .release(
+                        lost.getKey().getIndexName(),
+                        lost.getKey().id(),
+                        localNode.getId(),
+                        lost.getValue(),
+                        lost.getKey().getIndex().getUUID(),
+                        localNode.getEphemeralId()
+                    );
                 headsToGiveBack.remove(lost.getKey(), lost.getValue());
             } catch (java.io.IOException e) {
                 logger.warn("could not give back the head of " + lost.getKey() + "; will retry on the next renewal", e);
