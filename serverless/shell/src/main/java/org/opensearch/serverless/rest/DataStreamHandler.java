@@ -141,69 +141,171 @@ public final class DataStreamHandler extends BaseRestHandler {
         }
         final RestRequest.Method method = request.method();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
-            try {
-                switch (method) {
-                    case PUT -> IndexAdminHandler.gate(
-                        serving,
+            switch (method) {
+                case PUT -> serving.actionGate()
+                    .runAsync(
                         org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.NAME,
                         new org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.Request(name),
-                        () -> {
-                            create(channel, serving, metadata, name);
-                            return null;
-                        }
+                        (admitted, listener) -> onWorker(serving, listener, () -> {
+                            final var selected = (org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.Request) admitted;
+                            final var invalid = selected.validate();
+                            if (invalid != null) {
+                                throw invalid;
+                            }
+                            listener.onResponse(create(serving, metadata, selected.indices()[0]));
+                        }),
+                        org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
+                        ),
+                        answer(channel)
                     );
-                    case GET -> IndexAdminHandler.gate(
-                        serving,
+                case GET -> serving.actionGate()
+                    .runAsync(
                         org.opensearch.action.admin.indices.datastream.GetDataStreamAction.NAME,
-                        new org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Request(new String[] { name }),
-                        () -> {
-                            describe(channel, serving, metadata, name);
-                            return null;
-                        }
+                        new org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Request(
+                            org.opensearch.core.common.Strings.splitStringByCommaToArray(name)
+                        ),
+                        (admitted, listener) -> onWorker(serving, listener, () -> {
+                            final var selected = (org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Request) admitted;
+                            final var invalid = selected.validate();
+                            if (invalid != null) {
+                                throw invalid;
+                            }
+                            listener.onResponse(describe(serving, metadata, selected.indices()));
+                        }),
+                        org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response.class
+                        ),
+                        answer(channel)
                     );
-                    case DELETE -> IndexAdminHandler.gate(
-                        serving,
+                case DELETE -> serving.actionGate()
+                    .runAsync(
                         org.opensearch.action.admin.indices.datastream.DeleteDataStreamAction.NAME,
-                        new org.opensearch.action.admin.indices.datastream.DeleteDataStreamAction.Request(new String[] { name }),
-                        () -> {
-                            delete(channel, metadata, name);
-                            return null;
-                        }
+                        new org.opensearch.action.admin.indices.datastream.DeleteDataStreamAction.Request(
+                            org.opensearch.core.common.Strings.splitStringByCommaToArray(name)
+                        ),
+                        (admitted, listener) -> onWorker(serving, listener, () -> {
+                            final var selected = (org.opensearch.action.admin.indices.datastream.DeleteDataStreamAction.Request) admitted;
+                            final var invalid = selected.validate();
+                            if (invalid != null) {
+                                throw invalid;
+                            }
+                            if (selected.indices().length != 1
+                                || selected.indices()[0] == null
+                                || selected.indices()[0].contains(",")
+                                || selected.indices()[0].contains("*")
+                                || selected.indices()[0].contains("?")) {
+                                throw new IndexAdminHandler.RefusedException(
+                                    RestStatus.NOT_IMPLEMENTED,
+                                    "unsupported_data_stream_delete",
+                                    "deleting multiple data streams or patterns is not supported; name one concrete data stream"
+                                );
+                            }
+                            delete(metadata, selected.indices()[0]);
+                            // Complete the native operation after settling, so response filters still precede HTTP.
+                            IndexAdminHandler.afterDeleteSettles(
+                                serving,
+                                () -> listener.onResponse(new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true))
+                            );
+                        }),
+                        org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
+                        ),
+                        answer(channel)
                     );
-                    default -> sendQuietly(channel, RestStatus.METHOD_NOT_ALLOWED, "method_not_allowed", method + " is not supported here");
-                }
-            } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
-                sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
-            } catch (Exception e) {
-                try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
-                } catch (IOException nested) {
-                    logger.error("failed to report a data-stream failure", nested);
-                }
+                default -> sendQuietly(channel, RestStatus.METHOD_NOT_ALLOWED, "method_not_allowed", method + " is not supported here");
             }
         });
     }
 
-    private void create(org.opensearch.rest.RestChannel channel, ServerlessNode serving, MetadataPlane metadata, String name)
-        throws IOException {
+    private static void onWorker(
+        ServerlessNode serving,
+        org.opensearch.core.action.ActionListener<?> listener,
+        org.opensearch.common.CheckedRunnable<Exception> work
+    ) {
+        final Runnable run = () -> {
+            try {
+                work.run();
+            } catch (Exception e) {
+                listener.onFailure(e);
+            }
+        };
+        if (org.opensearch.transport.Transports.isTransportThread(Thread.currentThread())) {
+            serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(run);
+        } else {
+            run.run();
+        }
+    }
+
+    private <
+        Response extends org.opensearch.core.action.ActionResponse & org.opensearch.core.xcontent.ToXContent>
+        org.opensearch.core.action.ActionListener<Response>
+        answer(org.opensearch.rest.RestChannel channel) {
+        return org.opensearch.core.action.ActionListener.wrap(response -> {
+            try (var builder = channel.newBuilder()) {
+                response.toXContent(builder, channel.request());
+                channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            }
+        }, failure -> {
+            try {
+                if (failure instanceof IndexAdminHandler.RefusedException refused) {
+                    sendQuietly(channel, refused.status, refused.type, refused.getMessage());
+                } else if (failure instanceof DescriptorStore.TooManyMatchesException matches) {
+                    sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", matches.getMessage());
+                } else {
+                    channel.sendResponse(IndexAdminHandler.failure(channel, failure));
+                }
+            } catch (IOException nested) {
+                logger.error("failed to report a data-stream failure", nested);
+            }
+        });
+    }
+
+    private static void validateName(String name) throws IndexAdminHandler.RefusedException {
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("a data stream name is required");
+        }
+        if (name.startsWith("_") || name.startsWith(".")) {
+            throw new IndexAdminHandler.RefusedException(
+                name.startsWith("_") ? RestStatus.NOT_IMPLEMENTED : RestStatus.BAD_REQUEST,
+                name.startsWith("_") ? "not_implemented" : "illegal_argument_exception",
+                "'" + name + "' is not a data stream name"
+            );
+        }
+        org.opensearch.cluster.metadata.MetadataCreateIndexService.validateIndexOrAliasName(
+            name,
+            (invalid, reason) -> new IllegalArgumentException("data_stream [" + invalid + "] " + reason)
+        );
+        if (name.toLowerCase(Locale.ROOT).equals(name) == false) {
+            throw new IllegalArgumentException("data_stream [" + name + "] must be lowercase");
+        }
+    }
+
+    private org.opensearch.action.support.clustermanager.AcknowledgedResponse create(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        String name
+    ) throws Exception {
+        validateName(name);
         final String backing = backingIndexName(name, 1);
         for (String minted : new String[] { name, backing }) {
             if (serving.isSystemIndex(minted)) {
                 // A name a plugin declared as its own is reserved on every path that creates a name, not
                 // only on PUT /{index}: a stream created under it would resolve the plugin's own writes to a
                 // backing index nothing guards.
-                sendQuietly(
-                    channel,
+                throw new IndexAdminHandler.RefusedException(
                     RestStatus.FORBIDDEN,
                     "system_index",
                     "[" + minted + "] belongs to a plugin and cannot be created here"
                 );
-                return;
             }
         }
         if (metadata.resolve(name).absent() == false) {
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "[" + name + "] already exists");
-            return;
+            throw new IndexAdminHandler.RefusedException(
+                RestStatus.BAD_REQUEST,
+                "resource_already_exists_exception",
+                "[" + name + "] already exists"
+            );
         }
         final TemplateResolver.Inherited inherited = TemplateResolver.resolveFromStores(
             metadata.indexTemplates(),
@@ -212,13 +314,11 @@ public final class DataStreamHandler extends BaseRestHandler {
         );
         if (inherited.isDataStream() == false) {
             // Core's own requirement, in core's words.
-            sendQuietly(
-                channel,
+            throw new IndexAdminHandler.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "illegal_argument_exception",
                 "no matching index template found for data stream [" + name + "]"
             );
-            return;
         }
         // The hint before the truth, as every alias creation does: the backing index lists the stream
         // before the stream's record exists, and a reader verifies the hint against the record.
@@ -237,11 +337,13 @@ public final class DataStreamHandler extends BaseRestHandler {
                 inherited
             );
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "index [" + backing + "] already exists");
-            return;
+            throw new IndexAdminHandler.RefusedException(
+                RestStatus.BAD_REQUEST,
+                "resource_already_exists_exception",
+                "index [" + backing + "] already exists"
+            );
         } catch (IndexAdminHandler.RefusedException e) {
-            sendQuietly(channel, e.status, e.type, e.getMessage());
-            return;
+            throw new IndexAdminHandler.RefusedException(e.status, e.type, e.getMessage());
         }
         try {
             metadata.createAlias(new AliasRecord(name, List.of(backing), true, 1L, inherited.timestampField()));
@@ -253,94 +355,108 @@ public final class DataStreamHandler extends BaseRestHandler {
             } catch (Exception cleanup) {
                 logger.warn("could not remove the backing index [" + backing + "] of a data stream that was not created", cleanup);
             }
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "resource_already_exists_exception", "[" + name + "] already exists");
-            return;
+            throw new IndexAdminHandler.RefusedException(
+                RestStatus.BAD_REQUEST,
+                "resource_already_exists_exception",
+                "[" + name + "] already exists"
+            );
         }
-        acknowledge(channel);
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
-    private void describe(org.opensearch.rest.RestChannel channel, ServerlessNode serving, MetadataPlane metadata, String names)
-        throws IOException {
-        final List<String> wanted = IndexPatterns.expand(metadata, names, serving.patternCap());
-        final List<AliasRecord> streams = new java.util.ArrayList<>();
-        for (String each : wanted) {
-            final DescriptorStore.Resolution resolved = metadata.resolve(each);
-            if (resolved.alias() != null && resolved.alias().dataStream()) {
-                streams.add(resolved.alias());
-            } else if (IndexPatterns.isPrefixPattern(names) == false) {
-                sendQuietly(channel, RestStatus.NOT_FOUND, "resource_not_found_exception", "data stream [" + each + "] does not exist");
-                return;
+    private org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response describe(
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        String[] names
+    ) throws Exception {
+        final String[] selectors = names == null || names.length == 0 ? new String[] { "*" } : names;
+        final Map<String, AliasRecord> streams = new LinkedHashMap<>();
+        for (String expression : selectors) {
+            if (expression == null || expression.isBlank()) {
+                throw new IllegalArgumentException("a data stream selector must not be empty");
+            }
+            for (String token : expression.split(",")) {
+                final String selector = token.trim();
+                if (selector.isEmpty()) {
+                    continue;
+                }
+                final String wanted = "_all".equals(selector) ? "*" : selector;
+                final boolean pattern = IndexPatterns.isPrefixPattern(wanted);
+                if (pattern == false) {
+                    validateName(wanted);
+                }
+                for (String each : IndexPatterns.expand(metadata, wanted, serving.patternCap())) {
+                    final var resolved = metadata.resolve(each);
+                    if (resolved.alias() != null && resolved.alias().dataStream()) {
+                        streams.putIfAbsent(each, resolved.alias());
+                    } else if (pattern == false) {
+                        throw new IndexAdminHandler.RefusedException(
+                            RestStatus.NOT_FOUND,
+                            "resource_not_found_exception",
+                            "data stream [" + each + "] does not exist"
+                        );
+                    }
+                }
             }
         }
         final Map<String, String> templateNames = TemplateResolver.matchingTemplateNames(
             metadata.indexTemplates(),
-            streams.stream().map(AliasRecord::name).toList()
+            streams.keySet().stream().toList()
         );
-        // Core's GetDataStreamAction shape.
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.startArray("data_streams");
-            for (AliasRecord stream : streams) {
-                builder.startObject();
-                builder.field("name", stream.name());
-                builder.startObject("timestamp_field").field("name", stream.timestampField()).endObject();
-                builder.startArray("indices");
-                for (String backing : stream.indices()) {
-                    final Optional<IndexDescriptor> descriptor = metadata.describe(backing);
-                    builder.startObject();
-                    builder.field("index_name", backing);
-                    builder.field("index_uuid", descriptor.map(IndexDescriptor::uuid).orElse("_na_"));
-                    builder.endObject();
-                }
-                builder.endArray();
-                builder.field("generation", stream.generation());
-                builder.field("status", "GREEN");
-                final String template = templateNames.get(stream.name());
-                if (template != null) {
-                    builder.field("template", template);
-                }
-                builder.endObject();
+        final var result = new java.util.ArrayList<
+            org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response.DataStreamInfo>();
+        for (AliasRecord stream : streams.values()) {
+            final var indices = new java.util.ArrayList<org.opensearch.core.index.Index>();
+            for (String backing : stream.indices()) {
+                indices.add(
+                    new org.opensearch.core.index.Index(backing, metadata.describe(backing).map(IndexDescriptor::uuid).orElse("_na_"))
+                );
             }
-            builder.endArray();
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+            if (indices.isEmpty()) {
+                throw new IOException("data stream [" + stream.name() + "] has no backing indices");
+            }
+            final var nativeStream = new org.opensearch.cluster.metadata.DataStream(
+                stream.name(),
+                new org.opensearch.cluster.metadata.DataStream.TimestampField(stream.timestampField()),
+                indices,
+                stream.generation()
+            );
+            result.add(
+                new org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response.DataStreamInfo(
+                    nativeStream,
+                    org.opensearch.cluster.health.ClusterHealthStatus.GREEN,
+                    templateNames.get(stream.name())
+                )
+            );
         }
+        return new org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response(result);
     }
 
-    private void delete(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name) throws IOException {
+    private void delete(MetadataPlane metadata, String name) throws Exception {
+        validateName(name);
         final Optional<MetadataPlane.AliasAtGeneration> found = metadata.aliasWithGeneration(name);
         if (found.isEmpty() || found.get().alias().dataStream() == false) {
-            sendQuietly(channel, RestStatus.NOT_FOUND, "resource_not_found_exception", "data stream [" + name + "] does not exist");
-            return;
+            throw new IndexAdminHandler.RefusedException(
+                RestStatus.NOT_FOUND,
+                "resource_not_found_exception",
+                "data stream [" + name + "] does not exist"
+            );
         }
         // The name first, so a write arriving during the deletion has nowhere to land, then the indices --
         // and only the indices the record this deleted actually named. A rollover landing between the read
         // and the delete used to leave a live record over deleted backing indices, with a 200 to the caller.
         final AliasRecord record = found.get().alias();
         if (metadata.deleteAlias(record, found.get().generation()) == false) {
-            sendQuietly(
-                channel,
+            throw new IndexAdminHandler.RefusedException(
                 RestStatus.CONFLICT,
                 "version_conflict_engine_exception",
                 "data stream [" + name + "] was changed concurrently; nothing was deleted, retry"
             );
-            return;
         }
         for (String backing : record.indices()) {
             metadata.deleteIndex(backing);
         }
-        // Answered once no node can still be acknowledging into a backing index it deleted; see
-        // IndexAdminHandler#afterDeleteSettles.
-        IndexAdminHandler.afterDeleteSettles(node.get(), () -> acknowledge(channel));
-    }
 
-    private static void acknowledge(org.opensearch.rest.RestChannel channel) throws IOException {
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("acknowledged", true);
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
     }
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
