@@ -712,12 +712,14 @@ public final class ShardReconciler {
                 }
                 open.put(shardId, shard);
                 return shard;
-            } catch (Exception e) {
-                abandon(indexService, shardId, e);
-                throw e;
             } finally {
                 replayedRecords.remove(shardId);
             }
+        } catch (Exception e) {
+            // Service creation can succeed before mapping, manifest lookup or shard creation fails.
+            // Look it up here because indexServiceFor itself can throw after installing the service.
+            abandon(indicesService.indexService(shardId.getIndex()), shardId, e);
+            throw e;
         } finally {
             opening.remove(shardId);
         }
@@ -767,7 +769,7 @@ public final class ShardReconciler {
     /** Takes a shard that never became ours back out of its IndexService, keeping the cause's own report. */
     private void abandon(IndexService indexService, ShardId shardId, Exception cause) {
         try {
-            if (indexService.hasShard(shardId.id())) {
+            if (indexService != null && indexService.hasShard(shardId.id())) {
                 indexService.removeShard(shardId.id(), "activation failed: " + cause.getMessage());
             }
         } catch (Exception e) {
