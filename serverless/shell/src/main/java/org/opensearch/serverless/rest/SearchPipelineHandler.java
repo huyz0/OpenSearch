@@ -63,96 +63,117 @@ public final class SearchPipelineHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final String id = request.param("id");
-        final String body = request.hasContent() ? request.content().utf8ToString() : null;
         final RestRequest.Method method = request.method();
-        request.param("cluster_manager_timeout");
         request.param("master_timeout");
+        request.param("cluster_manager_timeout");
         request.param("timeout");
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        if (id != null && id.startsWith("_")) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "not_implemented",
-                    "'" + id + "' is not a pipeline id: names beginning with an underscore are reserved for APIs"
-                )
+        // Keep the accounted HTTP bytes until the operation completes. Decode only the admitted body,
+        // off the HTTP worker, rather than retaining a decoded copy while authorization is pending.
+        final org.opensearch.core.common.bytes.BytesReference source = request.hasContent()
+            ? request.content()
+            : org.opensearch.core.common.bytes.BytesArray.EMPTY;
+        final org.opensearch.core.xcontent.MediaType mediaType = request.getMediaType() == null
+            ? org.opensearch.common.xcontent.XContentType.JSON
+            : request.getMediaType();
+        final org.opensearch.action.ActionRequest ask;
+        final String action;
+        if (method == RestRequest.Method.PUT) {
+            ask = new org.opensearch.action.search.PutSearchPipelineRequest(id, source, mediaType);
+            action = org.opensearch.action.search.PutSearchPipelineAction.NAME;
+        } else if (method == RestRequest.Method.DELETE) {
+            ask = new org.opensearch.action.search.DeleteSearchPipelineRequest(id);
+            action = org.opensearch.action.search.DeleteSearchPipelineAction.NAME;
+        } else {
+            ask = new org.opensearch.action.search.GetSearchPipelineRequest(
+                org.opensearch.core.common.Strings.splitStringByCommaToArray(id)
             );
-        }
-        if (method == RestRequest.Method.PUT && (body == null || body.isBlank())) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a pipeline body is required")
-            );
+            action = org.opensearch.action.search.GetSearchPipelineAction.NAME;
         }
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 final TemplateStore store = metadata.searchPipelines();
-                final String action = switch (method) {
-                    case PUT -> org.opensearch.action.search.PutSearchPipelineAction.NAME;
-                    case DELETE -> org.opensearch.action.search.DeleteSearchPipelineAction.NAME;
-                    default -> org.opensearch.action.search.GetSearchPipelineAction.NAME;
-                };
-                IndexAdminHandler.gate(
-                    serving,
-                    action,
-                    new org.opensearch.action.search.GetSearchPipelineRequest(id == null ? new String[0] : new String[] { id }),
-                    () -> {
-                        switch (method) {
-                            case PUT -> put(channel, serving, store, id, body);
-                            case GET -> get(channel, store, id);
-                            case DELETE -> delete(channel, store, id);
-                            default -> channel.sendResponse(
-                                IndexAdminHandler.error(
-                                    channel,
-                                    RestStatus.METHOD_NOT_ALLOWED,
-                                    "method_not_allowed",
-                                    method + " is not supported here"
-                                )
-                            );
-                        }
-                        return null;
+                if (method == RestRequest.Method.PUT) {
+                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                        final var selected = require(admitted, org.opensearch.action.search.PutSearchPipelineRequest.class);
+                        concreteId(selected.getId());
+                        return put(serving, store, selected.getId(), jsonSource(selected.getSource(), selected.getMediaType()));
+                    },
+                        org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
+                        )
+                    );
+                    try (XContentBuilder builder = channel.newBuilder()) {
+                        response.toXContent(builder, request);
+                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                     }
-                );
+                } else if (method == RestRequest.Method.DELETE) {
+                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                        final var selected = require(admitted, org.opensearch.action.search.DeleteSearchPipelineRequest.class);
+                        concreteId(selected.getId());
+                        return delete(store, selected.getId());
+                    },
+                        org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
+                        )
+                    );
+                    try (XContentBuilder builder = channel.newBuilder()) {
+                        response.toXContent(builder, request);
+                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                    }
+                } else {
+                    buffered(channel, serving, action, ask, (admitted, output) -> {
+                        final var selected = require(admitted, org.opensearch.action.search.GetSearchPipelineRequest.class);
+                        final String[] ids = selected.getIds();
+                        if (ids == null || ids.length == 0 || (ids.length == 1 && ("*".equals(ids[0]) || "_all".equals(ids[0])))) {
+                            get(output, store, null);
+                        } else if (ids.length == 1) {
+                            concreteId(ids[0]);
+                            get(output, store, ids[0]);
+                        } else {
+                            throw unsupported("pipeline reads currently require one concrete ID or all pipelines");
+                        }
+                    });
+                }
+            } catch (IndexAdminHandler.RefusedException e) {
+                sendQuietly(channel, e.status, e.type, e.getMessage());
             } catch (TemplateStore.TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_pipelines", e.getMessage());
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a search-pipeline failure", nested);
+                    logger.error("failed to report a pipeline failure", nested);
                 }
             }
         });
     }
 
-    private void put(org.opensearch.rest.RestChannel channel, ServerlessNode serving, TemplateStore store, String id, String body)
-        throws IOException {
+    private org.opensearch.action.support.clustermanager.AcknowledgedResponse put(
+        ServerlessNode serving,
+        TemplateStore store,
+        String id,
+        String body
+    ) throws IOException, IndexAdminHandler.RefusedException {
         try {
             serving.searchPipelines().validate(id, body);
         } catch (Exception e) {
-            sendQuietly(
-                channel,
+            throw new IndexAdminHandler.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "invalid_pipeline",
                 (e.getMessage() == null ? e.toString() : e.getMessage())
                     + ". Available processors: "
                     + String.join(", ", serving.searchPipelines().available())
             );
-            return;
         }
         store.put(id, body);
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("acknowledged", true);
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
     private void get(org.opensearch.rest.RestChannel channel, TemplateStore store, String id) throws IOException {
@@ -181,17 +202,75 @@ public final class SearchPipelineHandler extends BaseRestHandler {
         }
     }
 
-    private void delete(org.opensearch.rest.RestChannel channel, TemplateStore store, String id) throws IOException {
+    private org.opensearch.action.support.clustermanager.AcknowledgedResponse delete(TemplateStore store, String id) throws IOException,
+        IndexAdminHandler.RefusedException {
         if (store.delete(id) == false) {
-            sendQuietly(channel, RestStatus.NOT_FOUND, "pipeline_missing", "no such search pipeline: " + id);
-            return;
+            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_FOUND, "pipeline_missing", "no such pipeline: " + id);
         }
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.field("acknowledged", true);
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
+    }
+
+    private static org.opensearch.OpenSearchStatusException unsupported(String reason) {
+        return new org.opensearch.OpenSearchStatusException(reason, RestStatus.NOT_IMPLEMENTED);
+    }
+
+    private static <T> T require(org.opensearch.action.ActionRequest request, Class<T> type) {
+        if (type.isInstance(request) == false) {
+            throw unsupported("pipeline action requires " + type.getSimpleName());
         }
+        return type.cast(request);
+    }
+
+    private static void concreteId(String id) {
+        if (id == null || id.isBlank() || id.startsWith("_") || id.indexOf('*') >= 0 || id.indexOf('?') >= 0 || "_all".equals(id)) {
+            throw unsupported("this pipeline action requires one concrete ID");
+        }
+    }
+
+    private static String jsonSource(
+        org.opensearch.core.common.bytes.BytesReference source,
+        org.opensearch.core.xcontent.MediaType mediaType
+    ) throws IOException {
+        if (source == null || source.length() == 0) {
+            throw new IllegalArgumentException("a pipeline body is required");
+        }
+        if (org.opensearch.common.xcontent.XContentType.JSON.equals(mediaType)) {
+            return source.utf8ToString();
+        }
+        throw unsupported("pipeline definitions and simulation requests currently require JSON content");
+    }
+
+    private static void buffered(
+        org.opensearch.rest.RestChannel channel,
+        ServerlessNode serving,
+        String action,
+        org.opensearch.action.ActionRequest request,
+        org.opensearch.common.CheckedBiConsumer<org.opensearch.action.ActionRequest, org.opensearch.rest.RestChannel, Exception> work
+    ) throws Exception {
+        final var opaque = org.opensearch.serverless.shell.ActionGate.<org.opensearch.rest.RestResponse>opaque();
+        final var view = new org.opensearch.serverless.shell.ActionGate.ResponseView<org.opensearch.rest.RestResponse>() {
+            @Override
+            public org.opensearch.core.action.ActionResponse show(org.opensearch.rest.RestResponse result) {
+                return opaque.show(result);
+            }
+
+            @Override
+            public org.opensearch.rest.RestResponse read(
+                org.opensearch.core.action.ActionResponse response,
+                org.opensearch.rest.RestResponse original
+            ) {
+                if (original == null || response instanceof org.opensearch.serverless.shell.ActionGate.Admitted == false) {
+                    throw unsupported("cached or rewritten native search pipeline read responses are not supported");
+                }
+                return original;
+            }
+        };
+        final var response = serving.actionGate().run(action, request, admitted -> {
+            final var pending = new PendingRestChannel(channel);
+            work.accept(admitted, pending);
+            return pending.response();
+        }, view);
+        channel.sendResponse(response);
     }
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
