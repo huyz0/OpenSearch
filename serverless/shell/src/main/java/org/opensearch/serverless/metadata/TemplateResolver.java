@@ -264,11 +264,20 @@ public final class TemplateResolver {
 
     private static long priority(Map<String, Object> template) {
         final Object priority = template.get("priority");
-        if (priority instanceof Number number) {
-            return number.longValue();
+        if (priority == null) {
+            return 0L;
         }
-        // Absent means lowest, so a template that names a priority always beats one that does not.
-        return 0L;
+        try {
+            // Existing records may predate native PUT parsing. Use core's numeric string and decimal
+            // coercion instead of silently assigning those records the omitted-priority default.
+            final long value = org.opensearch.common.Numbers.toLong(priority.toString(), true);
+            if (value < 0L) {
+                throw new IllegalArgumentException("priority must be >= 0");
+            }
+            return value;
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("index template priority must be a nonnegative long", e);
+        }
     }
 
     private static Pattern glob(String pattern) {
