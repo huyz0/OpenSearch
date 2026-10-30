@@ -84,10 +84,12 @@ public final class MultiSearchHandler extends BaseRestHandler {
      * @param status the refusal's status, or null when the line is runnable
      * @param type the refusal's type, or null
      * @param reason the refusal's reason, or null
+     * @param partialResults the line's own partial-results policy, or null for the default
      */
-    record Sub(String index, SearchSourceBuilder source, boolean ignoreUnavailable, RestStatus status, String type, String reason) {
+    record Sub(String index, SearchSourceBuilder source, boolean ignoreUnavailable, RestStatus status, String type, String reason,
+        Boolean partialResults) {
         static Sub refuse(String index, RestStatus status, String type, String reason) {
-            return new Sub(index, null, false, status, type, reason);
+            return new Sub(index, null, false, status, type, reason, null);
         }
 
         /**
@@ -113,7 +115,16 @@ public final class MultiSearchHandler extends BaseRestHandler {
                     || (options.preference() != null && options.preference().startsWith("_shards")))) {
                 return refuse(index, RestStatus.NOT_IMPLEMENTED, "unsupported_search", "the search requests unsupported execution options");
             }
-            return of(index, source, ignoreUnavailable);
+            final Sub planned = of(index, source, ignoreUnavailable);
+            return new Sub(
+                planned.index(),
+                planned.source(),
+                planned.ignoreUnavailable(),
+                planned.status(),
+                planned.type(),
+                planned.reason(),
+                options == null ? null : options.allowPartialSearchResults()
+            );
         }
 
         static Sub of(String index, SearchSourceBuilder source, boolean ignoreUnavailable) {
@@ -142,7 +153,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                     "a search pipeline inside an _msearch line is not applied here; send that search through _search, which runs it"
                 );
             }
-            return new Sub(index, source, ignoreUnavailable, null, null, null);
+            return new Sub(index, source, ignoreUnavailable, null, null, null, null);
         }
     }
 
@@ -280,6 +291,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                     serving,
                     resolved.indices().keySet(),
                     sub.source(),
+                    sub.partialResults(),
                     admitted -> SearchFanout.run(serving, metadata, resolved.indices(), admitted)
                 );
                 items.add(
@@ -408,6 +420,9 @@ public final class MultiSearchHandler extends BaseRestHandler {
                     switch (entry.getKey()) {
                         case "search_type", "searchType" -> options.searchType(text);
                         case "routing" -> options.routing(text);
+                        case "allow_partial_search_results" -> options.allowPartialSearchResults(
+                            org.opensearch.common.xcontent.support.XContentMapValues.nodeBooleanValue(value, null)
+                        );
                         case "preference" -> options.preference(text);
                         default -> {
                         }
