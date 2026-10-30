@@ -82,4 +82,48 @@ public class ServerlessFailedEngineTests extends OpenSearchTestCase {
             assertTrue(node.get(taken.get(), "published-3").found());
         }
     }
+
+    public void testAFailedReaderIsClosedEvenWhileAQueryIsAdmitted() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-failed-reader", 1, MAPPING, null));
+            try (
+                var writer = new ServerlessNode(nodeSettings("failed-reader-writer"));
+                var reader = new ServerlessNode(
+                    Settings.builder().put(nodeSettings("failed-reader")).put("serverless.roles", "search").build()
+                )
+            ) {
+                writer.start();
+                writer.setMetadataPlane(plane);
+                final var writerId = writer.activateWriter(plane, "alpha", 0).orElseThrow();
+                writer.index(writerId, "doc", "{\"msg\":\"survives\",\"n\":1}");
+                writer.publishShard(writerId, plane.heads().read("alpha", 0).orElseThrow().term());
+                assertTrue(plane.heads().release("alpha", 0, writer.localNode().getId()));
+                reader.start();
+                reader.setMetadataPlane(plane);
+                final var id = reader.serveAsReader(plane, "alpha", 0);
+                assertTrue(reader.reconciler().isReader(id));
+                final var failed = reader.reconciler().shard(id);
+                reader.reconciler().enter(id);
+                try {
+                    failed.failShard("injected", new java.io.IOException("injected reader failure"));
+                    assertBusy(
+                        () -> assertNull("failed readers must not remain cached behind their active query", reader.reconciler().shard(id))
+                    );
+                } finally {
+                    reader.reconciler().exit(id);
+                }
+                final var reopened = reader.serveAsReader(plane, "alpha", 0);
+                final var replacement = reader.reconciler().shard(reopened);
+                assertNotSame(failed, replacement);
+                assertEquals(
+                    org.opensearch.serverless.shard.ShardReconciler.FailedShardRelease.NOT_CURRENT,
+                    reader.reconciler().releaseFailedShard(failed, "delayed failure")
+                );
+                assertSame(replacement, reader.reconciler().shard(reopened));
+                assertTrue(reader.get(reopened, "doc").found());
+            }
+        }
+    }
+
 }

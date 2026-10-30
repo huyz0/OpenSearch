@@ -3503,23 +3503,24 @@ public final class ServerlessNode implements Closeable {
      * takes the shard at a higher term, which fences whatever the failed engine might still append, opens it from
      * the published commit and replays the log. A failed reader holds no head and is simply closed.
      */
-    private void onShardFailed(org.opensearch.core.index.shard.ShardId shardId, Exception cause) {
-        final var plane = metadataPlane;
+    private void onShardFailed(org.opensearch.index.shard.IndexShard failed, Exception cause) {
+        final var shardId = failed.shardId();
         logger.warn("shard " + shardId + " failed; closing it and taking it again from its published commit and log", cause);
         try {
-            if (reconciler.isReader(shardId)) {
-                reconciler.releaseShard(shardId, "its engine failed");
-                forgetReader(shardId);
-                return;
+            final var released = underShardFence(shardId, () -> {
+                final var result = reconciler.releaseFailedShard(failed, "its engine failed");
+                if (result != ShardReconciler.FailedShardRelease.NOT_CURRENT) {
+                    writeFenced.remove(shardId);
+                    forgetShardRecords(shardId);
+                }
+                return result;
+            });
+            if (released == ShardReconciler.FailedShardRelease.WRITER && metadataPlane != null) {
+                signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
             }
-            if (reconciler.shard(shardId) == null || plane == null) {
-                return;
-            }
-            releaseLost(plane, shardId, "its engine failed: " + (cause == null ? "unknown" : cause.getMessage()), false);
         } catch (Exception e) {
             logger.warn("could not close failed shard " + shardId, e);
         }
-        signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
     }
 
     /**

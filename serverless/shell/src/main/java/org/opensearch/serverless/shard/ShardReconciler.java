@@ -314,14 +314,14 @@ public final class ShardReconciler {
         shard.updateLocalCheckpointForShard(shard.routingEntry().allocationId().getId(), shard.getLocalCheckpoint());
     }
 
-    private volatile java.util.function.BiConsumer<ShardId, Exception> onShardFailed;
+    private volatile java.util.function.BiConsumer<IndexShard, Exception> onShardFailed;
 
     /**
      * Sets what happens when an open shard's engine fails: told the shard and the cause, on the thread that failed it.
      *
      * @param onShardFailed the listener, or null for none
      */
-    public void setOnShardFailed(java.util.function.BiConsumer<ShardId, Exception> onShardFailed) {
+    public void setOnShardFailed(java.util.function.BiConsumer<IndexShard, Exception> onShardFailed) {
         this.onShardFailed = onShardFailed;
     }
 
@@ -623,9 +623,9 @@ public final class ShardReconciler {
             // A failed engine is reported, not just left in place: a shard whose engine has failed still counts as
             // open, and a writer's head kept naming a node that answered "engine is closed" to everything.
             shard.addShardFailureCallback(failure -> {
-                final java.util.function.BiConsumer<ShardId, Exception> listener = onShardFailed;
+                final java.util.function.BiConsumer<IndexShard, Exception> listener = onShardFailed;
                 if (listener != null) {
-                    listener.accept(shardId, failure.cause);
+                    listener.accept(shard, failure.cause);
                 }
             });
 
@@ -1268,7 +1268,38 @@ public final class ShardReconciler {
         readers.remove(shardId);
     }
 
+    /** The role of the failed engine removed, or whether a replacement already owns its slot. */
+    public enum FailedShardRelease {
+        NOT_CURRENT,
+        READER,
+        WRITER
+    }
+
+    /**
+     * Removes only the engine that failed. Its admitted queries cannot keep an unusable reader cached,
+     * and an asynchronously delivered failure cannot remove a healthy replacement.
+     *
+     * @param failed the actual failed engine
+     * @param reason why it is being removed
+     * @return the removed engine's role, or {@link FailedShardRelease#NOT_CURRENT}
+     */
+    public FailedShardRelease releaseFailedShard(IndexShard failed, String reason) {
+        final ShardId shardId = failed.shardId();
+        synchronized (lifecycle(shardId)) {
+            if (open.get(shardId) != failed) {
+                return FailedShardRelease.NOT_CURRENT;
+            }
+            final boolean reader = readers.contains(shardId);
+            releaseShardLocked(shardId, reason, false, true);
+            return reader ? FailedShardRelease.READER : FailedShardRelease.WRITER;
+        }
+    }
+
     private boolean releaseShardLocked(ShardId shardId, String reason, boolean deleteStore) {
+        return releaseShardLocked(shardId, reason, deleteStore, false);
+    }
+
+    private boolean releaseShardLocked(ShardId shardId, String reason, boolean deleteStore, boolean failed) {
         if (readers.contains(shardId) == false && open.containsKey(shardId)) {
             // Writers only: every way a writer stops, for reconstructing a handover.
             final IndexShard writer = open.get(shardId);
@@ -1286,7 +1317,7 @@ public final class ShardReconciler {
         // Readers only. A writer being released has lost its head, or is about to give it up, and a
         // writer that stays open past that point would go on acknowledging writes nobody will replay; a
         // query against it failing on a closed reader is the lesser harm, and the one this always risked.
-        if (busy > 0 && readers.contains(shardId)) {
+        if (failed == false && busy > 0 && readers.contains(shardId)) {
             logger.debug(
                 "not releasing {} ({}): {} quer{} still running against it",
                 shardId,
