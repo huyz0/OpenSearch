@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
+import java.util.PriorityQueue;
 
 /**
  * Which search nodes should serve a shard.
@@ -54,21 +55,33 @@ public final class ReaderPlacement {
      * @return candidate node ids, most preferred first; empty if no node advertises the role
      */
     public static List<String> candidatesFor(String indexName, int shardId, Collection<NodeLease> members, String role, int limit) {
+        if (limit < 0) {
+            throw new IllegalArgumentException("candidate limit must be non-negative");
+        }
+        if (limit == 0) {
+            return List.of();
+        }
         final String key = indexName + "#" + shardId;
-        final List<String> ranked = new ArrayList<>();
+        final Comparator<Candidate> preferred = Comparator.comparingInt(Candidate::weight).reversed().thenComparing(Candidate::nodeId);
+        // The worst retained candidate is first. The common two-reader route retains only two entries,
+        // hashes each eligible member once, and never sorts the whole fleet for each searched shard.
+        final PriorityQueue<Candidate> best = new PriorityQueue<>(Math.min(limit, 16), preferred.reversed());
         for (NodeLease lease : members) {
             if (lease.roles().contains(role)) {
-                ranked.add(lease.nodeId());
+                final Candidate candidate = new Candidate(lease.nodeId(), Murmur3HashFunction.hash(lease.nodeId() + "/" + key));
+                if (best.size() < limit) {
+                    best.add(candidate);
+                } else if (preferred.compare(candidate, best.peek()) < 0) {
+                    best.poll();
+                    best.add(candidate);
+                }
             }
         }
-        // Highest random weight. Ties broken by node id so every node computes the same order from the
-        // same membership -- two nodes disagreeing about placement is allowed, but disagreeing while
-        // holding identical inputs would just be a bug.
-        ranked.sort(
-            Comparator.<String>comparingInt(nodeId -> Murmur3HashFunction.hash(nodeId + "/" + key))
-                .reversed()
-                .thenComparing(nodeId -> nodeId)
-        );
-        return ranked.size() <= limit ? List.copyOf(ranked) : List.copyOf(ranked.subList(0, limit));
+        final List<Candidate> ranked = new ArrayList<>(best);
+        ranked.sort(preferred);
+        return ranked.stream().map(Candidate::nodeId).toList();
+    }
+
+    private record Candidate(String nodeId, int weight) {
     }
 }

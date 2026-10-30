@@ -964,14 +964,14 @@ public final class SearchFanout {
         // is the writer: routing searches to writers would couple search capacity to write capacity and
         // make per-index search scale-to-zero meaningless. Placement is a cache-affinity hint, so the
         // owner remains a last resort for the case where no search node exists at all.
-        final List<String> ranked = org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+        final var members = metadata.membership().current();
+        final List<String> targets = org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
             index,
             shard,
-            metadata.membership().current(),
+            members,
             ServerlessNode.ROLE_SEARCH,
-            Integer.MAX_VALUE
+            2
         );
-        final List<String> targets = new ArrayList<>(ranked.subList(0, Math.min(2, ranked.size())));
         final java.util.Set<String> tried = new java.util.HashSet<>();
         boolean refusedAtTheCap = false;
         // The owner is the last resort, and its head is read only when the placement candidates could
@@ -1008,10 +1008,16 @@ public final class SearchFanout {
         // A candidate was full. Placement is an affinity, not a requirement: any search node can open a reader,
         // and one with room answers where the preferred ones could only refuse. A burst of searches over thousands of
         // indices filled the preferred nodes and failed the rest outright while other nodes had slots free.
-        for (String spare : ranked) {
-            if (refusedAtTheCap == false) {
-                break;
-            }
+        final List<String> spares = refusedAtTheCap
+            ? org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+                index,
+                shard,
+                members,
+                ServerlessNode.ROLE_SEARCH,
+                Integer.MAX_VALUE
+            )
+            : List.of();
+        for (String spare : spares) {
             if (tried.add(spare) == false) {
                 continue;
             }
