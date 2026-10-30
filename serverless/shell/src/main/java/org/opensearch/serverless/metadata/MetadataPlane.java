@@ -369,21 +369,32 @@ public final class MetadataPlane {
     /**
      * Deletes an index and every shard-head belonging to it.
      *
-     * <p>Heads first, then the descriptor. The order matters and the reason is worth stating: deleting
-     * the descriptor first would leave heads that no reader can interpret, since the shard count needed
-     * to enumerate them lives in the descriptor. Orphaned heads with no descriptor are the kind of
-     * garbage that is discovered years later.
+     * <p>Read the descriptor and heads first, then order the descriptor away with compare-and-swap before
+     * removing the captured heads. Conditional head cleanup uses their captured generations, and data
+     * cleanup uses the captured UUID, to preserve a replacement index.
      *
      * @param indexName the index to delete
      * @return true if the index existed
      * @throws IOException if the delete fails
      */
     public boolean deleteIndex(String indexName) throws IOException {
+        return deleteIndex(indexName, null);
+    }
+
+    /**
+     * Deletes only the incarnation the caller selected, preserving a replacement under the same name.
+     *
+     * @param indexName the index name
+     * @param expectedUuid the selected UUID, or null to select the current incarnation
+     * @return true if the selected incarnation was deleted
+     * @throws IOException if deletion fails
+     */
+    public boolean deleteIndex(String indexName, String expectedUuid) throws IOException {
         // The descriptor and the generation it was read at, from one read: read separately, a change
         // landing between the two handed the delete a fresh generation for a stale descriptor.
         final DescriptorStore.Resolution resolved = descriptors.resolve(indexName);
         final Optional<IndexDescriptor> descriptor = Optional.ofNullable(resolved.index());
-        if (descriptor.isEmpty()) {
+        if (descriptor.isEmpty() || (expectedUuid != null && expectedUuid.equals(descriptor.get().uuid()) == false)) {
             return false;
         }
         final boolean conditional = descriptors.conditionalDelete();

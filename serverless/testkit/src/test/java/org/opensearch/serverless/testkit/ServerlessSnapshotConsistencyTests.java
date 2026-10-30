@@ -263,6 +263,39 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRestoreRollbackCannotDeleteAReplacementIndex() throws Exception {
+        final var clock = new AtomicLong(1000L);
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            plane.createIndex(new IndexDescriptor("original", "uuid-rollback-original", 1, MAPPING, null));
+            try (var node = new ServerlessNode(nodeSettings("restore-rollback-incarnation"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var loop = hold(node, plane, clock, "original", 1);
+                assertEquals(201, send(node, "PUT", "/original/_doc/1?refresh=true", "{\"msg\":\"doc\",\"n\":1}").status());
+                loop.tick(clock.get());
+                assertEquals(200, send(node, "PUT", "/_snapshot/backups", null).status());
+                assertEquals(200, send(node, "PUT", "/_snapshot/backups/full", "{\"indices\":\"original\"}").status());
+                store.beforeFirstManifestSwap(path -> path.buildAsString().contains("segments/restored#"), container -> {
+                    assertTrue(plane.deleteIndex("restored"));
+                    plane.createIndex(new IndexDescriptor("restored", "uuid-rollback-replacement", 1, MAPPING, null));
+                    throw new IOException("injected restore failure after replacement");
+                });
+                final var response = send(
+                    node,
+                    "POST",
+                    "/_snapshot/backups/full/_restore?wait_for_completion=true",
+                    "{\"rename_pattern\":\"original\",\"rename_replacement\":\"restored\"}"
+                );
+                assertTrue("the replacement was created during restore", store.fired());
+                assertEquals(response.body(), 500, response.status());
+                final var replacement = plane.describe("restored");
+                assertTrue("a failed restore can only roll back its own index", replacement.isPresent());
+                assertEquals("uuid-rollback-replacement", replacement.orElseThrow().uuid());
+            }
+        }
+    }
+
     /** Settings captured with an index come back with it, including the analyzers its mapping names. */
     public void testSettingsRoundTripThroughASnapshot() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

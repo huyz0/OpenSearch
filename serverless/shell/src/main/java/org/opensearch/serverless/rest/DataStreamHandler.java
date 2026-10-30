@@ -224,8 +224,9 @@ public final class DataStreamHandler extends BaseRestHandler {
         // declared the stream -- handed in rather than resolved against ".ds-events-000001", which no
         // pattern written for "events*" matches. Resolved against its own name, the backing index got
         // one shard and only the timestamp mapped, whatever the template said.
+        final org.opensearch.serverless.cluster.IndexDescriptor created;
         try {
-            IndexAdminHandler.createIndex(
+            created = IndexAdminHandler.createIndex(
                 metadata,
                 backing,
                 withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), inherited.timestampField()),
@@ -244,7 +245,7 @@ public final class DataStreamHandler extends BaseRestHandler {
             // The stream lost its name; the backing index made for it must not stay, or every later
             // attempt to create the stream would find ".ds-<name>-000001" taken and the name unusable.
             try {
-                metadata.deleteIndex(backing);
+                metadata.deleteIndex(backing, created.uuid());
             } catch (Exception cleanup) {
                 logger.warn("could not remove the backing index [" + backing + "] of a data stream that was not created", cleanup);
             }

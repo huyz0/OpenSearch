@@ -353,14 +353,25 @@ public final class IndexAdminHandler extends BaseRestHandler {
                         existed = gated(
                             org.opensearch.action.admin.indices.delete.DeleteIndexAction.NAME,
                             new org.opensearch.action.admin.indices.delete.DeleteIndexRequest(index),
-                            () -> metadata.deleteIndex(index)
+                            () -> deleting.isPresent() && metadata.deleteIndex(index, deleting.get().uuid())
                         );
                     } catch (Exception e) {
                         channel.sendResponse(new BytesRestResponse(channel, e));
                         return;
                     }
                     if (existed == false) {
-                        channel.sendResponse(error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
+                        if (deleting.isPresent()) {
+                            channel.sendResponse(
+                                error(
+                                    channel,
+                                    RestStatus.CONFLICT,
+                                    "version_conflict_engine_exception",
+                                    "index [" + index + "] changed concurrently; nothing was deleted, retry"
+                                )
+                            );
+                        } else {
+                            channel.sendResponse(error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
+                        }
                         return;
                     }
                     final var serving = node.get();

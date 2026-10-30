@@ -776,7 +776,7 @@ public final class SnapshotHandler extends BaseRestHandler {
         final BlobStore blobStore = metadata.blobStore();
         // Every target created so far, so a restore that fails part-way removes what it made rather than
         // leaving earlier targets restored and the current one with nothing published behind its name.
-        final List<String> created = new ArrayList<>();
+        final Map<String, String> created = new LinkedHashMap<>();
         int shardsRestored = 0;
         try {
             for (Map.Entry<String, String> restoring : targets.entrySet()) {
@@ -789,7 +789,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                     new IndexDescriptor(restoring.getValue(), newUuid, capturedIndex.numberOfShards(), capturedIndex.mapping(), settings)
                         .createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id)
                 );
-                created.add(restoring.getValue());
+                created.put(restoring.getValue(), newUuid);
                 for (Map.Entry<Integer, CommitManifest> shard : capturedIndex.shards().entrySet()) {
                     final BlobPath sourceBase = record.shallow()
                         ? RegisterMap.shardData(metadata.basePath(), restoring.getKey(), capturedIndex.uuid(), shard.getKey())
@@ -820,9 +820,9 @@ public final class SnapshotHandler extends BaseRestHandler {
                 }
             }
         } catch (Exception e) {
-            for (String target : created) {
+            for (Map.Entry<String, String> target : created.entrySet()) {
                 try {
-                    metadata.deleteIndex(target);
+                    metadata.deleteIndex(target.getKey(), target.getValue());
                 } catch (Exception cleanup) {
                     e.addSuppressed(cleanup);
                 }
