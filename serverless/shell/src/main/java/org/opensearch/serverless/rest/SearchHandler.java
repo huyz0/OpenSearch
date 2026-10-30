@@ -314,7 +314,7 @@ public final class SearchHandler extends BaseRestHandler {
                 )
             );
         }
-        final boolean failOnPartial = Boolean.FALSE.equals(searchRequest.allowPartialSearchResults());
+        final Boolean partialResults = searchRequest.allowPartialSearchResults();
         // Its own opt-in, not allow_partial_search_results: that defaults to true, and a search wider than
         // the activation budget must be refused unless the caller asked, in so many words, for part of it.
         final SearchFanout.Options fanoutOptions = new SearchFanout.Options(request.paramAsBoolean("allow_partial_activation", false));
@@ -482,7 +482,7 @@ public final class SearchHandler extends BaseRestHandler {
             final var view = frozen;
             return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
                 try {
-                    respondFrozen(channel, serving, metadata, view, source, counting, request, failOnPartial, postProcess);
+                    respondFrozen(channel, serving, metadata, view, source, counting, request, partialResults, postProcess);
                 } catch (Exception e) {
                     try {
                         channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -541,7 +541,7 @@ public final class SearchHandler extends BaseRestHandler {
                     source,
                     counting,
                     request,
-                    failOnPartial,
+                    partialResults,
                     postProcess,
                     searchOptions
                 );
@@ -1011,7 +1011,7 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
     ) throws IOException {
-        return gated(serving, null, indices, source, work);
+        return gated(serving, null, indices, source, null, work);
     }
 
     /**
@@ -1033,6 +1033,39 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
     ) throws IOException {
+        return gated(serving, nativeRequest, indices, source, null, work);
+    }
+
+    /**
+     * Runs an already planned search with the caller's partial-results policy visible to filters.
+     *
+     * @param serving the serving node
+     * @param indices the resolved authorization scope
+     * @param source the planned source, including any already applied search pipeline
+     * @param partialResults the caller's partial-results policy, or null for the default
+     * @param work the search receiving the admitted source
+     * @param <T> the result type
+     * @return the filtered result
+     * @throws IOException if the search fails
+     */
+    public static <T> T gated(
+        ServerlessNode serving,
+        java.util.Collection<String> indices,
+        SearchSourceBuilder source,
+        Boolean partialResults,
+        org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
+    ) throws IOException {
+        return gated(serving, null, indices, source, partialResults, work);
+    }
+
+    private static <T> T gated(
+        ServerlessNode serving,
+        org.opensearch.action.search.SearchRequest nativeRequest,
+        java.util.Collection<String> indices,
+        SearchSourceBuilder source,
+        Boolean partialResults,
+        org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
+    ) throws IOException {
         final var gate = serving.actionGate();
         final java.util.Set<String> resolvedScope = gate.isEmpty() ? null : java.util.Set.copyOf(indices);
         final var visible = nativeRequest == null
@@ -1041,6 +1074,9 @@ public final class SearchHandler extends BaseRestHandler {
                 .source(source)
                 // Core's copy constructor omits the named pipeline.
                 .pipeline(nativeRequest.pipeline());
+        if (nativeRequest == null && partialResults != null) {
+            visible.allowPartialSearchResults(partialResults);
+        }
         try {
             return gate.run(
                 org.opensearch.action.search.SearchAction.NAME,
@@ -1087,6 +1123,9 @@ public final class SearchHandler extends BaseRestHandler {
                                 throw failure;
                             }
                             throw new IOException("search shard failed", cause);
+                        }
+                        if (Boolean.FALSE.equals(rewritten.allowPartialSearchResults()) && outcome.timedOut()) {
+                            throw new org.opensearch.search.query.QueryPhaseExecutionException(null, "Time exceeded");
                         }
                         outcome.withTotalHitsTracking(
                             accepted.trackTotalHitsUpTo() == null
@@ -1213,7 +1252,7 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         boolean counting,
         org.opensearch.core.xcontent.ToXContent.Params params,
-        boolean failOnPartial,
+        Boolean partialResults,
         java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess
     ) throws IOException {
         final long startNanos = System.nanoTime();
@@ -1223,6 +1262,7 @@ public final class SearchHandler extends BaseRestHandler {
                 serving,
                 java.util.List.of(pit.index()),
                 source,
+                partialResults,
                 admitted -> SearchFanout.runFrozen(serving, metadata, pit, admitted)
             );
         } catch (Exception e) {
@@ -1241,18 +1281,7 @@ public final class SearchHandler extends BaseRestHandler {
             }
             throw e;
         }
-        render(
-            channel,
-            java.util.List.of(),
-            outcome,
-            source,
-            tookMillis(startNanos),
-            counting,
-            pit.id(),
-            params,
-            failOnPartial,
-            postProcess
-        );
+        render(channel, java.util.List.of(), outcome, source, tookMillis(startNanos), counting, pit.id(), params, postProcess);
     }
 
     /**
@@ -1370,7 +1399,7 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         boolean counting,
         org.opensearch.core.xcontent.ToXContent.Params params,
-        boolean failOnPartial,
+        Boolean partialResults,
         java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess,
         SearchFanout.Options fanoutOptions
     ) throws IOException {
@@ -1381,9 +1410,10 @@ public final class SearchHandler extends BaseRestHandler {
             serving,
             indices.keySet(),
             source,
+            partialResults,
             admitted -> SearchFanout.run(serving, metadata, indices, admitted, fanoutOptions)
         );
-        render(channel, skipped, outcome, source, tookMillis(startNanos), counting, null, params, failOnPartial, postProcess);
+        render(channel, skipped, outcome, source, tookMillis(startNanos), counting, null, params, postProcess);
     }
 
     /**
@@ -1473,17 +1503,8 @@ public final class SearchHandler extends BaseRestHandler {
         boolean counting,
         String pitId,
         org.opensearch.core.xcontent.ToXContent.Params params,
-        boolean failOnPartial,
         java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess
     ) throws IOException {
-        if (failOnPartial && outcome.failures().isEmpty() == false) {
-            // allow_partial_search_results=false: the caller said a partial answer is no answer. The
-            // first shard's own failure is the response, with its own status, which is what a classic
-            // coordinator does with the same flag.
-            final Throwable cause = outcome.failures().get(0).getCause();
-            channel.sendResponse(new BytesRestResponse(channel, cause instanceof Exception e ? e : new IOException(cause)));
-            return;
-        }
         final org.opensearch.action.search.SearchResponse response = postProcess.apply(toResponse(outcome, source, tookMillis, pitId));
         if (counting) {
             renderCount(channel, response, source, params);

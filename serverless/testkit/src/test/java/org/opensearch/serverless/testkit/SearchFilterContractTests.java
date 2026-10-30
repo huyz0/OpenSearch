@@ -247,6 +247,47 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
         }
     }
 
+    private static ShardOperations.SearchOutcome timedOutShard() {
+        return new ShardOperations.SearchOutcome(
+            1L,
+            List.of(),
+            1,
+            1,
+            null,
+            org.apache.lucene.search.TotalHits.Relation.EQUAL_TO,
+            Float.NaN,
+            true,
+            null,
+            List.of()
+        );
+    }
+
+    public void testStrictPartialPolicyRejectsTimeoutWithoutShardFailures() throws Exception {
+        try (var node = node(request -> {}, null)) {
+            final var request = new SearchRequest("private").allowPartialSearchResults(false);
+            final var failure = expectThrows(
+                org.opensearch.search.query.QueryPhaseExecutionException.class,
+                () -> SearchHandler.gated(node, request, List.of("private"), new SearchSourceBuilder(), source -> timedOutShard())
+            );
+            assertEquals("Time exceeded", failure.getMessage());
+        }
+    }
+
+    public void testAllowedPartialPolicyKeepsTimeoutWithoutShardFailures() throws Exception {
+        try (var node = node(request -> {}, null)) {
+            final var request = new SearchRequest("private").allowPartialSearchResults(true);
+            final var outcome = SearchHandler.gated(
+                node,
+                request,
+                List.of("private"),
+                new SearchSourceBuilder(),
+                source -> timedOutShard()
+            );
+            assertTrue(outcome.timedOut());
+            assertTrue(outcome.failures().isEmpty());
+        }
+    }
+
     public void testAFilterCanRemoveTotalHitCounts() throws Exception {
         try (var node = node(request -> {}, null, SearchFilterContractTests::withoutTotals)) {
             final var source = new SearchSourceBuilder();
