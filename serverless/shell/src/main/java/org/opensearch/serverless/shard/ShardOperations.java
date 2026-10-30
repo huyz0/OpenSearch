@@ -1216,14 +1216,13 @@ public final class ShardOperations {
      * @throws IOException if the search fails outright
      */
     public SearchOutcome search(String index, org.opensearch.search.builder.SearchSourceBuilder source) throws IOException {
-        return gated(
-            org.opensearch.action.search.SearchAction.NAME,
-            new org.opensearch.action.search.SearchRequest(new String[] { index }, source),
-            () -> {
-                final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
-                return org.opensearch.serverless.rest.SearchFanout.run(node, plane, descriptor, source);
+        return org.opensearch.serverless.rest.SearchHandler.gated(node, java.util.List.of(index), source, accepted -> {
+            if (refuseSystemIndices && node.isSystemIndex(index)) {
+                throw new SystemIndexException(index);
             }
-        );
+            final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
+            return org.opensearch.serverless.rest.SearchFanout.run(node, plane, descriptor, accepted);
+        });
     }
 
     /**
