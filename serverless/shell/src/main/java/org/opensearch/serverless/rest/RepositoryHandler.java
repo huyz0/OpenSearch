@@ -8,15 +8,39 @@
 
 package org.opensearch.serverless.rest;
 
+import org.opensearch.action.ActionRequest;
+import org.opensearch.action.admin.cluster.repositories.delete.DeleteRepositoryAction;
+import org.opensearch.action.admin.cluster.repositories.delete.DeleteRepositoryRequest;
+import org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesAction;
+import org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesRequest;
+import org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesResponse;
+import org.opensearch.action.admin.cluster.repositories.put.PutRepositoryAction;
+import org.opensearch.action.admin.cluster.repositories.put.PutRepositoryRequest;
+import org.opensearch.action.admin.cluster.repositories.verify.VerifyRepositoryAction;
+import org.opensearch.action.admin.cluster.repositories.verify.VerifyRepositoryRequest;
+import org.opensearch.action.admin.cluster.repositories.verify.VerifyRepositoryResponse;
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
+import org.opensearch.common.CheckedFunction;
+import org.opensearch.common.regex.Regex;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.action.ActionResponse;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.xcontent.DeprecationHandler;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.repositories.RepositoryMissingException;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.Names;
 import org.opensearch.serverless.metadata.RepositoryDescriptor;
 import org.opensearch.serverless.metadata.RepositoryInUseException;
+import org.opensearch.serverless.shell.ActionGate;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -24,7 +48,6 @@ import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
@@ -82,137 +105,156 @@ public final class RepositoryHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final MetadataPlane metadata = plane.get();
-        final String repoParam = request.param("repo");
+        final String repo = request.param("repo");
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        // Hints: there is no cluster manager to time out against, and a repository here is a namespace
-        // in this deployment's own object store, which is verified by the deployment running at all.
+        // There is no cluster manager to time out against. Verification checks this deployment's own store.
         request.param("master_timeout");
         request.param("cluster_manager_timeout");
         request.param("timeout");
-        request.param("verify");
+        final boolean verify = request.paramAsBoolean("verify", true);
         if (request.path().endsWith("/_verify")) {
-            return channel -> dispatch(channel, () -> {
-                if (metadata.describeRepository(repoParam).isEmpty()) {
-                    channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.NOT_FOUND,
-                            "repository_missing_exception",
-                            "[" + repoParam + "] missing"
-                        )
-                    );
-                    return;
-                }
-                // Core's VerifyRepositoryResponse: the nodes that could reach the repository. Every node
-                // here reaches the one object store, and this one is answering.
-                final var serving = node.get();
-                try (XContentBuilder builder = channel.newBuilder()) {
-                    builder.startObject();
-                    builder.startObject("nodes");
-                    builder.startObject(serving.localNode().getId());
-                    builder.field("name", serving.localNode().getName());
-                    builder.endObject();
-                    builder.endObject();
-                    builder.endObject();
-                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-                }
-            });
-        }
-        if (repoParam == null || "_all".equals(repoParam) || "*".equals(repoParam)) {
-            // These selectors list repositories only on GET. The {repo} routes also match mutations;
-            // answering those with a listing would falsely acknowledge work that never happened.
-            if (request.method() != RestRequest.Method.GET) {
-                return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "illegal_argument_exception",
-                        "repository mutations require one concrete repository name"
-                    )
-                );
-            }
-            return channel -> dispatch(channel, () -> handleList(channel, metadata, null));
-        }
-        if (repoParam.startsWith("_")) {
-            // Not a repository name: an underscore-prefixed segment here is an API this shell does not
-            // implement, and answering "no such repository: _status" would send a caller looking for a
-            // repository that was never a name. The same class as an index API read as an index name.
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+            return channel -> dispatch(
+                channel,
+                () -> respond(
                     channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "not_implemented",
-                    "'"
-                        + repoParam
-                        + "' is not a repository: names beginning with an underscore are reserved for "
-                        + "APIs, and this shell does not implement this one"
+                    gated(VerifyRepositoryAction.NAME, new VerifyRepositoryRequest(repo), VerifyRepositoryResponse.class, admitted -> {
+                        final String selected = ((VerifyRepositoryRequest) admitted).name();
+                        Names.validateId(selected, "repository");
+                        metadata.describeRepository(selected).orElseThrow(() -> new RepositoryMissingException(selected));
+                        return new VerifyRepositoryResponse(new org.opensearch.cluster.node.DiscoveryNode[] { node.get().localNode() });
+                    })
                 )
             );
         }
-        final List<String> names = List.of(repoParam.split(","));
-
+        if (repo != null && repo.startsWith("_") && "_all".equals(repo) == false) {
+            return channel -> channel.sendResponse(
+                error(
+                    channel,
+                    RestStatus.NOT_IMPLEMENTED,
+                    "not_implemented",
+                    "repository names beginning with an underscore are reserved for APIs"
+                )
+            );
+        }
+        if (request.method() == RestRequest.Method.GET) {
+            final String[] names = repo == null ? new String[0] : repo.split(",");
+            return channel -> dispatch(
+                channel,
+                () -> respond(
+                    channel,
+                    gated(
+                        GetRepositoriesAction.NAME,
+                        new GetRepositoriesRequest(names),
+                        GetRepositoriesResponse.class,
+                        admitted -> describe(metadata, ((GetRepositoriesRequest) admitted).repositories())
+                    )
+                )
+            );
+        }
         switch (request.method()) {
             case PUT:
             case POST: {
-                final Map<String, Object> body = request.hasContent() ? parseBody(request) : Map.of();
-                if (names.size() != 1) {
-                    return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_request", "one repository per PUT")
-                    );
-                }
-                final String repo = names.get(0);
-                try {
-                    // A repository name is half of every snapshot's register key (repo#name), so a '#' or a
-                    // ',' in it makes one repository's listing include another's snapshots.
-                    org.opensearch.serverless.metadata.Names.validateId(repo, "repository");
-                } catch (IllegalArgumentException e) {
-                    return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "repository_exception", e.getMessage())
-                    );
-                }
-                final Object typeField = body.get("type");
-                final String type = typeField == null ? RepositoryDescriptor.TYPE_NATIVE : String.valueOf(typeField);
-                if (type.equals(RepositoryDescriptor.TYPE_NATIVE) == false) {
-                    return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.NOT_IMPLEMENTED,
-                            "unsupported_repository_type",
-                            "type '"
-                                + type
-                                + "' is not supported; this deployment has exactly one object store, reached with type '"
-                                + RepositoryDescriptor.TYPE_NATIVE
-                                + "' (D3) -- a genuinely distinct backend is not offered here"
-                        )
-                    );
-                }
-                @SuppressWarnings("unchecked")
-                final Map<String, Object> settings = body.get("settings") instanceof Map
-                    ? new LinkedHashMap<>((Map<String, Object>) body.get("settings"))
-                    : Map.of();
+                // Decode on the worker, where the configuration reads and writes run as well.
+                final BytesReference content = request.hasContent() ? request.content() : null;
+                final var mediaType = request.getMediaType();
                 return channel -> dispatch(channel, () -> {
-                    gated(
-                        org.opensearch.action.admin.cluster.repositories.put.PutRepositoryAction.NAME,
-                        new org.opensearch.action.admin.cluster.repositories.put.PutRepositoryRequest(repo),
-                        () -> {
-                            metadata.putRepository(new RepositoryDescriptor(repo, type, settings, metadata.clock().getAsLong()));
-                            return null;
+                    final var put = new PutRepositoryRequest(repo).type(RepositoryDescriptor.TYPE_NATIVE).verify(verify);
+                    if (content != null) {
+                        try (
+                            var parser = mediaType.xContent()
+                                .createParser(
+                                    NamedXContentRegistry.EMPTY,
+                                    DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                                    content.streamInput()
+                                )
+                        ) {
+                            put.source(parser.map());
                         }
-                    );
-                    respondAcknowledged(channel);
+                    }
+                    respond(channel, gated(PutRepositoryAction.NAME, put, AcknowledgedResponse.class, admitted -> {
+                        final var selected = (PutRepositoryRequest) admitted;
+                        Names.validateId(selected.name(), "repository");
+                        final var invalid = selected.validate();
+                        if (invalid != null) {
+                            throw invalid;
+                        }
+                        if (RepositoryDescriptor.TYPE_NATIVE.equals(selected.type()) == false) {
+                            throw new IndexAdminHandler.RefusedException(
+                                RestStatus.NOT_IMPLEMENTED,
+                                "unsupported_repository_type",
+                                "type '"
+                                    + selected.type()
+                                    + "' is not supported; this deployment has exactly one object store, reached with type '"
+                                    + RepositoryDescriptor.TYPE_NATIVE
+                                    + "' (D3)"
+                            );
+                        }
+                        if (selected.cryptoSettings() != null) {
+                            throw new IndexAdminHandler.RefusedException(
+                                RestStatus.NOT_IMPLEMENTED,
+                                "unsupported_repository_setting",
+                                "repository crypto_settings are not supported"
+                            );
+                        }
+                        final Map<String, Object> settings;
+                        try (var builder = XContentFactory.jsonBuilder()) {
+                            builder.startObject();
+                            selected.settings()
+                                .toXContent(
+                                    builder,
+                                    new org.opensearch.core.xcontent.ToXContent.MapParams(Map.of("flat_settings", "true"))
+                                );
+                            builder.endObject();
+                            settings = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                                BytesReference.bytes(builder),
+                                true,
+                                XContentType.JSON
+                            ).v2();
+                        }
+                        metadata.putRepository(
+                            new RepositoryDescriptor(selected.name(), selected.type(), settings, metadata.clock().getAsLong())
+                        );
+                        return new AcknowledgedResponse(true);
+                    }));
                 });
             }
-            case GET:
-                if (names.size() == 1) {
-                    return channel -> dispatch(channel, () -> handleDescribe(channel, metadata, names.get(0)));
-                }
-                return channel -> dispatch(channel, () -> handleList(channel, metadata, names));
-            case DELETE:
-                return channel -> dispatch(channel, () -> handleDelete(channel, metadata, names));
+            case DELETE: {
+                final String[] names = repo == null ? new String[0] : repo.split(",");
+                return channel -> dispatch(channel, () -> {
+                    for (String name : names) {
+                        // Validate before the gate too: wildcard mutations must never acknowledge a listing.
+                        Names.validateId(name, "repository");
+                        if ("_all".equals(name) || Regex.isSimpleMatchPattern(name)) {
+                            throw new IllegalArgumentException("repository mutations require concrete repository names");
+                        }
+                    }
+                    boolean acknowledged = true;
+                    for (String name : names) {
+                        final var result = gated(
+                            DeleteRepositoryAction.NAME,
+                            new DeleteRepositoryRequest(name),
+                            AcknowledgedResponse.class,
+                            admitted -> {
+                                final String selected = ((DeleteRepositoryRequest) admitted).name();
+                                Names.validateId(selected, "repository");
+                                if ("_all".equals(selected) || Regex.isSimpleMatchPattern(selected)) {
+                                    throw new IllegalArgumentException("repository mutations require concrete repository names");
+                                }
+                                if (metadata.deleteRepository(selected) == false) {
+                                    throw new RepositoryMissingException(selected);
+                                }
+                                return new AcknowledgedResponse(true);
+                            }
+                        );
+                        acknowledged &= result.isAcknowledged();
+                    }
+                    respond(channel, new AcknowledgedResponse(acknowledged));
+                });
+            }
             default:
                 return channel -> channel.sendResponse(
                     error(channel, RestStatus.METHOD_NOT_ALLOWED, "method_not_allowed", request.method() + " is not supported here")
@@ -220,101 +262,58 @@ public final class RepositoryHandler extends BaseRestHandler {
         }
     }
 
-    private void handleDescribe(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String repo) throws Exception {
-        final Optional<RepositoryDescriptor> descriptor = gated(
-            org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesAction.NAME,
-            new org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesRequest(new String[] { repo }),
-            () -> metadata.describeRepository(repo)
-        );
-        if (descriptor.isEmpty()) {
-            channel.sendResponse(error(channel, RestStatus.NOT_FOUND, "repository_missing", "no such repository: " + repo));
-            return;
+    /** Resolves the selection admitted by the filters, and builds core's native response. */
+    private GetRepositoriesResponse describe(MetadataPlane metadata, String[] names) throws IOException {
+        final Map<String, RepositoryDescriptor> selected = new LinkedHashMap<>();
+        for (String name : names) {
+            if ("_all".equals(name) == false && Regex.isSimpleMatchPattern(name) == false) {
+                selected.put(name, metadata.describeRepository(name).orElseThrow(() -> new RepositoryMissingException(name)));
+            }
         }
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            writeRepository(builder, descriptor.get());
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
-    }
-
-    /**
-     * @param only the repositories to include, or null for every registered one
-     */
-    private void handleList(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, List<String> only) throws Exception {
-        final List<RepositoryDescriptor> all = gated(
-            org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesAction.NAME,
-            new org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesRequest(
-                only == null ? new String[0] : only.toArray(new String[0])
-            ),
-            metadata::listRepositories
-        );
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            for (RepositoryDescriptor descriptor : all) {
-                if (only != null && only.contains(descriptor.name()) == false) {
-                    continue;
+        if (names.length == 0 || java.util.Arrays.stream(names).anyMatch(n -> "_all".equals(n) || Regex.isSimpleMatchPattern(n))) {
+            for (var descriptor : metadata.listRepositories()) {
+                if (names.length == 0
+                    || java.util.Arrays.stream(names).anyMatch(n -> "_all".equals(n) || Regex.simpleMatch(n, descriptor.name()))) {
+                    selected.put(descriptor.name(), descriptor);
                 }
-                writeRepository(builder, descriptor);
-            }
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
-    }
-
-    private void handleDelete(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, List<String> repos) throws Exception {
-        for (String repo : repos) {
-            final boolean existed;
-            try {
-                existed = gated(
-                    org.opensearch.action.admin.cluster.repositories.delete.DeleteRepositoryAction.NAME,
-                    new org.opensearch.action.admin.cluster.repositories.delete.DeleteRepositoryRequest(repo),
-                    () -> metadata.deleteRepository(repo)
-                );
-            } catch (RepositoryInUseException e) {
-                channel.sendResponse(error(channel, RestStatus.CONFLICT, "repository_in_use", e.getMessage()));
-                return;
-            }
-            if (existed == false) {
-                channel.sendResponse(error(channel, RestStatus.NOT_FOUND, "repository_missing", "no such repository: " + repo));
-                return;
             }
         }
-        respondAcknowledged(channel);
-    }
-
-    private void writeRepository(XContentBuilder builder, RepositoryDescriptor descriptor) throws IOException {
-        builder.startObject(descriptor.name());
-        builder.field("type", descriptor.type());
-        builder.startObject("settings");
-        for (Map.Entry<String, Object> setting : descriptor.settings().entrySet()) {
-            builder.field(setting.getKey(), setting.getValue());
-        }
-        builder.endObject();
-        builder.endObject();
-    }
-
-    private void respondAcknowledged(org.opensearch.rest.RestChannel channel) throws IOException {
-        try (XContentBuilder builder = channel.newBuilder()) {
+        // Core's constructor is package private; its public parser preserves the native plugin contract.
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject();
-            builder.field("acknowledged", true);
+            for (var descriptor : selected.values()) {
+                builder.startObject(descriptor.name());
+                builder.field("type", descriptor.type());
+                builder.startObject("settings");
+                Settings.builder()
+                    .loadFromMap(descriptor.settings())
+                    .build()
+                    .toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+                builder.endObject();
+                builder.endObject();
+            }
             builder.endObject();
+            try (
+                var parser = XContentType.JSON.xContent()
+                    .createParser(
+                        NamedXContentRegistry.EMPTY,
+                        DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                        BytesReference.bytes(builder).streamInput()
+                    )
+            ) {
+                return GetRepositoriesResponse.fromXContent(parser);
+            }
+        }
+    }
+
+    private void respond(org.opensearch.rest.RestChannel channel, ToXContentObject response) throws IOException {
+        try (XContentBuilder builder = channel.newBuilder()) {
+            response.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
     }
 
-    private Map<String, Object> parseBody(RestRequest request) throws IOException {
-        try (XContentParser parser = request.contentOrSourceParamParser()) {
-            return parser.map();
-        }
-    }
-
-    /**
-     * Runs work off the transport thread, or inline when there is no node to borrow a pool from.
-     *
-     * <p>Every operation here touches the object store, and the transport thread is not the thread to
-     * wait on remote IO from — the same lesson the cluster-settings write path learned.
-     */
+    /** Runs object-store work and decoding off the HTTP transport thread. */
     private void dispatch(org.opensearch.rest.RestChannel channel, org.opensearch.common.CheckedRunnable<Exception> work) {
         final var serving = node.get();
         if (serving == null) {
@@ -329,20 +328,27 @@ public final class RepositoryHandler extends BaseRestHandler {
             work.run();
         } catch (Exception e) {
             try {
-                channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                if (e instanceof IndexAdminHandler.RefusedException refused) {
+                    channel.sendResponse(error(channel, refused.status, refused.type, refused.getMessage()));
+                } else if (e instanceof RepositoryInUseException) {
+                    channel.sendResponse(error(channel, RestStatus.CONFLICT, "repository_in_use", e.getMessage()));
+                } else {
+                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                }
             } catch (IOException nested) {
                 logger.error("failed to report a repository administration failure", nested);
             }
         }
     }
 
-    private <T> T gated(
+    private <T extends ActionResponse> T gated(
         String action,
-        org.opensearch.action.ActionRequest request,
-        org.opensearch.common.CheckedSupplier<T, Exception> work
+        ActionRequest request,
+        Class<T> responseType,
+        CheckedFunction<ActionRequest, T, Exception> work
     ) throws Exception {
         final var serving = node.get();
-        return serving == null ? work.get() : serving.actionGate().run(action, request, work);
+        return serving == null ? work.apply(request) : serving.actionGate().run(action, request, work, ActionGate.identity(responseType));
     }
 
     private static BytesRestResponse error(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason)
