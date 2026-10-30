@@ -166,15 +166,48 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                IndexAdminHandler.gate(
-                    serving,
-                    org.opensearch.action.fieldcaps.FieldCapabilitiesAction.NAME,
-                    new org.opensearch.action.fieldcaps.FieldCapabilitiesRequest().indices(index),
-                    () -> {
-                        answer(channel, metadata, serving, index, wantedFields);
-                        return null;
+                final var ask = new org.opensearch.action.fieldcaps.FieldCapabilitiesRequest().indices(
+                    org.opensearch.core.common.Strings.splitStringByCommaToArray(index)
+                ).fields(org.opensearch.core.common.Strings.splitStringByCommaToArray(wantedFields));
+                final var result = serving.actionGate().run(org.opensearch.action.fieldcaps.FieldCapabilitiesAction.NAME, ask, admitted -> {
+                    if (admitted instanceof org.opensearch.action.fieldcaps.FieldCapabilitiesRequest == false) {
+                        throw unsupported("field capabilities require a native field capabilities request");
                     }
-                );
+                    final var selected = (org.opensearch.action.fieldcaps.FieldCapabilitiesRequest) admitted;
+                    final var invalid = selected.validate();
+                    if (invalid != null) {
+                        throw new IllegalArgumentException(invalid.getMessage(), invalid);
+                    }
+                    if (selected.includeUnmapped() || selected.indexFilter() != null) {
+                        throw unsupported("unmapped capabilities and index filters are not supported");
+                    }
+                    if (selected.indicesOptions().equals(org.opensearch.action.support.IndicesOptions.strictExpandOpen()) == false) {
+                        throw unsupported("rewritten index expansion options are not supported for field capabilities");
+                    }
+                    if (selected.indices().length == 0) {
+                        throw unsupported("field capabilities require index names or a bounded prefix pattern");
+                    }
+                    return answer(metadata, serving, String.join(",", selected.indices()), selected.fields());
+                }, new org.opensearch.serverless.shell.ActionGate.ResponseView<CapabilitiesResult>() {
+                    @Override
+                    public org.opensearch.core.action.ActionResponse show(CapabilitiesResult value) {
+                        return value.response();
+                    }
+
+                    @Override
+                    public CapabilitiesResult read(org.opensearch.core.action.ActionResponse response, CapabilitiesResult original) {
+                        if (response instanceof org.opensearch.action.fieldcaps.FieldCapabilitiesResponse == false) {
+                            throw unsupported("field capabilities require a native field capabilities response");
+                        }
+                        return new CapabilitiesResult(
+                            (org.opensearch.action.fieldcaps.FieldCapabilitiesResponse) response,
+                            original == null ? java.util.Set.of() : original.metadataFields()
+                        );
+                    }
+                });
+                render(channel, result);
+            } catch (IndexAdminHandler.RefusedException e) {
+                sendQuietly(channel, e.status, e.type, e.getMessage());
             } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
@@ -187,22 +220,19 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
         });
     }
 
-    private void answer(
-        org.opensearch.rest.RestChannel channel,
+    private CapabilitiesResult answer(
         MetadataPlane metadata,
         org.opensearch.serverless.shell.ServerlessNode serving,
         String index,
-        String fields
+        String[] wanted
     ) throws Exception {
         final List<String> names = new java.util.ArrayList<>(IndexPatterns.expand(metadata, index, serving.patternCap()));
         // A plugin's index is not described through the request path, whatever spelling reached it.
         names.removeIf(serving::isSystemIndex);
         if (names.isEmpty()) {
-            sendQuietly(channel, RestStatus.BAD_REQUEST, "no_index", "name an index or a prefix pattern");
-            return;
+            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "no_index", "name an index or a prefix pattern");
         }
 
-        final String[] wanted = org.opensearch.core.common.Strings.splitStringByCommaToArray(fields);
         // field -> type -> the indices mapping it that way. Sorted so the answer is stable across calls,
         // which matters for a response a client may diff.
         final Map<String, Map<String, TreeSet<String>>> capabilities = new TreeMap<>();
@@ -221,8 +251,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                     // A pattern is a filter over what exists, not an assertion that anything does.
                     continue;
                 }
-                sendQuietly(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name);
-                return;
+                throw new IndexAdminHandler.RefusedException(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name);
             }
             answered.add(name);
             final MapperService mapperService = serving.indicesService()
@@ -279,47 +308,71 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
             }
         }
 
+        final Map<String, Map<String, org.opensearch.action.fieldcaps.FieldCapabilities>> fields = new TreeMap<>();
+        for (var field : capabilities.entrySet()) {
+            final Map<String, org.opensearch.action.fieldcaps.FieldCapabilities> types = new TreeMap<>();
+            for (var type : field.getValue().entrySet()) {
+                final String key = field.getKey() + " " + type.getKey();
+                final var cannotSearch = nonSearchable.get(key);
+                final var cannotAggregate = nonAggregatable.get(key);
+                final Map<String, java.util.Set<String>> meta = new TreeMap<>();
+                meta.putAll(fieldMetadata.getOrDefault(key, Map.of()));
+                types.put(
+                    type.getKey(),
+                    new org.opensearch.action.fieldcaps.FieldCapabilities(
+                        field.getKey(),
+                        type.getKey(),
+                        searchable.getOrDefault(key, Boolean.FALSE),
+                        aggregatable.getOrDefault(key, Boolean.FALSE),
+                        field.getValue().size() > 1 ? type.getValue().toArray(String[]::new) : null,
+                        cannotSearch != null && cannotSearch.size() < type.getValue().size() ? cannotSearch.toArray(String[]::new) : null,
+                        cannotAggregate != null && cannotAggregate.size() < type.getValue().size()
+                            ? cannotAggregate.toArray(String[]::new)
+                            : null,
+                        meta
+                    )
+                );
+            }
+            fields.put(field.getKey(), types);
+        }
+        return new CapabilitiesResult(
+            new org.opensearch.action.fieldcaps.FieldCapabilitiesResponse(answered.toArray(String[]::new), fields),
+            java.util.Set.copyOf(metadataFields)
+        );
+    }
+
+    /** The HTTP metadata-field extension is retained alongside the native filter-visible result. */
+    private record CapabilitiesResult(org.opensearch.action.fieldcaps.FieldCapabilitiesResponse response, java.util.Set<
+        String> metadataFields) {
+    }
+
+    private static void render(org.opensearch.rest.RestChannel channel, CapabilitiesResult result) throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
-            builder.startArray("indices");
-            for (String name : answered) {
-                builder.value(name);
-            }
-            builder.endArray();
+            builder.field("indices", result.response().getIndices());
             builder.startObject("fields");
-            for (Map.Entry<String, Map<String, TreeSet<String>>> field : capabilities.entrySet()) {
+            for (var field : result.response().get().entrySet()) {
                 builder.startObject(field.getKey());
-                for (Map.Entry<String, TreeSet<String>> type : field.getValue().entrySet()) {
-                    final String key = field.getKey() + " " + type.getKey();
+                for (var type : field.getValue().entrySet()) {
+                    final var capability = type.getValue();
                     builder.startObject(type.getKey());
-                    builder.field("type", type.getKey());
-                    // Conservative where indices disagree: a field is reported searchable only if it is
-                    // searchable everywhere it appears, because a query that works against one index and
-                    // silently matches nothing in another is worse than being told it cannot be run.
-                    builder.field("searchable", searchable.getOrDefault(key, Boolean.FALSE));
-                    builder.field("aggregatable", aggregatable.getOrDefault(key, Boolean.FALSE));
-                    final TreeSet<String> cannotSearch = nonSearchable.get(key);
-                    if (cannotSearch != null && cannotSearch.size() < type.getValue().size()) {
-                        builder.field("non_searchable_indices", cannotSearch);
+                    builder.field("type", capability.getType());
+                    builder.field("searchable", capability.isSearchable());
+                    builder.field("aggregatable", capability.isAggregatable());
+                    if (capability.nonSearchableIndices() != null) {
+                        builder.field("non_searchable_indices", capability.nonSearchableIndices());
                     }
-                    final TreeSet<String> cannotAggregate = nonAggregatable.get(key);
-                    if (cannotAggregate != null && cannotAggregate.size() < type.getValue().size()) {
-                        builder.field("non_aggregatable_indices", cannotAggregate);
+                    if (capability.nonAggregatableIndices() != null) {
+                        builder.field("non_aggregatable_indices", capability.nonAggregatableIndices());
                     }
-                    if (fieldMetadata.containsKey(key)) {
-                        builder.field("meta", fieldMetadata.get(key));
+                    if (capability.meta().isEmpty() == false) {
+                        builder.field("meta", capability.meta());
                     }
-                    if (metadataFields.contains(field.getKey())) {
+                    if (result.metadataFields().contains(field.getKey())) {
                         builder.field("metadata_field", true);
                     }
-                    if (field.getValue().size() > 1) {
-                        // Named only when there is a disagreement to attribute. OpenSearch omits this key
-                        // when every index agrees, and a client uses its presence to detect a conflict.
-                        builder.startArray("indices");
-                        for (String name : type.getValue()) {
-                            builder.value(name);
-                        }
-                        builder.endArray();
+                    if (capability.indices() != null) {
+                        builder.field("indices", capability.indices());
                     }
                     builder.endObject();
                 }
@@ -329,6 +382,10 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
+    }
+
+    private static org.opensearch.OpenSearchStatusException unsupported(String reason) {
+        return new org.opensearch.OpenSearchStatusException(reason, RestStatus.NOT_IMPLEMENTED);
     }
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
