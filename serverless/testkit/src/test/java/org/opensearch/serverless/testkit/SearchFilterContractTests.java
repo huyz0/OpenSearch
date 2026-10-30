@@ -191,6 +191,62 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
         }
     }
 
+    private static ShardOperations.SearchOutcome failedShard() {
+        return new ShardOperations.SearchOutcome(
+            1L,
+            List.of(),
+            2,
+            1,
+            null,
+            org.apache.lucene.search.TotalHits.Relation.EQUAL_TO,
+            Float.NaN,
+            false,
+            null,
+            List.of(new org.opensearch.action.search.ShardSearchFailure(new java.io.IOException("unreachable shard")))
+        );
+    }
+
+    public void testNativeSearchCanDisallowPartialResults() throws Exception {
+        try (var node = node(request -> {}, null)) {
+            final var request = new SearchRequest("private").allowPartialSearchResults(false);
+            final var failure = expectThrows(
+                Exception.class,
+                () -> SearchHandler.gated(node, request, List.of("private"), new SearchSourceBuilder(), source -> failedShard())
+            );
+            assertNotNull(failure.toString(), org.opensearch.ExceptionsHelper.unwrap(failure, java.io.IOException.class));
+            assertEquals("unreachable shard", org.opensearch.ExceptionsHelper.unwrap(failure, java.io.IOException.class).getMessage());
+        }
+    }
+
+    public void testFilterCanDisallowPartialResults() throws Exception {
+        try (var node = node(request -> request.allowPartialSearchResults(false), null)) {
+            final var failure = expectThrows(
+                Exception.class,
+                () -> SearchHandler.gated(node, List.of("private"), new SearchSourceBuilder(), source -> failedShard())
+            );
+            assertNotNull(failure.toString(), org.opensearch.ExceptionsHelper.unwrap(failure, java.io.IOException.class));
+            assertEquals("unreachable shard", org.opensearch.ExceptionsHelper.unwrap(failure, java.io.IOException.class).getMessage());
+        }
+    }
+
+    public void testNativeSearchCanAllowPartialResults() throws Exception {
+        try (var node = node(request -> {}, null)) {
+            final var request = new SearchRequest("private").allowPartialSearchResults(true);
+            final var outcome = SearchHandler.gated(node, request, List.of("private"), new SearchSourceBuilder(), source -> failedShard());
+            assertEquals(1, outcome.answered());
+            assertEquals(1, outcome.failures().size());
+        }
+    }
+
+    public void testFilterCanRelaxNativePartialResultsPolicy() throws Exception {
+        try (var node = node(request -> request.allowPartialSearchResults(true), null)) {
+            final var request = new SearchRequest("private").allowPartialSearchResults(false);
+            final var outcome = SearchHandler.gated(node, request, List.of("private"), new SearchSourceBuilder(), source -> failedShard());
+            assertEquals(1, outcome.answered());
+            assertEquals(1, outcome.failures().size());
+        }
+    }
+
     public void testAFilterCanRemoveTotalHitCounts() throws Exception {
         try (var node = node(request -> {}, null, SearchFilterContractTests::withoutTotals)) {
             final var source = new SearchSourceBuilder();

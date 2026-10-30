@@ -146,8 +146,51 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
         });
     }
 
+    public void testNativePartialResultsPolicyWithRealShardFailure() throws Exception {
+        withNodeAndMetadata(new org.opensearch.plugins.Plugin() {
+        }, (node, metadata) -> {
+            node.client()
+                .admin()
+                .indices()
+                .create(
+                    new org.opensearch.action.admin.indices.create.CreateIndexRequest("numbers").mapping(
+                        "{\"properties\":{\"msg\":{\"type\":\"long\"}}}",
+                        org.opensearch.common.xcontent.XContentType.JSON
+                    )
+                )
+                .actionGet();
+            final var numbers = node.activateWriter(metadata, "numbers", 0).orElseThrow();
+            node.client()
+                .index(
+                    new org.opensearch.action.index.IndexRequest("numbers").id("number")
+                        .source("{\"msg\":42}", org.opensearch.common.xcontent.XContentType.JSON)
+                )
+                .actionGet();
+            node.reconciler().shard(numbers).refresh("partial-results-test");
+            final var source = new SearchSourceBuilder().query(QueryBuilders.rangeQuery("msg").gte("aaa"));
+            final var request = new SearchRequest("docs", "numbers").source(source).allowPartialSearchResults(true);
+            final var partial = node.client().search(request).actionGet();
+            assertEquals(2, partial.getSuccessfulShards());
+            assertEquals(1, partial.getFailedShards());
+            assertEquals(2L, partial.getHits().getTotalHits().value());
+            request.allowPartialSearchResults(false);
+            final var failure = expectThrows(Exception.class, () -> node.client().search(request).actionGet());
+            assertNotNull(
+                failure.toString(),
+                org.opensearch.ExceptionsHelper.unwrap(failure, org.opensearch.index.query.QueryShardException.class)
+            );
+        });
+    }
+
     private void withNode(org.opensearch.plugins.Plugin plugin, org.opensearch.common.CheckedConsumer<ServerlessNode, Exception> work)
         throws Exception {
+        withNodeAndMetadata(plugin, (node, metadata) -> work.accept(node));
+    }
+
+    private void withNodeAndMetadata(
+        org.opensearch.plugins.Plugin plugin,
+        org.opensearch.common.CheckedBiConsumer<ServerlessNode, MetadataPlane, Exception> work
+    ) throws Exception {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
             final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
             final var settings = Settings.builder()
@@ -167,7 +210,7 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
                     node.index(shard, "doc-" + i, "{\"msg\":\"visible\"}");
                     node.reconciler().shard(shard).refresh("search-options-test");
                 }
-                work.accept(node);
+                work.accept(node, metadata);
             }
         }
     }
