@@ -187,7 +187,7 @@ public final class RolloverHandler extends BaseRestHandler {
 
     private void rollover(org.opensearch.rest.RestChannel channel, ServerlessNode serving, MetadataPlane metadata, Ask ask)
         throws Exception {
-        final DescriptorStore.Resolution resolved = metadata.resolve(ask.target());
+        final DescriptorStore.Resolution resolved = metadata.resolveForAliasMutation(ask.target());
         if (resolved.alias() == null) {
             sendQuietly(
                 channel,
@@ -200,6 +200,10 @@ public final class RolloverHandler extends BaseRestHandler {
             return;
         }
         final AliasRecord record = resolved.alias();
+        if (record.mutationPending()) {
+            sendQuietly(channel, RestStatus.CONFLICT, "version_conflict_engine_exception", "alias is being changed: " + ask.target());
+            return;
+        }
         final long generation = resolved.generation();
         final boolean bodyShapesIndex = ask.create().mapping != null
             || (ask.create().settings != null && ask.create().settings.isEmpty() == false);

@@ -182,3 +182,20 @@ New data-stream backing indices, including those created by rollover, enable cor
 timestamp value; rejected documents are not added to the WAL. Existing backing
 indices keep their stored mappings: roll over a stream to apply this validation
 to subsequent writes.
+
+Alias membership changes reserve the alias register before preparing reverse hints,
+then publish membership with a second compare-and-swap. Readers see the previous
+membership during an update and cannot see an unfinished creation. Newly added
+members force a descriptor swap even when the hint is already present, fencing
+concurrent cleanup. Failed or expired preparations restore the previous alias (or
+remove an unpublished creation); a delayed writer cannot publish afterward.
+Recovery uses the node lease TTL and runs when the alias is next accessed.
+Mutators back off for up to roughly 250 ms per attempt while another preparation
+is active, then report a retryable conflict if it remains busy.
+
+Upgrade all nodes together for this alias protocol. Stable alias records keep
+their previous encoding, but older nodes do not understand the temporary
+`mutation` field. Each membership change adds one alias register swap; hint
+preparation and cleanup read only the affected indices and alias, without a
+namespace listing. An abandoned preparation can retain harmless extra reverse
+hints until recovery; reverse lookups verify them against published membership.
