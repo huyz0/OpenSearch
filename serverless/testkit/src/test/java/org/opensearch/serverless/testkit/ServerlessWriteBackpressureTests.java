@@ -87,6 +87,33 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
         }
     }
 
+    /** Retrying a mapping update belongs to the write already admitted, even at the minimum limit. */
+    public void testDynamicMappingUsesOneWriteAdmission() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-dynamic-admission", 1, "{}", null));
+            final Settings settings = Settings.builder()
+                .put("node.name", "dynamic-admission")
+                .put("path.home", createTempDir())
+                .put("network.host", "127.0.0.1")
+                .put("http.port", "0")
+                .put("transport.port", "0")
+                .put("serverless.roles", "ingest")
+                .put("serverless.write.backpressure.min_in_flight", 1)
+                .put("serverless.write.backpressure.max_in_flight", 1)
+                .build();
+            try (var node = new ServerlessNode(settings)) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                node.index(id, "doc", "{\"new_field\":\"first\"}");
+                assertTrue(node.get(id, "doc").found());
+                node.index(id, "doc", "{\"new_field\":\"second\",\"another_field\":7}");
+                assertTrue(node.get(id, "doc").source().contains("second"));
+            }
+        }
+    }
+
     /** The limit falls on slow appends, refuses past it, and recovers on fast ones. */
     public void testTheLimitFollowsHowTheStoreAnswers() {
         final WriteBackpressure limiter = new WriteBackpressure(100, 1_000, 2, 16);
