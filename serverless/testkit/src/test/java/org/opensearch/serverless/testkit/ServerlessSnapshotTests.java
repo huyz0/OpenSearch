@@ -104,6 +104,27 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRepositoryMutationsCannotSilentlyListAllRepositories() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
+            try (var node = new ServerlessNode(nodeSettings("repository-selectors"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                assertEquals(200, standardRepo(node, "backups").status());
+                for (String selector : new String[] { "_all", "*" }) {
+                    for (String method : new String[] { "PUT", "POST", "DELETE" }) {
+                        final var response = send(node, method, "/_snapshot/" + selector, null);
+                        assertEquals(method + " " + selector + ": " + response.body(), 400, response.status());
+                    }
+                    final var response = send(node, "GET", "/_snapshot/" + selector, null);
+                    assertEquals(response.body(), 200, response.status());
+                    assertTrue(response.body(), response.body().contains("\"backups\""));
+                }
+                assertTrue(plane.describeRepository("backups").isPresent());
+            }
+        }
+    }
+
     /** A repository still holding a snapshot refuses deletion; empty, it deletes cleanly. */
     public void testARepositoryInUseRefusesDeletion() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
