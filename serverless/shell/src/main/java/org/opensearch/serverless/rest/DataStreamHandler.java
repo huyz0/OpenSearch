@@ -78,6 +78,15 @@ public final class DataStreamHandler extends BaseRestHandler {
         return String.format(Locale.ROOT, BACKING_INDEX_PREFIX + "%s-%06d", stream, generation);
     }
 
+    /** Applies the default timestamp mapping after templates and the request have been composed. */
+    static IndexAdminHandler.CreateRequest withTimestamp(
+        IndexAdminHandler.CreateRequest create,
+        String timestampField,
+        TemplateResolver.Inherited inherited
+    ) throws IOException {
+        return withTimestamp(create.withMapping(IndexAdminHandler.CreateRequest.mappingWith(create.mapping, inherited)), timestampField);
+    }
+
     /** A create request with the timestamp field mapped as a date, over whatever else it carried. */
     static IndexAdminHandler.CreateRequest withTimestamp(IndexAdminHandler.CreateRequest create, String timestampField) {
         final Map<String, Object> merged = new LinkedHashMap<>(Map.of("properties", Map.of(timestampField, Map.of("type", "date"))));
@@ -217,7 +226,7 @@ public final class DataStreamHandler extends BaseRestHandler {
             created = IndexAdminHandler.createIndex(
                 metadata,
                 backing,
-                withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), inherited.timestampField()),
+                withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), inherited.timestampField(), inherited),
                 inherited
             );
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
