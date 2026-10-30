@@ -182,6 +182,11 @@ public final class HookedBlobStore implements BlobStore {
     }
 
     @Override
+    public void validateKey(BlobPath path, String blobName) {
+        delegate.validateKey(path, blobName);
+    }
+
+    @Override
     public BlobContainer blobContainer(BlobPath path) {
         return new Hooked(delegate.blobContainer(path));
     }

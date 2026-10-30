@@ -348,6 +348,11 @@ public final class ObjectStores {
         }
 
         @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
+        }
+
+        @Override
         public BlobContainer blobContainer(BlobPath path) {
             return new Counting(delegate.blobContainer(path));
         }

@@ -478,6 +478,11 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         }
 
         @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
+        }
+
+        @Override
         public BlobContainer blobContainer(BlobPath path) {
             final BlobContainer honest = delegate.blobContainer(path);
             if (path.buildAsString().contains("/wal/t=") == false) {
@@ -518,6 +523,11 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         }
 
         @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
+        }
+
+        @Override
         public BlobContainer blobContainer(BlobPath path) {
             final BlobContainer honest = delegate.blobContainer(path);
             if (path.buildAsString().startsWith("shards/") == false) {
@@ -554,6 +564,11 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         ClaimHookingBlobStore(BlobStore delegate, Runnable onClaim) {
             this.delegate = delegate;
             this.onClaim = onClaim;
+        }
+
+        @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
         }
 
         @Override

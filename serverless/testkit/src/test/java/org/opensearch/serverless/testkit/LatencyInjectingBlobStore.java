@@ -69,6 +69,11 @@ final class LatencyInjectingBlobStore implements BlobStore {
     }
 
     @Override
+    public void validateKey(BlobPath path, String blobName) {
+        inner.validateKey(path, blobName);
+    }
+
+    @Override
     public BlobContainer blobContainer(BlobPath path) {
         return new Delayed(inner.blobContainer(path));
     }

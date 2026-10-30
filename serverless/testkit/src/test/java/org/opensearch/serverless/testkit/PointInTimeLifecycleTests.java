@@ -207,6 +207,11 @@ public class PointInTimeLifecycleTests extends OpenSearchTestCase {
         }
 
         @Override
+        public void validateKey(BlobPath path, String blobName) {
+            delegate.validateKey(path, blobName);
+        }
+
+        @Override
         public BlobContainer blobContainer(BlobPath path) {
             final var inner = delegate.blobContainer(path);
             if (path.buildAsString().contains("pit") == false) {

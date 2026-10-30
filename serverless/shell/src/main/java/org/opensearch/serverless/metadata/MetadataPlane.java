@@ -229,6 +229,12 @@ public final class MetadataPlane {
      * @throws IOException if the write fails
      */
     public long createIndex(IndexDescriptor descriptor) throws IOException {
+        // The longest shard key includes the UUID and the largest shard number. Refuse an unusable
+        // layout before acknowledging its descriptor, without creating directories or probing the store.
+        blobStore.validateKey(
+            RegisterMap.shardData(base, descriptor.name(), descriptor.uuid(), descriptor.numberOfShards() - 1),
+            org.opensearch.serverless.store.SegmentPublisher.MANIFEST
+        );
         // No clearing of the path here, and that is the point of putting the uuid in it: a uuid is minted
         // per create, so a new index's storage is somewhere no previous index of that name ever wrote.
         // Emptiness is a property of the path rather than of a sweep having finished.
