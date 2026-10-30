@@ -72,6 +72,46 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
         return ShardOps.hits(node.searchService(), shardId, "msg", text);
     }
 
+    public void testMappingRefreshCannotChangeAnotherIncarnation() throws Exception {
+        assertDescriptorRefreshIncarnation(true);
+    }
+
+    public void testSettingsRefreshCannotChangeAnotherIncarnation() throws Exception {
+        assertDescriptorRefreshIncarnation(false);
+    }
+
+    private void assertDescriptorRefreshIncarnation(boolean mapping) throws Exception {
+        final var clock = new AtomicLong(1000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = planeOver(store, clock);
+            final var original = new IndexDescriptor("alpha", "uuid-original-refresh", 1, MAPPING, null);
+            plane.createIndex(original);
+            try (var node = new ServerlessNode(nodeSettings("descriptor-refresh", "ingest"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                final var service = node.indicesService().indexService(id.getIndex());
+                final var before = service.getMetadata();
+                final var replacement = new IndexDescriptor("alpha", "uuid-replacement-refresh", 1, MAPPING, null);
+                final String changedMapping = "{\"properties\":{\"added\":{\"type\":\"keyword\"}}}";
+                final Settings changedSettings = Settings.builder().put("index.refresh_interval", "5s").build();
+                if (mapping) {
+                    node.reconciler().refreshMapping("alpha", replacement.withMapping(changedMapping));
+                } else {
+                    node.reconciler().refreshSettings("alpha", replacement.withSettings(changedSettings));
+                }
+                assertSame("metadata for another UUID must not touch the open service", before, service.getMetadata());
+                if (mapping) {
+                    node.reconciler().refreshMapping("alpha", original.withMapping(changedMapping));
+                    assertNotNull(service.mapperService().fieldType("added"));
+                } else {
+                    node.reconciler().refreshSettings("alpha", original.withSettings(changedSettings));
+                    assertEquals("5s", service.getMetadata().getSettings().get("index.refresh_interval"));
+                }
+            }
+        }
+    }
+
     public void testAStaleSearchPlanCannotReadARecreatedIndex() throws Exception {
         final var clock = new AtomicLong(1_000L);
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {

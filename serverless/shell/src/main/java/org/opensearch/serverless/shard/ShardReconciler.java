@@ -1468,15 +1468,9 @@ public final class ShardReconciler {
      * @throws IOException if core rejects the new mapping
      */
     public void refreshMapping(String indexName, org.opensearch.serverless.cluster.IndexDescriptor descriptor) throws IOException {
-        final Index index = openShards().stream()
-            .map(ShardId::getIndex)
-            .filter(each -> each.getName().equals(indexName))
-            .findFirst()
-            .orElse(null);
-        if (index == null) {
-            return;
-        }
-        final IndexService indexService = indicesService.indexService(index);
+        // A descriptor belongs to one incarnation. Name-only lookup can select a still-open service
+        // from before delete/recreate, and scanning every held shard also makes each refresh fleet-sized.
+        final IndexService indexService = indicesService.indexService(new Index(indexName, descriptor.uuid()));
         if (indexService == null) {
             return;
         }
@@ -1502,15 +1496,9 @@ public final class ShardReconciler {
      * @throws IOException if the new metadata cannot be built
      */
     public void refreshSettings(String indexName, org.opensearch.serverless.cluster.IndexDescriptor descriptor) throws IOException {
-        final Index index = openShards().stream()
-            .map(ShardId::getIndex)
-            .filter(each -> each.getName().equals(indexName))
-            .findFirst()
-            .orElse(null);
-        if (index == null) {
-            return;
-        }
-        final IndexService indexService = indicesService.indexService(index);
+        // A descriptor belongs to one incarnation. Name-only lookup can select a still-open service
+        // from before delete/recreate, and scanning every held shard also makes each refresh fleet-sized.
+        final IndexService indexService = indicesService.indexService(new Index(indexName, descriptor.uuid()));
         if (indexService == null) {
             return;
         }
