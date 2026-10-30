@@ -278,6 +278,92 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         }
     }
 
+    public void testBulkVersionDoesNotBecomeAnUnconditionalWrite() throws Exception {
+        assertBulkParsingRefused("{\"index\":{\"_id\":\"conditional\",\"version\":7}}\n{\"n\":9}\n", 200, "index");
+    }
+
+    public void testNestedConditionsCannotBecomeUnconditionalWrites() throws Exception {
+        assertBulkParsingRefused("{\"index\":{\"_id\":\"conditional\",\"if_seq_no\":{}}}\n{\"n\":9}\n", 400, null);
+    }
+
+    public void testExtraActionsOnOneLineAreRejected() throws Exception {
+        assertBulkParsingRefused("{\"index\":{\"_id\":\"conditional\"},\"delete\":{\"_id\":\"other\"}}\n{\"n\":9}\n", 400, null);
+    }
+
+    public void testUnsupportedActionsKeepTheirResponseName() throws Exception {
+        assertBulkParsingRefused("{\"update\":{\"_id\":\"conditional\"}}\n{\"doc\":{\"n\":9}}\n", 200, "update");
+    }
+
+    public void testDeleteWithoutAnIdIsNotARandomDeletion() throws Exception {
+        assertBulkParsingRefused("{\"delete\":{}}\n", 200, "delete");
+    }
+
+    public void testUnknownActionMetadataIsRejected() throws Exception {
+        assertBulkParsingRefused("{\"index\":{\"_id\":\"conditional\",\"if_sequence_no\":1}}\n{\"n\":9}\n", 400, null);
+    }
+
+    public void testTrailingActionObjectsAreRejected() throws Exception {
+        assertBulkParsingRefused("{\"index\":{\"_id\":\"conditional\"}} {\"delete\":{\"_id\":\"other\"}}\n{\"n\":9}\n", 400, null);
+    }
+
+    public void testCreateWithCompareAndSetIsRejected() throws Exception {
+        assertBulkParsingRefused(
+            "{\"create\":{\"_id\":\"conditional\",\"if_seq_no\":0,\"if_primary_term\":1}}\n{\"n\":9}\n",
+            200,
+            "create"
+        );
+    }
+
+    public void testNegativeSequenceConditionsAreRejected() throws Exception {
+        assertBulkParsingRefused("{\"index\":{\"_id\":\"conditional\",\"if_seq_no\":-1,\"if_primary_term\":1}}\n{\"n\":9}\n", 200, "index");
+    }
+
+    private void assertBulkParsingRefused(String body, int status, String action) throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = freshIndex(clock, createTempDir(), 1);
+        try (var node = new ServerlessNode(nodeSettings("bulk-parse-refusal"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final var loop = new BackgroundReconciler(node, plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            final Response response = send(node, "POST", "/alpha/_bulk?refresh=true", body);
+            assertEquals(response.body(), status, response.status());
+            if (action != null) {
+                assertTrue(response.body(), response.body().contains("\"errors\":true"));
+                final var parsed = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                    new org.opensearch.core.common.bytes.BytesArray(response.body()),
+                    false,
+                    org.opensearch.common.xcontent.XContentType.JSON
+                ).v2();
+                final var item = (java.util.Map<?, ?>) ((java.util.List<?>) parsed.get("items")).get(0);
+                assertTrue("preserve the submitted operation name: " + response.body(), item.containsKey(action));
+            }
+            assertEquals("a refused conditional operation must not write", 0, hits(node, "n", "9"));
+        }
+    }
+
+    public void testAnEmptySourceDoesNotConsumeTheNextAction() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        final var plane = freshIndex(clock, createTempDir(), 1);
+        try (var node = new ServerlessNode(nodeSettings("bulk-empty-source"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final var loop = new BackgroundReconciler(node, plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            final Response response = send(
+                node,
+                "POST",
+                "/alpha/_bulk?refresh=true",
+                "{\"index\":{\"_id\":\"empty\"}}\n\n" + indexLine("valid", 2)
+            );
+            assertEquals(response.body(), 200, response.status());
+            assertTrue(response.body(), response.body().contains("\"missing_source\""));
+            assertEquals("the next action keeps its own source", 1, hits(node, "n", "2"));
+        }
+    }
+
     /**
      * A batch spanning two nodes is one forwarded request per shard, not one per document.
      *
