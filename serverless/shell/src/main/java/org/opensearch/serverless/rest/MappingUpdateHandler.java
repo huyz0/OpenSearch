@@ -8,8 +8,12 @@
 
 package org.opensearch.serverless.rest;
 
+import org.opensearch.action.admin.indices.mapping.put.PutMappingAction;
+import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest;
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.compress.CompressedXContent;
+import org.opensearch.core.index.Index;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.mapper.MapperService;
@@ -18,6 +22,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shell.ActionGate;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -89,9 +94,8 @@ public final class MappingUpdateHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final String index = request.param("index");
-        final String body = request.hasContent() ? request.content().utf8ToString() : null;
-        // Hints; see IndexAdminHandler. write_index_only concerns an alias with a write index, which this
-        // surface does not have -- a mapping update names an index.
+        final var content = request.hasContent() ? request.content() : null;
+        final var mediaType = request.getMediaType();
         for (String hint : new String[] {
             "write_index_only",
             "timeout",
@@ -103,13 +107,11 @@ public final class MappingUpdateHandler extends BaseRestHandler {
             "include_type_name" }) {
             request.param(hint);
         }
-
-        if (body == null || body.isBlank()) {
+        if (content == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a mapping body is required")
             );
         }
-
         final MetadataPlane metadata = plane.get();
         final var serving = node.get();
         if (metadata == null || serving == null) {
@@ -117,18 +119,38 @@ public final class MappingUpdateHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                IndexAdminHandler.gate(
-                    serving,
-                    org.opensearch.action.admin.indices.mapping.put.PutMappingAction.NAME,
-                    new org.opensearch.action.admin.indices.mapping.put.PutMappingRequest(index),
-                    () -> {
-                        apply(channel, metadata, serving, index, body);
-                        return null;
+                final var nativeRequest = new PutMappingRequest(index).source(content, mediaType);
+                final var supportedOptions = nativeRequest.indicesOptions();
+                final var result = serving.actionGate().run(PutMappingAction.NAME, nativeRequest, admitted -> {
+                    final var selected = (PutMappingRequest) admitted;
+                    final var invalid = selected.validate();
+                    if (invalid != null) {
+                        throw invalid;
                     }
-                );
+                    if (selected.indicesOptions().equals(supportedOptions) == false) {
+                        throw new org.opensearch.OpenSearchStatusException(
+                            "mapping index options are not supported",
+                            RestStatus.NOT_IMPLEMENTED
+                        );
+                    }
+                    final Index concrete = selected.getConcreteIndex();
+                    final String selectedIndex;
+                    if (concrete != null) {
+                        selectedIndex = concrete.getName();
+                    } else if (selected.indices() != null && selected.indices().length == 1) {
+                        selectedIndex = selected.indices()[0];
+                    } else {
+                        throw new org.opensearch.OpenSearchStatusException(
+                            "a mapping update requires one concrete index",
+                            RestStatus.NOT_IMPLEMENTED
+                        );
+                    }
+                    org.opensearch.serverless.metadata.Names.validateIndexOrAlias(selectedIndex);
+                    return apply(metadata, serving, selectedIndex, concrete, selected.source());
+                }, responseView());
+                acknowledge(channel, result);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -139,64 +161,62 @@ public final class MappingUpdateHandler extends BaseRestHandler {
         });
     }
 
-    private void apply(
-        org.opensearch.rest.RestChannel channel,
+    private record MappingResult(AcknowledgedResponse response, String index, Boolean changed) {
+    }
+
+    private static ActionGate.ResponseView<MappingResult> responseView() {
+        return new ActionGate.ResponseView<>() {
+            @Override
+            public org.opensearch.core.action.ActionResponse show(MappingResult result) {
+                return result.response();
+            }
+
+            @Override
+            public MappingResult read(org.opensearch.core.action.ActionResponse response, MappingResult original) {
+                if (original != null && response == original.response()) {
+                    return original;
+                }
+                // A native cached or replaced acknowledgement has no index-specific extension fields.
+                return new MappingResult((AcknowledgedResponse) response, null, null);
+            }
+        };
+    }
+
+    private MappingResult apply(
         MetadataPlane metadata,
         org.opensearch.serverless.shell.ServerlessNode serving,
         String index,
+        Index concrete,
         String body
     ) throws Exception {
         for (int attempt = 0; attempt < ATTEMPTS; attempt++) {
             final long generation = metadata.descriptorGeneration(index);
             final Optional<IndexDescriptor> current = metadata.describe(index);
-            if (current.isEmpty()) {
-                channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
-                return;
+            if (current.isEmpty() || (concrete != null && concrete.getUUID().equals(current.get().uuid()) == false)) {
+                throw new org.opensearch.index.IndexNotFoundException(index);
             }
-
             final String merged;
             try {
                 merged = mergedMapping(serving, current.get(), body);
             } catch (IllegalArgumentException | org.opensearch.index.mapper.MapperParsingException e) {
-                // Core's own verdict on the change, reported as core worded it. A conflicting field type is
-                // the caller's mistake, not a server failure, so it is a 400 rather than a 500.
-                channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "illegal_argument_exception",
-                        e.getMessage() == null ? e.toString() : e.getMessage()
-                    )
+                throw new org.opensearch.OpenSearchStatusException(
+                    e.getMessage() == null ? e.toString() : e.getMessage(),
+                    RestStatus.BAD_REQUEST,
+                    e
                 );
-                return;
             }
-
             if (merged.equals(current.get().mapping())) {
-                // Nothing changed. Answering acknowledged without a write is the truthful answer and saves a
-                // swap, and it makes the operation idempotent -- a client replaying the same update is not
-                // punished for it.
-                acknowledge(channel, index, false);
-                return;
+                return new MappingResult(new AcknowledgedResponse(true), index, false);
             }
-
             final IndexDescriptor updated = current.get().withMapping(merged);
             if (metadata.updateDescriptor(updated, generation).isPresent()) {
-                // Applied to the shards this node holds. Every other node picks it up on its next reconcile
-                // pass, from the same descriptor -- there is no push, because there is nothing to push from.
                 serving.reconciler().refreshMapping(index, updated);
-                acknowledge(channel, index, true);
-                return;
+                return new MappingResult(new AcknowledgedResponse(true), index, true);
             }
-            // Another writer swapped first. Re-read and merge again, so both changes survive.
         }
-
-        channel.sendResponse(
-            IndexAdminHandler.error(
-                channel,
-                RestStatus.CONFLICT,
-                "version_conflict_engine_exception",
-                "the mapping for " + index + " is being changed concurrently; retry"
-            )
+        throw new org.opensearch.OpenSearchStatusException(
+            "the mapping for " + index + " is being changed concurrently; retry",
+            RestStatus.CONFLICT
         );
     }
 
@@ -266,14 +286,15 @@ public final class MappingUpdateHandler extends BaseRestHandler {
         }
     }
 
-    private static void acknowledge(org.opensearch.rest.RestChannel channel, String index, boolean changed) throws IOException {
+    private static void acknowledge(org.opensearch.rest.RestChannel channel, MappingResult result) throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
-            builder.field("acknowledged", true);
-            builder.field("index", index);
-            // Additive, and worth saying: a client replaying an update should be able to tell that it was a
-            // no-op from the answer rather than by diffing the mapping afterwards.
-            builder.field("changed", changed);
+            builder.field("acknowledged", result.response().isAcknowledged());
+            if (result.index() != null) {
+                builder.field("index", result.index());
+                // Preserve the existing additive no-op report when the native response is unchanged.
+                builder.field("changed", result.changed());
+            }
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
