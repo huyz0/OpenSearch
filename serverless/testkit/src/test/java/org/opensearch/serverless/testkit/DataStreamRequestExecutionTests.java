@@ -77,6 +77,26 @@ public class DataStreamRequestExecutionTests extends OpenSearchTestCase {
         }
     }
 
+    public void testDescribeReportsMissingBackingIndexAsRed() throws Exception {
+        withNode(PolicyFilterPlugin.request(GetDataStreamAction.NAME, request -> request), fixture -> {
+            final String backing = org.opensearch.cluster.metadata.DataStream.getDefaultBackingIndexName("stream-original", 1L);
+            assertTrue(fixture.metadata().deleteIndex(backing));
+            final var result = send(fixture.node(), "GET", "stream-original");
+            assertEquals(result.body(), 200, result.statusCode());
+            assertTrue(result.body(), result.body().contains("\"status\":\"RED\""));
+            assertTrue(result.body(), result.body().contains("\"index_uuid\":\"_na_\""));
+        });
+    }
+
+    public void testDescribeAnIntactEmptyStreamIsGreen() throws Exception {
+        withNode(PolicyFilterPlugin.request(GetDataStreamAction.NAME, request -> request), fixture -> {
+            final var result = send(fixture.node(), "GET", "stream-original");
+            assertEquals(result.body(), 200, result.statusCode());
+            assertTrue(result.body(), result.body().contains("\"status\":\"GREEN\""));
+            assertTrue(result.body(), result.body().contains("\"index_uuid\":\"uuid-stream-original\""));
+        });
+    }
+
     public void testCreateUsesTheAdmittedName() throws Exception {
         withNode(
             PolicyFilterPlugin.request(CreateDataStreamAction.NAME, request -> new CreateDataStreamAction.Request("stream-chosen")),

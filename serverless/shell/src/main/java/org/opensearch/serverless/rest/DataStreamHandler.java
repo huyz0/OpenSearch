@@ -407,10 +407,13 @@ public final class DataStreamHandler extends BaseRestHandler {
             org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response.DataStreamInfo>();
         for (AliasRecord stream : streams.values()) {
             final var indices = new java.util.ArrayList<org.opensearch.core.index.Index>();
+            var health = org.opensearch.cluster.health.ClusterHealthStatus.GREEN;
             for (String backing : stream.indices()) {
-                indices.add(
-                    new org.opensearch.core.index.Index(backing, metadata.describe(backing).map(IndexDescriptor::uuid).orElse("_na_"))
-                );
+                final var descriptor = metadata.describe(backing);
+                if (descriptor.isEmpty()) {
+                    health = org.opensearch.cluster.health.ClusterHealthStatus.RED;
+                }
+                indices.add(new org.opensearch.core.index.Index(backing, descriptor.map(IndexDescriptor::uuid).orElse("_na_")));
             }
             if (indices.isEmpty()) {
                 throw new IOException("data stream [" + stream.name() + "] has no backing indices");
@@ -424,7 +427,7 @@ public final class DataStreamHandler extends BaseRestHandler {
             result.add(
                 new org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response.DataStreamInfo(
                     nativeStream,
-                    org.opensearch.cluster.health.ClusterHealthStatus.GREEN,
+                    health,
                     templateNames.get(stream.name())
                 )
             );
