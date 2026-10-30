@@ -11,6 +11,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
@@ -52,6 +53,10 @@ public class SearchRetainedPayloadBudgetTests extends OpenSearchTestCase {
                 final String source = nested ? "{\"items\":[{\"payload\":\"" + payload + "\"}]}" : "{\"payload\":\"" + payload + "\"}";
                 final var written = send(node, "PUT", "/docs/_doc/id?refresh=true", source);
                 assertEquals(written.body(), 201, written.statusCode());
+                // Drain the translog's charged write buffer and the completed HTTP response before
+                // measuring search allocations; background cleanup can otherwise change the baseline.
+                node.reconciler().shard(new ShardId("docs", "uuid-docs", 0)).sync();
+                assertBusy(() -> assertEquals(0L, node.circuitBreakerService().getBreaker(CircuitBreaker.REQUEST).getUsed()));
                 work.accept(node);
             }
         }
