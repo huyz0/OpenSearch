@@ -427,10 +427,31 @@ public final class TemplateStore {
      * @throws IOException if listing or reading fails
      */
     public Map<String, String> withPrefix(String prefix) throws IOException {
-        final Map<String, String> matching = new LinkedHashMap<>();
-        for (Map.Entry<String, String> each : all().entrySet()) {
-            if (prefix.isEmpty() || each.getKey().startsWith(prefix)) {
-                matching.put(each.getKey(), each.getValue());
+        if (prefix.isEmpty()) {
+            return all();
+        }
+        try {
+            return withPrefix(prefix, readMarker());
+        } catch (MissingContentException e) {
+            // A selected revision was removed while reading. Retry the complete selection from a fresh marker.
+            return withPrefix(prefix, readMarker());
+        }
+    }
+
+    private Map<String, String> withPrefix(String prefix, Marker marker) throws IOException {
+        final Map<String, String> matching = new TreeMap<>();
+        if (marker.legacy()) {
+            for (String blob : container.listBlobsByPrefix(LEGACY_PREFIX + prefix).keySet()) {
+                if (blob.startsWith(LEGACY_PREFIX + prefix)) {
+                    final String name = blob.substring(LEGACY_PREFIX.length());
+                    legacyGet(name).ifPresent(source -> matching.put(name, source));
+                }
+            }
+        } else {
+            for (String name : marker.entries().keySet()) {
+                if (name.startsWith(prefix)) {
+                    get(name, marker).ifPresent(source -> matching.put(name, source));
+                }
             }
         }
         return matching;
