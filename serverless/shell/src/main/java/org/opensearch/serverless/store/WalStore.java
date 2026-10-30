@@ -442,7 +442,13 @@ public final class WalStore {
                 continue;
             }
             fence(older.getKey(), false, listed);
-            older.getValue().writeBlob(FENCED_MARKER, new ByteArrayInputStream(new byte[0]), 0L, false);
+            try {
+                // Immutable and shared by successors. Overwriting can unlink another filesystem
+                // writer's marker before it syncs; an existing marker already records this fact.
+                older.getValue().writeBlob(FENCED_MARKER, new ByteArrayInputStream(new byte[0]), 0L, true);
+            } catch (java.nio.file.FileAlreadyExistsException alreadyMarked) {
+                // Another successor installed the same marker.
+            }
         }
     }
 
