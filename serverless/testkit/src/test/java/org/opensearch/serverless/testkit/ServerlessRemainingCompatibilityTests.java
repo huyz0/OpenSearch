@@ -337,6 +337,46 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
         }
     }
 
+    public void testDataStreamPipelinesSeeTheBackingIndexForSingleAndBulkWrites() throws Exception {
+        try (Fixture f = fixture("stream-ingest-index")) {
+            Response answer = send(
+                f.node(),
+                "PUT",
+                "/_ingest/pipeline/observe-index",
+                "{\"processors\":[{\"set\":{\"field\":\"observed_index\",\"value\":\"{{_index}}\"}}]}"
+            );
+            assertEquals(answer.body(), 200, answer.status());
+            answer = send(
+                f.node(),
+                "PUT",
+                "/_index_template/events",
+                "{\"index_patterns\":[\"events*\"],\"data_stream\":{},\"template\":{\"settings\":{\"index.final_pipeline\":\"observe-index\"}}}"
+            );
+            assertEquals(answer.body(), 200, answer.status());
+            answer = send(f.node(), "PUT", "/_data_stream/events", null);
+            assertEquals(answer.body(), 200, answer.status());
+            f.loop().want(".ds-events-000001", 0);
+            f.loop().tick(f.clock().get());
+            final String source = "{\"@timestamp\":\"2026-10-30T00:00:00Z\",\"msg\":\"hello\"}";
+            answer = send(f.node(), "PUT", "/events/_create/single?refresh=true", source);
+            assertEquals(answer.body(), 201, answer.status());
+            answer = send(f.node(), "GET", "/.ds-events-000001/_doc/single", null);
+            assertEquals(answer.body(), 200, answer.status());
+            assertTrue(answer.body(), answer.body().contains("\"observed_index\":\".ds-events-000001\""));
+            answer = send(
+                f.node(),
+                "POST",
+                "/_bulk?refresh=true",
+                "{\"create\":{\"_index\":\"events\",\"_id\":\"bulk\"}}\n" + source + "\n"
+            );
+            assertEquals(answer.body(), 200, answer.status());
+            assertTrue(answer.body(), answer.body().contains("\"errors\":false"));
+            answer = send(f.node(), "GET", "/.ds-events-000001/_doc/bulk", null);
+            assertEquals(answer.body(), 200, answer.status());
+            assertTrue(answer.body(), answer.body().contains("\"observed_index\":\".ds-events-000001\""));
+        }
+    }
+
     /** Data streams: an alias with a generation, written through to its newest backing index. */
     public void testDataStreams() throws Exception {
         try (Fixture f = fixture("streams")) {
