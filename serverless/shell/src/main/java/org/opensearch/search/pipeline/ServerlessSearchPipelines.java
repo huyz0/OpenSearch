@@ -45,6 +45,8 @@ public final class ServerlessSearchPipelines {
     private final Map<String, Processor.Factory<SearchResponseProcessor>> responseFactories;
     private final NamedWriteableRegistry namedWriteableRegistry;
     private final SystemGeneratedPipelineHolder noSystemPipelines;
+    private final org.opensearch.serverless.pipeline.CompiledPipelineCache<Pipeline> compiled =
+        new org.opensearch.serverless.pipeline.CompiledPipelineCache<>();
 
     /**
      * Builds the processor factories from the common module, with what this node has.
@@ -128,7 +130,7 @@ public final class ServerlessSearchPipelines {
      * @throws Exception if a processor is unknown or misconfigured
      */
     public void validate(String id, String json) throws Exception {
-        compile(id, parse(json));
+        compiled(id, json);
     }
 
     private static Map<String, Object> parse(String json) {
@@ -145,7 +147,7 @@ public final class ServerlessSearchPipelines {
      * @throws Exception if a processor is unknown, misconfigured, or fails
      */
     public PipelinedRequest transformRequest(String id, String json, SearchRequest request) throws Exception {
-        return transformRequest(compile(id, parse(json)), request);
+        return transformRequest(compiled(id, json), request);
     }
 
     /**
@@ -159,6 +161,10 @@ public final class ServerlessSearchPipelines {
      */
     public PipelinedRequest transformRequest(String id, Map<String, Object> config, SearchRequest request) throws Exception {
         return transformRequest(compile(id, config), request);
+    }
+
+    private Pipeline compiled(String id, String json) throws Exception {
+        return compiled.get(id, json, () -> compile(id, parse(json)));
     }
 
     private Pipeline compile(String id, Map<String, Object> config) throws Exception {
