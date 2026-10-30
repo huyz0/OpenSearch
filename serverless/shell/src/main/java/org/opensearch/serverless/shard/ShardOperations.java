@@ -246,6 +246,13 @@ public final class ShardOperations {
         }
     }
 
+    /** A known capability refusal: retains the native exception contract and receives HTTP 501. */
+    public static final class UnsupportedRequestOptionException extends UnsupportedOperationException {
+        private UnsupportedRequestOptionException(String message) {
+            super(message);
+        }
+    }
+
     /** The index named does not exist. */
     public static final class NoSuchIndexException extends IOException {
 
@@ -612,16 +619,10 @@ public final class ShardOperations {
             throw validation;
         }
         if (request.routing() != null) {
-            throw new org.opensearch.OpenSearchStatusException(
-                "routing is not supported: documents are placed by their id",
-                org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
-            );
+            throw new UnsupportedRequestOptionException("routing is not supported: documents are placed by their id");
         }
         if (request.storedFields() != null) {
-            throw new org.opensearch.OpenSearchStatusException(
-                "stored_fields is not supported",
-                org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
-            );
+            throw new UnsupportedRequestOptionException("stored_fields is not supported");
         }
         final Read read = doGet(request.index(), request.id());
         final var document = read.document();
@@ -1683,10 +1684,7 @@ public final class ShardOperations {
                 throw validation;
             }
             if (accepted.indices().length != 1 || accepted.getRouting() != null) {
-                throw new org.opensearch.OpenSearchStatusException(
-                    "delete-by-query requires one concrete index and no routing",
-                    org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
-                );
+                throw new UnsupportedRequestOptionException("delete-by-query requires one concrete index and no routing");
             }
             final var search = accepted.getSearchRequest();
             final var acceptedQuery = search.source().query();
@@ -1698,9 +1696,8 @@ public final class ShardOperations {
                 || accepted.getSlices() != 1
                 || accepted.getRequestsPerSecond() != Float.POSITIVE_INFINITY
                 || accepted.getShouldStoreResult()) {
-                throw new org.opensearch.OpenSearchStatusException(
-                    "delete-by-query search options, slicing, throttling and stored tasks are not supported",
-                    org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
+                throw new UnsupportedRequestOptionException(
+                    "delete-by-query search options, slicing, throttling and stored tasks are not supported"
                 );
             }
             final long started = System.nanoTime();

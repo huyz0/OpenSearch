@@ -49,7 +49,17 @@ public class AdmittedRequestRefusalTests extends OpenSearchTestCase {
         );
     }
 
+    public void testUnrelatedUnsupportedFailuresRemainInternalErrors() throws Exception {
+        assertResponse(PolicyFilterPlugin.request(GetAction.NAME, request -> {
+            throw new UnsupportedOperationException("unexpected plugin failure");
+        }), false, 500);
+    }
+
     private void assertUnsupported(PolicyFilterPlugin plugin, boolean deletion) throws Exception {
+        assertResponse(plugin, deletion, 501);
+    }
+
+    private void assertResponse(PolicyFilterPlugin plugin, boolean deletion, int expectedStatus) throws Exception {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
             final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
             metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 1, "{}", null));
@@ -79,8 +89,12 @@ public class AdmittedRequestRefusalTests extends OpenSearchTestCase {
                         request.GET();
                     }
                     final var response = client.send(request.build(), HttpResponse.BodyHandlers.ofString());
-                    assertEquals(response.body(), 501, response.statusCode());
-                    assertTrue(response.body(), response.body().contains("not supported") || response.body().contains("no routing"));
+                    assertEquals(response.body(), expectedStatus, response.statusCode());
+                    if (expectedStatus == 501) {
+                        assertTrue(response.body(), response.body().contains("not supported") || response.body().contains("no routing"));
+                    } else {
+                        assertTrue(response.body(), response.body().contains("unexpected plugin failure"));
+                    }
                 }
                 assertTrue("refusal must not delete the document", node.get(shard, "kept").found());
             }
