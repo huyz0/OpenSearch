@@ -3528,6 +3528,25 @@ public final class ServerlessNode implements Closeable {
         String indexName,
         int shardNumber
     ) throws Exception {
+        return serveAsReader(plane, indexName, shardNumber, null);
+    }
+
+    /**
+     * Opens a reader only for the incarnation this request resolved.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index name
+     * @param shardNumber the shard number
+     * @param expectedUuid the resolved incarnation, or null for an unbound control-plane caller
+     * @return the shard to serve
+     * @throws Exception if opening fails or the name now resolves to another incarnation
+     */
+    public org.opensearch.core.index.shard.ShardId serveAsReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String expectedUuid
+    ) throws Exception {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
@@ -3540,6 +3559,7 @@ public final class ServerlessNode implements Closeable {
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final String openingKey = indexName + "#" + shardNumber;
         final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey);
+        requireReaderIncarnation(served, expectedUuid);
         try {
             validateReader(plane, indexName, shardNumber, served);
         } catch (ShardBehindLogException e) {
@@ -3548,10 +3568,20 @@ public final class ServerlessNode implements Closeable {
             }
             // The copy was on a replaced commit and has been let go: one open now is onto the current one.
             final org.opensearch.core.index.shard.ShardId reopened = openOrShareReader(plane, indexName, shardNumber, openingKey);
+            requireReaderIncarnation(reopened, expectedUuid);
             validateReader(plane, indexName, shardNumber, reopened);
             return reopened;
         }
         return served;
+    }
+
+    private static void requireReaderIncarnation(org.opensearch.core.index.shard.ShardId actual, String expectedUuid)
+        throws StaleIncarnationException {
+        if (expectedUuid != null && expectedUuid.equals(actual.getIndex().getUUID()) == false) {
+            throw new StaleIncarnationException(
+                new org.opensearch.core.index.shard.ShardId(actual.getIndexName(), expectedUuid, actual.id())
+            );
+        }
     }
 
     /**

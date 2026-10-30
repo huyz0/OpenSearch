@@ -72,6 +72,81 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
         return ShardOps.hits(node.searchService(), shardId, "msg", text);
     }
 
+    public void testAStaleSearchPlanCannotReadARecreatedIndex() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = planeOver(store, clock);
+            final var original = new IndexDescriptor("recreated", "uuid-original", 1, MAPPING, null);
+            plane.createIndex(original);
+            assertTrue(plane.deleteIndex("recreated"));
+            plane.createIndex(new IndexDescriptor("recreated", "uuid-replacement", 2, MAPPING, null));
+            try (var node = new ServerlessNode(nodeSettings("reader-plan-incarnation", "ingest"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var writer = node.activateWriter(plane, "recreated", 0).orElseThrow();
+                node.index(writer, "new-document", "{\"msg\":\"replacement\",\"n\":1}");
+                node.reconciler().shard(writer).refresh("test");
+                node.publishShard(writer, plane.heads().read("recreated", 0).orElseThrow().term());
+                final var failure = expectThrows(
+                    IOException.class,
+                    () -> org.opensearch.serverless.rest.SearchFanout.run(
+                        node,
+                        plane,
+                        original,
+                        new org.opensearch.search.builder.SearchSourceBuilder().size(10)
+                    )
+                );
+                assertNotNull(
+                    "the old plan must fail instead of returning replacement documents",
+                    org.opensearch.ExceptionsHelper.unwrap(failure, org.opensearch.serverless.shell.StaleIncarnationException.class)
+                );
+            }
+        }
+    }
+
+    public void testAStaleGetPlanDoesNotReadReplacementDocuments() throws Exception {
+        assertStaleSingleDocumentPlan(false);
+    }
+
+    public void testAStaleExplainPlanDoesNotReadReplacementDocuments() throws Exception {
+        assertStaleSingleDocumentPlan(true);
+    }
+
+    private void assertStaleSingleDocumentPlan(boolean explain) throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = planeOver(store, clock);
+            final var original = new IndexDescriptor("recreated", "uuid-original", 1, MAPPING, null);
+            plane.createIndex(original);
+            assertTrue(plane.deleteIndex("recreated"));
+            plane.createIndex(new IndexDescriptor("recreated", "uuid-replacement", 1, MAPPING, null));
+            try (var node = new ServerlessNode(nodeSettings("reader-document-incarnation", "ingest"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var writer = node.activateWriter(plane, "recreated", 0).orElseThrow();
+                node.index(writer, "new-document", "{\"msg\":\"replacement\",\"n\":1}");
+                node.reconciler().shard(writer).refresh("test");
+                final long term = plane.heads().read("recreated", 0).orElseThrow().term();
+                node.publishShard(writer, term);
+                assertTrue(plane.heads().release("recreated", 0, node.localNode().getId(), term));
+                node.releaseShard(writer, "the replacement is served only from its published commit");
+                final var operations = new org.opensearch.serverless.shard.ShardOperations(node, plane);
+                operations.assumeDescribed(original);
+                if (explain) {
+                    assertFalse(
+                        "an old placement must not explain the replacement document",
+                        operations.explain("recreated", "new-document", org.opensearch.index.query.QueryBuilders.matchAllQuery()).exists()
+                    );
+                } else {
+                    assertFalse(
+                        "an old placement must not read the replacement document",
+                        operations.get("recreated", "new-document").document().found()
+                    );
+                }
+            }
+        }
+    }
+
     /**
      * A writer fenced after a local flush, later serving the same shard as a reader, serves the successor's
      * segment and not its own of the same name.
