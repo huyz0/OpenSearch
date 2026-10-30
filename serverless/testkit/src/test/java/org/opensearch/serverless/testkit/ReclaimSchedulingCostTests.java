@@ -35,6 +35,25 @@ public class ReclaimSchedulingCostTests extends OpenSearchTestCase {
         }
     }
 
+    public void testNoMembershipReadsWithoutDueTombstones() throws Exception {
+        for (boolean future : new boolean[] { false, true }) {
+            final var clock = new AtomicLong(1_000L);
+            try (var counter = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+                final var metadata = new MetadataPlane(counter, BlobPath.cleanPath(), clock::get, 30_000L);
+                metadata.descriptors().setConditionalDelete(false);
+                if (future) {
+                    metadata.createIndex(new org.opensearch.serverless.cluster.IndexDescriptor("old-index", "uuid-old", 1, null, null));
+                    assertTrue(metadata.deleteIndex("old-index"));
+                }
+                metadata.descriptors().setConditionalDelete(true);
+                counter.reset();
+                assertTrue(new GarbageCollector(counter, BlobPath.cleanPath()).collectTombstones(metadata, clock.get(), "self").isEmpty());
+                assertEquals(counter.breakdown(), 0L, counter.registerReads());
+                assertEquals("only discovery of due buckets is needed: " + counter.breakdown(), 1L, counter.reads());
+            }
+        }
+    }
+
     public void testDueBucketsStillUseMembershipAndAreDrained() throws Exception {
         final var clock = new AtomicLong(1_000L);
         try (var counter = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false))) {

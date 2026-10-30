@@ -553,19 +553,25 @@ public final class GarbageCollector {
      * @throws IOException if membership cannot be read, or listing, reading or deleting fails
      */
     public List<String> collectTombstones(MetadataPlane plane, long nowMillis, String selfId) throws IOException {
-        // Refreshed first: an idle node's view is only as fresh as its last request, and a stale one that
-        // still listed a dead node would leave that node's buckets to nobody until something woke it.
         final java.util.Set<String> members = new java.util.TreeSet<>();
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().refreshIfOlderThan(plane.leaseTtlMillis() / 2)) {
-            members.add(lease.nodeId());
+        try {
+            return plane.descriptors().sweepTombstones(nowMillis, DescriptorStore.DEFAULT_TOMBSTONE_QUARANTINE_MILLIS, bucket -> {
+                if (members.isEmpty()) {
+                    try {
+                        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership()
+                            .refreshIfOlderThan(plane.leaseTtlMillis() / 2)) {
+                            members.add(lease.nodeId());
+                        }
+                    } catch (IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                    members.add(selfId);
+                }
+                return selfId.equals(org.opensearch.serverless.cluster.Rendezvous.owner("tombstones/" + bucket, members));
+            });
+        } catch (java.io.UncheckedIOException e) {
+            throw e.getCause();
         }
-        members.add(selfId);
-        return plane.descriptors()
-            .sweepTombstones(
-                nowMillis,
-                DescriptorStore.DEFAULT_TOMBSTONE_QUARANTINE_MILLIS,
-                bucket -> selfId.equals(org.opensearch.serverless.cluster.Rendezvous.owner("tombstones/" + bucket, members))
-            );
     }
 
     /**
