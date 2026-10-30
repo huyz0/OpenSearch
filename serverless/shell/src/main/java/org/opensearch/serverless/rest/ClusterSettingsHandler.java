@@ -13,7 +13,6 @@ import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest
 import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
@@ -49,7 +48,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
      * Creates the handler.
      *
      * @param plane supplies the metadata plane
-     * @param node supplies the node, for the write path's action gate
+     * @param node supplies the node, for the read and write action gates
      */
     public ClusterSettingsHandler(Supplier<MetadataPlane> plane, Supplier<ServerlessNode> node) {
         this.plane = plane;
@@ -70,8 +69,8 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
     @SuppressWarnings("unchecked")
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final MetadataPlane metadata = plane.get();
-        // Hints: there are no defaults rendered from a settings registry here, and no cluster manager to
-        // time out against. flat_settings is consumed; settings here are rendered nested.
+        // There is no defaults registry or cluster manager to time out against. Formatting is passed
+        // to the native response serializer after the action filters finish.
         request.param("include_defaults");
         request.param("master_timeout");
         request.param("cluster_manager_timeout");
@@ -84,34 +83,69 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         }
 
         if (request.method() == RestRequest.Method.GET) {
-            // Off the transport thread and through the gate, as the PUT below already is: a read of the
-            // config register is an object-store round trip, and a filter that guards cluster state must
-            // see the read as well as the write.
             final ServerlessNode reader = node.get();
-            return channel -> {
-                final Runnable read = () -> {
-                    try {
-                        final Settings current = IndexAdminHandler.gate(
-                            reader,
-                            org.opensearch.action.admin.cluster.state.ClusterStateAction.NAME,
-                            new org.opensearch.action.admin.cluster.state.ClusterStateRequest(),
-                            () -> metadata.clusterConfig().read().settings()
+            if (reader == null) {
+                return channel -> channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable")
+                );
+            }
+            final var nativeRequest = new org.opensearch.action.admin.cluster.state.ClusterStateRequest().clear().metadata(true);
+            final var indicesOptions = nativeRequest.indicesOptions();
+            return channel -> reader.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
+                try {
+                    final var result = reader.actionGate()
+                        .run(org.opensearch.action.admin.cluster.state.ClusterStateAction.NAME, nativeRequest, admitted -> {
+                            final var selected = (org.opensearch.action.admin.cluster.state.ClusterStateRequest) admitted;
+                            final var invalid = selected.validate();
+                            if (invalid != null) {
+                                throw invalid;
+                            }
+                            if (selected.routingTable()
+                                || selected.nodes()
+                                || selected.blocks()
+                                || selected.customs()
+                                || selected.indices().length != 0
+                                || selected.indicesOptions().equals(indicesOptions) == false
+                                || selected.waitForMetadataVersion() != null) {
+                                throw new org.opensearch.OpenSearchStatusException(
+                                    "cluster settings reads support global configuration metadata only; fleet state, index selection "
+                                        + "and metadata-version waits are not supported",
+                                    RestStatus.NOT_IMPLEMENTED
+                                );
+                            }
+                            final Settings current = selected.metadata() ? metadata.clusterConfig().read().settings() : Settings.EMPTY;
+                            final var clusterName = new org.opensearch.cluster.ClusterName(reader.clusterName());
+                            // This endpoint exposes the global settings projection, not fleet topology or index metadata.
+                            final var state = org.opensearch.cluster.ClusterState.builder(clusterName)
+                                .metadata(org.opensearch.cluster.metadata.Metadata.builder().persistentSettings(current))
+                                .build();
+                            return new org.opensearch.action.admin.cluster.state.ClusterStateResponse(clusterName, state, false);
+                        },
+                            org.opensearch.serverless.shell.ActionGate.identity(
+                                org.opensearch.action.admin.cluster.state.ClusterStateResponse.class
+                            )
                         );
-                        respond(channel, current, false);
-                    } catch (Exception e) {
-                        try {
-                            channel.sendResponse(IndexAdminHandler.failure(channel, e));
-                        } catch (IOException nested) {
-                            logger.error("failed to report a cluster settings read failure", nested);
-                        }
+                    if (result.isWaitForTimedOut()) {
+                        throw new org.opensearch.OpenSearchStatusException("cluster settings read timed out", RestStatus.REQUEST_TIMEOUT);
                     }
-                };
-                if (reader == null) {
-                    read.run();
-                    return;
+                    final var state = java.util.Objects.requireNonNull(result.getState(), "cluster settings response has no state");
+                    final var settings = new org.opensearch.action.admin.cluster.settings.ClusterGetSettingsResponse(
+                        state.metadata().persistentSettings(),
+                        state.metadata().transientSettings(),
+                        Settings.EMPTY
+                    );
+                    try (var builder = channel.newBuilder()) {
+                        settings.toXContent(builder, channel.request());
+                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                    }
+                } catch (Exception e) {
+                    try {
+                        channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    } catch (IOException nested) {
+                        logger.error("failed to report a cluster settings read failure", nested);
+                    }
                 }
-                reader.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(read);
-            };
+            });
         }
 
         final var content = request.hasContent() ? request.content() : null;
@@ -173,7 +207,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                     return nativeResponse(metadata.clusterConfig().update(flat));
                 }, org.opensearch.serverless.shell.ActionGate.identity(ClusterUpdateSettingsResponse.class));
                 try (var builder = channel.newBuilder()) {
-                    result.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+                    result.toXContent(builder, channel.request());
                     channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                 }
             } catch (Exception e) {
@@ -223,22 +257,4 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         }
     }
 
-    private void respond(org.opensearch.rest.RestChannel channel, Settings settings, boolean acknowledged) throws IOException {
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            // Only on the write path -- real OpenSearch's own GET has no such field, and a caller reading
-            // it there would find nothing rather than a stale or invented value.
-            if (acknowledged) {
-                builder.field("acknowledged", true);
-            }
-            builder.startObject("persistent");
-            settings.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
-            builder.endObject();
-            // Always present and always empty: a client that reads response.transient expecting an
-            // object, rather than checking whether the key exists at all, gets one.
-            builder.startObject("transient").endObject();
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
-    }
 }
