@@ -398,6 +398,33 @@ public final class ShardHeadStore {
         return deleteIfUnchanged(readAllOf(indexName, numberOfShards, indexUuid));
     }
 
+    /**
+     * Releases matching heads by CAS when the backend cannot delete registers conditionally.
+     *
+     * <p>The unowned register retains its term: deleting by name could erase a replacement's live head,
+     * allowing another writer to acquire it. Recreated indices overwrite this small record at a higher term.
+     *
+     * @param indexName the deleted index name
+     * @param numberOfShards its shard count
+     * @param indexUuid its selected incarnation
+     * @return how many owned heads were released
+     * @throws IOException if a head cannot be read or swapped
+     */
+    public int releaseAllOf(String indexName, int numberOfShards, String indexUuid) throws IOException {
+        int released = 0;
+        for (HeadAt existing : readAllOf(indexName, numberOfShards, indexUuid)) {
+            final ShardHead head = existing.head();
+            if (head.ownerNodeId() == null) {
+                continue;
+            }
+            final ShardHead unowned = new ShardHead(head.indexName(), head.shardId(), head.term(), null, null, 0L, head.indexUuid());
+            if (container.compareAndSwapRegister(existing.blobName(), existing.generation(), unowned.toBytes()).applied()) {
+                released++;
+            }
+        }
+        return released;
+    }
+
     /** A head of one incarnation, as read, and the generation it was read at. */
     public record HeadAt(String blobName, long generation, ShardHead head) {
     }
