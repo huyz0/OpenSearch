@@ -176,3 +176,9 @@ and capture covers every shard of one concrete index. Node-scoped listing,
 routing and preference selectors, and cached or replaced native PIT response objects are
 refused with 501 instead of silently returning a different result. Response
 buffering uses the HTTP channel's accounted output buffers.
+
+New data-stream backing indices, including those created by rollover, enable core's
+`_data_stream_timestamp` mapper. Single and bulk writes must contain exactly one
+timestamp value; rejected documents are not added to the WAL. Existing backing
+indices keep their stored mappings: roll over a stream to apply this validation
+to subsequent writes.

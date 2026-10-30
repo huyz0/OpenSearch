@@ -468,7 +468,9 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
             final var descriptor = f.plane().describe(name).orElseThrow();
             final Map<String, Object> expected = Map.of(
                 "properties",
-                Map.of("@timestamp", Map.of("type", "date_nanos", "format", "strict_date_optional_time_nanos"))
+                Map.of("@timestamp", Map.of("type", "date_nanos", "format", "strict_date_optional_time_nanos")),
+                "_data_stream_timestamp",
+                Map.of("enabled", true, "timestamp_field", Map.of("name", "@timestamp"))
             );
             assertEquals(
                 expected,
@@ -477,6 +479,115 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
                     false,
                     org.opensearch.common.xcontent.XContentType.JSON
                 ).v2()
+            );
+        }
+    }
+
+    public void testDataStreamWritesRequireATimestamp() throws Exception {
+        assertDataStreamTimestampDocument("{\"msg\":\"missing\"}", false, false, 400);
+    }
+
+    public void testDataStreamWritesRequireASingleTimestampValue() throws Exception {
+        assertDataStreamTimestampDocument(
+            "{\"@timestamp\":[\"2026-10-30T00:00:00Z\",\"2026-10-30T00:00:01Z\"],\"msg\":\"two-values\"}",
+            false,
+            false,
+            400
+        );
+    }
+
+    public void testBulkDataStreamWritesRequireATimestamp() throws Exception {
+        assertDataStreamTimestampDocument("{\"msg\":\"missing\"}", true, false, 400);
+    }
+
+    public void testRolledDataStreamWritesStillRequireATimestamp() throws Exception {
+        assertDataStreamTimestampDocument("{\"msg\":\"missing\"}", false, true, 400);
+    }
+
+    public void testDataStreamWritesAcceptOneTimestamp() throws Exception {
+        assertDataStreamTimestampDocument("{\"@timestamp\":\"2026-10-30T00:00:00Z\",\"msg\":\"valid\"}", false, false, 201);
+    }
+
+    private void assertDataStreamTimestampDocument(String document, boolean bulk, boolean rollover, int expectedStatus) throws Exception {
+        try (Fixture f = fixture("stream-timestamp-document")) {
+            final Response template = send(
+                f.node(),
+                "PUT",
+                "/_index_template/events",
+                "{\"index_patterns\":[\"events*\"],\"data_stream\":{},\"template\":{\"mappings\":" + MAPPING + "}}"
+            );
+            assertEquals(template.body(), 200, template.status());
+            final Response created = send(f.node(), "PUT", "/_data_stream/events", null);
+            assertEquals(created.body(), 200, created.status());
+            String backing = ".ds-events-000001";
+            if (rollover) {
+                final Response rolled = send(f.node(), "POST", "/events/_rollover", null);
+                assertEquals(rolled.body(), 200, rolled.status());
+                backing = ".ds-events-000002";
+            }
+            f.loop().want(backing, 0);
+            f.loop().tick(f.clock().get());
+            if (bulk) {
+                final Response response = send(
+                    f.node(),
+                    "POST",
+                    "/_bulk",
+                    "{\"create\":{\"_index\":\"events\",\"_id\":\"timestamp-case\"}}\n" + document + "\n"
+                );
+                assertEquals(response.body(), 200, response.status());
+                assertTrue(response.body(), response.body().contains("\"status\":" + expectedStatus));
+            } else {
+                final Response response = send(f.node(), "PUT", "/events/_create/timestamp-case", document);
+                assertEquals(response.body(), expectedStatus, response.status());
+            }
+            if (expectedStatus == 400) {
+                final Response got = send(f.node(), "GET", "/" + backing + "/_doc/timestamp-case", null);
+                assertEquals(got.body(), 404, got.status());
+                final var descriptor = f.plane().describe(backing).orElseThrow();
+                assertTrue(
+                    "invalid source must never enter the durable replay log",
+                    f.plane()
+                        .walStore(backing, descriptor.uuid(), 0)
+                        .replayable()
+                        .stream()
+                        .noneMatch(record -> record.id().equals("timestamp-case"))
+                );
+            }
+        }
+    }
+
+    public void testDataStreamValidationUsesTheCustomNanosecondTimestampField() throws Exception {
+        try (Fixture f = fixture("custom-stream-timestamp")) {
+            final String template =
+                "{\"index_patterns\":[\"events*\"],\"data_stream\":{\"timestamp_field\":{\"name\":\"observed_at\"}},\"template\":{\"mappings\":{\"properties\":{\"observed_at\":{\"type\":\"date_nanos\",\"format\":\"strict_date_optional_time_nanos\"},\"msg\":{\"type\":\"keyword\"}}}}}";
+            final Response stored = send(f.node(), "PUT", "/_index_template/events", template);
+            assertEquals(stored.body(), 200, stored.status());
+            final Response created = send(f.node(), "PUT", "/_data_stream/events", null);
+            assertEquals(created.body(), 200, created.status());
+            f.loop().want(".ds-events-000001", 0);
+            f.loop().tick(f.clock().get());
+            final Response valid = send(
+                f.node(),
+                "PUT",
+                "/events/_create/valid",
+                "{\"observed_at\":\"2026-10-30T00:00:00.123456789Z\",\"msg\":\"valid\"}"
+            );
+            assertEquals(valid.body(), 201, valid.status());
+            final Response wrongField = send(
+                f.node(),
+                "PUT",
+                "/events/_create/invalid",
+                "{\"@timestamp\":\"2026-10-30T00:00:00Z\",\"msg\":\"wrong-field\"}"
+            );
+            assertEquals(wrongField.body(), 400, wrongField.status());
+            assertFalse(f.node().get(f.node().reconciler().openShards().iterator().next(), "invalid").found());
+            final var descriptor = f.plane().describe(".ds-events-000001").orElseThrow();
+            assertTrue(
+                f.plane()
+                    .walStore(descriptor.name(), descriptor.uuid(), 0)
+                    .replayable()
+                    .stream()
+                    .noneMatch(record -> record.id().equals("invalid"))
             );
         }
     }

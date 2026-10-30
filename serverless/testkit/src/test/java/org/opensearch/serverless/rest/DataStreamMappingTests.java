@@ -20,7 +20,15 @@ public class DataStreamMappingTests extends OpenSearchTestCase {
     public void testTimestampFieldNamesAreJsonEscaped() throws Exception {
         final String field = "event\"time\\stamp";
         final var request = DataStreamHandler.withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), field);
-        assertEquals(Map.of("properties", Map.of(field, Map.of("type", "date"))), mapping(request));
+        assertEquals(
+            Map.of(
+                "properties",
+                Map.of(field, Map.of("type", "date")),
+                "_data_stream_timestamp",
+                Map.of("enabled", true, "timestamp_field", Map.of("name", field))
+            ),
+            mapping(request)
+        );
     }
 
     public void testTimestampMappingKeepsAnExplicitShardCount() throws Exception {
@@ -34,7 +42,12 @@ public class DataStreamMappingTests extends OpenSearchTestCase {
 
     public void testExistingTimestampTypeAndFormatArePreserved() throws Exception {
         final var definition = Map.of("type", "date_nanos", "format", "strict_date_optional_time_nanos");
-        final var mapping = Map.of("properties", Map.of("@timestamp", definition));
+        final var mapping = Map.of(
+            "properties",
+            Map.of("@timestamp", definition),
+            "_data_stream_timestamp",
+            Map.of("enabled", true, "timestamp_field", Map.of("name", "@timestamp"))
+        );
         final var original = new IndexAdminHandler.CreateRequest(
             1,
             "{\"properties\":{\"@timestamp\":{\"type\":\"date_nanos\",\"format\":\"strict_date_optional_time_nanos\"}}}",
@@ -45,5 +58,18 @@ public class DataStreamMappingTests extends OpenSearchTestCase {
 
     private static Map<String, Object> mapping(IndexAdminHandler.CreateRequest request) {
         return XContentHelper.convertToMap(new BytesArray(request.mapping), false, XContentType.JSON).v2();
+    }
+
+    public void testAProvidedMappingCannotDisableTheTimestampGuard() throws Exception {
+        final var original = new IndexAdminHandler.CreateRequest(
+            1,
+            "{\"_data_stream_timestamp\":{\"enabled\":false,\"timestamp_field\":{\"name\":\"other\"}}}",
+            Settings.EMPTY
+        );
+        final var selected = DataStreamHandler.withTimestamp(original, "@timestamp");
+        assertEquals(
+            Map.of("enabled", true, "timestamp_field", Map.of("name", "@timestamp")),
+            mapping(selected).get("_data_stream_timestamp")
+        );
     }
 }
