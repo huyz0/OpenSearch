@@ -65,6 +65,38 @@ public class MetadataPlaneTests extends OpenSearchTestCase {
         assertEquals(2, read.get().numberOfShards());
     }
 
+    public void testRecordedCreationVersionReachesTheDataPlane() throws Exception {
+        final var original = alpha().createdAt(1_000L, org.opensearch.Version.V_3_0_0.id);
+        final var read = IndexDescriptor.fromStream(original.toBytes().streamInput());
+        assertEquals(org.opensearch.Version.V_3_0_0, read.toIndexMetadata(java.util.Map.of()).getCreationVersion());
+        assertEquals(org.opensearch.Version.V_3_0_0, read.routingMetadata().getCreationVersion());
+        assertEquals(
+            "legacy descriptors retain the old fallback",
+            org.opensearch.Version.CURRENT,
+            alpha().toIndexMetadata(java.util.Map.of()).getCreationVersion()
+        );
+    }
+
+    public void testDescriptorIdentityOverridesExtraSettings() throws Exception {
+        final var descriptor = new IndexDescriptor(
+            "identity",
+            "uuid-identity",
+            2,
+            null,
+            Settings.builder()
+                .put("index.uuid", "wrong-uuid")
+                .put("index.number_of_shards", 7)
+                .put("index.number_of_replicas", 4)
+                .put("index.version.created", org.opensearch.Version.CURRENT.id)
+                .build()
+        ).createdAt(1_000L, org.opensearch.Version.V_3_0_0.id);
+        final var metadata = descriptor.toIndexMetadata(java.util.Map.of());
+        assertEquals("uuid-identity", metadata.getIndexUUID());
+        assertEquals(2, metadata.getNumberOfShards());
+        assertEquals(0, metadata.getNumberOfReplicas());
+        assertEquals(org.opensearch.Version.V_3_0_0, metadata.getCreationVersion());
+    }
+
     public void testDescribeDistinguishesAbsentFromPresent() throws Exception {
         final MetadataPlane plane = plane(new AtomicLong(1_000L));
         assertTrue("an index that was never created must read as absent", plane.describe("ghost").isEmpty());
