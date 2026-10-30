@@ -169,3 +169,10 @@ terms increasing. The fallback reads each shard head and swaps each matching
 owned head; it retains one small unowned head per previously activated shard
 of a historical index name. Reusing the name overwrites those heads. Backends
 with verified conditional deletion continue removing unchanged heads outright.
+
+PIT endpoints apply the request admitted by action filters and send HTTP responses
+only after the complete filter chain succeeds. PIT listing is deployment-wide,
+and capture covers every shard of one concrete index. Node-scoped listing,
+shard-routing selectors, and cached or replaced native PIT response objects are
+refused with 501 instead of silently returning a different result. Response
+buffering uses the HTTP channel's accounted output buffers.
