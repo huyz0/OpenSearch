@@ -485,7 +485,17 @@ public final class SearchHandler extends BaseRestHandler {
         // One instant for the whole request: the rollups judge date math against it here, and the fan-out
         // must judge against the same one, or a range ending at "now" could be ruled out a millisecond early.
         final long nowMillis = System.currentTimeMillis();
-        final Resolution resolved = resolveIndices(metadata, serving, index, ignoreUnavailable, true, source, nowMillis);
+        // Filters can replace or broaden the query. Pruning on the original query before they run
+        // would silently remove indices the admitted query needs, so defer query-dependent pruning.
+        final Resolution resolved = resolveIndices(
+            metadata,
+            serving,
+            index,
+            ignoreUnavailable,
+            true,
+            serving.actionGate().isEmpty() ? source : null,
+            nowMillis
+        );
         final SearchFanout.Options searchOptions = new SearchFanout.Options(
             fanoutOptions.allowPartialActivation(),
             resolved.refused() ? 0 : resolved.prunedShards(),
@@ -981,27 +991,52 @@ public final class SearchHandler extends BaseRestHandler {
         SearchSourceBuilder source,
         org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
     ) throws IOException {
+        final var gate = serving.actionGate();
+        final java.util.Set<String> resolvedScope = gate.isEmpty() ? null : java.util.Set.copyOf(indices);
         try {
-            return serving.actionGate()
-                .run(
-                    org.opensearch.action.search.SearchAction.NAME,
-                    // Every index the search covers, so a filter evaluating privileges sees all of them
-                    // rather than the first one named.
-                    new org.opensearch.action.search.SearchRequest(indices.toArray(new String[0]), source),
-                    // The source as the filters left it: a document-level security query a filter folded
-                    // into the request reaches every shard, rather than being silently ignored.
-                    admitted -> work.apply(
-                        admitted instanceof org.opensearch.action.search.SearchRequest rewritten && rewritten.source() != null
-                            ? rewritten.source()
-                            : source
-                    ),
-                    searchView()
-                );
+            return gate.run(
+                org.opensearch.action.search.SearchAction.NAME,
+                // Every index the search covers, so a filter evaluating privileges sees all of them
+                // rather than the first one named.
+                new org.opensearch.action.search.SearchRequest(indices.toArray(new String[0]), source),
+                // The source as the filters left it: a document-level security query a filter folded
+                // into the request reaches every shard, rather than being silently ignored.
+                admitted -> {
+                    if (admitted instanceof org.opensearch.action.search.SearchRequest == false) {
+                        throw unsupportedFilterRewrite("a search must remain a search request");
+                    }
+                    final var rewritten = (org.opensearch.action.search.SearchRequest) admitted;
+                    if (resolvedScope != null
+                        && resolvedScope.equals(java.util.Set.copyOf(java.util.List.of(rewritten.indices()))) == false) {
+                        throw unsupportedFilterRewrite("changing indices after the search scope has been resolved");
+                    }
+                    if (rewritten.searchType() != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH
+                        || rewritten.routing() != null
+                        || rewritten.scroll() != null
+                        || rewritten.pipeline() != null) {
+                        throw unsupportedFilterRewrite("the rewritten search requests unsupported execution options");
+                    }
+                    final SearchSourceBuilder accepted = rewritten.source() == null ? new SearchSourceBuilder() : rewritten.source();
+                    final String unsupported = whatCannotBeMerged(accepted);
+                    if (unsupported != null || accepted.pointInTimeBuilder() != null) {
+                        throw unsupportedFilterRewrite(unsupported == null ? "adding a point in time after planning" : unsupported);
+                    }
+                    return work.apply(accepted);
+                },
+                searchView()
+            );
         } catch (IOException | RuntimeException e) {
             throw e;
         } catch (Exception e) {
             throw new IOException(e);
         }
+    }
+
+    private static org.opensearch.OpenSearchStatusException unsupportedFilterRewrite(String reason) {
+        return new org.opensearch.OpenSearchStatusException(
+            "cannot apply action-filter search rewrite: " + reason,
+            RestStatus.NOT_IMPLEMENTED
+        );
     }
 
     /**
@@ -1045,17 +1080,19 @@ public final class SearchHandler extends BaseRestHandler {
                     if (response instanceof org.opensearch.action.search.SearchResponse answered) {
                         final org.apache.lucene.search.TotalHits total = answered.getHits().getTotalHits();
                         return new org.opensearch.serverless.shard.ShardOperations.SearchOutcome(
-                            total == null ? original.total() : total.value(),
+                            total == null ? (original == null ? 0L : original.total()) : total.value(),
                             java.util.List.of(answered.getHits().getHits()),
-                            original.shards(),
-                            original.answered(),
+                            original == null ? answered.getTotalShards() : original.shards(),
+                            original == null ? answered.getSuccessfulShards() : original.answered(),
                             (org.opensearch.search.aggregations.InternalAggregations) answered.getAggregations(),
-                            total == null ? original.relation() : total.relation(),
+                            total == null
+                                ? (original == null ? org.apache.lucene.search.TotalHits.Relation.EQUAL_TO : original.relation())
+                                : total.relation(),
                             answered.getHits().getMaxScore(),
-                            answered.isTimedOut(),
-                            answered.isTerminatedEarly(),
-                            java.util.List.of(answered.getShardFailures())
-                        );
+                            original == null ? answered.isTimedOut() : original.timedOut(),
+                            original == null ? answered.isTerminatedEarly() : original.terminatedEarly(),
+                            original == null ? java.util.List.of(answered.getShardFailures()) : original.failures()
+                        ).withSkipped(original == null ? answered.getSkippedShards() : original.skipped());
                     }
                     // A filter that replaced the response with something that is not a search answer.
                     // Taking the original would silently undo whatever it meant to do, so this refuses
