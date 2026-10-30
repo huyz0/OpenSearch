@@ -91,6 +91,23 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
         return store.blobContainer(BlobPath.cleanPath().add("conformance"));
     }
 
+    public void testRepeatableBlobCopySpansMultipartUploads() throws Exception {
+        final BlobContainer container = newContainer();
+        // The fixture uses 5 MiB upload parts; the second part must continue at the right offset.
+        final byte[] bytes = new byte[6 * 1024 * 1024 + 37];
+        random().nextBytes(bytes);
+        try (var input = new java.io.ByteArrayInputStream(bytes)) {
+            container.writeBlob("large-source", input, bytes.length, false);
+        }
+        try (var input = new org.opensearch.serverless.store.RepeatableBlobInputStream(container, "large-source", bytes.length)) {
+            container.writeBlob("large-copy", input, bytes.length, false);
+        }
+        try (var copied = container.readBlob("large-copy")) {
+            assertArrayEquals(bytes, copied.readAllBytes());
+        }
+        container.deleteBlobsIgnoringIfNotExists(java.util.List.of("large-source", "large-copy"));
+    }
+
     private org.opensearch.common.blobstore.BlobStore lastStore;
 
     @Override

@@ -365,6 +365,9 @@ public final class SnapshotRecord {
                         builder.field(file.getKey(), file.getValue());
                     }
                     builder.endObject();
+                    if (shard.getValue().lengths().isEmpty() == false) {
+                        builder.field("lengths", shard.getValue().lengths());
+                    }
                     builder.endObject();
                 }
                 builder.endArray();
@@ -455,7 +458,21 @@ public final class SnapshotRecord {
                         for (Map.Entry<?, ?> file : ((Map<?, ?>) shardBody.get("files")).entrySet()) {
                             files.put(requiredString(file.getKey(), "file name"), requiredString(file.getValue(), "file location"));
                         }
-                        shards.put((int) shard, new CommitManifest(term, files));
+                        final Map<String, Long> lengths = new LinkedHashMap<>();
+                        if (shardBody.containsKey("lengths")) {
+                            if (shardBody.get("lengths") instanceof Map<?, ?> == false) {
+                                throw malformed("lengths must be an object");
+                            }
+                            for (var length : ((Map<?, ?>) shardBody.get("lengths")).entrySet()) {
+                                final String file = requiredString(length.getKey(), "file name");
+                                final long size = requiredLong(length.getValue(), "file length");
+                                if (size < 0L || files.containsKey(file) == false) {
+                                    throw malformed("length must be nonnegative and name a captured file");
+                                }
+                                lengths.put(file, size);
+                            }
+                        }
+                        shards.put((int) shard, new CommitManifest(term, files, null, lengths));
                     }
                     if (shards.isEmpty() == false && shards.size() != shardCount) {
                         throw malformed("a completed index must contain every shard");
