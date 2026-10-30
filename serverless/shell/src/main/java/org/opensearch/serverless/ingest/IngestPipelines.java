@@ -178,6 +178,9 @@ public final class IngestPipelines {
         final IngestDocument after;
         try {
             after = done.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw e;
         } catch (ExecutionException e) {
             final Throwable cause = e.getCause();
             throw cause instanceof Exception ? (Exception) cause : new IllegalStateException(cause);
