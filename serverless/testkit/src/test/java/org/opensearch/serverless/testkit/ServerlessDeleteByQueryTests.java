@@ -344,6 +344,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
                 result.body().contains("\"matched\":" + documents)
             );
             assertTrue(result.body(), result.body().contains("\"deleted\":" + documents));
+            assertTrue("all three nonempty pages must be reported: " + result.body(), result.body().contains("\"batches\":3"));
 
             final Response search = send(http, "POST", "/alpha/_search", "{\"query\":{\"match_all\":{}}}");
             assertTrue("nothing must remain: " + search.body(), search.body().contains("\"value\":0"));

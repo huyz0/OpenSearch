@@ -1472,6 +1472,7 @@ public final class ShardOperations {
 
         private final long matched;
         private final long deleted;
+        private final int batches;
         private final long versionConflicts;
         private final String abortedOn;
         private final org.opensearch.index.reindex.BulkByScrollResponse response;
@@ -1482,7 +1483,7 @@ public final class ShardOperations {
         }
 
         DeleteByQueryOutcome(long matched, long deleted, long versionConflicts, String abortedOn) {
-            this(matched, deleted, versionConflicts, abortedOn, null, null);
+            this(matched, deleted, versionConflicts, abortedOn, null, null, matched == 0 ? 0 : 1);
         }
 
         private DeleteByQueryOutcome(
@@ -1491,8 +1492,10 @@ public final class ShardOperations {
             long versionConflicts,
             String abortedOn,
             org.opensearch.index.reindex.BulkByScrollResponse response,
-            org.opensearch.index.engine.VersionConflictEngineException conflict
+            org.opensearch.index.engine.VersionConflictEngineException conflict,
+            int batches
         ) {
+            this.batches = batches;
             this.response = response;
             this.conflict = conflict;
             this.versionConflicts = versionConflicts;
@@ -1515,7 +1518,7 @@ public final class ShardOperations {
                 0L,
                 0L,
                 deleted,
-                matched == 0 ? 0 : 1,
+                batches,
                 versionConflicts,
                 0L,
                 0L,
@@ -1535,7 +1538,7 @@ public final class ShardOperations {
                 java.util.List.of(),
                 false
             );
-            return new DeleteByQueryOutcome(matched, deleted, versionConflicts, abortedOn, nativeResponse, conflict);
+            return new DeleteByQueryOutcome(matched, deleted, versionConflicts, abortedOn, nativeResponse, conflict, batches);
         }
 
         /**
@@ -1726,7 +1729,8 @@ public final class ShardOperations {
                     answered.getVersionConflicts(),
                     abortedOn,
                     answered,
-                    null
+                    null,
+                    answered.getBatches()
                 );
             }
         });
@@ -1776,6 +1780,7 @@ public final class ShardOperations {
             long visited = 0;
             long deleted = 0;
             long conflicts = 0;
+            int batches = 0;
             for (Integer shard : shards.keySet()) {
                 final var frozenShardId = node.openFrozenView(plane, pit, shard);
                 Object[] cursor = null;
@@ -1795,6 +1800,7 @@ public final class ShardOperations {
                     if (hits.isEmpty()) {
                         break;
                     }
+                    batches = Math.incrementExact(batches);
                     final boolean lastPageOfShard = hits.size() < page.size() || visited + hits.size() >= maxDocs;
                     long pageBytes = 0L;
                     for (var hit : hits) {
@@ -1822,7 +1828,7 @@ public final class ShardOperations {
                                 // and counted, rather than deleted regardless.
                                 conflicts++;
                                 if (abortOnConflict) {
-                                    return new DeleteByQueryOutcome(visited, deleted, conflicts, hit.getId(), null, e);
+                                    return new DeleteByQueryOutcome(visited, deleted, conflicts, hit.getId(), null, e, batches);
                                 }
                             }
                         }
@@ -1838,7 +1844,7 @@ public final class ShardOperations {
                 // A shard with no match never entered the loop above, so it never issued a delete and
                 // never needed a refresh -- correctly, since nothing changed on it to make visible.
             }
-            return new DeleteByQueryOutcome(visited, deleted, conflicts, null);
+            return new DeleteByQueryOutcome(visited, deleted, conflicts, null, null, null, batches);
         } finally {
             // Local shards first, then the record -- the same order _pit's own release does, so this node
             // is never left holding open frozen shards for a view no longer recorded anywhere.
