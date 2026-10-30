@@ -497,7 +497,11 @@ public final class ObjectStores {
             @Override
             public org.opensearch.common.blobstore.InputStreamWithMetadata readBlobWithMetadata(String blobName)
                 throws java.io.IOException {
-                return count(blobReads, () -> inner.readBlobWithMetadata(blobName));
+                final var result = count(blobReads, () -> inner.readBlobWithMetadata(blobName));
+                return new org.opensearch.common.blobstore.InputStreamWithMetadata(
+                    result.getInputStream() == null ? null : new CountedStream(result.getInputStream()),
+                    result.getMetadata()
+                );
             }
 
             @Override
@@ -553,7 +557,9 @@ public final class ObjectStores {
 
             @Override
             public org.opensearch.common.blobstore.VersionedBlob readBlobWithVersion(String blobName) throws java.io.IOException {
-                return count(blobReads, () -> inner.readBlobWithVersion(blobName));
+                final var result = count(blobReads, () -> inner.readBlobWithVersion(blobName));
+                bytesRead.addAndGet(result.content().length);
+                return result;
             }
 
             @Override
@@ -575,7 +581,35 @@ public final class ObjectStores {
                 org.opensearch.core.action.ActionListener<java.util.List<BlobMetadata>> listener
             ) {
                 listings.incrementAndGet();
-                inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, blobNameSortOrder, listener);
+                final java.util.concurrent.atomic.AtomicLong attributed = ATTRIBUTION.get();
+                if (attributed != null) {
+                    attributed.incrementAndGet();
+                }
+                final var completed = new java.util.concurrent.atomic.AtomicBoolean();
+                final org.opensearch.core.action.ActionListener<java.util.List<BlobMetadata>> counted =
+                    new org.opensearch.core.action.ActionListener<>() {
+                        @Override
+                        public void onResponse(java.util.List<BlobMetadata> result) {
+                            completed.set(true);
+                            listener.onResponse(result);
+                        }
+
+                        @Override
+                        public void onFailure(Exception failure) {
+                            if (completed.compareAndSet(false, true)) {
+                                errors.incrementAndGet();
+                            }
+                            listener.onFailure(failure);
+                        }
+                    };
+                try {
+                    inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, blobNameSortOrder, counted);
+                } catch (RuntimeException failure) {
+                    if (completed.compareAndSet(false, true)) {
+                        errors.incrementAndGet();
+                    }
+                    throw failure;
+                }
             }
 
             @Override
@@ -604,29 +638,54 @@ public final class ObjectStores {
 
             @Override
             public int read() throws java.io.IOException {
-                final int b = super.read();
-                if (b >= 0) {
-                    bytesRead.incrementAndGet();
+                try {
+                    final int b = super.read();
+                    if (b >= 0) {
+                        bytesRead.incrementAndGet();
+                    }
+                    return b;
+                } catch (java.io.IOException | RuntimeException failure) {
+                    errors.incrementAndGet();
+                    throw failure;
                 }
-                return b;
             }
 
             @Override
             public int read(byte[] buffer, int offset, int length) throws java.io.IOException {
-                final int n = super.read(buffer, offset, length);
-                if (n > 0) {
-                    bytesRead.addAndGet(n);
+                try {
+                    final int n = super.read(buffer, offset, length);
+                    if (n > 0) {
+                        bytesRead.addAndGet(n);
+                    }
+                    return n;
+                } catch (java.io.IOException | RuntimeException failure) {
+                    errors.incrementAndGet();
+                    throw failure;
                 }
-                return n;
             }
 
             @Override
             public long skip(long n) throws java.io.IOException {
-                final long skipped = super.skip(n);
-                if (skipped > 0) {
-                    bytesRead.addAndGet(skipped);
+                try {
+                    final long skipped = super.skip(n);
+                    if (skipped > 0) {
+                        bytesRead.addAndGet(skipped);
+                    }
+                    return skipped;
+                } catch (java.io.IOException | RuntimeException failure) {
+                    errors.incrementAndGet();
+                    throw failure;
                 }
-                return skipped;
+            }
+
+            @Override
+            public void close() throws java.io.IOException {
+                try {
+                    super.close();
+                } catch (java.io.IOException | RuntimeException failure) {
+                    errors.incrementAndGet();
+                    throw failure;
+                }
             }
         }
     }
