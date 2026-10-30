@@ -519,7 +519,7 @@ public final class AliasHandler extends BaseRestHandler {
      */
     private Refusal swap(MetadataPlane metadata, String name, List<String> indices, boolean adding) throws IOException {
         for (int attempt = 0; attempt < 4; attempt++) {
-            final var resolved = metadata.resolve(name);
+            final var resolved = metadata.resolveForAliasMutation(name);
             if (resolved.index() != null) {
                 return new Refusal(
                     RestStatus.BAD_REQUEST,
@@ -758,7 +758,7 @@ public final class AliasHandler extends BaseRestHandler {
 
         final String alias = aliases.iterator().next();
         for (int attempt = 0; attempt < 4; attempt++) {
-            final var resolved = metadata.resolve(alias);
+            final var resolved = metadata.resolveForAliasMutation(alias);
             if (resolved.index() != null) {
                 channel.sendResponse(
                     IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "name_taken", "[" + alias + "] is an index, not an alias")

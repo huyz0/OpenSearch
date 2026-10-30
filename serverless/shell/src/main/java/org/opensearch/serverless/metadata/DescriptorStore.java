@@ -349,6 +349,14 @@ public final class DescriptorStore {
      * @throws IOException if the register cannot be read or parsed
      */
     public Resolution resolve(String name) throws IOException {
+        final Resolution resolved = resolveRaw(name);
+        return resolved.alias() != null && resolved.alias().creationPending()
+            ? new Resolution(null, null, resolved.generation())
+            : resolved;
+    }
+
+    /** Internal mutation state, including an unpublished alias creation. */
+    Resolution resolveRaw(String name) throws IOException {
         Names.validateIndexOrAlias(name);
         final Optional<BlobRegister> register = container.readRegister(RegisterMap.descriptorBlob(name));
         final long generation = register.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);

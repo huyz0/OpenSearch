@@ -48,6 +48,9 @@ public final class AliasRecord {
     private final boolean dataStream;
     private final long generation;
     private final String timestampField;
+    private final long mutationUntil;
+    private final boolean creating;
+    private final List<String> additions;
 
     /**
      * Creates an alias.
@@ -73,11 +76,72 @@ public final class AliasRecord {
      * @param timestampField the data stream's timestamp field, null for an alias
      */
     public AliasRecord(String name, List<String> indices, boolean dataStream, long generation, String timestampField) {
+        this(name, indices, dataStream, generation, timestampField, 0L, false, List.of());
+    }
+
+    private AliasRecord(
+        String name,
+        List<String> indices,
+        boolean dataStream,
+        long generation,
+        String timestampField,
+        long mutationUntil,
+        boolean creating,
+        List<String> additions
+    ) {
         this.name = name;
         this.indices = List.copyOf(indices);
         this.dataStream = dataStream;
         this.generation = generation;
         this.timestampField = timestampField;
+        this.mutationUntil = mutationUntil;
+        this.creating = creating;
+        this.additions = List.copyOf(additions);
+    }
+
+    /** Whether a mutation is preparing reverse hints before publishing membership. */
+    public boolean mutationPending() {
+        return mutationUntil != 0L;
+    }
+
+    /** Whether the pending mutation is an unpublished creation. */
+    public boolean creationPending() {
+        return mutationPending() && creating;
+    }
+
+    /** The recovery deadline for a pending mutation, or zero for a published record. */
+    public long mutationUntil() {
+        return mutationUntil;
+    }
+
+    /** The members whose hints the pending mutation is preparing. */
+    public List<String> pendingAdditions() {
+        return additions;
+    }
+
+    /** Published and preparing members both prevent a concurrent cleanup from removing their hint. */
+    public boolean protectsHint(String index) {
+        return indices.contains(index) || additions.contains(index);
+    }
+
+    /**
+     * Reserves a mutation while preserving the previously published fields.
+     *
+     * @param additions the newly added members whose hints must be protected
+     * @param until when another writer may recover an abandoned mutation
+     * @param creating whether no alias has been published yet
+     * @return the reserved record
+     */
+    public AliasRecord preparing(List<String> additions, long until, boolean creating) {
+        if (until <= 0L || mutationPending()) {
+            throw new IllegalArgumentException("invalid alias mutation reservation");
+        }
+        return new AliasRecord(name, indices, dataStream, generation, timestampField, until, creating, additions);
+    }
+
+    /** Returns the last published fields without their temporary mutation reservation. */
+    public AliasRecord published() {
+        return new AliasRecord(name, indices, dataStream, generation, timestampField);
     }
 
     /**
@@ -156,6 +220,13 @@ public final class AliasRecord {
                 builder.field("generation", generation);
                 builder.field("timestamp_field", timestampField);
             }
+            if (mutationPending()) {
+                builder.startObject("mutation");
+                builder.field("until", mutationUntil);
+                builder.field("creating", creating);
+                builder.field("additions", additions);
+                builder.endObject();
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -190,7 +261,29 @@ public final class AliasRecord {
             final boolean dataStream = Boolean.TRUE.equals(body.get("data_stream"));
             final long generation = body.get("generation") instanceof Number n ? n.longValue() : 0L;
             final String timestampField = body.get("timestamp_field") == null ? null : String.valueOf(body.get("timestamp_field"));
-            return new AliasRecord(name.toString(), indices, dataStream, generation, timestampField);
+            final AliasRecord result = new AliasRecord(name.toString(), indices, dataStream, generation, timestampField);
+            if (body.containsKey("mutation") == false) {
+                return result;
+            }
+            if (body.get("mutation") instanceof java.util.Map<?, ?> == false) {
+                throw new IOException("invalid alias mutation");
+            }
+            final var mutation = (java.util.Map<?, ?>) body.get("mutation");
+            final Object until = mutation.get("until");
+            if ((until instanceof Integer || until instanceof Long) == false
+                || ((Number) until).longValue() <= 0L
+                || mutation.get("creating") instanceof Boolean == false
+                || mutation.get("additions") instanceof List<?> == false) {
+                throw new IOException("invalid alias mutation fields");
+            }
+            final List<String> additions = new ArrayList<>();
+            for (Object added : (List<?>) mutation.get("additions")) {
+                if (added instanceof String == false || ((String) added).isEmpty()) {
+                    throw new IOException("invalid alias mutation member");
+                }
+                additions.add((String) added);
+            }
+            return result.preparing(additions, ((Number) until).longValue(), (Boolean) mutation.get("creating"));
         }
     }
 

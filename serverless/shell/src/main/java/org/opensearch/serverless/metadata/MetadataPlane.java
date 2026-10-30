@@ -474,7 +474,11 @@ public final class MetadataPlane {
         for (String name : deleted.aliasedBy()) {
             boolean done = false;
             for (int attempt = 0; attempt < 4 && done == false; attempt++) {
-                final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+                final DescriptorStore.Resolution resolved = descriptors.resolveRaw(name);
+                if (resolved.alias() != null && resolved.alias().mutationPending() && resolved.alias().protectsHint(deleted.name())) {
+                    abortAlias(resolved.alias(), resolved.generation());
+                    continue;
+                }
                 if (resolved.alias() == null || resolved.alias().indices().contains(deleted.name()) == false) {
                     break;
                 }
@@ -508,14 +512,14 @@ public final class MetadataPlane {
     }
 
     /**
-     * Reads an alias and the generation to change it under, in one register read.
+     * Reads an alias and its generation together, briefly waiting for a pending mutation.
      *
      * @param name the alias
      * @return the record and its generation, or empty when the name is not an alias
      * @throws IOException if the read fails
      */
     public Optional<AliasAtGeneration> aliasWithGeneration(String name) throws IOException {
-        final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+        final DescriptorStore.Resolution resolved = resolveForAliasMutation(name);
         return resolved.alias() == null ? Optional.empty() : Optional.of(new AliasAtGeneration(resolved.alias(), resolved.generation()));
     }
 
@@ -555,7 +559,7 @@ public final class MetadataPlane {
      * @throws IOException if the swap fails
      */
     public Optional<Long> updateAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
-        return updateAlias(descriptors.resolve(alias.name()).alias(), alias, expectedGeneration);
+        return updateAlias(recoverAlias(alias.name()).alias(), alias, expectedGeneration);
     }
 
     /**
@@ -572,30 +576,19 @@ public final class MetadataPlane {
         org.opensearch.serverless.cluster.AliasRecord alias,
         long expectedGeneration
     ) throws IOException {
-        // An alias created before aliases were entered gains its entry on its next update.
+        if (before == null || before.mutationPending()) {
+            recoverAlias(alias.name());
+            return Optional.empty();
+        }
         rollups.markAlias(alias.name());
-        // Which indices this alias named before, so the ones it stops naming can be told.
-        final java.util.List<String> previously = before == null ? java.util.List.of() : before.indices();
-        for (String index : alias.indices()) {
-            if (previously.contains(index) == false) {
-                noteAlias(index, alias.name(), true);
-            }
+        final List<String> additions = new ArrayList<>(alias.indices());
+        additions.removeAll(before.indices());
+        final var pending = before.preparing(additions, mutationDeadline(), false);
+        final Optional<Long> reserved = descriptors.updateAlias(pending, expectedGeneration);
+        if (reserved.isEmpty()) {
+            return Optional.empty();
         }
-        final Optional<Long> applied = descriptors.updateAlias(alias, expectedGeneration);
-        if (applied.isPresent()) {
-            for (String index : previously) {
-                if (alias.indices().contains(index) == false) {
-                    noteAlias(index, alias.name(), false);
-                }
-            }
-            // And once more for what it names now: a concurrent removal may have taken the hint between
-            // the note above and the swap, and a live alias with no hint is the one thing the hint must
-            // never be.
-            for (String index : alias.indices()) {
-                noteAlias(index, alias.name(), true);
-            }
-        }
-        return applied;
+        return publishAlias(pending, alias, reserved.get());
     }
 
     /**
@@ -606,34 +599,72 @@ public final class MetadataPlane {
      * @throws IOException if a descriptor or the alias register cannot be written
      */
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
-        // Entered first: a pattern resolved from the rollups finds the alias, and a crash between the two writes
-        // leaves an entry with no alias behind it, which costs a search one absent read and nothing else.
         rollups.markAlias(alias.name());
-        // The hint before the truth: an index that lists an alias which was never created over-approximates
-        // and is filtered on read; an alias that exists and is listed nowhere would be invisible to the
-        // reverse question, which is the failure this ordering prevents.
-        for (String index : alias.indices()) {
-            noteAlias(index, alias.name(), true);
-        }
+        recoverAlias(alias.name());
+        final var pending = alias.preparing(alias.indices(), mutationDeadline(), true);
+        final long reserved = descriptors.createAlias(pending);
+        return publishAlias(pending, alias, reserved).orElseThrow(() -> new IOException("alias creation was superseded: " + alias.name()));
+    }
+
+    private long mutationDeadline() {
+        final long now = Math.max(1L, clock.getAsLong());
+        return now > Long.MAX_VALUE - leaseTtlMillis ? Long.MAX_VALUE : now + leaseTtlMillis;
+    }
+
+    private Optional<Long> publishAlias(
+        org.opensearch.serverless.cluster.AliasRecord pending,
+        org.opensearch.serverless.cluster.AliasRecord target,
+        long reserved
+    ) throws IOException {
+        final Optional<Long> applied;
         try {
-            final long generation = descriptors.createAlias(alias);
-            for (String index : alias.indices()) {
-                noteAlias(index, alias.name(), true);
+            for (String index : target.indices()) {
+                prepareAliasHint(index, pending, reserved);
             }
-            return generation;
-        } catch (IndexAlreadyExistsException | NameBeingReclaimedException e) {
-            // The hint was written for an alias that was not created; take it back so a name that keeps
-            // losing this race does not accumulate a stale entry per attempt -- unless the alias that won
-            // the race names the index, in which case the hint is the winner's and stripping it would
-            // leave a live alias with no hint, the one thing the hint must never be.
-            final DescriptorStore.Resolution winner = descriptors.resolve(alias.name());
-            for (String index : alias.indices()) {
-                if (winner.alias() == null || winner.alias().indices().contains(index) == false) {
-                    noteAlias(index, alias.name(), false);
-                }
+            applied = descriptors.updateAlias(target.published(), reserved);
+        } catch (IOException | RuntimeException e) {
+            try {
+                abortAlias(pending, reserved);
+            } catch (IOException cleanup) {
+                e.addSuppressed(cleanup);
             }
             throw e;
         }
+        if (applied.isEmpty()) {
+            abortAlias(pending, reserved);
+        } else if (pending.creationPending() == false) {
+            for (String index : pending.indices()) {
+                if (target.indices().contains(index) == false) {
+                    removeAliasHint(index, target.name(), false);
+                }
+            }
+        }
+        return applied;
+    }
+
+    private void abortAlias(org.opensearch.serverless.cluster.AliasRecord pending, long reserved) throws IOException {
+        if (pending.creationPending()) {
+            descriptors.deleteIfUnchanged(pending.name(), reserved, clock.getAsLong());
+        } else {
+            descriptors.updateAlias(pending.published(), reserved);
+        }
+        for (String index : pending.pendingAdditions()) {
+            removeAliasHint(index, pending.name(), true);
+        }
+    }
+
+    /** Expired preparations are aborted; the owner can publish only while its generation still holds. */
+    private DescriptorStore.Resolution recoverAlias(String name) throws IOException {
+        for (int attempt = 0; attempt < 4; attempt++) {
+            final var current = descriptors.resolveRaw(name);
+            if (current.alias() == null
+                || current.alias().mutationPending() == false
+                || current.alias().mutationUntil() > clock.getAsLong()) {
+                return current;
+            }
+            abortAlias(current.alias(), current.generation());
+        }
+        return descriptors.resolveRaw(name);
     }
 
     /**
@@ -651,7 +682,7 @@ public final class MetadataPlane {
     public java.util.List<String> aliasesOf(IndexDescriptor descriptor) throws IOException {
         final java.util.List<String> confirmed = new java.util.ArrayList<>();
         for (String name : descriptor.aliasedBy()) {
-            final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+            final DescriptorStore.Resolution resolved = resolve(name);
             if (resolved.alias() != null && resolved.alias().indices().contains(descriptor.name())) {
                 confirmed.add(name);
             }
@@ -659,42 +690,53 @@ public final class MetadataPlane {
         return confirmed;
     }
 
-    /**
-     * Adds or removes an alias name on an index's descriptor, under compare-and-swap.
-     *
-     * <p>Best effort on the way out: a lost race against a concurrent mapping or settings update is retried
-     * a few times, and a hint that could not be written is logged rather than failing the alias operation
-     * it accompanies -- the alias record stays the truth either way, and an absent hint costs a reverse
-     * lookup one name until the next alias change rewrites it.
-     */
-    private void noteAlias(String index, String alias, boolean add) throws IOException {
+    /** Prepare hints before publication, fencing removers even when the hint is already present. */
+    private void prepareAliasHint(String index, org.opensearch.serverless.cluster.AliasRecord pending, long reserved) throws IOException {
         for (int attempt = 0; attempt < 4; attempt++) {
-            final long generation = descriptors.generationOf(index);
-            final Optional<IndexDescriptor> current = descriptors.get(index);
-            if (current.isEmpty()) {
+            final var current = descriptors.resolveRaw(index);
+            if (current.index() == null) {
+                if (pending.pendingAdditions().contains(index)) {
+                    throw new IOException("alias member does not exist: " + index);
+                }
+                return; // An existing alias may still name a deleted index for diagnostics.
+            }
+            final var owner = descriptors.resolveRaw(pending.name());
+            if (owner.generation() != reserved || owner.alias() == null || owner.alias().mutationPending() == false) {
+                throw new IOException("alias preparation was superseded: " + pending.name());
+            }
+            final List<String> names = new ArrayList<>(current.index().aliasedBy());
+            if (names.contains(pending.name()) == false) {
+                names.add(pending.name());
+            } else if (pending.pendingAdditions().contains(index) == false) {
                 return;
             }
-            final java.util.List<String> names = new java.util.ArrayList<>(current.get().aliasedBy());
-            if (add ? names.contains(alias) : names.contains(alias) == false) {
-                return;
-            }
-            if (add) {
-                names.add(alias);
-            } else {
-                names.remove(alias);
-            }
-            if (descriptors.update(current.get().withAliasedBy(names), generation).isPresent()) {
+            if (descriptors.update(current.index().withAliasedBy(names), current.generation()).isPresent()) {
                 return;
             }
         }
-        // Said out loud: a reverse lookup on this index will miss this alias until its membership next
-        // changes, which is a wrong answer worth an operator's attention rather than a silent one.
-        LOGGER.warn(
-            "could not record that alias [{}] {} index [{}]; the reverse lookup may miss it",
-            alias,
-            add ? "names" : "no longer names",
-            index
-        );
+        throw new IOException("could not prepare alias hint: " + pending.name() + " on " + index);
+    }
+
+    /** Read the index before fresh alias truth so a later preparation fences this removal's CAS. */
+    private void removeAliasHint(String index, String alias, boolean fencePreparation) throws IOException {
+        for (int attempt = 0; attempt < 4; attempt++) {
+            final var current = descriptors.resolveRaw(index);
+            if (current.index() == null) {
+                return;
+            }
+            final var truth = descriptors.resolveRaw(alias);
+            if (truth.alias() != null && truth.alias().protectsHint(index)) {
+                return;
+            }
+            final List<String> names = new ArrayList<>(current.index().aliasedBy());
+            if (names.remove(alias) == false && fencePreparation == false) {
+                return;
+            }
+            if (descriptors.update(current.index().withAliasedBy(names), current.generation()).isPresent()) {
+                return;
+            }
+        }
+        LOGGER.warn("could not remove stale alias hint [{}] from [{}]", alias, index);
     }
 
     /**
@@ -751,7 +793,35 @@ public final class MetadataPlane {
      * @throws IOException if the read fails
      */
     public DescriptorStore.Resolution resolve(String name) throws IOException {
-        return descriptors.resolve(name);
+        final var resolved = recoverAlias(name);
+        return resolved.alias() != null && resolved.alias().creationPending()
+            ? new DescriptorStore.Resolution(null, null, resolved.generation())
+            : resolved;
+    }
+
+    /**
+     * Reads an alias for mutation, briefly backing off while another writer prepares its hints.
+     *
+     * @param name the alias name
+     * @return its published value and generation, or a still-busy reservation after the bounded wait
+     * @throws IOException if the register cannot be read or the thread is interrupted
+     */
+    public DescriptorStore.Resolution resolveForAliasMutation(String name) throws IOException {
+        final long started = System.nanoTime();
+        long pause = 1_000_000L;
+        while (true) {
+            final var current = recoverAlias(name);
+            if (current.alias() == null || current.alias().mutationPending() == false || System.nanoTime() - started >= 250_000_000L) {
+                return current.alias() != null && current.alias().creationPending()
+                    ? new DescriptorStore.Resolution(null, null, current.generation())
+                    : current;
+            }
+            if (Thread.currentThread().isInterrupted()) {
+                throw new java.io.InterruptedIOException("interrupted waiting for alias mutation: " + name);
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(pause);
+            pause = Math.min(64_000_000L, pause * 2L);
+        }
     }
 
     /**
@@ -823,7 +893,7 @@ public final class MetadataPlane {
             epoch = routingCacheEpoch;
         }
         final long readStartedNanos = System.nanoTime();
-        final DescriptorStore.Resolution fresh = descriptors.resolve(name);
+        final DescriptorStore.Resolution fresh = resolve(name);
         synchronized (routingCacheMutation) {
             // A read started before a local mutation must not republish the invalidated value.
             if (epoch == routingCacheEpoch) {
@@ -974,6 +1044,9 @@ public final class MetadataPlane {
             for (String member : alias.indices()) {
                 weight += 64L + 2L * member.length();
             }
+            for (String member : alias.pendingAdditions()) {
+                weight += 64L + 2L * member.length();
+            }
         }
         return weight;
     }
@@ -1000,7 +1073,7 @@ public final class MetadataPlane {
      * @throws IOException if the delete fails
      */
     public boolean deleteAlias(String name) throws IOException {
-        final DescriptorStore.Resolution resolved = descriptors.resolve(name);
+        final DescriptorStore.Resolution resolved = resolve(name);
         if (resolved.alias() == null) {
             return false;
         }
@@ -1019,10 +1092,14 @@ public final class MetadataPlane {
      * @throws IOException if the delete fails
      */
     public boolean deleteAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
+        if (alias.mutationPending()) {
+            recoverAlias(alias.name());
+            return false;
+        }
         final boolean deleted = descriptors.deleteIfUnchanged(alias.name(), expectedGeneration, clock.getAsLong());
         if (deleted) {
             for (String index : alias.indices()) {
-                noteAlias(index, alias.name(), false);
+                removeAliasHint(index, alias.name(), false);
             }
         }
         return deleted;
