@@ -94,8 +94,14 @@ final class PointInTimeStore {
             writeMarker(pin, true);
         } catch (IOException | RuntimeException failure) {
             try {
-                states.compareAndSwapRegister(pin.id(), created.currentGeneration(), RELEASED);
-                inventory.deleteBlobsIgnoringIfNotExists(List.of(pin.id()));
+                boolean mayDelete = states.compareAndSwapRegister(pin.id(), created.currentGeneration(), RELEASED).applied();
+                if (mayDelete == false) {
+                    final var current = states.readRegister(pin.id());
+                    mayDelete = current.isEmpty() || decode(pin.id(), current.get()).pin() == null;
+                }
+                if (mayDelete) {
+                    inventory.deleteBlobsIgnoringIfNotExists(List.of(pin.id()));
+                }
             } catch (Exception cleanup) {
                 failure.addSuppressed(cleanup);
             }

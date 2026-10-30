@@ -165,6 +165,26 @@ public class PointInTimeLifecycleTests extends OpenSearchTestCase {
         }
     }
 
+    public void testAmbiguousCreationFailureDoesNotUnpinAnAcknowledgedExtension() throws Exception {
+        try (var store = new RacingStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = plane(store);
+            final var pin = pin(org.opensearch.common.UUIDs.randomBase64UUID(), 10_000L);
+            store.mutate.set(() -> {
+                // The provider committed the marker but failed to return its acknowledgement.
+                final var marker = new PointInTime(pin.id(), pin.index(), pin.indexUuid(), Long.MAX_VALUE, Map.of(), true).toBytes();
+                try (var input = marker.streamInput()) {
+                    store.delegate.blobContainer(org.opensearch.serverless.metadata.RegisterMap.pointsInTime(BlobPath.cleanPath()))
+                        .writeBlobAtomic(pin.id(), input, marker.length(), true);
+                }
+                assertTrue(plane.extendPointInTime(pin.withExpiry(20_000L), 10_000L));
+                throw new IOException("lost marker acknowledgement after keep-alive succeeded");
+            });
+            expectThrows(IOException.class, () -> plane.createPointInTime(pin));
+            assertEquals(20_000L, plane.pointInTime(pin.id()).orElseThrow().expiresAtMillis());
+            assertEquals("the acknowledged view must remain discoverable by collectors", 1, plane.livePointsInTime(1_000L).size());
+        }
+    }
+
     @FunctionalInterface
     private interface IoAction {
         void run() throws IOException;
