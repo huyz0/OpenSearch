@@ -1798,18 +1798,54 @@ public final class ShardOperations {
     /** What an update did. */
     public static final class UpdateOutcome {
 
+        private final org.opensearch.action.update.UpdateResponse response;
         private final String result;
         private final String servedBy;
         private final long seqNo;
         private final long primaryTerm;
         private final long version;
 
-        UpdateOutcome(String result, String servedBy, long seqNo, long primaryTerm, long version) {
-            this.result = result;
+        UpdateOutcome(
+            String result,
+            String servedBy,
+            long seqNo,
+            long primaryTerm,
+            long version,
+            ShardId shardId,
+            String id,
+            boolean refresh
+        ) {
+            this(
+                new org.opensearch.action.update.UpdateResponse(
+                    shardId,
+                    id,
+                    seqNo,
+                    primaryTerm,
+                    version,
+                    org.opensearch.action.DocWriteResponse.Result.valueOf(result.toUpperCase(java.util.Locale.ROOT))
+                ),
+                servedBy
+            );
+            if ("noop".equals(result) == false) {
+                completeNativeWriteResponse(response, refresh);
+            }
+        }
+
+        private UpdateOutcome(org.opensearch.action.update.UpdateResponse response, String servedBy) {
+            this.response = response;
+            this.result = response.getResult().getLowercase();
             this.servedBy = servedBy;
-            this.seqNo = seqNo;
-            this.primaryTerm = primaryTerm;
-            this.version = version;
+            this.seqNo = response.getSeqNo();
+            this.primaryTerm = response.getPrimaryTerm();
+            this.version = response.getVersion();
+        }
+
+        /**
+         * Returns the native response as the action filters left it.
+         * @return the native result, including its actual index and document id
+         */
+        public org.opensearch.action.update.UpdateResponse response() {
+            return response;
         }
 
         /**
@@ -1843,7 +1879,7 @@ public final class ShardOperations {
         }
 
         /**
-         * Returns what happened: {@code created}, {@code updated} or {@code noop}.
+         * Returns what happened: {@code created}, {@code updated}, {@code deleted} or {@code noop}.
          *
          * @return the result
          */
@@ -1864,13 +1900,10 @@ public final class ShardOperations {
     /**
      * Reads a document, merges a partial update into it, and writes the result back.
      *
-     * <p><b>This is a merge, not a transaction.</b> The read and the write are two separate calls to two
-     * separate primitives — {@link #get} and {@link #index}'s underlying machinery — with nothing holding
-     * the document still in between. A write that lands in that window is overwritten by this one, silently,
-     * exactly as two plain {@code index} calls racing each other would be. Classic OpenSearch's
-     * {@code _update} avoids that by retrying under {@code if_seq_no}/{@code if_primary_term}, which is
-     * exactly the version model {@code WalRecord} does not have. This is the honest version of the feature
-     * without one: best-effort, not compare-and-swap, and it does not pretend otherwise.
+     * <p>The read and write use the document's sequence identity as a compare-and-swap. A concurrent
+     * change causes a conflict rather than losing a merge. Native requests may retry an unconditional
+     * update from a fresh read up to their admitted {@code retry_on_conflict} count; a caller-supplied
+     * sequence condition is never retried against a different identity.
      *
      * <p><b>The merge itself is core's own</b> ({@link org.opensearch.common.xcontent.XContentHelper#update}),
      * used by core's own {@code _update} internally — recursing into nested objects, overwriting everything
@@ -1946,147 +1979,287 @@ public final class ShardOperations {
         org.opensearch.script.Script script,
         boolean scriptedUpsert
     ) throws IOException {
-        return gated(org.opensearch.action.update.UpdateAction.NAME, new org.opensearch.action.update.UpdateRequest(index, id), () -> {
-            // doGet, not get: this whole method is one gated operation under UpdateAction's own name, and
-            // calling the public get() here would run the filter chain a second time under GetAction's --
-            // which is not what a filter checking "may this caller write" expects to see for an update.
-            final Read current = doGet(index, id);
-            final ServerlessNode.Document existing = current.document();
+        final var request = new org.opensearch.action.update.UpdateRequest(index, id).docAsUpsert(docAsUpsert)
+            .detectNoop(detectNoop)
+            .script(script)
+            .scriptedUpsert(scriptedUpsert)
+            .setIfSeqNo(ifSeqNo)
+            .setIfPrimaryTerm(ifPrimaryTerm)
+            .setRefreshPolicy(
+                refresh
+                    ? org.opensearch.action.support.WriteRequest.RefreshPolicy.IMMEDIATE
+                    : org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE
+            );
+        if (doc != null) {
+            request.doc(doc);
+        }
+        if (upsert != null) {
+            request.upsert(upsert);
+        }
+        return update(request);
+    }
+
+    /**
+     * Runs an update using the native request admitted by action filters.
+     * @param request the update, including its source, script and retry policy
+     * @return the native result and the serving node when the response was not replaced
+     * @throws IOException if placement, reading or writing fails
+     */
+    public UpdateOutcome update(org.opensearch.action.update.UpdateRequest request) throws IOException {
+        return gated(org.opensearch.action.update.UpdateAction.NAME, request, admitted -> {
+            final var selected = (org.opensearch.action.update.UpdateRequest) admitted;
+            final var invalid = selected.validate();
+            if (invalid != null) {
+                throw invalid;
+            }
+            if (selected.retryOnConflict() < 0) {
+                throw new IllegalArgumentException("retry_on_conflict must be non negative");
+            }
+            if (selected.scriptedUpsert() && selected.script() == null) {
+                throw new IllegalArgumentException("scripted_upsert was given without a script");
+            }
+            if (selected.routing() != null
+                || selected.isRequireAlias()
+                || selected.waitForActiveShards().validate(0) == false
+                || (selected.fetchSource() != null && selected.fetchSource().fetchSource())) {
+                throw new org.opensearch.OpenSearchStatusException(
+                    "routing, require_alias, source fetching and active-shard counts above one are not supported on updates",
+                    org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
+                );
+            }
+            if ((selected.doc() != null && selected.doc().extraFieldValues().isEmpty() == false)
+                || (selected.upsertRequest() != null && selected.upsertRequest().extraFieldValues().isEmpty() == false)) {
+                throw new org.opensearch.OpenSearchStatusException(
+                    "extra field values are not supported on updates",
+                    org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
+                );
+            }
+            final java.util.Map<String, Object> doc = selected.doc() == null ? null : selected.doc().sourceAsMap();
+            final java.util.Map<String, Object> upsert = selected.upsertRequest() == null ? null : selected.upsertRequest().sourceAsMap();
+            final boolean refresh = selected.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
+            final long attempts = 1L + selected.retryOnConflict();
+            for (long attempt = 0L;; attempt++) {
+                try {
+                    return executeAcceptedUpdate(
+                        selected.index(),
+                        selected.id(),
+                        doc,
+                        upsert,
+                        selected.docAsUpsert(),
+                        selected.detectNoop(),
+                        refresh,
+                        selected.ifSeqNo(),
+                        selected.ifPrimaryTerm(),
+                        selected.script(),
+                        selected.scriptedUpsert()
+                    );
+                } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
+                    if (attempt >= attempts - 1L) {
+                        throw e;
+                    }
+                }
+            }
+        }, new org.opensearch.serverless.shell.ActionGate.ResponseView<UpdateOutcome>() {
+            @Override
+            public org.opensearch.core.action.ActionResponse show(UpdateOutcome result) {
+                return result.response();
+            }
+
+            @Override
+            public UpdateOutcome read(org.opensearch.core.action.ActionResponse response, UpdateOutcome original) {
+                return original != null && response == original.response()
+                    ? original
+                    : new UpdateOutcome((org.opensearch.action.update.UpdateResponse) response, null);
+            }
+        });
+    }
+
+    /** Applies one read/compare-and-swap attempt without invoking a nested action filter chain. */
+    private UpdateOutcome executeAcceptedUpdate(
+        String index,
+        String id,
+        java.util.Map<String, Object> doc,
+        java.util.Map<String, Object> upsert,
+        boolean docAsUpsert,
+        boolean detectNoop,
+        boolean refresh,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        org.opensearch.script.Script script,
+        boolean scriptedUpsert
+    ) throws IOException {
+        // doGet, not get: this whole method is one gated operation under UpdateAction's own name, and
+        // calling the public get() here would run the filter chain a second time under GetAction's --
+        // which is not what a filter checking "may this caller write" expects to see for an update.
+        final Read current = doGet(index, id);
+        final ServerlessNode.Document existing = current.document();
+        if (existing.found()
+            && ifSeqNo != org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO
+            && (existing.seqNo() != ifSeqNo || existing.primaryTerm() != ifPrimaryTerm)) {
+            // Core checks the condition on its update read, before a script or noop can bypass
+            // the write path. A stale condition must also fail when no write would be emitted.
+            throw new org.opensearch.index.engine.VersionConflictEngineException(
+                current.shardId(),
+                id,
+                ifSeqNo,
+                ifPrimaryTerm,
+                existing.seqNo(),
+                existing.primaryTerm()
+            );
+        }
+
+        final java.util.Map<String, Object> merged;
+        final String result;
+        if (existing.found() == false) {
+            if (docAsUpsert) {
+                merged = org.opensearch.ingest.IngestDocument.deepCopyMap(doc);
+                result = "created";
+            } else if (upsert != null) {
+                merged = org.opensearch.ingest.IngestDocument.deepCopyMap(upsert);
+                result = "created";
+            } else {
+                throw new DocumentMissingException(index, id);
+            }
+        } else {
+            merged = org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                new org.opensearch.core.common.bytes.BytesArray(existing.source()),
+                false,
+                org.opensearch.common.xcontent.XContentType.JSON
+            ).v2();
+            if (script != null) {
+                result = "updated";
+            } else {
+                final boolean changed = org.opensearch.common.xcontent.XContentHelper.update(merged, doc, detectNoop);
+                result = (detectNoop && changed == false) ? "noop" : "updated";
+            }
+        }
+
+        String operation = result;
+        if (script != null && (existing.found() || scriptedUpsert)) {
+            // ctx as classic OpenSearch builds it, so a script written against a classic node behaves
+            // the same here. The map is mutable and the script edits it in place, which is the contract
+            // UpdateScript defines rather than one chosen here.
+            final java.util.Map<String, Object> ctx = new java.util.HashMap<>();
+            ctx.put("_source", merged);
+            ctx.put("_now", node.threadPool().absoluteTimeInMillis());
+            ctx.put("op", existing.found() ? "index" : "create");
+            if (existing.found()) {
+                ctx.put("_index", index);
+                ctx.put("_id", id);
+                ctx.put("_version", existing.version());
+                ctx.put("_routing", null);
+            }
+            final var factory = node.scriptService().compile(script, org.opensearch.script.UpdateScript.CONTEXT);
+            factory.newInstance(script.getParams(), ctx).execute();
+            operation = (String) ctx.get("op");
+            // Core permits only create for an upsert, and index/delete for an existing
+            // document. Every other script operation is a noop, including unknown values.
             if (existing.found()
-                && ifSeqNo != org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO
-                && (existing.seqNo() != ifSeqNo || existing.primaryTerm() != ifPrimaryTerm)) {
-                // Core checks the condition on its update read, before a script or noop can bypass
-                // the write path. A stale condition must also fail when no write would be emitted.
-                throw new org.opensearch.index.engine.VersionConflictEngineException(
+                ? "index".equals(operation) == false && "delete".equals(operation) == false
+                : "create".equals(operation) == false) {
+                operation = "noop";
+            }
+            @SuppressWarnings("unchecked")
+            final java.util.Map<String, Object> edited = (java.util.Map<String, Object>) ctx.get("_source");
+            // A script usually mutates ctx._source in place, in which case it *is* this map and there is
+            // nothing to copy. It may also replace it wholesale. Clearing first and copying second
+            // handles the second case and silently empties the document in the first, because the source
+            // and the destination are the same object -- which is what the assertion on the document's
+            // contents, rather than on the response, caught.
+            if (edited != null && edited != merged) {
+                final java.util.Map<String, Object> replacement = new java.util.LinkedHashMap<>(edited);
+                merged.clear();
+                merged.putAll(replacement);
+            }
+        }
+
+        if ("noop".equals(operation) || "none".equals(operation)) {
+            return new UpdateOutcome(
+                "noop",
+                current.servedBy(),
+                existing.seqNo(),
+                existing.primaryTerm(),
+                existing.version(),
+                current.shardId(),
+                id,
+                refresh
+            );
+        }
+        if ("delete".equals(operation)) {
+            if (existing.found() == false) {
+                // A scripted upsert cannot delete a document another writer created after this read.
+                return new UpdateOutcome(
+                    "noop",
+                    current.servedBy(),
+                    existing.seqNo(),
+                    existing.primaryTerm(),
+                    existing.version(),
                     current.shardId(),
                     id,
-                    ifSeqNo,
-                    ifPrimaryTerm,
-                    existing.seqNo(),
-                    existing.primaryTerm()
+                    refresh
                 );
             }
-
-            final java.util.Map<String, Object> merged;
-            final String result;
-            if (existing.found() == false) {
-                if (docAsUpsert) {
-                    merged = org.opensearch.ingest.IngestDocument.deepCopyMap(doc);
-                    result = "created";
-                } else if (upsert != null) {
-                    merged = org.opensearch.ingest.IngestDocument.deepCopyMap(upsert);
-                    result = "created";
-                } else {
-                    throw new DocumentMissingException(index, id);
-                }
-            } else {
-                merged = org.opensearch.common.xcontent.XContentHelper.convertToMap(
-                    new org.opensearch.core.common.bytes.BytesArray(existing.source()),
-                    false,
-                    org.opensearch.common.xcontent.XContentType.JSON
-                ).v2();
-                if (script != null) {
-                    result = "updated";
-                } else {
-                    final boolean changed = org.opensearch.common.xcontent.XContentHelper.update(merged, doc, detectNoop);
-                    result = (detectNoop && changed == false) ? "noop" : "updated";
-                }
-            }
-
-            String operation = result;
-            if (script != null && (existing.found() || scriptedUpsert)) {
-                // ctx as classic OpenSearch builds it, so a script written against a classic node behaves
-                // the same here. The map is mutable and the script edits it in place, which is the contract
-                // UpdateScript defines rather than one chosen here.
-                final java.util.Map<String, Object> ctx = new java.util.HashMap<>();
-                ctx.put("_source", merged);
-                ctx.put("_now", node.threadPool().absoluteTimeInMillis());
-                ctx.put("op", existing.found() ? "index" : "create");
-                if (existing.found()) {
-                    ctx.put("_index", index);
-                    ctx.put("_id", id);
-                    ctx.put("_version", existing.version());
-                    ctx.put("_routing", null);
-                }
-                final var factory = node.scriptService().compile(script, org.opensearch.script.UpdateScript.CONTEXT);
-                factory.newInstance(script.getParams(), ctx).execute();
-                operation = (String) ctx.get("op");
-                // Core permits only create for an upsert, and index/delete for an existing
-                // document. Every other script operation is a noop, including unknown values.
-                if (existing.found()
-                    ? "index".equals(operation) == false && "delete".equals(operation) == false
-                    : "create".equals(operation) == false) {
-                    operation = "noop";
-                }
-                @SuppressWarnings("unchecked")
-                final java.util.Map<String, Object> edited = (java.util.Map<String, Object>) ctx.get("_source");
-                // A script usually mutates ctx._source in place, in which case it *is* this map and there is
-                // nothing to copy. It may also replace it wholesale. Clearing first and copying second
-                // handles the second case and silently empties the document in the first, because the source
-                // and the destination are the same object -- which is what the assertion on the document's
-                // contents, rather than on the response, caught.
-                if (edited != null && edited != merged) {
-                    final java.util.Map<String, Object> replacement = new java.util.LinkedHashMap<>(edited);
-                    merged.clear();
-                    merged.putAll(replacement);
-                }
-            }
-
-            if ("noop".equals(operation) || "none".equals(operation)) {
-                return new UpdateOutcome("noop", current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
-            }
-            if ("delete".equals(operation)) {
-                if (existing.found() == false) {
-                    // A scripted upsert cannot delete a document another writer created after this read.
-                    return new UpdateOutcome("noop", current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
-                }
-                // The script decided against the document we read. Deleting unconditionally here
-                // removed a newer concurrent write; use the same compare-and-swap as an indexed update.
-                final Written removed = written(index, id, "", refresh, true, existing.seqNo(), existing.primaryTerm());
-                return new UpdateOutcome(
-                    "deleted",
-                    removed.servedBy(),
-                    removed.outcome().seqNo(),
-                    removed.outcome().primaryTerm(),
-                    removed.outcome().version()
-                );
-            }
-
-            if ("noop".equals(result)) {
-                // Nothing written, so the document keeps the identity the read just observed. Reporting
-                // that identity rather than an unassigned one is what lets a caller chain a conditional
-                // write after a noop without having to re-read.
-                return new UpdateOutcome(result, current.servedBy(), existing.seqNo(), existing.primaryTerm(), existing.version());
-            }
-            final String mergedJson;
-            try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
-                builder.map(merged);
-                mergedJson = org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
-            }
-            // The compare-and-swap an update is: against what was just read, unless the caller brought a
-            // condition of their own. This used to pass the caller's (unassigned) condition, so two
-            // concurrent partial updates each read, each wrote, and one merge was lost -- and the
-            // retry_on_conflict loop above this could never fire. A missing document is written as a
-            // create, so two concurrent upserts cannot both "create".
-            final boolean unconditional = ifSeqNo == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
-            final Written written = written(
-                index,
+            // The script decided against the document we read. Deleting unconditionally here
+            // removed a newer concurrent write; use the same compare-and-swap as an indexed update.
+            final Written removed = written(index, id, "", refresh, true, existing.seqNo(), existing.primaryTerm());
+            return new UpdateOutcome(
+                "deleted",
+                removed.servedBy(),
+                removed.outcome().seqNo(),
+                removed.outcome().primaryTerm(),
+                removed.outcome().version(),
+                removed.shardId,
                 id,
-                mergedJson,
-                refresh,
-                false,
-                unconditional && existing.found() ? existing.seqNo() : ifSeqNo,
-                unconditional && existing.found() ? existing.primaryTerm() : ifPrimaryTerm,
-                unconditional && existing.found() == false
+                refresh
             );
+        }
+
+        if ("noop".equals(result)) {
+            // Nothing written, so the document keeps the identity the read just observed. Reporting
+            // that identity rather than an unassigned one is what lets a caller chain a conditional
+            // write after a noop without having to re-read.
             return new UpdateOutcome(
                 result,
-                written.servedBy(),
-                written.outcome().seqNo(),
-                written.outcome().primaryTerm(),
-                written.outcome().version()
+                current.servedBy(),
+                existing.seqNo(),
+                existing.primaryTerm(),
+                existing.version(),
+                current.shardId(),
+                id,
+                refresh
             );
-        });
+        }
+        final String mergedJson;
+        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            builder.map(merged);
+            mergedJson = org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
+        }
+        // The compare-and-swap an update is: against what was just read, unless the caller brought a
+        // condition of their own. This used to pass the caller's (unassigned) condition, so two
+        // concurrent partial updates each read, each wrote, and one merge was lost -- and the
+        // retry_on_conflict loop could never fire. A missing document is written as a
+        // create, so two concurrent upserts cannot both "create".
+        final boolean unconditional = ifSeqNo == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
+        final Written written = written(
+            index,
+            id,
+            mergedJson,
+            refresh,
+            false,
+            unconditional && existing.found() ? existing.seqNo() : ifSeqNo,
+            unconditional && existing.found() ? existing.primaryTerm() : ifPrimaryTerm,
+            unconditional && existing.found() == false
+        );
+        return new UpdateOutcome(
+            result,
+            written.servedBy(),
+            written.outcome().seqNo(),
+            written.outcome().primaryTerm(),
+            written.outcome().version(),
+            written.shardId,
+            id,
+            refresh
+        );
     }
 
     private boolean doDelete(String index, String id, boolean refresh) throws IOException {
