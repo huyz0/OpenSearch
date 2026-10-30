@@ -308,19 +308,22 @@ public class ServerlessTemplateTests extends OpenSearchTestCase {
     /** The two ways of writing a template that could never do what its author meant. */
     public void testTemplatesThatCouldNeverWorkAreRefused() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
-        try (ServerlessNode node = running(plane(clock, createTempDir()), "tmpl-invalid")) {
+        final MetadataPlane metadata = plane(clock, createTempDir());
+        try (ServerlessNode node = running(metadata, "tmpl-invalid")) {
             assertNotNull(node);
 
             final Answer noPatterns = call("PUT", "/_index_template/nopat", "{\"template\":{}}");
             assertEquals("an index template with no patterns matches nothing: " + noPatterns.body(), 400, noPatterns.status());
-            assertTrue(noPatterns.body(), noPatterns.has("can never match an index"));
+            assertTrue(noPatterns.body(), noPatterns.has("index_patterns"));
+            assertTrue(metadata.indexTemplates().get("nopat").isEmpty());
 
             final Answer componentWithPatterns = call("PUT", "/_component_template/bad", "{\"index_patterns\":[\"x-*\"],\"template\":{}}");
             assertEquals(componentWithPatterns.body(), 400, componentWithPatterns.status());
             assertTrue(
                 "a component does not decide what it applies to: " + componentWithPatterns.body(),
-                componentWithPatterns.has("composed by an index template")
+                componentWithPatterns.has("index_patterns")
             );
+            assertTrue(metadata.componentTemplates().get("bad").isEmpty());
         }
     }
 
