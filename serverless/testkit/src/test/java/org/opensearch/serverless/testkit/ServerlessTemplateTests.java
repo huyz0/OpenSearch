@@ -305,6 +305,29 @@ public class ServerlessTemplateTests extends OpenSearchTestCase {
         }
     }
 
+    public void testLegacyPrioritiesAreAppliedOrRefusedBeforeIndexCreation() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane metadata = plane(clock, createTempDir());
+        try (ServerlessNode node = running(metadata, "legacy-priority")) {
+            assertNotNull(node);
+            metadata.indexTemplates()
+                .put("lower", "{\"index_patterns\":[\"logs-*\"],\"priority\":10,\"template\":{\"settings\":{\"number_of_shards\":2}}}");
+            metadata.indexTemplates()
+                .put(
+                    "higher",
+                    "{\"index_patterns\":[\"logs-*\"],\"priority\":\"20\",\"template\":{\"settings\":{\"number_of_shards\":1}}}"
+                );
+            final Answer created = call("PUT", "/logs-new", "{}");
+            assertEquals(created.body(), 200, created.status());
+            assertEquals(1, metadata.describe("logs-new").orElseThrow().numberOfShards());
+            metadata.indexTemplates().put("higher", "{\"index_patterns\":[\"logs-*\"],\"priority\":true,\"template\":{}}");
+            final Answer refused = call("PUT", "/logs-invalid", "{}");
+            assertEquals(refused.body(), 400, refused.status());
+            assertTrue(refused.body(), refused.has("priority"));
+            assertTrue(metadata.describe("logs-invalid").isEmpty());
+        }
+    }
+
     /** The two ways of writing a template that could never do what its author meant. */
     public void testTemplatesThatCouldNeverWorkAreRefused() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
