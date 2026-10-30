@@ -364,6 +364,34 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMetadataReadFailuresRemainRetryable() throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+            try (var node = new ServerlessNode(nodeSettings("bulk-metadata-failure"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final var loop = new BackgroundReconciler(node, plane);
+                loop.want("alpha", 0);
+                loop.tick(clock.get());
+                loop.reclaimSweep().get(30, java.util.concurrent.TimeUnit.SECONDS);
+                final Response response;
+                store.failRegisterReadsUnder("indices");
+                try {
+                    response = send(node, "POST", "/alpha/_bulk?refresh=true", indexLine("not-written", 9));
+                } finally {
+                    store.failRegisterReadsUnder(null);
+                }
+                assertEquals(response.body(), 200, response.status());
+                assertTrue(response.body(), response.body().contains("\"errors\":true"));
+                assertTrue("a failed read does not establish absence: " + response.body(), response.body().contains("\"status\":503"));
+                assertFalse(response.body(), response.body().contains("index_not_found"));
+                assertEquals(0, hits(node, "n", "9"));
+            }
+        }
+    }
+
     /**
      * A batch spanning two nodes is one forwarded request per shard, not one per document.
      *
