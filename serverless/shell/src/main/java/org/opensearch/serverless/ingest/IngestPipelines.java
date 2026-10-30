@@ -47,6 +47,8 @@ public final class IngestPipelines {
 
     private final Map<String, Processor.Factory> factories;
     private final org.opensearch.script.ScriptService scriptService;
+    private final org.opensearch.serverless.pipeline.CompiledPipelineCache<Pipeline> compiled =
+        new org.opensearch.serverless.pipeline.CompiledPipelineCache<>();
 
     /**
      * Creates the compiler over a set of processor factories.
@@ -77,10 +79,12 @@ public final class IngestPipelines {
      * @throws Exception if the definition names an unknown processor or configures one wrongly
      */
     public Pipeline compile(String id, String source) throws Exception {
-        final Map<String, Object> config = new HashMap<>(
-            XContentHelper.convertToMap(new BytesArray(source.getBytes(StandardCharsets.UTF_8)), false, XContentType.JSON).v2()
-        );
-        return Pipeline.create(id, config, factories, scriptService);
+        return compiled.get(id, source, () -> {
+            final Map<String, Object> config = new HashMap<>(
+                XContentHelper.convertToMap(new BytesArray(source.getBytes(StandardCharsets.UTF_8)), false, XContentType.JSON).v2()
+            );
+            return Pipeline.create(id, config, factories, scriptService);
+        });
     }
 
     /**
