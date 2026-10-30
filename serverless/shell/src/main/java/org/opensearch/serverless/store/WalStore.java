@@ -158,6 +158,8 @@ public final class WalStore {
 
     /** How many record reads a replay keeps in flight. */
     static final int READ_WIDTH = 8;
+    /** Raw bodies retained before decoding; an individual larger blob is read on its own. */
+    static final long REPLAY_READ_BYTES = 16L * 1024 * 1024;
 
     /**
      * Lets a replay read its records concurrently on the given executor, the calling thread reading too.
@@ -554,20 +556,34 @@ public final class WalStore {
                 names.removeIf(name -> name.compareTo(limit) > 0);
             }
             names.sort(Comparator.naturalOrder());
-            final List<byte[]> bodies = readAll(container, names);
-            for (int i = 0; i < names.size(); i++) {
-                final String name = names.get(i);
-                try {
-                    records.addAll(parseBatch(bodies.get(i)));
-                } catch (IOException e) {
-                    // A name that matches ours and does not parse is corruption, and it propagates --
-                    // naming the blob, because a parse failure that does not say which record failed
-                    // leaves an operator with a corrupt log and nowhere to look. Anything not matching
-                    // was filtered above: a foreign object sharing the prefix is not ours to interpret,
-                    // and must not brick a shard's recovery. Absent, foreign and corrupt are three
-                    // different answers.
-                    throw new IOException("unreadable WAL record at " + container.path().buildAsString() + name, e);
+            // Decode before fetching the next window. Retaining every raw body in a term alongside
+            // the decoded replay list doubles recovery memory and can exhaust the heap on a cold shard.
+            final int width = reads == null ? 1 : READ_WIDTH;
+            for (int start = 0; start < names.size();) {
+                int end = start;
+                long bytes = 0L;
+                while (end < names.size() && end - start < width) {
+                    final long length = Math.max(0L, listed.get(names.get(end)).length());
+                    if (end > start && (bytes >= REPLAY_READ_BYTES || length > REPLAY_READ_BYTES - bytes)) {
+                        break;
+                    }
+                    bytes += length;
+                    end++;
                 }
+                final List<String> selected = names.subList(start, end);
+                final List<byte[]> bodies = readAll(container, selected);
+                for (int i = 0; i < selected.size(); i++) {
+                    final String name = selected.get(i);
+                    try {
+                        records.addAll(parseBatch(bodies.get(i)));
+                    } catch (IOException e) {
+                        // Preserve the failing blob's identity and stop before reading another window.
+                        throw new IOException("unreadable WAL record at " + container.path().buildAsString() + name, e);
+                    } finally {
+                        bodies.set(i, null);
+                    }
+                }
+                start = end;
             }
         }
         return records;
