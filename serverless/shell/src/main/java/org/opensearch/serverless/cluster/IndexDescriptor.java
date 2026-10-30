@@ -336,13 +336,13 @@ public final class IndexDescriptor {
         final IndexMetadata.Builder builder = IndexMetadata.builder(name)
             .settings(
                 Settings.builder()
-                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(extraSettings)
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, createdVersionId == 0 ? Version.CURRENT : Version.fromId(createdVersionId))
                     .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
                     .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, numberOfShards)
                     // No replicas: durability comes from the object store, not from copies on peers.
                     .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
                     .put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.DOCUMENT)
-                    .put(extraSettings)
                     .build()
             );
         if (mapping != null) {
