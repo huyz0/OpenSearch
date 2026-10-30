@@ -284,4 +284,58 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
     public void testLegacyDeleteSuffixStillAppliesAfterASequencedWrite() throws Exception {
         assertMixedReplay(java.util.List.of(new WalRecord("logged", "{\"n\":1}", 0L, 1L, 1L), WalRecord.deletion("logged")), null);
     }
+
+    public void testSameSequenceIdentityCannotHideDifferentSources() throws Exception {
+        assertSequencedConflict(
+            java.util.List.of(new WalRecord("logged", "{\"n\":1}", 0L, 1L, 1L), new WalRecord("logged", "{\"n\":9}", 0L, 1L, 1L))
+        );
+    }
+
+    public void testSameSequenceIdentityCannotHideDifferentVersions() throws Exception {
+        assertSequencedConflict(
+            java.util.List.of(new WalRecord("logged", "{\"n\":1}", 0L, 1L, 1L), new WalRecord("logged", "{\"n\":1}", 0L, 1L, 2L))
+        );
+    }
+
+    public void testSameSequenceDeleteCannotHideDifferentVersions() throws Exception {
+        assertSequencedConflict(java.util.List.of(WalRecord.deletion("logged", 0L, 1L, 1L), WalRecord.deletion("logged", 0L, 1L, 2L)));
+    }
+
+    public void testSameSequenceDeleteCannotHideDifferentDocumentIds() throws Exception {
+        assertSequencedConflict(java.util.List.of(WalRecord.deletion("logged", 0L, 1L, 1L), WalRecord.deletion("other", 0L, 1L, 1L)));
+    }
+
+    public void testIdenticalSequencedWritesRemainReplayable() throws Exception {
+        final var record = new WalRecord("logged", "{\"n\":9}", 0L, 1L, 1L);
+        assertMixedReplay(java.util.List.of(record, record), "{\"n\":9}");
+    }
+
+    public void testIdenticalSequencedDeletesRemainReplayable() throws Exception {
+        final var record = WalRecord.deletion("logged", 0L, 1L, 1L);
+        assertMixedReplay(java.util.List.of(record, record), null);
+    }
+
+    private void assertSequencedConflict(java.util.List<WalRecord> records) throws Exception {
+        final var clock = new AtomicLong(1_000L);
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            final var descriptor = new IndexDescriptor(
+                "conflict",
+                "uuid-conflict",
+                1,
+                "{\"properties\":{\"n\":{\"type\":\"long\"}}}",
+                null
+            );
+            plane.createIndex(descriptor);
+            plane.walStore("conflict", descriptor.uuid(), 0).append(1L, records);
+            try (var node = new ServerlessNode(nodeSettings("payload-replay-conflict"))) {
+                node.start();
+                node.setMetadataPlane(plane);
+                final Exception failure = expectThrows(Exception.class, () -> node.activateWriter(plane, "conflict", 0));
+                final String reason = org.opensearch.ExceptionsHelper.detailedMessage(failure);
+                assertTrue(reason, reason.contains("share a sequence number"));
+                assertTrue(node.reconciler().openShards().isEmpty());
+            }
+        }
+    }
 }

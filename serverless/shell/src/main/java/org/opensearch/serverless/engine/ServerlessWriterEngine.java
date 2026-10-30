@@ -106,13 +106,31 @@ public final class ServerlessWriterEngine extends InternalEngine {
         // Two operations in the log itself under one sequence number: core applies the first and skips the second,
         // and the publish after this open trims the record. A fleet run lost three acknowledged writes so, when a
         // writer's record landed past its successor's fence. The same operation twice -- a record kept for a fence
-        // and replayed again -- is the same id at the same term, and is not one.
-        final java.util.Map<Long, String> bySeqNo = new java.util.HashMap<>();
+        // and replayed again -- has identical contents, and is not one.
+        final java.util.Map<Long, Translog.Operation> bySeqNo = new java.util.HashMap<>();
         for (Translog.Operation operation : operations) {
-            final String identity = operation.opType() + " " + identityOf(operation) + " term " + operation.primaryTerm();
-            final String earlier = bySeqNo.putIfAbsent(operation.seqNo(), identity);
-            if (earlier != null && earlier.equals(identity) == false && collision == null) {
-                collision = "seqNo " + operation.seqNo() + " is in the log twice: " + earlier + ", and " + identity;
+            final Translog.Operation earlier = bySeqNo.putIfAbsent(operation.seqNo(), operation);
+            // Compare the complete operation, including source and version. Delete.equals does not
+            // include the document ID, so check that separately as well. Retain references to the
+            // existing operations rather than allocating an identity string for every WAL record.
+            if (earlier != null
+                && (earlier.equals(operation) == false || identityOf(earlier).equals(identityOf(operation)) == false)
+                && collision == null) {
+                collision = "seqNo "
+                    + operation.seqNo()
+                    + " has conflicting operations: "
+                    + earlier.opType()
+                    + " "
+                    + identityOf(earlier)
+                    + " term "
+                    + earlier.primaryTerm()
+                    + ", and "
+                    + operation.opType()
+                    + " "
+                    + identityOf(operation)
+                    + " term "
+                    + operation.primaryTerm()
+                    + " (operation contents differ)";
                 logger.error("{} replay would drop an acknowledged operation: {}", shardId, collision);
             }
         }
