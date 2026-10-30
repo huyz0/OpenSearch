@@ -70,4 +70,23 @@ public class TemplateContentRaceTests extends OpenSearchTestCase {
             assertEquals(delete ? Map.of("second", original) : Map.of("first", replacement, "second", original), cold.all());
         }
     }
+
+    public void testPrefixReadsRetryASelectedRevisionRemovedAfterTheMarkerRead() throws Exception {
+        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final var container = store.blobContainer(BlobPath.cleanPath().add("prefix-race"));
+            final var writer = new TemplateStore(container);
+            writer.put("chosen-a", "original");
+            writer.put("unrelated", "unchanged");
+            store.onNextRegisterRead("prefix-race", "_version", () -> {
+                try {
+                    writer.put("chosen-a", "replacement");
+                    writer.put("chosen-b", "new");
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+            assertEquals(Map.of("chosen-a", "replacement", "chosen-b", "new"), new TemplateStore(container).withPrefix("chosen-"));
+            assertTrue(store.fired());
+        }
+    }
 }
