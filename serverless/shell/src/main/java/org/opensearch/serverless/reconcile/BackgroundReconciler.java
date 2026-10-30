@@ -104,6 +104,9 @@ public final class BackgroundReconciler implements Closeable {
     private volatile boolean demandDriven;
     /** Set by a running {@link ReconcileScheduler}: the lease is renewed by its timer, so the backstop must not renew it again. */
     private volatile boolean renewalDrivenByTimer;
+    private final ReconcileActivity activity = new ReconcileActivity();
+    private final Object activationAdmission = new Object();
+
     /**
      * The activations in flight, one per shard. The renewal timer, the backstop, a failure-triggered pass and
      * a write waiting for its shard can all ask for the same shard at once; the first starts it and the rest
@@ -132,7 +135,8 @@ public final class BackgroundReconciler implements Closeable {
     private final java.util.concurrent.atomic.AtomicLong activationSequence = new java.util.concurrent.atomic.AtomicLong();
 
     /** One activation waiting for a slot, ordered by this node's rank for its shard and then by arrival. */
-    private record QueuedActivation(int rank, long sequence, Runnable task) implements Comparable<QueuedActivation> {
+    private record QueuedActivation(int rank, long sequence, Map.Entry<String, Integer> key, java.util.concurrent.CompletableFuture<
+        Optional<ShardId>> result, Runnable task) implements Comparable<QueuedActivation> {
         @Override
         public int compareTo(QueuedActivation other) {
             final int byRank = Integer.compare(rank, other.rank);
@@ -250,6 +254,9 @@ public final class BackgroundReconciler implements Closeable {
      * @param shardId the shard number
      */
     public void want(String indexName, int shardId) {
+        if (activity.isClosed()) {
+            return;
+        }
         wanted.add(Map.entry(indexName, shardId));
     }
 
@@ -260,6 +267,9 @@ public final class BackgroundReconciler implements Closeable {
      * @param shardId the shard number
      */
     public void stopWanting(String indexName, int shardId) {
+        if (activity.isClosed()) {
+            return;
+        }
         wanted.remove(Map.entry(indexName, shardId));
     }
 
@@ -275,83 +285,88 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public TickResult tick(long nowMillis) throws Exception {
-        final Set<ShardId> released = new java.util.LinkedHashSet<>(renewLeases());
-        final Set<ShardId> activated = new java.util.LinkedHashSet<>(activateWanted());
-        final Set<ShardId> published = publishAll();
-        // After publishing, so a shard released for idleness has just had its chance to flush.
-        released.addAll(releaseIdle(nowMillis));
-        trimToCap();
-        handOffToMemberWithRoom();
-        // And after that, so a reader this node has just let go of for idleness is not looked up again.
-        released.addAll(refreshReaders());
-        // Views this node is holding for a record that has gone: in-memory to decide, so it costs nothing
-        // on a node holding none, and it must not wait for the reaping cadence below.
-        closeReleasedViews();
-        // The deployment-wide reap is a listing, and every node would otherwise pay one every pass to be
-        // told that a feature nobody used is still not being used. A keep-alive is minutes; this is
-        // seconds times a small number, which is soon enough and is a fraction of the cost.
-        if (passes++ % REAP_EVERY_PASSES == 0) {
-            if (reapExpiredViews() > 0) {
-                // Files a reaped view was holding are deletable now, and nothing else would notice until
-                // the shard next lost a file of its own.
-                forceSweepOfOpenWriters();
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return new TickResult(Set.of(), Set.of(), Set.of(), 0);
             }
-            reaps++;
-            // And the pins this node did not touch: two listings, no reads, every few reaps. A view reaped
-            // elsewhere or a snapshot deleted anywhere changes the set, and a changed set is the one signal
-            // that files a quiet index held under that pin are collectable now rather than at its next
-            // merge.
-            if (reaps % PINS_EVERY_REAPS == 0) {
-                try {
-                    final Set<String> pins = collector.pins();
-                    if (lastPins != null && pins.equals(lastPins) == false) {
-                        forceSweepOfOpenWriters();
+            final Set<ShardId> released = new java.util.LinkedHashSet<>(renewLeases());
+            final Set<ShardId> activated = new java.util.LinkedHashSet<>(activateWanted());
+            final Set<ShardId> published = publishAll();
+            // After publishing, so a shard released for idleness has just had its chance to flush.
+            released.addAll(releaseIdle(nowMillis));
+            trimToCap();
+            handOffToMemberWithRoom();
+            // And after that, so a reader this node has just let go of for idleness is not looked up again.
+            released.addAll(refreshReaders());
+            // Views this node is holding for a record that has gone: in-memory to decide, so it costs nothing
+            // on a node holding none, and it must not wait for the reaping cadence below.
+            closeReleasedViews();
+            // The deployment-wide reap is a listing, and every node would otherwise pay one every pass to be
+            // told that a feature nobody used is still not being used. A keep-alive is minutes; this is
+            // seconds times a small number, which is soon enough and is a fraction of the cost.
+            if (passes++ % REAP_EVERY_PASSES == 0) {
+                if (reapExpiredViews() > 0) {
+                    // Files a reaped view was holding are deletable now, and nothing else would notice until
+                    // the shard next lost a file of its own.
+                    forceSweepOfOpenWriters();
+                }
+                reaps++;
+                // And the pins this node did not touch: two listings, no reads, every few reaps. A view reaped
+                // elsewhere or a snapshot deleted anywhere changes the set, and a changed set is the one signal
+                // that files a quiet index held under that pin are collectable now rather than at its next
+                // merge.
+                if (reaps % PINS_EVERY_REAPS == 0) {
+                    try {
+                        final Set<String> pins = collector.pins();
+                        if (lastPins != null && pins.equals(lastPins) == false) {
+                            forceSweepOfOpenWriters();
+                        }
+                        lastPins = pins;
+                    } catch (Exception e) {
+                        logger.warn("could not read the deployment's pins; the sweep gate keeps its last reading", e);
                     }
-                    lastPins = pins;
-                } catch (Exception e) {
-                    logger.warn("could not read the deployment's pins; the sweep gate keeps its last reading", e);
+                }
+                // Descriptor tombstones past their quarantine, rarely: a name created and deleted daily used
+                // to poison its prefix pattern after a year, because nothing ever removed them. Only the
+                // buckets this node owns, so the deployment pays once per deleted name, not once per node.
+                final org.opensearch.cluster.node.DiscoveryNode self = node.localNode();
+                if (reaps % TOMBSTONE_SWEEP_EVERY_REAPS == 0 && self != null) {
+                    sweepTombstonesOffThePass(self.getId());
+                }
+                // And one slice of the orphaned-shard sweep, as rarely: a backstop for shard data whose index
+                // is gone and whose reclaim never ran. The cursor is shared, so every node's slices advance one
+                // cycle, and a slice costs its budget whatever the deployment's size.
+                if (reaps % ORPHAN_SLICE_EVERY_REAPS == ORPHAN_SLICE_EVERY_REAPS / 2 && orphanSliceBudget > 0) {
+                    sliceOrphansOffThePass();
+                }
+                // And the deletes whose reclaim intents have fallen due, every reap: an intent is due minutes
+                // after its delete, not hours, and the queue lists only the buckets that are.
+                if (self != null) {
+                    reclaimOffThePass(self.getId());
                 }
             }
-            // Descriptor tombstones past their quarantine, rarely: a name created and deleted daily used
-            // to poison its prefix pattern after a year, because nothing ever removed them. Only the
-            // buckets this node owns, so the deployment pays once per deleted name, not once per node.
-            final org.opensearch.cluster.node.DiscoveryNode self = node.localNode();
-            if (reaps % TOMBSTONE_SWEEP_EVERY_REAPS == 0 && self != null) {
-                sweepTombstonesOffThePass(self.getId());
+            // One small register read: the stored scripts are re-read only when their marker has moved, which
+            // is how a script put on another node reaches this one without a listing per pass.
+            node.storedScripts().refresh(false);
+            // The full re-read of this node's truth, rarely. Activation no longer goes through it -- taking
+            // one shard used to re-read every held head -- so this is what reopens a shard whose head still
+            // names this node but which is not open here: one closed after a failed log append, or one whose
+            // open failed after the head was won. One listing and a head read per claim, every
+            // RESYNC_EVERY_PASSES backstops, which at the default interval is once in ten minutes.
+            if (passes % RESYNC_EVERY_PASSES == RESYNC_EVERY_PASSES - 1) {
+                try {
+                    activated.addAll(node.syncFrom(plane));
+                } catch (Exception e) {
+                    logger.warn("periodic resync against the metadata plane failed; the next one will retry", e);
+                }
             }
-            // And one slice of the orphaned-shard sweep, as rarely: a backstop for shard data whose index
-            // is gone and whose reclaim never ran. The cursor is shared, so every node's slices advance one
-            // cycle, and a slice costs its budget whatever the deployment's size.
-            if (reaps % ORPHAN_SLICE_EVERY_REAPS == ORPHAN_SLICE_EVERY_REAPS / 2 && orphanSliceBudget > 0) {
-                sliceOrphansOffThePass();
-            }
-            // And the deletes whose reclaim intents have fallen due, every reap: an intent is due minutes
-            // after its delete, not hours, and the queue lists only the buckets that are.
-            if (self != null) {
-                reclaimOffThePass(self.getId());
-            }
+            // Only what was published, so the sweep costs nothing at all on a shard nobody is writing to.
+            // Edge-triggered publishes are swept here too: only the backstop's result used to enter the
+            // watch set, so a burst-then-idle shard kept its merged-away segments forever.
+            published.addAll(drainPendingSweeps());
+            sweepPublished(published);
+            return new TickResult(released, activated, published, refreshHints(nowMillis));
         }
-        // One small register read: the stored scripts are re-read only when their marker has moved, which
-        // is how a script put on another node reaches this one without a listing per pass.
-        node.storedScripts().refresh(false);
-        // The full re-read of this node's truth, rarely. Activation no longer goes through it -- taking
-        // one shard used to re-read every held head -- so this is what reopens a shard whose head still
-        // names this node but which is not open here: one closed after a failed log append, or one whose
-        // open failed after the head was won. One listing and a head read per claim, every
-        // RESYNC_EVERY_PASSES backstops, which at the default interval is once in ten minutes.
-        if (passes % RESYNC_EVERY_PASSES == RESYNC_EVERY_PASSES - 1) {
-            try {
-                activated.addAll(node.syncFrom(plane));
-            } catch (Exception e) {
-                logger.warn("periodic resync against the metadata plane failed; the next one will retry", e);
-            }
-        }
-        // Only what was published, so the sweep costs nothing at all on a shard nobody is writing to.
-        // Edge-triggered publishes are swept here too: only the backstop's result used to enter the
-        // watch set, so a burst-then-idle shard kept its merged-away segments forever.
-        published.addAll(drainPendingSweeps());
-        sweepPublished(published);
-        return new TickResult(released, activated, published, refreshHints(nowMillis));
     }
 
     /**
@@ -378,64 +393,73 @@ public final class BackgroundReconciler implements Closeable {
      * @return the readers released
      */
     public Set<ShardId> refreshReaders() {
-        final Set<ShardId> stale = new LinkedHashSet<>();
-        final Set<ShardId> views = node.reconciler().frozenShards();
-        for (ShardId shardId : node.reconciler().readerShards()) {
-            if (views.contains(shardId)) {
-                continue;
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
             }
-            final var opened = node.reconciler().readerCommit(shardId);
-            if (opened.isEmpty()) {
-                continue;
-            }
-            if (node.reconciler().inFlight(shardId) > 0) {
-                // A query is running against it. Closing the reader under a running aggregation failed
-                // the query with a closed reader, which looks like corruption and is a scheduling choice;
-                // the next pass finds the commit still superseded and tries again.
-                continue;
-            }
-            try {
-                final var current = plane.segmentPublisher(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id())
-                    .readManifest();
-                if (current.isEmpty()) {
-                    // The commit this reader is serving is no longer published at all. A deleted index,
-                    // most likely -- but a manifest read that came back empty is not proof of that on its
-                    // own, so the descriptor decides: gone too, and the reader is let go with the records
-                    // this node kept of it; still there, and the next search will say what is true.
-                    if (plane.describe(shardId.getIndexName()).isEmpty()
-                        && node.reconciler()
-                            .releaseReader(shardId, opened.get(), "its index has been deleted") == ShardReconciler.ReaderRelease.RELEASED) {
-                        node.forgetReader(shardId);
-                        stale.add(shardId);
+            final Set<ShardId> stale = new LinkedHashSet<>();
+            final Set<ShardId> views = node.reconciler().frozenShards();
+            for (ShardId shardId : node.reconciler().readerShards()) {
+                if (views.contains(shardId)) {
+                    continue;
+                }
+                final var opened = node.reconciler().readerCommit(shardId);
+                if (opened.isEmpty()) {
+                    continue;
+                }
+                if (node.reconciler().inFlight(shardId) > 0) {
+                    // A query is running against it. Closing the reader under a running aggregation failed
+                    // the query with a closed reader, which looks like corruption and is a scheduling choice;
+                    // the next pass finds the commit still superseded and tries again.
+                    continue;
+                }
+                try {
+                    final var current = plane.segmentPublisher(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id())
+                        .readManifest();
+                    if (current.isEmpty()) {
+                        // The commit this reader is serving is no longer published at all. A deleted index,
+                        // most likely -- but a manifest read that came back empty is not proof of that on its
+                        // own, so the descriptor decides: gone too, and the reader is let go with the records
+                        // this node kept of it; still there, and the next search will say what is true.
+                        if (plane.describe(shardId.getIndexName()).isEmpty()
+                            && node.reconciler()
+                                .releaseReader(
+                                    shardId,
+                                    opened.get(),
+                                    "its index has been deleted"
+                                ) == ShardReconciler.ReaderRelease.RELEASED) {
+                            node.forgetReader(shardId);
+                            stale.add(shardId);
+                        }
+                        continue;
                     }
-                    continue;
+                    if (sameCommit(opened.get(), current.get())) {
+                        continue;
+                    }
+                    // Only if it is still the reader judged above. The manifest read is a round trip, and a write during
+                    // it can make this node the shard's writer under the same id: closing that would leave its head
+                    // naming a node with nothing open, answering "retry" for as long as the node lives.
+                    if (node.reconciler()
+                        .releaseReader(
+                            shardId,
+                            opened.get(),
+                            "the commit it was serving has been superseded"
+                        ) != ShardReconciler.ReaderRelease.RELEASED) {
+                        continue;
+                    }
+                    // And the node's own record of serving it, or a search node that cycles through readers
+                    // carries every one it ever opened into every reader open for the rest of its life.
+                    node.forgetReader(shardId);
+                    stale.add(shardId);
+                } catch (Exception e) {
+                    // Refreshing is an optimisation over being wrong, not a correctness step of its own: a
+                    // failure here leaves the reader exactly where it was, which is where it would have been
+                    // if this method did not exist.
+                    logger.warn("could not check whether the reader for " + shardId + " is stale; keeping it", e);
                 }
-                if (sameCommit(opened.get(), current.get())) {
-                    continue;
-                }
-                // Only if it is still the reader judged above. The manifest read is a round trip, and a write during
-                // it can make this node the shard's writer under the same id: closing that would leave its head
-                // naming a node with nothing open, answering "retry" for as long as the node lives.
-                if (node.reconciler()
-                    .releaseReader(
-                        shardId,
-                        opened.get(),
-                        "the commit it was serving has been superseded"
-                    ) != ShardReconciler.ReaderRelease.RELEASED) {
-                    continue;
-                }
-                // And the node's own record of serving it, or a search node that cycles through readers
-                // carries every one it ever opened into every reader open for the rest of its life.
-                node.forgetReader(shardId);
-                stale.add(shardId);
-            } catch (Exception e) {
-                // Refreshing is an optimisation over being wrong, not a correctness step of its own: a
-                // failure here leaves the reader exactly where it was, which is where it would have been
-                // if this method did not exist.
-                logger.warn("could not check whether the reader for " + shardId + " is stale; keeping it", e);
             }
+            return stale;
         }
-        return stale;
     }
 
     /** How many sweeps a blob must be seen unreferenced by before it is deleted. */
@@ -543,78 +567,83 @@ public final class BackgroundReconciler implements Closeable {
      * @return the blobs deleted, qualified by term container
      */
     public Set<String> sweepPublished(Collection<ShardId> published) {
-        final Set<String> deleted = new LinkedHashSet<>();
-        if (plane.blobStore() == null) {
-            return deleted;
-        }
-        final Set<ShardId> toSweep = new LinkedHashSet<>();
-        for (ShardId shardId : published) {
-            if (sweepCanFindSomething(shardId)) {
-                toSweep.add(shardId);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
             }
-        }
-        toSweep.addAll(unreferencedFor.keySet());
-        if (toSweep.isEmpty()) {
-            // Nothing published that lost a file, and nothing on watch: this pass costs no listing at all.
-            return deleted;
-        }
-        // The views and snapshots every shard's sweep checks against, read once per pass rather than once
-        // per shard: at a hundred published shards and a thousand views that was a hundred thousand reads
-        // a pass.
-        final java.util.List<org.opensearch.serverless.metadata.PointInTime> views;
-        final java.util.List<org.opensearch.serverless.metadata.SnapshotRecord> snapshots;
-        try {
-            views = plane.livePointsInTime(plane.clock().getAsLong());
-            snapshots = plane.liveSnapshots();
-        } catch (Exception e) {
-            logger.warn("could not read the views and snapshots a sweep must respect; sweeping nothing this pass", e);
-            return deleted;
-        }
-        for (ShardId shardId : toSweep) {
-            if (node.reconciler().openShards().contains(shardId) == false || node.reconciler().isReader(shardId)) {
-                // Not ours to sweep any more. Forgetting what we had seen is the safe direction: the next
-                // owner starts again from nothing and simply deletes later than it could have.
-                unreferencedFor.remove(shardId);
-                sweptAgainst.remove(shardId);
-                lastManifests.remove(shardId);
-                continue;
+            final Set<String> deleted = new LinkedHashSet<>();
+            if (plane.blobStore() == null) {
+                return deleted;
             }
-            final Map<String, Integer> seen = unreferencedFor.getOrDefault(shardId, Map.of());
-            // Null means "everything unreferenced, now". Building the eligible set from what a previous
-            // sweep saw would make a grace of zero delete nothing on the first sweep and everything on the
-            // second -- a knob that looks like it is off and is really set to one.
-            Set<String> eligible = null;
-            if (sweepGracePasses > 0) {
-                eligible = new java.util.HashSet<>();
-                for (Map.Entry<String, Integer> entry : seen.entrySet()) {
-                    if (entry.getValue() >= sweepGracePasses) {
-                        eligible.add(entry.getKey());
+            final Set<ShardId> toSweep = new LinkedHashSet<>();
+            for (ShardId shardId : published) {
+                if (sweepCanFindSomething(shardId)) {
+                    toSweep.add(shardId);
+                }
+            }
+            toSweep.addAll(unreferencedFor.keySet());
+            if (toSweep.isEmpty()) {
+                // Nothing published that lost a file, and nothing on watch: this pass costs no listing at all.
+                return deleted;
+            }
+            // The views and snapshots every shard's sweep checks against, read once per pass rather than once
+            // per shard: at a hundred published shards and a thousand views that was a hundred thousand reads
+            // a pass.
+            final java.util.List<org.opensearch.serverless.metadata.PointInTime> views;
+            final java.util.List<org.opensearch.serverless.metadata.SnapshotRecord> snapshots;
+            try {
+                views = plane.livePointsInTime(plane.clock().getAsLong());
+                snapshots = plane.liveSnapshots();
+            } catch (Exception e) {
+                logger.warn("could not read the views and snapshots a sweep must respect; sweeping nothing this pass", e);
+                return deleted;
+            }
+            for (ShardId shardId : toSweep) {
+                if (node.reconciler().openShards().contains(shardId) == false || node.reconciler().isReader(shardId)) {
+                    // Not ours to sweep any more. Forgetting what we had seen is the safe direction: the next
+                    // owner starts again from nothing and simply deletes later than it could have.
+                    unreferencedFor.remove(shardId);
+                    sweptAgainst.remove(shardId);
+                    lastManifests.remove(shardId);
+                    continue;
+                }
+                final Map<String, Integer> seen = unreferencedFor.getOrDefault(shardId, Map.of());
+                // Null means "everything unreferenced, now". Building the eligible set from what a previous
+                // sweep saw would make a grace of zero delete nothing on the first sweep and everything on the
+                // second -- a knob that looks like it is off and is really set to one.
+                Set<String> eligible = null;
+                if (sweepGracePasses > 0) {
+                    eligible = new java.util.HashSet<>();
+                    for (Map.Entry<String, Integer> entry : seen.entrySet()) {
+                        if (entry.getValue() >= sweepGracePasses) {
+                            eligible.add(entry.getKey());
+                        }
                     }
                 }
+                try {
+                    final var swept = collector.sweepShard(plane, shardId.getIndexName(), shardId.id(), eligible, views, snapshots);
+                    final var manifest = lastManifests.get(shardId);
+                    if (manifest != null) {
+                        sweptAgainst.put(shardId, Set.copyOf(manifest.files().keySet()));
+                    }
+                    deleted.addAll(swept.deleted());
+                    final Map<String, Integer> next = new java.util.HashMap<>();
+                    for (String candidate : swept.candidates()) {
+                        next.put(candidate, seen.getOrDefault(candidate, 0) + 1);
+                    }
+                    if (next.isEmpty()) {
+                        unreferencedFor.remove(shardId);
+                    } else {
+                        unreferencedFor.put(shardId, next);
+                    }
+                } catch (Exception e) {
+                    // Reclaiming space is the one job here whose failure costs only money, so it never
+                    // interrupts a pass and never escalates.
+                    logger.warn("could not sweep " + shardId + "; the next pass will try again", e);
+                }
             }
-            try {
-                final var swept = collector.sweepShard(plane, shardId.getIndexName(), shardId.id(), eligible, views, snapshots);
-                final var manifest = lastManifests.get(shardId);
-                if (manifest != null) {
-                    sweptAgainst.put(shardId, Set.copyOf(manifest.files().keySet()));
-                }
-                deleted.addAll(swept.deleted());
-                final Map<String, Integer> next = new java.util.HashMap<>();
-                for (String candidate : swept.candidates()) {
-                    next.put(candidate, seen.getOrDefault(candidate, 0) + 1);
-                }
-                if (next.isEmpty()) {
-                    unreferencedFor.remove(shardId);
-                } else {
-                    unreferencedFor.put(shardId, next);
-                }
-            } catch (Exception e) {
-                // Reclaiming space is the one job here whose failure costs only money, so it never
-                // interrupts a pass and never escalates.
-                logger.warn("could not sweep " + shardId + "; the next pass will try again", e);
-            }
+            return deleted;
         }
-        return deleted;
     }
 
     /**
@@ -636,14 +665,19 @@ public final class BackgroundReconciler implements Closeable {
      * @return how many records were removed by this pass
      */
     public int reapExpiredViews() {
-        int reaped = 0;
-        try {
-            reaped = plane.reapPointsInTime(plane.clock().getAsLong());
-        } catch (Exception e) {
-            logger.warn("could not reap expired points in time; the next pass will retry", e);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return 0;
+            }
+            int reaped = 0;
+            try {
+                reaped = plane.reapPointsInTime(plane.clock().getAsLong());
+            } catch (Exception e) {
+                logger.warn("could not reap expired points in time; the next pass will retry", e);
+            }
+            closeReleasedViews();
+            return reaped;
         }
-        closeReleasedViews();
-        return reaped;
     }
 
     /** How many passes between deployment-wide reaps of expired views. */
@@ -669,7 +703,10 @@ public final class BackgroundReconciler implements Closeable {
         }
         try {
             tombstoneSweep = node.threadPool().generic().submit(() -> {
-                try {
+                try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+                    if (work == null) {
+                        return;
+                    }
                     collector.collectTombstones(plane, plane.clock().getAsLong(), selfId);
                 } catch (Exception e) {
                     logger.warn("could not sweep descriptor tombstones; the next sweep will retry", e);
@@ -711,7 +748,10 @@ public final class BackgroundReconciler implements Closeable {
         }
         try {
             orphanSlice = node.threadPool().generic().submit(() -> {
-                try {
+                try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+                    if (work == null) {
+                        return;
+                    }
                     final GarbageCollector.OrphanSlice slice = collector.collectOrphanedShards(plane, orphanSliceBudget);
                     if (slice.deleted().isEmpty() == false) {
                         logger.info("the orphan sweep collected {} shard containers", slice.deleted().size());
@@ -747,7 +787,10 @@ public final class BackgroundReconciler implements Closeable {
         }
         try {
             reclaimSweep = node.threadPool().generic().submit(() -> {
-                try {
+                try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+                    if (work == null) {
+                        return;
+                    }
                     collector.collectReclaims(plane, plane.clock().getAsLong(), selfId);
                 } catch (Exception e) {
                     logger.warn("could not drain the reclaim queue; the next reap will retry", e);
@@ -817,24 +860,29 @@ public final class BackgroundReconciler implements Closeable {
      * @return how many views were closed
      */
     public int closeReleasedViews() {
-        int closed = 0;
-        // One record read per view, not per frozen shard: a hundred-shard view was a hundred identical
-        // reads every pass on every node holding it.
-        final Set<String> viewIds = new LinkedHashSet<>();
-        for (ShardId view : node.reconciler().frozenShards()) {
-            viewIds.add(view.getIndex().getUUID());
-        }
-        for (String viewId : viewIds) {
-            try {
-                final var record = plane.pointInTime(viewId);
-                if (record.isEmpty() || record.get().expiredAt(plane.clock().getAsLong())) {
-                    closed += node.reconciler().closeFrozenReader(viewId);
-                }
-            } catch (Exception e) {
-                logger.warn("could not check whether the view " + viewId + " is still held; keeping its shards", e);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return 0;
             }
+            int closed = 0;
+            // One record read per view, not per frozen shard: a hundred-shard view was a hundred identical
+            // reads every pass on every node holding it.
+            final Set<String> viewIds = new LinkedHashSet<>();
+            for (ShardId view : node.reconciler().frozenShards()) {
+                viewIds.add(view.getIndex().getUUID());
+            }
+            for (String viewId : viewIds) {
+                try {
+                    final var record = plane.pointInTime(viewId);
+                    if (record.isEmpty() || record.get().expiredAt(plane.clock().getAsLong())) {
+                        closed += node.reconciler().closeFrozenReader(viewId);
+                    }
+                } catch (Exception e) {
+                    logger.warn("could not check whether the view " + viewId + " is still held; keeping its shards", e);
+                }
+            }
+            return closed;
         }
-        return closed;
     }
 
     /**
@@ -884,31 +932,36 @@ public final class BackgroundReconciler implements Closeable {
      * @return the shards released for idleness
      */
     public Set<ShardId> releaseIdle(long nowMillis) {
-        final Set<ShardId> letGoSet = new java.util.LinkedHashSet<>();
-        if (idleAfterMillis <= 0) {
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
+            }
+            final Set<ShardId> letGoSet = new java.util.LinkedHashSet<>();
+            if (idleAfterMillis <= 0) {
+                return letGoSet;
+            }
+            for (ShardId shardId : node.reconciler().openShards()) {
+                if (pinnedIndices.contains(shardId.getIndexName())) {
+                    continue;
+                }
+                final long lastUsed = node.reconciler().lastUsed(shardId).orElse(openedAt.getOrDefault(shardId, nowMillis));
+                if (nowMillis - lastUsed < idleAfterMillis) {
+                    continue;
+                }
+                if (letGo(shardId, "idle for " + (nowMillis - lastUsed) + "ms")) {
+                    letGoSet.add(shardId);
+                }
+            }
+            for (ShardId shardId : letGoSet) {
+                openedAt.remove(shardId);
+                // Stop trying to take it straight back. A demand-driven node re-acquires on the next write or
+                // read for it, which is the point; a node that was told to want it keeps wanting it.
+                if (demandDriven) {
+                    wanted.remove(Map.entry(shardId.getIndexName(), shardId.id()));
+                }
+            }
             return letGoSet;
         }
-        for (ShardId shardId : node.reconciler().openShards()) {
-            if (pinnedIndices.contains(shardId.getIndexName())) {
-                continue;
-            }
-            final long lastUsed = node.reconciler().lastUsed(shardId).orElse(openedAt.getOrDefault(shardId, nowMillis));
-            if (nowMillis - lastUsed < idleAfterMillis) {
-                continue;
-            }
-            if (letGo(shardId, "idle for " + (nowMillis - lastUsed) + "ms")) {
-                letGoSet.add(shardId);
-            }
-        }
-        for (ShardId shardId : letGoSet) {
-            openedAt.remove(shardId);
-            // Stop trying to take it straight back. A demand-driven node re-acquires on the next write or
-            // read for it, which is the point; a node that was told to want it keeps wanting it.
-            if (demandDriven) {
-                wanted.remove(Map.entry(shardId.getIndexName(), shardId.id()));
-            }
-        }
-        return letGoSet;
     }
 
     /**
@@ -955,20 +1008,25 @@ public final class BackgroundReconciler implements Closeable {
      * @return how many shards were let go
      */
     public int handOffToMemberWithRoom() {
-        if (demandDriven == false || evictAfterMillis <= 0) {
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return 0;
+            }
+            if (demandDriven == false || evictAfterMillis <= 0) {
+                return 0;
+            }
+            if (node.nearlyFull() && node.memberWithRoom(plane).isPresent()) {
+                final int floor = (int) Math.floor(maxShardsHeld * HAND_OFF_DOWN_TO);
+                return evictDownTo(floor, Math.max(1, maxShardsHeld / 10), true);
+            }
+            // Far above its share, near its cap or not, while a member is below the mean: down towards the mean, at the same
+            // pace. The writes for what it lets go are steered to that member, so they do not come straight back.
+            if (node.aboveFleetShare(plane) && node.memberBelowMean(plane).isPresent()) {
+                final int floor = (int) Math.ceil(node.fleetMeanHeld(plane) * ServerlessNode.HAND_OFF_DOWN_TO_MEAN);
+                return evictDownTo(floor, Math.max(1, maxShardsHeld / 10), true);
+            }
             return 0;
         }
-        if (node.nearlyFull() && node.memberWithRoom(plane).isPresent()) {
-            final int floor = (int) Math.floor(maxShardsHeld * HAND_OFF_DOWN_TO);
-            return evictDownTo(floor, Math.max(1, maxShardsHeld / 10), true);
-        }
-        // Far above its share, near its cap or not, while a member is below the mean: down towards the mean, at the same
-        // pace. The writes for what it lets go are steered to that member, so they do not come straight back.
-        if (node.aboveFleetShare(plane) && node.memberBelowMean(plane).isPresent()) {
-            final int floor = (int) Math.ceil(node.fleetMeanHeld(plane) * ServerlessNode.HAND_OFF_DOWN_TO_MEAN);
-            return evictDownTo(floor, Math.max(1, maxShardsHeld / 10), true);
-        }
-        return 0;
     }
 
     /** The share of its cap a node hands off down to when a member has room. */
@@ -1258,17 +1316,22 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> renewLeases() throws Exception {
-        if (renewalDrivenByTimer) {
-            // The timer renews the lease; the backstop's job is the half that verifies. Renewing here too
-            // was a fourth lease write per TTL that guaranteed nothing the timer's three did not.
-            //
-            // IfDue, not unconditionally: the scan is one register read per held shard, and running it on
-            // every renewal and every backstop alike made it the largest standing cost of an idle node.
-            // See ServerlessNode#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS for why a bounded wait is safe here
-            // and where the unconditional scan still happens.
-            return node.verifyHeadsIfDue(plane);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
+            }
+            if (renewalDrivenByTimer) {
+                // The timer renews the lease; the backstop's job is the half that verifies. Renewing here too
+                // was a fourth lease write per TTL that guaranteed nothing the timer's three did not.
+                //
+                // IfDue, not unconditionally: the scan is one register read per held shard, and running it on
+                // every renewal and every backstop alike made it the largest standing cost of an idle node.
+                // See ServerlessNode#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS for why a bounded wait is safe here
+                // and where the unconditional scan still happens.
+                return node.verifyHeadsIfDue(plane);
+            }
+            return node.heartbeat(plane);
         }
-        return node.heartbeat(plane);
     }
 
     /**
@@ -1283,7 +1346,12 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> renewLease() throws Exception {
-        return node.renewLease(plane);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
+            }
+            return node.renewLease(plane);
+        }
     }
 
     /**
@@ -1293,7 +1361,12 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> verifyHeads() throws Exception {
-        return node.verifyHeadsIfDue(plane);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
+            }
+            return node.verifyHeadsIfDue(plane);
+        }
     }
 
     /**
@@ -1303,7 +1376,12 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> verifyHeadsNow() throws Exception {
-        return node.verifyHeads(plane);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
+            }
+            return node.verifyHeads(plane);
+        }
     }
 
     /**
@@ -1328,14 +1406,19 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> activateWanted() throws Exception {
-        final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
-        for (Map.Entry<String, Integer> target : wanted) {
-            if (heldAsWriter(target.getKey(), target.getValue()) == false) {
-                countSource("wanted");
-                pending.add(activate(target.getKey(), target.getValue(), false));
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
             }
+            final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
+            for (Map.Entry<String, Integer> target : wanted) {
+                if (heldAsWriter(target.getKey(), target.getValue()) == false) {
+                    countSource("wanted");
+                    pending.add(activate(target.getKey(), target.getValue(), false));
+                }
+            }
+            return settle(pending);
         }
-        return settle(pending);
     }
 
     /**
@@ -1362,19 +1445,24 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> activateOnDemand(Collection<Map.Entry<String, Integer>> candidates) throws Exception {
-        if (demandDriven == false) {
-            return Set.of();
-        }
-        final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
-        for (Map.Entry<String, Integer> candidate : candidates) {
-            if (heldAsWriter(candidate.getKey(), candidate.getValue()) == false
-                && heldByAnotherLiveNode(candidate.getKey(), candidate.getValue()) == false
-                && leftToTakeoverWinner(candidate) == false) {
-                countSource("doubt");
-                pending.add(activate(candidate.getKey(), candidate.getValue(), true));
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
             }
+            if (demandDriven == false) {
+                return Set.of();
+            }
+            final java.util.List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending = new java.util.ArrayList<>();
+            for (Map.Entry<String, Integer> candidate : candidates) {
+                if (heldAsWriter(candidate.getKey(), candidate.getValue()) == false
+                    && heldByAnotherLiveNode(candidate.getKey(), candidate.getValue()) == false
+                    && leftToTakeoverWinner(candidate) == false) {
+                    countSource("doubt");
+                    pending.add(activate(candidate.getKey(), candidate.getValue(), true));
+                }
+            }
+            return settle(pending);
         }
-        return settle(pending);
     }
 
     /**
@@ -1420,16 +1508,21 @@ public final class BackgroundReconciler implements Closeable {
      *     runs demand-driven, the node is full, or another node won it
      */
     public java.util.concurrent.CompletableFuture<Optional<ShardId>> activateForRequest(String indexName, int shard) {
-        // A shard this node was told to want is taken whatever the policy, and without the cap -- exactly as
-        // the pass would take it; any other shard only under demand-driven activation.
-        countSource("request");
-        if (wanted.contains(Map.entry(indexName, shard))) {
-            return activate(indexName, shard, false);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return java.util.concurrent.CompletableFuture.completedFuture(Optional.empty());
+            }
+            // A shard this node was told to want is taken whatever the policy, and without the cap -- exactly as
+            // the pass would take it; any other shard only under demand-driven activation.
+            countSource("request");
+            if (wanted.contains(Map.entry(indexName, shard))) {
+                return activate(indexName, shard, false);
+            }
+            if (demandDriven == false) {
+                return java.util.concurrent.CompletableFuture.completedFuture(Optional.empty());
+            }
+            return activate(indexName, shard, true);
         }
-        if (demandDriven == false) {
-            return java.util.concurrent.CompletableFuture.completedFuture(Optional.empty());
-        }
-        return activate(indexName, shard, true);
     }
 
     /** Waits for every activation of a pass and collects the shards it took; the first failure is rethrown. */
@@ -1463,7 +1556,12 @@ public final class BackgroundReconciler implements Closeable {
      * activation is never handed to a later caller.
      */
     private java.util.concurrent.CompletableFuture<Optional<ShardId>> activate(String indexName, int shard, boolean onDemand) {
-        return activate(indexName, shard, onDemand, null);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return java.util.concurrent.CompletableFuture.completedFuture(Optional.empty());
+            }
+            return activate(indexName, shard, onDemand, null);
+        }
     }
 
     /** As {@link #activate(String, int, boolean)}, counting the store requests of the activation into a sink if one is given. */
@@ -1473,39 +1571,72 @@ public final class BackgroundReconciler implements Closeable {
         boolean onDemand,
         java.util.concurrent.atomic.AtomicLong sink
     ) {
-        final Map.Entry<String, Integer> key = Map.entry(indexName, shard);
-        final java.util.concurrent.CompletableFuture<Optional<ShardId>> mine = new java.util.concurrent.CompletableFuture<>();
-        final java.util.concurrent.CompletableFuture<Optional<ShardId>> running = activating.putIfAbsent(key, mine);
-        if (running != null) {
-            return running;
-        }
-        final long queuedAt = System.nanoTime();
-        activationQueue.add(new QueuedActivation(rankHere(indexName, shard), activationSequence.incrementAndGet(), () -> {
-            final long startedAt = System.nanoTime();
-            activationWaitMax.accumulateAndGet(startedAt - queuedAt, Math::max);
-            try {
-                final Optional<ShardId> taken = sink == null
-                    ? activateNow(indexName, shard, onDemand)
-                    : org.opensearch.serverless.store.ObjectStores.attributedTo(sink, () -> activateNow(indexName, shard, onDemand));
-                if (taken.isPresent()) {
-                    // Only an activation that opened a shard says how fast the store is taking them: a refusal or a
-                    // shard already held elsewhere returns in a read and would make it look faster than it is.
-                    adaptActivationLimit(System.nanoTime() - startedAt);
-                }
-                mine.complete(taken);
-            } catch (Throwable t) {
-                mine.completeExceptionally(t);
-            } finally {
-                activating.remove(key, mine);
-                final long endedAt = System.nanoTime();
-                activationsDone.incrementAndGet();
-                activationWaitNanos.addAndGet(startedAt - queuedAt);
-                activationRunNanos.addAndGet(endedAt - startedAt);
-                activationRunMax.accumulateAndGet(endedAt - startedAt, Math::max);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return java.util.concurrent.CompletableFuture.completedFuture(Optional.empty());
             }
-        }));
-        drainActivations();
-        return mine;
+            final Map.Entry<String, Integer> key = Map.entry(indexName, shard);
+            final java.util.concurrent.CompletableFuture<Optional<ShardId>> mine = new java.util.concurrent.CompletableFuture<>();
+            synchronized (activationAdmission) {
+                if (activity.isClosed()) {
+                    return java.util.concurrent.CompletableFuture.completedFuture(Optional.empty());
+                }
+                final java.util.concurrent.CompletableFuture<Optional<ShardId>> running = activating.putIfAbsent(key, mine);
+                if (running != null) {
+                    return running;
+                }
+            }
+            // Compute fleet ranking outside admission's short critical section. Reserving the future
+            // first still coalesces concurrent callers, so only one caller ranks a given shard.
+            final long queuedAt = System.nanoTime();
+            final QueuedActivation queued = new QueuedActivation(
+                rankHere(indexName, shard),
+                activationSequence.incrementAndGet(),
+                key,
+                mine,
+                () -> {
+                    final long startedAt = System.nanoTime();
+                    activationWaitMax.accumulateAndGet(startedAt - queuedAt, Math::max);
+                    try {
+                        final Optional<ShardId> taken = sink == null
+                            ? activateNow(indexName, shard, onDemand)
+                            : org.opensearch.serverless.store.ObjectStores.attributedTo(
+                                sink,
+                                () -> activateNow(indexName, shard, onDemand)
+                            );
+                        if (taken.isPresent()) {
+                            // Only an activation that opened a shard says how fast the store is taking them: a refusal or a
+                            // shard already held elsewhere returns in a read and would make it look faster than it is.
+                            adaptActivationLimit(System.nanoTime() - startedAt);
+                        }
+                        mine.complete(taken);
+                    } catch (Throwable t) {
+                        mine.completeExceptionally(t);
+                    } finally {
+                        activating.remove(key, mine);
+                        final long endedAt = System.nanoTime();
+                        activationsDone.incrementAndGet();
+                        activationWaitNanos.addAndGet(startedAt - queuedAt);
+                        activationRunNanos.addAndGet(endedAt - startedAt);
+                        activationRunMax.accumulateAndGet(endedAt - startedAt, Math::max);
+                    }
+                }
+            );
+            final boolean enqueued;
+            synchronized (activationAdmission) {
+                enqueued = activity.isClosed() == false;
+                if (enqueued) {
+                    activationQueue.add(queued);
+                }
+            }
+            if (enqueued) {
+                drainActivations();
+            } else {
+                activating.remove(key, mine);
+                mine.complete(Optional.empty());
+            }
+            return mine;
+        }
     }
 
     private final java.util.concurrent.atomic.AtomicLong activationsDone = new java.util.concurrent.atomic.AtomicLong();
@@ -1576,6 +1707,9 @@ public final class BackgroundReconciler implements Closeable {
 
     /** Starts queued activations while fewer than the bound are running; each one that ends starts the next. */
     private void drainActivations() {
+        if (activity.isClosed()) {
+            return;
+        }
         while (true) {
             final int running = activationsRunning.get();
             if (running >= currentActivationLimit() || activationQueue.isEmpty()) {
@@ -1601,12 +1735,10 @@ public final class BackgroundReconciler implements Closeable {
                     }
                 });
             } catch (RuntimeException e) {
-                // A pool that will not take work -- a node shutting down -- runs it here instead of losing it.
-                try {
-                    task.run();
-                } finally {
-                    activationsRunning.decrementAndGet();
-                }
+                // Refuse honestly. Running store I/O inline here could activate a shard during shutdown.
+                activating.remove(queued.key(), queued.result());
+                queued.result().completeExceptionally(e);
+                activationsRunning.decrementAndGet();
             }
         }
     }
@@ -1671,10 +1803,15 @@ public final class BackgroundReconciler implements Closeable {
      * @return how many shards were let go
      */
     public int trimToCap() {
-        if (evictAfterMillis <= 0 || node.reconciler().heldShards().size() <= maxShardsHeld) {
-            return 0;
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return 0;
+            }
+            if (evictAfterMillis <= 0 || node.reconciler().heldShards().size() <= maxShardsHeld) {
+                return 0;
+            }
+            return evictDownTo(maxShardsHeld, Math.max(1, maxShardsHeld / 10), false);
         }
-        return evictDownTo(maxShardsHeld, Math.max(1, maxShardsHeld / 10), false);
     }
 
     /** Whether another node holds a shard's head under a live lease: one register read, against an eviction. */
@@ -1720,63 +1857,68 @@ public final class BackgroundReconciler implements Closeable {
      * @return the claims left for the second look
      */
     public List<Map.Entry<String, Integer>> takeOverFrom(String deadNodeId) {
-        if (demandDriven == false || deadNodeId.equals(node.localNode().getId())) {
-            return List.of();
-        }
-        // Gone from this node's view is not gone: a view loses a member whose lease read failed, or that it read
-        // late. A fleet run had a node that had just started take shards from all five of its live peers.
-        try {
-            final java.util.OptionalLong liveUntil = leaseLiveUntil(deadNodeId);
-            if (liveUntil.isPresent()) {
-                logger.info(
-                    "node {} left this node's view, but its lease runs {} ms more: its shards stay with it",
-                    deadNodeId,
-                    liveUntil.getAsLong() - plane.clock().getAsLong()
-                );
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
                 return List.of();
             }
-        } catch (Exception e) {
-            logger.warn("could not read the lease of departed node " + deadNodeId + "; its shards wait for requests", e);
-            return List.of();
-        }
-        final List<Map.Entry<String, Integer>> claims;
-        try {
-            claims = plane.claimsOf(deadNodeId);
-        } catch (Exception e) {
-            logger.warn("could not list the claims of departed node " + deadNodeId + "; its shards wait for requests", e);
-            return List.of();
-        }
-        final List<String> live = new java.util.ArrayList<>();
-        for (var lease : plane.membership().current()) {
-            if (lease.nodeId().equals(deadNodeId) == false && lease.isExpiredAt(plane.clock().getAsLong()) == false) {
-                live.add(lease.nodeId());
+            if (demandDriven == false || deadNodeId.equals(node.localNode().getId())) {
+                return List.of();
             }
-        }
-        java.util.Collections.sort(live);
-        final int rank = live.indexOf(node.localNode().getId());
-        final List<Map.Entry<String, Integer>> later = new java.util.ArrayList<>();
-        final long settledBefore = settledClean.get();
-        int taking = 0;
-        for (Map.Entry<String, Integer> claim : claims) {
-            // The same choice a request for the shard is routed by, so the shard is queued on one survivor only.
-            final Optional<String> winner = node.takeoverWinner(plane, claim.getKey(), claim.getValue(), deadNodeId);
-            if (rank < 0 || winner.isEmpty() || winner.get().equals(node.localNode().getId())) {
-                if (takeIfStillHeldBy(deadNodeId, claim)) {
-                    taking++;
+            // Gone from this node's view is not gone: a view loses a member whose lease read failed, or that it read
+            // late. A fleet run had a node that had just started take shards from all five of its live peers.
+            try {
+                final java.util.OptionalLong liveUntil = leaseLiveUntil(deadNodeId);
+                if (liveUntil.isPresent()) {
+                    logger.info(
+                        "node {} left this node's view, but its lease runs {} ms more: its shards stay with it",
+                        deadNodeId,
+                        liveUntil.getAsLong() - plane.clock().getAsLong()
+                    );
+                    return List.of();
                 }
-            } else {
-                later.add(claim);
+            } catch (Exception e) {
+                logger.warn("could not read the lease of departed node " + deadNodeId + "; its shards wait for requests", e);
+                return List.of();
             }
+            final List<Map.Entry<String, Integer>> claims;
+            try {
+                claims = plane.claimsOf(deadNodeId);
+            } catch (Exception e) {
+                logger.warn("could not list the claims of departed node " + deadNodeId + "; its shards wait for requests", e);
+                return List.of();
+            }
+            final List<String> live = new java.util.ArrayList<>();
+            for (var lease : plane.membership().current()) {
+                if (lease.nodeId().equals(deadNodeId) == false && lease.isExpiredAt(plane.clock().getAsLong()) == false) {
+                    live.add(lease.nodeId());
+                }
+            }
+            java.util.Collections.sort(live);
+            final int rank = live.indexOf(node.localNode().getId());
+            final List<Map.Entry<String, Integer>> later = new java.util.ArrayList<>();
+            final long settledBefore = settledClean.get();
+            int taking = 0;
+            for (Map.Entry<String, Integer> claim : claims) {
+                // The same choice a request for the shard is routed by, so the shard is queued on one survivor only.
+                final Optional<String> winner = node.takeoverWinner(plane, claim.getKey(), claim.getValue(), deadNodeId);
+                if (rank < 0 || winner.isEmpty() || winner.get().equals(node.localNode().getId())) {
+                    if (takeIfStillHeldBy(deadNodeId, claim)) {
+                        taking++;
+                    }
+                } else {
+                    later.add(claim);
+                }
+            }
+            logger.info(
+                "node {} left: taking {} of its {} claimed shards and giving back {} fully published, {} more if still unclaimed later",
+                deadNodeId,
+                taking,
+                claims.size(),
+                settledClean.get() - settledBefore,
+                later.size()
+            );
+            return later;
         }
-        logger.info(
-            "node {} left: taking {} of its {} claimed shards and giving back {} fully published, {} more if still unclaimed later",
-            deadNodeId,
-            taking,
-            claims.size(),
-            settledClean.get() - settledBefore,
-            later.size()
-        );
-        return later;
     }
 
     /**
@@ -1787,11 +1929,16 @@ public final class BackgroundReconciler implements Closeable {
      * @throws java.io.IOException if the lease cannot be read
      */
     public java.util.OptionalLong leaseLiveUntil(String nodeId) throws java.io.IOException {
-        final var lease = plane.membership().read(nodeId);
-        if (lease.isEmpty() || lease.get().isExpiredAt(plane.clock().getAsLong())) {
-            return java.util.OptionalLong.empty();
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return java.util.OptionalLong.empty();
+            }
+            final var lease = plane.membership().read(nodeId);
+            if (lease.isEmpty() || lease.get().isExpiredAt(plane.clock().getAsLong())) {
+                return java.util.OptionalLong.empty();
+            }
+            return java.util.OptionalLong.of(lease.get().expiresAtMillis());
         }
-        return java.util.OptionalLong.of(lease.get().expiresAtMillis());
     }
 
     /**
@@ -1801,7 +1948,12 @@ public final class BackgroundReconciler implements Closeable {
      * @param claims the claims {@link #takeOverFrom} left for later
      */
     public void takeOverRemaining(String deadNodeId, List<Map.Entry<String, Integer>> claims) {
-        takeOverRemaining(deadNodeId, claims, false);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
+            }
+            takeOverRemaining(deadNodeId, claims, false);
+        }
     }
 
     /**
@@ -1818,21 +1970,26 @@ public final class BackgroundReconciler implements Closeable {
      * @return the shards left for the last look
      */
     public List<Map.Entry<String, Integer>> takeOverRemaining(String deadNodeId, List<Map.Entry<String, Integer>> claims, boolean last) {
-        int taking = 0;
-        final List<Map.Entry<String, Integer>> deferred = new java.util.ArrayList<>();
-        for (Map.Entry<String, Integer> claim : claims) {
-            if (last == false && node.takeoverBelongsElsewhere(plane, claim.getKey(), claim.getValue())) {
-                deferred.add(claim);
-                continue;
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return List.of();
             }
-            if (takeIfStillHeldBy(deadNodeId, claim)) {
-                taking++;
+            int taking = 0;
+            final List<Map.Entry<String, Integer>> deferred = new java.util.ArrayList<>();
+            for (Map.Entry<String, Integer> claim : claims) {
+                if (last == false && node.takeoverBelongsElsewhere(plane, claim.getKey(), claim.getValue())) {
+                    deferred.add(claim);
+                    continue;
+                }
+                if (takeIfStillHeldBy(deadNodeId, claim)) {
+                    taking++;
+                }
             }
+            if (taking > 0) {
+                logger.info("node {} left: took {} more of its shards that no other survivor had", deadNodeId, taking);
+            }
+            return deferred;
         }
-        if (taking > 0) {
-            logger.info("node {} left: took {} more of its shards that no other survivor had", deadNodeId, taking);
-        }
-        return deferred;
     }
 
     private boolean takeIfStillHeldBy(String deadNodeId, Map.Entry<String, Integer> claim) {
@@ -1900,134 +2057,139 @@ public final class BackgroundReconciler implements Closeable {
      * @throws IOException if the store cannot be listed
      */
     public JanitorPass sweepAbandoned(int budget, int replays) throws IOException {
-        final long now = plane.clock().getAsLong();
-        final List<String> live = new java.util.ArrayList<>();
-        for (var lease : plane.membership().current()) {
-            if (lease.isExpiredAt(now) == false) {
-                live.add(lease.nodeId());
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return new JanitorPass(0, 0, 0, 0, null, false);
             }
-        }
-        java.util.Collections.sort(live);
-        final int rank = live.indexOf(node.localNode().getId());
-        if (rank < 0) {
-            return new JanitorPass(0, 0, 0, 0, null, false);
-        }
-        final int[] counts = new int[4]; // examined, released, replays, forgotten
-        final int[] replaysLeft = { replays };
+            final long now = plane.clock().getAsLong();
+            final List<String> live = new java.util.ArrayList<>();
+            for (var lease : plane.membership().current()) {
+                if (lease.isExpiredAt(now) == false) {
+                    live.add(lease.nodeId());
+                }
+            }
+            java.util.Collections.sort(live);
+            final int rank = live.indexOf(node.localNode().getId());
+            if (rank < 0) {
+                return new JanitorPass(0, 0, 0, 0, null, false);
+            }
+            final int[] counts = new int[4]; // examined, released, replays, forgotten
+            final int[] replaysLeft = { replays };
 
-        // Claims of nodes dead for longer than a live departure takes to be handled -- at most half the budget, or a
-        // crashed fleet's thousands of stale claims starve the marks, which are what make a wide search slow.
-        final int claimsBudget = Math.max(1, budget / 2);
-        final long settledAfter = ReconcileScheduler.RECENT_DEPARTURE_TTLS * plane.leaseTtlMillis();
-        for (String nodeId : plane.nodesWithClaims()) {
-            if (counts[0] >= claimsBudget) {
-                break;
-            }
-            if (live.contains(nodeId)) {
-                continue;
-            }
-            final var lease = plane.membership().read(nodeId);
-            if (lease.isPresent() && now - lease.get().expiresAtMillis() < settledAfter) {
-                continue;
-            }
-            for (Map.Entry<String, Integer> claim : plane.claimsOf(nodeId)) {
+            // Claims of nodes dead for longer than a live departure takes to be handled -- at most half the budget, or a
+            // crashed fleet's thousands of stale claims starve the marks, which are what make a wide search slow.
+            final int claimsBudget = Math.max(1, budget / 2);
+            final long settledAfter = ReconcileScheduler.RECENT_DEPARTURE_TTLS * plane.leaseTtlMillis();
+            for (String nodeId : plane.nodesWithClaims()) {
                 if (counts[0] >= claimsBudget) {
                     break;
                 }
-                if (Math.floorMod((claim.getKey() + "#" + claim.getValue()).hashCode(), live.size()) != rank) {
+                if (live.contains(nodeId)) {
                     continue;
                 }
-                counts[0]++;
-                try {
-                    settleForJanitor(claim.getKey(), claim.getValue(), nodeId, -1L, counts, replaysLeft);
-                } catch (Exception e) {
-                    logger.debug("janitor could not settle " + claim + " of " + nodeId, e);
-                }
-            }
-        }
-
-        // One rollup bucket, rotating through every group's buckets; this node reads the ones that hash to it.
-        final List<String> groups = plane.rollups().groups();
-        java.util.Collections.sort(groups);
-        String read = null;
-        final int slots = groups.size() * DigestRollups.BUCKETS;
-        // This node's slots are every live-size-th one from its rank; the cursor counts through them, and stays on a
-        // bucket until a pass gets through it within the budget -- a crashed fleet leaves hundreds of marks in one.
-        final int mine = slots <= rank ? 0 : (slots - rank + live.size() - 1) / live.size();
-        if (mine > 0) {
-            final long slot = rank + (long) live.size() * Math.floorMod(janitorCursor.get(), (long) mine);
-            final String group = groups.get((int) (slot / DigestRollups.BUCKETS));
-            final int bucket = (int) (slot % DigestRollups.BUCKETS);
-            read = group + "/" + bucket;
-            for (Map.Entry<String, DigestRollups.Entry> entry : plane.rollups().readBucket(group, bucket).entrySet()) {
-                if (entry.getValue().alias() || counts[0] >= budget) {
+                final var lease = plane.membership().read(nodeId);
+                if (lease.isPresent() && now - lease.get().expiresAtMillis() < settledAfter) {
                     continue;
                 }
-                if (DigestRollups.recordsNothing(entry.getValue())) {
-                    // An entry no wide search can rule out: opened once and given back with nothing written, which
-                    // needs no entry; or holding data under no digest, which gets the one its commit carries -- or a
-                    // replay, whose publish computes one.
-                    counts[0]++;
-                    try {
-                        if (plane.forgetIfNothing(entry.getKey())) {
-                            counts[1]++;
-                        } else {
-                            final List<Integer> replay = plane.backfillDigest(entry.getKey());
-                            if (replay.isEmpty()) {
-                                counts[1]++;
-                            }
-                            for (int shard : replay) {
-                                if (replaysLeft[0] > 0) {
-                                    replaysLeft[0]--;
-                                    counts[2]++;
-                                    replayAndRelease(entry.getKey(), shard);
-                                }
-                            }
-                        }
-                    } catch (Exception e) {
-                        logger.debug("janitor could not take " + entry.getKey() + " out of its rollup", e);
+                for (Map.Entry<String, Integer> claim : plane.claimsOf(nodeId)) {
+                    if (counts[0] >= claimsBudget) {
+                        break;
                     }
-                    continue;
-                }
-                final List<DigestRollups.ShardState> states = entry.getValue().states();
-                for (int shard = 0; shard < states.size() && counts[0] < budget; shard++) {
-                    final long marked = states.get(shard).ownerTerm();
-                    if (marked == 0L) {
+                    if (Math.floorMod((claim.getKey() + "#" + claim.getValue()).hashCode(), live.size()) != rank) {
                         continue;
                     }
                     counts[0]++;
                     try {
-                        final var head = plane.heads().read(entry.getKey(), shard);
-                        if (head.isEmpty()) {
-                            continue;
-                        }
-                        final String owner = head.get().ownerNodeId();
-                        if (owner == null) {
-                            settleForJanitor(entry.getKey(), shard, null, marked, counts, replaysLeft);
-                        } else if (owner.equals(node.localNode().getId()) == false && leaseLiveUntil(owner).isEmpty()) {
-                            settleForJanitor(entry.getKey(), shard, owner, -1L, counts, replaysLeft);
-                        }
+                        settleForJanitor(claim.getKey(), claim.getValue(), nodeId, -1L, counts, replaysLeft);
                     } catch (Exception e) {
-                        logger.debug("janitor could not settle the mark on " + entry.getKey() + "[" + shard + "]", e);
+                        logger.debug("janitor could not settle " + claim + " of " + nodeId, e);
                     }
                 }
             }
-            if (counts[0] < budget) {
-                // Got through it: the next pass reads the next bucket.
-                janitorCursor.incrementAndGet();
+
+            // One rollup bucket, rotating through every group's buckets; this node reads the ones that hash to it.
+            final List<String> groups = plane.rollups().groups();
+            java.util.Collections.sort(groups);
+            String read = null;
+            final int slots = groups.size() * DigestRollups.BUCKETS;
+            // This node's slots are every live-size-th one from its rank; the cursor counts through them, and stays on a
+            // bucket until a pass gets through it within the budget -- a crashed fleet leaves hundreds of marks in one.
+            final int mine = slots <= rank ? 0 : (slots - rank + live.size() - 1) / live.size();
+            if (mine > 0) {
+                final long slot = rank + (long) live.size() * Math.floorMod(janitorCursor.get(), (long) mine);
+                final String group = groups.get((int) (slot / DigestRollups.BUCKETS));
+                final int bucket = (int) (slot % DigestRollups.BUCKETS);
+                read = group + "/" + bucket;
+                for (Map.Entry<String, DigestRollups.Entry> entry : plane.rollups().readBucket(group, bucket).entrySet()) {
+                    if (entry.getValue().alias() || counts[0] >= budget) {
+                        continue;
+                    }
+                    if (DigestRollups.recordsNothing(entry.getValue())) {
+                        // An entry no wide search can rule out: opened once and given back with nothing written, which
+                        // needs no entry; or holding data under no digest, which gets the one its commit carries -- or a
+                        // replay, whose publish computes one.
+                        counts[0]++;
+                        try {
+                            if (plane.forgetIfNothing(entry.getKey())) {
+                                counts[1]++;
+                            } else {
+                                final List<Integer> replay = plane.backfillDigest(entry.getKey());
+                                if (replay.isEmpty()) {
+                                    counts[1]++;
+                                }
+                                for (int shard : replay) {
+                                    if (replaysLeft[0] > 0) {
+                                        replaysLeft[0]--;
+                                        counts[2]++;
+                                        replayAndRelease(entry.getKey(), shard);
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            logger.debug("janitor could not take " + entry.getKey() + " out of its rollup", e);
+                        }
+                        continue;
+                    }
+                    final List<DigestRollups.ShardState> states = entry.getValue().states();
+                    for (int shard = 0; shard < states.size() && counts[0] < budget; shard++) {
+                        final long marked = states.get(shard).ownerTerm();
+                        if (marked == 0L) {
+                            continue;
+                        }
+                        counts[0]++;
+                        try {
+                            final var head = plane.heads().read(entry.getKey(), shard);
+                            if (head.isEmpty()) {
+                                continue;
+                            }
+                            final String owner = head.get().ownerNodeId();
+                            if (owner == null) {
+                                settleForJanitor(entry.getKey(), shard, null, marked, counts, replaysLeft);
+                            } else if (owner.equals(node.localNode().getId()) == false && leaseLiveUntil(owner).isEmpty()) {
+                                settleForJanitor(entry.getKey(), shard, owner, -1L, counts, replaysLeft);
+                            }
+                        } catch (Exception e) {
+                            logger.debug("janitor could not settle the mark on " + entry.getKey() + "[" + shard + "]", e);
+                        }
+                    }
+                }
+                if (counts[0] < budget) {
+                    // Got through it: the next pass reads the next bucket.
+                    janitorCursor.incrementAndGet();
+                }
             }
+            final JanitorPass pass = new JanitorPass(counts[0], counts[1], counts[2], counts[3], read, counts[0] >= budget);
+            if (pass.released() + pass.replays() + pass.claimsForgotten() > 0) {
+                logger.info(
+                    "janitor: looked at {} shards, gave back {} fully published, took {} to replay, forgot {} stale claims",
+                    pass.examined(),
+                    pass.released(),
+                    pass.replays(),
+                    pass.claimsForgotten()
+                );
+            }
+            return pass;
         }
-        final JanitorPass pass = new JanitorPass(counts[0], counts[1], counts[2], counts[3], read, counts[0] >= budget);
-        if (pass.released() + pass.replays() + pass.claimsForgotten() > 0) {
-            logger.info(
-                "janitor: looked at {} shards, gave back {} fully published, took {} to replay, forgot {} stale claims",
-                pass.examined(),
-                pass.released(),
-                pass.replays(),
-                pass.claimsForgotten()
-            );
-        }
-        return pass;
     }
 
     /** One shard: given back clean, taken to replay within the budget, or -- a claim whose head moved on -- forgotten. */
@@ -2122,7 +2284,12 @@ public final class BackgroundReconciler implements Closeable {
      * @throws IOException if the view cannot be read
      */
     public void refreshMembership(long maxAgeMillis) throws IOException {
-        plane.membership().refreshIfOlderThan(maxAgeMillis);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
+            }
+            plane.membership().refreshIfOlderThan(maxAgeMillis);
+        }
     }
 
     /** How many shards a node activates at once by default, or the most when the limit adapts. */
@@ -2254,101 +2421,106 @@ public final class BackgroundReconciler implements Closeable {
 
     /** One shard's activation, run by exactly one caller at a time. */
     private Optional<ShardId> activateNow(String indexName, int shard, boolean onDemand) throws Exception {
-        final ShardId open = node.reconciler()
-            .openShards()
-            .stream()
-            .filter(s -> s.getIndexName().equals(indexName) && s.id() == shard)
-            .findFirst()
-            .orElse(null);
-        if (open != null && node.reconciler().isReader(open) == false) {
-            return Optional.of(open);
-        }
-        boolean reserved = false;
-        if (onDemand) {
-            // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
-            // it counts against the bound. makeRoom only ever considers openShards, so counting one here
-            // can refuse an activation the node has no room for -- which is the point -- but can never
-            // take a view away from the caller holding it. The slots other activations in flight have
-            // reserved count too, or a burst of them would each see room for one and all take it.
-            boolean full;
-            synchronized (capLock) {
-                full = open == null && node.reconciler().heldShards().size() + capReserved >= maxShardsHeld;
-                if (full == false && open == null) {
-                    capReserved++;
-                    reserved = true;
-                }
-            }
-            if (full && takeoverMayOvercommit(indexName, shard)) {
-                // A dead member's shard, and room under the takeover ceiling: taken without evicting. Evicting here put
-                // a publish and a head release in front of every shard a survivor near its cap took from a dead node,
-                // one at a time, and that -- not the open -- was most of how long a kill took to recover from. The trim
-                // in each pass brings the node back to its cap once the taken shards have been idle a while.
-                synchronized (capLock) {
-                    if (node.reconciler().heldShards().size() + capReserved < takeoverCeiling()) {
-                        capReserved++;
-                        reserved = true;
-                        full = false;
-                    }
-                }
-                if (reserved) {
-                    node.noteTakeoverOvercommitted();
-                }
-            }
-            if (full && heldByAnotherLiveNode(indexName, shard)) {
-                // Nothing to take, so nothing to make room for. Every survivor of a dead node queues every one of its
-                // shards; the ones another survivor has taken by the time this reaches them used to cost an eviction
-                // each -- a publish and a head release, for a shard this node then found it could not have -- and
-                // survivors at their cap took a dead node's 321 shards at p50 131 s.
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
                 return Optional.empty();
             }
-            if (full) {
-                // Room is made outside the lock. An eviction is a publish and a head release, and every activation
-                // reserves its slot under this lock: evicting inside it made the survivors of a node that died with
-                // them at the cap take its shards one eviction at a time, p99 two minutes.
-                makeRoom();
+            final ShardId open = node.reconciler()
+                .openShards()
+                .stream()
+                .filter(s -> s.getIndexName().equals(indexName) && s.id() == shard)
+                .findFirst()
+                .orElse(null);
+            if (open != null && node.reconciler().isReader(open) == false) {
+                return Optional.of(open);
             }
-            synchronized (capLock) {
-                if (reserved) {
-                    full = false;
-                } else {
-                    // makeRoom answers for what is held, not for what is reserved, so the reservations are counted
-                    // again after it: room it made may already be spoken for.
+            boolean reserved = false;
+            if (onDemand) {
+                // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
+                // it counts against the bound. makeRoom only ever considers openShards, so counting one here
+                // can refuse an activation the node has no room for -- which is the point -- but can never
+                // take a view away from the caller holding it. The slots other activations in flight have
+                // reserved count too, or a burst of them would each see room for one and all take it.
+                boolean full;
+                synchronized (capLock) {
                     full = open == null && node.reconciler().heldShards().size() + capReserved >= maxShardsHeld;
+                    if (full == false && open == null) {
+                        capReserved++;
+                        reserved = true;
+                    }
                 }
-                if (full && headNamesThisNode(indexName, shard) == false) {
-                    // Refusing is a routing outcome, not an error. Saying so is the difference between a
-                    // node that is full and a node that is broken, and only one of them should page anyone.
-                    logger.info(
-                        "not taking {}[{}] on demand: holding {} shards, the cap, and all of them are in use",
-                        indexName,
-                        shard,
-                        maxShardsHeld
-                    );
-                    node.noteActivationRefusedAtCap(indexName, shard);
+                if (full && takeoverMayOvercommit(indexName, shard)) {
+                    // A dead member's shard, and room under the takeover ceiling: taken without evicting. Evicting here put
+                    // a publish and a head release in front of every shard a survivor near its cap took from a dead node,
+                    // one at a time, and that -- not the open -- was most of how long a kill took to recover from. The trim
+                    // in each pass brings the node back to its cap once the taken shards have been idle a while.
+                    synchronized (capLock) {
+                        if (node.reconciler().heldShards().size() + capReserved < takeoverCeiling()) {
+                            capReserved++;
+                            reserved = true;
+                            full = false;
+                        }
+                    }
+                    if (reserved) {
+                        node.noteTakeoverOvercommitted();
+                    }
+                }
+                if (full && heldByAnotherLiveNode(indexName, shard)) {
+                    // Nothing to take, so nothing to make room for. Every survivor of a dead node queues every one of its
+                    // shards; the ones another survivor has taken by the time this reaches them used to cost an eviction
+                    // each -- a publish and a head release, for a shard this node then found it could not have -- and
+                    // survivors at their cap took a dead node's 321 shards at p50 131 s.
                     return Optional.empty();
                 }
-                if (open == null && reserved == false) {
-                    capReserved++;
-                    reserved = true;
+                if (full) {
+                    // Room is made outside the lock. An eviction is a publish and a head release, and every activation
+                    // reserves its slot under this lock: evicting inside it made the survivors of a node that died with
+                    // them at the cap take its shards one eviction at a time, p99 two minutes.
+                    makeRoom();
+                }
+                synchronized (capLock) {
+                    if (reserved) {
+                        full = false;
+                    } else {
+                        // makeRoom answers for what is held, not for what is reserved, so the reservations are counted
+                        // again after it: room it made may already be spoken for.
+                        full = open == null && node.reconciler().heldShards().size() + capReserved >= maxShardsHeld;
+                    }
+                    if (full && headNamesThisNode(indexName, shard) == false) {
+                        // Refusing is a routing outcome, not an error. Saying so is the difference between a
+                        // node that is full and a node that is broken, and only one of them should page anyone.
+                        logger.info(
+                            "not taking {}[{}] on demand: holding {} shards, the cap, and all of them are in use",
+                            indexName,
+                            shard,
+                            maxShardsHeld
+                        );
+                        node.noteActivationRefusedAtCap(indexName, shard);
+                        return Optional.empty();
+                    }
+                    if (open == null && reserved == false) {
+                        capReserved++;
+                        reserved = true;
+                    }
                 }
             }
-        }
-        try {
-            if (open != null) {
-                // Held as a reader. That used to count as held, so a node that had searched a shard could
-                // never become its writer until idle release let the reader go. A reader holds no head
-                // and no unpublished write, so closing it costs nothing.
-                node.reconciler().releaseShard(open, "reopening as a writer");
-            }
-            final Optional<ShardId> taken = node.activateWriter(plane, indexName, shard);
-            // Its idle clock starts here, so a shard just taken is not immediately a candidate for being
-            // given straight back -- whether it was wanted or taken on demand.
-            taken.ifPresent(shardId -> openedAt.put(shardId, plane.clock().getAsLong()));
-            return taken;
-        } finally {
-            if (reserved) {
-                synchronized (capLock) {
-                    capReserved--;
+            try {
+                if (open != null) {
+                    // Held as a reader. That used to count as held, so a node that had searched a shard could
+                    // never become its writer until idle release let the reader go. A reader holds no head
+                    // and no unpublished write, so closing it costs nothing.
+                    node.reconciler().releaseShard(open, "reopening as a writer");
+                }
+                final Optional<ShardId> taken = node.activateWriter(plane, indexName, shard);
+                // Its idle clock starts here, so a shard just taken is not immediately a candidate for being
+                // given straight back -- whether it was wanted or taken on demand.
+                taken.ifPresent(shardId -> openedAt.put(shardId, plane.clock().getAsLong()));
+                return taken;
+            } finally {
+                if (reserved) {
+                    synchronized (capLock) {
+                        capReserved--;
+                    }
                 }
             }
         }
@@ -2389,7 +2561,12 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> publishAll() throws Exception {
-        return publish(node.reconciler().openShards());
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
+            }
+            return publish(node.reconciler().openShards());
+        }
     }
 
     /**
@@ -2403,9 +2580,14 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> publishDirty() throws Exception {
-        final Set<ShardId> drained = new LinkedHashSet<>(dirty);
-        dirty.removeAll(drained);
-        return publish(drained);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
+            }
+            final Set<ShardId> drained = new LinkedHashSet<>(dirty);
+            dirty.removeAll(drained);
+            return publish(drained);
+        }
     }
 
     /**
@@ -2414,6 +2596,9 @@ public final class BackgroundReconciler implements Closeable {
      * @param shardId the shard
      */
     public void markDirty(ShardId shardId) {
+        if (activity.isClosed()) {
+            return;
+        }
         dirty.add(shardId);
     }
 
@@ -2565,16 +2750,21 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public int refreshHints(long nowMillis) throws Exception {
-        final Map<String, Integer> shardCounts = new java.util.LinkedHashMap<>();
-        for (Map.Entry<String, Integer> target : wanted) {
-            shardCounts.merge(target.getKey(), target.getValue() + 1, Math::max);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return 0;
+            }
+            final Map<String, Integer> shardCounts = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, Integer> target : wanted) {
+                shardCounts.merge(target.getKey(), target.getValue() + 1, Math::max);
+            }
+            hints.refresh(
+                (index, shard) -> recentOrReadHead(new ShardId(new org.opensearch.core.index.Index(index, "_na_"), shard)),
+                shardCounts,
+                nowMillis
+            );
+            return hints.size();
         }
-        hints.refresh(
-            (index, shard) -> recentOrReadHead(new ShardId(new org.opensearch.core.index.Index(index, "_na_"), shard)),
-            shardCounts,
-            nowMillis
-        );
-        return hints.size();
     }
 
     /** A head the heartbeat read within one renewal, or a fresh read that is then noted for the others. */
@@ -2601,11 +2791,31 @@ public final class BackgroundReconciler implements Closeable {
         return hints;
     }
 
+    /** Stops new work, settles queued callers, and drains active I/O before shutdown handover. */
     @Override
     public void close() {
+        activity.stopAccepting();
+        final List<java.util.concurrent.CompletableFuture<Optional<ShardId>>> pending;
+        synchronized (activationAdmission) {
+            pending = List.copyOf(activating.values());
+            activating.clear();
+            activationQueue.clear();
+        }
+        // Unblock passes waiting for these futures before draining those passes. No admission lock is
+        // held while completing a future, since its callbacks may themselves ask for an activation.
+        pending.forEach(future -> future.complete(Optional.empty()));
+        activity.close();
+        // All submissions are now finished; cancel cleanup jobs still waiting on an executor.
+        tombstoneSweep.cancel(false);
+        orphanSlice.cancel(false);
+        reclaimSweep.cancel(false);
+        sweepingTombstones.set(false);
+        slicingOrphans.set(false);
+        reclaiming.set(false);
         wanted.clear();
         dirty.clear();
         fenced.clear();
+        pendingSweeps.clear();
     }
 
     private final Set<ShardId> pendingSweeps = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -2616,6 +2826,9 @@ public final class BackgroundReconciler implements Closeable {
      * @param published the shards an edge-triggered publish uploaded
      */
     public void noteForSweep(Collection<ShardId> published) {
+        if (activity.isClosed()) {
+            return;
+        }
         pendingSweeps.addAll(published);
     }
 

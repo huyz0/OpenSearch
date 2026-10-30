@@ -108,6 +108,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     /** How often the full pass runs regardless of what any edge did or failed to do. */
     public static final TimeValue DEFAULT_BACKSTOP_INTERVAL = TimeValue.timeValueSeconds(30);
 
+    private final ReconcileActivity activity = new ReconcileActivity();
     private final BackgroundReconciler loop;
     private final ThreadPool threadPool;
     private final LongSupplier clock;
@@ -171,13 +172,18 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     static final TimeValue JANITOR_BACKLOG_DELAY = TimeValue.timeValueSeconds(5);
 
     private void scheduleJanitor(TimeValue delay) {
-        if (closed) {
-            return;
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
+            }
+            if (closed) {
+                return;
+            }
+            janitorTask = threadPool.schedule(() -> {
+                final BackgroundReconciler.JanitorPass pass = janitorNow();
+                scheduleJanitor(pass != null && pass.full() ? JANITOR_BACKLOG_DELAY : janitorInterval);
+            }, delay, ThreadPool.Names.GENERIC);
         }
-        janitorTask = threadPool.schedule(() -> {
-            final BackgroundReconciler.JanitorPass pass = janitorNow();
-            scheduleJanitor(pass != null && pass.full() ? JANITOR_BACKLOG_DELAY : janitorInterval);
-        }, delay, ThreadPool.Names.GENERIC);
     }
 
     /**
@@ -186,20 +192,25 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return what it did, or null if it failed
      */
     public BackgroundReconciler.JanitorPass janitorNow() {
-        janitorPasses.incrementAndGet();
-        try {
-            final BackgroundReconciler.JanitorPass pass = org.opensearch.serverless.store.ObjectStores.attributedTo(
-                janitorRequests,
-                () -> loop.sweepAbandoned(BackgroundReconciler.DEFAULT_JANITOR_BUDGET, BackgroundReconciler.DEFAULT_JANITOR_REPLAYS)
-            );
-            janitorExamined.addAndGet(pass.examined());
-            janitorReleased.addAndGet(pass.released());
-            janitorReplays.addAndGet(pass.replays());
-            janitorForgotten.addAndGet(pass.claimsForgotten());
-            return pass;
-        } catch (Exception e) {
-            logger.warn("janitor pass failed; the next one will try again", e);
-            return null;
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return null;
+            }
+            janitorPasses.incrementAndGet();
+            try {
+                final BackgroundReconciler.JanitorPass pass = org.opensearch.serverless.store.ObjectStores.attributedTo(
+                    janitorRequests,
+                    () -> loop.sweepAbandoned(BackgroundReconciler.DEFAULT_JANITOR_BUDGET, BackgroundReconciler.DEFAULT_JANITOR_REPLAYS)
+                );
+                janitorExamined.addAndGet(pass.examined());
+                janitorReleased.addAndGet(pass.released());
+                janitorReplays.addAndGet(pass.replays());
+                janitorForgotten.addAndGet(pass.claimsForgotten());
+                return pass;
+            } catch (Exception e) {
+                logger.warn("janitor pass failed; the next one will try again", e);
+                return null;
+            }
         }
     }
 
@@ -213,7 +224,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * matter are relative to the lease TTL and a TTL and a renewal interval chosen independently is a
      * lease that lapses under a healthy node.
      *
-     * <p><b>The caller owns closing it.</b> Closing cancels the timers; not closing leaves them until
+     * <p><b>The caller owns closing it.</b> Closing drains active work and cancels the timers; not closing leaves them until
      * the node's thread pool terminates, which is safe but leaves a node doing work after it was meant
      * to stop.
      *
@@ -284,50 +295,65 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return this, for chaining onto a constructor
      */
     public ReconcileScheduler start() {
-        // The backstop must not renew the lease as well: with the timer running, a fourth renewal per
-        // TTL bought nothing but a third more lease writes. The backstop still verifies heads.
-        loop.setRenewalDrivenByTimer(true);
-        // A departure -- a lease that ran out -- is when a dead node's shards should be taken, not when a request
-        // for each happens to find it. The membership view is refreshed on the renewal timer, so one is noticed
-        // within a renewal interval of the lease running out.
-        loop.membership().subscribe(delta -> {
-            final java.util.Set<String> renewed = new java.util.HashSet<>();
-            for (var joined : delta.joined()) {
-                final String incarnation = joined.nodeId() + "/" + joined.ephemeralId();
-                renewed.add(incarnation);
-                departures.remove(incarnation);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return this;
             }
-            for (org.opensearch.serverless.membership.NodeLease left : delta.left()) {
-                // A changed expiry or address is an updated lease, not a departed process. Probing these
-                // scheduled repeated store reads for every live member on every renewal observation.
-                if (renewed.contains(left.nodeId() + "/" + left.ephemeralId())) {
-                    continue;
+            // The backstop must not renew the lease as well: with the timer running, a fourth renewal per
+            // TTL bought nothing but a third more lease writes. The backstop still verifies heads.
+            loop.setRenewalDrivenByTimer(true);
+            // A departure -- a lease that ran out -- is when a dead node's shards should be taken, not when a request
+            // for each happens to find it. The membership view is refreshed on the renewal timer, so one is noticed
+            // within a renewal interval of the lease running out.
+            loop.membership().subscribe(delta -> {
+                try (org.opensearch.common.lease.Releasable observation = activity.enter()) {
+                    if (observation == null) {
+                        return;
+                    }
+
+                    final java.util.Set<String> renewed = new java.util.HashSet<>();
+                    for (var joined : delta.joined()) {
+                        final String incarnation = joined.nodeId() + "/" + joined.ephemeralId();
+                        renewed.add(incarnation);
+                        departures.remove(incarnation);
+                    }
+                    for (org.opensearch.serverless.membership.NodeLease left : delta.left()) {
+                        // A changed expiry or address is an updated lease, not a departed process. Probing these
+                        // scheduled repeated store reads for every live member on every renewal observation.
+                        if (renewed.contains(left.nodeId() + "/" + left.ephemeralId())) {
+                            continue;
+                        }
+                        // Only a departure that just happened. A lease that ran out long ago belongs to a node whose shards
+                        // are dormant -- or to a fleet replaced wholesale, whose every shard taken at once would be a storm --
+                        // and those are taken as requests ask for them. Deduplicate each absence; a rejoin starts afresh.
+                        final long sinceExpiry = clock.getAsLong() - left.expiresAtMillis();
+                        if (closed == false && sinceExpiry <= RECENT_DEPARTURE_TTLS * leaseTtlMillis()) {
+                            final String incarnation = left.nodeId() + "/" + left.ephemeralId();
+                            final Departure departure = departures.computeIfAbsent(
+                                incarnation,
+                                key -> new Departure(left, clock.getAsLong())
+                            );
+                            threadPool.generic().execute(() -> takeOverIfGone(departure, 0));
+                        }
+                    }
+
                 }
-                // Only a departure that just happened. A lease that ran out long ago belongs to a node whose shards
-                // are dormant -- or to a fleet replaced wholesale, whose every shard taken at once would be a storm --
-                // and those are taken as requests ask for them. Deduplicate each absence; a rejoin starts afresh.
-                final long sinceExpiry = clock.getAsLong() - left.expiresAtMillis();
-                if (closed == false && sinceExpiry <= RECENT_DEPARTURE_TTLS * leaseTtlMillis()) {
-                    final String incarnation = left.nodeId() + "/" + left.ephemeralId();
-                    final Departure departure = departures.computeIfAbsent(incarnation, key -> new Departure(left, clock.getAsLong()));
-                    threadPool.generic().execute(() -> takeOverIfGone(departure, 0));
-                }
+            });
+            scheduleNextRenewal();
+            if (backstopInterval != null) {
+                backstopTask = threadPool.scheduleWithFixedDelay(this::backstopNow, backstopInterval, ThreadPool.Names.GENERIC);
             }
-        });
-        scheduleNextRenewal();
-        if (backstopInterval != null) {
-            backstopTask = threadPool.scheduleWithFixedDelay(this::backstopNow, backstopInterval, ThreadPool.Names.GENERIC);
+            if (janitorInterval != null) {
+                scheduleJanitor(janitorInterval);
+            }
+            logger.info(
+                "reconcile scheduler started: renewal every {}, publish debounce {}, backstop {}",
+                renewalInterval,
+                publishDebounce,
+                backstopInterval == null ? "disabled" : backstopInterval
+            );
+            return this;
         }
-        if (janitorInterval != null) {
-            scheduleJanitor(janitorInterval);
-        }
-        logger.info(
-            "reconcile scheduler started: renewal every {}, publish debounce {}, backstop {}",
-            renewalInterval,
-            publishDebounce,
-            backstopInterval == null ? "disabled" : backstopInterval
-        );
-        return this;
     }
 
     /**
@@ -356,10 +382,26 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     }
 
     private void scheduleNextRenewal() {
-        if (closed) {
-            return;
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
+            }
+            if (closed) {
+                return;
+            }
+            renewalTask = threadPool.schedule(
+                this::runRenewal,
+                nextRenewalDelay(),
+                org.opensearch.serverless.shell.ServerlessNode.LEASE_POOL
+            );
         }
-        renewalTask = threadPool.schedule(() -> {
+    }
+
+    private void runRenewal() {
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
+            }
             java.util.Set<ShardId> released;
             try {
                 released = renewLeaseNow();
@@ -384,7 +426,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             // The scan reads a head per held shard and is not what keeps the lease alive: back to GENERIC with it.
             final java.util.Set<ShardId> releasedByRenewal = released;
             threadPool.generic().execute(() -> verifyNow(releasedByRenewal));
-        }, nextRenewalDelay(), org.opensearch.serverless.shell.ServerlessNode.LEASE_POOL);
+        }
     }
 
     /**
@@ -426,29 +468,34 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * proactive takeover a later real departure gets.
      */
     private void takeOverIfGone(Departure departure, int rechecks) {
-        final var left = departure.lease();
-        final String incarnation = left.nodeId() + "/" + left.ephemeralId();
-        if (closed || departure.takenOver().get() || departures.get(incarnation) != departure) {
-            return;
-        }
-        long liveUntil;
-        try {
-            liveUntil = loop.leaseLiveUntil(left.nodeId()).orElse(Long.MIN_VALUE);
-        } catch (Exception e) {
-            // Unknown, not gone: look again shortly.
-            liveUntil = clock.getAsLong();
-        }
-        if (liveUntil == Long.MIN_VALUE) {
-            if (departure.takenOver().compareAndSet(false, true)) {
-                takeOver(left.nodeId());
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
             }
-            return;
+            final var left = departure.lease();
+            final String incarnation = left.nodeId() + "/" + left.ephemeralId();
+            if (closed || departure.takenOver().get() || departures.get(incarnation) != departure) {
+                return;
+            }
+            long liveUntil;
+            try {
+                liveUntil = loop.leaseLiveUntil(left.nodeId()).orElse(Long.MIN_VALUE);
+            } catch (Exception e) {
+                // Unknown, not gone: look again shortly.
+                liveUntil = clock.getAsLong();
+            }
+            if (liveUntil == Long.MIN_VALUE) {
+                if (departure.takenOver().compareAndSet(false, true)) {
+                    takeOver(left.nodeId());
+                }
+                return;
+            }
+            if (rechecks >= DEPARTURE_RECHECKS) {
+                return;
+            }
+            final long delay = Math.max(0L, liveUntil - clock.getAsLong()) + renewalInterval.millis();
+            threadPool.schedule(() -> takeOverIfGone(departure, rechecks + 1), TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
         }
-        if (rechecks >= DEPARTURE_RECHECKS) {
-            return;
-        }
-        final long delay = Math.max(0L, liveUntil - clock.getAsLong()) + renewalInterval.millis();
-        threadPool.schedule(() -> takeOverIfGone(departure, rechecks + 1), TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
     }
 
     /**
@@ -471,37 +518,53 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     /** The two looks at a departed node's shards; see BackgroundReconciler#takeOverFrom. */
     private void takeOver(String deadNodeId) {
-        try {
-            final java.util.List<Map.Entry<String, Integer>> later = loop.takeOverFrom(deadNodeId);
-            if (later.isEmpty() == false && closed == false) {
-                threadPool.schedule(() -> {
-                    final java.util.List<Map.Entry<String, Integer>> deferred = loop.takeOverRemaining(deadNodeId, later, false);
-                    if (deferred.isEmpty() == false && closed == false) {
-                        // The last look, a lease on: whatever the member named for it has still not taken.
-                        threadPool.schedule(
-                            () -> loop.takeOverRemaining(deadNodeId, deferred, true),
-                            TimeValue.timeValueMillis(renewalInterval.millis() * RENEWALS_PER_TTL),
-                            ThreadPool.Names.GENERIC
-                        );
-                    }
-                }, renewalInterval, ThreadPool.Names.GENERIC);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
             }
-        } catch (Exception e) {
-            logger.warn("could not take over the shards of departed node " + deadNodeId, e);
+            try {
+                final java.util.List<Map.Entry<String, Integer>> later = loop.takeOverFrom(deadNodeId);
+                if (later.isEmpty() == false && closed == false) {
+                    threadPool.schedule(() -> takeOverRemaining(deadNodeId, later, false), renewalInterval, ThreadPool.Names.GENERIC);
+                }
+            } catch (Exception e) {
+                logger.warn("could not take over the shards of departed node " + deadNodeId, e);
+            }
+        }
+    }
+
+    private void takeOverRemaining(String deadNodeId, java.util.List<Map.Entry<String, Integer>> claims, boolean last) {
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
+            }
+            final java.util.List<Map.Entry<String, Integer>> deferred = loop.takeOverRemaining(deadNodeId, claims, last);
+            if (last == false && deferred.isEmpty() == false && closed == false) {
+                threadPool.schedule(
+                    () -> takeOverRemaining(deadNodeId, deferred, true),
+                    TimeValue.timeValueMillis(renewalInterval.millis() * RENEWALS_PER_TTL),
+                    ThreadPool.Names.GENERIC
+                );
+            }
         }
     }
 
     private java.util.Set<ShardId> renewLeaseNow() {
-        pruneDepartureHistory();
-        renewals.incrementAndGet();
-        try {
-            return loop.renewLease();
-        } catch (Exception e) {
-            // Never propagate out of a scheduled task: an exception cancels a fixed-delay schedule, so
-            // one unreachable-object-store blip would silently stop this node renewing anything, for
-            // good, and the node would look healthy right up until its leases lapsed.
-            logger.warn("lease renewal failed; will retry on the next interval", e);
-            return java.util.Set.of();
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return java.util.Set.of();
+            }
+            pruneDepartureHistory();
+            renewals.incrementAndGet();
+            try {
+                return loop.renewLease();
+            } catch (Exception e) {
+                // Never propagate out of a scheduled task: an exception cancels a fixed-delay schedule, so
+                // one unreachable-object-store blip would silently stop this node renewing anything, for
+                // good, and the node would look healthy right up until its leases lapsed.
+                logger.warn("lease renewal failed; will retry on the next interval", e);
+                return java.util.Set.of();
+            }
         }
     }
 
@@ -512,28 +575,36 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @param alreadyReleased shards the renewal itself released, so a doubt is raised once for the pass
      */
     private void verifyNow(java.util.Set<ShardId> alreadyReleased) {
-        final java.util.Set<ShardId> released = new java.util.LinkedHashSet<>(alreadyReleased);
-        try {
-            released.addAll(loop.verifyHeads());
-        } catch (Exception e) {
-            logger.warn("shard-head verification failed; the backstop will retry", e);
-        }
-        if (renewals.get() % READER_REFRESH_EVERY_RENEWALS == 0) {
-            try {
-                loop.refreshReaders();
-            } catch (Exception e) {
-                logger.warn("reader refresh failed; the backstop will retry", e);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return;
             }
-        }
-        if (released.isEmpty() == false) {
-            // Losing a shard is itself evidence worth acting on: something else took it, so the
-            // picture this node has of ownership is out of date beyond just these shards.
-            ownershipDoubted(released.iterator().next().getIndexName(), released.iterator().next().id());
+            final java.util.Set<ShardId> released = new java.util.LinkedHashSet<>(alreadyReleased);
+            try {
+                released.addAll(loop.verifyHeads());
+            } catch (Exception e) {
+                logger.warn("shard-head verification failed; the backstop will retry", e);
+            }
+            if (renewals.get() % READER_REFRESH_EVERY_RENEWALS == 0) {
+                try {
+                    loop.refreshReaders();
+                } catch (Exception e) {
+                    logger.warn("reader refresh failed; the backstop will retry", e);
+                }
+            }
+            if (released.isEmpty() == false) {
+                // Losing a shard is itself evidence worth acting on: something else took it, so the
+                // picture this node has of ownership is out of date beyond just these shards.
+                ownershipDoubted(released.iterator().next().getIndexName(), released.iterator().next().id());
+            }
         }
     }
 
     @Override
     public void wrote(ShardId shardId) {
+        if (closed) {
+            return;
+        }
         loop.markDirty(shardId);
         // compareAndSet, not a lock: the point is that the second through millionth write in a window
         // are free. Only the write that finds no publish pending pays for scheduling one.
@@ -544,6 +615,9 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     @Override
     public void ownershipDoubted(String indexName, int shardNumber) {
+        if (closed) {
+            return;
+        }
         // Which shard is remembered, because under demand-driven activation the pass needs to try the
         // shard nobody wants -- not only the ones this node was told to want. Bounded because a storm of
         // doubts about a dead node must cost one pass, not one per request.
@@ -557,11 +631,17 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     @Override
     public java.util.concurrent.CompletableFuture<java.util.Optional<ShardId>> activate(String indexName, int shardNumber) {
-        if (closed) {
+        final org.opensearch.common.lease.Releasable work = activity.enter();
+        if (work == null) {
             return java.util.concurrent.CompletableFuture.completedFuture(java.util.Optional.empty());
         }
-        activations.incrementAndGet();
-        return loop.activateForRequest(indexName, shardNumber);
+        try {
+            activations.incrementAndGet();
+            return loop.activateForRequest(indexName, shardNumber).whenComplete((result, failure) -> work.close());
+        } catch (Throwable failure) {
+            work.close();
+            throw failure;
+        }
     }
 
     /**
@@ -571,16 +651,21 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return the shards released because this node lost them
      */
     public java.util.Set<ShardId> renewNow() {
-        final java.util.Set<ShardId> released = new java.util.LinkedHashSet<>(renewLeaseNow());
-        try {
-            released.addAll(loop.verifyHeads());
-        } catch (Exception e) {
-            logger.warn("shard-head verification failed; the backstop will retry", e);
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return java.util.Set.of();
+            }
+            final java.util.Set<ShardId> released = new java.util.LinkedHashSet<>(renewLeaseNow());
+            try {
+                released.addAll(loop.verifyHeads());
+            } catch (Exception e) {
+                logger.warn("shard-head verification failed; the backstop will retry", e);
+            }
+            if (released.isEmpty() == false) {
+                ownershipDoubted(released.iterator().next().getIndexName(), released.iterator().next().id());
+            }
+            return released;
         }
-        if (released.isEmpty() == false) {
-            ownershipDoubted(released.iterator().next().getIndexName(), released.iterator().next().id());
-        }
-        return released;
     }
 
     private final java.util.concurrent.atomic.AtomicBoolean publishRunning = new java.util.concurrent.atomic.AtomicBoolean();
@@ -591,38 +676,43 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return the shards published
      */
     public java.util.Set<ShardId> publishNow() {
-        publishPending.set(false);
-        // One pass at a time. A pass used to take minutes on a node holding a thousand shards, and each write meanwhile
-        // scheduled another: they piled up on GENERIC, blocked on the same shards' publish locks, until nothing else could
-        // run there. A pass that finds another running leaves its marks to it; the running one goes round again while any
-        // shard is dirty.
-        if (publishRunning.compareAndSet(false, true) == false) {
-            return java.util.Set.of();
-        }
-        final java.util.Set<ShardId> all = new java.util.LinkedHashSet<>();
-        int rounds = 0;
-        try {
-            do {
-                publishes.incrementAndGet();
-                final var published = loop.publishDirty();
-                loop.noteForSweep(published);
-                all.addAll(published);
-                final var fenced = loop.drainFenced();
-                if (fenced.isEmpty() == false) {
-                    ownershipDoubted(fenced.iterator().next().getIndexName(), fenced.iterator().next().id());
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return java.util.Set.of();
+            }
+            publishPending.set(false);
+            // One pass at a time. A pass used to take minutes on a node holding a thousand shards, and each write meanwhile
+            // scheduled another: they piled up on GENERIC, blocked on the same shards' publish locks, until nothing else could
+            // run there. A pass that finds another running leaves its marks to it; the running one goes round again while any
+            // shard is dirty.
+            if (publishRunning.compareAndSet(false, true) == false) {
+                return java.util.Set.of();
+            }
+            final java.util.Set<ShardId> all = new java.util.LinkedHashSet<>();
+            int rounds = 0;
+            try {
+                do {
+                    publishes.incrementAndGet();
+                    final var published = loop.publishDirty();
+                    loop.noteForSweep(published);
+                    all.addAll(published);
+                    final var fenced = loop.drainFenced();
+                    if (fenced.isEmpty() == false) {
+                        ownershipDoubted(fenced.iterator().next().getIndexName(), fenced.iterator().next().id());
+                    }
+                    // Bounded, so a shard whose publish keeps failing -- re-marked each time -- cannot spin a pass while the
+                    // store is down; the rest wait one debounce.
+                } while (closed == false && loop.hasDirty() && ++rounds < 10);
+                return all;
+            } catch (Exception e) {
+                logger.warn("edge-triggered publish failed; the backstop will retry", e);
+                return all;
+            } finally {
+                publishRunning.set(false);
+                // A mark made between the last look and here would wait for the next write or the backstop.
+                if (closed == false && loop.hasDirty() && publishPending.compareAndSet(false, true)) {
+                    threadPool.schedule(this::publishNow, publishDebounce, ThreadPool.Names.GENERIC);
                 }
-                // Bounded, so a shard whose publish keeps failing -- re-marked each time -- cannot spin a pass while the
-                // store is down; the rest wait one debounce.
-            } while (closed == false && loop.hasDirty() && ++rounds < 10);
-            return all;
-        } catch (Exception e) {
-            logger.warn("edge-triggered publish failed; the backstop will retry", e);
-            return all;
-        } finally {
-            publishRunning.set(false);
-            // A mark made between the last look and here would wait for the next write or the backstop.
-            if (closed == false && loop.hasDirty() && publishPending.compareAndSet(false, true)) {
-                threadPool.schedule(this::publishNow, publishDebounce, ThreadPool.Names.GENERIC);
             }
         }
     }
@@ -633,19 +723,24 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return the shards acquired
      */
     public java.util.Set<ShardId> activateNow() {
-        activationPending.set(false);
-        activations.incrementAndGet();
-        // Drained before the work, for the same reason the dirty set is: a doubt raised mid-pass must
-        // get its own pass rather than being swallowed by this one.
-        final java.util.Set<Map.Entry<String, Integer>> pending = new java.util.LinkedHashSet<>(doubted);
-        doubted.removeAll(pending);
-        try {
-            final java.util.Set<ShardId> taken = new java.util.LinkedHashSet<>(loop.activateWanted());
-            taken.addAll(loop.activateOnDemand(pending));
-            return taken;
-        } catch (Exception e) {
-            logger.warn("failure-triggered activation failed; the backstop will retry", e);
-            return java.util.Set.of();
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return java.util.Set.of();
+            }
+            activationPending.set(false);
+            activations.incrementAndGet();
+            // Drained before the work, for the same reason the dirty set is: a doubt raised mid-pass must
+            // get its own pass rather than being swallowed by this one.
+            final java.util.Set<Map.Entry<String, Integer>> pending = new java.util.LinkedHashSet<>(doubted);
+            doubted.removeAll(pending);
+            try {
+                final java.util.Set<ShardId> taken = new java.util.LinkedHashSet<>(loop.activateWanted());
+                taken.addAll(loop.activateOnDemand(pending));
+                return taken;
+            } catch (Exception e) {
+                logger.warn("failure-triggered activation failed; the backstop will retry", e);
+                return java.util.Set.of();
+            }
         }
     }
 
@@ -655,12 +750,17 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return what the pass did, or null if it failed
      */
     public BackgroundReconciler.TickResult backstopNow() {
-        backstops.incrementAndGet();
-        try {
-            return loop.tick(clock.getAsLong());
-        } catch (Exception e) {
-            logger.warn("backstop reconciliation pass failed; will retry on the next interval", e);
-            return null;
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return null;
+            }
+            backstops.incrementAndGet();
+            try {
+                return loop.tick(clock.getAsLong());
+            } catch (Exception e) {
+                logger.warn("backstop reconciliation pass failed; will retry on the next interval", e);
+                return null;
+            }
         }
     }
 
@@ -677,6 +777,9 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     @Override
     public void close() {
         closed = true;
+        activity.close();
+        departures.clear();
+        doubted.clear();
         // Whoever ticks the loop after this is the only thing renewing, so the tick renews again.
         loop.setRenewalDrivenByTimer(false);
         if (renewalTask != null) {
