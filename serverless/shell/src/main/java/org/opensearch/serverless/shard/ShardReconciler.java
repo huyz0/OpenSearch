@@ -37,6 +37,7 @@ import org.opensearch.serverless.store.SegmentPublisher;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Optional;
@@ -439,7 +440,24 @@ public final class ShardReconciler {
      * Shards between {@code createShard} and being recorded as open, so an index's service is not closed
      * underneath a shard of it that is still being built.
      */
-    private final Set<ShardId> opening = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<Index, Set<ShardId>> opening = new ConcurrentHashMap<>();
+
+    private void markOpening(ShardId shardId) {
+        // Publish the marker before indexServiceFor can acquire a service. Closing under the index's
+        // monitor either sees this marker or finishes before that acquisition, which creates a new service.
+        opening.compute(shardId.getIndex(), (index, shards) -> {
+            final Set<ShardId> current = shards == null ? new HashSet<>() : shards;
+            current.add(shardId);
+            return current;
+        });
+    }
+
+    private void unmarkOpening(ShardId shardId) {
+        opening.computeIfPresent(shardId.getIndex(), (index, shards) -> {
+            shards.remove(shardId);
+            return shards.isEmpty() ? null : shards;
+        });
+    }
 
     /**
      * The commit each shard currently being opened is opening at, for the directory factory.
@@ -559,7 +577,7 @@ public final class ShardReconciler {
         boolean replayWal,
         CommitManifest knownCommit
     ) throws IOException {
-        opening.add(shardId);
+        markOpening(shardId);
         final long[] at = { System.nanoTime() };
         final int[] step = { 0 };
         final Runnable lap = () -> {
@@ -721,7 +739,7 @@ public final class ShardReconciler {
             abandon(indicesService.indexService(shardId.getIndex()), shardId, e);
             throw e;
         } finally {
-            opening.remove(shardId);
+            unmarkOpening(shardId);
         }
     }
 
@@ -776,7 +794,7 @@ public final class ShardReconciler {
             cause.addSuppressed(e);
         }
         try {
-            opening.remove(shardId);
+            unmarkOpening(shardId);
             closeIndexIfUnused(shardId.getIndex(), "activation failed: " + cause.getMessage(), false);
         } catch (Exception e) {
             cause.addSuppressed(e);
@@ -1379,8 +1397,10 @@ public final class ShardReconciler {
                 if (indexLocks.get(index) != lock) {
                     continue;
                 }
-                final boolean inUse = open.keySet().stream().anyMatch(id -> id.getIndex().equals(index))
-                    || opening.stream().anyMatch(id -> id.getIndex().equals(index));
+                final IndexService service = indicesService.indexService(index);
+                // A release must depend only on this index. Scanning every held shard for every close
+                // made releasing N single-shard indices quadratic, including frozen-view churn.
+                final boolean inUse = (service != null && service.numberOfShards() > 0) || opening.containsKey(index);
                 if (inUse == false) {
                     // DELETED wipes the directory; NO_LONGER_ASSIGNED closes and keeps it. A view's
                     // directory is never opened again, a live shard's is a cache the next open uses.
