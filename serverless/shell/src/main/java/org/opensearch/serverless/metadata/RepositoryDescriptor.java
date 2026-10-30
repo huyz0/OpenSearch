@@ -131,7 +131,7 @@ public final class RepositoryDescriptor {
             builder.field("created_at", createdAtMillis);
             builder.startObject("settings");
             for (Map.Entry<String, Object> setting : settings.entrySet()) {
-                builder.field(setting.getKey(), String.valueOf(setting.getValue()));
+                builder.field(setting.getKey(), setting.getValue());
             }
             builder.endObject();
             builder.endObject();
