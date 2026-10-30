@@ -1079,6 +1079,27 @@ public final class ShardOperations {
         }
 
         private int skipped;
+        private Boolean totalHitsTracked;
+
+        /**
+         * Records whether the admitted request or filtered response includes total hits.
+         *
+         * @param tracked whether a count may be returned
+         * @return this outcome
+         */
+        public SearchOutcome withTotalHitsTracking(boolean tracked) {
+            totalHitsTracked = tracked;
+            return this;
+        }
+
+        /**
+         * Returns the admitted counting policy, or null when the caller's source supplies it.
+         *
+         * @return whether total hits are included, or null if unspecified
+         */
+        public Boolean tracksTotalHits() {
+            return totalHitsTracked;
+        }
 
         /**
          * Records how many shards were skipped because they provably could not match.

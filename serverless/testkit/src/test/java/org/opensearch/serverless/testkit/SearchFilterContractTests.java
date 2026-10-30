@@ -191,6 +191,139 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
         }
     }
 
+    public void testAFilterCanRemoveTotalHitCounts() throws Exception {
+        try (var node = node(request -> {}, null, SearchFilterContractTests::withoutTotals)) {
+            final var source = new SearchSourceBuilder();
+            final ShardOperations.SearchOutcome answer = SearchHandler.gated(
+                node,
+                List.of("private"),
+                source,
+                accepted -> new ShardOperations.SearchOutcome(42L, List.of(), 1, 1)
+            );
+            assertNull(
+                "a response filter's omitted count must stay omitted",
+                SearchHandler.toResponse(answer, source, 0L, null).getHits().getTotalHits()
+            );
+            assertEquals("the internal view must not restore the hidden count either", 0L, answer.total());
+        }
+    }
+
+    public void testDisabledCountingIsNotShownToResponseFilters() throws Exception {
+        final var exposed = new AtomicBoolean();
+        try (var node = node(request -> {}, null, response -> {
+            exposed.set(response.getHits().getTotalHits() != null);
+            return response;
+        })) {
+            SearchHandler.gated(
+                node,
+                List.of("private"),
+                new SearchSourceBuilder().trackTotalHits(false),
+                accepted -> new ShardOperations.SearchOutcome(42L, List.of(), 1, 1)
+            );
+            assertFalse("filters must see the same counting policy the caller requested", exposed.get());
+        }
+    }
+
+    public void testAnAdmittedCountingRewriteControlsTheResponse() throws Exception {
+        try (var node = node(request -> request.source(new SearchSourceBuilder().trackTotalHits(true)), null)) {
+            final var original = new SearchSourceBuilder().trackTotalHits(false);
+            final ShardOperations.SearchOutcome answer = SearchHandler.gated(
+                node,
+                List.of("private"),
+                original,
+                accepted -> new ShardOperations.SearchOutcome(42L, List.of(), 1, 1)
+            );
+            final var total = SearchHandler.toResponse(answer, original, 0L, null).getHits().getTotalHits();
+            assertNotNull("the rewritten request asks for totals", total);
+            assertEquals(42L, total.value());
+        }
+    }
+
+    public void testCachedSearchResponsesCanOmitTotalHits() throws Exception {
+        final var cached = withoutTotals(SearchHandler.toResponse(new ShardOperations.SearchOutcome(42L, List.of(), 1, 1), null, 0L, null));
+        try (var node = node(request -> {}, cached)) {
+            final var source = new SearchSourceBuilder();
+            final ShardOperations.SearchOutcome answer = SearchHandler.gated(node, List.of("private"), source, accepted -> {
+                throw new AssertionError("the cache must bypass execution");
+            });
+            assertNull(SearchHandler.toResponse(answer, source, 0L, null).getHits().getTotalHits());
+        }
+    }
+
+    public void testRedactedCountsDoNotExposeTheOldBound() throws Exception {
+        try (var node = node(request -> {}, null, SearchFilterContractTests::withoutTotals)) {
+            final var answer = SearchHandler.gated(
+                node,
+                List.of("private"),
+                new SearchSourceBuilder(),
+                source -> new ShardOperations.SearchOutcome(
+                    42L,
+                    List.of(),
+                    1,
+                    1,
+                    null,
+                    org.apache.lucene.search.TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO,
+                    Float.NaN,
+                    false,
+                    null,
+                    List.of()
+                )
+            );
+            assertEquals(0L, answer.total());
+            assertEquals(org.apache.lucene.search.TotalHits.Relation.EQUAL_TO, answer.relation());
+        }
+    }
+
+    public void testCountEndpointDoesNotRestoreARedactedTotal() throws Exception {
+        try (
+            var store = new org.opensearch.common.blobstore.fs.FsBlobStore(1024, createTempDir(), false);
+            var node = node(request -> {}, null, SearchFilterContractTests::withoutTotals);
+            var client = java.net.http.HttpClient.newHttpClient()
+        ) {
+            final var plane = new org.opensearch.serverless.metadata.MetadataPlane(
+                store,
+                org.opensearch.common.blobstore.BlobPath.cleanPath(),
+                () -> 1_000L,
+                30_000L
+            );
+            plane.createIndex(new org.opensearch.serverless.cluster.IndexDescriptor("counted", "uuid-counted", 1, "{}", null));
+            node.start();
+            node.setMetadataPlane(plane);
+            final var shard = node.activateWriter(plane, "counted", 0).orElseThrow();
+            node.index(shard, "one", "{}");
+            node.reconciler().shard(shard).refresh("test");
+            final var address = node.boundHttpAddress().publishAddress();
+            final var request = java.net.http.HttpRequest.newBuilder(
+                new java.net.URI("http", null, address.getAddress(), address.getPort(), "/counted/_count", null, null)
+            ).timeout(java.time.Duration.ofSeconds(30)).GET().build();
+            final var response = client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
+            assertEquals("the endpoint cannot return a count a filter removed: " + response.body(), 501, response.statusCode());
+        }
+    }
+
+    private static SearchResponse withoutTotals(SearchResponse response) {
+        final var hits = new org.opensearch.search.SearchHits(response.getHits().getHits(), null, response.getHits().getMaxScore());
+        final var internal = new org.opensearch.search.internal.InternalSearchResponse(
+            hits,
+            (org.opensearch.search.aggregations.InternalAggregations) response.getAggregations(),
+            null,
+            null,
+            response.isTimedOut(),
+            response.isTerminatedEarly(),
+            1
+        );
+        return new SearchResponse(
+            internal,
+            null,
+            response.getTotalShards(),
+            response.getSuccessfulShards(),
+            response.getSkippedShards(),
+            0L,
+            response.getShardFailures(),
+            SearchResponse.Clusters.EMPTY
+        );
+    }
+
     public void testARewrittenSecurityQueryStillReachesExecution() throws Exception {
         final var query = org.opensearch.index.query.QueryBuilders.termQuery("tenant", "allowed");
         try (var node = node(request -> request.source(new SearchSourceBuilder().query(query)), null)) {
