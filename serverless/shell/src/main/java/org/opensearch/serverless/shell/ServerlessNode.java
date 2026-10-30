@@ -4141,7 +4141,7 @@ public final class ServerlessNode implements Closeable {
             // once, because a second MAPPING_UPDATE_REQUIRED after the update has been applied means
             // something other than a missing field, and retrying forever would hide it.
             growMapping(shardId, result.getRequiredMappingUpdate());
-            return index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, false);
+            return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, false);
         }
         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
             // s0-findings.md F5: this is a value, not a throw. A caller that ignores it indexes nothing
