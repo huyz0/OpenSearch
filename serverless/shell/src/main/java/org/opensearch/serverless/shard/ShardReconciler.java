@@ -545,7 +545,7 @@ public final class ShardReconciler {
         }
         final long readingAt = System.nanoTime();
         try {
-            log.forEachReplayableAfterFencing(record -> {
+            log.replay(record -> {
                 consumer.accept(record);
                 logRecordsRead.incrementAndGet();
             });

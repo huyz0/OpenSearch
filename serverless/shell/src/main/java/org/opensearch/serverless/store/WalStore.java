@@ -57,7 +57,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * the write rate. Nothing about the format or the ordering here changes -- a group is one append of a
  * list, which is the call this class already had.
  */
-public final class WalStore {
+public final class WalStore implements org.opensearch.serverless.log.DurableOperationLog {
 
     private final BlobStore blobStore;
     private final BlobPath shardBase;
@@ -267,6 +267,7 @@ public final class WalStore {
      * @param records the writes, in the order they must replay
      * @throws IOException if the append fails
      */
+    @Override
     public void append(long term, List<WalRecord> records) throws IOException {
         if (records.isEmpty()) {
             // Not an error, and not a blob. An empty batch is what a bulk request whose items all belong
@@ -466,6 +467,11 @@ public final class WalStore {
         final List<WalRecord> records = new ArrayList<>();
         forEachReplayableAfterFencing(records::add);
         return records;
+    }
+
+    @Override
+    public void replay(org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer) throws IOException {
+        forEachReplayableAfterFencing(consumer);
     }
 
     /** Reads fenced history without retaining decoded records between read windows. */

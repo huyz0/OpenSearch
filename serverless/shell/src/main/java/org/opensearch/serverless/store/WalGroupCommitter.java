@@ -92,7 +92,7 @@ public final class WalGroupCommitter {
 
     /** What actually writes a group. {@link WalStore#append(long, List)}, in production. */
     @FunctionalInterface
-    public interface Flush {
+    public interface Flush extends org.opensearch.serverless.log.OperationAppender {
         /**
          * Writes a whole group as one blob.
          *
@@ -162,6 +162,20 @@ public final class WalGroupCommitter {
      * @throws IOException if the group carrying these records could not be written
      */
     public void commit(ShardId shardId, long term, List<WalRecord> records, Flush flush) throws IOException {
+        commitTo(shardId, term, records, flush);
+    }
+
+    /**
+     * Persists a group through the shared append boundary without allocating a forwarding callback.
+     *
+     * @param shardId shard identity
+     * @param term operation primary term
+     * @param records resolved operations
+     * @param flush durable backend; all callers for one shard must use the same active backend
+     * @throws IOException when group durability could not be established
+     */
+    public void commitTo(ShardId shardId, long term, List<WalRecord> records, org.opensearch.serverless.log.OperationAppender flush)
+        throws IOException {
         if (records.isEmpty()) {
             // Not an error and not a blob: what a bulk whose items all belong to other shards leaves here.
             return;

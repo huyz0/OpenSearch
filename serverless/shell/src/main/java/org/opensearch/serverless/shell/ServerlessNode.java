@@ -4322,7 +4322,7 @@ public final class ServerlessNode implements Closeable {
             // share one PUT, and this caller returns only once the blob carrying its own records has
             // landed. The two lease checks around this call are unchanged and remain per-caller, so every
             // member of a group independently establishes that its record sits ahead of any seal.
-            walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
+            walCommitter.commitTo(shardId, shard.getOperationPrimaryTerm(), records, wal);
             appendSucceeded = true;
             writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
         } catch (Exception | Error e) {
