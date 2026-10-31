@@ -240,11 +240,7 @@ public final class ActionGate {
                 listener.onFailure(e);
             }
         };
-        for (int i = filters.size() - 1; i >= 0; i--) {
-            final ActionFilter filter = filters.get(i);
-            final ActionFilterChain<ActionRequest, ActionResponse> next = chain;
-            chain = (task, name, req, listener) -> filter.apply(task, name, req, ActionRequestMetadata.empty(), listener, next);
-        }
+        chain = withFilters(chain);
 
         final PlainActionFuture<ActionResponse> future = PlainActionFuture.newFuture();
         final Task task = new Task(0L, "serverless", action, "", TaskId.EMPTY_TASK_ID, Map.of());
@@ -286,30 +282,33 @@ public final class ActionGate {
         ResponseView<T> view,
         org.opensearch.core.action.ActionListener<T> completion
     ) {
+        runAsync(null, action, request, work, view, completion);
+    }
+
+    /**
+     * Runs the same asynchronous chain, moving transport-thread work onto the generic pool.
+     * A null pool preserves caller-thread execution for existing adapters.
+     */
+    public <T> void runAsync(
+        org.opensearch.threadpool.ThreadPool workerPool,
+        String action,
+        ActionRequest request,
+        org.opensearch.common.CheckedBiConsumer<ActionRequest, org.opensearch.core.action.ActionListener<T>, Exception> work,
+        ResponseView<T> view,
+        org.opensearch.core.action.ActionListener<T> completion
+    ) {
         if (filters.isEmpty()) {
-            try {
-                work.accept(request, completion);
-            } catch (Exception e) {
-                completion.onFailure(e);
-            }
+            startWork(workerPool, request, work, completion);
             return;
         }
         final AtomicReference<T> original = new AtomicReference<>();
         ActionFilterChain<ActionRequest, ActionResponse> chain = (task, name, admitted, listener) -> {
-            try {
-                work.accept(admitted, org.opensearch.core.action.ActionListener.wrap(result -> {
-                    original.set(result);
-                    listener.onResponse(view.show(result));
-                }, listener::onFailure));
-            } catch (Exception e) {
-                listener.onFailure(e);
-            }
+            startWork(workerPool, admitted, work, org.opensearch.core.action.ActionListener.wrap(result -> {
+                original.set(result);
+                listener.onResponse(view.show(result));
+            }, listener::onFailure));
         };
-        for (int i = filters.size() - 1; i >= 0; i--) {
-            final ActionFilter filter = filters.get(i);
-            final ActionFilterChain<ActionRequest, ActionResponse> next = chain;
-            chain = (task, name, admitted, listener) -> filter.apply(task, name, admitted, ActionRequestMetadata.empty(), listener, next);
-        }
+        chain = withFilters(chain);
         final var finished = org.opensearch.core.action.ActionListener.<ActionResponse>wrap(
             answered -> completion.onResponse(view.read(answered, original.get())),
             completion::onFailure
@@ -319,6 +318,34 @@ public final class ActionGate {
             chain.proceed(task, action, request, finished);
         } catch (Exception e) {
             finished.onFailure(e);
+        }
+    }
+
+    private ActionFilterChain<ActionRequest, ActionResponse> withFilters(ActionFilterChain<ActionRequest, ActionResponse> terminal) {
+        var chain = terminal;
+        for (int i = filters.size() - 1; i >= 0; i--) {
+            final ActionFilter filter = filters.get(i);
+            final ActionFilterChain<ActionRequest, ActionResponse> next = chain;
+            chain = (task, name, request, listener) -> filter.apply(task, name, request, ActionRequestMetadata.empty(), listener, next);
+        }
+        return chain;
+    }
+
+    private static <T> void startWork(
+        org.opensearch.threadpool.ThreadPool workerPool,
+        ActionRequest request,
+        org.opensearch.common.CheckedBiConsumer<ActionRequest, org.opensearch.core.action.ActionListener<T>, Exception> work,
+        org.opensearch.core.action.ActionListener<T> completion
+    ) {
+        try {
+            if (workerPool != null && org.opensearch.transport.Transports.isTransportThread(Thread.currentThread())) {
+                workerPool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
+                    .execute(() -> startWork(null, request, work, completion));
+            } else {
+                work.accept(request, completion);
+            }
+        } catch (Exception e) {
+            completion.onFailure(e);
         }
     }
 

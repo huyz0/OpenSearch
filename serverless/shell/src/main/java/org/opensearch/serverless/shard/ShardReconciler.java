@@ -495,14 +495,8 @@ public final class ShardReconciler {
      * @throws IOException if the log cannot be read
      */
     public java.util.List<org.opensearch.serverless.store.WalRecord> replayRecordsFor(ShardId shardId) throws IOException {
-        final org.opensearch.serverless.store.WalStore wal = pendingReplay.get(shardId);
-        if (wal == null) {
-            return java.util.List.of();
-        }
-        final long readingAt = System.nanoTime();
-        final java.util.List<org.opensearch.serverless.store.WalRecord> records = wal.replayableAfterFencing();
-        writerOpenNanos[WRITER_OPEN_PHASES.indexOf("log_read")].addAndGet(System.nanoTime() - readingAt);
-        logRecordsRead.addAndGet(records.size());
+        final var records = new java.util.ArrayList<org.opensearch.serverless.store.WalRecord>();
+        forEachReplayRecord(shardId, records::add);
         return records;
     }
 
