@@ -98,5 +98,13 @@ asynchronous S3 archival are not enabled by these foundation commits.
   filtered-class descriptors. Node lifecycle wiring, safe learner replacement, and
   logical-shard authorization remain pending; catalog tests use local FS registers.
 
+- Learner/replacement feasibility: a native SDK probe confirmed voter-only
+  `ALL_COMMITTED` can succeed while a learner is stalled. After requiring that
+  learner's committed prefix to cover the cut, native CAS replaced one voter
+  atomically, rejected stale membership, and survived subsequent leader loss using
+  the replacement quorum. Both this 26-operation probe and the original
+  201-operation restart probe passed three iterations, with root precommit.
+  Production durable transitions and authorized learner startup remain pending.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

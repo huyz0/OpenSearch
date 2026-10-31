@@ -208,3 +208,40 @@ from the node lifecycle or authorize voter replacement. Safe learner catch-up an
 membership changes need separate durable transitions; editing genesis placement
 is not a membership protocol. Local conditional-register tests and real local
 journal integration do not substitute for cloud or independent-AZ qualification.
+
+## Native learner and atomic replacement probe
+
+A local SDK probe with four server instances in one JVM verifies
+non-voting learner catch-up, followed by a direct old-three to new-three voter
+replacement using native joint consensus. It preserves the existing 201-operation
+restart probe. The added history catches up operations 1–20, stalls the learner's
+persistence for operation 21, then confirms voter `ALL_COMMITTED` succeeds while
+the learner remains behind. After resuming persistence, it requires that learner's
+own committed prefix to cover the cut, replaces one non-leader voter, rejects a
+stale configuration CAS, writes 22–25, closes the leader, and commits operation 26
+using the remaining original voter plus its replacement. Both probes passed three
+iterations. This is native API feasibility, not production membership integration,
+independent voter processes, authentication, or AZ-failure qualification.
+
+Important Ratis 3.3.1 contracts for runtime integration:
+
+- `ALL_COMMITTED` covers voters. It cannot certify that a listener has caught up.
+  The local leader's public `Division.getCommitInfos()` includes listener progress
+  keyed by peer identity. Require the intended learner's committed prefix to cover
+  a committed transition barrier, with matching group, controller intent, and
+  leadership/configuration checks. This historical cut is not a current-read API.
+- Native staging uses `matchIndex + gap > committedIndex`. A gap of one requires
+  coverage of the committed index; zero incorrectly requires being ahead. The
+  probe uses one. Existing listeners promoted to voters skip fresh staging, so
+  explicit learner evidence is still necessary.
+- Use `SetConfigurationRequest.Mode.COMPARE_AND_SET` with expected voters and
+  listeners. Native CAS compares peer identities; it does not bind full addresses
+  or a controller revision. A durable pending transition must bind those fields
+  and serialize configuration changes before a local request is issued.
+- Replace old three with new three atomically after catch-up. A stable four-voter
+  intermediate configuration needs three votes and can lose availability when
+  two voters temporarily share the AZ being replaced.
+
+The runtime still needs durable transition records, authorized learner startup,
+restart reconciliation, and fencing of retired identities. Genesis reservations
+remain immutable. No reconfiguration API is enabled by this probe.

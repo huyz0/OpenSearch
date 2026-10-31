@@ -25,6 +25,7 @@ import org.apache.ratis.rpc.SupportedRpcType;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.storage.RaftStorage;
+import org.apache.ratis.statemachine.StateMachine;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.util.TimeDuration;
@@ -106,18 +107,27 @@ public class RatisPersistenceSpikeTests extends OpenSearchTestCase {
     }
 
     static RaftServer start(RaftPeer peer, RaftGroup group, Path storage) throws Exception {
+        return start(peer, group, storage, new CountingStateMachine());
+    }
+
+    static RaftServer start(RaftPeer peer, RaftGroup group, Path storage, StateMachine stateMachine) throws Exception {
+        // Initialize the host embedding policy before native SDK startup can install its handler.
+        Class.forName(RatisJournal.class.getName(), true, RatisJournal.class.getClassLoader());
         final RaftProperties properties = new RaftProperties();
         RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.GRPC);
         GrpcConfigKeys.Server.setHost(properties, "127.0.0.1");
         GrpcConfigKeys.Server.setPort(properties, Integer.parseInt(peer.getAddress().split(":")[1]));
         configureStorage(properties, storage.resolve(peer.getId().toString()));
+        // Native staging uses matchIndex + gap > committedIndex, so one means no committed gap.
+        RaftServerConfigKeys.setStagingCatchupGap(properties, 1);
+        RaftServerConfigKeys.Log.StateMachineData.setSyncTimeout(properties, TimeDuration.valueOf(60, TimeUnit.SECONDS));
         RaftServerConfigKeys.Log.setUnsafeFlushEnabled(properties, false);
         RaftServerConfigKeys.Log.setAsyncFlushEnabled(properties, false);
         final RaftServer server = RaftServer.newBuilder()
             .setServerId(peer.getId())
             .setGroup(group)
             .setProperties(properties)
-            .setStateMachineRegistry(ignored -> new CountingStateMachine())
+            .setStateMachineRegistry(ignored -> stateMachine)
             .setOption(RaftStorage.StartupOption.RECOVER)
             .build();
         try {

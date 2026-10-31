@@ -59,6 +59,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessFleetScaleTests.class'
   exclude '**/ServerlessLatencyBenchmarkTests.class'
   exclude '**/JournalGroupCatalogRuntimeTests.class'
+  exclude '**/RatisMembershipSpikeTests.class'
   exclude '**/RatisPersistenceSpikeTests.class'
   exclude '**/RatisGroupCountBenchmarkTests.class'
   exclude '**/ServerlessRealPluginTests.class'
@@ -204,6 +205,7 @@ tasks.register('latencyBenchmark', Test) {
 tasks.register('consensusTest', Test) {
   testClassesDirs = sourceSets.test.output.classesDirs
   classpath = sourceSets.test.runtimeClasspath
+  include '**/RatisMembershipSpikeTests.class'
   include '**/RatisPersistenceSpikeTests.class'
   systemProperty 'tests.security.manager', 'false'
   systemProperty 'tests.system_call_filter', 'false'
