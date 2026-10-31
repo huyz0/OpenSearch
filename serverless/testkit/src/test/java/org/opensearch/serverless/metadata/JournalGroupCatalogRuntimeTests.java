@@ -282,6 +282,7 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 loseReceiptReply.set(true);
                 expectThrows(IOException.class, () -> catalog.publishReplacement(leader[0], intent));
                 assertEquals(intent, restartedController.membership(group.id()));
+                final var previousLeader = leader[0];
                 leader[0].close();
                 assertBusy(() -> {
                     leader[0] = readyLeader(journals, group.id());
@@ -316,6 +317,14 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 final var secondPeers = new ArrayList<>(targetPeers);
                 secondPeers.remove(joining);
                 secondPeers.add(secondJoining);
+                final var retiredOriginal = journals.get(peers.indexOf(removed));
+                final var retainedJournal = journals.subList(0, 3)
+                    .stream()
+                    .filter(journal -> journal != previousLeader && journal != retiredOriginal)
+                    .findFirst()
+                    .orElseThrow();
+                final var oldChannel = establishedPeerChannel(retainedJournal, group.id(), joining.id());
+                assertFalse(oldChannel.isShutdown());
                 final var secondIntent = completedController.prepareReplacement(
                     group.id(),
                     1,
@@ -349,6 +358,7 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 }, 30, TimeUnit.SECONDS);
                 final var secondReceipt = completedController.publishReplacement(leader[0], secondIntent);
                 assertEquals(2, secondReceipt.completedMembership().revision());
+                assertTrue("the retired peer's established channel must be released", oldChannel.isShutdown());
                 assertEquals(published, new JournalGroupCatalog(real, deployment).publishReplacement(leader[0], intent));
                 expectThrows(IOException.class, () -> leader[0].advanceReplacement(intent));
                 final String receiptKey = "completed-" + group.id() + "-" + intent.pending().id();
@@ -365,6 +375,34 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 IOUtils.close(journals);
             }
         }
+    }
+
+    @SuppressForbidden(reason = "Inspect the exact pinned SDK transport channel after a real peer RPC")
+    private static org.apache.ratis.thirdparty.io.grpc.ManagedChannel establishedPeerChannel(RatisJournal journal, UUID group, UUID peer)
+        throws Exception {
+        final var serverField = RatisJournal.class.getDeclaredField("server");
+        serverField.setAccessible(true);
+        final var server = (org.apache.ratis.server.RaftServer) serverField.get(journal);
+        final var request = org.apache.ratis.proto.RaftProtos.RequestVoteRequestProto.newBuilder()
+            .setServerRequest(
+                org.apache.ratis.proto.RaftProtos.RaftRpcRequestProto.newBuilder()
+                    .setRequestorId(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(server.getId().toString()))
+                    .setReplyId(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(peer.toString()))
+                    .setRaftGroupId(
+                        org.apache.ratis.util.ProtoUtils.toRaftGroupIdProtoBuilder(org.apache.ratis.protocol.RaftGroupId.valueOf(group))
+                    )
+                    .setCallId(0)
+            )
+            .setCandidateTerm(0)
+            .setCandidateLastEntry(org.apache.ratis.proto.RaftProtos.TermIndexProto.newBuilder().setTerm(0).setIndex(0))
+            .setPreVote(true)
+            .build();
+        server.getServerRpc().requestVote(request);
+        final Object client = ((org.apache.ratis.server.RaftServerRpcWithProxy<?, ?>) server.getServerRpc()).getProxies()
+            .getProxy(org.apache.ratis.protocol.RaftPeerId.valueOf(peer.toString()));
+        final var channel = client.getClass().getDeclaredField("channel");
+        channel.setAccessible(true);
+        return (org.apache.ratis.thirdparty.io.grpc.ManagedChannel) channel.get(client);
     }
 
     private static RatisJournal readyLeader(List<RatisJournal> journals, UUID group) {

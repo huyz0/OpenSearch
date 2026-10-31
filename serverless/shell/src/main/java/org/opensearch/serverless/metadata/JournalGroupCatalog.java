@@ -318,20 +318,32 @@ public final class JournalGroupCatalog {
             if (current.revision() == completed.revision() && current.voters().equals(completed.voters()) == false) {
                 throw new IOException("completed replacement receipt conflicts with the current voters");
             }
-            return receipt;
+            return finishReplacement(journal, receipt);
         }
         if (current.equals(intent) == false) {
             throw new IOException("replacement receipt cannot advance a different pending head");
         }
         if (container.compareAndSwapRegister(key, register.generation(), new BytesArray(completed.encode())).applied()) {
-            return receipt;
+            return finishReplacement(journal, receipt);
         }
         final var observed = readMembership(genesis);
         if (observed.revision() >= completed.revision()
             && (observed.revision() > completed.revision() || observed.voters().equals(completed.voters()))) {
-            return receipt;
+            return finishReplacement(journal, receipt);
         }
         throw new IOException("replacement completion conflicted; reconcile the durable head before retrying");
+    }
+
+    private static JournalReplacementReceipt finishReplacement(RatisJournal journal, JournalReplacementReceipt receipt) throws IOException {
+        final var intent = receipt.intent();
+        final var removed = intent.voters()
+            .peers()
+            .stream()
+            .filter(peer -> intent.pending().target().peers().stream().noneMatch(current -> current.id().equals(peer.id())))
+            .findFirst()
+            .orElseThrow();
+        journal.releaseUnusedPeer(removed.id());
+        return receipt;
     }
 
     private static String completionName(UUID group, UUID operation) {

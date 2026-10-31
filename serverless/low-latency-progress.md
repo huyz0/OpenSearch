@@ -12,7 +12,7 @@ asynchronous S3 archival are not enabled by these foundation commits.
 | M0 | Node timing histograms, WAL group counters, explicit open-loop benchmark, initial real-process filesystem baseline | Additional pipeline stages during extraction; actual S3 and sustained-load qualification |
 | M1 | Append and streaming recovery interfaces, optional async dispatch with cancellation/rejection semantics, existing S3 path integration, bounded versioned log/checkpoint identity codecs | Subscription/token formats and shell adapters for consensus |
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
-| M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, explicit authorized learner/replacement APIs | Native replacement qualification in progress; node lifecycle, remaining partition histories and outbound resource retirement |
+| M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, explicit authorized learner/replacement APIs | Native replacement qualification in progress; node lifecycle, remaining partition histories and sustained resource qualification |
 | M4–M9 | Not implemented | Quorum writes, fresh readers, selective replication, archival, lifecycle, migration |
 | M10–M12 | Not implemented | Scale/cost/failure qualification, controlled rollout, optional attribute/QUIC extensions |
 
@@ -195,6 +195,14 @@ asynchronous S3 archival are not enabled by these foundation commits.
   now establishes TLS before holding the consensus monitor, excluding cold setup
   from its overload window. Node lifecycle, failed-learner recovery and outbound
   connection retirement remain separate work; shell quorum writes remain disabled.
+
+- Retired transport lifetime: a real peer RPC reproduced an established channel
+  surviving native removal. Completion publication/retry now resets unused local
+  SDK clients through its supported API. All current/previous voters and listeners
+  across colocated groups protect still-needed connections. Three iterations passed
+  the two-group retention/closure/append/replay history and the complete catalog
+  integration history (six cases). Lightweight descriptors remain bounded by the
+  current history ceiling and need reclamation before unbounded archival history.
 
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

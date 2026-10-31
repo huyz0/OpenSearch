@@ -437,6 +437,107 @@ public class RatisJournalTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRetiredTransportRemainsUntilEveryColocatedGroupStopsUsingIt() throws Exception {
+        final var fixture = fixture(2);
+        final var journals = new ArrayList<RatisJournal>();
+        try {
+            startAll(fixture, journals, true);
+            final var groups = fixture.configurations().getFirst().groups();
+            final var retained = leader(journals, groups.getFirst().id());
+            final var removedJournal = journals.stream().filter(journal -> journal != retained).findFirst().orElseThrow();
+            final var removed = fixture.configurations().get(journals.indexOf(removedJournal)).localPeer();
+            final Path directory = createTempDir();
+            final JournalConfiguration.Peer joining;
+            try (var port = new ServerSocket(0, 0, InetAddress.getByName("127.0.0.1"))) {
+                joining = new JournalConfiguration.Peer(
+                    JournalDiskIdentity.discover(directory),
+                    "127.0.0.1",
+                    port.getLocalPort(),
+                    removed.availabilityZone()
+                );
+            }
+            final var intents = new java.util.HashMap<UUID, JournalMembershipRecord>();
+            for (var group : groups) {
+                final var target = new ArrayList<>(group.peers());
+                target.remove(removed);
+                target.add(joining);
+                final var genesis = new JournalGroupRecord(
+                    fixture.deployment(),
+                    group,
+                    leader(journals, group.id()).groupActivation(group.id()).checkpoint()
+                );
+                intents.put(
+                    group.id(),
+                    JournalMembershipRecord.initial(genesis).begin(0, UUID.randomUUID(), new JournalConfiguration.Group(group.id(), target))
+                );
+            }
+            journals.add(
+                RatisJournal.openAssigned(
+                    new JournalConfiguration(
+                        fixture.deployment(),
+                        joining.id(),
+                        directory,
+                        groups,
+                        true,
+                        fixture.configurations().getFirst().limits(),
+                        joining
+                    ),
+                    fixture.key(),
+                    fixture.trust(),
+                    fixture.space()::get,
+                    intents,
+                    intents
+                )
+            );
+            final var channel = peerChannel(retained, groups.getFirst().id(), removed.id());
+            assertFalse(channel.isShutdown());
+            for (int position = 0; position < groups.size(); position++) {
+                final var group = groups.get(position);
+                final var intent = intents.get(group.id());
+                assertBusy(() -> {
+                    try {
+                        final var current = leader(journals, group.id());
+                        current.advanceReplacement(intent).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                        assertTrue(current.replacementReceipt(intent).isPresent());
+                        assertTrue(retained.replacementReceipt(intent).isPresent());
+                    } catch (Exception waiting) {
+                        throw new AssertionError("waiting for the colocated replacement", waiting);
+                    }
+                }, 40, TimeUnit.SECONDS);
+                if (position == 0) {
+                    assertFalse("the other group still requires this peer", retained.releaseUnusedPeer(removed.id()));
+                    assertFalse(channel.isShutdown());
+                } else {
+                    assertTrue(retained.releaseUnusedPeer(removed.id()));
+                    assertTrue(channel.isShutdown());
+                    assertTrue("releasing an already unused peer is idempotent", retained.releaseUnusedPeer(removed.id()));
+                }
+            }
+            for (var group : groups) {
+                final var stream = new ShardLogId(fixture.deployment(), "after-transport-retirement", 0, UUID.randomUUID());
+                leader(journals, group.id()).append(group.id(), operation(stream, 1)).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                assertBusy(
+                    () -> assertEquals(1, retained.scan(group.id(), -1, Set.of(stream), 100, 65536).operations().size()),
+                    20,
+                    TimeUnit.SECONDS
+                );
+            }
+        } finally {
+            closeAll(journals);
+        }
+    }
+
+    @SuppressForbidden(reason = "Inspect an existing pinned SDK channel used by real replication")
+    private static org.apache.ratis.thirdparty.io.grpc.ManagedChannel peerChannel(RatisJournal journal, UUID group, UUID peer)
+        throws Exception {
+        final var division = (org.apache.ratis.server.RaftServer.Division) nativeDivisionForStall(journal, group);
+        final Object client = ((org.apache.ratis.server.RaftServerRpcWithProxy<?, ?>) division.getRaftServer().getServerRpc()).getProxies()
+            .getProxy(org.apache.ratis.protocol.RaftPeerId.valueOf(peer.toString()));
+        final var channel = client.getClass().getDeclaredField("channel");
+        channel.setAccessible(true);
+        return (org.apache.ratis.thirdparty.io.grpc.ManagedChannel) channel.get(client);
+    }
+
     public void testPeerRpcExecutionRemainsBoundedWhenTheConsensusMonitorStalls() throws Exception {
         final var fixture = fixture(1);
         final var journals = new ArrayList<RatisJournal>();

@@ -356,5 +356,22 @@ pending head refuse recovery; they are never silently recreated. This adds one
 conditional metadata creation per lifecycle transition and no per-document S3 I/O.
 
 Pending intent is not canceled or overwritten. Failed-learner recovery, automatic
-provisioning, node lifecycle integration and outbound transport resource retirement
-still need qualification. These APIs do not enable quorum-mode shell writes.
+provisioning and node lifecycle integration still need qualification. These APIs do not enable quorum-mode shell writes.
+
+## Retired peer transport resources
+
+After completion publication, including an idempotent retry, the catalog asks the
+local journal to release the removed peer's cached transport client. The public
+`releaseUnusedPeer` hook also supports other local controllers. It first checks
+all active assignments' current and previous voters and listeners; a peer still
+used by any colocated group keeps its connection. Run cleanup on the bounded
+controller executor, outside SDK callbacks. Closing a transport client does not
+change membership or durable history, and a concurrent use can reconnect.
+
+A real peer RPC reproduced the old channel remaining open after replacement.
+The regression now verifies closure, while a two-group test keeps it open until
+both groups replace that peer and confirms subsequent append/replay. The supported
+SDK reset closes its heavy channels/stub pool but preserves a lightweight peer
+descriptor. Current unpurged history limits bound that descriptor population;
+archive/reclamation work must also address descriptor count before permitting
+unbounded membership history. This is resource cleanup, not log reclamation.

@@ -613,6 +613,33 @@ public final class RatisJournal implements Closeable {
         }
     }
 
+    /**
+     * Releases a cached transport client only when no local assignment still uses the peer. Current
+     * and transitional voters/listeners in every group protect colocated traffic. Call only on a
+     * bounded controller executor: SDK channel close must not run under consensus callbacks. This
+     * changes transport resources, not membership, durable history, or read authority.
+     * @param peer controller-observed retired peer identity
+     * @return whether reset was requested; false if still used or this journal is closed
+     * @throws IOException if a live assignment cannot be inspected safely
+     */
+    public boolean releaseUnusedPeer(UUID peer) throws IOException {
+        final var id = peerId(Objects.requireNonNull(peer));
+        if (closed) {
+            return false;
+        }
+        for (UUID group : groups.keySet()) {
+            final var nativeConf = division(group).getRaftConf();
+            if (nativeConf.getAllPeers().stream().anyMatch(value -> value.getId().equals(id))
+                || nativeConf.getAllPeers(RaftPeerRole.LISTENER).stream().anyMatch(value -> value.getId().equals(id))) {
+                return false;
+            }
+        }
+        // Supported SDK reset closes its heavy channels/stub pool, retaining only a lightweight
+        // descriptor. A concurrent membership change may reconnect; no log or vote is altered.
+        server.getServerRpc().handleException(id, new IOException("peer is unused by every local journal assignment"), true);
+        return true;
+    }
+
     private UUID requireReplacementIntent(JournalMembershipRecord intent) throws IOException {
         Objects.requireNonNull(intent);
         final UUID group = intent.genesis().initialPlacement().id();

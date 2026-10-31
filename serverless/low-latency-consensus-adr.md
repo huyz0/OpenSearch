@@ -423,5 +423,18 @@ later valid configuration coordinates remain acceptable proof of the same change
 Retries after later replacements use the permanent original receipt. Missing heads
 or missing historical receipts cannot reset or reconstruct controller history.
 
-Failed-learner recovery/abort, automatic provisioning, outbound peer-resource
-retirement, full node lifecycle and three-AZ qualification remain outstanding.
+Failed-learner recovery/abort, automatic provisioning, sustained replacement
+resource qualification, full node lifecycle and three-AZ qualification remain outstanding.
+
+## Retired peer connection lifetime
+
+A real mTLS peer RPC confirmed that a removed peer's established channel remained
+open after native replacement. Completion publication and retries now use the
+supported SDK reset to close the local unused transport client. Cleanup inspects
+all local groups' current/previous voters/listeners before acting, so another
+colocated group retains its connection. It runs on the controller executor, never
+a consensus callback. A two-group history verifies retention until both changes
+finish, closure afterwards and successful subsequent append/replay. No additional
+vendor patch or object-store request is required. Lightweight SDK descriptors
+remain subject to the current retained-history limit; archive integration must
+bound/reclaim them before allowing unbounded history.
