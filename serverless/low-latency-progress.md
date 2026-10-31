@@ -171,5 +171,14 @@ asynchronous S3 archival are not enabled by these foundation commits.
   with log module check and root precommit. The current absolute-index ceiling
   must become a retained-prefix count before snapshot/purge is enabled.
 
+- Inbound peer RPC limits: a real mTLS burst reproduced 64 blocked handlers while
+  holding the consensus monitor, despite the SDK's async-request pool setting.
+  A supported server customizer now installs four dedicated node workers and a
+  finite protocol queue, independent of submission/notification workers. The
+  regression overloads that queue, verifies the thread bound and restores quorum
+  append/replay after releasing the monitor. Three iterations passed 159 unit,
+  63 journal and three catalog integration cases, with log module check and root
+  precommit. Outbound callback and sustained-load qualification remain pending.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

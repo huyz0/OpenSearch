@@ -8,18 +8,15 @@
 
 package org.opensearch.serverless.log;
 
-import org.apache.ratis.util.Daemon;
 import org.apache.ratis.util.function.CheckedSupplier;
 
 import java.io.IOException;
 import java.util.Objects;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Detaches SDK submission and completion from consensus locks. Native "async" submission can join
@@ -36,22 +33,7 @@ final class JournalDispatch implements AutoCloseable {
     private boolean closed;
 
     JournalDispatch(String name, JournalConfiguration.Limits limits) {
-        final var sequence = new AtomicLong();
-        final var group = Thread.currentThread().getThreadGroup();
-        executor = new ThreadPoolExecutor(
-            4,
-            4,
-            30,
-            TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(limits.maximumPendingRequests()),
-            runnable -> Daemon.newBuilder()
-                .setName(name + "-journal-dispatch-" + sequence.getAndIncrement())
-                .setThreadGroup(group)
-                .setRunnable(runnable)
-                .build(),
-            new ThreadPoolExecutor.AbortPolicy()
-        );
-        executor.allowCoreThreadTimeOut(true);
+        executor = JournalExecutors.bounded(name + "-journal-dispatch", 4, limits.maximumPendingRequests());
     }
 
     <T> CompletionStage<T> submit(JournalAdmission.Permit permit, CheckedSupplier<CompletableFuture<T>, Exception> source)

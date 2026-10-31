@@ -437,6 +437,125 @@ public class RatisJournalTests extends OpenSearchTestCase {
         }
     }
 
+    public void testPeerRpcExecutionRemainsBoundedWhenTheConsensusMonitorStalls() throws Exception {
+        final var fixture = fixture(1);
+        final var journals = new ArrayList<RatisJournal>();
+        final var entered = new java.util.concurrent.CountDownLatch(1);
+        final var release = new java.util.concurrent.CountDownLatch(1);
+        Thread holder = null;
+        try {
+            startAll(fixture, journals, true);
+            final var placement = fixture.configurations().getFirst().groups().getFirst();
+            final var target = leader(journals, placement.id());
+            final int targetIndex = journals.indexOf(target);
+            final var local = fixture.configurations().get(targetIndex).localVoterId();
+            final var address = placement.peers().stream().filter(peer -> peer.id().equals(local)).findFirst().orElseThrow();
+            final var candidate = placement.peers().stream().filter(peer -> peer.id().equals(local) == false).findFirst().orElseThrow();
+            final Object monitor = nativeDivisionForStall(target, placement.id());
+            holder = org.opensearch.common.util.concurrent.OpenSearchExecutors.daemonThreadFactory("stalled-raft-monitor").newThread(() -> {
+                synchronized (monitor) {
+                    entered.countDown();
+                    try {
+                        if (release.await(20, TimeUnit.SECONDS) == false) {
+                            throw new AssertionError("test did not release the consensus monitor");
+                        }
+                    } catch (InterruptedException failure) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(failure);
+                    }
+                }
+            });
+            holder.start();
+            assertTrue(entered.await(10, TimeUnit.SECONDS));
+            final var tls = GrpcSslContexts.forClient().keyManager(fixture.key()).trustManager(fixture.trust()).build();
+            final var channel = NettyChannelBuilder.forAddress(address.host(), address.port()).sslContext(tls).build();
+            try {
+                final var stub = org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc.newFutureStub(channel)
+                    .withDeadlineAfter(3, TimeUnit.SECONDS);
+                final var requests = new ArrayList<org.apache.ratis.thirdparty.com.google.common.util.concurrent.ListenableFuture<?>>();
+                for (int i = 0; i < 256; i++) {
+                    final var rpc = org.apache.ratis.proto.RaftProtos.RaftRpcRequestProto.newBuilder()
+                        .setRequestorId(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(candidate.id().toString()))
+                        .setReplyId(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(local.toString()))
+                        .setRaftGroupId(
+                            org.apache.ratis.util.ProtoUtils.toRaftGroupIdProtoBuilder(
+                                org.apache.ratis.protocol.RaftGroupId.valueOf(placement.id())
+                            )
+                        )
+                        .setCallId(i)
+                        .build();
+                    requests.add(
+                        stub.requestVote(
+                            org.apache.ratis.proto.RaftProtos.RequestVoteRequestProto.newBuilder()
+                                .setServerRequest(rpc)
+                                .setCandidateTerm(0)
+                                .setCandidateLastEntry(org.apache.ratis.proto.RaftProtos.TermIndexProto.newBuilder().setTerm(0).setIndex(0))
+                                .setPreVote(true)
+                                .build()
+                        )
+                    );
+                }
+                int rejected = 0;
+                for (var request : requests) {
+                    final var failure = expectThrows(ExecutionException.class, () -> request.get(6, TimeUnit.SECONDS));
+                    final var status = Status.fromThrowable(failure.getCause());
+                    if (status.getCode() == Status.Code.INTERNAL) {
+                        // The pinned gRPC transport reports executor rejection as an RPC failure.
+                        // It must back off rather than create another blocked handler thread.
+                        rejected++;
+                    } else {
+                        assertEquals(status.toString(), Status.Code.DEADLINE_EXCEEDED, status.getCode());
+                    }
+                }
+                assertTrue("the burst must exercise the bounded queue's overload path", rejected > 0);
+                final int identity = System.identityHashCode(monitor);
+                final long blocked = java.util.Arrays.stream(
+                    java.lang.management.ManagementFactory.getThreadMXBean().dumpAllThreads(false, false)
+                )
+                    .filter(
+                        info -> info.getThreadState() == Thread.State.BLOCKED
+                            && info.getLockInfo() != null
+                            && info.getLockInfo().getIdentityHashCode() == identity
+                    )
+                    .filter(
+                        info -> java.util.Arrays.stream(info.getStackTrace())
+                            .anyMatch(
+                                frame -> frame.getClassName().equals("org.apache.ratis.grpc.server.GrpcServerProtocolService")
+                                    && frame.getMethodName().equals("requestVote")
+                            )
+                    )
+                    .count();
+                assertTrue("the fixture must reach the blocked peer RPC handler", blocked > 0);
+                assertTrue("peer RPC threads exceeded the node execution bound: " + blocked, blocked <= 4);
+            } finally {
+                release.countDown();
+                assertTrue(channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
+            }
+            final var stream = new ShardLogId(fixture.deployment(), "after-peer-overload", 0, UUID.randomUUID());
+            leader(journals, placement.id()).append(placement.id(), operation(stream, 1)).toCompletableFuture().get(10, TimeUnit.SECONDS);
+            assertBusy(
+                () -> assertEquals(1, target.scan(placement.id(), -1, Set.of(stream), 100, 65536).operations().size()),
+                20,
+                TimeUnit.SECONDS
+            );
+        } finally {
+            release.countDown();
+            if (holder != null) {
+                holder.join(TimeUnit.SECONDS.toMillis(10));
+                assertFalse(holder.isAlive());
+            }
+            closeAll(journals);
+        }
+    }
+
+    @SuppressForbidden(reason = "Model an unavailable pinned-SDK consensus monitor without a production fault-injection API")
+    private static Object nativeDivisionForStall(RatisJournal journal, UUID group) throws Exception {
+        final var field = RatisJournal.class.getDeclaredField("server");
+        field.setAccessible(true);
+        final var server = (org.apache.ratis.server.RaftServer) field.get(journal);
+        return server.getDivision(org.apache.ratis.protocol.RaftGroupId.valueOf(group));
+    }
+
     private record Fixture(UUID deployment, List<JournalConfiguration> configurations, X509KeyManager key, X509TrustManager trust,
         AtomicLong space) {
     }

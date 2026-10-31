@@ -72,6 +72,22 @@ completion after SDK close. Once notifications drain, its workers terminate.
 The extra worker threads and queue hops require workload qualification; they add
 no object-store request and do not change the quorum persistence rule.
 
+Peer RPC handlers use a separate pool of four node workers, with a queue bounded
+by `max(128, maximumPendingRequests)`. Protocol progress needs queue capacity even
+when local proposal admission permits only one request. The SDK's async-request
+pool setting covers its client-write service; it does not bound peer handlers.
+The supported server customizer installs the actual peer executor. Native close
+precedes executor shutdown; interrupted close preserves it until cleanup is retried.
+The volume lease still lasts until JVM exit.
+
+A real mTLS test reproduced 64 blocked peer-handler threads on the prior default
+executor. Its regression overloads the queue under a held consensus monitor,
+verifies at most four blocked handlers, then releases the monitor and confirms
+quorum writes and replay resume. The pinned gRPC transport reports queue rejection
+as an RPC `INTERNAL` failure, which follows normal peer retry/backoff. This bounds
+inbound handler execution; full throughput, CPU and outbound callback behavior
+still require workload and membership qualification.
+
 ## Storage identity and startup
 
 The host must first provision and durably mount a dedicated journal directory.

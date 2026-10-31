@@ -62,6 +62,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -147,6 +148,7 @@ public final class RatisJournal implements Closeable {
     private final DiskSpaceProbe diskSpace;
     private final JournalAdmission admission;
     private final JournalDispatch dispatch;
+    private final ThreadPoolExecutor peerRpcExecutor;
     private final Map<UUID, JournalConfiguration.Group> groups;
     private final ClientId clientId = ClientId.randomId();
     private final AtomicLong callIds = new AtomicLong();
@@ -173,43 +175,57 @@ public final class RatisJournal implements Closeable {
             .collect(Collectors.toUnmodifiableMap(JournalConfiguration.Group::id, group -> group));
         requireDiskSpace();
         dispatch = new JournalDispatch(configuration.localVoterId().toString(), configuration.limits());
+        peerRpcExecutor = JournalExecutors.bounded(
+            configuration.localVoterId() + "-journal-peer-rpc",
+            4,
+            Math.max(128, configuration.limits().maximumPendingRequests())
+        );
         final var parameters = new Parameters();
         GrpcConfigKeys.TLS.setConf(parameters, new GrpcTlsConfig(keyManager, trustManager, true));
-        GrpcConfigKeys.Server.setServicesCustomizer(parameters, (builder, types) -> builder.intercept(new ServerInterceptor() {
-            @Override
-            public <RequestT, ReplyT> ServerCall.Listener<RequestT> interceptCall(
-                ServerCall<RequestT, ReplyT> call,
-                Metadata headers,
-                ServerCallHandler<RequestT, ReplyT> next
-            ) {
-                if (RaftServerProtocolServiceGrpc.SERVICE_NAME.equals(call.getMethodDescriptor().getServiceName())) {
-                    return next.startCall(call, headers);
+        GrpcConfigKeys.Server.setServicesCustomizer(
+            parameters,
+            (builder, types) -> builder.executor(peerRpcExecutor).intercept(new ServerInterceptor() {
+                @Override
+                public <RequestT, ReplyT> ServerCall.Listener<RequestT> interceptCall(
+                    ServerCall<RequestT, ReplyT> call,
+                    Metadata headers,
+                    ServerCallHandler<RequestT, ReplyT> next
+                ) {
+                    if (RaftServerProtocolServiceGrpc.SERVICE_NAME.equals(call.getMethodDescriptor().getServiceName())) {
+                        return next.startCall(call, headers);
+                    }
+                    call.close(
+                        Status.PERMISSION_DENIED.withDescription("journal network endpoint accepts peer consensus RPCs only"),
+                        new Metadata()
+                    );
+                    return new ServerCall.Listener<>() {
+                    };
                 }
-                call.close(
-                    Status.PERMISSION_DENIED.withDescription("journal network endpoint accepts peer consensus RPCs only"),
-                    new Metadata()
-                );
-                return new ServerCall.Listener<>() {
-                };
-            }
-        }));
-        storage.retainUntilProcessExit();
-        server = RaftServer.newBuilder()
-            .setServerId(peerId(configuration.localVoterId()))
-            .setProperties(properties())
-            .setParameters(parameters)
-            .setStateMachineRegistry(group -> {
-                if (groups.containsKey(group.getUuid()) == false) {
-                    throw new IllegalArgumentException("unassigned physical group");
-                }
-                final var machine = new JournalStateMachine(group.getUuid());
-                if (stateMachines.putIfAbsent(group.getUuid(), machine) != null) {
-                    throw new IllegalStateException("physical group state machine already exists");
-                }
-                return machine;
             })
-            .setOption(RaftStorage.StartupOption.RECOVER)
-            .build();
+        );
+        storage.retainUntilProcessExit();
+        try {
+            server = RaftServer.newBuilder()
+                .setServerId(peerId(configuration.localVoterId()))
+                .setProperties(properties())
+                .setParameters(parameters)
+                .setStateMachineRegistry(group -> {
+                    if (groups.containsKey(group.getUuid()) == false) {
+                        throw new IllegalArgumentException("unassigned physical group");
+                    }
+                    final var machine = new JournalStateMachine(group.getUuid());
+                    if (stateMachines.putIfAbsent(group.getUuid(), machine) != null) {
+                        throw new IllegalStateException("physical group state machine already exists");
+                    }
+                    return machine;
+                })
+                .setOption(RaftStorage.StartupOption.RECOVER)
+                .build();
+        } catch (IOException | RuntimeException | Error failure) {
+            dispatch.close();
+            peerRpcExecutor.shutdown();
+            throw failure;
+        }
         try {
             server.start();
             if (configuration.bootstrap()) {
@@ -233,6 +249,9 @@ public final class RatisJournal implements Closeable {
                 server.close();
             } catch (IOException closeFailure) {
                 failure.addSuppressed(closeFailure);
+            } finally {
+                dispatch.close();
+                peerRpcExecutor.shutdown();
             }
             if (failure instanceof RuntimeException) {
                 throw new IOException("journal startup failed", failure);
@@ -846,7 +865,11 @@ public final class RatisJournal implements Closeable {
         if (Thread.currentThread().isInterrupted()) {
             throw new IOException("interrupted journal shutdown; retry cleanup from a non-interrupted thread");
         }
-        server.close();
+        try {
+            server.close();
+        } finally {
+            peerRpcExecutor.shutdown();
+        }
         // SDK shutdown may return while an uninterruptible I/O task is still running. Only OS
         // process teardown proves those tasks cannot touch this volume again.
 

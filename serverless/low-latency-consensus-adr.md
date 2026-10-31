@@ -377,3 +377,24 @@ boundary with a valid larger suffix, then successfully restores the original
 capacity with acknowledged data intact. No bytes are deleted or rewritten.
 This assumes unpurged history starting at zero; snapshot/purge integration must
 switch to a retained-prefix count before reclamation is enabled.
+
+## Inbound peer RPC execution
+
+A real mTLS request-vote burst under a held consensus monitor created 64 blocked
+RPC handler threads. The native async-request pool setting only configures its
+client-write service, which this runtime denies; peer callbacks still used gRPC's
+unbounded cached executor.
+
+The supported server customizer now installs a separate four-worker node pool and
+a bounded queue of `max(128, maximumPendingRequests)`. The protocol reserve keeps
+one-slot proposal admission usable. Dispatch and peer execution remain separate,
+so blocked peer handlers cannot consume the SDK submission/notification workers.
+Shutdown closes native services before the peer executor, and preserves it across
+interrupted cleanup. No consensus-library or third-party artifact patch is needed.
+
+The overload regression verifies four blocked handlers, queue rejection rather
+than new threads, and successful quorum append/replay after releasing the monitor.
+The pinned transport reports executor rejection as INTERNAL, a failed peer RPC
+that follows normal retry/backoff. This qualification covers inbound execution;
+outbound callback behavior and full memory/throughput sizing remain workload and
+membership qualification gates.
