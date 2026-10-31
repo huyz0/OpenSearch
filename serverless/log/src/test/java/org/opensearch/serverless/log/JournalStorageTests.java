@@ -14,9 +14,11 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 @SuppressFileSystems("*")
@@ -107,6 +109,101 @@ public class JournalStorageTests extends OpenSearchTestCase {
         );
         expectThrows(IOException.class, () -> JournalStorage.open(changed));
         try (var ignored = JournalStorage.open(recover)) {}
+    }
+
+    public void testRetirementPreservesHistoryAndOtherGroupsAndRejectsStaleAuthorization() throws Exception {
+        final var configuration = configuration();
+        try (var storage = JournalStorage.open(configuration)) {
+            for (var group : configuration.groups()) {
+                initialize(storage, group.id());
+            }
+            final UUID retiring = configuration.groups().getFirst().id();
+            expectThrows(
+                IOException.class,
+                () -> JournalStorage.open(copy(configuration, configuration.groups(), false), Set.of(retiring))
+            );
+            assertTrue(Files.exists(configuration.directory().resolve(retiring.toString())));
+            assertFalse(Files.exists(configuration.directory().resolve("retired")));
+        }
+        final UUID retired = configuration.groups().getFirst().id();
+        final UUID active = configuration.groups().get(1).id();
+        final Path source = configuration.directory().resolve(retired.toString());
+        final byte[] original = Files.readAllBytes(source.resolve("journal-floor"));
+        final var recover = copy(configuration, configuration.groups(), false);
+        try (var storage = JournalStorage.open(recover, Set.of(retired))) {
+            assertFalse(storage.isActiveGroup(retired));
+            assertTrue(storage.isActiveGroup(active));
+            expectThrows(IOException.class, () -> storage.groupDirectory(retired));
+            storage.flush(active);
+        }
+        final Path target = configuration.directory().resolve("retired").resolve(retired.toString());
+        assertFalse(Files.exists(source));
+        assertArrayEquals(original, Files.readAllBytes(target.resolve("journal-floor")));
+        expectThrows(IOException.class, () -> JournalStorage.open(recover));
+        assertFalse(Files.exists(source));
+        try (var storage = JournalStorage.open(recover, Set.of(retired))) {
+            storage.initialize(active);
+        }
+    }
+
+    public void testRetirementReconcilesAlreadyMovedHistoryBeforeStartingOtherGroups() throws Exception {
+        final var configuration = configuration();
+        try (var storage = JournalStorage.open(configuration)) {
+            for (var group : configuration.groups()) {
+                initialize(storage, group.id());
+            }
+        }
+        final UUID retired = configuration.groups().getFirst().id();
+        final Path archive = configuration.directory().resolve("retired");
+        Files.createDirectory(archive);
+        // Model a process dying after rename but before both parent directories were synchronized.
+        Files.move(
+            configuration.directory().resolve(retired.toString()),
+            archive.resolve(retired.toString()),
+            StandardCopyOption.ATOMIC_MOVE
+        );
+        try (var storage = JournalStorage.open(copy(configuration, configuration.groups(), false), Set.of(retired))) {
+            assertFalse(storage.isActiveGroup(retired));
+            storage.flush(configuration.groups().get(1).id());
+        }
+    }
+
+    public void testDuplicateOrUnknownRetiredHistoryNeverGetsOverwritten() throws Exception {
+        final var configuration = configuration();
+        try (var storage = JournalStorage.open(configuration)) {
+            for (var group : configuration.groups()) {
+                initialize(storage, group.id());
+            }
+        }
+        final UUID retired = configuration.groups().getFirst().id();
+        final var recover = copy(configuration, configuration.groups(), false);
+        expectThrows(IOException.class, () -> JournalStorage.open(recover, Set.of(UUID.randomUUID())));
+        expectThrows(IOException.class, () -> JournalStorage.open(configuration, Set.of(retired)));
+        final Path archive = configuration.directory().resolve("retired");
+        Files.createDirectories(archive.resolve(retired.toString()));
+        expectThrows(IOException.class, () -> JournalStorage.open(recover, Set.of(retired)));
+        final Path source = configuration.directory().resolve(retired.toString());
+        assertTrue(Files.exists(source.resolve("journal-initialized")));
+        Files.delete(archive.resolve(retired.toString()));
+        final Path unknown = archive.resolve(UUID.randomUUID().toString());
+        Files.createDirectory(unknown);
+        expectThrows(IOException.class, () -> JournalStorage.open(recover, Set.of(retired)));
+        assertTrue(Files.exists(source.resolve("journal-initialized")));
+    }
+
+    public void testRetiredBindingCorruptionIsRefusedBeforeMovingAnyGroup() throws Exception {
+        final var configuration = configuration();
+        try (var storage = JournalStorage.open(configuration)) {
+            for (var group : configuration.groups()) {
+                initialize(storage, group.id());
+            }
+        }
+        final UUID retired = configuration.groups().getFirst().id();
+        final Path source = configuration.directory().resolve(retired.toString());
+        Files.write(source.resolve("journal-initialized"), new byte[] { 1 });
+        expectThrows(IOException.class, () -> JournalStorage.open(copy(configuration, configuration.groups(), false), Set.of(retired)));
+        assertTrue(Files.exists(source));
+        assertFalse(Files.exists(configuration.directory().resolve("retired")));
     }
 
     private static void initialize(JournalStorage storage, UUID group) throws Exception {

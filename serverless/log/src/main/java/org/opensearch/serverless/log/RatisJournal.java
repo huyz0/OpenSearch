@@ -167,7 +167,10 @@ public final class RatisJournal implements Closeable {
         this.storage = storage;
         this.diskSpace = diskSpace;
         this.admission = new JournalAdmission(configuration.limits());
-        groups = configuration.groups().stream().collect(Collectors.toUnmodifiableMap(JournalConfiguration.Group::id, group -> group));
+        groups = configuration.groups()
+            .stream()
+            .filter(group -> storage.isActiveGroup(group.id()))
+            .collect(Collectors.toUnmodifiableMap(JournalConfiguration.Group::id, group -> group));
         requireDiskSpace();
         dispatch = new JournalDispatch(configuration.localVoterId().toString(), configuration.limits());
         final var parameters = new Parameters();
@@ -277,6 +280,64 @@ public final class RatisJournal implements Closeable {
         DiskSpaceProbe diskSpace,
         Map<UUID, LogCheckpoint> expectedActivations
     ) throws IOException {
+        return open(configuration, keyManager, trustManager, diskSpace, expectedActivations, Set.of());
+    }
+
+    /**
+     * Recovers immutable local assignments with controller-authorized completed membership heads.
+     * A retired assignment is preserved outside native group discovery before any SDK thread starts;
+     * other groups on the same volume remain active. This does not execute or certify a native
+     * membership change: the controller must publish completion only after its consensus proof.
+     * @param configuration original volume binding and recovery placement
+     * @param keyManager journal member credentials
+     * @param trustManager deployment-scoped trust
+     * @param diskSpace actual-volume disk probe
+     * @param memberships completed heads read from the durable catalog, for activated groups
+     * @return recovered journal excluding retired groups
+     * @throws IOException on bootstrap, pending/conflicting authorization or storage failure
+     */
+    public static RatisJournal recoverMembership(
+        JournalConfiguration configuration,
+        X509KeyManager keyManager,
+        X509TrustManager trustManager,
+        DiskSpaceProbe diskSpace,
+        Map<UUID, JournalMembershipRecord> memberships
+    ) throws IOException {
+        Objects.requireNonNull(configuration);
+        if (configuration.bootstrap()) {
+            throw new IOException("membership recovery cannot bootstrap a new journal volume");
+        }
+        final var retired = new java.util.HashSet<UUID>();
+        final var activations = new java.util.HashMap<UUID, LogCheckpoint>();
+        for (var entry : Map.copyOf(memberships).entrySet()) {
+            final var record = entry.getValue();
+            final var group = configuration.groups().stream().filter(candidate -> candidate.id().equals(entry.getKey())).findFirst();
+            if (group.isEmpty()
+                || record.pending() != null
+                || record.genesis().deploymentId().equals(configuration.deploymentId()) == false
+                || record.genesis().initialPlacement().id().equals(entry.getKey()) == false) {
+                throw new IOException("membership recovery requires assigned groups and completed controller intent");
+            }
+            final var expected = new JournalGroupRecord(configuration.deploymentId(), group.get(), record.genesis().activation());
+            if (record.genesis().equals(expected) == false) {
+                throw new IOException("membership recovery differs from the original volume lineage");
+            }
+            activations.put(entry.getKey(), record.genesis().activation());
+            if (record.voters().peers().stream().noneMatch(peer -> peer.id().equals(configuration.localVoterId()))) {
+                retired.add(entry.getKey());
+            }
+        }
+        return open(configuration, keyManager, trustManager, diskSpace, activations, retired);
+    }
+
+    private static RatisJournal open(
+        JournalConfiguration configuration,
+        X509KeyManager keyManager,
+        X509TrustManager trustManager,
+        DiskSpaceProbe diskSpace,
+        Map<UUID, LogCheckpoint> expectedActivations,
+        Set<UUID> retiredGroups
+    ) throws IOException {
         Objects.requireNonNull(configuration);
         Objects.requireNonNull(keyManager);
         Objects.requireNonNull(trustManager);
@@ -293,7 +354,7 @@ public final class RatisJournal implements Closeable {
                 throw new IOException("activation requirement differs from authorized group lineage", failure);
             }
         }
-        final var storage = JournalStorage.open(configuration);
+        final var storage = JournalStorage.open(configuration, retiredGroups);
         try {
             return new RatisJournal(configuration, storage, diskSpace, keyManager, trustManager, activations);
         } catch (IOException | RuntimeException | Error failure) {

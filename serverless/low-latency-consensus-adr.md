@@ -338,3 +338,25 @@ late native results never fall back to running user continuations under SDK lock
 The exact failing seed and the one-permit history passed three iterations.
 Cancellation, synchronous submission failure, slow callbacks at a full window,
 and late completion during close have deterministic dispatcher coverage.
+
+## Retirement of colocated assignments
+
+Completed controller membership can retire one assignment while the same volume
+continues hosting other groups. Under its exclusive process lease and before SDK
+startup, recovery atomically moves each retired UUID directory beneath a
+non-UUID `retired` parent, then forces both parent directories. Native discovery
+never loads that old group. Recovery also re-forces an already-completed rename;
+duplicates, foreign histories, corrupt bindings, or stale retirement authorization
+are refused. Old files remain intact and occupy disk until authorized reclamation.
+This uses filesystem operations and needs no additional native consensus patch.
+
+A child-JVM history models completed controller authorization, then verifies that
+one group stays excluded across two restarts while its colocated group continues
+serving committed data. Its retired boundary bytes remain unchanged. This test
+isolates retirement; it does not prove learner promotion or configuration commit.
+The controller must establish those proofs before publishing completed membership.
+
+Completed membership loads additionally verify every new voter's permanent
+reservation and exact placement. Validation performs at most three direct reads
+per group and never recursively walks transition history. Missing or rebound
+identities fail closed, with no repair to an earlier membership revision.

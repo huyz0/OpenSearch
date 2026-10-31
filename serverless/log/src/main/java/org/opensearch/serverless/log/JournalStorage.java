@@ -40,6 +40,7 @@ final class JournalStorage implements AutoCloseable {
     private static final String BINDING = "journal-binding";
     private static final String INITIALIZED = "journal-initialized";
     private static final String FLOOR = "journal-floor";
+    private static final String RETIRED = "retired";
     private final UUID deployment;
     private final Map<UUID, JournalDurableFloor> floors = new ConcurrentHashMap<>();
     private final JournalDiskIdentity.Lease lease;
@@ -54,6 +55,19 @@ final class JournalStorage implements AutoCloseable {
     }
 
     static JournalStorage open(JournalConfiguration configuration) throws IOException {
+        return open(configuration, Set.of());
+    }
+
+    /** The trusted controller must authorize retirement from completed membership before this call. */
+    static JournalStorage open(JournalConfiguration configuration, Set<UUID> retiredGroups) throws IOException {
+        final Set<UUID> retired = Set.copyOf(retiredGroups);
+        final var assigned = configuration.groups()
+            .stream()
+            .map(JournalConfiguration.Group::id)
+            .collect(java.util.stream.Collectors.toSet());
+        if (assigned.containsAll(retired) == false || (configuration.bootstrap() && retired.isEmpty() == false)) {
+            throw new IOException("retirement requires assigned groups on an established volume");
+        }
         final var lease = JournalDiskIdentity.acquire(configuration.directory());
         JournalStorage storage = null;
         try {
@@ -63,7 +77,9 @@ final class JournalStorage implements AutoCloseable {
             final byte[] binding = binding(configuration);
             final Set<UUID> groups = new HashSet<>();
             configuration.groups().forEach(group -> groups.add(group.id()));
-            storage = new JournalStorage(lease, binding, groups, configuration);
+            final var active = new HashSet<>(groups);
+            active.removeAll(retired);
+            storage = new JournalStorage(lease, binding, active, configuration);
             if (configuration.bootstrap()) {
                 try (var entries = Files.list(lease.directory)) {
                     if (entries.anyMatch(path -> Set.of("voter-identity", "voter-lock").contains(path.getFileName().toString()) == false)) {
@@ -73,7 +89,8 @@ final class JournalStorage implements AutoCloseable {
                 storage.publish(lease.directory.resolve(BINDING));
             } else {
                 storage.requireBinding(lease.directory.resolve(BINDING));
-                for (UUID group : groups) {
+                storage.retireGroups(retired);
+                for (UUID group : active) {
                     final Path directory = storage.groupDirectory(group);
                     requireDirectory(directory);
                     requireDirectory(directory.resolve("current"));
@@ -95,7 +112,10 @@ final class JournalStorage implements AutoCloseable {
                     floor.persist(observed);
                 }
                 final var allowed = new HashSet<>(Set.of("voter-identity", "voter-lock", BINDING));
-                groups.forEach(group -> allowed.add(group.toString()));
+                active.forEach(group -> allowed.add(group.toString()));
+                if (retired.isEmpty() == false) {
+                    allowed.add(RETIRED);
+                }
                 try (var entries = Files.list(lease.directory)) {
                     if (entries.anyMatch(path -> allowed.contains(path.getFileName().toString()) == false)) {
                         throw new IOException("journal contains unassigned or incomplete storage");
@@ -115,6 +135,63 @@ final class JournalStorage implements AutoCloseable {
             }
             throw failure;
         }
+    }
+
+    /**
+     * Move retired histories out of the SDK's UUID-directory discovery before starting any SDK
+     * thread. The process lease excludes an old voter; no active worker can retain these paths.
+     * Both pre-rename and post-rename crash states reconcile, but duplicates and unknown histories
+     * fail closed. Old bytes are preserved, and stale authorization cannot move them back.
+     */
+    private void retireGroups(Set<UUID> retired) throws IOException {
+        final Path archive = directory().resolve(RETIRED);
+        if (retired.isEmpty()) {
+            if (Files.exists(archive, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("retired journal history requires current controller authorization");
+            }
+            return;
+        }
+        if (Files.exists(archive, LinkOption.NOFOLLOW_LINKS)) {
+            requireDirectory(archive);
+            final Set<String> allowed = retired.stream().map(UUID::toString).collect(java.util.stream.Collectors.toSet());
+            try (var entries = Files.list(archive)) {
+                if (entries.anyMatch(path -> allowed.contains(path.getFileName().toString()) == false)) {
+                    throw new IOException("retired journal directory contains unassigned history");
+                }
+            }
+        }
+        // Validate every source before moving any history. The immutable binding proves which
+        // volume/deployment/genesis owns it; retired bytes need not become eligible for voting.
+        for (UUID group : retired) {
+            final Path source = directory().resolve(group.toString());
+            final Path target = archive.resolve(group.toString());
+            final boolean sourceExists = Files.exists(source, LinkOption.NOFOLLOW_LINKS);
+            final boolean targetExists = Files.exists(target, LinkOption.NOFOLLOW_LINKS);
+            if (sourceExists == targetExists) {
+                throw new IOException("retired journal history is missing or duplicated");
+            }
+            final Path existing = sourceExists ? source : target;
+            requireDirectory(existing);
+            requireBinding(existing.resolve(INITIALIZED));
+        }
+        if (Files.exists(archive, LinkOption.NOFOLLOW_LINKS) == false) {
+            Files.createDirectory(archive);
+            JournalDiskIdentity.forceDirectory(directory());
+        }
+        for (UUID group : retired) {
+            final Path source = directory().resolve(group.toString());
+            if (Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
+                Files.move(source, archive.resolve(group.toString()), StandardCopyOption.ATOMIC_MOVE);
+            }
+            // Also force an already-renamed directory after restart: CRCs do not prove that a
+            // previous process completed the rename's parent-directory synchronization.
+            JournalDiskIdentity.forceDirectory(archive);
+            JournalDiskIdentity.forceDirectory(directory());
+        }
+    }
+
+    boolean isActiveGroup(UUID group) {
+        return groups.contains(group);
     }
 
     void retainUntilProcessExit() throws IOException {

@@ -150,5 +150,16 @@ asynchronous S3 archival are not enabled by these foundation commits.
   integration and six native probe cases across three iterations, with log module
   check and root precommit. No additional SDK patch or per-write S3 call is needed.
 
+- Colocated retirement recovery: completed controller membership can exclude one
+  group while its volume's other groups recover normally. Before native startup,
+  exclusive-lease recovery atomically moves authorized retired directories out of
+  native discovery and synchronizes both parents. Old bytes remain intact; partial
+  rename, duplicates, stale authorization and corrupt bindings have coverage.
+  Completed membership also checks permanent exact-placement reservations for new
+  voters with bounded direct reads. The process history models completed controller
+  authority and does not qualify native promotion. Three iterations passed 156
+  unit, 57 journal, 39 catalog and three catalog integration cases; log module check
+  and root precommit passed. No additional native-library patch was needed.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

@@ -360,6 +360,83 @@ public class RatisJournalTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMembershipRecoveryRejectsPendingOrForeignAuthorizationBeforeStorage() throws Exception {
+        final var fixture = fixture(2);
+        final var original = fixture.configurations().getFirst();
+        final var configuration = new JournalConfiguration(
+            original.deploymentId(),
+            original.localVoterId(),
+            original.directory(),
+            original.groups(),
+            false,
+            original.limits()
+        );
+        final var group = configuration.groups().getFirst();
+        final var genesis = new JournalGroupRecord(
+            fixture.deployment(),
+            group,
+            new LogCheckpoint(JournalGroupRecord.controlIdentity(fixture.deployment(), group.id()), 2, 1)
+        );
+        final var initial = JournalMembershipRecord.initial(genesis);
+        final var target = new ArrayList<>(group.peers());
+        final var removed = target.removeLast();
+        target.add(new JournalConfiguration.Peer(UUID.randomUUID(), "replacement.invalid", 9001, removed.availabilityZone()));
+        final var pending = initial.begin(0, UUID.randomUUID(), new JournalConfiguration.Group(group.id(), target));
+        final List<Path> before;
+        try (var files = java.nio.file.Files.list(configuration.directory())) {
+            before = files.sorted().toList();
+        }
+        expectThrows(
+            IOException.class,
+            () -> RatisJournal.recoverMembership(
+                original,
+                fixture.key(),
+                fixture.trust(),
+                fixture.space()::get,
+                Map.of(group.id(), initial)
+            )
+        );
+        expectThrows(
+            IOException.class,
+            () -> RatisJournal.recoverMembership(
+                configuration,
+                fixture.key(),
+                fixture.trust(),
+                fixture.space()::get,
+                Map.of(group.id(), pending)
+            )
+        );
+        expectThrows(
+            IOException.class,
+            () -> RatisJournal.recoverMembership(
+                configuration,
+                fixture.key(),
+                fixture.trust(),
+                fixture.space()::get,
+                Map.of(configuration.groups().get(1).id(), initial)
+            )
+        );
+        final UUID foreign = UUID.randomUUID();
+        final var foreignGenesis = new JournalGroupRecord(
+            foreign,
+            group,
+            new LogCheckpoint(JournalGroupRecord.controlIdentity(foreign, group.id()), 2, 1)
+        );
+        expectThrows(
+            IOException.class,
+            () -> RatisJournal.recoverMembership(
+                configuration,
+                fixture.key(),
+                fixture.trust(),
+                fixture.space()::get,
+                Map.of(group.id(), JournalMembershipRecord.initial(foreignGenesis))
+            )
+        );
+        try (var files = java.nio.file.Files.list(configuration.directory())) {
+            assertEquals(before, files.sorted().toList());
+        }
+    }
+
     private record Fixture(UUID deployment, List<JournalConfiguration> configurations, X509KeyManager key, X509TrustManager trust,
         AtomicLong space) {
     }

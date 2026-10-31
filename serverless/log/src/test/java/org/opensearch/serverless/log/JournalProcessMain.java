@@ -67,13 +67,13 @@ public final class JournalProcessMain {
 
     /**
      * Runs one voter process from a trusted fixture's placement arguments.
-     * @param arguments volume, namespace, local UUID, bootstrap, group UUID CSV, three peer triples, and optional activation CSV
+     * @param arguments volume, namespace, local UUID, bootstrap, group UUID CSV, three peer triples, and optional activation/membership CSVs
      * @throws Exception on startup or broken control channel
      */
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length != 14 && arguments.length != 15) {
+        if (arguments.length < 14 || arguments.length > 16) {
             throw new IllegalArgumentException(
-                "expected volume, namespace, identity, bootstrap, groups, three peer triples, and optional activation CSV"
+                "expected volume, namespace, identity, bootstrap, groups, three peer triples, and optional activation/membership CSVs"
             );
         }
         final var peers = new ArrayList<JournalConfiguration.Peer>();
@@ -113,7 +113,7 @@ public final class JournalProcessMain {
         final var trustFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
         trustFactory.init(trust);
         final var requiredActivations = new HashMap<UUID, LogCheckpoint>();
-        if (arguments.length == 15 && arguments[14].isEmpty() == false) {
+        if (arguments.length >= 15 && arguments[14].isEmpty() == false) {
             for (String value : arguments[14].split(",")) {
                 final String[] fields = value.split(":");
                 if (fields.length != 3 || requiredActivations.size() >= 4) {
@@ -130,40 +130,63 @@ public final class JournalProcessMain {
                 );
             }
         }
+        final var memberships = new HashMap<UUID, JournalMembershipRecord>();
+        if (arguments.length == 16 && arguments[15].isEmpty() == false) {
+            for (String encoded : arguments[15].split(",")) {
+                if (memberships.size() >= 4 || encoded.length() > 2 * JournalMembershipRecord.MAX_BYTES) {
+                    throw new IOException("invalid fixture membership requirements");
+                }
+                final var record = JournalMembershipRecord.read(
+                    new java.io.ByteArrayInputStream(java.util.Base64.getDecoder().decode(encoded))
+                );
+                if (memberships.putIfAbsent(record.voters().id(), record) != null) {
+                    throw new IOException("duplicate fixture membership requirements");
+                }
+            }
+        }
         final var failStorage = new AtomicBoolean();
         final var storageFailed = new AtomicBoolean();
         final var stall = new AtomicBoolean();
         final var entered = new AtomicBoolean();
         final var release = new CountDownLatch(1);
+        final RatisJournal.DiskSpaceProbe probe = () -> {
+            if (failStorage.get() && Thread.currentThread().getName().endsWith("-SegmentedRaftLogWorker")) {
+                storageFailed.set(true);
+                throw new IOException("injected journal volume failure before log force");
+            }
+            if (stall.get() && Thread.currentThread().getName().endsWith("-SegmentedRaftLogWorker")) {
+                entered.set(true);
+                boolean interrupted = false;
+                while (true) {
+                    try {
+                        release.await();
+                        break;
+                    } catch (InterruptedException expected) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return Long.MAX_VALUE;
+        };
         try (
-            var journal = RatisJournal.open(
-                configuration,
-                (X509KeyManager) keyFactory.getKeyManagers()[0],
-                (X509TrustManager) trustFactory.getTrustManagers()[0],
-                () -> {
-                    if (failStorage.get() && Thread.currentThread().getName().endsWith("-SegmentedRaftLogWorker")) {
-                        storageFailed.set(true);
-                        throw new IOException("injected journal volume failure before log force");
-                    }
-                    if (stall.get() && Thread.currentThread().getName().endsWith("-SegmentedRaftLogWorker")) {
-                        entered.set(true);
-                        boolean interrupted = false;
-                        while (true) {
-                            try {
-                                release.await();
-                                break;
-                            } catch (InterruptedException expected) {
-                                interrupted = true;
-                            }
-                        }
-                        if (interrupted) {
-                            Thread.currentThread().interrupt();
-                        }
-                    }
-                    return Long.MAX_VALUE;
-                },
-                requiredActivations
-            );
+            var journal = memberships.isEmpty()
+                ? RatisJournal.open(
+                    configuration,
+                    (X509KeyManager) keyFactory.getKeyManagers()[0],
+                    (X509TrustManager) trustFactory.getTrustManagers()[0],
+                    probe,
+                    requiredActivations
+                )
+                : RatisJournal.recoverMembership(
+                    configuration,
+                    (X509KeyManager) keyFactory.getKeyManagers()[0],
+                    (X509TrustManager) trustFactory.getTrustManagers()[0],
+                    probe,
+                    memberships
+                );
             var input = new DataInputStream(new BufferedInputStream(System.in));
             var output = new DataOutputStream(protocolOutput())
         ) {

@@ -53,6 +53,16 @@ public record JournalMembershipRecord(JournalGroupRecord genesis, long revision,
         if (revision == 0 && voters.equals(genesis.initialPlacement()) == false) {
             throw new IllegalArgumentException("revision zero must retain the genesis placement");
         }
+        for (var peer : voters.peers()) {
+            final var original = genesis.initialPlacement()
+                .peers()
+                .stream()
+                .filter(candidate -> candidate.id().equals(peer.id()))
+                .findFirst();
+            if (original.isPresent() && original.get().equals(peer) == false) {
+                throw new IllegalArgumentException("completed membership cannot rebind a genesis voter identity");
+            }
+        }
         if (pending != null) {
             if (revision == Long.MAX_VALUE || pending.target().id().equals(voters.id()) == false) {
                 throw new IllegalArgumentException("replacement differs from group identity or exhausts revisions");

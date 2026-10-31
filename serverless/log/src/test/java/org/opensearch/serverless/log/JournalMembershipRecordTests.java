@@ -57,6 +57,10 @@ public class JournalMembershipRecordTests extends OpenSearchTestCase {
             IllegalArgumentException.class,
             () -> initial.begin(0, UUID.randomUUID(), new JournalConfiguration.Group(target.id(), peers))
         );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new JournalMembershipRecord(initial.genesis(), 1, new JournalConfiguration.Group(target.id(), peers), null)
+        );
         peers.set(0, new JournalConfiguration.Peer(UUID.randomUUID(), retained.host(), retained.port(), retained.availabilityZone()));
         expectThrows(
             IllegalArgumentException.class,

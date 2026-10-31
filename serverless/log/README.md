@@ -204,6 +204,37 @@ configuration CAS, restart reconciliation and retirement fencing still need
 integration. Static startup refuses a pending replacement before opening its
 volume. Persisting intent alone never promotes a voter or authorizes bootstrap.
 
+Completed membership also checks the permanent reservations for its non-genesis
+voters, including their original revision and exact address/AZ placement. Missing
+or rebound identities refuse recovery. These are at most three direct register
+reads per physical group on lifecycle paths; validation never recursively walks
+transition history. Genesis addresses cannot be rebound in the membership codec.
+
+## Retired colocated assignments
+
+`recoverMembership` accepts completed controller heads for the volume's original
+assignments, with the original activation guards. Pending intent, foreign lineage
+and bootstrap are refused. A retired group is excluded independently of other
+groups on the same volume; retirement does not change that immutable binding.
+The catalog recovery entry point supplies the heads read from durable registers.
+It still has no native replacement-completion publication API.
+
+Under the exclusive volume lease, before any native thread starts, retirement
+atomically moves each authorized group's directory into `retired/<group-uuid>`.
+Both parent directories are synchronized, including after recovery finds an
+already-completed rename. Native group discovery ignores this non-UUID parent,
+so it never loads the retired history or starts its voter. Original files are
+preserved for diagnosis and later authorized reclamation; they still consume disk
+space. No rename is attempted while another process holds the volume.
+
+An interrupted rename can resume from either location. Duplicates, unknown retired
+histories, corrupt ownership bindings and missing paths refuse startup. Stale
+configuration cannot move history back into service. This uses normal filesystem
+recovery and requires no additional consensus-library patch. It does not certify
+that the supplied controller completion was backed by a native membership change;
+the pending learner/promotion controller must establish that proof before
+publishing a completed head.
+
 ## Authentication and replay
 
 Peer consensus RPCs require mutual TLS. Network client-write and admin services

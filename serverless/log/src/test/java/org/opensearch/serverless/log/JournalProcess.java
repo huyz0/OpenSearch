@@ -62,6 +62,15 @@ final class JournalProcess implements AutoCloseable {
 
     static JournalProcess start(JournalConfiguration configuration, Path log, Map<UUID, LogCheckpoint> requiredActivations)
         throws IOException {
+        return start(configuration, log, requiredActivations, Map.of());
+    }
+
+    static JournalProcess start(
+        JournalConfiguration configuration,
+        Path log,
+        Map<UUID, LogCheckpoint> requiredActivations,
+        Map<UUID, JournalMembershipRecord> memberships
+    ) throws IOException {
         final List<String> arguments = new ArrayList<>();
         arguments.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
         arguments.add("-Xms64m");
@@ -87,6 +96,11 @@ final class JournalProcess implements AutoCloseable {
                 .map(entry -> entry.getKey() + ":" + entry.getValue().index() + ":" + entry.getValue().entryTerm())
                 .collect(Collectors.joining(","))
         );
+        final var encodedMemberships = new ArrayList<String>();
+        for (var record : memberships.values()) {
+            encodedMemberships.add(java.util.Base64.getEncoder().encodeToString(record.encode()));
+        }
+        arguments.add(String.join(",", encodedMemberships));
         final var fixture = new JournalProcess(startProcess(arguments, log), log);
         try {
             fixture.execute(() -> {

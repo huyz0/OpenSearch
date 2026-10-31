@@ -15,7 +15,6 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.serverless.log.JournalConfiguration;
 import org.opensearch.serverless.log.JournalGroupRecord;
 import org.opensearch.serverless.log.JournalMembershipRecord;
-import org.opensearch.serverless.log.LogCheckpoint;
 import org.opensearch.serverless.log.RatisJournal;
 
 import javax.net.ssl.X509KeyManager;
@@ -107,7 +106,7 @@ public final class JournalGroupCatalog {
         if (configuration.deploymentId().equals(deploymentId) == false) {
             throw new IOException("journal configuration differs from catalog deployment");
         }
-        final Map<UUID, LogCheckpoint> requiredActivations = new HashMap<>();
+        final Map<UUID, JournalMembershipRecord> memberships = new HashMap<>();
         for (var group : configuration.groups()) {
             final var current = readRequired(group.id());
             requirePlacement(current, new JournalGroupRecord(deploymentId, group, null));
@@ -116,13 +115,15 @@ public final class JournalGroupCatalog {
             }
             if (current.activation() != null) {
                 final var membership = readMembership(current);
-                if (membership.revision() != 0 || membership.pending() != null) {
+                if (membership.pending() != null) {
                     throw new IOException("journal membership requires replacement reconciliation before static startup");
                 }
-                requiredActivations.put(group.id(), current.activation());
+                memberships.put(group.id(), membership);
             }
         }
-        return RatisJournal.open(configuration, keyManager, trustManager, diskSpace, requiredActivations);
+        return configuration.bootstrap()
+            ? RatisJournal.open(configuration, keyManager, trustManager, diskSpace)
+            : RatisJournal.recoverMembership(configuration, keyManager, trustManager, diskSpace, memberships);
     }
 
     /**
@@ -203,6 +204,7 @@ public final class JournalGroupCatalog {
         final var currentRegister = container.readRegister(key)
             .orElseThrow(() -> new IOException("activated journal membership head is missing; refusing revision reset"));
         final var current = decodeMembership(genesis, currentRegister);
+        validateCompletedIdentities(current);
         final JournalMembershipRecord proposed;
         try {
             proposed = current.begin(expectedRevision, operation, target);
@@ -249,10 +251,31 @@ public final class JournalGroupCatalog {
         final var register = container.readRegister(membershipName(genesis.initialPlacement().id()))
             .orElseThrow(() -> new IOException("activated journal membership head is missing; refusing revision reset"));
         final var record = decodeMembership(genesis, register);
+        validateCompletedIdentities(record);
         if (record.pending() != null) {
             reserveReplacementIdentity(record, true);
         }
         return record;
+    }
+
+    private void validateCompletedIdentities(JournalMembershipRecord current) throws IOException {
+        for (var peer : current.voters().peers()) {
+            if (current.genesis().initialPlacement().peers().stream().anyMatch(original -> original.id().equals(peer.id()))) {
+                continue; // The codec verifies exact genesis placement; the immutable reservation binds it.
+            }
+            final String key = "replacement-" + current.voters().id() + "-" + peer.id();
+            final var register = container.readRegister(key)
+                .orElseThrow(() -> new IOException("completed membership voter identity reservation is missing"));
+            // Decode only: recursively validating this historical source could grow with history.
+            // Its immutable genesis, revision and exact new peer are sufficient for identity binding.
+            final var reservation = decodeMembership(current.genesis(), register);
+            if (reservation.pending() == null
+                || reservation.revision() >= current.revision()
+                || reservation.voters().peers().stream().anyMatch(old -> old.id().equals(peer.id()))
+                || reservation.pending().target().peers().contains(peer) == false) {
+                throw new IOException("completed membership voter differs from its permanent identity reservation");
+            }
+        }
     }
 
     private static JournalMembershipRecord decodeMembership(JournalGroupRecord genesis, BlobRegister register) throws IOException {

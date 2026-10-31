@@ -270,7 +270,74 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRetiredGroupStaysOutOfNativeRecoveryWhileColocatedGroupContinues() throws Exception {
+        final var fixture = fixture(2);
+        final List<JournalProcess> nodes = new ArrayList<>();
+        final var retiredStream = new ShardLogId(fixture.deployment(), "retired-assignment", 0, UUID.randomUUID());
+        final var activeStream = new ShardLogId(fixture.deployment(), "active-assignment", 0, UUID.randomUUID());
+        try {
+            startAll(fixture, nodes, true);
+            leader(nodes, 0).append(0, operation(retiredStream, 0));
+            leader(nodes, 1).append(1, operation(activeStream, 0));
+            final var original = fixture.configurations().getFirst();
+            final var retiredGroup = original.groups().getFirst();
+            final var activeGroup = original.groups().get(1);
+            final var requirements = Map.of(
+                retiredGroup.id(),
+                leader(nodes, 0).activation(0),
+                activeGroup.id(),
+                leader(nodes, 1).activation(1)
+            );
+            final var target = new ArrayList<>(retiredGroup.peers());
+            final var removed = target.removeFirst();
+            assertEquals(original.localVoterId(), removed.id());
+            target.add(new JournalConfiguration.Peer(UUID.randomUUID(), "replacement.invalid", 9001, removed.availabilityZone()));
+            final var retiredGenesis = new JournalGroupRecord(fixture.deployment(), retiredGroup, requirements.get(retiredGroup.id()));
+            // Model a controller-authorized completed head to isolate restart/retirement behavior.
+            // This test does not establish native learner promotion or configuration completion.
+            final var memberships = Map.of(
+                retiredGroup.id(),
+                new JournalMembershipRecord(retiredGenesis, 1, new JournalConfiguration.Group(retiredGroup.id(), target), null),
+                activeGroup.id(),
+                JournalMembershipRecord.initial(
+                    new JournalGroupRecord(fixture.deployment(), activeGroup, requirements.get(activeGroup.id()))
+                )
+            );
+            nodes.getFirst().stop();
+            final Path source = original.directory().resolve(retiredGroup.id().toString());
+            final byte[] boundary = Files.readAllBytes(source.resolve("journal-floor"));
+            final var recovered = restart(original, requirements, memberships);
+            nodes.set(0, recovered);
+            expectThrows(IOException.class, () -> recovered.leader(0));
+            assertFalse(Files.exists(source));
+            final Path archivedFloor = original.directory()
+                .resolve("retired")
+                .resolve(retiredGroup.id().toString())
+                .resolve("journal-floor");
+            assertArrayEquals(boundary, Files.readAllBytes(archivedFloor));
+            leader(nodes, 1).append(1, operation(activeStream, 1));
+            assertBusy(() -> assertEquals(2, recovered.scan(1, -1, Set.of(activeStream)).operations().size()), 30, TimeUnit.SECONDS);
+            recovered.close();
+            expectThrows(IOException.class, () -> restart(original, requirements));
+            final var again = restart(original, requirements, memberships);
+            nodes.set(0, again);
+            expectThrows(IOException.class, () -> again.leader(0));
+            assertBusy(() -> assertEquals(2, again.scan(1, -1, Set.of(activeStream)).operations().size()), 30, TimeUnit.SECONDS);
+            assertArrayEquals(boundary, Files.readAllBytes(archivedFloor));
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
     private JournalProcess restart(JournalConfiguration original, Map<UUID, LogCheckpoint> requirements) throws IOException {
+        return restart(original, requirements, Map.of());
+    }
+
+    private JournalProcess restart(
+        JournalConfiguration original,
+        Map<UUID, LogCheckpoint> requirements,
+        Map<UUID, JournalMembershipRecord> memberships
+    ) throws IOException {
         final var configuration = new JournalConfiguration(
             original.deploymentId(),
             original.localVoterId(),
@@ -279,7 +346,7 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
             false,
             original.limits()
         );
-        return JournalProcess.start(configuration, createTempDir().resolve("recovered-voter.log"), requirements);
+        return JournalProcess.start(configuration, createTempDir().resolve("recovered-voter.log"), requirements, memberships);
     }
 
     private record Fixture(UUID deployment, List<JournalConfiguration> configurations) {

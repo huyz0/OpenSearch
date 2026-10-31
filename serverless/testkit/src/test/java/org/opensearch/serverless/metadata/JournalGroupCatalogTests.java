@@ -429,6 +429,50 @@ public class JournalGroupCatalogTests extends OpenSearchTestCase {
         }
     }
 
+    public void testCompletedHeadRequiresExactPermanentBindingsForNewVoters() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final var catalog = new JournalGroupCatalog(container, UUID.randomUUID());
+            final var group = group(UUID.randomUUID());
+            activate(container, catalog, group);
+            final var pending = catalog.prepareReplacement(group.id(), 0, UUID.randomUUID(), replacement(group));
+            final var completed = new JournalMembershipRecord(pending.genesis(), 1, pending.pending().target(), null);
+            final String key = "membership-" + group.id();
+            var head = container.readRegister(key).orElseThrow();
+            assertTrue(container.compareAndSwapRegister(key, head.generation(), new BytesArray(completed.encode())).applied());
+            assertEquals(completed, catalog.membership(group.id()));
+            final var added = completed.voters()
+                .peers()
+                .stream()
+                .filter(peer -> group.peers().stream().noneMatch(original -> original.id().equals(peer.id())))
+                .findFirst()
+                .orElseThrow();
+            final var rebound = new ArrayList<>(completed.voters().peers());
+            rebound.remove(added);
+            rebound.add(new JournalConfiguration.Peer(added.id(), "rebound.invalid", added.port(), added.availabilityZone()));
+            final var changed = new JournalMembershipRecord(
+                pending.genesis(),
+                1,
+                new JournalConfiguration.Group(group.id(), rebound),
+                null
+            );
+            head = container.readRegister(key).orElseThrow();
+            assertTrue(container.compareAndSwapRegister(key, head.generation(), new BytesArray(changed.encode())).applied());
+            expectThrows(IOException.class, () -> catalog.membership(group.id()));
+            head = container.readRegister(key).orElseThrow();
+            assertTrue(container.compareAndSwapRegister(key, head.generation(), new BytesArray(completed.encode())).applied());
+            final String voterKey = "replacement-" + group.id() + "-" + added.id();
+            final var reservation = container.readRegister(voterKey).orElseThrow();
+            assertTrue(container.deleteRegisterIfUnchanged(voterKey, reservation.generation()));
+            expectThrows(IOException.class, () -> catalog.membership(group.id()));
+            expectThrows(
+                IOException.class,
+                () -> catalog.prepareReplacement(group.id(), 1, UUID.randomUUID(), replacement(completed.voters()))
+            );
+            assertTrue(container.readRegister(voterKey).isEmpty());
+        }
+    }
+
     private static void activate(BlobContainer container, JournalGroupCatalog catalog, JournalConfiguration.Group group)
         throws IOException {
         final var reserved = catalog.reserve(group);
@@ -447,7 +491,8 @@ public class JournalGroupCatalogTests extends OpenSearchTestCase {
     private static JournalConfiguration.Group replacement(JournalConfiguration.Group group) {
         final var peers = new ArrayList<>(group.peers());
         final var removed = peers.removeLast();
-        peers.add(new JournalConfiguration.Peer(UUID.randomUUID(), "replacement-host", 9500, removed.availabilityZone()));
+        final UUID identity = UUID.randomUUID();
+        peers.add(new JournalConfiguration.Peer(identity, "replacement-" + identity, 9500, removed.availabilityZone()));
         return new JournalConfiguration.Group(group.id(), peers);
     }
 
