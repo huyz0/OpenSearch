@@ -51,6 +51,11 @@ asynchronous S3 archival are not enabled by these foundation commits.
   The earlier 201-operation persistence probe and shell process smoke test also
   passed three iterations. Both merged vendor artifacts now receive a complete
   third-party API/JDK-jar-hell audit in addition to dependency audits.
+- Corrupt log open: recovery refused the invalid segment header, but the unpublished
+  log leaked its cache-eviction thread. The curated server artifact now closes logs
+  whose open fails. Three iterations passed (75 unit and 21 journal cases), with
+  vendor/log checks, full artifact audits, byte preservation, and root precommit.
+  The corrupted segment remains intact for diagnosis.
 - Static journal runtime: persistent majority appends, two shared physical groups,
   selected logical-stream replay with payload verification, leader close/full restart,
   majority-loss refusal, namespace/disk-reserve refusal, required client certificates,

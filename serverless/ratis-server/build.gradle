@@ -31,15 +31,15 @@ dependencies {
   api 'org.apache.ratis:ratis-metrics-api:3.3.1'
 }
 
-// One patched class replaces its upstream counterpart; all other classes/resources stay upstream.
+// Pinned cleanup fixes replace their upstream counterparts; all other classes/resources stay upstream.
 tasks.named('jar').configure {
   from({ zipTree(configurations.upstreamRatisServer.singleFile) }) {
-    exclude 'org/apache/ratis/server/impl/RaftServerProxy*.class'
+    exclude 'org/apache/ratis/server/impl/RaftServerProxy*.class', 'org/apache/ratis/server/impl/ServerState*.class'
     exclude 'META-INF/MANIFEST.MF'
     exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
   }
   manifest {
-    attributes 'Ratis-Upstream-Version': '3.3.1', 'OpenSearch-Ratis-Patch': 'group-init-cleanup-v1'
+    attributes 'Ratis-Upstream-Version': '3.3.1', 'OpenSearch-Ratis-Patch': 'startup-cleanup-v2'
   }
   from('README.md') { into 'META-INF/opensearch-ratis-server' }
 }
@@ -78,7 +78,8 @@ tasks.register('verifyUpstreamContents') {
     try {
       original.entries().each { entry ->
         if (!entry.directory && entry.name != 'META-INF/MANIFEST.MF'
-            && !entry.name.startsWith('org/apache/ratis/server/impl/RaftServerProxy')) {
+            && !entry.name.startsWith('org/apache/ratis/server/impl/RaftServerProxy')
+            && !entry.name.startsWith('org/apache/ratis/server/impl/ServerState')) {
           def replacement = patched.getEntry(entry.name)
           if (replacement == null || !java.util.Arrays.equals(original.getInputStream(entry).bytes, patched.getInputStream(replacement).bytes)) {
             throw new GradleException("Unexpected change to upstream Ratis entry: ${entry.name}")
@@ -91,7 +92,7 @@ tasks.register('verifyUpstreamContents') {
     }
   }
 }
-// The only replacement is package-private; document that scope with the standard doclet.
+// The replacements are package-private; document that scope with the standard doclet.
 tasks.named('javadoc').configure {
   options.memberLevel = org.gradle.external.javadoc.JavadocMemberLevel.PACKAGE
 }

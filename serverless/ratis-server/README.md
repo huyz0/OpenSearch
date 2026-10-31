@@ -1,11 +1,11 @@
 # Curated Apache Ratis server artifact
 
 Pinned upstream: Apache Ratis 3.3.1. The merged artifact replaces only
-`org.apache.ratis.server.impl.RaftServerProxy` and its nested classes.
+`org.apache.ratis.server.impl.RaftServerProxy`, `ServerState`, and their nested classes.
 Other upstream classes and resources are checked byte-for-byte against the
 original JAR by `verifyUpstreamContents`.
 
-## Resource cleanup fix
+## Resource cleanup fixes
 
 When group initialization throws, upstream `groupAddAsync` removes the failed
 division from its map without closing it. A later server close cannot find it,
@@ -31,3 +31,11 @@ inputs. `patchedArtifactAudit` separately audits the complete merged artifact;
 it uses the same forbidden-API and JDK-jar-hell checks without blanket exclusions.
 The runtime regression checks the actual artifact origin and refuses duplicate
 copies of the replacement class.
+
+When `ServerState` constructs a log whose `open` fails, the memoized supplier does
+not publish that object. Later division cleanup cannot reach it. The replacement
+closes the unpublished log on failed open, preserving the original exception and
+suppressing secondary close failures. A corrupt-header recovery test reproduced
+the leaked cache-eviction thread before this fix and checks that it terminates.
+
+Original `ServerState.java` source entry SHA-256: `87ea1923a11060963d3e2f5150418431d10f3c85ebbba81acec3b0238653a5e2`.
