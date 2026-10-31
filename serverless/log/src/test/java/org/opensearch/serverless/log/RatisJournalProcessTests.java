@@ -76,7 +76,9 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
             stalled.stall();
             leader.append(0, operation(stream, 1)); // The other two voters still form a persistent majority.
             assertBusy(() -> assertTrue(stalled.stalled()), 10, TimeUnit.SECONDS);
+            assertTrue(stalled.ioResourcesOpen());
             stalled.stopButKeepProcessAlive();
+            assertTrue("native log channel must not be closed while its worker is active", stalled.ioResourcesOpen());
             assertTrue(stalled.alive());
             expectThrows(IOException.class, () -> JournalDiskIdentity.discover(configuration.directory()));
             stalled.close();

@@ -79,5 +79,13 @@ asynchronous S3 archival are not enabled by these foundation commits.
   Three iterations passed 75 unit and 30 journal cases, with module checks and
   root precommit. These are local process tests, not independent-AZ qualification.
 
+- Stalled shutdown resources: the native log worker closed its output stream and
+  freed its direct write buffer after its shutdown timeout even if disk work was
+  still active. A child-JVM regression reproduced the channel close. The curated
+  server artifact now leaves both resources alive until worker and flush executors
+  terminate, or process teardown reclaims them. The targeted test passed three
+  iterations; 75 unit and 30 journal cases, vendor/log module checks, full artifact
+  audits, upstream byte verification, and root precommit also passed.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

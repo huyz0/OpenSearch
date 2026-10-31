@@ -34,12 +34,13 @@ dependencies {
 // Pinned cleanup fixes replace their upstream counterparts; all other classes/resources stay upstream.
 tasks.named('jar').configure {
   from({ zipTree(configurations.upstreamRatisServer.singleFile) }) {
-    exclude 'org/apache/ratis/server/impl/RaftServerProxy*.class', 'org/apache/ratis/server/impl/ServerState*.class'
+    exclude 'org/apache/ratis/server/impl/RaftServerProxy*.class', 'org/apache/ratis/server/impl/ServerState*.class',
+      'org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker*.class'
     exclude 'META-INF/MANIFEST.MF'
     exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
   }
   manifest {
-    attributes 'Ratis-Upstream-Version': '3.3.1', 'OpenSearch-Ratis-Patch': 'startup-cleanup-v2'
+    attributes 'Ratis-Upstream-Version': '3.3.1', 'OpenSearch-Ratis-Patch': 'startup-shutdown-cleanup-v3'
   }
   from('README.md') { into 'META-INF/opensearch-ratis-server' }
 }
@@ -79,7 +80,8 @@ tasks.register('verifyUpstreamContents') {
       original.entries().each { entry ->
         if (!entry.directory && entry.name != 'META-INF/MANIFEST.MF'
             && !entry.name.startsWith('org/apache/ratis/server/impl/RaftServerProxy')
-            && !entry.name.startsWith('org/apache/ratis/server/impl/ServerState')) {
+            && !entry.name.startsWith('org/apache/ratis/server/impl/ServerState')
+            && !entry.name.startsWith('org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker')) {
           def replacement = patched.getEntry(entry.name)
           if (replacement == null || !java.util.Arrays.equals(original.getInputStream(entry).bytes, patched.getInputStream(replacement).bytes)) {
             throw new GradleException("Unexpected change to upstream Ratis entry: ${entry.name}")

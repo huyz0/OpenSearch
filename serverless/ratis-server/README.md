@@ -1,7 +1,8 @@
 # Curated Apache Ratis server artifact
 
 Pinned upstream: Apache Ratis 3.3.1. The merged artifact replaces only
-`org.apache.ratis.server.impl.RaftServerProxy`, `ServerState`, and their nested classes.
+`org.apache.ratis.server.impl.RaftServerProxy`, `ServerState`,
+`org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogWorker`, and their nested classes.
 Other upstream classes and resources are checked byte-for-byte against the
 original JAR by `verifyUpstreamContents`.
 
@@ -39,3 +40,21 @@ suppressing secondary close failures. A corrupt-header recovery test reproduced
 the leaked cache-eviction thread before this fix and checks that it terminates.
 
 Original `ServerState.java` source entry SHA-256: `87ea1923a11060963d3e2f5150418431d10f3c85ebbba81acec3b0238653a5e2`.
+
+## Stalled shutdown I/O resources
+
+Upstream log-worker close waits three seconds, then closes the output stream and
+frees its direct write buffer even if the worker remains active in disk I/O. A
+real-process test reproduced the log channel closing while its worker was stalled
+inside the persistence hook. Closing or freeing live resources can race the old
+worker when that I/O resumes.
+
+The replacement cleans up the stream and direct buffer only after both worker
+and optional flush executors have terminated. Otherwise it leaves them alive for
+process teardown. The journal's process-lifetime volume lease prevents another
+voter opening that volume in the meantime. This intentionally trades immediate
+resource reclamation for safe process replacement after a stuck I/O shutdown.
+The consensus, log format, and acknowledgement rules are unchanged.
+
+Original `SegmentedRaftLogWorker.java` source entry SHA-256:
+`f9899dc64d71bd33194f220eb389ec9be3be8d6d7763b5874c98a1d8d41eac4e`.

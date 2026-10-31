@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.log;
 
+import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.server.RaftServer;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.core.common.io.stream.InputStreamStreamInput;
 import org.opensearch.core.common.io.stream.OutputStreamStreamOutput;
@@ -25,6 +27,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.util.ArrayList;
@@ -45,6 +48,7 @@ public final class JournalProcessMain {
     static final int STALLED = 6;
     static final int CLOSE_STAY = 7;
     static final int ACTIVATE = 8;
+    static final int IO_OPEN = 9;
     static final int FRAME_LIMIT = 17 * 1024;
 
     private JournalProcessMain() {}
@@ -131,6 +135,7 @@ public final class JournalProcessMain {
         ) {
             output.writeInt(READY);
             output.flush();
+            FileChannel pendingChannel = null;
             while (true) {
                 final int command;
                 try {
@@ -184,8 +189,19 @@ public final class JournalProcessMain {
                             output.writeByte(0);
                         }
                         case STALLED -> {
+                            final boolean blocked = entered.get();
+                            if (blocked && pendingChannel == null) {
+                                pendingChannel = logChannel(journal, groups.getFirst().id());
+                            }
                             output.writeByte(0);
-                            output.writeBoolean(entered.get());
+                            output.writeBoolean(blocked);
+                        }
+                        case IO_OPEN -> {
+                            if (pendingChannel == null) {
+                                throw new IOException("fixture has not captured a stalled log channel");
+                            }
+                            output.writeByte(0);
+                            output.writeBoolean(pendingChannel.isOpen());
                         }
                         case CLOSE, CLOSE_STAY -> {
                             journal.close();
@@ -205,6 +221,19 @@ public final class JournalProcessMain {
                 output.flush();
             }
         }
+    }
+
+    private static FileChannel logChannel(RatisJournal journal, UUID group) throws ReflectiveOperationException, IOException {
+        final var server = (RaftServer) field(journal, "server");
+        final var worker = field(server.getDivision(RaftGroupId.valueOf(group)).getRaftLog(), "fileLogWorker");
+        return (FileChannel) field(field(field(worker, "out"), "out"), "fileChannel");
+    }
+
+    @SuppressForbidden(reason = "Fault fixture inspects the pinned SDK private log channel without expanding its production API")
+    private static Object field(Object owner, String name) throws ReflectiveOperationException {
+        final var field = owner.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(owner);
     }
 
     static byte[] readFrame(DataInputStream input) throws IOException {

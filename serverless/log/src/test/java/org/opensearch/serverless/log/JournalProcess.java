@@ -151,6 +151,10 @@ final class JournalProcess implements AutoCloseable {
         return exchange(JournalProcessMain.STALLED, out -> {}, DataInputStream::readBoolean);
     }
 
+    boolean ioResourcesOpen() throws IOException {
+        return exchange(JournalProcessMain.IO_OPEN, out -> {}, DataInputStream::readBoolean);
+    }
+
     void stopButKeepProcessAlive() throws IOException {
         exchange(JournalProcessMain.CLOSE_STAY, out -> {}, in -> null);
     }
