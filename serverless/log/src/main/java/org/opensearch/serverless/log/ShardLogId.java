@@ -36,7 +36,14 @@ public record ShardLogId(UUID deploymentId, String indexUuid, int shardNumber, U
     private static final int FORMAT_VERSION = 1;
     private static final int MAX_UUID_BYTES = 256;
 
-    /** Validates a log identity before it can enter placement or persistence. */
+    /**
+     * Validates a log identity before it can enter placement or persistence.
+     *
+     * @param deploymentId durable deployment namespace
+     * @param indexUuid index incarnation
+     * @param shardNumber non-negative logical shard
+     * @param activationId activation identity, stable across elections
+     */
     public ShardLogId {
         Objects.requireNonNull(deploymentId);
         Objects.requireNonNull(activationId);

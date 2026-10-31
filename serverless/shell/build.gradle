@@ -11,6 +11,7 @@ apply plugin: 'opensearch.build'
 dependencies {
   // RFC §4 rule 1: serverless may depend on server. server may never point back.
   implementation project(':server')
+  implementation project(':serverless:log')
   implementation project(':libs:opensearch-common')
   implementation project(':libs:opensearch-core')
   implementation project(':libs:opensearch-telemetry')

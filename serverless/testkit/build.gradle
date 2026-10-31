@@ -11,6 +11,7 @@ apply plugin: 'opensearch.build'
 dependencies {
   implementation project(':server')
   implementation project(':serverless:shell')
+  implementation project(':serverless:log')
   implementation project(':serverless:auth')
   runtimeOnly project(':libs:opensearch-plugin-classloader')
   implementation project(':modules:transport-netty4')

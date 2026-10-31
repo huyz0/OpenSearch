@@ -30,7 +30,13 @@ public record LogCheckpoint(ShardLogId logId, long index, long entryTerm) implem
 
     private static final int FORMAT_VERSION = 1;
 
-    /** Validates the coordinate; this does not establish commit authority. */
+    /**
+     * Validates the coordinate; this does not establish commit authority.
+     *
+     * @param logId durable history identity
+     * @param index entry index, or -1 for an empty history
+     * @param entryTerm referenced entry's term
+     */
     public LogCheckpoint {
         Objects.requireNonNull(logId);
         if (index < -1 || entryTerm < 0 || (index == -1 && entryTerm != 0)) {

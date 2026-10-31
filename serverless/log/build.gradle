@@ -1,0 +1,18 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.build'
+
+dependencies {
+  api project(':libs:opensearch-common')
+  api project(':libs:opensearch-core')
+  testImplementation project(':test:framework')
+}
+
+// This engine-independent library does not carry server/CLI classes referenced by server signatures.
+tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatures' }

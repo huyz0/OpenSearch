@@ -59,6 +59,7 @@ List projects = [
   'client:rest-http-client',
   'client:rest-high-level',
   'serverless:auth',
+  'serverless:log',
   'serverless:shell',
   'serverless:testkit',
   'client:sniffer',

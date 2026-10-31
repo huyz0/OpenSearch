@@ -7,7 +7,7 @@
  */
 
 /**
- * Durable operation boundaries shared by the existing object-store path and the low-latency log.
- * Implementing this interface alone does not establish leadership, quorum replication, or fresh reads.
+ * Engine-independent identity, framing, persistence, and replication for activated operation logs.
+ * The shell owns document semantics; this module must not depend on the shell or search engine.
  */
 package org.opensearch.serverless.log;
