@@ -18,8 +18,8 @@ dependencies {
   testImplementation project(':test:framework')
   // R11 against a real S3 API: the conformance suite needs the container production would use.
   testImplementation project(':plugins:repository-s3')
-  // M2 feasibility only; the runtime does not depend on or activate consensus yet.
-  testImplementation 'org.apache.ratis:ratis-server:3.3.1'
+  // Dedicated consensus probes; the shell storage mode remains inactive.
+  testImplementation project(':serverless:ratis-server')
   testImplementation 'org.apache.ratis:ratis-client:3.3.1'
   testImplementation 'org.apache.ratis:ratis-grpc:3.3.1'
   testImplementation 'org.apache.ratis:ratis-metrics-default:3.3.1'

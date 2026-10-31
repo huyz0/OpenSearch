@@ -61,6 +61,7 @@ List projects = [
   'serverless:auth',
   'serverless:log',
   'serverless:ratis-common',
+  'serverless:ratis-server',
   'serverless:shell',
   'serverless:testkit',
   'client:sniffer',

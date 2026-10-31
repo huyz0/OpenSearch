@@ -1,0 +1,99 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+import org.opensearch.gradle.util.GradleUtils
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+
+apply plugin: 'opensearch.build'
+
+base { archivesName = 'opensearch-ratis-server' }
+
+configurations {
+  upstreamRatisServer {
+    canBeConsumed = false
+    canBeResolved = true
+    transitive = false
+  }
+}
+
+dependencies {
+  upstreamRatisServer 'org.apache.ratis:ratis-server:3.3.1'
+  compileOnly 'org.apache.ratis:ratis-server:3.3.1'
+  compileOnly project(':libs:opensearch-common')
+  api project(':serverless:ratis-common')
+  api 'org.apache.ratis:ratis-server-api:3.3.1'
+  api 'org.apache.ratis:ratis-client:3.3.1'
+  api 'org.apache.ratis:ratis-metrics-api:3.3.1'
+}
+
+// One patched class replaces its upstream counterpart; all other classes/resources stay upstream.
+tasks.named('jar').configure {
+  from({ zipTree(configurations.upstreamRatisServer.singleFile) }) {
+    exclude 'org/apache/ratis/server/impl/RaftServerProxy*.class'
+    exclude 'META-INF/MANIFEST.MF'
+    exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
+  }
+  manifest {
+    attributes 'Ratis-Upstream-Version': '3.3.1', 'OpenSearch-Ratis-Patch': 'group-init-cleanup-v1'
+  }
+  from('README.md') { into 'META-INF/opensearch-ratis-server' }
+}
+
+// Class-directory variants would expose only the replacement class, not the merged upstream jar.
+['apiElements', 'runtimeElements'].each { configuration ->
+  configurations.named(configuration).configure {
+    outgoing.variants.toList().findAll { it.name in ['classes', 'resources'] }.each { outgoing.variants.remove(it) }
+  }
+}
+
+tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatures' }
+apply from: '../ratis-artifact-audit.gradle'
+// The repository missing-doclet hardcodes org.opensearch; this source retains its upstream namespace.
+tasks.named('missingJavadoc').configure { enabled = false }
+tasks.named('dependencyLicenses').configure {
+  dependencies = files(provider {
+    GradleUtils.getFirstLevelModuleDependencyFiles(project, configurations.runtimeClasspath,
+      { id -> !(id instanceof ProjectComponentIdentifier) })
+  }, configurations.upstreamRatisServer)
+}
+// The compiler intentionally sees the original class while compiling its replacement. Audit the
+// distributable merged jar, not that intermediate overlay, for duplicate runtime classes.
+tasks.named('jarHell').configure {
+  dependsOn tasks.named('jar')
+  classpath = files(tasks.named('jar').flatMap { it.archiveFile }, configurations.runtimeClasspath, configurations.jarHell)
+}
+
+tasks.register('verifyUpstreamContents') {
+  dependsOn tasks.named('jar')
+  inputs.files(configurations.upstreamRatisServer)
+  inputs.file(tasks.named('jar').flatMap { it.archiveFile })
+  doLast {
+    def original = new java.util.zip.ZipFile(configurations.upstreamRatisServer.singleFile)
+    def patched = new java.util.zip.ZipFile(tasks.named('jar').get().archiveFile.get().asFile)
+    try {
+      original.entries().each { entry ->
+        if (!entry.directory && entry.name != 'META-INF/MANIFEST.MF'
+            && !entry.name.startsWith('org/apache/ratis/server/impl/RaftServerProxy')) {
+          def replacement = patched.getEntry(entry.name)
+          if (replacement == null || !java.util.Arrays.equals(original.getInputStream(entry).bytes, patched.getInputStream(replacement).bytes)) {
+            throw new GradleException("Unexpected change to upstream Ratis entry: ${entry.name}")
+          }
+        }
+      }
+    } finally {
+      patched.close()
+      original.close()
+    }
+  }
+}
+// The only replacement is package-private; document that scope with the standard doclet.
+tasks.named('javadoc').configure {
+  options.memberLevel = org.gradle.external.javadoc.JavadocMemberLevel.PACKAGE
+}
+tasks.named('check').configure { dependsOn 'verifyUpstreamContents' }
+test.enabled = false

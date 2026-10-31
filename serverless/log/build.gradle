@@ -17,8 +17,9 @@ dependencies {
   compileOnly "com.google.errorprone:error_prone_annotations:${versions.error_prone_annotations}"
   testImplementation project(':test:framework')
   implementation project(':serverless:ratis-common')
+  implementation project(':serverless:ratis-server')
   runtimeOnly "org.apache.logging.log4j:log4j-slf4j2-impl:${versions.log4j}"
-  ['ratis-server', 'ratis-server-api', 'ratis-client', 'ratis-grpc', 'ratis-metrics-api', 'ratis-metrics-default'].each {
+  ['ratis-server-api', 'ratis-client', 'ratis-grpc', 'ratis-metrics-api', 'ratis-metrics-default'].each {
     implementation "org.apache.ratis:${it}:3.3.1"
   }
 }
@@ -27,11 +28,15 @@ dependencies {
 tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatures' }
 
 // Persistent socket-based journal tests need native gRPC access, isolated from ordinary unit tests.
-tasks.named('test').configure { exclude '**/RatisJournalTests.class' }
+tasks.named('test').configure {
+  exclude '**/RatisJournalTests.class'
+  exclude '**/RatisFailureCleanupTests.class'
+}
 tasks.register('journalTest', Test) {
   testClassesDirs = sourceSets.test.output.classesDirs
   classpath = sourceSets.test.runtimeClasspath
   include '**/RatisJournalTests.class'
+  include '**/RatisFailureCleanupTests.class'
   systemProperty 'tests.security.manager', 'false'
   systemProperty 'tests.system_call_filter', 'false'
 }

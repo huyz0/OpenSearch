@@ -59,3 +59,7 @@ complete publication, and an actual POSIX permission fault after rename that mak
 directory synchronization fail. The fault is skipped on privileged or non-POSIX
 filesystems where that injection is ineffective. The local three-replica Ratis
 test then exercises persisted replay and leader replacement with the patched jar.
+
+`patchedArtifactAudit` additionally scans the complete merged artifact, including
+unchanged upstream common classes. It complements the existing dependency audit,
+which skips project artifacts and compile-only inputs.

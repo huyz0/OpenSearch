@@ -49,6 +49,7 @@ tasks.named('jar').configure {
 
 tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatures' }
 apply from: 'thirdparty-audit.gradle'
+apply from: '../ratis-artifact-audit.gradle'
 // The repository missing-doclet hardcodes org.opensearch; this source retains its upstream namespace.
 tasks.named('missingJavadoc').configure { enabled = false }
 tasks.named('dependencyLicenses').configure {

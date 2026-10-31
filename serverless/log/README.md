@@ -64,7 +64,10 @@ A crash during incomplete initial bootstrap requires controller intervention.
 This first runtime supports static membership. Learner catch-up, safe membership
 changes, group movement, and bootstrap recovery still need their controller state
 machines. Operators must not edit the binding or copy a live voter directory to
-another live voter. A failed replication-service close retains the volume lease.
+another live voter. A failed replication-service close retains the volume lease. The curated
+`ratis-server` artifact closes a failed group before unregistering it, fixing a
+reproduced native storage-lock leak on initialization failure. Other I/O-error
+and interrupted-shutdown cleanup paths still require qualification.
 
 ## Authentication and replay
 

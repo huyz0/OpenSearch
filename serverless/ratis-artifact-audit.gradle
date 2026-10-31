@@ -1,0 +1,34 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+import org.opensearch.gradle.info.BuildParams
+import org.opensearch.gradle.precommit.ThirdPartyAuditTask
+import org.gradle.api.file.ConfigurableFileCollection
+import org.gradle.api.tasks.Classpath
+
+// Normal thirdPartyAudit skips project JARs and compile-only inputs. Audit the actual
+// merged vendor artifact as well, so unchanged upstream classes do not escape checks.
+abstract class PatchedRatisArtifactAudit extends ThirdPartyAuditTask {
+  @javax.inject.Inject
+  PatchedRatisArtifactAudit(Project project) { super(project) }
+
+  @Classpath
+  abstract ConfigurableFileCollection getPatchedJars()
+
+  @Override
+  Set<File> getJarsToScan() { return getPatchedJars().files }
+}
+
+tasks.register('patchedArtifactAudit', PatchedRatisArtifactAudit) {
+  patchedJars.from(tasks.named('jar').flatMap { it.archiveFile })
+  dependsOn 'jar', 'thirdPartyAuditResources'
+  javaHome = BuildParams.runtimeJavaHome.toString()
+  targetCompatibility.set(provider { BuildParams.runtimeJavaVersion })
+  signatureFile = layout.buildDirectory.file('third-party-audit-config/forbidden/third-party-audit.txt').get().asFile
+}
+tasks.named('precommit').configure { dependsOn 'patchedArtifactAudit' }

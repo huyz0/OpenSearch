@@ -44,6 +44,13 @@ asynchronous S3 archival are not enabled by these foundation commits.
   host must provision a durable directory, and the backend must compare its identity
   with authorized membership; this primitive alone does not activate a voter.
 
+- Failed group initialization: a native storage-lock leak was reproduced, then
+  fixed in the curated `ratis-server` artifact. Its two regression/artifact tests
+  and the runtime suite passed three iterations (18 journal cases total), alongside
+  75 unit cases, both vendor module checks, the log module check, and root precommit.
+  The earlier 201-operation persistence probe and shell process smoke test also
+  passed three iterations. Both merged vendor artifacts now receive a complete
+  third-party API/JDK-jar-hell audit in addition to dependency audits.
 - Static journal runtime: persistent majority appends, two shared physical groups,
   selected logical-stream replay with payload verification, leader close/full restart,
   majority-loss refusal, namespace/disk-reserve refusal, required client certificates,
