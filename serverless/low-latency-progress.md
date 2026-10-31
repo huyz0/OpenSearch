@@ -118,5 +118,14 @@ asynchronous S3 archival are not enabled by these foundation commits.
   exact owned thread identities, with a same-name foreign timer regression.
   Additional local metadata force cost still needs workload qualification.
 
+- Live storage failure: independent child-JVM tests inject an I/O exception on
+  the native log worker before force. A failed leader permits healthy-quorum
+  takeover while retaining its volume lease, and a failed follower cannot supply
+  a second persistent acknowledgement after the other follower is lost. Failed
+  requests remain ambiguous and may have committed elsewhere. Both histories
+  passed three iterations (six cases), with root precommit. These tests cover
+  reported local I/O errors; they do not qualify arbitrary hardware failure or
+  stalled I/O availability.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

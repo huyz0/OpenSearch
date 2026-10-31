@@ -221,6 +221,55 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
         }
     }
 
+    public void testLeaderStorageFailureAllowsTheHealthyQuorumToTakeOver() throws Exception {
+        final var fixture = fixture(1);
+        final List<JournalProcess> nodes = new ArrayList<>();
+        final var stream = new ShardLogId(fixture.deployment(), "failed-leader", 0, UUID.randomUUID());
+        try {
+            startAll(fixture, nodes, true);
+            final var failed = leader(nodes, 0);
+            failed.append(0, operation(stream, 0));
+            failed.failStorage();
+            expectThrows(IOException.class, () -> failed.append(0, operation(stream, 1)));
+            assertBusy(() -> assertTrue(failed.storageFailed()), 10, TimeUnit.SECONDS);
+            final var healthy = nodes.stream().filter(node -> node != failed).toList();
+            final var replacement = leader(healthy, 0);
+            replacement.append(0, operation(stream, 2));
+            final var history = replacement.scan(0, -1, Set.of(stream)).operations();
+            assertEquals(0, history.getFirst().operation().payloadReader().read());
+            assertEquals(2, history.getLast().operation().payloadReader().read());
+            // The failed append may have committed elsewhere; its IO result is not rollback.
+            assertTrue(failed.alive());
+            final var placement = fixture.configurations().get(nodes.indexOf(failed));
+            expectThrows(IOException.class, () -> JournalDiskIdentity.discover(placement.directory()));
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
+    public void testFailedFollowerCannotSupplyTheSecondPersistentAcknowledgement() throws Exception {
+        final var fixture = fixture(1);
+        final List<JournalProcess> nodes = new ArrayList<>();
+        final var stream = new ShardLogId(fixture.deployment(), "failed-follower", 0, UUID.randomUUID());
+        try {
+            startAll(fixture, nodes, true);
+            final var leader = leader(nodes, 0);
+            leader.append(0, operation(stream, 0));
+            final var failed = nodes.stream().filter(node -> node != leader).findFirst().orElseThrow();
+            failed.failStorage();
+            leader.append(0, operation(stream, 1));
+            assertBusy(() -> assertTrue(failed.storageFailed()), 10, TimeUnit.SECONDS);
+            final var other = nodes.stream().filter(node -> node != leader && node != failed).findFirst().orElseThrow();
+            other.close();
+            expectThrows(IOException.class, () -> leader.append(0, operation(stream, 2)));
+            for (var item : leader.scan(0, -1, Set.of(stream)).operations()) {
+                assertNotEquals(2, item.operation().payloadReader().read());
+            }
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
     private JournalProcess restart(JournalConfiguration original, Map<UUID, LogCheckpoint> requirements) throws IOException {
         final var configuration = new JournalConfiguration(
             original.deploymentId(),

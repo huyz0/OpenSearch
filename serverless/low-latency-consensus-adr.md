@@ -283,3 +283,16 @@ restarts all voters with the committed history intact. Binding format 3 rejects
 older experimental volumes without this evidence. Snapshot/purged-prefix recovery,
 arbitrary storage rollback/old-backup restoration, and production recovery/replacement
 remain separate gates. The feature remains disabled.
+
+## Reported local I/O failure
+
+Independent voter JVM tests inject a persistent I/O exception on the native log
+worker before log force. The healthy two voters can elect a replacement after a
+leader's storage fails. If a follower fails storage and the other follower is
+subsequently lost, another append cannot be acknowledged or exposed in the local
+committed scan. The failed process retains its volume lease until termination.
+Both histories passed three iterations without additional runtime changes.
+
+An unsuccessful append remains ambiguous: it can have committed on another
+quorum member. These tests do not establish availability under uninterruptible
+I/O stalls or production hardware faults.

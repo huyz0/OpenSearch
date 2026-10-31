@@ -175,6 +175,14 @@ final class JournalProcess implements AutoCloseable {
         exchange(JournalProcessMain.ACTIVATE, out -> out.writeInt(group), in -> null);
     }
 
+    void failStorage() throws IOException {
+        exchange(JournalProcessMain.FAIL_STORAGE, out -> {}, in -> null);
+    }
+
+    boolean storageFailed() throws IOException {
+        return exchange(JournalProcessMain.STORAGE_FAILED, out -> {}, DataInputStream::readBoolean);
+    }
+
     void stall() throws IOException {
         exchange(JournalProcessMain.STALL, out -> {}, in -> null);
     }

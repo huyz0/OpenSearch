@@ -54,6 +54,8 @@ public final class JournalProcessMain {
     static final int ACTIVATION_COORDINATE = 10;
     static final int APPEND_BATCH = 11;
     static final int PROGRESS = 12;
+    static final int FAIL_STORAGE = 13;
+    static final int STORAGE_FAILED = 14;
     static final int FRAME_LIMIT = 17 * 1024;
 
     private JournalProcessMain() {}
@@ -128,6 +130,8 @@ public final class JournalProcessMain {
                 );
             }
         }
+        final var failStorage = new AtomicBoolean();
+        final var storageFailed = new AtomicBoolean();
         final var stall = new AtomicBoolean();
         final var entered = new AtomicBoolean();
         final var release = new CountDownLatch(1);
@@ -137,6 +141,10 @@ public final class JournalProcessMain {
                 (X509KeyManager) keyFactory.getKeyManagers()[0],
                 (X509TrustManager) trustFactory.getTrustManagers()[0],
                 () -> {
+                    if (failStorage.get() && Thread.currentThread().getName().endsWith("-SegmentedRaftLogWorker")) {
+                        storageFailed.set(true);
+                        throw new IOException("injected journal volume failure before log force");
+                    }
                     if (stall.get() && Thread.currentThread().getName().endsWith("-SegmentedRaftLogWorker")) {
                         entered.set(true);
                         boolean interrupted = false;
@@ -235,6 +243,14 @@ public final class JournalProcessMain {
                         case ACTIVATE -> {
                             journal.activateGroup(groups.get(input.readInt()).id()).toCompletableFuture().get(20, TimeUnit.SECONDS);
                             output.writeByte(0);
+                        }
+                        case FAIL_STORAGE -> {
+                            failStorage.set(true);
+                            output.writeByte(0);
+                        }
+                        case STORAGE_FAILED -> {
+                            output.writeByte(0);
+                            output.writeBoolean(storageFailed.get());
                         }
                         case STALL -> {
                             stall.set(true);
