@@ -18,6 +18,7 @@ import java.net.ServerSocket;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -34,10 +35,12 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
         try {
             startAll(fixture, nodes, true);
             final var leader = leader(nodes, 0);
+            final var activation = leader.activation(0);
             for (int i = 0; i < 20; i++) {
                 leader.append(0, operation(i % 2 == 0 ? first : second, i));
             }
             leader(nodes, 1).append(1, operation(third, 99));
+            final var otherActivation = leader(nodes, 1).activation(1);
             assertEquals(10, leader.scan(0, -1, Set.of(first)).operations().size());
             leader.close(); // SIGKILL, without native shutdown or a final flush.
             final var replacement = leader(nodes, 0);
@@ -48,8 +51,10 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
                 }
             }
             nodes.clear();
-            startAll(fixture, nodes, false);
+            final var groups = fixture.configurations().getFirst().groups();
+            startAll(fixture, nodes, false, Map.of(groups.getFirst().id(), activation, groups.get(1).id(), otherActivation));
             final var recovered = leader(nodes, 0);
+            assertEquals(activation, recovered.activation(0));
             recovered.append(0, operation(first, 21));
             final var history = recovered.scan(0, -1, Set.of(first, second)).operations();
             assertEquals(22, history.size());
@@ -144,6 +149,11 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
     }
 
     private void startAll(Fixture fixture, List<JournalProcess> nodes, boolean bootstrap) throws Exception {
+        startAll(fixture, nodes, bootstrap, Map.of());
+    }
+
+    private void startAll(Fixture fixture, List<JournalProcess> nodes, boolean bootstrap, Map<UUID, LogCheckpoint> requiredActivations)
+        throws Exception {
         for (var original : fixture.configurations()) {
             final var configuration = new JournalConfiguration(
                 original.deploymentId(),
@@ -153,10 +163,24 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
                 bootstrap,
                 original.limits()
             );
-            nodes.add(JournalProcess.start(configuration, createTempDir().resolve("voter.log")));
+            nodes.add(JournalProcess.start(configuration, createTempDir().resolve("voter.log"), requiredActivations));
         }
-        for (int group = 0; group < fixture.configurations().getFirst().groups().size(); group++) {
-            leader(nodes, group).activate(group);
+        final var groups = fixture.configurations().getFirst().groups();
+        for (int group = 0; group < groups.size(); group++) {
+            final var node = leader(nodes, group);
+            final var required = requiredActivations.get(groups.get(group).id());
+            if (required == null) {
+                node.activate(group);
+            } else {
+                final int groupIndex = group;
+                assertBusy(() -> {
+                    try {
+                        assertEquals(required, node.activation(groupIndex));
+                    } catch (IOException awaitingReplay) {
+                        throw new AssertionError("waiting for established activation replay", awaitingReplay);
+                    }
+                }, 20, TimeUnit.SECONDS);
+            }
         }
     }
 

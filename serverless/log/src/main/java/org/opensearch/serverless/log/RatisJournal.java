@@ -126,10 +126,22 @@ public final class RatisJournal implements Closeable {
         }
     }
 
+    /**
+     * Historical proof exposed only to the trusted bootstrap controller. It does not establish
+     * present read authority or authorize a replacement group.
+     * @param deploymentId deployment namespace
+     * @param initialPlacement original reserved voters
+     * @param checkpoint first committed activation marker
+     */
+    @InternalApi
+    public record GroupActivation(UUID deploymentId, JournalConfiguration.Group initialPlacement, LogCheckpoint checkpoint) {
+    }
+
     private static final byte[] SEED_PAYLOAD = new byte[] { 0 };
     private static final byte[] ACTIVATION_PAYLOAD = new byte[] { 1 };
     private final Map<UUID, JournalStateMachine> stateMachines = new ConcurrentHashMap<>();
     private final JournalConfiguration configuration;
+    private final Map<UUID, LogCheckpoint> expectedActivations;
     private final JournalStorage storage;
     private final DiskSpaceProbe diskSpace;
     private final JournalAdmission admission;
@@ -145,9 +157,11 @@ public final class RatisJournal implements Closeable {
         JournalStorage storage,
         DiskSpaceProbe diskSpace,
         X509KeyManager keyManager,
-        X509TrustManager trustManager
+        X509TrustManager trustManager,
+        Map<UUID, LogCheckpoint> expectedActivations
     ) throws IOException {
         this.configuration = configuration;
+        this.expectedActivations = expectedActivations;
         this.storage = storage;
         this.diskSpace = diskSpace;
         this.admission = new JournalAdmission(configuration.limits());
@@ -239,13 +253,46 @@ public final class RatisJournal implements Closeable {
         X509TrustManager trustManager,
         DiskSpaceProbe diskSpace
     ) throws IOException {
+        return open(configuration, keyManager, trustManager, diskSpace, Map.of());
+    }
+
+    /**
+     * Starts a controller-authorized journal with historical activation requirements. An established
+     * group can replay its original marker but cannot initialize a fresh history if replay is missing.
+     * @param configuration authorized placement and limits
+     * @param keyManager journal member credentials
+     * @param trustManager deployment-scoped journal trust
+     * @param diskSpace actual-volume disk probe
+     * @param expectedActivations original catalog markers for already-activated assigned groups
+     * @return running journal, initially unable to append until required activation is replayed
+     * @throws IOException on invalid authorization, storage or startup failure
+     */
+    public static RatisJournal open(
+        JournalConfiguration configuration,
+        X509KeyManager keyManager,
+        X509TrustManager trustManager,
+        DiskSpaceProbe diskSpace,
+        Map<UUID, LogCheckpoint> expectedActivations
+    ) throws IOException {
         Objects.requireNonNull(configuration);
         Objects.requireNonNull(keyManager);
         Objects.requireNonNull(trustManager);
         Objects.requireNonNull(diskSpace);
+        final var activations = Map.copyOf(expectedActivations);
+        for (var required : activations.entrySet()) {
+            final var assigned = configuration.groups().stream().filter(group -> group.id().equals(required.getKey())).findFirst();
+            if (assigned.isEmpty()) {
+                throw new IOException("activation requirement names an unassigned physical group");
+            }
+            try {
+                new JournalGroupRecord(configuration.deploymentId(), assigned.get(), required.getValue());
+            } catch (IllegalArgumentException failure) {
+                throw new IOException("activation requirement differs from authorized group lineage", failure);
+            }
+        }
         final var storage = JournalStorage.open(configuration);
         try {
-            return new RatisJournal(configuration, storage, diskSpace, keyManager, trustManager);
+            return new RatisJournal(configuration, storage, diskSpace, keyManager, trustManager, activations);
         } catch (IOException | RuntimeException | Error failure) {
             try {
                 if (storage.isProcessOwned() == false) {
@@ -273,7 +320,7 @@ public final class RatisJournal implements Closeable {
         if (operation.logId().equals(activationIdentity(groupId))) {
             throw new IOException("physical group control identity is reserved");
         }
-        if (stateMachines.get(groupId).activated == false) {
+        if (stateMachines.get(groupId).activation == null) {
             throw new IOException("physical group has not completed initial voter activation");
         }
         return appendFrame(groupId, operation);
@@ -295,8 +342,11 @@ public final class RatisJournal implements Closeable {
         if (division.getInfo().isLeaderReady() == false) {
             throw new IOException("local journal member is not the ready leader");
         }
-        if (stateMachines.get(groupId).activated) {
+        if (stateMachines.get(groupId).activation != null) {
             return CompletableFuture.<Void>completedFuture(null).minimalCompletionStage();
+        }
+        if (expectedActivations.containsKey(groupId)) {
+            throw new IOException("established group must replay its original activation; fresh activation is forbidden");
         }
         return appendFrame(
             groupId,
@@ -317,6 +367,23 @@ public final class RatisJournal implements Closeable {
                 return CompletableFuture.<Void>failedFuture(failure);
             }
         }).toCompletableFuture().minimalCompletionStage();
+    }
+
+    /**
+     * Returns the original activation marker after committed local application. The controller
+     * must persist it against the same reserved placement before authorizing logical shards.
+     * This historical evidence remains valid through leadership changes and quorum loss.
+     * @param groupId assigned physical group
+     * @return immutable original placement and its committed activation coordinate
+     * @throws IOException when closed, fenced, unassigned, or not activated
+     */
+    public GroupActivation groupActivation(UUID groupId) throws IOException {
+        division(groupId);
+        final var checkpoint = stateMachines.get(groupId).activation;
+        if (checkpoint == null) {
+            throw new IOException("physical group has no committed activation marker");
+        }
+        return new GroupActivation(configuration.deploymentId(), groups.get(groupId), checkpoint);
     }
 
     private CompletableFuture<Void> watchAllCommitted(UUID groupId, long index) throws IOException {
@@ -501,7 +568,7 @@ public final class RatisJournal implements Closeable {
     }
 
     private ShardLogId activationIdentity(UUID group) {
-        return new ShardLogId(configuration.deploymentId(), "__journal_group/" + group, 0, group);
+        return JournalGroupRecord.controlIdentity(configuration.deploymentId(), group);
     }
 
     private boolean isActivation(OperationEnvelope operation, UUID group) throws IOException {
@@ -524,7 +591,7 @@ public final class RatisJournal implements Closeable {
 
     private final class JournalStateMachine extends BaseStateMachine {
         private final UUID group;
-        private volatile boolean activated;
+        private volatile LogCheckpoint activation;
 
         private JournalStateMachine(UUID group) {
             this.group = group;
@@ -552,7 +619,7 @@ public final class RatisJournal implements Closeable {
             requireDiskSpace();
             requireRetainedCapacity(group);
             final var operation = decodeOperation(request.getMessage().getContent());
-            if (isActivation(operation, group) == false && activated == false) {
+            if (isActivation(operation, group) == false && activation == null) {
                 throw new IOException("physical group has not completed initial voter activation");
             }
             return super.startTransaction(request);
@@ -566,9 +633,8 @@ public final class RatisJournal implements Closeable {
                 }
                 final var entry = transaction.getLogEntry();
                 final var operation = decodeOperation(entry.getStateMachineLogEntry().getLogData());
-                if (isActivation(operation, group)) {
-                    activated |= Arrays.equals(operation.payloadReader().readAllBytes(), ACTIVATION_PAYLOAD);
-                } else if (activated == false) {
+                final boolean control = isActivation(operation, group);
+                if (control == false && activation == null) {
                     throw new IOException("logical operation precedes physical group activation");
                 }
                 final var checkpoint = new LogCheckpoint(operation.logId(), entry.getIndex(), entry.getTerm());
@@ -576,7 +642,19 @@ public final class RatisJournal implements Closeable {
                 try (var out = new OutputStreamStreamOutput(bytes)) {
                     checkpoint.writeTo(out);
                 }
+                final boolean initialActivation = control
+                    && activation == null
+                    && Arrays.equals(operation.payloadReader().readAllBytes(), ACTIVATION_PAYLOAD);
+                if (initialActivation) {
+                    final var required = expectedActivations.get(group);
+                    if (required != null && required.equals(checkpoint) == false) {
+                        throw new IOException("committed activation differs from the durable controller catalog");
+                    }
+                }
                 updateLastAppliedTermIndex(entry.getTerm(), entry.getIndex());
+                if (initialActivation) {
+                    activation = checkpoint;
+                }
                 return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(bytes.toByteArray())));
             } catch (IOException failure) {
                 failed = failure;

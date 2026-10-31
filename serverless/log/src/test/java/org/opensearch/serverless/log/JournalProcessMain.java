@@ -31,6 +31,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -49,6 +50,7 @@ public final class JournalProcessMain {
     static final int CLOSE_STAY = 7;
     static final int ACTIVATE = 8;
     static final int IO_OPEN = 9;
+    static final int ACTIVATION_COORDINATE = 10;
     static final int FRAME_LIMIT = 17 * 1024;
 
     private JournalProcessMain() {}
@@ -60,15 +62,17 @@ public final class JournalProcessMain {
 
     /**
      * Runs one voter process from a trusted fixture's placement arguments.
-     * @param arguments volume, namespace, local UUID, bootstrap, group UUID CSV, then three peer triples
+     * @param arguments volume, namespace, local UUID, bootstrap, group UUID CSV, three peer triples, and optional activation CSV
      * @throws Exception on startup or broken control channel
      */
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length != 14) {
-            throw new IllegalArgumentException("expected volume, namespace, identity, bootstrap, groups, and three peer triples");
+        if (arguments.length != 14 && arguments.length != 15) {
+            throw new IllegalArgumentException(
+                "expected volume, namespace, identity, bootstrap, groups, three peer triples, and optional activation CSV"
+            );
         }
         final var peers = new ArrayList<JournalConfiguration.Peer>();
-        for (int i = 5; i < arguments.length; i += 3) {
+        for (int i = 5; i < 14; i += 3) {
             peers.add(
                 new JournalConfiguration.Peer(
                     UUID.fromString(arguments[i]),
@@ -103,6 +107,24 @@ public final class JournalProcessMain {
         }
         final var trustFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
         trustFactory.init(trust);
+        final var requiredActivations = new HashMap<UUID, LogCheckpoint>();
+        if (arguments.length == 15 && arguments[14].isEmpty() == false) {
+            for (String value : arguments[14].split(",")) {
+                final String[] fields = value.split(":");
+                if (fields.length != 3 || requiredActivations.size() >= 4) {
+                    throw new IOException("invalid fixture activation requirements");
+                }
+                final UUID group = UUID.fromString(fields[0]);
+                requiredActivations.put(
+                    group,
+                    new LogCheckpoint(
+                        JournalGroupRecord.controlIdentity(configuration.deploymentId(), group),
+                        Long.parseLong(fields[1]),
+                        Long.parseLong(fields[2])
+                    )
+                );
+            }
+        }
         final var stall = new AtomicBoolean();
         final var entered = new AtomicBoolean();
         final var release = new CountDownLatch(1);
@@ -128,7 +150,8 @@ public final class JournalProcessMain {
                         }
                     }
                     return Long.MAX_VALUE;
-                }
+                },
+                requiredActivations
             );
             var input = new DataInputStream(new BufferedInputStream(System.in));
             var output = new DataOutputStream(protocolOutput())
@@ -179,6 +202,11 @@ public final class JournalProcessMain {
                                 writeCheckpoint(output, item.checkpoint());
                                 writeFrame(output, item.operation().encode(16384));
                             }
+                        }
+                        case ACTIVATION_COORDINATE -> {
+                            final var activation = journal.groupActivation(groups.get(input.readInt()).id());
+                            output.writeByte(0);
+                            writeCheckpoint(output, activation.checkpoint());
                         }
                         case ACTIVATE -> {
                             journal.activateGroup(groups.get(input.readInt()).id()).toCompletableFuture().get(20, TimeUnit.SECONDS);

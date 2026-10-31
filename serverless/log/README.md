@@ -89,6 +89,39 @@ another live voter. The curated `ratis-server` artifact closes failed groups and
 unpublished logs on startup errors. Other I/O-error cleanup paths still require
 qualification; the lifetime lease prevents their old tasks overlapping a new voter.
 
+## Durable bootstrap catalog
+
+`JournalGroupCatalog` in the shell metadata package stores one permanent deployment
+identity and one conditional register per physical group under
+`RegisterMap.journalGroups(base)`. A bounded, checksummed `JournalGroupRecord`
+binds the deployment, unique group UUID, and canonical initial voter UUIDs,
+addresses, and AZ labels. Retrying the same reservation is idempotent; changing its
+placement is refused. No catalog deletion or identity reuse API is exposed.
+
+The controller must reserve the complete initial placement before calling
+`catalog.openJournal` on the three hosts. This entry point checks every reservation
+before touching local storage or starting SDK services. After `activateGroup`
+completes, the controller calls `publishActivation` on its own bounded executor.
+Publication records the first committed activation coordinate with conditional
+replacement. A lost storage reply is reconciled by retrying against the same
+reservation and marker. Only the durable active record may authorize assigning
+logical shards. These are lifecycle operations; normal appends perform no catalog
+read or write, and catalog I/O must never run on a Raft completion callback.
+
+Recovery uses `bootstrap=false` and the original placement. The catalog passes its
+active marker to the journal: until that marker replays, the journal cannot append
+or seed a fresh activation. A different committed activation fences the local
+journal. The marker is historical evidence, not current-read authority. It does
+not by itself prove completeness of all later data; omitted-tail detection and
+archive/recovery-boundary qualification remain separate work.
+
+The catalog API does not yet drive the node startup lifecycle or enable an index
+mode. Safe membership transitions, logical-shard activation and migration still
+need their controllers. Initial placement is immutable; operators must never edit
+it to simulate reconfiguration or bootstrap an active group after quorum loss.
+The protocol tests use local filesystem conditional registers; they do not
+establish a cloud provider's failure or durability behavior.
+
 ## Authentication and replay
 
 Peer consensus RPCs require mutual TLS. Network client-write and admin services

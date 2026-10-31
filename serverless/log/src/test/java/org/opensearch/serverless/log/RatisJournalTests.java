@@ -37,6 +37,7 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
@@ -130,8 +131,13 @@ public class RatisJournalTests extends OpenSearchTestCase {
             final var leader = leader(journals, group);
             final var stream = new ShardLogId(fixture.deployment(), "index", 0, UUID.randomUUID());
             expectThrows(IOException.class, () -> leader.append(group, operation(stream, 0)));
+            expectThrows(IOException.class, () -> leader.groupActivation(group));
             leader.activateGroup(group).toCompletableFuture().get(20, TimeUnit.SECONDS);
+            final var activation = leader.groupActivation(group);
+            assertEquals(fixture.deployment(), activation.deploymentId());
+            assertEquals(group, activation.initialPlacement().id());
             final var control = new ShardLogId(fixture.deployment(), "__journal_group/" + group, 0, group);
+            assertEquals(control, activation.checkpoint().logId());
             expectThrows(IOException.class, () -> leader.append(group, operation(control, 0)));
             leader.append(group, operation(stream, 0)).toCompletableFuture().get(10, TimeUnit.SECONDS);
             final var before = leader.scan(group, -1, Set.of(stream, control), 4096, 65536);
@@ -139,6 +145,7 @@ public class RatisJournalTests extends OpenSearchTestCase {
             assertEquals(stream, before.operations().getFirst().operation().logId());
             leader.activateGroup(group).toCompletableFuture().get(10, TimeUnit.SECONDS);
             assertEquals(before.committedIndex(), leader.scan(group, -1, Set.of(), 4096, 65536).committedIndex());
+            assertEquals(activation, leader.groupActivation(group));
             Thread.currentThread().interrupt();
             try {
                 expectThrows(IOException.class, leader::close);
@@ -149,6 +156,24 @@ public class RatisJournalTests extends OpenSearchTestCase {
             expectThrows(IOException.class, () -> leader.append(group, operation(stream, 1)));
             // Finally retries native cleanup without the interrupt; the process lease remains held.
 
+        } finally {
+            closeAll(journals);
+        }
+    }
+
+    public void testEstablishedActivationCannotBeReplacedWhenItsHistoryIsMissing() throws Exception {
+        final var fixture = fixture(1);
+        final var journals = new ArrayList<RatisJournal>();
+        final UUID group = fixture.configurations().getFirst().groups().getFirst().id();
+        final var required = new LogCheckpoint(JournalGroupRecord.controlIdentity(fixture.deployment(), group), 100, 50);
+        try {
+            // Simulate controller evidence of an established history absent from these empty logs.
+            openAll(fixture, journals, true, Map.of(group, required));
+            final var leader = leader(journals, group);
+            expectThrows(IOException.class, () -> leader.activateGroup(group));
+            expectThrows(IOException.class, () -> leader.groupActivation(group));
+            final var stream = new ShardLogId(fixture.deployment(), "index", 0, UUID.randomUUID());
+            expectThrows(IOException.class, () -> leader.append(group, operation(stream, 0)));
         } finally {
             closeAll(journals);
         }
@@ -304,6 +329,15 @@ public class RatisJournalTests extends OpenSearchTestCase {
     }
 
     private static void openAll(Fixture fixture, List<RatisJournal> journals, boolean bootstrap) throws Exception {
+        openAll(fixture, journals, bootstrap, Map.of());
+    }
+
+    private static void openAll(
+        Fixture fixture,
+        List<RatisJournal> journals,
+        boolean bootstrap,
+        Map<UUID, LogCheckpoint> requiredActivations
+    ) throws Exception {
         for (var initial : fixture.configurations()) {
             final var configuration = new JournalConfiguration(
                 initial.deploymentId(),
@@ -313,7 +347,7 @@ public class RatisJournalTests extends OpenSearchTestCase {
                 bootstrap,
                 initial.limits()
             );
-            journals.add(RatisJournal.open(configuration, fixture.key(), fixture.trust(), fixture.space()::get));
+            journals.add(RatisJournal.open(configuration, fixture.key(), fixture.trust(), fixture.space()::get, requiredActivations));
         }
 
     }

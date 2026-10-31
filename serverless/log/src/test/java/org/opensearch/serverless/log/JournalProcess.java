@@ -25,7 +25,9 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -55,6 +57,11 @@ final class JournalProcess implements AutoCloseable {
     }
 
     static JournalProcess start(JournalConfiguration configuration, Path log) throws IOException {
+        return start(configuration, log, Map.of());
+    }
+
+    static JournalProcess start(JournalConfiguration configuration, Path log, Map<UUID, LogCheckpoint> requiredActivations)
+        throws IOException {
         final List<String> arguments = new ArrayList<>();
         arguments.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
         arguments.add("-Xms64m");
@@ -74,6 +81,12 @@ final class JournalProcess implements AutoCloseable {
             arguments.add(Integer.toString(peer.port()));
             arguments.add(peer.availabilityZone());
         }
+        arguments.add(
+            requiredActivations.entrySet()
+                .stream()
+                .map(entry -> entry.getKey() + ":" + entry.getValue().index() + ":" + entry.getValue().entryTerm())
+                .collect(Collectors.joining(","))
+        );
         final var fixture = new JournalProcess(startProcess(arguments, log), log);
         try {
             fixture.execute(() -> {
@@ -137,6 +150,10 @@ final class JournalProcess implements AutoCloseable {
             }
             return new RatisJournal.ScanBatch(operations, through, committed);
         });
+    }
+
+    LogCheckpoint activation(int group) throws IOException {
+        return exchange(JournalProcessMain.ACTIVATION_COORDINATE, out -> out.writeInt(group), JournalProcess::readCheckpoint);
     }
 
     void activate(int group) throws IOException {

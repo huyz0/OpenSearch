@@ -58,6 +58,7 @@ tasks.named('test').configure {
   exclude '**/Serverless*MeasurementTests.class'
   exclude '**/ServerlessFleetScaleTests.class'
   exclude '**/ServerlessLatencyBenchmarkTests.class'
+  exclude '**/JournalGroupCatalogRuntimeTests.class'
   exclude '**/RatisPersistenceSpikeTests.class'
   exclude '**/RatisGroupCountBenchmarkTests.class'
   exclude '**/ServerlessRealPluginTests.class'
@@ -240,3 +241,13 @@ tasks.named('processTestResources').configure {
     into 'rest-api-spec/api'
   }
 }
+
+// Bootstrap authorization must be exercised with real journal sockets outside the unit sandbox.
+tasks.register('journalCatalogTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/JournalGroupCatalogRuntimeTests.class'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'tests.system_call_filter', 'false'
+}
+tasks.named('check').configure { dependsOn 'journalCatalogTest' }

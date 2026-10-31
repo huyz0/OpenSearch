@@ -178,3 +178,33 @@ close returning while the log worker still held unfinished disk work. Holding th
 OS lock until process exit prevents a replacement voter overlapping that work.
 In-process hot reopening is unsupported. Membership changes within a running
 journal remain separate work; this decision does not change Raft election rules.
+
+## Permanent bootstrap reservations
+
+The dedicated journal catalog stores an immutable deployment UUID and one
+conditional register per physical group, separate from legacy descriptors,
+shard-head leases, and node discovery. A reservation permanently binds the unique
+group UUID and its canonical initial voter identities, addresses, and verified AZ
+labels. It cannot be overwritten to create an independent group after quorum
+loss. Initial reservation and activation are lifecycle writes; they add no S3
+request to normal consensus appends.
+
+The controller validates reservations before opening local journal volumes. After
+the all-initial-voter seed barrier and majority activation marker commit, it
+publishes that first marker with conditional replacement. Retries reconcile the
+same durable marker after lost replies. Logical-shard assignment must wait for the
+active catalog state. Catalog storage I/O runs on a bounded controller executor,
+never on Raft completion threads.
+
+On recovery, catalog activation evidence is passed into the journal. Missing
+replay cannot trigger fresh activation, and a different committed marker fences
+the local journal before advancing its applied prefix. This is historical lineage
+evidence, not authority for a current read, and it does not prove completeness of
+later log tails. Full local corruption-boundary and S3 recovery-catalog proofs
+remain required.
+
+The first catalog implements reservation and activation only. It does not yet run
+from the node lifecycle or authorize voter replacement. Safe learner catch-up and
+membership changes need separate durable transitions; editing genesis placement
+is not a membership protocol. Local conditional-register tests and real local
+journal integration do not substitute for cloud or independent-AZ qualification.

@@ -87,5 +87,16 @@ asynchronous S3 archival are not enabled by these foundation commits.
   iterations; 75 unit and 30 journal cases, vendor/log module checks, full artifact
   audits, upstream byte verification, and root precommit also passed.
 
+- Bootstrap catalog: permanent deployment/group reservation registers, canonical
+  genesis placement, pre-volume startup authorization, and conditional publication
+  of the first committed activation marker. Lost reservation/activation replies
+  reconcile against the original identity; active groups cannot bootstrap another
+  history. Recovery requires replay of the catalog's original activation marker.
+  Three iterations passed 90 log unit cases, 33 journal cases, 15 catalog protocol
+  cases, 45 existing metadata cases, and three real-journal/catalog integration
+  cases. Log module check and root precommit passed. These counts exclude Gradle's
+  filtered-class descriptors. Node lifecycle wiring, safe learner replacement, and
+  logical-shard authorization remain pending; catalog tests use local FS registers.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

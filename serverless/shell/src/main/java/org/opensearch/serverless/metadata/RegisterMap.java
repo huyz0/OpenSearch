@@ -45,6 +45,15 @@ public final class RegisterMap {
     private RegisterMap() {}
 
     /**
+     * Returns the dedicated durable journal bootstrap catalog prefix.
+     * @param base deployment object-store root
+     * @return container with immutable deployment identity and per-group reservations
+     */
+    public static BlobPath journalGroups(BlobPath base) {
+        return base.add("journal").add("groups");
+    }
+
+    /**
      * Returns the container path holding index descriptors.
      *
      * @param base the deployment's base path
