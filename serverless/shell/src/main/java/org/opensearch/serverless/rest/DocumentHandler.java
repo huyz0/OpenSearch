@@ -299,22 +299,10 @@ public final class DocumentHandler extends BaseRestHandler {
         }
         serving.actionGate()
             .runAsync(
+                serving.threadPool(),
                 deletion ? org.opensearch.action.delete.DeleteAction.NAME : org.opensearch.action.index.IndexAction.NAME,
                 request,
-                (admitted, listener) -> {
-                    if (org.opensearch.transport.Transports.isTransportThread(Thread.currentThread())) {
-                        // A filter may resume from a network callback; its admitted work can read the store.
-                        serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
-                            try {
-                                planAcceptedWrite(metadata, serving, deletion, admitted, listener);
-                            } catch (Exception e) {
-                                listener.onFailure(e);
-                            }
-                        });
-                    } else {
-                        planAcceptedWrite(metadata, serving, deletion, admitted, listener);
-                    }
-                },
+                (admitted, listener) -> planAcceptedWrite(metadata, serving, deletion, admitted, listener),
                 writeView(deletion),
                 completed
             );

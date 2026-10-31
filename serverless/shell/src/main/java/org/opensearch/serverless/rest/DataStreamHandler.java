@@ -144,16 +144,17 @@ public final class DataStreamHandler extends BaseRestHandler {
             switch (method) {
                 case PUT -> serving.actionGate()
                     .runAsync(
+                        serving.threadPool(),
                         org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.NAME,
                         new org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.Request(name),
-                        (admitted, listener) -> onWorker(serving, listener, () -> {
+                        (admitted, listener) -> {
                             final var selected = (org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.Request) admitted;
                             final var invalid = selected.validate();
                             if (invalid != null) {
                                 throw invalid;
                             }
                             listener.onResponse(create(serving, metadata, selected.indices()[0]));
-                        }),
+                        },
                         org.opensearch.serverless.shell.ActionGate.identity(
                             org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                         ),
@@ -161,18 +162,19 @@ public final class DataStreamHandler extends BaseRestHandler {
                     );
                 case GET -> serving.actionGate()
                     .runAsync(
+                        serving.threadPool(),
                         org.opensearch.action.admin.indices.datastream.GetDataStreamAction.NAME,
                         new org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Request(
                             org.opensearch.core.common.Strings.splitStringByCommaToArray(name)
                         ),
-                        (admitted, listener) -> onWorker(serving, listener, () -> {
+                        (admitted, listener) -> {
                             final var selected = (org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Request) admitted;
                             final var invalid = selected.validate();
                             if (invalid != null) {
                                 throw invalid;
                             }
                             listener.onResponse(describe(serving, metadata, selected.indices()));
-                        }),
+                        },
                         org.opensearch.serverless.shell.ActionGate.identity(
                             org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response.class
                         ),
@@ -180,11 +182,12 @@ public final class DataStreamHandler extends BaseRestHandler {
                     );
                 case DELETE -> serving.actionGate()
                     .runAsync(
+                        serving.threadPool(),
                         org.opensearch.action.admin.indices.datastream.DeleteDataStreamAction.NAME,
                         new org.opensearch.action.admin.indices.datastream.DeleteDataStreamAction.Request(
                             org.opensearch.core.common.Strings.splitStringByCommaToArray(name)
                         ),
-                        (admitted, listener) -> onWorker(serving, listener, () -> {
+                        (admitted, listener) -> {
                             final var selected = (org.opensearch.action.admin.indices.datastream.DeleteDataStreamAction.Request) admitted;
                             final var invalid = selected.validate();
                             if (invalid != null) {
@@ -207,7 +210,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                                 serving,
                                 () -> listener.onResponse(new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true))
                             );
-                        }),
+                        },
                         org.opensearch.serverless.shell.ActionGate.identity(
                             org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                         ),
@@ -216,25 +219,6 @@ public final class DataStreamHandler extends BaseRestHandler {
                 default -> sendQuietly(channel, RestStatus.METHOD_NOT_ALLOWED, "method_not_allowed", method + " is not supported here");
             }
         });
-    }
-
-    private static void onWorker(
-        ServerlessNode serving,
-        org.opensearch.core.action.ActionListener<?> listener,
-        org.opensearch.common.CheckedRunnable<Exception> work
-    ) {
-        final Runnable run = () -> {
-            try {
-                work.run();
-            } catch (Exception e) {
-                listener.onFailure(e);
-            }
-        };
-        if (org.opensearch.transport.Transports.isTransportThread(Thread.currentThread())) {
-            serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(run);
-        } else {
-            run.run();
-        }
     }
 
     private <

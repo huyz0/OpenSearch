@@ -29,6 +29,92 @@ public class ActionGateAsyncTests extends OpenSearchTestCase {
         return new ActionGate(plugin.getActionFilters());
     }
 
+    public void testNetworkWorkMovesToAWorkerWithItsRequestContext() throws Exception {
+        final var pool = new org.opensearch.threadpool.TestThreadPool("async-gate-dispatch");
+        try {
+            for (boolean filtered : new boolean[] { false, true }) {
+                final var gate = filtered ? gate(PolicyFilterPlugin.request(ACTION, request -> request)) : new ActionGate(List.of());
+                final var completion = PlainActionFuture.<AcknowledgedResponse>newFuture();
+                onNetworkThread(() -> {
+                    try (var context = pool.getThreadContext().stashContext()) {
+                        pool.getThreadContext().putHeader("request-marker", "preserved");
+                        gate.runAsync(pool, ACTION, new GetRequest("index", "item"), (request, listener) -> {
+                            assertFalse(org.opensearch.transport.Transports.isTransportThread(Thread.currentThread()));
+                            assertEquals("preserved", pool.getThreadContext().getHeader("request-marker"));
+                            listener.onResponse(new AcknowledgedResponse(true));
+                        }, ActionGate.identity(AcknowledgedResponse.class), completion);
+                    }
+                });
+                assertTrue(completion.get(10, TimeUnit.SECONDS).isAcknowledged());
+            }
+        } finally {
+            assertTrue(org.opensearch.threadpool.ThreadPool.terminate(pool, 10, TimeUnit.SECONDS));
+        }
+    }
+
+    public void testWorkerFailurePreservesTheCheckedException() throws Exception {
+        final var pool = new org.opensearch.threadpool.TestThreadPool("async-gate-failure");
+        try {
+            for (boolean filtered : new boolean[] { false, true }) {
+                final var gate = filtered ? gate(PolicyFilterPlugin.request(ACTION, request -> request)) : new ActionGate(List.of());
+                final var completion = PlainActionFuture.<AcknowledgedResponse>newFuture();
+                final var failure = new IOException("store unavailable");
+                onNetworkThread(
+                    () -> gate.runAsync(
+                        pool,
+                        ACTION,
+                        new GetRequest("index", "item"),
+                        (request, listener) -> { throw failure; },
+                        ActionGate.identity(AcknowledgedResponse.class),
+                        completion
+                    )
+                );
+                assertSame(failure, expectThrows(ExecutionException.class, () -> completion.get(10, TimeUnit.SECONDS)).getCause());
+            }
+        } finally {
+            assertTrue(org.opensearch.threadpool.ThreadPool.terminate(pool, 10, TimeUnit.SECONDS));
+        }
+    }
+
+    public void testRejectedWorkerFailsCompletionWithoutStartingWork() throws Exception {
+        final var rejected = Executors.newSingleThreadExecutor();
+        rejected.shutdown();
+        final var pool = org.mockito.Mockito.mock(org.opensearch.threadpool.ThreadPool.class);
+        org.mockito.Mockito.when(pool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)).thenReturn(rejected);
+        try {
+            for (boolean filtered : new boolean[] { false, true }) {
+                final var gate = filtered ? gate(PolicyFilterPlugin.request(ACTION, request -> request)) : new ActionGate(List.of());
+                final var completion = PlainActionFuture.<AcknowledgedResponse>newFuture();
+                final var started = new AtomicBoolean();
+                onNetworkThread(() -> gate.runAsync(pool, ACTION, new GetRequest("index", "item"), (request, listener) -> {
+                    started.set(true);
+                    listener.onResponse(new AcknowledgedResponse(true));
+                }, ActionGate.identity(AcknowledgedResponse.class), completion));
+                final var failure = expectThrows(ExecutionException.class, () -> completion.get(10, TimeUnit.SECONDS)).getCause();
+                assertTrue(failure.toString(), failure instanceof java.util.concurrent.RejectedExecutionException);
+                assertFalse(started.get());
+            }
+        } finally {
+            rejected.shutdownNow();
+            assertTrue(rejected.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    private static void onNetworkThread(org.opensearch.common.CheckedRunnable<Exception> work) throws Exception {
+        final var executor = Executors.newSingleThreadExecutor(
+            task -> new Thread(task, org.opensearch.transport.Transports.TEST_MOCK_TRANSPORT_THREAD_PREFIX + "-gate-dispatch")
+        );
+        try {
+            executor.submit(() -> {
+                work.run();
+                return null;
+            }).get(10, TimeUnit.SECONDS);
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
     public void testWaitingForAsyncWorkDoesNotHoldTheCallingWorker() throws Exception {
         for (boolean filtered : new boolean[] { false, true }) {
             final var gate = filtered ? gate(PolicyFilterPlugin.request(ACTION, request -> request)) : new ActionGate(List.of());
