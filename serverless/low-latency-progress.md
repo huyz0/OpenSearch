@@ -139,5 +139,16 @@ asynchronous S3 archival are not enabled by these foundation commits.
   journal/consensus checks passed 48 journal and six native probe cases, with log
   module check and root precommit. These counts exclude filtered-class descriptors.
 
+- Callback reentry: a majority-loss history exposed activation reentering native
+  async submission under leader/watch locks, deadlocking both progress and close.
+  Bounded node workers now handle SDK submission and notification, with permits
+  released before public completion. This also fixes activation and dependent
+  appends at the valid one-request limit. Exact failing seed and one-permit
+  regressions passed three iterations. Dispatcher tests cover saturation with
+  slow callbacks, monitor separation, cancellation, synchronous failure and late
+  completion during close. The broad run passed 144 unit, 51 journal, three catalog
+  integration and six native probe cases across three iterations, with log module
+  check and root precommit. No additional SDK patch or per-write S3 call is needed.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

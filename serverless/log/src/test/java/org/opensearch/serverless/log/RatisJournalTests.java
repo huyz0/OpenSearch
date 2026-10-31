@@ -314,6 +314,52 @@ public class RatisJournalTests extends OpenSearchTestCase {
         expectThrows(IOException.class, () -> JournalDiskIdentity.discover(configuration.directory()));
     }
 
+    public void testActivationAndDependentAppendsWorkWithOnePendingPermit() throws Exception {
+        final var initial = fixture(1);
+        final var configurations = new ArrayList<JournalConfiguration>();
+        for (var configuration : initial.configurations()) {
+            final var limits = configuration.limits();
+            configurations.add(
+                new JournalConfiguration(
+                    configuration.deploymentId(),
+                    configuration.localVoterId(),
+                    configuration.directory(),
+                    configuration.groups(),
+                    true,
+                    new JournalConfiguration.Limits(
+                        limits.maximumGroups(),
+                        limits.maximumPayloadBytes(),
+                        1,
+                        limits.maximumPendingBytes(),
+                        limits.queueBytes(),
+                        limits.segmentBytes(),
+                        limits.cachedSegmentBytes(),
+                        limits.maximumRetainedEntries(),
+                        limits.minimumFreeBytes()
+                    )
+                )
+            );
+        }
+        final var fixture = new Fixture(initial.deployment(), configurations, initial.key(), initial.trust(), initial.space());
+        final var journals = new ArrayList<RatisJournal>();
+        try {
+            startAll(fixture, journals, true);
+            final UUID group = configurations.getFirst().groups().getFirst().id();
+            final var stream = new ShardLogId(fixture.deployment(), "dependent-append", 0, UUID.randomUUID());
+            final var leader = leader(journals, group);
+            leader.append(group, operation(stream, 0)).thenCompose(checkpoint -> {
+                try {
+                    return leader.append(group, operation(stream, 1));
+                } catch (IOException failure) {
+                    return java.util.concurrent.CompletableFuture.<LogCheckpoint>failedFuture(failure);
+                }
+            }).toCompletableFuture().get(10, TimeUnit.SECONDS);
+            assertEquals(2, leader.scan(group, -1, Set.of(stream), 100, 65536).operations().size());
+        } finally {
+            closeAll(journals);
+        }
+    }
+
     private record Fixture(UUID deployment, List<JournalConfiguration> configurations, X509KeyManager key, X509TrustManager trust,
         AtomicLong space) {
     }

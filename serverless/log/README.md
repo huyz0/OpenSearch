@@ -39,6 +39,24 @@ metadata and retry caches, bounded replay batches, TLS, and transport overhead.
 The retry-cache budget must be revisited before archival permits sustained history
 reclamation; a time-based native retry cache alone is not a hard count limit.
 
+## Submission and completion workers
+
+Native async submission can join the SDK's client executor, and native futures
+can complete while holding leader/watch locks. Calling back into submission from
+those locks deadlocks activation and shutdown. Local proposals and activation
+watches therefore dispatch both submission and notification through four bounded
+node workers, shared across physical groups. Their queue holds at most the node's
+pending-request limit; each charged proposal owns at most one queued task.
+
+Permits remain charged until notification is dequeued, then release before the
+public future completes. Dependent appends and activation handoffs consequently
+work with a single pending slot. Caller cancellation still cannot release accepted
+persistence. Close refuses new dispatch and queued proposals not yet submitted;
+it preserves the dispatcher for outstanding native results, including late I/O
+completion after SDK close. Once notifications drain, its workers terminate.
+The extra worker threads and queue hops require workload qualification; they add
+no object-store request and do not change the quorum persistence rule.
+
 ## Storage identity and startup
 
 The host must first provision and durably mount a dedicated journal directory.

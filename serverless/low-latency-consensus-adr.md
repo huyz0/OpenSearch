@@ -319,3 +319,22 @@ must next authorize learner startup, establish that specific learner's committed
 barrier coverage, issue the native configuration CAS, reconcile ambiguous results,
 and fence retired assignments before publishing completion. Intent is neither
 membership commitment nor permission to start an independent history.
+
+## Completion reentry and bounded dispatch
+
+A repeated majority-loss test exposed a deadlock: the leader completed a watch
+under its leader/watch locks, the activation continuation synchronously reentered
+native async submission, and that method joined another client-executor thread
+waiting for the held leader lock. Shutdown then waited indefinitely as well.
+A separate focused history reproduced activation failing at the valid one-request
+limit because its previous permit remained held while a continuation ran.
+
+Both SDK submission and notification now use four bounded workers per journal,
+shared by its physical groups. A permit stays charged through submission,
+persistence and queued notification, and releases before public completion.
+At most one queued task belongs to each charged permit, so the pending-request
+limit bounds the queue. Workers close only after outstanding notifications drain;
+late native results never fall back to running user continuations under SDK locks.
+The exact failing seed and the one-permit history passed three iterations.
+Cancellation, synchronous submission failure, slow callbacks at a full window,
+and late completion during close have deterministic dispatcher coverage.

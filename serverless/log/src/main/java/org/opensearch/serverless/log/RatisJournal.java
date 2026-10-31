@@ -146,6 +146,7 @@ public final class RatisJournal implements Closeable {
     private final JournalStorage storage;
     private final DiskSpaceProbe diskSpace;
     private final JournalAdmission admission;
+    private final JournalDispatch dispatch;
     private final Map<UUID, JournalConfiguration.Group> groups;
     private final ClientId clientId = ClientId.randomId();
     private final AtomicLong callIds = new AtomicLong();
@@ -168,6 +169,7 @@ public final class RatisJournal implements Closeable {
         this.admission = new JournalAdmission(configuration.limits());
         groups = configuration.groups().stream().collect(Collectors.toUnmodifiableMap(JournalConfiguration.Group::id, group -> group));
         requireDiskSpace();
+        dispatch = new JournalDispatch(configuration.localVoterId().toString(), configuration.limits());
         final var parameters = new Parameters();
         GrpcConfigKeys.TLS.setConf(parameters, new GrpcTlsConfig(keyManager, trustManager, true));
         GrpcConfigKeys.Server.setServicesCustomizer(parameters, (builder, types) -> builder.intercept(new ServerInterceptor() {
@@ -389,7 +391,6 @@ public final class RatisJournal implements Closeable {
 
     private CompletableFuture<Void> watchAllCommitted(UUID groupId, long index) throws IOException {
         final var permit = admission.acquire(0);
-        final CompletableFuture<org.apache.ratis.protocol.RaftClientReply> watched;
         try {
             final var request = RaftClientRequest.newBuilder()
                 .setClientId(clientId)
@@ -399,16 +400,16 @@ public final class RatisJournal implements Closeable {
                 .setMessage(Message.valueOf(ByteString.EMPTY))
                 .setType(RaftClientRequest.watchRequestType(index, ReplicationLevel.ALL_COMMITTED))
                 .build();
-            watched = server.submitClientRequestAsync(request).whenComplete((reply, failure) -> permit.close());
-        } catch (IOException | RuntimeException | Error failure) {
+            return dispatch.submit(permit, () -> server.submitClientRequestAsync(request)).thenApply(reply -> {
+                if (reply.isSuccess() == false) {
+                    throw new java.util.concurrent.CompletionException(reply.getException());
+                }
+                return (Void) null;
+            }).toCompletableFuture();
+        } catch (RuntimeException | Error | IOException failure) {
             permit.close();
             throw failure;
         }
-        return watched.thenCompose(
-            reply -> reply.isSuccess()
-                ? CompletableFuture.<Void>completedFuture(null)
-                : CompletableFuture.<Void>failedFuture(reply.getException())
-        );
     }
 
     private CompletionStage<LogCheckpoint> appendFrame(UUID groupId, OperationEnvelope operation) throws IOException {
@@ -424,9 +425,9 @@ public final class RatisJournal implements Closeable {
         requireDiskSpace();
         requireRetainedCapacity(groupId);
         final var permit = admission.acquire(operation.payloadLength());
-        final var completion = new CompletableFuture<LogCheckpoint>();
         try {
             final byte[] frame = operation.encode(configuration.limits().maximumPayloadBytes());
+            final var expectedIdentity = operation.logId();
             final var request = RaftClientRequest.newBuilder()
                 .setClientId(clientId)
                 .setServerId(server.getId())
@@ -435,30 +436,24 @@ public final class RatisJournal implements Closeable {
                 .setMessage(Message.valueOf(ByteString.copyFrom(frame)))
                 .setType(RaftClientRequest.writeRequestType())
                 .build();
-            server.submitClientRequestAsync(request).whenComplete((reply, failure) -> {
+            return dispatch.submit(permit, () -> server.submitClientRequestAsync(request)).thenApply(reply -> {
                 try {
-                    if (failure != null) {
-                        completion.completeExceptionally(failure);
-                    } else if (reply.isSuccess() == false) {
-                        completion.completeExceptionally(reply.getException());
-                    } else {
-                        final var checkpoint = decodeCheckpoint(reply.getMessage());
-                        if (checkpoint.logId().equals(operation.logId()) == false || checkpoint.index() != reply.getLogIndex()) {
-                            throw new IOException("committed reply does not match proposed operation");
-                        }
-                        completion.complete(checkpoint);
+                    if (reply.isSuccess() == false) {
+                        throw reply.getException();
                     }
-                } catch (Exception e) {
-                    completion.completeExceptionally(e);
-                } finally {
-                    permit.close();
+                    final var checkpoint = decodeCheckpoint(reply.getMessage());
+                    if (checkpoint.logId().equals(expectedIdentity) == false || checkpoint.index() != reply.getLogIndex()) {
+                        throw new IOException("committed reply does not match proposed operation");
+                    }
+                    return checkpoint;
+                } catch (IOException failure) {
+                    throw new java.util.concurrent.CompletionException(failure);
                 }
             });
         } catch (IOException | RuntimeException | Error failure) {
             permit.close();
             throw failure;
         }
-        return completion.minimalCompletionStage();
     }
 
     /**
@@ -786,6 +781,7 @@ public final class RatisJournal implements Closeable {
     public synchronized void close() throws IOException {
         closed = true;
         admission.close();
+        dispatch.close();
         if (Thread.currentThread().isInterrupted()) {
             throw new IOException("interrupted journal shutdown; retry cleanup from a non-interrupted thread");
         }
