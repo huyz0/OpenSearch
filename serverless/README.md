@@ -113,6 +113,11 @@ plugin API.
 
 ## Where it is, and what is unfinished
 
+The proposed SSD-backed quorum log, asynchronous S3 archive, and fresh-search
+replica architecture is described in
+[`low-latency-serverless-plan.md`](low-latency-serverless-plan.md). It is a delivery
+plan for `low-latency-serverless`, not implemented behavior of the current shell.
+
 [`STATUS.md`](STATUS.md) is the current statement of what works, what is refused on purpose,
 and what is genuinely still open. The one open item that was a correctness question rather than a missing
 feature -- the window between moving a shard's ownership and sealing its log -- is closed; see
