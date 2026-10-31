@@ -45,6 +45,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessLogRepairTests.class'
   exclude '**/Serverless*MeasurementTests.class'
   exclude '**/ServerlessFleetScaleTests.class'
+  exclude '**/ServerlessLatencyBenchmarkTests.class'
   exclude '**/ServerlessRealPluginTests.class'
   exclude '**/ServerlessTlsTests.class'
 }
@@ -161,6 +162,23 @@ tasks.register('fleetTest', Test) {
   // Every tests.fleet.* property given to Gradle reaches the test JVM.
   System.getProperties().each { key, value ->
     if (key.toString().startsWith('tests.fleet.')) {
+      systemProperty key.toString(), value.toString()
+    }
+  }
+  outputs.upToDateWhen { false }
+}
+
+// Explicit open-loop baseline; never runs as part of unit tests or check.
+tasks.register('latencyBenchmark', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/ServerlessLatencyBenchmarkTests.class'
+  systemProperty 'tests.system_call_filter', 'false'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'serverless.node.classpath', sourceSets.main.runtimeClasspath.asPath
+  systemProperty 'tests.latency.output', layout.buildDirectory.file('benchmarks/latency-baseline.json').get().asFile.absolutePath
+  System.getProperties().each { key, value ->
+    if (key.toString().startsWith('tests.latency.')) {
       systemProperty key.toString(), value.toString()
     }
   }
