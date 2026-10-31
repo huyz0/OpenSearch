@@ -127,5 +127,17 @@ asynchronous S3 archival are not enabled by these foundation commits.
   reported local I/O errors; they do not qualify arbitrary hardware failure or
   stalled I/O availability.
 
+- Membership serialization: separate bounded controller revision and pending
+  replacement records bind exact placements and idempotency nonces. A permanent
+  per-group voter reservation prevents identity reuse. Activation creates its
+  membership head first; missing heads never reset to genesis. Competing controller,
+  lost reply, deleted head, stale revision and retired identity histories are
+  covered. Static startup refuses pending intent before touching a volume. Native
+  learner startup, catch-up proof, configuration changes and completion publication
+  remain pending; no replacement endpoint is enabled. Three iterations passed
+  126 log unit, 36 catalog protocol and three catalog integration cases. The broad
+  journal/consensus checks passed 48 journal and six native probe cases, with log
+  module check and root precommit. These counts exclude filtered-class descriptors.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

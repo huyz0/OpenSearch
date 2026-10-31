@@ -21,6 +21,7 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.serverless.log.JournalConfiguration;
 import org.opensearch.serverless.log.JournalGroupRecord;
+import org.opensearch.serverless.log.JournalMembershipRecord;
 import org.opensearch.serverless.log.LogCheckpoint;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -187,6 +188,267 @@ public class JournalGroupCatalogTests extends OpenSearchTestCase {
             expectThrows(IOException.class, () -> catalog.read(corruptKey));
             assertEquals(valid, catalog.read(valid.initialPlacement().id()).orElseThrow());
         }
+    }
+
+    public void testReplacementIntentSurvivesRestartAndBlocksStaticStartupBeforeVolumeAccess() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final UUID deployment = UUID.randomUUID();
+            final var catalog = new JournalGroupCatalog(container, deployment);
+            final var group = group(UUID.randomUUID());
+            catalog.reserve(group);
+            expectThrows(IOException.class, () -> catalog.prepareReplacement(group.id(), 0, UUID.randomUUID(), replacement(group)));
+            activate(container, catalog, group);
+            final var initial = catalog.membership(group.id());
+            assertNull(initial.pending());
+            final UUID operation = UUID.randomUUID();
+            final var target = replacement(group);
+            final var pending = catalog.prepareReplacement(group.id(), 0, operation, target);
+            final var restarted = new JournalGroupCatalog(container, deployment);
+            assertEquals(pending, restarted.membership(group.id()));
+            assertEquals(pending, restarted.prepareReplacement(group.id(), 0, operation, target));
+            assertEquals(initial.genesis(), restarted.reserve(group));
+            expectThrows(IOException.class, () -> restarted.prepareReplacement(group.id(), 0, UUID.randomUUID(), target));
+            expectThrows(IOException.class, () -> restarted.prepareReplacement(group.id(), 1, operation, target));
+            final var volume = createTempDir();
+            final List<java.nio.file.Path> originalFiles;
+            try (var files = Files.list(volume)) {
+                originalFiles = files.sorted().toList();
+            }
+            final var configuration = new JournalConfiguration(
+                deployment,
+                group.peers().getFirst().id(),
+                volume,
+                List.of(group),
+                false,
+                JournalConfiguration.Limits.defaults()
+            );
+            final var failure = expectThrows(
+                IOException.class,
+                () -> restarted.openJournal(configuration, null, null, () -> Long.MAX_VALUE)
+            );
+            assertTrue(failure.getMessage(), failure.getMessage().contains("replacement reconciliation"));
+            try (var files = Files.list(volume)) {
+                assertEquals(originalFiles, files.sorted().toList());
+            }
+        }
+    }
+
+    public void testLostReplacementReplyReconcilesTheSameNonceAndPlacement() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var real = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final UUID deployment = UUID.randomUUID();
+            final var catalog = new JournalGroupCatalog(real, deployment);
+            final var group = group(UUID.randomUUID());
+            activate(real, catalog, group);
+            final var fail = new AtomicBoolean(true);
+            final var wrapper = new FilterBlobContainer(real) {
+                @Override
+                protected BlobContainer wrapChild(BlobContainer child) {
+                    throw new AssertionError("membership must use direct bounded register lookups");
+                }
+
+                @Override
+                public Optional<BlobRegister> readRegister(String name) throws IOException {
+                    return real.readRegister(name);
+                }
+
+                @Override
+                public BlobRegisterCasResult compareAndSwapRegister(String name, long expected, BytesReference value) throws IOException {
+                    final var result = real.compareAndSwapRegister(name, expected, value);
+                    if (name.startsWith("membership-") && result.applied()) {
+                        try (var in = value.streamInput()) {
+                            if (JournalMembershipRecord.read(in).pending() != null && fail.compareAndSet(true, false)) {
+                                throw new IOException("lost reply after replacement intent persisted");
+                            }
+                        }
+                    }
+                    return result;
+                }
+            };
+            final UUID operation = UUID.randomUUID();
+            final var target = replacement(group);
+            final var lossy = new JournalGroupCatalog(wrapper, deployment);
+            expectThrows(IOException.class, () -> lossy.prepareReplacement(group.id(), 0, operation, target));
+            final var observed = new JournalGroupCatalog(real, deployment).membership(group.id());
+            assertEquals(operation, observed.pending().id());
+            assertEquals(observed, lossy.prepareReplacement(group.id(), 0, operation, target));
+            assertEquals(observed.genesis(), catalog.read(group.id()).orElseThrow());
+        }
+    }
+
+    public void testCompetingReplacementControllersHaveOnlyOneDurableWinner() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final UUID deployment = UUID.randomUUID();
+            final var catalog = new JournalGroupCatalog(container, deployment);
+            final var group = group(UUID.randomUUID());
+            activate(container, catalog, group);
+            final var context = new ThreadContext(Settings.EMPTY);
+            final var pool = OpenSearchExecutors.newFixed(
+                "replace-voter",
+                2,
+                2,
+                OpenSearchExecutors.daemonThreadFactory("replace-voter"),
+                context
+            );
+            final var start = new CountDownLatch(1);
+            try {
+                final var futures = new ArrayList<Future<JournalMembershipRecord>>();
+                for (int i = 0; i < 2; i++) {
+                    final UUID operation = UUID.randomUUID();
+                    final var target = replacement(group);
+                    futures.add(pool.submit(() -> {
+                        start.await();
+                        return new JournalGroupCatalog(container, deployment).prepareReplacement(group.id(), 0, operation, target);
+                    }));
+                }
+                start.countDown();
+                JournalMembershipRecord winner = null;
+                int refused = 0;
+                for (var future : futures) {
+                    try {
+                        final var result = future.get(10, TimeUnit.SECONDS);
+                        assertNull(winner);
+                        winner = result;
+                    } catch (ExecutionException failure) {
+                        assertTrue(failure.getCause() instanceof IOException);
+                        refused++;
+                    }
+                }
+                assertNotNull(winner);
+                assertEquals(1, refused);
+                assertEquals(winner, catalog.membership(group.id()));
+            } finally {
+                start.countDown();
+                pool.shutdownNow();
+                assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    public void testCorruptOrForeignMembershipCannotAuthorizeStaticRecovery() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final UUID deployment = UUID.randomUUID();
+            final var catalog = new JournalGroupCatalog(container, deployment);
+            final var group = group(UUID.randomUUID());
+            activate(container, catalog, group);
+            final var other = group(UUID.randomUUID());
+            activate(container, catalog, other);
+            final var foreign = catalog.membership(other.id());
+            final String key = "membership-" + group.id();
+            final var originalHead = container.readRegister(key).orElseThrow();
+            assertTrue(container.compareAndSwapRegister(key, originalHead.generation(), new BytesArray(foreign.encode())).applied());
+            expectThrows(IOException.class, () -> catalog.membership(group.id()));
+            expectThrows(IOException.class, () -> catalog.prepareReplacement(group.id(), 0, UUID.randomUUID(), replacement(group)));
+            final var old = container.readRegister(key).orElseThrow();
+            assertTrue(container.compareAndSwapRegister(key, old.generation(), new BytesArray(new byte[] { 1 })).applied());
+            expectThrows(IOException.class, () -> catalog.membership(group.id()));
+        }
+    }
+
+    public void testMissingMembershipHeadNeverRecreatesRevisionZero() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final var catalog = new JournalGroupCatalog(container, UUID.randomUUID());
+            final var group = group(UUID.randomUUID());
+            activate(container, catalog, group);
+            final var target = replacement(group);
+            catalog.prepareReplacement(group.id(), 0, UUID.randomUUID(), target);
+            final String key = "membership-" + group.id();
+            final var head = container.readRegister(key).orElseThrow();
+            assertTrue(container.deleteRegisterIfUnchanged(key, head.generation()));
+            expectThrows(IOException.class, () -> catalog.membership(group.id()));
+            expectThrows(IOException.class, () -> catalog.prepareReplacement(group.id(), 0, UUID.randomUUID(), target));
+            assertTrue(container.readRegister(key).isEmpty());
+        }
+    }
+
+    public void testRetiredReplacementIdentityCannotBeReusedByALaterIntent() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final var catalog = new JournalGroupCatalog(container, UUID.randomUUID());
+            final var group = group(UUID.randomUUID());
+            activate(container, catalog, group);
+            final var first = catalog.prepareReplacement(group.id(), 0, UUID.randomUUID(), replacement(group));
+            // Model completed head publication to test the register protocol only. There is no
+            // production completion API until native catch-up and reconfiguration are integrated.
+            final var completed = new JournalMembershipRecord(first.genesis(), 1, first.pending().target(), null);
+            final String key = "membership-" + group.id();
+            var old = container.readRegister(key).orElseThrow();
+            assertTrue(container.compareAndSwapRegister(key, old.generation(), new BytesArray(completed.encode())).applied());
+            final var firstAdded = first.pending()
+                .target()
+                .peers()
+                .stream()
+                .filter(peer -> group.peers().stream().noneMatch(original -> original.id().equals(peer.id())))
+                .findFirst()
+                .orElseThrow();
+            final var secondPeers = new ArrayList<>(completed.voters().peers());
+            secondPeers.remove(firstAdded);
+            secondPeers.add(new JournalConfiguration.Peer(UUID.randomUUID(), "second-replacement", 9600, firstAdded.availabilityZone()));
+            final var second = catalog.prepareReplacement(
+                group.id(),
+                1,
+                UUID.randomUUID(),
+                new JournalConfiguration.Group(group.id(), secondPeers)
+            );
+            final var completedAgain = new JournalMembershipRecord(second.genesis(), 2, second.pending().target(), null);
+            old = container.readRegister(key).orElseThrow();
+            assertTrue(container.compareAndSwapRegister(key, old.generation(), new BytesArray(completedAgain.encode())).applied());
+            expectThrows(IOException.class, () -> catalog.prepareReplacement(group.id(), 2, UUID.randomUUID(), first.pending().target()));
+            expectThrows(IOException.class, () -> catalog.prepareReplacement(group.id(), 2, UUID.randomUUID(), group));
+            assertEquals(completedAgain, catalog.membership(group.id()));
+        }
+    }
+
+    public void testMissingPendingVoterReservationCannotBeReconstructed() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final var catalog = new JournalGroupCatalog(container, UUID.randomUUID());
+            final var group = group(UUID.randomUUID());
+            activate(container, catalog, group);
+            final UUID operation = UUID.randomUUID();
+            final var target = replacement(group);
+            final var pending = catalog.prepareReplacement(group.id(), 0, operation, target);
+            final var added = target.peers()
+                .stream()
+                .filter(peer -> group.peers().stream().noneMatch(original -> original.id().equals(peer.id())))
+                .findFirst()
+                .orElseThrow();
+            final String key = "replacement-" + group.id() + "-" + added.id();
+            final var reservation = container.readRegister(key).orElseThrow();
+            assertTrue(container.deleteRegisterIfUnchanged(key, reservation.generation()));
+            expectThrows(IOException.class, () -> catalog.prepareReplacement(group.id(), 0, operation, target));
+            assertTrue(container.readRegister(key).isEmpty());
+            expectThrows(IOException.class, () -> catalog.membership(group.id()));
+            try (var in = container.readRegister("membership-" + group.id()).orElseThrow().value().streamInput()) {
+                assertEquals(pending, JournalMembershipRecord.read(in));
+            }
+        }
+    }
+
+    private static void activate(BlobContainer container, JournalGroupCatalog catalog, JournalConfiguration.Group group)
+        throws IOException {
+        final var reserved = catalog.reserve(group);
+        final var active = reserved.activate(
+            new LogCheckpoint(JournalGroupRecord.controlIdentity(reserved.deploymentId(), group.id()), 2, 1)
+        );
+        assertTrue(
+            container.createRegisterIfAbsent("membership-" + group.id(), new BytesArray(JournalMembershipRecord.initial(active).encode()))
+                .applied()
+        );
+        final String name = "group-" + group.id();
+        final var old = container.readRegister(name).orElseThrow();
+        assertTrue(container.compareAndSwapRegister(name, old.generation(), new BytesArray(active.encode())).applied());
+    }
+
+    private static JournalConfiguration.Group replacement(JournalConfiguration.Group group) {
+        final var peers = new ArrayList<>(group.peers());
+        final var removed = peers.removeLast();
+        peers.add(new JournalConfiguration.Peer(UUID.randomUUID(), "replacement-host", 9500, removed.availabilityZone()));
+        return new JournalConfiguration.Group(group.id(), peers);
     }
 
     private static JournalConfiguration.Group group(UUID id) {

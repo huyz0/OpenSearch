@@ -155,6 +155,37 @@ it to simulate reconfiguration or bootstrap an active group after quorum loss.
 The protocol tests use local filesystem conditional registers; they do not
 establish a cloud provider's failure or durability behavior.
 
+## Serialized membership intent
+
+The separate bounded `JournalMembershipRecord` keeps the activated genesis,
+completed logical controller revision, exact current placement and one pending
+single-voter replacement. The revision is independent of native configuration
+log positions, which can change during election. Source and target retain two
+identical voters and bind every UUID, address and AZ label. An existing identity
+cannot be rebound to another endpoint.
+
+Activation publication first creates the permanent membership head, then marks
+the genesis reservation active. A lost reply at either step is retryable. Once
+active, a missing or corrupt head refuses recovery; it never recreates revision
+zero. Earlier experimental catalog activations without this head are refused.
+They must not be repaired by blindly reconstructing the genesis membership.
+
+`JournalGroupCatalog.prepareReplacement` conditionally persists a unique operation
+nonce and exact target. The same nonce and placement can retry after a lost reply;
+a competing operation, stale revision or different target cannot overwrite an
+unresolved intent. Each new voter identity also receives a permanent per-group
+reservation before intent publication. Failed competing intents can leave unused
+reservations, but those identities cannot be rebound or reused in later changes.
+Retired genesis identities are reserved implicitly by the immutable genesis.
+All these are bounded per-group lookups on lifecycle paths, with no per-write S3
+calls and no listing or global membership lock.
+
+This is an internal controller protocol, with no operator endpoint or production
+completion API yet. Native learner startup, caught-up barrier validation,
+configuration CAS, restart reconciliation and retirement fencing still need
+integration. Static startup refuses a pending replacement before opening its
+volume. Persisting intent alone never promotes a voter or authorizes bootstrap.
+
 ## Authentication and replay
 
 Peer consensus RPCs require mutual TLS. Network client-write and admin services

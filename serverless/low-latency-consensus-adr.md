@@ -296,3 +296,26 @@ Both histories passed three iterations without additional runtime changes.
 An unsuccessful append remains ambiguous: it can have committed on another
 quorum member. These tests do not establish availability under uninterruptible
 I/O stalls or production hardware faults.
+
+## Durable replacement serialization
+
+Keep genesis immutable and serialize controller intent in a separate per-group
+conditional register. `JournalMembershipRecord` binds activated genesis, completed
+logical revision, current exact placement, and at most one pending operation nonce
+and target. Replace one voter at a time while retaining two unchanged voters;
+address changes require a new storage identity. A permanent per-group reservation
+binds each replacement voter to its original intent, including an abandoned
+contender. Previously retired identities cannot be reused in later revisions.
+
+Publish the initial membership head before the ACTIVE genesis record. A missing
+head after activation is corruption or incomplete recovery, not permission to
+reconstruct revision zero. Lost replies reconcile the original values; competing
+controllers cannot supersede unresolved intent. These lifecycle requests add no
+per-document object-store operation and scale with physical groups, not shards.
+
+The current integration intentionally stops before native configuration mutation:
+static startup rejects pending intent before volume access. A production controller
+must next authorize learner startup, establish that specific learner's committed
+barrier coverage, issue the native configuration CAS, reconcile ambiguous results,
+and fence retired assignments before publishing completion. Intent is neither
+membership commitment nor permission to start an independent history.

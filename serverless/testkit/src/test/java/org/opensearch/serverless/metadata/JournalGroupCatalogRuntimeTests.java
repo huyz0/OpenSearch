@@ -140,6 +140,7 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
             final var real = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
             final var loseReply = new AtomicBoolean();
+            final var loseMembershipReply = new AtomicBoolean();
             final var wrapper = new FilterBlobContainer(real) {
                 @Override
                 protected BlobContainer wrapChild(BlobContainer child) {
@@ -154,6 +155,9 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 @Override
                 public BlobRegisterCasResult compareAndSwapRegister(String name, long expected, BytesReference value) throws IOException {
                     final var result = real.compareAndSwapRegister(name, expected, value);
+                    if (name.startsWith("membership-") && result.applied() && loseMembershipReply.compareAndSet(true, false)) {
+                        throw new IOException("lost membership-head reply before activation publication");
+                    }
                     if (name.startsWith("group-") && result.applied() && loseReply.compareAndSet(true, false)) {
                         throw new IOException("lost activation reply after persistence");
                     }
@@ -187,6 +191,10 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                     fail("no ready journal leader");
                 }, 30, TimeUnit.SECONDS);
                 leader[0].activateGroup(group.id()).toCompletableFuture().get(20, TimeUnit.SECONDS);
+                loseMembershipReply.set(true);
+                expectThrows(IOException.class, () -> catalog.publishActivation(leader[0], group.id()));
+                assertEquals(reservation, catalog.read(group.id()).orElseThrow());
+                assertTrue(real.readRegister("membership-" + group.id()).isPresent());
                 loseReply.set(true);
                 expectThrows(IOException.class, () -> catalog.publishActivation(leader[0], group.id()));
                 final var active = catalog.read(group.id()).orElseThrow();
@@ -195,6 +203,8 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 final var restartedController = new JournalGroupCatalog(real, deployment);
                 assertEquals(active, restartedController.publishActivation(leader[0], group.id()));
                 assertEquals(active, restartedController.reserve(group));
+                assertEquals(active, restartedController.membership(group.id()).genesis());
+                assertNull(restartedController.membership(group.id()).pending());
                 final var configuration = new JournalConfiguration(
                     deployment,
                     peers.getFirst().id(),
@@ -208,6 +218,11 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                     () -> restartedController.openJournal(configuration, key, trusted, () -> Long.MAX_VALUE)
                 );
                 assertTrue(refused.getMessage(), refused.getMessage().contains("activated physical group"));
+                final String membershipKey = "membership-" + group.id();
+                final var head = real.readRegister(membershipKey).orElseThrow();
+                assertTrue(real.deleteRegisterIfUnchanged(membershipKey, head.generation()));
+                expectThrows(IOException.class, () -> restartedController.publishActivation(leader[0], group.id()));
+                assertTrue(real.readRegister(membershipKey).isEmpty());
             } finally {
                 IOUtils.close(journals);
             }
