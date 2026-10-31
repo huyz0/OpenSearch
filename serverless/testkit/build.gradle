@@ -59,6 +59,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessFleetScaleTests.class'
   exclude '**/ServerlessLatencyBenchmarkTests.class'
   exclude '**/JournalGroupCatalogRuntimeTests.class'
+  exclude '**/JournalControllerRuntimeTests.class'
   exclude '**/RatisMembershipSpikeTests.class'
   exclude '**/RatisPersistenceSpikeTests.class'
   exclude '**/RatisGroupCountBenchmarkTests.class'
@@ -249,6 +250,7 @@ tasks.register('journalCatalogTest', Test) {
   testClassesDirs = sourceSets.test.output.classesDirs
   classpath = sourceSets.test.runtimeClasspath
   include '**/JournalGroupCatalogRuntimeTests.class'
+  include '**/JournalControllerRuntimeTests.class'
   systemProperty 'tests.security.manager', 'false'
   systemProperty 'tests.system_call_filter', 'false'
 }

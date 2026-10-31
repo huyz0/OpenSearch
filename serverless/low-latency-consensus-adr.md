@@ -424,7 +424,7 @@ Retries after later replacements use the permanent original receipt. Missing hea
 or missing historical receipts cannot reset or reconstruct controller history.
 
 Failed-learner recovery/abort, automatic provisioning, sustained replacement
-resource qualification, full node lifecycle and three-AZ qualification remain outstanding.
+resource qualification, command-line assignment/TLS loading and three-AZ qualification remain outstanding.
 
 ## Retired peer connection lifetime
 
@@ -438,3 +438,19 @@ finish, closure afterwards and successful subsequent append/replay. No additiona
 vendor patch or object-store request is required. Lightweight SDK descriptors
 remain subject to the current retained-history limit; archive integration must
 bound/reclaim them before allowing unbounded history.
+
+## Bounded node controller lifecycle
+
+Explicit programmatic bootstrap now owns the authenticated journal and its catalog
+controller before publishing metadata-plane availability. Native opening finishes
+before startup returns; activation continues asynchronously so hosts can start
+sequentially. Close and failed startup retain ownership of a late native open,
+including the process-lifetime volume quarantine after SDK startup.
+
+One dedicated worker and one queued task isolate controller I/O from application
+and consensus work. Per-group pending controls and wakeups coalesce. Local 200 ms
+reconciliation uses cached durable intent; catalog metadata polls every 30 seconds
+or on an explicit placement-change signal, with five-second failure backoff.
+These counts scale with physical groups. Current-read authority, searchable
+checkpoints and the opt-in index write path remain separate work. Command-line
+assignment/TLS loading and cloud qualification are not enabled by this host API.

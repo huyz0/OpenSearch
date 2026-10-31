@@ -197,9 +197,10 @@ journal. The marker is historical evidence, not current-read authority. It does
 not by itself prove completeness of all later data; omitted-tail detection and
 archive/recovery-boundary qualification remain separate work.
 
-The catalog API does not yet drive the node startup lifecycle or enable an index
-mode. Native membership operations now have explicit controller APIs described
-below; node lifecycle, logical-shard activation and migration still need integration. Initial placement is immutable; operators must never edit
+An explicit `ServerlessBootstrap.JournalAssignment` now attaches the catalog and
+native journal to the node startup/close lifecycle. The host controller described
+below drives activation and native replacement. Command-line assignment/credential
+loading, index-mode activation, logical-shard ownership and migration remain pending. Initial placement is immutable; operators must never edit
 it to simulate reconfiguration or bootstrap an active group after quorum loss.
 The protocol tests use local filesystem conditional registers; they do not
 establish a cloud provider's failure or durability behavior.
@@ -229,11 +230,12 @@ Retired genesis identities are reserved implicitly by the immutable genesis.
 All these are bounded per-group lookups on lifecycle paths, with no per-write S3
 calls and no listing or global membership lock.
 
-This is an internal controller protocol, with no operator endpoint or production
-completion API yet. Native learner startup, caught-up barrier validation,
-configuration CAS, restart reconciliation and retirement fencing still need
-integration. Static startup refuses a pending replacement before opening its
-volume. Persisting intent alone never promotes a voter or authorizes bootstrap.
+The internal assigned-startup and completion APIs below now drive native learner
+catch-up, configuration CAS, restart reconciliation and retirement through the
+explicit host controller. An operator endpoint is not exposed. Static startup
+continues refusing pending replacement before opening a volume; assigned startup
+validates its winning permanent reservation. Intent alone never promotes a voter
+or authorizes independent bootstrap.
 
 Completed membership also checks the permanent reservations for its non-genesis
 voters, including their original revision and exact address/AZ placement. Missing
@@ -356,7 +358,8 @@ pending head refuse recovery; they are never silently recreated. This adds one
 conditional metadata creation per lifecycle transition and no per-document S3 I/O.
 
 Pending intent is not canceled or overwritten. Failed-learner recovery, automatic
-provisioning and node lifecycle integration still need qualification. These APIs do not enable quorum-mode shell writes.
+provisioning and command-line configuration still need integration. The explicit
+host lifecycle below is qualified separately. These APIs do not enable quorum-mode shell writes.
 
 ## Retired peer transport resources
 
@@ -375,3 +378,40 @@ SDK reset closes its heavy channels/stub pool but preserves a lightweight peer
 descriptor. Current unpurged history limits bound that descriptor population;
 archive/reclamation work must also address descriptor count before permitting
 unbounded membership history. This is resource cleanup, not log reclamation.
+
+## Explicit node host lifecycle
+
+`ServerlessBootstrap.start(settings, JournalAssignment)` accepts a provisioned
+`JournalConfiguration`, member key manager, deployment-scoped trust manager and
+actual-volume probe. It attaches `JournalController` before publishing metadata-plane
+availability. Native opening must finish before startup returns. All-voter
+activation proceeds asynchronously, allowing hosts to start sequentially. The
+one-argument bootstrap keeps its legacy behavior. This explicit host API does not
+enable quorum-mode index writes or provide command-line credential loading.
+
+The node supplies exactly one controller worker and one queued task; operator
+settings cannot silently enlarge these bounds. Wakeups coalesce, and each physical
+group retains at most one pending native control operation. A 200 ms local ticker
+drives activation and membership reconciliation; ordinary appends bypass it.
+Stable catalog metadata is cached for 30 seconds, with an explicit refresh signal
+for known controller changes and a five-second error backoff. Native completion
+callbacks only enqueue work. Catalog I/O never runs on consensus callbacks, and
+control state grows with the bounded physical group count, not logical shards.
+
+`state`, a bounded failure diagnostic and the reconciliation counter support host
+observability. States describe locally observed control progress; they do not
+establish current read authority or a searchable checkpoint. The controller checks
+native availability before treating a missing marker as catch-up. A retired local
+assignment stops native mutation attempts while other colocated groups continue.
+
+Node close stops controller admission/timers and owns native cleanup before its
+thread pool terminates. A close racing catalog startup cannot subsequently start
+native storage. If native opening already began, a late server closes itself and
+its volume remains quarantined until JVM exit. Failed bootstrap authorization
+releases ordinary node resources without touching the journal volume.
+
+Real socket tests cover automatic two-group activation, learner replacement,
+replacement-quorum survival, colocated availability, metadata-outage backoff,
+10,000 coalesced wakeups without extra catalog reads, startup/close races and
+rejection of an enlarged controller queue. The host API uses local filesystem
+conditional metadata in these tests; cloud/three-AZ qualification remains pending.

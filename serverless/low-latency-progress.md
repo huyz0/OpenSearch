@@ -3,16 +3,17 @@
 Branch: `low-latency-serverless`. The delivery plan is
 [low-latency-serverless-plan.md](low-latency-serverless-plan.md).
 
-The current runtime still uses object-store WAL durability. Quorum-mode activation,
-replicated SSD logs, committed-only serving engines, streaming search replicas, and
-asynchronous S3 archival are not enabled by these foundation commits.
+Index writes still use object-store WAL durability. An explicit journal host now
+drives replicated-log activation and membership control. Quorum-mode index writes,
+committed-only serving engines, streaming search replicas and asynchronous S3
+archival remain pending.
 
 | Milestone | Delivered | Remaining |
 | --- | --- | --- |
 | M0 | Node timing histograms, WAL group counters, explicit open-loop benchmark, initial real-process filesystem baseline | Additional pipeline stages during extraction; actual S3 and sustained-load qualification |
 | M1 | Append and streaming recovery interfaces, optional async dispatch with cancellation/rejection semantics, existing S3 path integration, bounded versioned log/checkpoint identity codecs | Subscription/token formats and shell adapters for consensus |
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
-| M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, explicit authorized learner/replacement APIs | Native replacement qualification in progress; node lifecycle, remaining partition histories and sustained resource qualification |
+| M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement and bounded host controller | Command-line assignment/TLS loading, remaining partition/hardware histories and sustained resource qualification |
 | M4–M9 | Not implemented | Quorum writes, fresh readers, selective replication, archival, lifecycle, migration |
 | M10–M12 | Not implemented | Scale/cost/failure qualification, controlled rollout, optional attribute/QUIC extensions |
 
@@ -203,6 +204,21 @@ asynchronous S3 archival are not enabled by these foundation commits.
   the two-group retention/closure/append/replay history and the complete catalog
   integration history (six cases). Lightweight descriptors remain bounded by the
   current history ceiling and need reclamation before unbounded archival history.
+
+- Node host lifecycle: an explicit bootstrap assignment attaches and opens the
+  authenticated journal before metadata-plane availability. All-voter activation
+  and membership changes reconcile asynchronously on exactly one worker with one
+  queued task. Per-group pending native work and wakeups coalesce; a 30-second
+  metadata cache and five-second failure backoff keep progress edges off S3.
+  Readiness remains historical controller state. Close handles blocked catalog
+  startup and late native opening, preserving process-lifetime volume quarantine.
+  Native unavailability is distinguished from activation catch-up. Three iterations
+  passed 15 real controller cases and 84 existing bootstrap/scheduler cases, with
+  zero failures/errors/skips. Tests include 10,000 coalesced wakeups without extra
+  catalog reads, automatic two-group activation/replacement, new-quorum survival,
+  colocated availability, failure diagnostics, startup/close races and queue-bound
+  enforcement, including simultaneous learner/genesis roles in different groups.
+  Command-line loading and quorum-mode index writes remain pending.
 
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

@@ -99,6 +99,9 @@ public final class ServerlessNode implements Closeable {
      */
     public static final String FANOUT_POOL = "serverless_fanout";
 
+    /** Bounded catalog and native-journal lifecycle control, isolated from application requests. */
+    public static final String JOURNAL_CONTROLLER_POOL = "serverless_journal_controller";
+
     /**
      * The pool a forwarded write is applied on, at its owner.
      *
@@ -159,6 +162,7 @@ public final class ServerlessNode implements Closeable {
     private final ServerlessPlugins plugins;
     private volatile org.opensearch.identity.IdentityService identityService;
     private final ThreadPool threadPool;
+    private volatile JournalController journalController;
     private final NodeEnvironment nodeEnvironment;
     private final ClusterService clusterService;
     private final IndicesService indicesService;
@@ -877,6 +881,13 @@ public final class ServerlessNode implements Closeable {
         final int processors = org.opensearch.common.util.concurrent.OpenSearchExecutors.allocatedProcessors(settings);
         this.threadPool = new ThreadPool(
             settings,
+            new org.opensearch.threadpool.FixedExecutorBuilder(
+                settings,
+                JOURNAL_CONTROLLER_POOL,
+                1,
+                1,
+                "thread_pool." + JOURNAL_CONTROLLER_POOL
+            ),
             new org.opensearch.threadpool.ScalingExecutorBuilder(
                 FANOUT_POOL,
                 1,
@@ -2497,6 +2508,25 @@ public final class ServerlessNode implements Closeable {
      */
     public void setMembershipSource(MembershipSource source) {
         this.membershipSource = source;
+    }
+
+    /**
+     * Attaches the journal controller before publishing metadata-plane availability.
+     * @param controller unstarted controller owned by this node
+     */
+    public synchronized void setJournalController(JournalController controller) {
+        if (journalController != null || metadataPlane != null) {
+            throw new IllegalStateException("journal controller must be attached before metadata-plane availability");
+        }
+        journalController = java.util.Objects.requireNonNull(controller);
+    }
+
+    /**
+     * Returns this node's optional journal lifecycle, independent of legacy object-store writes.
+     * @return attached controller, if configured
+     */
+    public java.util.Optional<JournalController> journalController() {
+        return java.util.Optional.ofNullable(journalController);
     }
 
     /**
@@ -6641,6 +6671,7 @@ public final class ServerlessNode implements Closeable {
         // that owned a thread pool leaked it out of every node, and the leak detector said so.
         IOUtils.closeWhileHandlingException(httpServerTransport);
         ServerlessPlugins.closeAll(plugins.plugins());
+        IOUtils.closeWhileHandlingException(journalController);
         // After the plugins, because they were given these and may use them on the way out.
         IOUtils.closeWhileHandlingException(resourceWatcherService, scriptService);
         IOUtils.closeWhileHandlingException(transportService, searchService, indicesService, clusterService, nodeEnvironment);

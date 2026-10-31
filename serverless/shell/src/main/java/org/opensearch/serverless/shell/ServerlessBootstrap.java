@@ -218,6 +218,33 @@ public final class ServerlessBootstrap implements Closeable {
     }
 
     /**
+     * Explicit journal placement and deployment-scoped credentials. This configures the journal host,
+     * not an index durability mode; legacy shell writes keep their object-store WAL.
+     * @param configuration provisioned immutable assignment and one-time bootstrap authorization
+     * @param keyManager journal member credentials
+     * @param trustManager deployment-scoped journal trust
+     * @param diskSpace actual provisioned-volume reserve probe
+     */
+    @org.opensearch.common.annotation.InternalApi
+    public record JournalAssignment(org.opensearch.serverless.log.JournalConfiguration configuration,
+        javax.net.ssl.X509KeyManager keyManager, javax.net.ssl.X509TrustManager trustManager,
+        org.opensearch.serverless.log.RatisJournal.DiskSpaceProbe diskSpace) {
+        /**
+         * Requires explicit placement, credentials, trust and disk identity measurement.
+         * @param configuration assigned placement
+         * @param keyManager member credentials
+         * @param trustManager journal trust
+         * @param diskSpace provisioned-volume reserve probe
+         */
+        public JournalAssignment {
+            java.util.Objects.requireNonNull(configuration);
+            java.util.Objects.requireNonNull(keyManager);
+            java.util.Objects.requireNonNull(trustManager);
+            java.util.Objects.requireNonNull(diskSpace);
+        }
+    }
+
+    /**
      * Builds and starts a node: metadata plane, data plane, HTTP, and the three drivers.
      *
      * <p>Ordering matters in one place. The scheduler starts <em>last</em>, after the node is serving and
@@ -230,6 +257,19 @@ public final class ServerlessBootstrap implements Closeable {
      * @throws Exception if any part of startup fails
      */
     public static ServerlessBootstrap start(Settings settings) throws Exception {
+        return start(settings, null);
+    }
+
+    /**
+     * Starts an optional journal host before metadata-plane availability is advertised. Native open
+     * completes before startup returns; all-voter activation and replacement reconcile asynchronously
+     * on the bounded controller executor. The node owns controller/native cleanup on every exit path.
+     * @param settings node settings
+     * @param assignment explicit journal host assignment, or null for a legacy-only node
+     * @return running node
+     * @throws Exception on node, catalog, journal or object-store startup failure
+     */
+    public static ServerlessBootstrap start(Settings settings, JournalAssignment assignment) throws Exception {
         final String storeType = settings.get(org.opensearch.serverless.store.ObjectStores.TYPE, "fs");
         if ("s3".equals(storeType) && System.getProperty("opensearch.path.conf") == null) {
             // The AWS SDK v2 is told where the node's config lives so it does not go looking in the home
@@ -294,6 +334,24 @@ public final class ServerlessBootstrap implements Closeable {
             final MetadataPlane plane = new MetadataPlane(store.blobStore(), BlobPath.cleanPath(), System::currentTimeMillis, ttl);
             openedPlane = plane;
             logger.info("startup: store open at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
+            if (assignment != null) {
+                final var catalog = new org.opensearch.serverless.metadata.JournalGroupCatalog(
+                    store.blobStore().blobContainer(org.opensearch.serverless.metadata.RegisterMap.journalGroups(BlobPath.cleanPath())),
+                    assignment.configuration().deploymentId()
+                );
+                final var controller = new JournalController(
+                    assignment.configuration(),
+                    catalog,
+                    assignment.keyManager(),
+                    assignment.trustManager(),
+                    assignment.diskSpace(),
+                    node.threadPool(),
+                    System::nanoTime
+                );
+                node.setJournalController(controller);
+                controller.start();
+                controller.awaitOpened();
+            }
             node.setMetadataPlane(plane);
             logger.info(
                 "startup: lease published at {} ms",
