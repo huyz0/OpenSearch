@@ -162,3 +162,19 @@ shell preparation-service integration and measure its overhead. Before real
 traffic, require mutual authentication, activation binding, membership validation,
 disk-full/corruption/kill tests, safe state snapshots, and explicit legacy-mode
 exclusion. Keep all production behavior on the existing path until those gates pass.
+
+## Initial group activation and voter lifetime
+
+The static runtime gates initial logical writes on a seed entry committed on all
+three initial voters, followed by a majority-committed activation marker. This
+protects failover from Ratis's empty-log vote exclusion. Watching index zero does
+not establish nonempty durable logs. Once activated, normal writes use majority
+persistence; replay restores activation after restart. This is a local protocol
+barrier, not the unfinished durable controller reservation/activation state machine.
+
+A journal volume is leased until its JVM terminates, including after failed
+startup or successful SDK close. A real-process stalled-I/O test showed native
+close returning while the log worker still held unfinished disk work. Holding the
+OS lock until process exit prevents a replacement voter overlapping that work.
+In-process hot reopening is unsupported. Membership changes within a running
+journal remain separate work; this decision does not change Raft election rules.

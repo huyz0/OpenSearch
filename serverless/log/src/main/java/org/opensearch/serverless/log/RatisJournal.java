@@ -13,6 +13,7 @@ import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.grpc.GrpcTlsConfig;
+import org.apache.ratis.proto.RaftProtos.ReplicationLevel;
 import org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.GroupManagementRequest;
@@ -50,6 +51,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -57,6 +59,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
@@ -66,6 +69,8 @@ import java.util.stream.Collectors;
  * acknowledgements or replay records. This component does not provide current-read authority,
  * document preparation, logical-shard ownership, S3 archival, or automatic disaster recovery.
  * Every physical group must be durably reserved by the controller before initial bootstrap.
+ * Once native startup begins, the volume remains exclusively leased until this JVM exits,
+ * including after close or failed startup. A replacement voter requires process termination.
  */
 @InternalApi
 public final class RatisJournal implements Closeable {
@@ -121,6 +126,9 @@ public final class RatisJournal implements Closeable {
         }
     }
 
+    private static final byte[] SEED_PAYLOAD = new byte[] { 0 };
+    private static final byte[] ACTIVATION_PAYLOAD = new byte[] { 1 };
+    private final Map<UUID, JournalStateMachine> stateMachines = new ConcurrentHashMap<>();
     private final JournalConfiguration configuration;
     private final JournalStorage storage;
     private final DiskSpaceProbe diskSpace;
@@ -165,6 +173,7 @@ public final class RatisJournal implements Closeable {
                 };
             }
         }));
+        storage.retainUntilProcessExit();
         server = RaftServer.newBuilder()
             .setServerId(peerId(configuration.localVoterId()))
             .setProperties(properties())
@@ -173,7 +182,11 @@ public final class RatisJournal implements Closeable {
                 if (groups.containsKey(group.getUuid()) == false) {
                     throw new IllegalArgumentException("unassigned physical group");
                 }
-                return new JournalStateMachine(group.getUuid());
+                final var machine = new JournalStateMachine(group.getUuid());
+                if (stateMachines.putIfAbsent(group.getUuid(), machine) != null) {
+                    throw new IllegalStateException("physical group state machine already exists");
+                }
+                return machine;
             })
             .setOption(RaftStorage.StartupOption.RECOVER)
             .build();
@@ -195,13 +208,11 @@ public final class RatisJournal implements Closeable {
                 server.getDivision(RaftGroupId.valueOf(group));
             }
         } catch (IOException | RuntimeException | Error failure) {
-            // A failed close must retain the volume lease: another process must not start a voter
-            // while replication services might still be running.
+            // Native close is best effort; the process-lifetime lease prevents overlapping voters.
             try {
                 server.close();
             } catch (IOException closeFailure) {
                 failure.addSuppressed(closeFailure);
-                throw new UnclosedJournalException(failure);
             }
             if (failure instanceof RuntimeException) {
                 throw new IOException("journal startup failed", failure);
@@ -235,11 +246,11 @@ public final class RatisJournal implements Closeable {
         final var storage = JournalStorage.open(configuration);
         try {
             return new RatisJournal(configuration, storage, diskSpace, keyManager, trustManager);
-        } catch (UnclosedJournalException failure) {
-            throw new IOException("journal startup failed and replication services did not close; volume lease retained", failure);
         } catch (IOException | RuntimeException | Error failure) {
             try {
-                storage.close();
+                if (storage.isProcessOwned() == false) {
+                    storage.close();
+                }
             } catch (IOException closeFailure) {
                 failure.addSuppressed(closeFailure);
             }
@@ -258,6 +269,81 @@ public final class RatisJournal implements Closeable {
      * @throws IOException on synchronous validation, leader or admission failure
      */
     public CompletionStage<LogCheckpoint> append(UUID groupId, OperationEnvelope operation) throws IOException {
+        division(groupId);
+        if (operation.logId().equals(activationIdentity(groupId))) {
+            throw new IOException("physical group control identity is reserved");
+        }
+        if (stateMachines.get(groupId).activated == false) {
+            throw new IOException("physical group has not completed initial voter activation");
+        }
+        return appendFrame(groupId, operation);
+    }
+
+    /**
+     * Activates an initially reserved group after every initial voter has committed a seed
+     * entry. Ratis deliberately rejects votes from empty logs after a nonempty commit; admitting
+     * traffic before this barrier can strand a two-voter remainder after one failure. The activation
+     * record is then committed through the normal majority path and replayed on every member.
+     * This barrier runs once; ordinary writes never wait for every voter.
+     *
+     * @param groupId assigned, control-plane-reserved physical group
+     * @return completion after the durable activation record is committed and applied locally
+     * @throws IOException on local leadership or admission failure
+     */
+    public CompletionStage<Void> activateGroup(UUID groupId) throws IOException {
+        final var division = division(groupId);
+        if (division.getInfo().isLeaderReady() == false) {
+            throw new IOException("local journal member is not the ready leader");
+        }
+        if (stateMachines.get(groupId).activated) {
+            return CompletableFuture.<Void>completedFuture(null).minimalCompletionStage();
+        }
+        return appendFrame(
+            groupId,
+            new OperationEnvelope(activationIdentity(groupId), OperationEnvelope.Kind.RECOVERY_BARRIER, 0, 0, 0, SEED_PAYLOAD)
+        ).thenCompose(checkpoint -> {
+            try {
+                return watchAllCommitted(groupId, checkpoint.index());
+            } catch (IOException failure) {
+                return CompletableFuture.<Void>failedFuture(failure);
+            }
+        }).thenCompose(ignored -> {
+            try {
+                return appendFrame(
+                    groupId,
+                    new OperationEnvelope(activationIdentity(groupId), OperationEnvelope.Kind.RECOVERY_BARRIER, 0, 0, 0, ACTIVATION_PAYLOAD)
+                ).thenApply(checkpoint -> (Void) null);
+            } catch (IOException failure) {
+                return CompletableFuture.<Void>failedFuture(failure);
+            }
+        }).toCompletableFuture().minimalCompletionStage();
+    }
+
+    private CompletableFuture<Void> watchAllCommitted(UUID groupId, long index) throws IOException {
+        final var permit = admission.acquire(0);
+        final CompletableFuture<org.apache.ratis.protocol.RaftClientReply> watched;
+        try {
+            final var request = RaftClientRequest.newBuilder()
+                .setClientId(clientId)
+                .setServerId(server.getId())
+                .setGroupId(RaftGroupId.valueOf(groupId))
+                .setCallId(callIds.getAndIncrement())
+                .setMessage(Message.valueOf(ByteString.EMPTY))
+                .setType(RaftClientRequest.watchRequestType(index, ReplicationLevel.ALL_COMMITTED))
+                .build();
+            watched = server.submitClientRequestAsync(request).whenComplete((reply, failure) -> permit.close());
+        } catch (IOException | RuntimeException | Error failure) {
+            permit.close();
+            throw failure;
+        }
+        return watched.thenCompose(
+            reply -> reply.isSuccess()
+                ? CompletableFuture.<Void>completedFuture(null)
+                : CompletableFuture.<Void>failedFuture(reply.getException())
+        );
+    }
+
+    private CompletionStage<LogCheckpoint> appendFrame(UUID groupId, OperationEnvelope operation) throws IOException {
         final var division = division(groupId);
         Objects.requireNonNull(operation);
         if (operation.logId().deploymentId().equals(configuration.deploymentId()) == false
@@ -358,7 +444,7 @@ public final class RatisJournal implements Closeable {
                 }
                 bytes += data.size();
                 final var operation = decodeOperation(data);
-                if (selection.contains(operation.logId())) {
+                if (isActivation(operation, groupId) == false && selection.contains(operation.logId())) {
                     operations.add(
                         new CommittedOperation(operation, new LogCheckpoint(operation.logId(), entry.getIndex(), entry.getTerm()))
                     );
@@ -414,8 +500,31 @@ public final class RatisJournal implements Closeable {
         return operation;
     }
 
+    private ShardLogId activationIdentity(UUID group) {
+        return new ShardLogId(configuration.deploymentId(), "__journal_group/" + group, 0, group);
+    }
+
+    private boolean isActivation(OperationEnvelope operation, UUID group) throws IOException {
+        if (operation.logId().equals(activationIdentity(group)) == false) {
+            return false;
+        }
+        if (operation.kind() != OperationEnvelope.Kind.RECOVERY_BARRIER
+            || operation.producerEpoch() != 0
+            || operation.primaryTerm() != 0
+            || operation.schemaVersion() != 0
+            || operation.payloadLength() > ACTIVATION_PAYLOAD.length) {
+            throw new IOException("invalid physical group activation record");
+        }
+        final byte[] payload = operation.payloadReader().readAllBytes();
+        if (Arrays.equals(payload, ACTIVATION_PAYLOAD) == false && Arrays.equals(payload, SEED_PAYLOAD) == false) {
+            throw new IOException("invalid physical group activation payload");
+        }
+        return true;
+    }
+
     private final class JournalStateMachine extends BaseStateMachine {
         private final UUID group;
+        private volatile boolean activated;
 
         private JournalStateMachine(UUID group) {
             this.group = group;
@@ -442,7 +551,10 @@ public final class RatisJournal implements Closeable {
         public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
             requireDiskSpace();
             requireRetainedCapacity(group);
-            decodeOperation(request.getMessage().getContent());
+            final var operation = decodeOperation(request.getMessage().getContent());
+            if (isActivation(operation, group) == false && activated == false) {
+                throw new IOException("physical group has not completed initial voter activation");
+            }
             return super.startTransaction(request);
         }
 
@@ -454,6 +566,11 @@ public final class RatisJournal implements Closeable {
                 }
                 final var entry = transaction.getLogEntry();
                 final var operation = decodeOperation(entry.getStateMachineLogEntry().getLogData());
+                if (isActivation(operation, group)) {
+                    activated |= Arrays.equals(operation.payloadReader().readAllBytes(), ACTIVATION_PAYLOAD);
+                } else if (activated == false) {
+                    throw new IOException("logical operation precedes physical group activation");
+                }
                 final var checkpoint = new LogCheckpoint(operation.logId(), entry.getIndex(), entry.getTerm());
                 final var bytes = new ByteArrayOutputStream();
                 try (var out = new OutputStreamStreamOutput(bytes)) {
@@ -569,13 +686,13 @@ public final class RatisJournal implements Closeable {
     public synchronized void close() throws IOException {
         closed = true;
         admission.close();
+        if (Thread.currentThread().isInterrupted()) {
+            throw new IOException("interrupted journal shutdown; retry cleanup from a non-interrupted thread");
+        }
         server.close();
-        storage.close();
+        // SDK shutdown may return while an uninterruptible I/O task is still running. Only OS
+        // process teardown proves those tasks cannot touch this volume again.
+
     }
 
-    private static final class UnclosedJournalException extends IOException {
-        private UnclosedJournalException(Throwable cause) {
-            super(cause);
-        }
-    }
 }

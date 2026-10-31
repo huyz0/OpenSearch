@@ -79,7 +79,7 @@ public class RatisJournalTests extends OpenSearchTestCase {
         }
     }
 
-    public void testCommittedSharedStreamsSurviveLeaderLossAndFullRestart() throws Exception {
+    public void testCommittedSharedStreamsSurviveLeaderLoss() throws Exception {
         final var fixture = fixture(2);
         final var journals = new ArrayList<RatisJournal>();
         try {
@@ -99,7 +99,7 @@ public class RatisJournalTests extends OpenSearchTestCase {
             assertEquals(15, before.operations().size());
             assertTrue(before.throughIndex() >= before.operations().getLast().checkpoint().index());
             assertEquals(30, leader.scan(group, -1, Set.of(first, second), 4096, 65536).operations().size());
-            final var skipped = leader.scan(group, -1, Set.of(), 4096, operation(first, 0).encode(16384).length + 1);
+            final var skipped = leader.scan(group, -1, Set.of(), 4096, 512);
             assertTrue("unselected payloads must consume the scan byte budget", skipped.throughIndex() < skipped.committedIndex());
             assertTrue(skipped.operations().isEmpty());
             expectThrows(IOException.class, () -> leader.scan(group, -1, Set.of(first), 4096, 1));
@@ -108,18 +108,47 @@ public class RatisJournalTests extends OpenSearchTestCase {
             oldLeader.close();
             journals.remove(oldLeader);
             leader(journals, group).append(group, operation(first, 30)).toCompletableFuture().get(10, TimeUnit.SECONDS);
-            closeAll(journals);
-            startAll(fixture, journals, false);
-            final RatisJournal recoveredLeader = leader(journals, group);
-            recoveredLeader.append(group, operation(first, 31)).toCompletableFuture().get(10, TimeUnit.SECONDS);
-            assertEquals(32, recoveredLeader.scan(group, -1, Set.of(first, second), 4096, 65536).operations().size());
-            final var replay = recoveredLeader.scan(group, -1, Set.of(first, second), 4096, 65536);
+            final var replay = leader(journals, group).scan(group, -1, Set.of(first, second), 4096, 65536);
+            assertEquals(31, replay.operations().size());
             for (int i = 0; i < replay.operations().size(); i++) {
                 final var item = replay.operations().get(i);
                 assertEquals(i, item.operation().payloadReader().read());
                 assertEquals(i < 30 && i % 2 != 0 ? second : first, item.checkpoint().logId());
             }
             assertEquals(1, leader(journals, otherGroup).scan(otherGroup, -1, Set.of(first), 4096, 65536).operations().size());
+        } finally {
+            closeAll(journals);
+        }
+    }
+
+    public void testInitialActivationAndReservedControlIdentity() throws Exception {
+        final var fixture = fixture(1);
+        final var journals = new ArrayList<RatisJournal>();
+        try {
+            openAll(fixture, journals, true);
+            final UUID group = fixture.configurations().getFirst().groups().getFirst().id();
+            final var leader = leader(journals, group);
+            final var stream = new ShardLogId(fixture.deployment(), "index", 0, UUID.randomUUID());
+            expectThrows(IOException.class, () -> leader.append(group, operation(stream, 0)));
+            leader.activateGroup(group).toCompletableFuture().get(20, TimeUnit.SECONDS);
+            final var control = new ShardLogId(fixture.deployment(), "__journal_group/" + group, 0, group);
+            expectThrows(IOException.class, () -> leader.append(group, operation(control, 0)));
+            leader.append(group, operation(stream, 0)).toCompletableFuture().get(10, TimeUnit.SECONDS);
+            final var before = leader.scan(group, -1, Set.of(stream, control), 4096, 65536);
+            assertEquals(1, before.operations().size());
+            assertEquals(stream, before.operations().getFirst().operation().logId());
+            leader.activateGroup(group).toCompletableFuture().get(10, TimeUnit.SECONDS);
+            assertEquals(before.committedIndex(), leader.scan(group, -1, Set.of(), 4096, 65536).committedIndex());
+            Thread.currentThread().interrupt();
+            try {
+                expectThrows(IOException.class, leader::close);
+                assertTrue(Thread.currentThread().isInterrupted());
+            } finally {
+                Thread.interrupted();
+            }
+            expectThrows(IOException.class, () -> leader.append(group, operation(stream, 1)));
+            // Finally retries native cleanup without the interrupt; the process lease remains held.
+
         } finally {
             closeAll(journals);
         }
@@ -211,7 +240,7 @@ public class RatisJournalTests extends OpenSearchTestCase {
             expectThrows(IOException.class, () -> RatisJournal.open(configuration, fixture.key(), fixture.trust(), fixture.space()::get));
         }
         assertSame(handler, Thread.getDefaultUncaughtExceptionHandler());
-        assertEquals(configuration.localVoterId(), JournalDiskIdentity.discover(configuration.directory()));
+        expectThrows(IOException.class, () -> JournalDiskIdentity.discover(configuration.directory()));
     }
 
     private record Fixture(UUID deployment, List<JournalConfiguration> configurations, X509KeyManager key, X509TrustManager trust,
@@ -267,7 +296,14 @@ public class RatisJournalTests extends OpenSearchTestCase {
         );
     }
 
-    private static void startAll(Fixture fixture, List<RatisJournal> journals, boolean bootstrap) throws IOException {
+    private static void startAll(Fixture fixture, List<RatisJournal> journals, boolean bootstrap) throws Exception {
+        openAll(fixture, journals, bootstrap);
+        for (var group : fixture.configurations().getFirst().groups()) {
+            leader(journals, group.id()).activateGroup(group.id()).toCompletableFuture().get(20, TimeUnit.SECONDS);
+        }
+    }
+
+    private static void openAll(Fixture fixture, List<RatisJournal> journals, boolean bootstrap) throws Exception {
         for (var initial : fixture.configurations()) {
             final var configuration = new JournalConfiguration(
                 initial.deploymentId(),
@@ -279,6 +315,7 @@ public class RatisJournalTests extends OpenSearchTestCase {
             );
             journals.add(RatisJournal.open(configuration, fixture.key(), fixture.trust(), fixture.space()::get));
         }
+
     }
 
     private static OperationEnvelope operation(ShardLogId stream, int number) {

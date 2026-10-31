@@ -31,12 +31,15 @@ tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatur
 tasks.named('test').configure {
   exclude '**/RatisJournalTests.class'
   exclude '**/RatisFailureCleanupTests.class'
+  exclude '**/RatisJournalProcessTests.class'
 }
 tasks.register('journalTest', Test) {
   testClassesDirs = sourceSets.test.output.classesDirs
   classpath = sourceSets.test.runtimeClasspath
+  systemProperty 'tests.journal.classpath', sourceSets.test.runtimeClasspath.asPath
   include '**/RatisJournalTests.class'
   include '**/RatisFailureCleanupTests.class'
+  include '**/RatisJournalProcessTests.class'
   systemProperty 'tests.security.manager', 'false'
   systemProperty 'tests.system_call_filter', 'false'
 }

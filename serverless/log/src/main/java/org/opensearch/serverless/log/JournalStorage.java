@@ -20,13 +20,19 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
 /** Fail-closed guard around Ratis's permissive RECOVER-on-empty-directory behavior. */
 final class JournalStorage implements AutoCloseable {
+    // Strong references preserve OS locks even when a closed journal becomes unreachable.
+    // A voter host normally opens one volume. The hard cap bounds failed-startup quarantine.
+    private static final List<JournalStorage> PROCESS_VOLUMES = new ArrayList<>();
+    private volatile boolean processOwned;
     private static final String BINDING = "journal-binding";
     private static final String INITIALIZED = "journal-initialized";
     private final JournalDiskIdentity.Lease lease;
@@ -83,6 +89,23 @@ final class JournalStorage implements AutoCloseable {
             }
             throw failure;
         }
+    }
+
+    void retainUntilProcessExit() throws IOException {
+        synchronized (PROCESS_VOLUMES) {
+            if (processOwned) {
+                return;
+            }
+            if (PROCESS_VOLUMES.size() >= 128) {
+                throw new IOException("process journal volume limit reached; restart this JVM before opening more volumes");
+            }
+            PROCESS_VOLUMES.add(this);
+            processOwned = true;
+        }
+    }
+
+    boolean isProcessOwned() {
+        return processOwned;
     }
 
     Path directory() {
@@ -153,7 +176,7 @@ final class JournalStorage implements AutoCloseable {
     private static byte[] binding(JournalConfiguration configuration) throws IOException {
         final var bytes = new ByteArrayOutputStream();
         try (var out = new DataOutputStream(bytes)) {
-            out.writeInt(1);
+            out.writeInt(2);
             out.writeUTF(configuration.deploymentId().toString());
             out.writeUTF(configuration.localVoterId().toString());
             for (var group : configuration.groups()
@@ -190,6 +213,9 @@ final class JournalStorage implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+        if (processOwned) {
+            throw new IOException("native journal volume remains leased until this JVM exits");
+        }
         lease.close();
     }
 }

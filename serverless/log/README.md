@@ -60,14 +60,34 @@ inconsistent storage fails closed; native `RECOVER` is never allowed to silently
 format a wiped established voter. Initialization synchronizes newly created group
 directories up to the provisioned volume root before writing its marker.
 
+Before admitting logical operations, the local leader must complete
+`activateGroup`: append a seed, wait for its `ALL_COMMITTED` watch across all three
+initial voters, then commit an activation record through the majority path. A
+watch for index zero is insufficient because native initial commit hints can
+already report zero on an otherwise empty voter. Ratis rejects votes from empty
+logs after a nonempty commit; omitting this initial barrier can strand the two
+remaining voters after the first leader dies. Activation survives replay; normal
+writes and subsequent leader changes require a majority, not all three voters.
+Control identities are reserved and activation records are excluded from replay
+subscriptions while still consuming scan budgets. Binding format version 2
+rejects volumes created by the earlier experimental runtime without this barrier.
+
+Once native startup begins, the volume lease lasts for the **entire JVM lifetime**,
+even after `close` or failed startup. Native close can return while stalled disk
+work remains alive. A bounded process registry retains the lock's channel, and
+only process termination releases it for a replacement voter. The host must wait
+for the old process to exit before reopening its volume. Pre-interrupted close
+refuses SDK cleanup, closes admission, and preserves the interrupt; cleanup can be
+retried from a non-interrupted thread. The host normally opens one volume; the
+registry caps successful and failed-startup volumes at 128 per JVM.
+
 A crash during incomplete initial bootstrap requires controller intervention.
-This first runtime supports static membership. Learner catch-up, safe membership
+This runtime supports static membership. Learner catch-up, safe membership
 changes, group movement, and bootstrap recovery still need their controller state
 machines. Operators must not edit the binding or copy a live voter directory to
-another live voter. A failed replication-service close retains the volume lease. The curated
-`ratis-server` artifact closes a failed group before unregistering it, fixing a
-reproduced native storage-lock leak on initialization failure. Other I/O-error
-and interrupted-shutdown cleanup paths still require qualification.
+another live voter. The curated `ratis-server` artifact closes failed groups and
+unpublished logs on startup errors. Other I/O-error cleanup paths still require
+qualification; the lifetime lease prevents their old tasks overlapping a new voter.
 
 ## Authentication and replay
 
@@ -101,11 +121,13 @@ Run unit tests and the socket/disk integration task:
 ```
 
 The integration task disables the test security manager and system-call filter
-only for real gRPC sockets. It is part of this module's `check`. Its certificates
+for real gRPC sockets and child voter JVMs. It is part of this module's `check`. Its certificates
 are public test fixtures, copied from testkit, with password `testonly`.
 
 Local tests cover shared-stream isolation, two physical groups, leader close,
-full restart/replay with payload verification, majority loss, absent client
+SIGKILL followed by failover, full independent-JVM restart/replay with payload
+verification, stalled shutdown retaining the volume lock until process exit,
+activation/control isolation, majority loss, absent client
 credentials, disk-reserve refusal, namespace rejection, and strict storage
-binding/identity checks. Graceful close on one machine is not evidence of power
-loss, independent-process corruption recovery, or three-AZ durability/latency.
+binding/identity checks. Independent processes on one machine do not establish power-loss behavior,
+independent-AZ corruption recovery, or three-AZ durability/latency.

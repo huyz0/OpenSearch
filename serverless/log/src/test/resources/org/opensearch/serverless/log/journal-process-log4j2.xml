@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<Configuration status="ERROR">
+  <Appenders><Console name="stderr" target="SYSTEM_ERR"><PatternLayout pattern="%level %logger: %msg%n"/></Console></Appenders>
+  <Loggers><Root level="WARN"><AppenderRef ref="stderr"/></Root></Loggers>
+</Configuration>

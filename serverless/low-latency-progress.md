@@ -66,5 +66,18 @@ asynchronous S3 archival are not enabled by these foundation commits.
   cases with zero failures/errors/skips; module check and root precommit passed.
   Details are in [log/README.md](log/README.md).
 
+- Initial activation and voter lifetime: real child JVM tests reproduced failover
+  becoming unavailable when the third initial voter still had an empty log, and
+  SDK close releasing a volume while its disk worker remained stalled. The runtime
+  now gates initial writes on a seed committed by all initial voters plus a
+  majority-committed activation marker; subsequent writes still require a majority.
+  Volumes remain exclusively leased until their JVM exits, including after failed
+  startup. Independent process tests cover leader SIGKILL, two shared groups,
+  selective replay, full JVM restart, and a stalled shutdown retaining the volume
+  lock until process exit. In-process tests cover reserved control identities,
+  repeated activation, pre-interrupted close, and retrying cleanup on a clean thread.
+  Three iterations passed 75 unit and 30 journal cases, with module checks and
+  root precommit. These are local process tests, not independent-AZ qualification.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.
