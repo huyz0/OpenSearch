@@ -2418,7 +2418,7 @@ public final class ShardOperations {
                 ? node.delete(placement.local(), id, ifSeqNo, ifPrimaryTerm)
                 : node.index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
             if (refresh) {
-                node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
+                node.refreshAfterMutation(node.reconciler().shard(placement.local()), "serverless-ops-refresh");
             }
             return new Written(node.localNode().getId(), outcome, placement.local());
         }

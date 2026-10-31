@@ -470,6 +470,28 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("refused", backpressure.refused());
             builder.endObject();
 
+            builder.startObject("wal_group_commit");
+            builder.field("group_attempts", serving.walGroupAttempts());
+            builder.field("records_committed", serving.walRecordsCommitted());
+            builder.endObject();
+
+            builder.startObject("operation_timings");
+            builder.field("percentiles", "logarithmic_bucket_upper_bounds");
+            final var timings = serving.operationTimings().snapshots();
+            for (var stage : org.opensearch.serverless.store.OperationTimings.Stage.values()) {
+                final var timing = timings.get(stage);
+                builder.startObject(stage.name().toLowerCase(java.util.Locale.ROOT));
+                builder.field("samples", timing.samples());
+                builder.field("failures", timing.failures());
+                builder.field("total_nanos", timing.totalNanos());
+                builder.field("max_nanos", timing.maxNanos());
+                builder.field("p50_upper_bound_nanos", timing.p50UpperBoundNanos());
+                builder.field("p95_upper_bound_nanos", timing.p95UpperBoundNanos());
+                builder.field("p99_upper_bound_nanos", timing.p99UpperBoundNanos());
+                builder.endObject();
+            }
+            builder.endObject();
+
             objectStore(builder, metadata);
             blockCache(builder, serving);
             scheduler(builder, serving);

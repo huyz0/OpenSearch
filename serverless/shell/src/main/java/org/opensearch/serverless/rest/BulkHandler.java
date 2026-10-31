@@ -649,7 +649,7 @@ public final class BulkHandler extends BaseRestHandler {
                 if (refresh) {
                     final var open = serving.reconciler().shard(local);
                     if (open != null) {
-                        open.refresh("serverless-bulk-refresh");
+                        serving.refreshAfterMutation(open, "serverless-bulk-refresh");
                     }
                 }
             } catch (Exception e) {

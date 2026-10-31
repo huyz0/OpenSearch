@@ -39,6 +39,24 @@ public class ServerlessGroupCommitTests extends OpenSearchTestCase {
 
     private static final ShardId SHARD = new ShardId(new Index("alpha", "alpha-uuid"), 0);
 
+    public void testPhysicalAppendTimingsIncludeFailuresAndFatalErrors() throws Exception {
+        final var timings = new org.opensearch.serverless.store.OperationTimings();
+        final var committer = new WalGroupCommitter(1, 1024, timings);
+        committer.commit(SHARD, 1, List.of(record("success")), (term, records) -> {});
+        final IOException failure = new IOException("store unavailable");
+        assertSame(failure, expectThrows(IOException.class, () -> committer.commit(SHARD, 1, List.of(record("failed")), (term, records) -> {
+            throw failure;
+        })));
+        final Error fatal = new AssertionError("fatal failure");
+        assertSame(fatal, expectThrows(AssertionError.class, () -> committer.commit(SHARD, 1, List.of(record("fatal")), (term, records) -> {
+            throw fatal;
+        })));
+        final var stats = timings.snapshots().get(org.opensearch.serverless.store.OperationTimings.Stage.WAL_FLUSH);
+        assertEquals(3L, stats.samples());
+        assertEquals(2L, stats.failures());
+        assertEquals(1L, committer.recordsCommitted());
+    }
+
     private static WalRecord record(String id) {
         return new WalRecord(id, "{\"msg\":\"" + id + "\"}");
     }

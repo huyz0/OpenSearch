@@ -141,6 +141,24 @@ Reading it was not merely reassuring. The same page documents two further outcom
 under concurrency, and `404` when a delete beats an `If-Match` write -- which the S3 register mapped to
 exceptions rather than to conflicts. See `STATUS.md`.
 
+## Low-latency delivery measurements
+
+`/_serverless/stats` exposes node-local `wal_group_commit` counters and
+`operation_timings` histograms. Group attempts include failed attempts and backend
+retries are part of each physical append's duration; group attempts are not an
+exact S3 HTTP request count. Use the metered object-store counters for request cost.
+
+`wal_append` measures each caller's wait for group commit, while `wal_flush`
+measures each physical group append. `mutation_refresh` covers explicit refreshes
+on local and forwarded document/bulk writes. `segment_publication` includes the
+flush, upload, manifest publication, and post-publication log pruning. These stages
+overlap and do not sum to total client latency. Percentiles are logarithmic bucket
+upper bounds in nanoseconds; concurrent snapshots are approximate. Histograms have
+fixed process-local size and contain no per-index or per-shard labels.
+
+These measurements support the delivery plan; they do not enable quorum durability
+or change the current S3 acknowledgement contract.
+
 ## Transport replay capacity
 
 `serverless.transport.replay_cache.capacity` limits the accepted, still-valid nonces

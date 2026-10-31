@@ -264,7 +264,7 @@ public final class ShardRouter {
             );
         }
         if (request.refresh()) {
-            node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
+            node.refreshAfterMutation(node.reconciler().shard(shardId), "serverless-forwarded-refresh");
         }
         channel.sendResponse(
             new ForwardedIndexResponse(
@@ -302,7 +302,7 @@ public final class ShardRouter {
         requireLiveOwnership(shardId);
         final var outcomes = node.bulkOperations(shardId, request.batch());
         if (request.refresh()) {
-            node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
+            node.refreshAfterMutation(node.reconciler().shard(shardId), "serverless-forwarded-refresh");
         }
         channel.sendResponse(new ForwardedBulkResponse(node.localNode().getId(), outcomes));
     }

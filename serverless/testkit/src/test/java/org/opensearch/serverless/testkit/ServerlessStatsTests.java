@@ -188,6 +188,33 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
         }
     }
 
+    public void testOperationTimingsReflectActualWritesAndRefreshes() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("timed", "uuid-timed-00000000", 1, MAPPING, null));
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("stats-timings", null))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("timed", 0);
+            loop.tick(clock.get());
+            assertEquals(201, send(node, "PUT", "/timed/_doc/1?refresh=true", "{\"msg\":\"visible\"}").status());
+            final var timings = node.operationTimings().snapshots();
+            final var append = timings.get(org.opensearch.serverless.store.OperationTimings.Stage.WAL_APPEND);
+            assertEquals(1L, append.samples());
+            assertEquals(0L, append.failures());
+            assertEquals(1L, timings.get(org.opensearch.serverless.store.OperationTimings.Stage.WAL_FLUSH).samples());
+            assertEquals(1L, timings.get(org.opensearch.serverless.store.OperationTimings.Stage.MUTATION_REFRESH).samples());
+            assertEquals(1L, node.walGroupAttempts());
+            assertEquals(1L, node.walRecordsCommitted());
+            final Response response = send(node, "GET", "/_serverless/stats", null);
+            assertEquals(response.body(), 200, response.status());
+            assertTrue(response.body(), response.body().contains("\"wal_group_commit\":{\"group_attempts\":1,\"records_committed\":1}"));
+            assertTrue(response.body(), response.body().contains("\"operation_timings\""));
+            assertTrue(response.body(), response.body().contains("\"wal_append\":{\"samples\":1,\"failures\":0"));
+        }
+    }
+
     /** The breakers report a limit and a use, and the limit is the one that was configured. */
     public void testStatsReportTheBreakersThatDecideARefusal() throws Exception {
         final Settings settings = Settings.builder()

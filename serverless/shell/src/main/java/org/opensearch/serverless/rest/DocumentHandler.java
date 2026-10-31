@@ -717,7 +717,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 if (refresh) {
                     final var open = serving.reconciler().shard(into);
                     if (open != null) {
-                        open.refresh("serverless-rest-refresh");
+                        serving.refreshAfterMutation(open, "serverless-rest-refresh");
                         refreshed = true;
                     }
                 }

@@ -108,6 +108,7 @@ public final class WalGroupCommitter {
     private final Map<ShardId, State> states = new ConcurrentHashMap<>();
     private final AtomicLong groups = new AtomicLong();
     private final AtomicLong recordsCommitted = new AtomicLong();
+    private final OperationTimings timings;
 
     /** Creates a committer with the default bounds. */
     public WalGroupCommitter() {
@@ -125,6 +126,17 @@ public final class WalGroupCommitter {
      * @param maxBytes roughly the most bytes of id and source one group may carry; at least one
      */
     public WalGroupCommitter(int maxRecords, long maxBytes) {
+        this(maxRecords, maxBytes, new OperationTimings());
+    }
+
+    /**
+     * Creates a committer sharing node-scoped stage measurements.
+     *
+     * @param maxRecords maximum records before starting another group
+     * @param maxBytes approximate maximum group content bytes
+     * @param timings node-scoped measurements
+     */
+    public WalGroupCommitter(int maxRecords, long maxBytes, OperationTimings timings) {
         if (maxRecords < 1) {
             throw new IllegalArgumentException("maxRecords must be positive, got " + maxRecords);
         }
@@ -133,6 +145,7 @@ public final class WalGroupCommitter {
         }
         this.maxRecords = maxRecords;
         this.maxBytes = maxBytes;
+        this.timings = java.util.Objects.requireNonNull(timings);
     }
 
     /**
@@ -185,6 +198,7 @@ public final class WalGroupCommitter {
                 IOException thrown = null;
                 Error fatal = null;
                 state.lock.unlock();
+                final long flushStarted = System.nanoTime();
                 try {
                     flush.append(batch.term, batch.records);
                 } catch (IOException e) {
@@ -195,6 +209,7 @@ public final class WalGroupCommitter {
                     fatal = e;
                     thrown = new IOException("write-ahead log append to " + shardId + " failed", e);
                 } finally {
+                    timings.record(OperationTimings.Stage.WAL_FLUSH, System.nanoTime() - flushStarted, thrown == null);
                     state.lock.lock();
                     batch.failure = thrown;
                     batch.done = true;

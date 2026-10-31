@@ -155,8 +155,26 @@ public final class ShardReconciler {
      * @param localNode this node's identity
      */
     public ShardReconciler(IndicesService indicesService, DiscoveryNode localNode) {
+        this(indicesService, localNode, new org.opensearch.serverless.store.OperationTimings());
+    }
+
+    private final org.opensearch.serverless.store.OperationTimings operationTimings;
+
+    /**
+     * Creates a reconciler sharing node-scoped measurements.
+     *
+     * @param indicesService indices service
+     * @param localNode local identity
+     * @param operationTimings node-scoped measurements
+     */
+    public ShardReconciler(
+        IndicesService indicesService,
+        DiscoveryNode localNode,
+        org.opensearch.serverless.store.OperationTimings operationTimings
+    ) {
         this.indicesService = indicesService;
         this.localNode = localNode;
+        this.operationTimings = java.util.Objects.requireNonNull(operationTimings);
     }
 
     /**
@@ -237,6 +255,22 @@ public final class ShardReconciler {
      * @throws IOException if the shard is not held here, or publication fails
      */
     public CommitManifest publish(ShardId shardId, long term) throws IOException {
+        final long started = System.nanoTime();
+        boolean success = false;
+        try {
+            final CommitManifest manifest = publishCommit(shardId, term);
+            success = true;
+            return manifest;
+        } finally {
+            operationTimings.record(
+                org.opensearch.serverless.store.OperationTimings.Stage.SEGMENT_PUBLICATION,
+                System.nanoTime() - started,
+                success
+            );
+        }
+    }
+
+    private CommitManifest publishCommit(ShardId shardId, long term) throws IOException {
         final IndexShard shard = open.get(shardId);
         if (shard == null) {
             throw new IOException("cannot publish " + shardId + ": not open on " + localNode.getId());

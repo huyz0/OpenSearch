@@ -196,6 +196,8 @@ public final class ServerlessNode implements Closeable {
      * per document.
      */
     private final org.opensearch.serverless.store.WalGroupCommitter walCommitter;
+    private final org.opensearch.serverless.store.OperationTimings operationTimings =
+        new org.opensearch.serverless.store.OperationTimings();
 
     /** How many writes may wait on the object store at once; see WriteBackpressure. */
     private final org.opensearch.serverless.store.WriteBackpressure writeBackpressure;
@@ -856,7 +858,11 @@ public final class ServerlessNode implements Closeable {
                 "serverless.wal.group_commit.max_records",
                 org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_RECORDS
             ),
-            settings.getAsLong("serverless.wal.group_commit.max_bytes", org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES)
+            settings.getAsLong(
+                "serverless.wal.group_commit.max_bytes",
+                org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES
+            ),
+            operationTimings
         );
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
@@ -2541,7 +2547,7 @@ public final class ServerlessNode implements Closeable {
         // Built here rather than in the constructor: both need the node identity, and the identity is
         // not final until the transport has bound and told us the address it got.
         projector = new LocalViewProjector(ClusterName.CLUSTER_NAME_SETTING.get(settings), localNode);
-        reconciler = new ShardReconciler(indicesService, localNode);
+        reconciler = new ShardReconciler(indicesService, localNode, operationTimings);
         reconciler.setOnShardFailed((failed, cause) -> {
             // Off the failing thread, which may hold engine locks the release needs.
             try {
@@ -3808,6 +3814,54 @@ public final class ServerlessNode implements Closeable {
         return writeBackpressure.stats();
     }
 
+    /**
+     * Returns fixed-cardinality timing measurements for this process.
+     *
+     * @return operation timings
+     */
+    public org.opensearch.serverless.store.OperationTimings operationTimings() {
+        return operationTimings;
+    }
+
+    /**
+     * Returns the number of physical WAL group append attempts on this node.
+     *
+     * @return group attempts, including failed attempts
+     */
+    public long walGroupAttempts() {
+        return walCommitter.groups();
+    }
+
+    /**
+     * Returns records successfully persisted through group commit on this node.
+     *
+     * @return committed records
+     */
+    public long walRecordsCommitted() {
+        return walCommitter.recordsCommitted();
+    }
+
+    /**
+     * Refreshes a mutation's shard and records the complete refresh attempt.
+     *
+     * @param shard the mutation's open shard
+     * @param reason refresh reason
+     */
+    public void refreshAfterMutation(org.opensearch.index.shard.IndexShard shard, String reason) {
+        final long started = System.nanoTime();
+        boolean success = false;
+        try {
+            shard.refresh(reason);
+            success = true;
+        } finally {
+            operationTimings.record(
+                org.opensearch.serverless.store.OperationTimings.Stage.MUTATION_REFRESH,
+                System.nanoTime() - started,
+                success
+            );
+        }
+    }
+
     /** Counts departures from the membership this node consults, once per plane. */
     private void watchDepartures(org.opensearch.serverless.metadata.MetadataPlane plane) {
         if (watchingDepartures.compareAndSet(false, true)) {
@@ -4262,12 +4316,14 @@ public final class ServerlessNode implements Closeable {
             );
         }
         final long appendStarted = System.nanoTime();
+        boolean appendSucceeded = false;
         try {
             // Through the group committer rather than straight to the log: concurrent writes to this shard
             // share one PUT, and this caller returns only once the blob carrying its own records has
             // landed. The two lease checks around this call are unchanged and remain per-caller, so every
             // member of a group independently establishes that its record sits ahead of any seal.
             walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
+            appendSucceeded = true;
             writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
         } catch (Exception | Error e) {
             writeBackpressure.onAppend(System.nanoTime() - appendStarted, false);
@@ -4282,6 +4338,12 @@ public final class ServerlessNode implements Closeable {
                     + shardId
                     + "; the write was not acknowledged, the shard now refuses writes and will be reopened from its log",
                 e
+            );
+        } finally {
+            operationTimings.record(
+                org.opensearch.serverless.store.OperationTimings.Stage.WAL_APPEND,
+                System.nanoTime() - appendStarted,
+                appendSucceeded
             );
         }
         // The PUT landed, so the record is durable: a successor fences this term before it replays, and a
