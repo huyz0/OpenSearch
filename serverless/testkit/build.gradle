@@ -17,6 +17,17 @@ dependencies {
   testImplementation project(':test:framework')
   // R11 against a real S3 API: the conformance suite needs the container production would use.
   testImplementation project(':plugins:repository-s3')
+  // M2 feasibility only; the runtime does not depend on or activate consensus yet.
+  testImplementation 'org.apache.ratis:ratis-server:3.3.1'
+  testImplementation 'org.apache.ratis:ratis-client:3.3.1'
+  testImplementation 'org.apache.ratis:ratis-grpc:3.3.1'
+  testImplementation 'org.apache.ratis:ratis-metrics-default:3.3.1'
+  // OpenSearch deliberately disables transitive dependencies: enumerate the pinned closure.
+  testImplementation 'org.apache.ratis:ratis-server-api:3.3.1'
+  testImplementation 'org.apache.ratis:ratis-common:3.3.1'
+  testImplementation 'org.apache.ratis:ratis-proto:3.3.1'
+  testImplementation 'org.apache.ratis:ratis-metrics-api:3.3.1'
+  testImplementation 'org.apache.ratis:ratis-thirdparty-misc:1.1.0'
 }
 
 // Spikes (S0, S1) live here. They are disposable probes, not a regression suite —
@@ -46,6 +57,8 @@ tasks.named('test').configure {
   exclude '**/Serverless*MeasurementTests.class'
   exclude '**/ServerlessFleetScaleTests.class'
   exclude '**/ServerlessLatencyBenchmarkTests.class'
+  exclude '**/RatisPersistenceSpikeTests.class'
+  exclude '**/RatisGroupCountBenchmarkTests.class'
   exclude '**/ServerlessRealPluginTests.class'
   exclude '**/ServerlessTlsTests.class'
 }
@@ -179,6 +192,30 @@ tasks.register('latencyBenchmark', Test) {
   systemProperty 'tests.latency.output', layout.buildDirectory.file('benchmarks/latency-baseline.json').get().asFile.absolutePath
   System.getProperties().each { key, value ->
     if (key.toString().startsWith('tests.latency.')) {
+      systemProperty key.toString(), value.toString()
+    }
+  }
+  outputs.upToDateWhen { false }
+}
+
+// Isolated feasibility tests: real sockets and disk, without enabling a runtime mode.
+tasks.register('consensusTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/RatisPersistenceSpikeTests.class'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'tests.system_call_filter', 'false'
+}
+
+tasks.register('consensusBenchmark', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/RatisGroupCountBenchmarkTests.class'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'tests.system_call_filter', 'false'
+  systemProperty 'tests.consensus.output', layout.buildDirectory.file('benchmarks/consensus-groups.json').get().asFile.absolutePath
+  System.getProperties().each { key, value ->
+    if (key.toString().startsWith('tests.consensus.')) {
       systemProperty key.toString(), value.toString()
     }
   }

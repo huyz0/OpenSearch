@@ -121,12 +121,12 @@ transport/security integration, group commit behavior, snapshot installation,
 membership changes, failure recovery, and measured per-group overhead. Do not
 implement a bespoke Raft protocol or reuse discovery leases as an approximation.
 
-Start with one logical consensus group per active shard for simple correctness,
-with many groups multiplexed on shared physical nodes and bounded executors.
-Measure group count at 1,000 and 10,000 active shards before production selection.
-If overhead is excessive, introduce a separately reviewed shared-log-group design
-with per-shard ordered streams, checkpoint vectors, and fair scheduling; that design
-is not assumed to be free or equivalent to per-shard groups.
+The initial per-shard-group feasibility probe found substantial per-division thread
+overhead. Follow the [consensus ADR](low-latency-consensus-adr.md): use a bounded
+set of physical groups carrying multiple logical shard streams, with per-shard
+ordering, checkpoint vectors, ownership epochs, and fair scheduling. Qualify 1,000
+and 10,000 logical shards over that bounded group topology; do not extrapolate a
+ten-group probe into a claim of a tested 10,000-group deployment.
 
 Leader election is not a vote per write. Normal writes append to the elected
 leader and share persistence work. Membership changes use the library's safe

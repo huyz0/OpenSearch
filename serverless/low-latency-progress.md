@@ -11,7 +11,7 @@ asynchronous S3 archival are not enabled by these foundation commits.
 | --- | --- | --- |
 | M0 | Node timing histograms, WAL group counters, explicit open-loop benchmark, initial real-process filesystem baseline | Additional pipeline stages during extraction; actual S3 and sustained-load qualification |
 | M1 | Append and streaming recovery interfaces, optional async dispatch with cancellation/rejection semantics, existing S3 path integration, bounded versioned log/checkpoint identity codecs | Operation-envelope and subscription formats after consensus/engine spike decisions |
-| M2 | Consensus dependency/source evaluation started | Real three-replica persistence/election spike, committed-serving engine prototype, architecture decision |
+| M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3–M9 | Not implemented | Persistent quorum lifecycle, writes, fresh readers, selective replication, archival, lifecycle, migration |
 | M10–M12 | Not implemented | Scale/cost/failure qualification, controlled rollout, optional attribute/QUIC extensions |
 
@@ -26,6 +26,9 @@ asynchronous S3 archival are not enabled by these foundation commits.
   failures, and cancellation without discarding already accepted persistence work.
 - Checkpoint tests cover empty/max coordinates, activation/incarnation separation,
   preallocation length limits, malformed UTF-8, and unknown format versions.
+- Full foundation regression: 1,432 cases, zero failures/errors, two skips, 8m26s.
+- Consensus persistence and engine-boundary probes each passed three randomized
+  iterations. Group-count benchmark and root precommit passed. Ratis remains test-scoped.
 
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.
