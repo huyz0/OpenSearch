@@ -71,6 +71,16 @@ final class JournalProcess implements AutoCloseable {
         Map<UUID, LogCheckpoint> requiredActivations,
         Map<UUID, JournalMembershipRecord> memberships
     ) throws IOException {
+        return start(configuration, log, requiredActivations, memberships, Map.of());
+    }
+
+    static JournalProcess start(
+        JournalConfiguration configuration,
+        Path log,
+        Map<UUID, LogCheckpoint> requiredActivations,
+        Map<UUID, JournalMembershipRecord> memberships,
+        Map<UUID, JournalMembershipRecord> originalJoins
+    ) throws IOException {
         final List<String> arguments = new ArrayList<>();
         arguments.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
         arguments.add("-Xms64m");
@@ -102,6 +112,11 @@ final class JournalProcess implements AutoCloseable {
             encodedMemberships.add(java.util.Base64.getEncoder().encodeToString(record.encode()));
         }
         arguments.add(String.join(",", encodedMemberships));
+        final var encodedJoins = new ArrayList<String>();
+        for (var record : originalJoins.values()) {
+            encodedJoins.add(java.util.Base64.getEncoder().encodeToString(record.encode()));
+        }
+        arguments.add(String.join(",", encodedJoins));
         final var fixture = new JournalProcess(startProcess(arguments, log), log);
         try {
             fixture.execute(() -> {
@@ -120,6 +135,37 @@ final class JournalProcess implements AutoCloseable {
     @SuppressForbidden(reason = "ProcessBuilder.redirectError requires java.io.File for this child-process fixture")
     private static Process startProcess(List<String> arguments, Path log) throws IOException {
         return new ProcessBuilder(arguments).redirectError(log.toFile()).start();
+    }
+
+    void advance(JournalMembershipRecord intent) throws IOException {
+        exchange(JournalProcessMain.ADVANCE, out -> JournalProcessMain.writeFrame(out, intent.encode()), in -> null);
+    }
+
+    java.util.Optional<JournalReplacementReceipt> receipt(JournalMembershipRecord intent) throws IOException {
+        return exchange(JournalProcessMain.RECEIPT, out -> JournalProcessMain.writeFrame(out, intent.encode()), in -> {
+            if (in.readBoolean() == false) {
+                return java.util.Optional.empty();
+            }
+            return java.util.Optional.of(JournalReplacementReceipt.read(new ByteArrayInputStream(JournalProcessMain.readFrame(in))));
+        });
+    }
+
+    Set<UUID> voters(int group) throws IOException {
+        return exchange(JournalProcessMain.VOTERS, out -> out.writeInt(group), in -> {
+            final int count = in.readInt();
+            if (count < 0 || count > 6) {
+                throw new IOException("invalid fixture voter count");
+            }
+            final var result = new java.util.HashSet<UUID>();
+            for (int i = 0; i < count; i++) {
+                result.add(UUID.fromString(in.readUTF()));
+            }
+            return Set.copyOf(result);
+        });
+    }
+
+    void release() throws IOException {
+        exchange(JournalProcessMain.RELEASE, out -> {}, in -> null);
     }
 
     boolean leader(int group) throws IOException {

@@ -27,6 +27,218 @@ import java.util.concurrent.TimeUnit;
 /** Real JVM restart/crash tests, distinct from power-loss and three-AZ qualification. */
 @SuppressFileSystems("*")
 public class RatisJournalProcessTests extends OpenSearchTestCase {
+    public void testLearnerCatchupPromotionAndReplacementQuorumSurviveRestart() throws Exception {
+        final var fixture = fixture(1);
+        final var nodes = new ArrayList<JournalProcess>();
+        final var stream = new ShardLogId(fixture.deployment(), "replacement-index", 0, UUID.randomUUID());
+        try {
+            startAll(fixture, nodes, true);
+            final var leader = leader(nodes, 0);
+            final var group = fixture.configurations().getFirst().groups().getFirst();
+            final var genesis = new JournalGroupRecord(fixture.deployment(), group, leader.activation(0));
+            final var removed = fixture.configurations()
+                .get(nodes.indexOf(nodes.stream().filter(node -> node != leader).findFirst().orElseThrow()))
+                .localPeer();
+            final Path directory = createTempDir();
+            final JournalConfiguration.Peer joining;
+            try (var port = reservePort()) {
+                joining = new JournalConfiguration.Peer(
+                    JournalDiskIdentity.discover(directory),
+                    "127.0.0.1",
+                    port.getLocalPort(),
+                    removed.availabilityZone()
+                );
+            }
+            final var targetPeers = new ArrayList<>(group.peers());
+            targetPeers.remove(removed);
+            targetPeers.add(joining);
+            final var target = new JournalConfiguration.Group(group.id(), targetPeers);
+            final var intent = JournalMembershipRecord.initial(genesis).begin(0, UUID.randomUUID(), target);
+            final var learnerConfiguration = new JournalConfiguration(
+                fixture.deployment(),
+                joining.id(),
+                directory,
+                List.of(group),
+                true,
+                JournalConfiguration.Limits.defaults(),
+                joining
+            );
+            // A controller can crash after empty learner startup but before adding its listener.
+            final var empty = JournalProcess.start(
+                learnerConfiguration,
+                createTempDir().resolve("empty-learner.log"),
+                Map.of(),
+                Map.of(group.id(), intent),
+                Map.of(group.id(), intent)
+            );
+            nodes.add(empty);
+            empty.stop();
+            final var recovery = new JournalConfiguration(
+                fixture.deployment(),
+                joining.id(),
+                directory,
+                List.of(group),
+                false,
+                learnerConfiguration.limits(),
+                joining
+            );
+            final var learner = JournalProcess.start(
+                recovery,
+                createTempDir().resolve("learner.log"),
+                Map.of(),
+                Map.of(group.id(), intent),
+                Map.of(group.id(), intent)
+            );
+            nodes.add(learner);
+            leader.advance(intent); // Add a nonvoting listener only.
+            leader.append(0, operation(stream, 0));
+            assertBusy(() -> {
+                try {
+                    assertEquals(genesis.activation(), learner.activation(0));
+                } catch (IOException replaying) {
+                    throw new AssertionError("waiting for learner activation replay", replaying);
+                }
+            }, 20, TimeUnit.SECONDS);
+            learner.stall();
+            final var last = leader.append(0, operation(stream, 1));
+            assertBusy(() -> assertTrue(learner.stalled()), 10, TimeUnit.SECONDS);
+            leader.advance(intent); // Commit a fresh nonce-bound barrier through the original quorum.
+            leader.advance(intent); // A stalled learner must still not be promoted.
+            assertEquals(
+                group.peers().stream().map(JournalConfiguration.Peer::id).collect(java.util.stream.Collectors.toSet()),
+                leader.voters(0)
+            );
+            assertTrue(leader.receipt(intent).isEmpty());
+            assertTrue(learner.progress(0).flushed() < last.index());
+            learner.release();
+            final var receipt = new JournalReplacementReceipt[1];
+            assertBusy(() -> {
+                try {
+                    leader.advance(intent);
+                    receipt[0] = leader.receipt(intent).orElseThrow(() -> new IOException("waiting for target commit"));
+                } catch (IOException waiting) {
+                    throw new AssertionError("waiting for learner promotion", waiting);
+                }
+            }, 30, TimeUnit.SECONDS);
+            assertEquals(intent, receipt[0].intent());
+            assertTrue(receipt[0].learnerBarrierIndex() < receipt[0].targetConfigurationIndex());
+            assertEquals(
+                target.peers().stream().map(JournalConfiguration.Peer::id).collect(java.util.stream.Collectors.toSet()),
+                leader.voters(0)
+            );
+            leader.append(0, operation(stream, 2));
+            final var retired = nodes.get(
+                fixture.configurations().stream().map(JournalConfiguration::localVoterId).toList().indexOf(removed.id())
+            );
+            retired.close();
+            leader.close();
+            // Only the caught-up replacement and one retained voter remain alive.
+            leader(nodes, 0).append(0, operation(stream, 3));
+            for (var node : nodes) {
+                if (node.alive()) {
+                    node.stop();
+                }
+            }
+            nodes.clear();
+            // Model controller loss before receipt/head publication: all processes recover with
+            // the old pending head, including the source voter already excluded by native consensus.
+            for (var original : fixture.configurations()) {
+                nodes.add(restart(original, Map.of(), Map.of(group.id(), intent)));
+            }
+            nodes.add(
+                JournalProcess.start(
+                    recovery,
+                    createTempDir().resolve("promoted-restart.log"),
+                    Map.of(),
+                    Map.of(group.id(), intent),
+                    Map.of(group.id(), intent)
+                )
+            );
+            final var recovered = leader(nodes, 0);
+            final var recoveredReceipt = recovered.receipt(intent).orElseThrow();
+            assertEquals(receipt[0].intent(), recoveredReceipt.intent());
+            assertEquals(receipt[0].learnerBarrierIndex(), recoveredReceipt.learnerBarrierIndex());
+            assertEquals(receipt[0].learnerBarrierTerm(), recoveredReceipt.learnerBarrierTerm());
+            assertTrue(recoveredReceipt.targetConfigurationIndex() >= receipt[0].targetConfigurationIndex());
+            recovered.append(0, operation(stream, 4));
+            final var history = recovered.scan(0, -1, Set.of(stream)).operations();
+            assertEquals(5, history.size());
+            for (int i = 0; i < history.size(); i++) {
+                assertEquals(i, history.get(i).operation().payloadReader().read());
+            }
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
+    public void testReplacingTheLeaderReconcilesOnTheNewQuorum() throws Exception {
+        final var fixture = fixture(1);
+        final var nodes = new ArrayList<JournalProcess>();
+        try {
+            startAll(fixture, nodes, true);
+            final var oldLeader = leader(nodes, 0);
+            final var removed = fixture.configurations().get(nodes.indexOf(oldLeader)).localPeer();
+            final var group = fixture.configurations().getFirst().groups().getFirst();
+            final var genesis = new JournalGroupRecord(fixture.deployment(), group, oldLeader.activation(0));
+            final Path directory = createTempDir();
+            final JournalConfiguration.Peer joining;
+            try (var port = reservePort()) {
+                joining = new JournalConfiguration.Peer(
+                    JournalDiskIdentity.discover(directory),
+                    "127.0.0.1",
+                    port.getLocalPort(),
+                    removed.availabilityZone()
+                );
+            }
+            final var peers = new ArrayList<>(group.peers());
+            peers.remove(removed);
+            peers.add(joining);
+            final var target = new JournalConfiguration.Group(group.id(), peers);
+            final var intent = JournalMembershipRecord.initial(genesis).begin(0, UUID.randomUUID(), target);
+            nodes.add(
+                JournalProcess.start(
+                    new JournalConfiguration(
+                        fixture.deployment(),
+                        joining.id(),
+                        directory,
+                        List.of(group),
+                        true,
+                        JournalConfiguration.Limits.defaults(),
+                        joining
+                    ),
+                    createTempDir().resolve("leader-replacement.log"),
+                    Map.of(),
+                    Map.of(group.id(), intent),
+                    Map.of(group.id(), intent)
+                )
+            );
+            assertBusy(() -> {
+                try {
+                    final var currentLeader = leader(nodes, 0);
+                    currentLeader.advance(intent);
+                    assertTrue(currentLeader.receipt(intent).isPresent());
+                } catch (Exception waiting) {
+                    throw new AssertionError("waiting for replacement of the previous leader", waiting);
+                }
+            }, 45, TimeUnit.SECONDS);
+            oldLeader.close();
+            final var replacement = leader(nodes, 0);
+            assertEquals(
+                peers.stream().map(JournalConfiguration.Peer::id).collect(java.util.stream.Collectors.toSet()),
+                replacement.voters(0)
+            );
+            final var stream = new ShardLogId(fixture.deployment(), "leader-replacement", 0, UUID.randomUUID());
+            replacement.append(0, operation(stream, 0));
+            replacement.close();
+            // Exactly two members of the new three remain after both leader processes are killed.
+            final var remaining = leader(nodes, 0);
+            remaining.append(0, operation(stream, 1));
+            assertEquals(2, remaining.scan(0, -1, Set.of(stream)).operations().size());
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
     public void testAcknowledgedStreamsSurviveLeaderKillAndFullJvmRestart() throws Exception {
         final var fixture = fixture(2);
         final List<JournalProcess> nodes = new ArrayList<>();

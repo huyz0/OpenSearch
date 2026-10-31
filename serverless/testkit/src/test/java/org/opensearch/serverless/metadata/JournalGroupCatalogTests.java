@@ -473,6 +473,35 @@ public class JournalGroupCatalogTests extends OpenSearchTestCase {
         }
     }
 
+    public void testOperationNonceCannotBeReusedAfterCompletionOrMissingReservation() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final var container = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
+            final var catalog = new JournalGroupCatalog(container, UUID.randomUUID());
+            final var group = group(UUID.randomUUID());
+            activate(container, catalog, group);
+            final var first = catalog.prepareReplacement(group.id(), 0, UUID.randomUUID(), replacement(group));
+            final String operationKey = "transition-" + group.id() + "-" + first.pending().id();
+            final var reservation = container.readRegister(operationKey).orElseThrow();
+            assertTrue(container.deleteRegisterIfUnchanged(operationKey, reservation.generation()));
+            expectThrows(IOException.class, () -> catalog.membership(group.id()));
+            expectThrows(
+                IOException.class,
+                () -> catalog.prepareReplacement(group.id(), 0, first.pending().id(), first.pending().target())
+            );
+            assertTrue(container.readRegister(operationKey).isEmpty());
+            assertTrue(container.createRegisterIfAbsent(operationKey, new BytesArray(first.encode())).applied());
+            final var completed = new JournalMembershipRecord(first.genesis(), 1, first.pending().target(), null);
+            final String key = "membership-" + group.id();
+            final var head = container.readRegister(key).orElseThrow();
+            assertTrue(container.compareAndSwapRegister(key, head.generation(), new BytesArray(completed.encode())).applied());
+            expectThrows(
+                IOException.class,
+                () -> catalog.prepareReplacement(group.id(), 1, first.pending().id(), replacement(completed.voters()))
+            );
+            assertEquals(completed, catalog.membership(group.id()));
+        }
+    }
+
     private static void activate(BlobContainer container, JournalGroupCatalog catalog, JournalConfiguration.Group group)
         throws IOException {
         final var reserved = catalog.reserve(group);

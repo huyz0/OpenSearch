@@ -56,6 +56,10 @@ public final class JournalProcessMain {
     static final int PROGRESS = 12;
     static final int FAIL_STORAGE = 13;
     static final int STORAGE_FAILED = 14;
+    static final int ADVANCE = 15;
+    static final int RECEIPT = 16;
+    static final int RELEASE = 17;
+    static final int VOTERS = 18;
     static final int FRAME_LIMIT = 17 * 1024;
 
     private JournalProcessMain() {}
@@ -71,7 +75,7 @@ public final class JournalProcessMain {
      * @throws Exception on startup or broken control channel
      */
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length < 14 || arguments.length > 16) {
+        if (arguments.length < 14 || arguments.length > 17) {
             throw new IllegalArgumentException(
                 "expected volume, namespace, identity, bootstrap, groups, three peer triples, and optional activation/membership CSVs"
             );
@@ -102,13 +106,35 @@ public final class JournalProcessMain {
             Long.getLong("tests.journal.retained", 10_000L),
             1
         );
+        final var originalJoins = new HashMap<UUID, JournalMembershipRecord>();
+        if (arguments.length == 17 && arguments[16].isEmpty() == false) {
+            for (String encoded : arguments[16].split(",")) {
+                if (originalJoins.size() >= 4 || encoded.length() > 2 * JournalMembershipRecord.MAX_BYTES) {
+                    throw new IOException("invalid fixture learner reservations");
+                }
+                final var record = JournalMembershipRecord.read(
+                    new java.io.ByteArrayInputStream(java.util.Base64.getDecoder().decode(encoded))
+                );
+                if (originalJoins.putIfAbsent(record.voters().id(), record) != null) {
+                    throw new IOException("duplicate fixture learner reservation");
+                }
+            }
+        }
+        final UUID local = UUID.fromString(arguments[2]);
+        final var joiningPeer = originalJoins.values()
+            .stream()
+            .flatMap(record -> record.pending().target().peers().stream())
+            .filter(peer -> peer.id().equals(local))
+            .findFirst()
+            .orElse(null);
         final var configuration = new JournalConfiguration(
             UUID.fromString(arguments[1]),
             UUID.fromString(arguments[2]),
             Path.of(arguments[0]),
             groups,
             Boolean.parseBoolean(arguments[3]),
-            limits
+            limits,
+            joiningPeer
         );
         final var keys = KeyStore.getInstance("PKCS12");
         try (var input = JournalProcessMain.class.getResourceAsStream("tls-test-keystore.p12")) {
@@ -141,7 +167,7 @@ public final class JournalProcessMain {
             }
         }
         final var memberships = new HashMap<UUID, JournalMembershipRecord>();
-        if (arguments.length == 16 && arguments[15].isEmpty() == false) {
+        if (arguments.length >= 16 && arguments[15].isEmpty() == false) {
             for (String encoded : arguments[15].split(",")) {
                 if (memberships.size() >= 4 || encoded.length() > 2 * JournalMembershipRecord.MAX_BYTES) {
                     throw new IOException("invalid fixture membership requirements");
@@ -190,12 +216,13 @@ public final class JournalProcessMain {
                     probe,
                     requiredActivations
                 )
-                : RatisJournal.recoverMembership(
+                : RatisJournal.openAssigned(
                     configuration,
                     (X509KeyManager) keyFactory.getKeyManagers()[0],
                     (X509TrustManager) trustFactory.getTrustManagers()[0],
                     probe,
-                    memberships
+                    memberships,
+                    originalJoins
                 );
             var input = new DataInputStream(new BufferedInputStream(System.in));
             var output = new DataOutputStream(protocolOutput())
@@ -212,6 +239,34 @@ public final class JournalProcessMain {
                 }
                 try {
                     switch (command) {
+                        case ADVANCE -> {
+                            final var intent = JournalMembershipRecord.read(new java.io.ByteArrayInputStream(readFrame(input)));
+                            journal.advanceReplacement(intent).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                            output.writeByte(0);
+                        }
+                        case RECEIPT -> {
+                            final var intent = JournalMembershipRecord.read(new java.io.ByteArrayInputStream(readFrame(input)));
+                            final var receipt = journal.replacementReceipt(intent);
+                            output.writeByte(0);
+                            output.writeBoolean(receipt.isPresent());
+                            if (receipt.isPresent()) {
+                                writeFrame(output, receipt.get().encode());
+                            }
+                        }
+                        case VOTERS -> {
+                            final UUID group = groups.get(input.readInt()).id();
+                            final var division = ((RaftServer) field(journal, "server")).getDivision(RaftGroupId.valueOf(group));
+                            final var voters = division.getRaftConf().getCurrentPeers();
+                            output.writeByte(0);
+                            output.writeInt(voters.size());
+                            for (var voter : voters) {
+                                output.writeUTF(voter.getId().toString());
+                            }
+                        }
+                        case RELEASE -> {
+                            release.countDown();
+                            output.writeByte(0);
+                        }
                         case LEADER -> {
                             final boolean ready = journal.isLeaderReady(groups.get(input.readInt()).id());
                             output.writeByte(0);

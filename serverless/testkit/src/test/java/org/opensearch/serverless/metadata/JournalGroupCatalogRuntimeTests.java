@@ -26,7 +26,9 @@ import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.serverless.log.JournalConfiguration;
 import org.opensearch.serverless.log.JournalDiskIdentity;
+import org.opensearch.serverless.log.OperationEnvelope;
 import org.opensearch.serverless.log.RatisJournal;
+import org.opensearch.serverless.log.ShardLogId;
 import org.opensearch.test.OpenSearchTestCase;
 
 import javax.net.ssl.KeyManagerFactory;
@@ -141,6 +143,8 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
             final var real = store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath()));
             final var loseReply = new AtomicBoolean();
             final var loseMembershipReply = new AtomicBoolean();
+            final var loseReceiptReply = new AtomicBoolean();
+            final var hideReceiptRead = new AtomicBoolean();
             final var wrapper = new FilterBlobContainer(real) {
                 @Override
                 protected BlobContainer wrapChild(BlobContainer child) {
@@ -149,7 +153,22 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
 
                 @Override
                 public Optional<BlobRegister> readRegister(String name) throws IOException {
+                    if (name.startsWith("completed-") && hideReceiptRead.compareAndSet(true, false)) {
+                        return Optional.empty(); // Model a competing publisher winning after our empty read.
+                    }
                     return real.readRegister(name);
+                }
+
+                @Override
+                public BlobRegisterCasResult createRegisterIfAbsent(String name, BytesReference value) throws IOException {
+                    final var result = real.createRegisterIfAbsent(name, value);
+                    if (name.startsWith("membership-") && result.applied() && loseMembershipReply.compareAndSet(true, false)) {
+                        throw new IOException("lost membership-head creation reply after persistence");
+                    }
+                    if (name.startsWith("completed-") && result.applied() && loseReceiptReply.compareAndSet(true, false)) {
+                        throw new IOException("lost replacement receipt reply after persistence");
+                    }
+                    return result;
                 }
 
                 @Override
@@ -218,6 +237,125 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                     () -> restartedController.openJournal(configuration, key, trusted, () -> Long.MAX_VALUE)
                 );
                 assertTrue(refused.getMessage(), refused.getMessage().contains("activated physical group"));
+                final var removed = peers.get(
+                    journals.indexOf(journals.stream().filter(journal -> journal != leader[0]).findFirst().orElseThrow())
+                );
+                final Path learnerDirectory = createTempDir();
+                final JournalConfiguration.Peer joining;
+                try (var port = new ServerSocket(0, 0, InetAddress.getByName("127.0.0.1"))) {
+                    joining = new JournalConfiguration.Peer(
+                        JournalDiskIdentity.discover(learnerDirectory),
+                        "127.0.0.1",
+                        port.getLocalPort(),
+                        removed.availabilityZone()
+                    );
+                }
+                final var targetPeers = new ArrayList<>(peers);
+                targetPeers.remove(removed);
+                targetPeers.add(joining);
+                final var intent = catalog.prepareReplacement(
+                    group.id(),
+                    0,
+                    UUID.randomUUID(),
+                    new JournalConfiguration.Group(group.id(), targetPeers)
+                );
+                final var learnerConfiguration = new JournalConfiguration(
+                    deployment,
+                    joining.id(),
+                    learnerDirectory,
+                    List.of(group),
+                    true,
+                    limits,
+                    joining
+                );
+                journals.add(catalog.openAssignedJournal(learnerConfiguration, key, trusted, () -> Long.MAX_VALUE));
+                expectThrows(IOException.class, () -> catalog.publishReplacement(leader[0], intent));
+                assertBusy(() -> {
+                    try {
+                        leader[0].advanceReplacement(intent).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                        assertTrue(leader[0].replacementReceipt(intent).isPresent());
+                    } catch (Exception waiting) {
+                        throw new AssertionError("waiting for native replacement completion", waiting);
+                    }
+                }, 30, TimeUnit.SECONDS);
+                final var nativeProof = leader[0].replacementReceipt(intent).orElseThrow();
+                loseReceiptReply.set(true);
+                expectThrows(IOException.class, () -> catalog.publishReplacement(leader[0], intent));
+                assertEquals(intent, restartedController.membership(group.id()));
+                leader[0].close();
+                assertBusy(() -> {
+                    leader[0] = readyLeader(journals, group.id());
+                    final var newerProof = leader[0].replacementReceipt(intent);
+                    assertTrue(newerProof.isPresent());
+                    assertTrue(newerProof.get().targetConfigurationIndex() > nativeProof.targetConfigurationIndex());
+                }, 30, TimeUnit.SECONDS);
+                hideReceiptRead.set(true);
+                loseMembershipReply.set(true);
+                expectThrows(IOException.class, () -> catalog.publishReplacement(leader[0], intent));
+                assertEquals(nativeProof.completedMembership(), restartedController.membership(group.id()));
+                final var completedController = new JournalGroupCatalog(real, deployment);
+                final var published = completedController.publishReplacement(leader[0], intent);
+                assertEquals(nativeProof, published);
+                assertEquals(published, catalog.publishReplacement(leader[0], intent));
+                final var stream = new ShardLogId(deployment, "replacement-catalog", 0, UUID.randomUUID());
+                leader[0].append(group.id(), new OperationEnvelope(stream, OperationEnvelope.Kind.DOCUMENTS, 1, 1, 1, new byte[] { 1 }))
+                    .toCompletableFuture()
+                    .get(10, TimeUnit.SECONDS);
+                // Replace the first learner again: its original reservation remains immutable,
+                // while retries for the first operation must return the earlier stored receipt.
+                final Path secondDirectory = createTempDir();
+                final JournalConfiguration.Peer secondJoining;
+                try (var port = new ServerSocket(0, 0, InetAddress.getByName("127.0.0.1"))) {
+                    secondJoining = new JournalConfiguration.Peer(
+                        JournalDiskIdentity.discover(secondDirectory),
+                        "127.0.0.1",
+                        port.getLocalPort(),
+                        joining.availabilityZone()
+                    );
+                }
+                final var secondPeers = new ArrayList<>(targetPeers);
+                secondPeers.remove(joining);
+                secondPeers.add(secondJoining);
+                final var secondIntent = completedController.prepareReplacement(
+                    group.id(),
+                    1,
+                    UUID.randomUUID(),
+                    new JournalConfiguration.Group(group.id(), secondPeers)
+                );
+                journals.add(
+                    completedController.openAssignedJournal(
+                        new JournalConfiguration(
+                            deployment,
+                            secondJoining.id(),
+                            secondDirectory,
+                            List.of(group),
+                            true,
+                            limits,
+                            secondJoining
+                        ),
+                        key,
+                        trusted,
+                        () -> Long.MAX_VALUE
+                    )
+                );
+                assertBusy(() -> {
+                    try {
+                        leader[0] = readyLeader(journals, group.id());
+                        leader[0].advanceReplacement(secondIntent).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                        assertTrue(leader[0].replacementReceipt(secondIntent).isPresent());
+                    } catch (Exception waiting) {
+                        throw new AssertionError("waiting for the next native replacement", waiting);
+                    }
+                }, 30, TimeUnit.SECONDS);
+                final var secondReceipt = completedController.publishReplacement(leader[0], secondIntent);
+                assertEquals(2, secondReceipt.completedMembership().revision());
+                assertEquals(published, new JournalGroupCatalog(real, deployment).publishReplacement(leader[0], intent));
+                expectThrows(IOException.class, () -> leader[0].advanceReplacement(intent));
+                final String receiptKey = "completed-" + group.id() + "-" + intent.pending().id();
+                final var receiptRegister = real.readRegister(receiptKey).orElseThrow();
+                assertTrue(real.deleteRegisterIfUnchanged(receiptKey, receiptRegister.generation()));
+                expectThrows(IOException.class, () -> completedController.publishReplacement(leader[0], intent));
+                assertTrue(real.readRegister(receiptKey).isEmpty());
                 final String membershipKey = "membership-" + group.id();
                 final var head = real.readRegister(membershipKey).orElseThrow();
                 assertTrue(real.deleteRegisterIfUnchanged(membershipKey, head.generation()));
@@ -228,4 +366,18 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
             }
         }
     }
+
+    private static RatisJournal readyLeader(List<RatisJournal> journals, UUID group) {
+        for (var journal : journals) {
+            try {
+                if (journal.isLeaderReady(group)) {
+                    return journal;
+                }
+            } catch (IOException unavailable) {
+                // Closed or retired local group; other members can still form a quorum.
+            }
+        }
+        throw new AssertionError("waiting for a ready journal leader");
+    }
+
 }

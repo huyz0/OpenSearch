@@ -99,7 +99,18 @@ final class JournalStorage implements AutoCloseable {
                     requireDirectory(directory);
                     requireDirectory(directory.resolve("current"));
                     requireRegular(directory.resolve("current/raft-meta"));
-                    requireRegular(directory.resolve("current/raft-meta.conf"));
+                    final Path nativeConfiguration = directory.resolve("current/raft-meta.conf");
+                    final boolean emptyLearner = configuration.joiningPeer() != null
+                        && configuration.groups()
+                            .stream()
+                            .filter(value -> value.id().equals(group))
+                            .findFirst()
+                            .orElseThrow()
+                            .peers()
+                            .stream()
+                            .noneMatch(peer -> peer.id().equals(configuration.localVoterId()))
+                        && Files.exists(nativeConfiguration, LinkOption.NOFOLLOW_LINKS) == false;
+                    requireRegular(emptyLearner ? directory.resolve("current/raft-meta.bootstrap") : nativeConfiguration);
                     storage.requireBinding(directory.resolve(INITIALIZED));
                     final var floor = JournalDurableFloor.open(directory.resolve(FLOOR), configuration.deploymentId(), lease.id, group);
                     storage.floors.put(group, floor);
@@ -112,6 +123,9 @@ final class JournalStorage implements AutoCloseable {
                         (long) configuration.limits().segmentBytes() + configuration.limits().queueBytes() + 1024,
                         maximumFiles
                     );
+                    if (emptyLearner && (floor.index() != -1 || observed != -1)) {
+                        throw new IOException("only an empty authorized learner can recover from its native bootstrap configuration");
+                    }
                     storage.requireRetainedIndex(observed);
                     floor.persist(observed);
                 }
@@ -322,6 +336,16 @@ final class JournalStorage implements AutoCloseable {
                     out.writeInt(peer.port());
                     out.writeUTF(peer.availabilityZone());
                 }
+            }
+            if (configuration.joiningPeer() != null) {
+                // Original-voter binding bytes remain unchanged. A learner volume binds its
+                // original transport identity for every subsequent role and restart.
+                final var peer = configuration.joiningPeer();
+                out.writeInt(0x4a4f494e);
+                out.writeUTF(peer.id().toString());
+                out.writeUTF(peer.host());
+                out.writeInt(peer.port());
+                out.writeUTF(peer.availabilityZone());
             }
         }
         try {

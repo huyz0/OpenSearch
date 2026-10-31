@@ -27,10 +27,31 @@ import java.util.UUID;
  * @param groups bounded physical groups assigned to this voter
  * @param bootstrap explicit initial-group creation authorization
  * @param limits admission and storage limits
+ * @param joiningPeer original learner transport identity, or null for a genesis voter
  */
 @InternalApi
 public record JournalConfiguration(UUID deploymentId, UUID localVoterId, Path directory, List<Group> groups, boolean bootstrap,
-    Limits limits) {
+    Limits limits, Peer joiningPeer) {
+    /**
+     * Creates an original-voter assignment without learner bootstrap authorization.
+     * @param deploymentId cluster namespace
+     * @param localVoterId durable storage identity
+     * @param directory provisioned durable directory
+     * @param groups immutable genesis assignments
+     * @param bootstrap initial creation flag
+     * @param limits resource bounds
+     */
+    public JournalConfiguration(
+        UUID deploymentId,
+        UUID localVoterId,
+        Path directory,
+        List<Group> groups,
+        boolean bootstrap,
+        Limits limits
+    ) {
+        this(deploymentId, localVoterId, directory, groups, bootstrap, limits, null);
+    }
+
     /**
      * Validates and snapshots placement before any network or storage service starts.
      * @param deploymentId cluster namespace
@@ -39,12 +60,16 @@ public record JournalConfiguration(UUID deploymentId, UUID localVoterId, Path di
      * @param groups assigned physical groups
      * @param bootstrap initial creation authorization
      * @param limits resource limits
+     * @param joiningPeer original authorized learner identity, or null
      */
     public JournalConfiguration {
         Objects.requireNonNull(deploymentId);
         Objects.requireNonNull(localVoterId);
         Objects.requireNonNull(directory);
         Objects.requireNonNull(limits);
+        if (joiningPeer != null && joiningPeer.id().equals(localVoterId) == false) {
+            throw new IllegalArgumentException("joining peer differs from local storage identity");
+        }
         groups = List.copyOf(groups);
         if (groups.isEmpty() || groups.size() > limits.maximumGroups()) {
             throw new IllegalArgumentException("physical group count exceeds configured bounds");
@@ -56,11 +81,13 @@ public record JournalConfiguration(UUID deploymentId, UUID localVoterId, Path di
             if (ids.add(group.id()) == false) {
                 throw new IllegalArgumentException("duplicate physical group identity");
             }
-            final Peer candidate = group.peers()
-                .stream()
-                .filter(peer -> peer.id().equals(localVoterId))
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("local voter is absent from an assigned group"));
+            final Peer candidate = group.peers().stream().filter(peer -> peer.id().equals(localVoterId)).findFirst().orElse(joiningPeer);
+            if (candidate == null) {
+                throw new IllegalArgumentException("local voter is absent from an assigned group");
+            }
+            if (joiningPeer != null && candidate.equals(joiningPeer) == false) {
+                throw new IllegalArgumentException("joining peer differs from its genesis transport placement");
+            }
             if (local != null && local.equals(candidate) == false) {
                 throw new IllegalArgumentException("local voter addresses differ between groups");
             }
@@ -72,6 +99,19 @@ public record JournalConfiguration(UUID deploymentId, UUID localVoterId, Path di
                 }
             }
         }
+    }
+
+    /**
+     * Returns the local transport identity, including an explicitly provisioned learner.
+     * This accessor does not authorize joining a group; its durable intent must be validated separately.
+     * @return immutable local peer placement
+     */
+    public Peer localPeer() {
+        return groups.stream()
+            .flatMap(group -> group.peers().stream())
+            .filter(peer -> peer.id().equals(localVoterId))
+            .findFirst()
+            .orElse(joiningPeer);
     }
 
     /**

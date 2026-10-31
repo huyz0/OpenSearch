@@ -13,6 +13,7 @@ import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.grpc.GrpcTlsConfig;
+import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
 import org.apache.ratis.proto.RaftProtos.ReplicationLevel;
 import org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc;
 import org.apache.ratis.protocol.ClientId;
@@ -23,7 +24,9 @@ import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.protocol.SetConfigurationRequest;
 import org.apache.ratis.rpc.SupportedRpcType;
+import org.apache.ratis.server.RaftConfiguration;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.raftlog.segmented.OpenSearchLogPersistence;
@@ -162,7 +165,8 @@ public final class RatisJournal implements Closeable {
         DiskSpaceProbe diskSpace,
         X509KeyManager keyManager,
         X509TrustManager trustManager,
-        Map<UUID, LogCheckpoint> expectedActivations
+        Map<UUID, LogCheckpoint> expectedActivations,
+        Map<UUID, RaftGroup> initialGroups
     ) throws IOException {
         this.configuration = configuration;
         this.expectedActivations = expectedActivations;
@@ -232,7 +236,13 @@ public final class RatisJournal implements Closeable {
                 for (var group : configuration.groups()) {
                     final var reply = await(
                         server.groupManagementAsync(
-                            GroupManagementRequest.newAdd(clientId, server.getId(), callIds.getAndIncrement(), raftGroup(group), false)
+                            GroupManagementRequest.newAdd(
+                                clientId,
+                                server.getId(),
+                                callIds.getAndIncrement(),
+                                initialGroups.getOrDefault(group.id(), raftGroup(group)),
+                                false
+                            )
                         )
                     );
                     if (reply.isSuccess() == false) {
@@ -299,7 +309,10 @@ public final class RatisJournal implements Closeable {
         DiskSpaceProbe diskSpace,
         Map<UUID, LogCheckpoint> expectedActivations
     ) throws IOException {
-        return open(configuration, keyManager, trustManager, diskSpace, expectedActivations, Set.of());
+        if (configuration.joiningPeer() != null) {
+            throw new IOException("learner startup requires its catalog-authorized original intent");
+        }
+        return open(configuration, keyManager, trustManager, diskSpace, expectedActivations, Set.of(), Map.of());
     }
 
     /**
@@ -323,8 +336,8 @@ public final class RatisJournal implements Closeable {
         Map<UUID, JournalMembershipRecord> memberships
     ) throws IOException {
         Objects.requireNonNull(configuration);
-        if (configuration.bootstrap()) {
-            throw new IOException("membership recovery cannot bootstrap a new journal volume");
+        if (configuration.bootstrap() || configuration.joiningPeer() != null) {
+            throw new IOException("static membership recovery requires an established genesis voter; learners need their original intent");
         }
         final var retired = new java.util.HashSet<UUID>();
         final var activations = new java.util.HashMap<UUID, LogCheckpoint>();
@@ -346,7 +359,40 @@ public final class RatisJournal implements Closeable {
                 retired.add(entry.getKey());
             }
         }
-        return open(configuration, keyManager, trustManager, diskSpace, activations, retired);
+        return open(configuration, keyManager, trustManager, diskSpace, activations, retired, Map.of());
+    }
+
+    /**
+     * Opens controller-authorized assignments, including a new nonvoting learner and pending-aware
+     * recovery. The catalog must validate permanent reservations and the current pending winner
+     * before calling. Original genesis bindings and activation coordinates remain immutable.
+     * @param configuration original local assignment and optional learner transport identity
+     * @param keyManager member credentials
+     * @param trustManager deployment-scoped trust
+     * @param diskSpace actual-volume reserve probe
+     * @param memberships current catalog heads for activated assignments
+     * @param originalJoins permanent original reservations for non-genesis local assignments
+     * @return running assigned groups with retired histories excluded
+     * @throws IOException on conflicting authority, storage or startup failure
+     */
+    public static RatisJournal openAssigned(
+        JournalConfiguration configuration,
+        X509KeyManager keyManager,
+        X509TrustManager trustManager,
+        DiskSpaceProbe diskSpace,
+        Map<UUID, JournalMembershipRecord> memberships,
+        Map<UUID, JournalMembershipRecord> originalJoins
+    ) throws IOException {
+        final var authorized = JournalStartup.authorize(configuration, memberships, originalJoins);
+        return open(
+            configuration,
+            keyManager,
+            trustManager,
+            diskSpace,
+            authorized.activations(),
+            authorized.retired(),
+            authorized.initialGroups()
+        );
     }
 
     private static RatisJournal open(
@@ -355,7 +401,8 @@ public final class RatisJournal implements Closeable {
         X509TrustManager trustManager,
         DiskSpaceProbe diskSpace,
         Map<UUID, LogCheckpoint> expectedActivations,
-        Set<UUID> retiredGroups
+        Set<UUID> retiredGroups,
+        Map<UUID, RaftGroup> initialGroups
     ) throws IOException {
         Objects.requireNonNull(configuration);
         Objects.requireNonNull(keyManager);
@@ -375,7 +422,7 @@ public final class RatisJournal implements Closeable {
         }
         final var storage = JournalStorage.open(configuration, retiredGroups);
         try {
-            return new RatisJournal(configuration, storage, diskSpace, keyManager, trustManager, activations);
+            return new RatisJournal(configuration, storage, diskSpace, keyManager, trustManager, activations, initialGroups);
         } catch (IOException | RuntimeException | Error failure) {
             try {
                 if (storage.isProcessOwned() == false) {
@@ -400,7 +447,7 @@ public final class RatisJournal implements Closeable {
      */
     public CompletionStage<LogCheckpoint> append(UUID groupId, OperationEnvelope operation) throws IOException {
         division(groupId);
-        if (operation.logId().equals(activationIdentity(groupId))) {
+        if (operation.logId().equals(activationIdentity(groupId)) || operation.logId().indexUuid().startsWith("__journal_membership/")) {
             throw new IOException("physical group control identity is reserved");
         }
         if (stateMachines.get(groupId).activation == null) {
@@ -469,6 +516,257 @@ public final class RatisJournal implements Closeable {
         return new GroupActivation(configuration.deploymentId(), groups.get(groupId), checkpoint);
     }
 
+    /**
+     * Advances one controller-authorized replacement without blocking a consensus callback.
+     * Repeated calls reconcile the same durable intent. A learner is first added without a vote,
+     * then must report commitment through a nonce-bound barrier before the atomic voter change.
+     * Call on a bounded controller executor; obtain the intent from the durable catalog each time.
+     * Completion means this attempt finished, not necessarily that the transition is complete.
+     * @param intent exact durable pending head
+     * @return completion of one bounded proposal or observation
+     * @throws IOException on conflicting lineage, leadership, admission or storage failure
+     */
+    public CompletionStage<Void> advanceReplacement(JournalMembershipRecord intent) throws IOException {
+        final UUID group = requireReplacementIntent(intent);
+        final var division = division(group);
+        if (division.getInfo().isLeaderReady() == false) {
+            throw new IOException("replacement must run on the ready local leader");
+        }
+        final var nativeConf = division.getRaftConf();
+        if (stable(nativeConf) == false || committedConfiguration(division, nativeConf) == false) {
+            return CompletableFuture.<Void>completedFuture(null).minimalCompletionStage();
+        }
+        if (matches(nativeConf.getCurrentPeers(), intent.pending().target().peers())
+            && nativeConf.getCurrentPeers(RaftPeerRole.LISTENER).isEmpty()) {
+            replacementReceipt(intent); // Refuse a target with no preceding committed nonce barrier.
+            return CompletableFuture.<Void>completedFuture(null).minimalCompletionStage();
+        }
+        if (matches(nativeConf.getCurrentPeers(), intent.voters().peers()) == false) {
+            throw new IOException("native voters differ from both sides of the durable replacement intent");
+        }
+        final var learner = replacementPeer(intent);
+        final var listeners = nativeConf.getCurrentPeers(RaftPeerRole.LISTENER);
+        if (listeners.isEmpty()) {
+            return setConfiguration(group, intent.voters(), List.of(), intent.voters(), List.of(learner));
+        }
+        if (matches(listeners, List.of(learner)) == false) {
+            throw new IOException("native listeners differ from the durable replacement identity");
+        }
+        final var barrier = replacementBarrier(group, intent, division.getInfo().getCurrentTerm());
+        if (barrier.isDone() == false) {
+            return barrier.thenApply(ignored -> (Void) null).minimalCompletionStage();
+        }
+        final LogCheckpoint cut;
+        try {
+            cut = barrier.join();
+        } catch (java.util.concurrent.CompletionException failure) {
+            throw new IOException("replacement barrier failed; reconcile the committed history", failure);
+        }
+        final long learnerCommit = division.getCommitInfos()
+            .stream()
+            .filter(info -> info.getServer().getId().toStringUtf8().equals(learner.id().toString()))
+            .mapToLong(info -> info.getCommitIndex())
+            .findFirst()
+            .orElse(-1);
+        if (learnerCommit < cut.index()) {
+            return CompletableFuture.<Void>completedFuture(null).minimalCompletionStage();
+        }
+        // Native CAS atomically transitions three voters plus one listener to three voters.
+        // There is never a stable four-voter configuration requiring three live failure domains.
+        return setConfiguration(group, intent.voters(), List.of(learner), intent.pending().target(), List.of());
+    }
+
+    /**
+     * Returns historical proof only after the exact target configuration is locally committed and
+     * applied. This is neither current read authority nor a guarantee of current learner health.
+     * @param intent original durable pending replacement
+     * @return receipt, or empty while the target is not committed
+     * @throws IOException on lineage mismatch, missing barrier or unavailable history
+     */
+    public java.util.Optional<JournalReplacementReceipt> replacementReceipt(JournalMembershipRecord intent) throws IOException {
+        final UUID group = requireReplacementIntent(intent);
+        final var division = division(group);
+        final var nativeConf = division.getRaftConf();
+        if (stable(nativeConf) == false
+            || matches(nativeConf.getCurrentPeers(), intent.pending().target().peers()) == false
+            || nativeConf.getCurrentPeers(RaftPeerRole.LISTENER).isEmpty() == false
+            || committedConfiguration(division, nativeConf) == false) {
+            return java.util.Optional.empty();
+        }
+        final var barrier = stateMachines.get(group).membershipBarrier;
+        if (barrier == null || barrier.revision() != intent.revision() + 1 || barrier.operation().equals(intent.pending().id()) == false) {
+            throw new IOException("committed target lacks its original nonce-bound learner barrier");
+        }
+        final var entry = division.getRaftLog().get(nativeConf.getLogEntryIndex());
+        try {
+            return java.util.Optional.of(
+                new JournalReplacementReceipt(
+                    intent,
+                    barrier.checkpoint().index(),
+                    barrier.checkpoint().entryTerm(),
+                    entry.getIndex(),
+                    entry.getTerm()
+                )
+            );
+        } catch (IllegalArgumentException failure) {
+            throw new IOException("committed target configuration precedes its learner barrier", failure);
+        }
+    }
+
+    private UUID requireReplacementIntent(JournalMembershipRecord intent) throws IOException {
+        Objects.requireNonNull(intent);
+        final UUID group = intent.genesis().initialPlacement().id();
+        final var proof = groupActivation(group);
+        if (intent.pending() == null
+            || intent.genesis()
+                .equals(new JournalGroupRecord(proof.deploymentId(), proof.initialPlacement(), proof.checkpoint())) == false) {
+            throw new IOException("replacement intent differs from the activated physical group");
+        }
+        final var barrier = stateMachines.get(group).membershipBarrier;
+        if (barrier != null
+            && (barrier.revision() > intent.revision() + 1
+                || (barrier.revision() == intent.revision() + 1 && barrier.operation().equals(intent.pending().id()) == false))) {
+            throw new IOException("replacement intent is stale or conflicts with an applied controller nonce");
+        }
+        return group;
+    }
+
+    private static JournalConfiguration.Peer replacementPeer(JournalMembershipRecord intent) {
+        return intent.pending()
+            .target()
+            .peers()
+            .stream()
+            .filter(peer -> intent.voters().peers().contains(peer) == false)
+            .findFirst()
+            .orElseThrow();
+    }
+
+    private static boolean stable(RaftConfiguration configuration) {
+        return configuration.getPreviousPeers().isEmpty() && configuration.getPreviousPeers(RaftPeerRole.LISTENER).isEmpty();
+    }
+
+    private static boolean committedConfiguration(RaftServer.Division division, RaftConfiguration configuration) throws IOException {
+        final long index = configuration.getLogEntryIndex();
+        if (index < 0 || index > Math.min(division.getRaftLog().getLastCommittedIndex(), division.getInfo().getLastAppliedIndex())) {
+            return false;
+        }
+        final var entry = division.getRaftLog().get(index);
+        if (entry == null || entry.hasConfigurationEntry() == false) {
+            throw new IOException("native committed configuration history is unavailable");
+        }
+        return true;
+    }
+
+    private static boolean matches(java.util.Collection<RaftPeer> nativePeers, List<JournalConfiguration.Peer> expected) {
+        if (nativePeers.size() != expected.size()) {
+            return false;
+        }
+        return expected.stream().allMatch(peer -> {
+            final var nativePeer = JournalStartup.peer(peer, RaftPeerRole.FOLLOWER);
+            return nativePeers.stream()
+                .anyMatch(
+                    actual -> actual.getId().equals(nativePeer.getId()) && Objects.equals(actual.getAddress(), nativePeer.getAddress())
+                );
+        });
+    }
+
+    private CompletionStage<Void> setConfiguration(
+        UUID group,
+        JournalConfiguration.Group source,
+        List<JournalConfiguration.Peer> oldListeners,
+        JournalConfiguration.Group target,
+        List<JournalConfiguration.Peer> newListeners
+    ) throws IOException {
+        requireDiskSpace();
+        final var arguments = SetConfigurationRequest.Arguments.newBuilder()
+            .setMode(SetConfigurationRequest.Mode.COMPARE_AND_SET)
+            .setServersInCurrentConf(List.copyOf(JournalStartup.raftGroup(source).getPeers()))
+            .setListenersInCurrentConf(oldListeners.stream().map(peer -> JournalStartup.peer(peer, RaftPeerRole.LISTENER)).toList())
+            .setServersInNewConf(List.copyOf(JournalStartup.raftGroup(target).getPeers()))
+            .setListenersInNewConf(newListeners.stream().map(peer -> JournalStartup.peer(peer, RaftPeerRole.LISTENER)).toList())
+            .build();
+        final var request = new SetConfigurationRequest(
+            clientId,
+            server.getId(),
+            RaftGroupId.valueOf(group),
+            callIds.getAndIncrement(),
+            arguments
+        );
+        final var permit = admission.acquire(0);
+        return dispatch.submit(permit, () -> server.setConfigurationAsync(request)).thenApply(reply -> {
+            if (reply.isSuccess() == false) {
+                throw new java.util.concurrent.CompletionException(reply.getException());
+            }
+            return (Void) null;
+        });
+    }
+
+    private record MembershipBarrier(long revision, UUID operation, LogCheckpoint checkpoint) {
+    }
+
+    private record BarrierAttempt(long revision, UUID operation, long leaderTerm, CompletableFuture<LogCheckpoint> future) {
+    }
+
+    private CompletableFuture<LogCheckpoint> replacementBarrier(UUID group, JournalMembershipRecord intent, long term) throws IOException {
+        final var machine = stateMachines.get(group);
+        final CompletableFuture<LogCheckpoint> future;
+        synchronized (machine) {
+            final var previous = machine.barrierAttempt;
+            if (previous != null
+                && previous.revision() == intent.revision() + 1
+                && previous.operation().equals(intent.pending().id())
+                && previous.leaderTerm() == term
+                && previous.future().isCompletedExceptionally() == false) {
+                return previous.future();
+            }
+            future = new CompletableFuture<>();
+            machine.barrierAttempt = new BarrierAttempt(intent.revision() + 1, intent.pending().id(), term, future);
+        }
+        try {
+            appendFrame(
+                group,
+                new OperationEnvelope(
+                    membershipIdentity(group, intent.pending().id()),
+                    OperationEnvelope.Kind.RECOVERY_BARRIER,
+                    intent.revision() + 1,
+                    0,
+                    0,
+                    SEED_PAYLOAD
+                )
+            ).whenComplete((checkpoint, failure) -> {
+                if (failure == null) {
+                    future.complete(checkpoint);
+                } else {
+                    future.completeExceptionally(failure);
+                }
+            });
+        } catch (IOException | RuntimeException failure) {
+            future.completeExceptionally(failure);
+            throw failure;
+        }
+        return future;
+    }
+
+    private ShardLogId membershipIdentity(UUID group, UUID operation) {
+        return new ShardLogId(configuration.deploymentId(), "__journal_membership/" + group, 0, operation);
+    }
+
+    private boolean isMembershipBarrier(OperationEnvelope operation, UUID group) throws IOException {
+        if (operation.logId().indexUuid().equals("__journal_membership/" + group) == false) {
+            return false;
+        }
+        if (operation.logId().shardNumber() != 0
+            || operation.kind() != OperationEnvelope.Kind.RECOVERY_BARRIER
+            || operation.producerEpoch() < 1
+            || operation.primaryTerm() != 0
+            || operation.schemaVersion() != 0
+            || operation.payloadLength() != 1
+            || Arrays.equals(operation.payloadReader().readAllBytes(), SEED_PAYLOAD) == false) {
+            throw new IOException("invalid physical group membership barrier");
+        }
+        return true;
+    }
+
     private CompletableFuture<Void> watchAllCommitted(UUID groupId, long index) throws IOException {
         final var permit = admission.acquire(0);
         try {
@@ -503,7 +801,9 @@ public final class RatisJournal implements Closeable {
             throw new IOException("local journal member is not the ready leader");
         }
         requireDiskSpace();
-        requireRetainedCapacity(groupId);
+        if (isMembershipBarrier(operation, groupId) == false) {
+            requireRetainedCapacity(groupId);
+        }
         final var permit = admission.acquire(operation.payloadLength());
         try {
             final byte[] frame = operation.encode(configuration.limits().maximumPayloadBytes());
@@ -587,7 +887,9 @@ public final class RatisJournal implements Closeable {
                 }
                 bytes += data.size();
                 final var operation = decodeOperation(data);
-                if (isActivation(operation, groupId) == false && selection.contains(operation.logId())) {
+                if (isActivation(operation, groupId) == false
+                    && isMembershipBarrier(operation, groupId) == false
+                    && selection.contains(operation.logId())) {
                     operations.add(
                         new CommittedOperation(operation, new LogCheckpoint(operation.logId(), entry.getIndex(), entry.getTerm()))
                     );
@@ -668,6 +970,8 @@ public final class RatisJournal implements Closeable {
     private final class JournalStateMachine extends BaseStateMachine implements OpenSearchLogPersistence {
         private final UUID group;
         private volatile LogCheckpoint activation;
+        private volatile MembershipBarrier membershipBarrier;
+        private BarrierAttempt barrierAttempt;
 
         private JournalStateMachine(UUID group) {
             this.group = group;
@@ -714,8 +1018,10 @@ public final class RatisJournal implements Closeable {
         @Override
         public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
             requireDiskSpace();
-            requireRetainedCapacity(group);
             final var operation = decodeOperation(request.getMessage().getContent());
+            if (isMembershipBarrier(operation, group) == false) {
+                requireRetainedCapacity(group);
+            }
             if (isActivation(operation, group) == false && activation == null) {
                 throw new IOException("physical group has not completed initial voter activation");
             }
@@ -748,6 +1054,15 @@ public final class RatisJournal implements Closeable {
                         throw new IOException("committed activation differs from the durable controller catalog");
                     }
                 }
+                if (isMembershipBarrier(operation, group)) {
+                    final var previous = membershipBarrier;
+                    if (previous == null || operation.producerEpoch() > previous.revision()) {
+                        membershipBarrier = new MembershipBarrier(operation.producerEpoch(), operation.logId().activationId(), checkpoint);
+                    } else if (operation.producerEpoch() == previous.revision()
+                        && operation.logId().activationId().equals(previous.operation()) == false) {
+                            throw new IOException("conflicting committed replacement nonce for the same controller revision");
+                        }
+                }
                 updateLastAppliedTermIndex(entry.getTerm(), entry.getIndex());
                 if (initialActivation) {
                     activation = checkpoint;
@@ -763,13 +1078,7 @@ public final class RatisJournal implements Closeable {
     private RaftProperties properties() {
         final var properties = new RaftProperties();
         final var limits = configuration.limits();
-        final var local = configuration.groups()
-            .getFirst()
-            .peers()
-            .stream()
-            .filter(peer -> peer.id().equals(configuration.localVoterId()))
-            .findFirst()
-            .orElseThrow();
+        final var local = configuration.localPeer();
         RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.GRPC);
         GrpcConfigKeys.Server.setHost(properties, local.host());
         GrpcConfigKeys.Server.setPort(properties, local.port());
@@ -780,6 +1089,7 @@ public final class RatisJournal implements Closeable {
         GrpcConfigKeys.Server.setBossGroupSize(properties, 1);
         GrpcConfigKeys.Server.setWorkerGroupSize(properties, 2);
         configureStorage(properties, storage.directory());
+        RaftServerConfigKeys.setStagingCatchupGap(properties, 1);
         RaftServerConfigKeys.setStorageFreeSpaceMin(properties, SizeInBytes.valueOf(limits.minimumFreeBytes()));
         RaftServerConfigKeys.ThreadPool.setProxyCached(properties, false);
         RaftServerConfigKeys.ThreadPool.setProxySize(properties, 4);
@@ -821,16 +1131,7 @@ public final class RatisJournal implements Closeable {
     }
 
     private static RaftGroup raftGroup(JournalConfiguration.Group group) {
-        final List<RaftPeer> peers = group.peers()
-            .stream()
-            .map(
-                peer -> RaftPeer.newBuilder()
-                    .setId(peerId(peer.id()))
-                    .setAddress((peer.host().contains(":") ? "[" + peer.host() + "]" : peer.host()) + ":" + peer.port())
-                    .build()
-            )
-            .toList();
-        return RaftGroup.valueOf(RaftGroupId.valueOf(group.id()), peers);
+        return JournalStartup.raftGroup(group);
     }
 
     private static LogCheckpoint decodeCheckpoint(Message message) throws IOException {

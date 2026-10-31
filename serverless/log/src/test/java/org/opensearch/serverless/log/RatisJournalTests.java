@@ -465,39 +465,39 @@ public class RatisJournalTests extends OpenSearchTestCase {
                     }
                 }
             });
-            holder.start();
-            assertTrue(entered.await(10, TimeUnit.SECONDS));
             final var tls = GrpcSslContexts.forClient().keyManager(fixture.key()).trustManager(fixture.trust()).build();
             final var channel = NettyChannelBuilder.forAddress(address.host(), address.port()).sslContext(tls).build();
             try {
-                final var stub = org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc.newFutureStub(channel)
-                    .withDeadlineAfter(3, TimeUnit.SECONDS);
+                final var rpc = org.apache.ratis.proto.RaftProtos.RaftRpcRequestProto.newBuilder()
+                    .setRequestorId(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(candidate.id().toString()))
+                    .setReplyId(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(local.toString()))
+                    .setRaftGroupId(
+                        org.apache.ratis.util.ProtoUtils.toRaftGroupIdProtoBuilder(
+                            org.apache.ratis.protocol.RaftGroupId.valueOf(placement.id())
+                        )
+                    )
+                    .setCallId(0)
+                    .build();
+                final var vote = org.apache.ratis.proto.RaftProtos.RequestVoteRequestProto.newBuilder()
+                    .setServerRequest(rpc)
+                    .setCandidateTerm(0)
+                    .setCandidateLastEntry(org.apache.ratis.proto.RaftProtos.TermIndexProto.newBuilder().setTerm(0).setIndex(0))
+                    .setPreVote(true)
+                    .build();
+                final var readyStub = org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc.newFutureStub(channel);
+                // Establish TLS/HTTP2 before the stall, so cold connection setup cannot consume
+                // the overload window and turn the burst into client-side deadline failures.
+                readyStub.withDeadlineAfter(10, TimeUnit.SECONDS).requestVote(vote).get(10, TimeUnit.SECONDS);
+                holder.start();
+                assertTrue(entered.await(10, TimeUnit.SECONDS));
+                final var stub = readyStub.withDeadlineAfter(6, TimeUnit.SECONDS);
                 final var requests = new ArrayList<org.apache.ratis.thirdparty.com.google.common.util.concurrent.ListenableFuture<?>>();
                 for (int i = 0; i < 256; i++) {
-                    final var rpc = org.apache.ratis.proto.RaftProtos.RaftRpcRequestProto.newBuilder()
-                        .setRequestorId(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(candidate.id().toString()))
-                        .setReplyId(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(local.toString()))
-                        .setRaftGroupId(
-                            org.apache.ratis.util.ProtoUtils.toRaftGroupIdProtoBuilder(
-                                org.apache.ratis.protocol.RaftGroupId.valueOf(placement.id())
-                            )
-                        )
-                        .setCallId(i)
-                        .build();
-                    requests.add(
-                        stub.requestVote(
-                            org.apache.ratis.proto.RaftProtos.RequestVoteRequestProto.newBuilder()
-                                .setServerRequest(rpc)
-                                .setCandidateTerm(0)
-                                .setCandidateLastEntry(org.apache.ratis.proto.RaftProtos.TermIndexProto.newBuilder().setTerm(0).setIndex(0))
-                                .setPreVote(true)
-                                .build()
-                        )
-                    );
+                    requests.add(stub.requestVote(vote.toBuilder().setServerRequest(rpc.toBuilder().setCallId(i + 1)).build()));
                 }
                 int rejected = 0;
                 for (var request : requests) {
-                    final var failure = expectThrows(ExecutionException.class, () -> request.get(6, TimeUnit.SECONDS));
+                    final var failure = expectThrows(ExecutionException.class, () -> request.get(10, TimeUnit.SECONDS));
                     final var status = Status.fromThrowable(failure.getCause());
                     if (status.getCode() == Status.Code.INTERNAL) {
                         // The pinned gRPC transport reports executor rejection as an RPC failure.

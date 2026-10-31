@@ -15,6 +15,7 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.serverless.log.JournalConfiguration;
 import org.opensearch.serverless.log.JournalGroupRecord;
 import org.opensearch.serverless.log.JournalMembershipRecord;
+import org.opensearch.serverless.log.JournalReplacementReceipt;
 import org.opensearch.serverless.log.RatisJournal;
 
 import javax.net.ssl.X509KeyManager;
@@ -225,7 +226,140 @@ public final class JournalGroupCatalog {
         throw new IOException("journal replacement publication conflicted; reconcile its durable intent before retrying");
     }
 
+    /**
+     * Opens assignments using current controller heads and permanent learner reservations. Unlike
+     * static startup, this explicitly reconciles pending transitions without changing disk identity.
+     * @param configuration original genesis assignments and optional learner placement
+     * @param keyManager member credentials
+     * @param trustManager deployment-scoped trust
+     * @param diskSpace actual-volume reserve probe
+     * @return running authenticated journal
+     * @throws IOException on missing/conflicting authorization or startup failure
+     */
+    public RatisJournal openAssignedJournal(
+        JournalConfiguration configuration,
+        X509KeyManager keyManager,
+        X509TrustManager trustManager,
+        RatisJournal.DiskSpaceProbe diskSpace
+    ) throws IOException {
+        ensureNamespace(false);
+        if (configuration.deploymentId().equals(deploymentId) == false) {
+            throw new IOException("journal configuration differs from catalog deployment");
+        }
+        final var memberships = new HashMap<UUID, JournalMembershipRecord>();
+        final var joins = new HashMap<UUID, JournalMembershipRecord>();
+        for (var group : configuration.groups()) {
+            final var genesis = readRequired(group.id());
+            requirePlacement(genesis, new JournalGroupRecord(deploymentId, group, null));
+            if (genesis.activation() == null) {
+                continue;
+            }
+            final var head = readMembership(genesis);
+            memberships.put(group.id(), head);
+            if (group.peers().stream().noneMatch(peer -> peer.id().equals(configuration.localVoterId()))) {
+                final String key = "replacement-" + group.id() + "-" + configuration.localVoterId();
+                final var register = container.readRegister(key)
+                    .orElseThrow(() -> new IOException("learner has no permanent original replacement reservation"));
+                joins.put(group.id(), decodeMembership(genesis, register));
+            }
+        }
+        return RatisJournal.openAssigned(configuration, keyManager, trustManager, diskSpace, memberships, joins);
+    }
+
+    /**
+     * Publishes native completion proof before advancing the durable membership head. A lost reply
+     * is reconciled from the permanent receipt, including after later replacements have completed.
+     * No caller-supplied receipt is accepted. Run on the bounded controller executor.
+     * @param journal authenticated journal containing the committed native transition
+     * @param intent original durable pending head
+     * @return permanent historical transition receipt
+     * @throws IOException on missing proof, conflicting intent or conditional storage failure
+     */
+    public JournalReplacementReceipt publishReplacement(RatisJournal journal, JournalMembershipRecord intent) throws IOException {
+        final UUID group = intent.genesis().initialPlacement().id();
+        final var genesis = readRequired(group);
+        if (intent.pending() == null || intent.genesis().equals(genesis) == false) {
+            throw new IOException("replacement publication differs from the permanent activated group");
+        }
+        reserveReplacementIdentity(intent, true);
+        final String receiptKey = completionName(group, intent.pending().id());
+        final var existing = container.readRegister(receiptKey);
+        final JournalReplacementReceipt receipt;
+        if (existing.isPresent()) {
+            receipt = decodeReceipt(genesis, intent.pending().id(), existing.get());
+            if (receipt.intent().equals(intent) == false) {
+                throw new IOException("replacement operation is permanently bound to another intent");
+            }
+        } else {
+            if (readMembership(genesis).equals(intent) == false) {
+                throw new IOException("replacement has no published receipt and is no longer the pending head");
+            }
+            final var proof = journal.replacementReceipt(intent)
+                .orElseThrow(() -> new IOException("replacement target has not been committed and applied locally"));
+            if (container.createRegisterIfAbsent(receiptKey, new BytesArray(proof.encode())).applied()) {
+                receipt = proof;
+            } else {
+                final var observed = container.readRegister(receiptKey)
+                    .orElseThrow(() -> new IOException("replacement receipt disappeared during publication"));
+                receipt = decodeReceipt(genesis, intent.pending().id(), observed);
+                if (receipt.intent().equals(proof.intent()) == false
+                    || receipt.learnerBarrierIndex() != proof.learnerBarrierIndex()
+                    || receipt.learnerBarrierTerm() != proof.learnerBarrierTerm()) {
+                    throw new IOException("replacement proof conflicts with its permanent receipt");
+                }
+            }
+        }
+        final String key = membershipName(group);
+        final var register = container.readRegister(key).orElseThrow(() -> new IOException("activated journal membership head is missing"));
+        final var current = decodeMembership(genesis, register);
+        final var completed = receipt.completedMembership();
+        if (current.revision() >= completed.revision()) {
+            readMembership(genesis);
+            if (current.revision() == completed.revision() && current.voters().equals(completed.voters()) == false) {
+                throw new IOException("completed replacement receipt conflicts with the current voters");
+            }
+            return receipt;
+        }
+        if (current.equals(intent) == false) {
+            throw new IOException("replacement receipt cannot advance a different pending head");
+        }
+        if (container.compareAndSwapRegister(key, register.generation(), new BytesArray(completed.encode())).applied()) {
+            return receipt;
+        }
+        final var observed = readMembership(genesis);
+        if (observed.revision() >= completed.revision()
+            && (observed.revision() > completed.revision() || observed.voters().equals(completed.voters()))) {
+            return receipt;
+        }
+        throw new IOException("replacement completion conflicted; reconcile the durable head before retrying");
+    }
+
+    private static String completionName(UUID group, UUID operation) {
+        return "completed-" + group + "-" + operation;
+    }
+
+    private static JournalReplacementReceipt decodeReceipt(JournalGroupRecord genesis, UUID operation, BlobRegister register)
+        throws IOException {
+        final JournalReplacementReceipt receipt;
+        try (var in = register.value().streamInput()) {
+            receipt = JournalReplacementReceipt.read(in);
+        }
+        if (receipt.intent().genesis().equals(genesis) == false || receipt.intent().pending().id().equals(operation) == false) {
+            throw new IOException("replacement receipt differs from its immutable group or operation identity");
+        }
+        return receipt;
+    }
+
     private void reserveReplacementIdentity(JournalMembershipRecord proposed, boolean alreadyPending) throws IOException {
+        final String operationKey = "transition-" + proposed.voters().id() + "-" + proposed.pending().id();
+        if (alreadyPending == false) {
+            final var created = container.createRegisterIfAbsent(operationKey, new BytesArray(proposed.encode()));
+            if (created.applied() == false) {
+                requireOperationReservation(proposed, operationKey);
+            }
+        } else {
+            requireOperationReservation(proposed, operationKey);
+        }
         final var replacement = proposed.pending()
             .target()
             .peers()
@@ -241,6 +375,14 @@ public final class JournalGroupCatalog {
             .orElseThrow(() -> new IOException("pending replacement voter identity reservation is missing"));
         if (decodeMembership(proposed.genesis(), reservation).equals(proposed) == false) {
             throw new IOException("replacement voter identity is permanently reserved for a different intent");
+        }
+    }
+
+    private void requireOperationReservation(JournalMembershipRecord proposed, String key) throws IOException {
+        final var register = container.readRegister(key)
+            .orElseThrow(() -> new IOException("replacement operation nonce reservation is missing"));
+        if (decodeMembership(proposed.genesis(), register).equals(proposed) == false) {
+            throw new IOException("replacement operation nonce is permanently reserved for another intent");
         }
     }
 

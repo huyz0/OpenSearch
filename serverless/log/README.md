@@ -198,8 +198,8 @@ not by itself prove completeness of all later data; omitted-tail detection and
 archive/recovery-boundary qualification remain separate work.
 
 The catalog API does not yet drive the node startup lifecycle or enable an index
-mode. Safe membership transitions, logical-shard activation and migration still
-need their controllers. Initial placement is immutable; operators must never edit
+mode. Native membership operations now have explicit controller APIs described
+below; node lifecycle, logical-shard activation and migration still need integration. Initial placement is immutable; operators must never edit
 it to simulate reconfiguration or bootstrap an active group after quorum loss.
 The protocol tests use local filesystem conditional registers; they do not
 establish a cloud provider's failure or durability behavior.
@@ -248,7 +248,8 @@ assignments, with the original activation guards. Pending intent, foreign lineag
 and bootstrap are refused. A retired group is excluded independently of other
 groups on the same volume; retirement does not change that immutable binding.
 The catalog recovery entry point supplies the heads read from durable registers.
-It still has no native replacement-completion publication API.
+The separate `openAssignedJournal` entry point supports pending reconciliation and
+permanent learner reservations; `publishReplacement` publishes native completion.
 
 Under the exclusive volume lease, before any native thread starts, retirement
 atomically moves each authorized group's directory into `retired/<group-uuid>`.
@@ -263,7 +264,7 @@ histories, corrupt ownership bindings and missing paths refuse startup. Stale
 configuration cannot move history back into service. This uses normal filesystem
 recovery and requires no additional consensus-library patch. It does not certify
 that the supplied controller completion was backed by a native membership change;
-the pending learner/promotion controller must establish that proof before
+the explicit learner/promotion path below establishes that proof before
 publishing a completed head.
 
 ## Authentication and replay
@@ -308,3 +309,52 @@ activation/control isolation, majority loss, absent client
 credentials, disk-reserve refusal, namespace rejection, and strict storage
 binding/identity checks. Independent processes on one machine do not establish power-loss behavior,
 independent-AZ corruption recovery, or three-AZ durability/latency.
+
+## Authorized learners and native replacement
+
+`openAssignedJournal` checks activated genesis, the current membership head and
+any permanent original learner reservation before acquiring the volume. A blank
+learner volume requires the exact winning pending intent; an orphan reservation
+cannot authorize startup. Its original transport identity becomes part of the
+immutable volume binding and remains unchanged through promotion and retirement.
+The initial native group contains the source three voters and a nonvoting listener.
+An initialized empty learner can restart from its native bootstrap configuration
+before listener addition, but missing vote metadata, floor or binding still refuses
+startup. A nonempty history requires its normal native configuration metadata.
+
+On a bounded controller executor, call `advanceReplacement` with the exact durable
+pending head. Each attempt observes progress or issues one bounded native proposal:
+add the listener with native CAS; commit a nonce-bound membership barrier; require
+the learner's UUID-keyed committed prefix to cover a fresh cut in this leader term;
+then atomically replace old three plus listener with new three. Voter
+`ALL_COMMITTED` is never treated as learner catch-up evidence. The native staging
+gap is one, so the zero-gap comparison cannot prevent completed catch-up.
+
+The first committed barrier for each controller revision and nonce is preserved
+through duplicate proposals and replay. A bounded per-group tracker coalesces
+fresh barrier requests within a leader term. Internal controls may consume the
+finite metadata allowance beyond ordinary customer admission; the hard native
+persistence ceiling remains enforced. Customer appends cannot use the reserved
+membership namespace, and scans exclude these controls while charging their
+entry and byte budgets.
+
+`replacementReceipt` requires a locally committed/applied stable exact target
+configuration following that barrier. `publishReplacement` obtains proof directly
+from the authenticated journal, creates a permanent operation receipt first, then
+conditionally advances the pending head. A lost receipt reply leaves the head
+pending; a lost head reply reconciles from the same receipt. Later elections can
+write a newer native configuration with identical membership: the first published
+receipt wins, and a later valid proof of the same intent/barrier accepts it. An old
+retry can return that receipt after later replacements; a missing old receipt is
+never synthesized from a later controller head. Coordinates are historical proof,
+not current-read authority or a guarantee of present learner health.
+
+Each replacement nonce also has a permanent exact-intent reservation before the
+pending-head CAS. Completed or abandoned nonces cannot be rebound to a later
+revision or target and collide with an earlier receipt. Missing reservations on a
+pending head refuse recovery; they are never silently recreated. This adds one
+conditional metadata creation per lifecycle transition and no per-document S3 I/O.
+
+Pending intent is not canceled or overwritten. Failed-learner recovery, automatic
+provisioning, node lifecycle integration and outbound transport resource retirement
+still need qualification. These APIs do not enable quorum-mode shell writes.

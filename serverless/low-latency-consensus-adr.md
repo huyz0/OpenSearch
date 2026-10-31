@@ -242,9 +242,9 @@ Important Ratis 3.3.1 contracts for runtime integration:
   intermediate configuration needs three votes and can lose availability when
   two voters temporarily share the AZ being replaced.
 
-The runtime still needs durable transition records, authorized learner startup,
-restart reconciliation, and fencing of retired identities. Genesis reservations
-remain immutable. No reconfiguration API is enabled by this probe.
+The probe established the native mechanics. The explicit controller integration
+below adds durable intent, authorized learner startup and completion publication;
+genesis reservations remain immutable. The probe alone enabled no runtime API.
 
 ## Local persisted-prefix evidence
 
@@ -313,12 +313,10 @@ reconstruct revision zero. Lost replies reconcile the original values; competing
 controllers cannot supersede unresolved intent. These lifecycle requests add no
 per-document object-store operation and scale with physical groups, not shards.
 
-The current integration intentionally stops before native configuration mutation:
-static startup rejects pending intent before volume access. A production controller
-must next authorize learner startup, establish that specific learner's committed
-barrier coverage, issue the native configuration CAS, reconcile ambiguous results,
-and fence retired assignments before publishing completion. Intent is neither
-membership commitment nor permission to start an independent history.
+Static startup rejects pending intent before volume access. The explicit assigned
+startup and native replacement path described below handles authorized learners
+and pending reconciliation. Intent alone is neither membership commitment nor
+permission to start an independent history.
 
 ## Completion reentry and bounded dispatch
 
@@ -398,3 +396,32 @@ The pinned transport reports executor rejection as INTERNAL, a failed peer RPC
 that follows normal retry/backoff. This qualification covers inbound execution;
 outbound callback behavior and full memory/throughput sizing remain workload and
 membership qualification gates.
+
+## Authorized native replacement and completion
+
+Assigned startup validates the winning durable intent before provisioning a
+nonvoting learner. Original genesis and the learner's original transport binding
+remain immutable through subsequent roles. Empty initialized learners can restart
+before native listener addition without inventing missing vote or floor metadata.
+Pending-aware recovery can reconcile native completion even when the controller
+has not yet published a completed head; native consensus excludes retired voters.
+
+Replacement adds one listener, commits a nonce-bound barrier and checks that exact
+learner's committed prefix by UUID before atomic old-three-to-new-three native CAS.
+The first barrier per logical revision/nonce survives duplicate proposals/replay;
+a separate bounded tracker requests a fresh cut in each leader term. Controls use
+the finite metadata headroom, preserving the hard native persistence ceiling.
+Submission and completion use the existing bounded dispatcher outside native locks.
+
+The controller obtains a historical receipt directly from committed/applied native
+target state, publishes it before the completed head and never accepts caller-built
+proof. Receipts retain the original intent and first barrier. A permanent exact-intent
+nonce reservation precedes pending-head CAS, preventing a later revision or orphan
+contender from reusing an operation identity and colliding with an older receipt. Elections may append
+another identical stable configuration; the first published receipt wins while
+later valid configuration coordinates remain acceptable proof of the same change.
+Retries after later replacements use the permanent original receipt. Missing heads
+or missing historical receipts cannot reset or reconstruct controller history.
+
+Failed-learner recovery/abort, automatic provisioning, outbound peer-resource
+retirement, full node lifecycle and three-AZ qualification remain outstanding.

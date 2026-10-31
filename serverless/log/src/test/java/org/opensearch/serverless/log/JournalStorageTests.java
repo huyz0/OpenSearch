@@ -221,6 +221,55 @@ public class JournalStorageTests extends OpenSearchTestCase {
         }
     }
 
+    public void testLearnerBindingSurvivesRecoveryAndCannotChangeItsTransport() throws Exception {
+        final var original = configuration();
+        final Path directory = createTempDir();
+        final UUID identity = JournalDiskIdentity.discover(directory);
+        final var joining = new JournalConfiguration.Peer(identity, "localhost", 11001, "az-a");
+        final var learner = new JournalConfiguration(
+            original.deploymentId(),
+            identity,
+            directory,
+            original.groups(),
+            true,
+            original.limits(),
+            joining
+        );
+        try (var storage = JournalStorage.open(learner)) {
+            for (var group : learner.groups()) {
+                initialize(storage, group.id());
+                Files.move(
+                    storage.groupDirectory(group.id()).resolve("current/raft-meta.conf"),
+                    storage.groupDirectory(group.id()).resolve("current/raft-meta.bootstrap")
+                );
+            }
+        }
+        final var recovery = new JournalConfiguration(
+            learner.deploymentId(),
+            identity,
+            directory,
+            learner.groups(),
+            false,
+            learner.limits(),
+            joining
+        );
+        try (var ignored = JournalStorage.open(recovery)) {
+            // An initialized learner with an empty durable floor can resume before native add-listener.
+        }
+        final var rebound = new JournalConfiguration(
+            learner.deploymentId(),
+            identity,
+            directory,
+            learner.groups(),
+            false,
+            learner.limits(),
+            new JournalConfiguration.Peer(identity, "localhost", 11002, "az-a")
+        );
+        expectThrows(IOException.class, () -> JournalStorage.open(rebound));
+        Files.delete(directory.resolve(learner.groups().getFirst().id().toString()).resolve("current/raft-meta"));
+        expectThrows(IOException.class, () -> JournalStorage.open(recovery));
+    }
+
     private static void initialize(JournalStorage storage, UUID group) throws Exception {
         final Path root = storage.groupDirectory(group);
         Files.createDirectories(root.resolve("current"));
