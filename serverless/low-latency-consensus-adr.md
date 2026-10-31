@@ -245,3 +245,41 @@ Important Ratis 3.3.1 contracts for runtime integration:
 The runtime still needs durable transition records, authorized learner startup,
 restart reconciliation, and fencing of retired identities. Genesis reservations
 remain immutable. No reconfiguration API is enabled by this probe.
+
+## Local persisted-prefix evidence
+
+A process test removed a follower's newest acknowledged segment while preserving
+its identity, initial activation, native term/vote/configuration files, and earlier
+closed segment. The prior runtime accepted startup. A stable identity and CRC on
+remaining bytes do not prove that a previously persisted suffix still exists.
+
+Each physical group now has a fixed two-slot, checksummed local boundary file,
+scoped to deployment, voter-volume UUID, and group UUID. An opt-in native worker
+hook forces that evidence after log data force and before the flush index or
+replication acknowledgement advances. The boundary is local durability evidence,
+not a commit index, read authority, or archive/purge permission. It costs an extra
+local metadata force per native flush batch; workload latency/IOPS qualification
+remains required.
+
+Recovery checks both slots before SDK startup; it refuses corrupt/torn slots
+rather than falling back and hiding a newer acknowledged boundary. It verifies a
+contiguous unpurged prefix covering the required position using the pinned native
+CRC reader, with entry/file/directory bounds. Only the required segment and newest
+closed/open tails need additional reading. Valid existing metadata is re-forced;
+valid unacknowledged open-tail data is verified and forced before its observed end
+is adopted as durable and voting begins. Log contents are not repaired or removed.
+
+A worker-ordered pre-truncation hook can lower the boundary for a legitimate
+uncommitted suffix; generations still increase. The upstream state-machine
+truncate callback occurs earlier under the Raft write lock, so its timing cannot
+provide this evidence. Segment finalization and truncation propagate output errors
+and force directory changes before persistence progress advances. Safe synchronous
+flush is mandatory. Consensus selection, ordering, and voting algorithms remain
+unchanged.
+
+The missing-tail test now refuses startup. A second process history persists a
+long uncommitted suffix, elects a different quorum, discards that suffix, and
+restarts all voters with the committed history intact. Binding format 3 rejects
+older experimental volumes without this evidence. Snapshot/purged-prefix recovery,
+arbitrary storage rollback/old-backup restoration, and production recovery/replacement
+remain separate gates. The feature remains disabled.

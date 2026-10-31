@@ -253,3 +253,8 @@ tasks.register('journalCatalogTest', Test) {
   systemProperty 'tests.system_call_filter', 'false'
 }
 tasks.named('check').configure { dependsOn 'journalCatalogTest' }
+
+// Match only SDK-owned global timer threads, independently of their lazy creator's thread group.
+['consensusTest', 'consensusBenchmark', 'journalCatalogTest'].each { name ->
+  tasks.named(name).configure { jvmArgs '--add-opens=java.base/java.util=ALL-UNNAMED' }
+}

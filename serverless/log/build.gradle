@@ -37,6 +37,8 @@ tasks.register('journalTest', Test) {
   testClassesDirs = sourceSets.test.output.classesDirs
   classpath = sourceSets.test.runtimeClasspath
   systemProperty 'tests.journal.classpath', sourceSets.test.runtimeClasspath.asPath
+  // Exact ownership checks for the SDK's persistent global Timer threads.
+  jvmArgs '--add-opens=java.base/java.util=ALL-UNNAMED'
   include '**/RatisJournalTests.class'
   include '**/RatisFailureCleanupTests.class'
   include '**/RatisJournalProcessTests.class'

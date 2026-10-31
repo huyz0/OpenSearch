@@ -58,3 +58,27 @@ The consensus, log format, and acknowledgement rules are unchanged.
 
 Original `SegmentedRaftLogWorker.java` source entry SHA-256:
 `f9899dc64d71bd33194f220eb389ec9be3be8d6d7763b5874c98a1d8d41eac4e`.
+
+## Persisted log boundaries
+
+Two internal extension types are added beside the pinned reader classes:
+`OpenSearchLogPersistence` supplies opt-in hooks on the serialized log worker,
+and `OpenSearchLogRecovery` uses the native CRC reader to verify a required prefix
+before any server/voter is started. The hooks require safe synchronous log flush.
+Normal acknowledgement evidence is recorded after the file force and before the
+native flush index advances. A separate worker-ordered truncation hook runs before
+suffix deletion; the upstream state-machine truncate callback runs earlier, under
+the Raft write lock, and cannot provide that ordering.
+
+Segment finalization now propagates output close/flush errors, completes pending
+state-machine data persistence, and forces the directory after rename. Truncation
+also forces its directory changes before advancing the flush index. The original
+state-machine callback ordering and consensus algorithms remain intact. Shutdown's
+best-effort cleanup still retains live resources when workers have not terminated.
+
+Recovery verification checks unpurged filename ranges from index zero and reads
+at most the required segment and the newest closed/open tails, with native CRC,
+entry-size, file-size and directory-entry bounds. It forces a valid existing open
+tail before the host adopts its end as durable. It never repairs, rewrites, or
+deletes log contents. Snapshot/purged-prefix recovery needs a separate trusted
+catalog proof and remains unsupported here.

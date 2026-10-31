@@ -69,8 +69,8 @@ logs after a nonempty commit; omitting this initial barrier can strand the two
 remaining voters after the first leader dies. Activation survives replay; normal
 writes and subsequent leader changes require a majority, not all three voters.
 Control identities are reserved and activation records are excluded from replay
-subscriptions while still consuming scan budgets. Binding format version 2
-rejects volumes created by the earlier experimental runtime without this barrier.
+subscriptions while still consuming scan budgets. Binding format version 3
+rejects earlier experimental volumes without persisted local boundary evidence.
 
 Once native startup begins, the volume lease lasts for the **entire JVM lifetime**,
 even after `close` or failed startup. Native close can return while stalled disk
@@ -88,6 +88,39 @@ machines. Operators must not edit the binding or copy a live voter directory to
 another live voter. The curated `ratis-server` artifact closes failed groups and
 unpublished logs on startup errors. Other I/O-error cleanup paths still require
 qualification; the lifetime lease prevents their old tasks overlapping a new voter.
+
+## Local durability boundaries and corruption
+
+Each group keeps a fixed 152-byte, two-slot checksummed boundary file, bound to its
+deployment, volume UUID, and group UUID. The native worker forces this evidence
+**after log data persistence and before advancing its flush index or acknowledging
+replication**. This is one additional local metadata force per native flush batch;
+its latency and IOPS cost still require workload qualification. It adds no S3 call.
+The position proves local persistence only, not commitment, searchability, or
+permission to discard history.
+
+Recovery validates both slots and their generations and re-forces the valid file
+and its directory before SDK startup. A corrupt
+or torn slot quarantines the voter even when the other slot is valid: silently
+falling back could hide an acknowledged newer boundary. Missing segments, gaps,
+or a tail shorter than that boundary refuse startup. A valid open tail is verified
+and forced, then its actual end is recorded before voting can begin. This lets
+normal process restarts retain valid unacknowledged entries without treating dirty
+page-cache data as already durable.
+
+Authorized Raft truncation can reduce the index. A worker-ordered hook records
+that lower bound before deleting an uncommitted suffix; generations still increase.
+This preserves recovery after legitimate leader changes. Segment roll/truncate
+also force their directory changes, and output-close failures propagate before
+persistence progress can be reported. The floor is not a snapshot or archive cut.
+
+A missing-tail process test removed the newest acknowledged segments while
+retaining the identity, activation and native metadata; the earlier runtime
+accepted that voter. It now refuses before consensus startup. Another real-process
+history discards a long uncommitted suffix and then restarts all voters, preserving
+only committed operations. CRC/omission checks do not authorize restoring old
+backups under a live voter identity or protect against arbitrary stable-storage
+rollback. A quarantined volume must follow authorized recovery/replacement.
 
 ## Durable bootstrap catalog
 

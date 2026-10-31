@@ -26,6 +26,7 @@ import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.rpc.SupportedRpcType;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.server.raftlog.segmented.OpenSearchLogPersistence;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
@@ -589,7 +590,7 @@ public final class RatisJournal implements Closeable {
         return true;
     }
 
-    private final class JournalStateMachine extends BaseStateMachine {
+    private final class JournalStateMachine extends BaseStateMachine implements OpenSearchLogPersistence {
         private final UUID group;
         private volatile LogCheckpoint activation;
 
@@ -610,7 +611,28 @@ public final class RatisJournal implements Closeable {
                 storage.flush(group);
                 return CompletableFuture.completedFuture(null);
             } catch (IOException failure) {
+                failed = failure;
                 return CompletableFuture.failedFuture(failure);
+            }
+        }
+
+        @Override
+        public void onLogFlushed(long index) throws IOException {
+            try {
+                storage.recordFlushed(group, index);
+            } catch (IOException failure) {
+                failed = failure;
+                throw failure;
+            }
+        }
+
+        @Override
+        public void beforeLogTruncate(long firstIndex) throws IOException {
+            try {
+                storage.beforeTruncate(group, firstIndex);
+            } catch (IOException failure) {
+                failed = failure;
+                throw failure;
             }
         }
 

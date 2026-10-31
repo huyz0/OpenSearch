@@ -118,6 +118,21 @@ final class JournalProcess implements AutoCloseable {
         }, JournalProcess::readCheckpoint);
     }
 
+    void appendBatch(int group, OperationEnvelope operation, int count) throws IOException {
+        exchange(JournalProcessMain.APPEND_BATCH, out -> {
+            out.writeInt(group);
+            out.writeInt(count);
+            JournalProcessMain.writeFrame(out, operation.encode(16384));
+        }, in -> null);
+    }
+
+    record Progress(long flushed, long committed) {
+    }
+
+    Progress progress(int group) throws IOException {
+        return exchange(JournalProcessMain.PROGRESS, out -> out.writeInt(group), in -> new Progress(in.readLong(), in.readLong()));
+    }
+
     RatisJournal.ScanBatch scan(int group, long after, Set<ShardLogId> selection) throws IOException {
         return exchange(JournalProcessMain.SCAN, out -> {
             out.writeInt(group);

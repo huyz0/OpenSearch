@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.log;
 
+import org.apache.ratis.server.raftlog.segmented.OpenSearchLogRecovery;
+
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -24,8 +26,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Fail-closed guard around Ratis's permissive RECOVER-on-empty-directory behavior. */
 final class JournalStorage implements AutoCloseable {
@@ -35,18 +39,23 @@ final class JournalStorage implements AutoCloseable {
     private volatile boolean processOwned;
     private static final String BINDING = "journal-binding";
     private static final String INITIALIZED = "journal-initialized";
+    private static final String FLOOR = "journal-floor";
+    private final UUID deployment;
+    private final Map<UUID, JournalDurableFloor> floors = new ConcurrentHashMap<>();
     private final JournalDiskIdentity.Lease lease;
     private final byte[] binding;
     private final Set<UUID> groups;
 
-    private JournalStorage(JournalDiskIdentity.Lease lease, byte[] binding, Set<UUID> groups) {
+    private JournalStorage(JournalDiskIdentity.Lease lease, byte[] binding, Set<UUID> groups, JournalConfiguration configuration) {
         this.lease = lease;
+        this.deployment = configuration.deploymentId();
         this.binding = binding;
         this.groups = Set.copyOf(groups);
     }
 
     static JournalStorage open(JournalConfiguration configuration) throws IOException {
         final var lease = JournalDiskIdentity.acquire(configuration.directory());
+        JournalStorage storage = null;
         try {
             if (lease.id.equals(configuration.localVoterId()) == false) {
                 throw new IOException("journal volume identity differs from authorized voter membership");
@@ -54,7 +63,7 @@ final class JournalStorage implements AutoCloseable {
             final byte[] binding = binding(configuration);
             final Set<UUID> groups = new HashSet<>();
             configuration.groups().forEach(group -> groups.add(group.id()));
-            final var storage = new JournalStorage(lease, binding, groups);
+            storage = new JournalStorage(lease, binding, groups, configuration);
             if (configuration.bootstrap()) {
                 try (var entries = Files.list(lease.directory)) {
                     if (entries.anyMatch(path -> Set.of("voter-identity", "voter-lock").contains(path.getFileName().toString()) == false)) {
@@ -71,6 +80,19 @@ final class JournalStorage implements AutoCloseable {
                     requireRegular(directory.resolve("current/raft-meta"));
                     requireRegular(directory.resolve("current/raft-meta.conf"));
                     storage.requireBinding(directory.resolve(INITIALIZED));
+                    final var floor = JournalDurableFloor.open(directory.resolve(FLOOR), configuration.deploymentId(), lease.id, group);
+                    storage.floors.put(group, floor);
+                    final long allowance = 4L * configuration.limits().maximumPendingRequests() + 32;
+                    final long retained = configuration.limits().maximumRetainedEntries();
+                    final long maximumFiles = retained > Long.MAX_VALUE - allowance ? Long.MAX_VALUE : retained + allowance;
+                    final long observed = OpenSearchLogRecovery.verifyAndForce(
+                        directory.resolve("current"),
+                        floor.index(),
+                        configuration.limits().queueBytes(),
+                        (long) configuration.limits().segmentBytes() + configuration.limits().queueBytes() + 1024,
+                        maximumFiles
+                    );
+                    floor.persist(observed);
                 }
                 final var allowed = new HashSet<>(Set.of("voter-identity", "voter-lock", BINDING));
                 groups.forEach(group -> allowed.add(group.toString()));
@@ -83,7 +105,11 @@ final class JournalStorage implements AutoCloseable {
             return storage;
         } catch (IOException | RuntimeException | Error failure) {
             try {
-                lease.close();
+                if (storage == null) {
+                    lease.close();
+                } else {
+                    storage.close();
+                }
             } catch (IOException closeFailure) {
                 failure.addSuppressed(closeFailure);
             }
@@ -119,12 +145,15 @@ final class JournalStorage implements AutoCloseable {
         return directory().resolve(group.toString());
     }
 
-    void initialize(UUID group) throws IOException {
+    synchronized void initialize(UUID group) throws IOException {
         final Path directory = groupDirectory(group);
         requireDirectory(directory);
         requireDirectory(directory.resolve("current"));
         requireDirectory(directory.resolve("sm"));
         requireRegular(directory.resolve("current/raft-meta"));
+        if (floors.containsKey(group) == false) {
+            floors.put(group, JournalDurableFloor.create(directory.resolve(FLOOR), deployment, lease.id, group));
+        }
         JournalDiskIdentity.forceDirectory(directory.resolve("current"));
         JournalDiskIdentity.forceDirectory(directory.resolve("sm"));
         JournalDiskIdentity.forceDirectory(directory);
@@ -139,6 +168,21 @@ final class JournalStorage implements AutoCloseable {
 
     void flush(UUID group) throws IOException {
         JournalDiskIdentity.forceDirectory(groupDirectory(group).resolve("current"));
+    }
+
+    void recordFlushed(UUID group, long index) throws IOException {
+        final var floor = floors.get(group);
+        if (floor == null) {
+            throw new IOException("journal durable boundary was not initialized");
+        }
+        floor.persist(index);
+    }
+
+    void beforeTruncate(UUID group, long firstIndex) throws IOException {
+        if (firstIndex < 0) {
+            throw new IOException("invalid journal truncation boundary");
+        }
+        recordFlushed(group, firstIndex - 1);
     }
 
     private void requireBinding(Path path) throws IOException {
@@ -176,7 +220,7 @@ final class JournalStorage implements AutoCloseable {
     private static byte[] binding(JournalConfiguration configuration) throws IOException {
         final var bytes = new ByteArrayOutputStream();
         try (var out = new DataOutputStream(bytes)) {
-            out.writeInt(2);
+            out.writeInt(3);
             out.writeUTF(configuration.deploymentId().toString());
             out.writeUTF(configuration.localVoterId().toString());
             for (var group : configuration.groups()
@@ -216,6 +260,29 @@ final class JournalStorage implements AutoCloseable {
         if (processOwned) {
             throw new IOException("native journal volume remains leased until this JVM exits");
         }
-        lease.close();
+        IOException failedClose = null;
+        for (var floor : floors.values()) {
+            try {
+                floor.close();
+            } catch (IOException failure) {
+                if (failedClose == null) {
+                    failedClose = failure;
+                } else {
+                    failedClose.addSuppressed(failure);
+                }
+            }
+        }
+        try {
+            lease.close();
+        } catch (IOException failure) {
+            if (failedClose == null) {
+                failedClose = failure;
+            } else {
+                failedClose.addSuppressed(failure);
+            }
+        }
+        if (failedClose != null) {
+            throw failedClose;
+        }
     }
 }

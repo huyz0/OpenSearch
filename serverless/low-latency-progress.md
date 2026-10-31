@@ -106,5 +106,17 @@ asynchronous S3 archival are not enabled by these foundation commits.
   201-operation restart probe passed three iterations, with root precommit.
   Production durable transitions and authorized learner startup remain pending.
 
+- Persisted-prefix recovery: a real-process test reproduced startup accepting a
+  voter after its newest acknowledged segment was removed. Per-group fixed-size
+  boundary evidence now persists after log force and before native progress/ACK,
+  and recovery validates it before SDK startup. Corrupt floors and missing tails
+  refuse recovery; valid unacknowledged tails are forced before adoption. Another
+  process history verifies legitimate uncommitted-tail truncation and subsequent
+  full restart. Three iterations passed 108 unit, 42 journal and three catalog
+  integration cases; both consensus probes (six cases), vendor/log checks, complete
+  artifact audits and root precommit also passed. SDK global timer checks now match
+  exact owned thread identities, with a same-name foreign timer regression.
+  Additional local metadata force cost still needs workload qualification.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

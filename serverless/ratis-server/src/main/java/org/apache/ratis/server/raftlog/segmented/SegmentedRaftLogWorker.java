@@ -56,7 +56,9 @@ import org.opensearch.common.SuppressForbidden;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.LinkedList;
 import java.util.Objects;
 import java.util.Optional;
@@ -216,6 +218,10 @@ class SegmentedRaftLogWorker {
         RaftProperties properties,
         SegmentedRaftLogMetrics metricRegistry
     ) {
+        if (stateMachine instanceof OpenSearchLogPersistence
+            && (RaftServerConfigKeys.Log.unsafeFlushEnabled(properties) || RaftServerConfigKeys.Log.asyncFlushEnabled(properties))) {
+            throw new IllegalArgumentException("persistent boundary evidence requires safe synchronous log flush");
+        }
         this.name = memberId + "-" + JavaUtils.getClassSimpleName(getClass());
         LOG.info("new {} for {}", name, storage);
 
@@ -445,6 +451,7 @@ class SegmentedRaftLogWorker {
                     if (!stateMachineDataPolicy.isSync()) {
                         IOUtils.getFromFuture(f, () -> this + "-flushStateMachineData");
                     }
+                    recordDurableBoundary(lastWrittenIndex);
                     updateFlushedIndexIncreasingly();
                 }
             }
@@ -656,7 +663,16 @@ class SegmentedRaftLogWorker {
 
         @Override
         public void execute() throws IOException {
+            final CompletableFuture<Void> stateMachineFlush = pendingFlushNum > 0 && stateMachine != null
+                ? stateMachine.data().flush(lastWrittenIndex)
+                : CompletableFuture.completedFuture(null);
+            if (stateMachineDataPolicy.isSync()) {
+                stateMachineDataPolicy.getFromFuture(stateMachineFlush, () -> this + "-finalizeStateMachineData");
+            }
             freeSegmentedRaftLogOutputStream();
+            if (!stateMachineDataPolicy.isSync()) {
+                IOUtils.getFromFuture(stateMachineFlush, () -> this + "-finalizeStateMachineData");
+            }
 
             final LogSegmentStartEnd openStartEnd = LogSegmentStartEnd.valueOf(startIndex);
             final File openFile = getFile(openStartEnd);
@@ -672,6 +688,8 @@ class SegmentedRaftLogWorker {
                 final Path deleted = FileUtils.deleteFile(openFile);
                 LOG.info("{}: Deleted empty RaftLog segment: startEnd={}, path={}", name, openStartEnd, deleted);
             }
+            forceLogDirectory();
+            recordDurableBoundary(lastWrittenIndex);
             updateFlushedIndexIncreasingly();
             safeCacheEvictIndex.updateToMax(endIndex, traceIndexChange);
         }
@@ -721,10 +739,12 @@ class SegmentedRaftLogWorker {
     @SuppressForbidden(reason = "Pinned upstream log task retains its java.io.File storage API")
     private class TruncateLog extends Task {
         private final TruncationSegments segments;
+        private final long firstIndex;
         private CompletableFuture<Void> stateMachineFuture = null;
 
         TruncateLog(TruncationSegments ts, long index) {
             this.segments = ts;
+            this.firstIndex = index;
             if (stateMachine != null) {
                 // TruncateLog and WriteLog instance is created while taking a RaftLog write lock.
                 // StateMachine call is made inside the constructor so that it is lock
@@ -737,6 +757,9 @@ class SegmentedRaftLogWorker {
 
         @Override
         void execute() throws IOException {
+            if (stateMachine instanceof OpenSearchLogPersistence listener) {
+                listener.beforeLogTruncate(firstIndex);
+            }
             freeSegmentedRaftLogOutputStream();
 
             if (segments.getToDelete() != null && segments.getToDelete().length > 0) {
@@ -777,6 +800,8 @@ class SegmentedRaftLogWorker {
             if (stateMachineFuture != null) {
                 IOUtils.getFromFuture(stateMachineFuture, () -> this + "-truncateStateMachineData");
             }
+            forceLogDirectory();
+            recordDurableBoundary(lastWrittenIndex);
             flushIndex.setUnconditionally(lastWrittenIndex, infoIndexChange);
             safeCacheEvictIndex.setUnconditionally(lastWrittenIndex, infoIndexChange);
             postUpdateFlushedIndex(0);
@@ -806,9 +831,23 @@ class SegmentedRaftLogWorker {
         return safeCacheEvictIndex.get();
     }
 
-    private void freeSegmentedRaftLogOutputStream() {
-        IOUtils.cleanup(LOG, out);
-        out = null;
+    private void recordDurableBoundary(long index) throws IOException {
+        if (stateMachine instanceof OpenSearchLogPersistence listener) {
+            listener.onLogFlushed(index);
+        }
+    }
+
+    private void forceLogDirectory() throws IOException {
+        try (var directory = FileChannel.open(storage.getStorageDir().getCurrentDir().toPath(), StandardOpenOption.READ)) {
+            directory.force(true);
+        }
+    }
+
+    private void freeSegmentedRaftLogOutputStream() throws IOException {
+        if (out != null) {
+            out.close();
+            out = null;
+        }
         Preconditions.assertTrue(writeBuffer.position() == 0);
     }
 

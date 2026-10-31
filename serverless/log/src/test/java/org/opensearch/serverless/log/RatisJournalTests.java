@@ -19,6 +19,9 @@ import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
 import org.apache.ratis.thirdparty.io.grpc.netty.GrpcSslContexts;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
+import org.apache.ratis.util.MemoizedSupplier;
+import org.apache.ratis.util.TimeoutTimer;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.test.OpenSearchTestCase;
 
 import javax.net.ssl.KeyManager;
@@ -39,6 +42,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Timer;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -51,11 +55,10 @@ import java.util.concurrent.atomic.AtomicLong;
 @ThreadLeakLingering(linger = 70_000)
 @ThreadLeakFilters(filters = RatisJournalTests.GlobalTimerFilter.class)
 public class RatisJournalTests extends OpenSearchTestCase {
-    /** Only known idle JVM-global library threads without a public shutdown API are excluded. */
+    /** Only SDK-owned global timers and the known idle gRPC destroyer are excluded. */
     public static class GlobalTimerFilter implements ThreadFilter {
         @Override
         public boolean reject(Thread thread) {
-            final var group = thread.getThreadGroup();
             if (thread.isDaemon() && thread.getName().equals("grpc-shared-destroyer-0") && thread.getState() == Thread.State.WAITING) {
                 // SharedResourceHolder keeps its cleanup scheduler after all client executors retire.
                 for (var frame : thread.getStackTrace()) {
@@ -65,19 +68,62 @@ public class RatisJournalTests extends OpenSearchTestCase {
                     }
                 }
             }
-            if (thread.isDaemon() == false
-                || thread.getName().matches("timer[0-7]") == false
-                || group == null
-                || group.getName().matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@group-[0-9A-F]{12}") == false) {
+            if (thread.isDaemon() == false || thread.getName().matches("timer[0-7]") == false) {
                 return false;
             }
             for (var frame : thread.getStackTrace()) {
                 if (frame.getClassName().equals("java.util.TimerThread")) {
-                    return true;
+                    return nativeTimerThreads().contains(thread);
                 }
             }
             return false;
         }
+
+        @SuppressForbidden(reason = "Identify exact pinned-SDK global timer threads; fixture opens java.util for identity checks")
+        private static Set<Thread> nativeTimerThreads() {
+            try {
+                final var field = TimeoutTimer.class.getDeclaredField("timers");
+                field.setAccessible(true);
+                final var result = new java.util.HashSet<Thread>();
+                for (var value : (List<?>) field.get(TimeoutTimer.getInstance())) {
+                    if (value instanceof MemoizedSupplier<?> supplier && supplier.isInitialized()) {
+                        result.add(timerThread((Timer) supplier.getInitializedValue()));
+                    }
+                }
+                return Set.copyOf(result);
+            } catch (ReflectiveOperationException | RuntimeException failure) {
+                throw new AssertionError("cannot identify pinned Ratis global timers", failure);
+            }
+        }
+
+        @SuppressForbidden(reason = "Read the identity of a test/global Timer thread without suppressing unrelated timer leaks")
+        private static Thread timerThread(Timer timer) throws ReflectiveOperationException {
+            final var field = Timer.class.getDeclaredField("thread");
+            field.setAccessible(true);
+            return (Thread) field.get(timer);
+        }
+    }
+
+    public void testTimerFilterDoesNotHideAnUnrelatedTimerWithTheSameName() throws Exception {
+        final var filter = new GlobalTimerFilter();
+        final var ran = new java.util.concurrent.CountDownLatch(1);
+        TimeoutTimer.getInstance().onTimeout(org.apache.ratis.util.TimeDuration.ZERO, ran::countDown, failure -> {
+            throw new AssertionError(failure);
+        });
+        assertTrue(ran.await(5, TimeUnit.SECONDS));
+        assertFalse(GlobalTimerFilter.nativeTimerThreads().isEmpty());
+        for (var thread : GlobalTimerFilter.nativeTimerThreads()) {
+            assertTrue(filter.reject(thread));
+        }
+        final var unrelated = new Timer("timer5", true);
+        final var thread = GlobalTimerFilter.timerThread(unrelated);
+        try {
+            assertFalse(filter.reject(thread));
+        } finally {
+            unrelated.cancel();
+            thread.join(5000);
+        }
+        assertFalse(thread.isAlive());
     }
 
     public void testCommittedSharedStreamsSurviveLeaderLoss() throws Exception {

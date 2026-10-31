@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.net.BindException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -91,6 +92,145 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
         } finally {
             closeAll(nodes);
         }
+    }
+
+    public void testMissingAcknowledgedTailCannotRestartAsAnEstablishedVoter() throws Exception {
+        final var fixture = fixture(1);
+        final List<JournalProcess> nodes = new ArrayList<>();
+        final var stream = new ShardLogId(fixture.deployment(), "tail-index", 0, UUID.randomUUID());
+        try {
+            startAll(fixture, nodes, true);
+            final var leader = leader(nodes, 0);
+            final var activation = leader.activation(0);
+            final var follower = nodes.stream().filter(node -> node != leader).findFirst().orElseThrow();
+            final var original = fixture.configurations().get(nodes.indexOf(follower));
+            LogCheckpoint last = null;
+            for (int i = 0; i < 200; i++) {
+                final byte[] payload = new byte[16384];
+                payload[0] = (byte) i;
+                last = leader.append(0, new OperationEnvelope(stream, OperationEnvelope.Kind.DOCUMENTS, 1, 1, 1, payload));
+            }
+            final var acknowledged = last;
+            assertBusy(() -> {
+                try {
+                    final var tail = follower.scan(0, acknowledged.index() - 1, Set.of(stream));
+                    assertTrue(tail.operations().stream().anyMatch(item -> item.checkpoint().equals(acknowledged)));
+                } catch (IOException awaitingCommit) {
+                    throw new AssertionError("waiting for the follower's acknowledged prefix", awaitingCommit);
+                }
+            }, 20, TimeUnit.SECONDS);
+            follower.close(); // Stop this voter before other shutdowns can elect another term.
+            closeAll(nodes);
+            final var group = original.groups().getFirst().id();
+            final Path current = original.directory().resolve(group.toString()).resolve("current");
+            final List<Path> segments;
+            try (var entries = Files.list(current)) {
+                segments = entries.filter(path -> path.getFileName().toString().startsWith("log_")).toList();
+            }
+            assertTrue("fixture must rotate its two-MiB segments", segments.size() >= 2);
+            int removed = 0;
+            for (var segment : segments) {
+                final String name = segment.getFileName().toString();
+                final long start = name.startsWith("log_inprogress_")
+                    ? Long.parseLong(name.substring("log_inprogress_".length()))
+                    : Long.parseLong(name.substring("log_".length(), name.indexOf('-')));
+                if (start > 0) {
+                    Files.delete(segment);
+                    removed++;
+                }
+            }
+            assertTrue(removed > 0);
+            final var recovering = new JournalConfiguration(
+                original.deploymentId(),
+                original.localVoterId(),
+                original.directory(),
+                original.groups(),
+                false,
+                original.limits()
+            );
+            expectThrows(IOException.class, () -> {
+                try (
+                    var restarted = JournalProcess.start(recovering, createTempDir().resolve("missing-tail.log"), Map.of(group, activation))
+                ) {
+                    fail("a voter missing its previously acknowledged tail must fail before serving consensus RPCs");
+                }
+            });
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
+    public void testLegitimateUncommittedSuffixTruncationKeepsRecoveryUsable() throws Exception {
+        final var fixture = fixture(1);
+        final List<JournalProcess> nodes = new ArrayList<>();
+        final var stream = new ShardLogId(fixture.deployment(), "truncate-index", 0, UUID.randomUUID());
+        try {
+            startAll(fixture, nodes, true);
+            final var oldLeader = leader(nodes, 0);
+            final int oldLeaderIndex = nodes.indexOf(oldLeader);
+            final var activation = oldLeader.activation(0);
+            final UUID group = fixture.configurations().getFirst().groups().getFirst().id();
+            final var requirements = Map.of(group, activation);
+            oldLeader.append(0, operation(stream, 0));
+            for (var node : nodes) {
+                if (node != oldLeader) {
+                    node.stall();
+                }
+            }
+            expectThrows(IOException.class, () -> oldLeader.appendBatch(0, operation(stream, 99), 20));
+            for (var node : nodes) {
+                if (node != oldLeader) {
+                    assertBusy(() -> assertTrue(node.stalled()), 10, TimeUnit.SECONDS);
+                }
+            }
+            final var oldProgress = oldLeader.progress(0);
+            assertTrue("fixture must persist a long uncommitted suffix", oldProgress.flushed() - oldProgress.committed() >= 10);
+            closeAll(nodes);
+            // Elect a new leader from the two voters that never persisted the uncommitted suffix.
+            for (int i = 0; i < fixture.configurations().size(); i++) {
+                if (i != oldLeaderIndex) {
+                    nodes.add(restart(fixture.configurations().get(i), requirements));
+                }
+            }
+            final var newLeader = leader(nodes, 0);
+            newLeader.append(0, operation(stream, 1));
+            final var old = restart(fixture.configurations().get(oldLeaderIndex), requirements);
+            nodes.add(old);
+            assertBusy(() -> {
+                try {
+                    assertEquals(2, old.scan(0, -1, Set.of(stream)).operations().size());
+                } catch (IOException awaitingCatchup) {
+                    throw new AssertionError("waiting for the old leader to discard its uncommitted suffix", awaitingCatchup);
+                }
+            }, 20, TimeUnit.SECONDS);
+            assertTrue("the old durable floor must actually move backwards", old.progress(0).flushed() < oldProgress.flushed());
+            for (var node : nodes) {
+                node.stop();
+            }
+            nodes.clear();
+            startAll(fixture, nodes, false, requirements);
+            final var recovered = leader(nodes, 0);
+            recovered.append(0, operation(stream, 2));
+            final var history = recovered.scan(0, -1, Set.of(stream)).operations();
+            assertEquals(3, history.size());
+            for (int i = 0; i < history.size(); i++) {
+                assertEquals(i, history.get(i).operation().payloadReader().read());
+            }
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
+    private JournalProcess restart(JournalConfiguration original, Map<UUID, LogCheckpoint> requirements) throws IOException {
+        final var configuration = new JournalConfiguration(
+            original.deploymentId(),
+            original.localVoterId(),
+            original.directory(),
+            original.groups(),
+            false,
+            original.limits()
+        );
+        return JournalProcess.start(configuration, createTempDir().resolve("recovered-voter.log"), requirements);
     }
 
     private record Fixture(UUID deployment, List<JournalConfiguration> configurations) {

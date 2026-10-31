@@ -34,6 +34,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -51,6 +52,8 @@ public final class JournalProcessMain {
     static final int ACTIVATE = 8;
     static final int IO_OPEN = 9;
     static final int ACTIVATION_COORDINATE = 10;
+    static final int APPEND_BATCH = 11;
+    static final int PROGRESS = 12;
     static final int FRAME_LIMIT = 17 * 1024;
 
     private JournalProcessMain() {}
@@ -179,6 +182,27 @@ public final class JournalProcessMain {
                             final var checkpoint = journal.append(group, operation).toCompletableFuture().get(10, TimeUnit.SECONDS);
                             output.writeByte(0);
                             writeCheckpoint(output, checkpoint);
+                        }
+                        case APPEND_BATCH -> {
+                            final UUID group = groups.get(input.readInt()).id();
+                            final int count = input.readInt();
+                            if (count < 1 || count > 24) {
+                                throw new IOException("invalid fixture proposal batch size");
+                            }
+                            final var operation = OperationEnvelope.decode(readFrame(input), 16384);
+                            final var pending = new ArrayList<CompletableFuture<LogCheckpoint>>();
+                            for (int i = 0; i < count; i++) {
+                                pending.add(journal.append(group, operation).toCompletableFuture());
+                            }
+                            CompletableFuture.allOf(pending.toArray(CompletableFuture[]::new)).get(10, TimeUnit.SECONDS);
+                            output.writeByte(0);
+                        }
+                        case PROGRESS -> {
+                            final UUID group = groups.get(input.readInt()).id();
+                            final var log = ((RaftServer) field(journal, "server")).getDivision(RaftGroupId.valueOf(group)).getRaftLog();
+                            output.writeByte(0);
+                            output.writeLong(log.getFlushIndex());
+                            output.writeLong(log.getLastCommittedIndex());
                         }
                         case SCAN -> {
                             final UUID group = groups.get(input.readInt()).id();

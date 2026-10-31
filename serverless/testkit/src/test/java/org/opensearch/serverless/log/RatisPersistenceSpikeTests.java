@@ -28,7 +28,9 @@ import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachine;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
+import org.apache.ratis.util.MemoizedSupplier;
 import org.apache.ratis.util.TimeDuration;
+import org.apache.ratis.util.TimeoutTimer;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -37,6 +39,8 @@ import java.net.ServerSocket;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.Timer;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -53,19 +57,39 @@ public class RatisPersistenceSpikeTests extends OpenSearchTestCase {
     public static class GlobalTimerFilter implements ThreadFilter {
         @Override
         public boolean reject(Thread thread) {
-            final ThreadGroup group = thread.getThreadGroup();
-            if (thread.isDaemon() == false
-                || thread.getName().matches("timer[0-7]") == false
-                || group == null
-                || group.getName().startsWith("peer-") == false) {
+            if (thread.isDaemon() == false || thread.getName().matches("timer[0-7]") == false) {
                 return false;
             }
             for (StackTraceElement frame : thread.getStackTrace()) {
                 if (frame.getClassName().equals("java.util.TimerThread")) {
-                    return true;
+                    return nativeTimerThreads().contains(thread);
                 }
             }
             return false;
+        }
+
+        @SuppressForbidden(reason = "Identify exact pinned-SDK global timer threads; fixture opens java.util for identity checks")
+        private static Set<Thread> nativeTimerThreads() {
+            try {
+                final var field = TimeoutTimer.class.getDeclaredField("timers");
+                field.setAccessible(true);
+                final var result = new java.util.HashSet<Thread>();
+                for (var value : (List<?>) field.get(TimeoutTimer.getInstance())) {
+                    if (value instanceof MemoizedSupplier<?> supplier && supplier.isInitialized()) {
+                        result.add(timerThread((Timer) supplier.getInitializedValue()));
+                    }
+                }
+                return Set.copyOf(result);
+            } catch (ReflectiveOperationException | RuntimeException failure) {
+                throw new AssertionError("cannot identify pinned Ratis global timers", failure);
+            }
+        }
+
+        @SuppressForbidden(reason = "Read the identity of a test/global Timer thread without suppressing unrelated timer leaks")
+        private static Thread timerThread(Timer timer) throws ReflectiveOperationException {
+            final var field = Timer.class.getDeclaredField("thread");
+            field.setAccessible(true);
+            return (Thread) field.get(timer);
         }
     }
 
