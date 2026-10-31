@@ -49,6 +49,12 @@ Ratis 3.3.1 source inspection identified:
 - Segment creation/rename, parent-directory durability, metadata/vote persistence,
   failure propagation, and filesystem/storage assumptions still require a dedicated
   production audit. A source-level `force` call is not a complete crash proof.
+- The follow-up metadata audit confirmed that the upstream atomic metadata stream
+  syncs its temporary file but not the renamed parent directory. The curated
+  [ratis-common module](ratis-common/README.md) fixes that filesystem boundary;
+  it preserves the protocol and every other upstream class/resource byte. Actual
+  directory-sync failure is covered by a regression test. Segment-directory and
+  bootstrap persistence still need their runtime-specific integration.
 - Eight JVM-global daemon timeout Timers have no close API. The probe filters only
   those named timers in its Ratis peer thread groups, with TimerThread stacks;
   server/appender/executor leak checks remain enabled.

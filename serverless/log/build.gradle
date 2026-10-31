@@ -12,6 +12,7 @@ dependencies {
   api project(':libs:opensearch-common')
   api project(':libs:opensearch-core')
   testImplementation project(':test:framework')
+  testImplementation project(':serverless:ratis-common')
 }
 
 // This engine-independent library does not carry server/CLI classes referenced by server signatures.

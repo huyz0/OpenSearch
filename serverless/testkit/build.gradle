@@ -25,7 +25,7 @@ dependencies {
   testImplementation 'org.apache.ratis:ratis-metrics-default:3.3.1'
   // OpenSearch deliberately disables transitive dependencies: enumerate the pinned closure.
   testImplementation 'org.apache.ratis:ratis-server-api:3.3.1'
-  testImplementation 'org.apache.ratis:ratis-common:3.3.1'
+  testImplementation project(':serverless:ratis-common')
   testImplementation 'org.apache.ratis:ratis-proto:3.3.1'
   testImplementation 'org.apache.ratis:ratis-metrics-api:3.3.1'
   testImplementation 'org.apache.ratis:ratis-thirdparty-misc:1.1.0'
