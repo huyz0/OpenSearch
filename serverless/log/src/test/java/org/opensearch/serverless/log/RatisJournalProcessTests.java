@@ -329,6 +329,80 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRecoveryRefusesHistoryBeyondTheConfiguredMetadataBudgetBeforeSdkStartup() throws Exception {
+        final var fixture = fixture(1);
+        final List<JournalProcess> nodes = new ArrayList<>();
+        final var stream = new ShardLogId(fixture.deployment(), "metadata-budget", 0, UUID.randomUUID());
+        try {
+            startAll(fixture, nodes, true);
+            final var leader = leader(nodes, 0);
+            final var activation = leader.activation(0);
+            final var follower = nodes.stream().filter(node -> node != leader).findFirst().orElseThrow();
+            final int followerIndex = nodes.indexOf(follower);
+            final var original = fixture.configurations().get(followerIndex);
+            LogCheckpoint last = null;
+            for (int i = 0; i < 1500 && (last == null || last.index() < 1350); i++) {
+                last = leader.append(0, operation(stream, i));
+            }
+            assertNotNull(last);
+            assertTrue(last.index() >= 1350);
+            final var required = last;
+            assertBusy(
+                () -> assertTrue(
+                    follower.scan(0, -1, Set.of(stream)).operations().stream().anyMatch(item -> item.checkpoint().equals(required))
+                ),
+                30,
+                TimeUnit.SECONDS
+            );
+            follower.stop();
+            final var limits = original.limits();
+            final var smaller = new JournalConfiguration(
+                original.deploymentId(),
+                original.localVoterId(),
+                original.directory(),
+                original.groups(),
+                false,
+                new JournalConfiguration.Limits(
+                    limits.maximumGroups(),
+                    limits.maximumPayloadBytes(),
+                    32,
+                    limits.maximumPendingBytes(),
+                    limits.queueBytes(),
+                    limits.segmentBytes(),
+                    limits.cachedSegmentBytes(),
+                    1024,
+                    limits.minimumFreeBytes()
+                )
+            );
+            final var requirements = Map.of(original.groups().getFirst().id(), activation);
+            expectThrows(IOException.class, () -> nodes.set(followerIndex, restart(smaller, requirements)));
+            // A synthetic low local boundary leaves a valid larger suffix. Recovery must bound
+            // the observed tail too, not merely check the saved boundary before streaming it.
+            try (
+                var floor = JournalDurableFloor.open(
+                    original.directory().resolve(original.groups().getFirst().id().toString()).resolve("journal-floor"),
+                    original.deploymentId(),
+                    original.localVoterId(),
+                    original.groups().getFirst().id()
+                )
+            ) {
+                floor.persist(0);
+            }
+            expectThrows(IOException.class, () -> nodes.set(followerIndex, restart(smaller, requirements)));
+            final var recovered = restart(original, requirements);
+            nodes.set(followerIndex, recovered);
+            assertBusy(
+                () -> assertTrue(
+                    recovered.scan(0, -1, Set.of(stream)).operations().stream().anyMatch(item -> item.checkpoint().equals(required))
+                ),
+                30,
+                TimeUnit.SECONDS
+            );
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
     private JournalProcess restart(JournalConfiguration original, Map<UUID, LogCheckpoint> requirements) throws IOException {
         return restart(original, requirements, Map.of());
     }

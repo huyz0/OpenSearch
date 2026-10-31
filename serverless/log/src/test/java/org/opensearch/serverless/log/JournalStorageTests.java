@@ -206,6 +206,21 @@ public class JournalStorageTests extends OpenSearchTestCase {
         assertFalse(Files.exists(configuration.directory().resolve("retired")));
     }
 
+    public void testNativePersistenceCannotExceedTheMetadataAllowance() throws Exception {
+        final var configuration = configuration();
+        final UUID group = configuration.groups().getFirst().id();
+        final var limits = configuration.limits();
+        final long maximumIndex = limits.maximumRetainedEntries() + 4L * limits.maximumPendingRequests() + 31;
+        try (var storage = JournalStorage.open(configuration)) {
+            initialize(storage, group);
+            storage.recordFlushed(group, maximumIndex);
+            final Path path = storage.groupDirectory(group).resolve("journal-floor");
+            final byte[] before = Files.readAllBytes(path);
+            expectThrows(IOException.class, () -> storage.recordFlushed(group, maximumIndex + 1));
+            assertArrayEquals(before, Files.readAllBytes(path));
+        }
+    }
+
     private static void initialize(JournalStorage storage, UUID group) throws Exception {
         final Path root = storage.groupDirectory(group);
         Files.createDirectories(root.resolve("current"));

@@ -46,12 +46,16 @@ final class JournalStorage implements AutoCloseable {
     private final JournalDiskIdentity.Lease lease;
     private final byte[] binding;
     private final Set<UUID> groups;
+    private final long maximumRetainedIndex;
 
     private JournalStorage(JournalDiskIdentity.Lease lease, byte[] binding, Set<UUID> groups, JournalConfiguration configuration) {
         this.lease = lease;
         this.deployment = configuration.deploymentId();
         this.binding = binding;
         this.groups = Set.copyOf(groups);
+        // All log history is unpurged and starts at zero: snapshots/reclamation remain disabled.
+        // Cache the bound here; a disk-worker hook must never acquire a native Raft/log lock.
+        maximumRetainedIndex = configuration.limits().maximumRetainedEntries() + 4L * configuration.limits().maximumPendingRequests() + 31;
     }
 
     static JournalStorage open(JournalConfiguration configuration) throws IOException {
@@ -99,9 +103,8 @@ final class JournalStorage implements AutoCloseable {
                     storage.requireBinding(directory.resolve(INITIALIZED));
                     final var floor = JournalDurableFloor.open(directory.resolve(FLOOR), configuration.deploymentId(), lease.id, group);
                     storage.floors.put(group, floor);
-                    final long allowance = 4L * configuration.limits().maximumPendingRequests() + 32;
-                    final long retained = configuration.limits().maximumRetainedEntries();
-                    final long maximumFiles = retained > Long.MAX_VALUE - allowance ? Long.MAX_VALUE : retained + allowance;
+                    storage.requireRetainedIndex(floor.index());
+                    final long maximumFiles = storage.maximumRetainedIndex + 1;
                     final long observed = OpenSearchLogRecovery.verifyAndForce(
                         directory.resolve("current"),
                         floor.index(),
@@ -109,6 +112,7 @@ final class JournalStorage implements AutoCloseable {
                         (long) configuration.limits().segmentBytes() + configuration.limits().queueBytes() + 1024,
                         maximumFiles
                     );
+                    storage.requireRetainedIndex(observed);
                     floor.persist(observed);
                 }
                 final var allowed = new HashSet<>(Set.of("voter-identity", "voter-lock", BINDING));
@@ -252,7 +256,14 @@ final class JournalStorage implements AutoCloseable {
         if (floor == null) {
             throw new IOException("journal durable boundary was not initialized");
         }
+        requireRetainedIndex(index);
         floor.persist(index);
+    }
+
+    private void requireRetainedIndex(long index) throws IOException {
+        if (index > maximumRetainedIndex) {
+            throw new IOException("journal history exceeds configured retained-entry metadata capacity");
+        }
     }
 
     void beforeTruncate(UUID group, long firstIndex) throws IOException {

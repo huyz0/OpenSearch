@@ -360,3 +360,20 @@ Completed membership loads additionally verify every new voter's permanent
 reservation and exact placement. Validation performs at most three direct reads
 per group and never recursively walks transition history. Missing or rebound
 identities fail closed, with no repair to an earlier membership revision.
+
+## Retained metadata capacity at persistence and startup
+
+A real-process recovery history accepted a log larger than its newly configured
+retained-entry budget. Bounding file count and frame bytes did not bound the
+number of log-entry metadata objects loaded by the native SDK. Ordinary proposal
+admission also cannot cover automatic native election/configuration entries.
+
+A cached ceiling now permits at most the configured retained watermark plus
+`4 * maximumPendingRequests + 32` physical positions. The post-force/pre-ACK hook
+checks it without acquiring a native Raft/log lock. Recovery checks both the saved
+boundary and the verified observed tail before SDK startup and boundary adoption.
+The history verifies refusal for a high saved boundary and for a synthetic low
+boundary with a valid larger suffix, then successfully restores the original
+capacity with acknowledged data intact. No bytes are deleted or rewritten.
+This assumes unpurged history starting at zero; snapshot/purge integration must
+switch to a retained-prefix count before reclamation is enabled.

@@ -39,6 +39,21 @@ metadata and retry caches, bounded replay batches, TLS, and transport overhead.
 The retry-cache budget must be revisited before archival permits sustained history
 reclamation; a time-based native retry cache alone is not a hard count limit.
 
+The ordinary retained-entry watermark is also backed by a native persistence and
+recovery ceiling: at most `maximumRetainedEntries + 4 * maximumPendingRequests + 32`
+physical positions. The finite allowance covers in-flight and control metadata.
+This includes automatic native election/configuration entries that bypass customer
+admission. The worker checks a cached bound before advancing its durable boundary;
+it never acquires a native Raft/log lock to calculate it.
+
+Before SDK startup, recovery checks both the saved boundary and the observed
+on-disk end. Lowering the configured budget cannot silently load an older, larger
+history into native heap metadata. A refusal preserves its bytes; restoring the
+original capacity remains possible. The bound currently uses a zero-based unpurged
+prefix. Snapshot/reclamation integration must change it to count retained positions
+before enabling log purge. This metadata count is one component of process sizing,
+not a guarantee that arbitrary heap, payload and buffer settings fit a host.
+
 ## Submission and completion workers
 
 Native async submission can join the SDK's client executor, and native futures

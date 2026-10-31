@@ -75,6 +75,7 @@ final class JournalProcess implements AutoCloseable {
         arguments.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
         arguments.add("-Xms64m");
         arguments.add("-Xmx256m");
+        arguments.add("-Dtests.journal.retained=" + configuration.limits().maximumRetainedEntries());
         arguments.add("--enable-native-access=ALL-UNNAMED");
         arguments.add("-Dlog4j2.configurationFile=" + JournalProcessMain.class.getResource("journal-process-log4j2.xml"));
         arguments.add("-cp");

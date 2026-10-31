@@ -161,5 +161,15 @@ asynchronous S3 archival are not enabled by these foundation commits.
   unit, 57 journal, 39 catalog and three catalog integration cases; log module check
   and root precommit passed. No additional native-library patch was needed.
 
+- Native metadata capacity: a child-JVM history reproduced recovery accepting a
+  log larger than its configured retained-entry budget. The persistence hook and
+  pre-SDK recovery now enforce a cached ceiling including finite in-flight/control
+  allowance, covering automatic native metadata as well as customer proposals.
+  Both saved boundaries and valid larger observed tails are checked. Restoring
+  the original capacity recovers acknowledged data without deleting history.
+  Three iterations passed 159 unit, 60 journal and three catalog integration cases,
+  with log module check and root precommit. The current absolute-index ceiling
+  must become a retained-prefix count before snapshot/purge is enabled.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

@@ -91,7 +91,17 @@ public final class JournalProcessMain {
         for (String id : arguments[4].split(",")) {
             groups.add(new JournalConfiguration.Group(UUID.fromString(id), peers));
         }
-        final var limits = new JournalConfiguration.Limits(4, 16384, 32, 1024 * 1024, 1024 * 1024, 2 * 1024 * 1024, 0, 10_000, 1);
+        final var limits = new JournalConfiguration.Limits(
+            4,
+            16384,
+            32,
+            1024 * 1024,
+            1024 * 1024,
+            2 * 1024 * 1024,
+            0,
+            Long.getLong("tests.journal.retained", 10_000L),
+            1
+        );
         final var configuration = new JournalConfiguration(
             UUID.fromString(arguments[1]),
             UUID.fromString(arguments[2]),
