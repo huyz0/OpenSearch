@@ -5,9 +5,10 @@ This records M2 findings, not completion of the low-latency runtime.
 
 ## Decisions
 
-1. Use Apache Ratis 3.3.1 as the candidate consensus backend. Keep it test-scoped
-   until the runtime adapter, security, storage, licensing, and failure gates pass.
-   Reuse its election, durable replication, membership, and snapshot protocols.
+1. Use Apache Ratis 3.3.1 as the candidate consensus backend. Introduce it through
+   the inactive runtime adapter in `serverless/log`; enable shell traffic only after
+   the security, storage, licensing, and failure gates pass. Reuse its election,
+   durable replication, membership, and snapshot protocols.
 2. Explicitly disable unsafe log flushing. The initial implementation also disables
    asynchronous flushing, establishing a simple synchronous persistence baseline.
 3. Bound physical consensus groups per node. Multiplex logical shard streams within

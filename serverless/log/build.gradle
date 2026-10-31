@@ -6,14 +6,41 @@
  * compatible open source license.
  */
 
+import org.opensearch.gradle.util.GradleUtils
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+
 apply plugin: 'opensearch.build'
 
 dependencies {
   api project(':libs:opensearch-common')
   api project(':libs:opensearch-core')
+  compileOnly "com.google.errorprone:error_prone_annotations:${versions.error_prone_annotations}"
   testImplementation project(':test:framework')
-  testImplementation project(':serverless:ratis-common')
+  implementation project(':serverless:ratis-common')
+  runtimeOnly "org.apache.logging.log4j:log4j-slf4j2-impl:${versions.log4j}"
+  ['ratis-server', 'ratis-server-api', 'ratis-client', 'ratis-grpc', 'ratis-metrics-api', 'ratis-metrics-default'].each {
+    implementation "org.apache.ratis:${it}:3.3.1"
+  }
 }
 
 // This engine-independent library does not carry server/CLI classes referenced by server signatures.
 tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatures' }
+
+// Persistent socket-based journal tests need native gRPC access, isolated from ordinary unit tests.
+tasks.named('test').configure { exclude '**/RatisJournalTests.class' }
+tasks.register('journalTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/RatisJournalTests.class'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'tests.system_call_filter', 'false'
+}
+tasks.named('check').configure { dependsOn 'journalTest' }
+
+// Include the build-only SDK annotations in license/SHA verification as well.
+tasks.named('dependencyLicenses').configure {
+  dependencies = files(provider {
+    GradleUtils.getFirstLevelModuleDependencyFiles(project, configurations.runtimeClasspath,
+      { id -> !(id instanceof ProjectComponentIdentifier) })
+  }, configurations.resolveableCompileOnly)
+}

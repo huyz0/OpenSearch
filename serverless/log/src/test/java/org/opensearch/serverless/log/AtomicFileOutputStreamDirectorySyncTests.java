@@ -49,10 +49,7 @@ public class AtomicFileOutputStreamDirectorySyncTests extends OpenSearchTestCase
 
     public void testDirectorySyncFailureIsNotReportedAsSuccessfulPublication() throws Exception {
         final Path directory = createTempDir();
-        assumeTrue(
-            "requires POSIX directory permissions",
-            Files.getFileAttributeView(directory, PosixFileAttributeView.class) != null
-        );
+        assumeTrue("requires POSIX directory permissions", Files.getFileAttributeView(directory, PosixFileAttributeView.class) != null);
         final var original = Files.getPosixFilePermissions(directory);
         final Path destination = directory.resolve("raft-meta");
         try (var out = new AtomicFileOutputStream(legacyFile(destination))) {
