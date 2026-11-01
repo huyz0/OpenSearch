@@ -13,7 +13,8 @@ This records M2 findings, not completion of the low-latency runtime.
    asynchronous flushing, establishing a simple synchronous persistence baseline.
 3. Bound physical consensus groups per node. Multiplex logical shard streams within
    those groups; do not allocate a Raft division for every index shard by default.
-4. Start with a private preparation engine and a committed-serving replica engine.
+4. Start with a private preparation engine and a committed-serving engine using
+   native non-primary operation planning.
    Measure the duplicate indexing cost before accepting it for production. Retain
    the prepare/commit core-hook alternative if it misses the performance gates.
 5. Keep conditional preparation behind dependent commit barriers. Never evaluate
@@ -77,16 +78,51 @@ Three randomized iterations passed.
 
 This proves a useful engine boundary. It does not establish routing isolation,
 automatic commit admission, crash recovery, query token semantics, or the cost of
-running two engines. The actual shell must also isolate private index services:
-one `IndexService` cannot host two copies of the same `ShardId`. Evaluate an
-unadvertised preparation service with separate local identity and preserved public
-index semantics, or a separately owned preparation service. Test real shell
-lifecycle, mappings, plugins, and cleanup before committing to that integration.
+running two engines. One `IndexService` cannot host two copies of the same
+`ShardId`. The integration direction below uses a private engine directly rather
+than registering a second copy of the shard in another public index service.
 
 The serving copy must use writable replica semantics for committed replay. The
 existing S3 read-only engine cannot simply accept streamed operations. Likewise,
 replica-origin operations cannot be applied to a primary-mode shard by bypassing
 core assertions. No assertion disabling is part of the design.
+
+### Primary-serving adapter for M4
+
+The core `EngineConfig` already supports `PrimaryOperationPolicy`. The shell's
+`CommittedServingEngine` uses this extension to accept resolved primary-origin
+operations with upstream sequence numbers, terms and versions. Its policy plans
+those operations using native non-primary conflict handling. Planning receives a
+replica-origin copy; the actual applied operation retains its primary origin and
+identity. CAS and version allocation belong to preparation and are not repeated
+during application. Ordinary primary requests without assigned identities fail
+before changing the serving engine. Gap filling cannot invent operations absent
+from the committed log.
+
+This permits the public primary `IndexShard` to apply committed records through
+`applyTranslogOperation(..., PRIMARY)`, retaining standard parsing, GET/search,
+routing, and indexing listeners. It avoids applying replica-origin writes to a
+primary shard. The engine advances the update/delete boundary conservatively for
+every assigned index/delete, so replay and out-of-order delivery cannot use an
+unsafe append-only optimization. This trades some indexing efficiency for a
+simpler initial correctness boundary.
+
+Keep one public `IndexService` and one public serving shard. The next integration
+step is a separately owned private `InternalEngine` with its own SSD store,
+translog, default primary policy, lifecycle and resource budget. Reuse the public
+mapper/analyzers without creating a second plugin/index registration. Direct
+engine preparation must be checked against plugins that depend on shard hooks;
+custom engines and incompatible data formats cannot be silently enabled. The
+private engine must not inherit public refresh listeners, warmers or failure
+callbacks that could expose speculative state or fail the serving shard.
+
+The adapter itself is not a commit verifier and is not enabled by the launcher.
+Assigned operation identities are not evidence of commitment. The host must
+validate the committed stream, ownership epoch, schema and shard incarnation
+before invoking application. Quorum replay after local data loss, term changes,
+private-engine rebuild after ambiguity, mapping/lifecycle barriers and bounded
+engine admission remain M4 integration work. No duplicate-indexing cost or
+millisecond latency qualification is claimed by these engine tests.
 
 ### Physical group footprint
 

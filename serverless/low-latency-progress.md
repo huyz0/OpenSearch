@@ -4,9 +4,10 @@ Branch: `low-latency-serverless`. The delivery plan is
 [low-latency-serverless-plan.md](low-latency-serverless-plan.md).
 
 Index writes still use object-store WAL durability. An explicit journal host now
-drives replicated-log activation and membership control. Quorum-mode index writes,
-committed-only serving engines, streaming search replicas and asynchronous S3
-archival remain pending.
+drives replicated-log activation and membership control. A committed-serving
+primary adapter has engine and shard-level tests but is not enabled by the
+launcher. Quorum-mode index writes, streaming search replicas and asynchronous
+S3 archival remain pending.
 
 | Milestone | Delivered | Remaining |
 | --- | --- | --- |
@@ -15,7 +16,8 @@ archival remain pending.
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
 | M3a | [Selected cell/active-state design](low-latency-capacity-adr.md), runnable descriptor/resource/failure/cost models and raw local results | Per-group proposal admission/workers delivered; metadata routing, dynamic group admission, bounded engines and broader isolation pending |
-| M4–M9 | Not implemented | Quorum writes, fresh readers, selective replication, archival, lifecycle, migration |
+| M4 | Committed-serving primary adapter through the existing core policy, resolved identity/routing/listener and local-restart tests | Private preparation, verified quorum application, term/schema/lifecycle fencing and shell mutation integration |
+| M5–M9 | Not implemented | Fresh readers, selective replication, archival, lifecycle, migration |
 | M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
 | M6a | Planned; no runtime completion claimed | Missing-chunk/resumable bulk shard copies, peer/S3 source selection and live-versus-recovery scheduling |
 | M9a | Planned; no runtime completion claimed | Fenced hot-shard movement, cell expansion and post-failure capacity headroom |
