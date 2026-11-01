@@ -59,9 +59,21 @@ not a guarantee that arbitrary heap, payload and buffer settings fit a host.
 Native async submission can join the SDK's client executor, and native futures
 can complete while holding leader/watch locks. Calling back into submission from
 those locks deadlocks activation and shutdown. Local proposals and activation
-watches therefore dispatch both submission and notification through four bounded
-node workers, shared across physical groups. Their queue holds at most the node's
-pending-request limit; each charged proposal owns at most one queued task.
+watches therefore dispatch submission and notification on one bounded worker per
+active physical group, at most sixteen per host. A group's blocked submission or
+slow application callback cannot occupy another group's worker. Each queue has
+the node's pending-request limit; global charged admission bounds aggregate queued
+work because each proposal owns at most one queued task.
+
+Admission reserves one request and enough bytes for a maximum-size proposal for
+each active group. Other capacity can be borrowed, but a hot group cannot borrow
+another group's unused reservation. Reservations return as proposals complete;
+cancellation still cannot release accepted persistence. The node-wide request and
+byte ceilings remain hard limits, and accounting updates are constant-time.
+Before opening/binding a volume, startup requires sufficient request/byte capacity
+for those reservations. At payload limit `P` and `G` active groups, this needs at
+least `G` requests and `G * 6 * (P + 512)` pending bytes. A higher configured group
+ceiling alone does not increase the byte budget.
 
 Permits remain charged until notification is dequeued, then release before the
 public future completes. Dependent appends and activation handoffs consequently

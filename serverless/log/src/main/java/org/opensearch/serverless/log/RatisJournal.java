@@ -152,7 +152,7 @@ public final class RatisJournal implements Closeable {
     private final JournalStorage storage;
     private final DiskSpaceProbe diskSpace;
     private final JournalAdmission admission;
-    private final JournalDispatch dispatch;
+    private final Map<UUID, JournalDispatch> dispatch;
     private final ThreadPoolExecutor peerRpcExecutor;
     private final Map<UUID, JournalConfiguration.Group> groups;
     private final ClientId clientId = ClientId.randomId();
@@ -174,13 +174,20 @@ public final class RatisJournal implements Closeable {
         this.expectedActivations = expectedActivations;
         this.storage = storage;
         this.diskSpace = diskSpace;
-        this.admission = new JournalAdmission(configuration.limits());
         groups = configuration.groups()
             .stream()
             .filter(group -> storage.isActiveGroup(group.id()))
             .collect(Collectors.toUnmodifiableMap(JournalConfiguration.Group::id, group -> group));
         requireDiskSpace();
-        dispatch = new JournalDispatch(configuration.localVoterId().toString(), configuration.limits());
+        this.admission = new JournalAdmission(configuration.limits(), groups.keySet());
+        dispatch = groups.keySet()
+            .stream()
+            .collect(
+                Collectors.toUnmodifiableMap(
+                    group -> group,
+                    group -> new JournalDispatch(configuration.localVoterId() + "-" + group, configuration.limits(), 1)
+                )
+            );
         peerRpcExecutor = JournalExecutors.bounded(
             configuration.localVoterId() + "-journal-peer-rpc",
             4,
@@ -228,7 +235,7 @@ public final class RatisJournal implements Closeable {
                 .setOption(RaftStorage.StartupOption.RECOVER)
                 .build();
         } catch (IOException | RuntimeException | Error failure) {
-            dispatch.close();
+            dispatch.values().forEach(JournalDispatch::close);
             peerRpcExecutor.shutdown();
             throw failure;
         }
@@ -262,7 +269,7 @@ public final class RatisJournal implements Closeable {
             } catch (IOException closeFailure) {
                 failure.addSuppressed(closeFailure);
             } finally {
-                dispatch.close();
+                dispatch.values().forEach(JournalDispatch::close);
                 peerRpcExecutor.shutdown();
             }
             if (failure instanceof RuntimeException) {
@@ -424,6 +431,7 @@ public final class RatisJournal implements Closeable {
                 throw new IOException("activation requirement differs from authorized group lineage", failure);
             }
         }
+        JournalAdmission.validate(configuration.limits(), configuration.groups().size() - retiredGroups.size());
         final var storage = JournalStorage.open(configuration, retiredGroups, emptyOriginals);
         try {
             return new RatisJournal(configuration, storage, diskSpace, keyManager, trustManager, activations, initialGroups);
@@ -723,8 +731,8 @@ public final class RatisJournal implements Closeable {
             callIds.getAndIncrement(),
             arguments
         );
-        final var permit = admission.acquire(0);
-        return dispatch.submit(permit, () -> server.setConfigurationAsync(request)).thenApply(reply -> {
+        final var permit = admission.acquire(group, 0);
+        return dispatch.get(group).submit(permit, () -> server.setConfigurationAsync(request)).thenApply(reply -> {
             if (reply.isSuccess() == false) {
                 throw new java.util.concurrent.CompletionException(reply.getException());
             }
@@ -799,7 +807,7 @@ public final class RatisJournal implements Closeable {
     }
 
     private CompletableFuture<Void> watchAllCommitted(UUID groupId, long index) throws IOException {
-        final var permit = admission.acquire(0);
+        final var permit = admission.acquire(groupId, 0);
         try {
             final var request = RaftClientRequest.newBuilder()
                 .setClientId(clientId)
@@ -809,7 +817,7 @@ public final class RatisJournal implements Closeable {
                 .setMessage(Message.valueOf(ByteString.EMPTY))
                 .setType(RaftClientRequest.watchRequestType(index, ReplicationLevel.ALL_COMMITTED))
                 .build();
-            return dispatch.submit(permit, () -> server.submitClientRequestAsync(request)).thenApply(reply -> {
+            return dispatch.get(groupId).submit(permit, () -> server.submitClientRequestAsync(request)).thenApply(reply -> {
                 if (reply.isSuccess() == false) {
                     throw new java.util.concurrent.CompletionException(reply.getException());
                 }
@@ -835,7 +843,7 @@ public final class RatisJournal implements Closeable {
         if (isMembershipBarrier(operation, groupId) == false) {
             requireRetainedCapacity(groupId);
         }
-        final var permit = admission.acquire(operation.payloadLength());
+        final var permit = admission.acquire(groupId, operation.payloadLength());
         try {
             final byte[] frame = operation.encode(configuration.limits().maximumPayloadBytes());
             final var expectedIdentity = operation.logId();
@@ -847,7 +855,7 @@ public final class RatisJournal implements Closeable {
                 .setMessage(Message.valueOf(ByteString.copyFrom(frame)))
                 .setType(RaftClientRequest.writeRequestType())
                 .build();
-            return dispatch.submit(permit, () -> server.submitClientRequestAsync(request)).thenApply(reply -> {
+            return dispatch.get(groupId).submit(permit, () -> server.submitClientRequestAsync(request)).thenApply(reply -> {
                 try {
                     if (reply.isSuccess() == false) {
                         throw reply.getException();
@@ -1199,7 +1207,7 @@ public final class RatisJournal implements Closeable {
     public synchronized void close() throws IOException {
         closed = true;
         admission.close();
-        dispatch.close();
+        dispatch.values().forEach(JournalDispatch::close);
         if (Thread.currentThread().isInterrupted()) {
             throw new IOException("interrupted journal shutdown; retry cleanup from a non-interrupted thread");
         }

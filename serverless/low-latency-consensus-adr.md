@@ -327,8 +327,9 @@ waiting for the held leader lock. Shutdown then waited indefinitely as well.
 A separate focused history reproduced activation failing at the valid one-request
 limit because its previous permit remained held while a continuation ran.
 
-Both SDK submission and notification now use four bounded workers per journal,
-shared by its physical groups. A permit stays charged through submission,
+The initial fix used four bounded workers shared by physical groups. The M3a
+isolation regression below replaces that sharing with one bounded worker per
+active physical group. A permit stays charged through submission,
 persistence and queued notification, and releases before public completion.
 At most one queued task belongs to each charged permit, so the pending-request
 limit bounds the queue. Workers close only after outstanding notifications drain;
@@ -504,3 +505,21 @@ attempts. Earlier unsealed experimental voters require authorized fresh-identity
 replacement from a healthy quorum, not automatic checksum creation. Recovery
 leaves refused files intact. This integrity guard does not replace the existing
 restriction on copying live voter directories or resurrecting old disk snapshots.
+
+## Proposal isolation between physical groups
+
+A native-lock stall with four accepted proposals reproduced every shared host
+submission worker blocking on one group. A healthy group led on the same host
+then timed out. Separate histories filled the node-wide request or byte budget
+with that stalled group and reproduced the healthy group's immediate rejection.
+
+Use one bounded submission/completion worker per active physical group, with the
+existing node-wide count and conservative byte ceilings. Reserve one maximum-size
+proposal per group; borrowing may use other spare capacity but never another
+group's reservation. Constant-time accounting tracks covered reservations and
+restores them on release, including idempotent close and cancellation semantics.
+Preflight rejects impossible reservations before creating the volume binding.
+
+These histories prove the tested proposal boundary. Shared peer RPC handling,
+shared-device failures and broader cell routing/recovery isolation need their own
+histories; this change does not claim all runtime isolation gates are complete.

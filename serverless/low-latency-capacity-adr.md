@@ -76,7 +76,7 @@ The capacity model uses a 16-GiB host, a 75% admission envelope and an assumed
 32-MiB resident contribution per engine; these are sensitivity inputs, not measured
 JVM sizing. Under those inputs, 1M descriptors at 0.1% activity fit the small
 one-cell profile at about 10.24 GiB on its busiest leader host. For 10M descriptors
-at 0.1%, four dense-profile cells use about 9.97 GiB per busiest host across 96
+at 0.1%, four dense-profile cells use about 10.03 GiB per busiest host across 96
 journal hosts; sixteen small-profile cells use about 7.36 GiB across 192 hosts.
 The modeled grid does not fit 10M descriptors at 1% activity within the assumed
 host-memory envelope. More memory/cells, smaller measured engine footprints or a

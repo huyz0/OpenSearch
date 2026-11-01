@@ -99,7 +99,12 @@ omitted values. Counts, byte limits and their relationships are validated by
 `JournalConfiguration.Limits`. Four physical groups are the default limit, and
 sixteen is the hard maximum. These groups multiplex logical shards; they are not
 one physical group per index shard. Buffer and process sizing still require
-workload qualification.
+workload qualification. Startup also reserves one maximum-size pending proposal
+per active physical group: request capacity must be at least that group count,
+and pending bytes must be at least `groups * 6 * (maximum_payload_bytes + 512)`.
+The defaults support the default four-group bound. More active groups can require
+a larger byte budget or smaller payload limit; changing `maximum_groups` alone
+is insufficient. This check runs before binding/opening native journal storage.
 
 The assignment is limited to 64 KiB. Unknown or duplicate fields, trailing content,
 unsupported versions, noncanonical UUIDs, coercions from strings/floating point,

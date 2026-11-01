@@ -34,7 +34,11 @@ final class JournalDispatch implements AutoCloseable {
     private boolean closed;
 
     JournalDispatch(String name, JournalConfiguration.Limits limits) {
-        executor = JournalExecutors.bounded(name + "-journal-dispatch", 4, limits.maximumPendingRequests());
+        this(name, limits, 4);
+    }
+
+    JournalDispatch(String name, JournalConfiguration.Limits limits, int workers) {
+        executor = JournalExecutors.bounded(name + "-journal-dispatch", workers, limits.maximumPendingRequests());
     }
 
     <T> CompletionStage<T> submit(JournalAdmission.Permit permit, CheckedSupplier<CompletableFuture<T>, Exception> source)

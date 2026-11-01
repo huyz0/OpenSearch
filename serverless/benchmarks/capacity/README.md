@@ -78,6 +78,13 @@ separate fixed-resource comparison: 384 journal hosts and 1,024 groups partition
 into 1/4/16 cells. The ordinary candidate grid varies fleet size and reports its
 compute-cost assumption; it is not a fixed-resource performance comparison.
 
+Proposal admission now preserves a maximum-size request for each active physical
+group. The resource estimate therefore charges at least
+`active local groups * 6 * (maximum payload bytes + 512)` pending bytes, even when
+that exceeds the 128-MiB baseline. At eight groups and a 4-MiB payload this minimum
+is about 192 MiB. Actual host configuration must also cover planned repair/growth;
+raising the group-count ceiling alone does not supply that byte budget.
+
 The model assumes active shards are uniformly distributed among groups; workload
 skew can exceed its busiest-host estimate. It charges two engines for each owned
 resident writer shard, using the

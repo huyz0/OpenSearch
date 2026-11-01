@@ -126,6 +126,93 @@ public class RatisJournalTests extends OpenSearchTestCase {
         assertFalse(thread.isAlive());
     }
 
+    public void testUnserviceableGroupBudgetsRefuseBeforeBindingTheVolume() throws Exception {
+        final var fixture = fixture(2);
+        final var original = fixture.configurations().getFirst();
+        final var limited = new JournalConfiguration.Limits(2, 16384, 1, 1024 * 1024, 1024 * 1024, 2 * 1024 * 1024, 0, 10_000, 1);
+        final var invalid = new JournalConfiguration(
+            original.deploymentId(),
+            original.localVoterId(),
+            original.directory(),
+            original.groups(),
+            true,
+            limited
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> RatisJournal.open(invalid, fixture.key(), fixture.trust(), fixture.space()::get)
+        );
+        assertFalse(java.nio.file.Files.exists(original.directory().resolve("journal-binding")));
+        assertEquals(original.localVoterId(), JournalDiskIdentity.discover(original.directory()));
+    }
+
+    public void testBlockedGroupCannotOccupyEverySubmissionWorker() throws Exception {
+        assertBlockedGroupIsolation(4, 32);
+    }
+
+    public void testBlockedGroupCannotTakeEveryPendingRequest() throws Exception {
+        assertBlockedGroupIsolation(32, 32);
+    }
+
+    public void testBlockedGroupCannotTakeEveryPendingByte() throws Exception {
+        assertBlockedGroupIsolation(12, 16384);
+    }
+
+    private void assertBlockedGroupIsolation(int proposals, int payloadBytes) throws Exception {
+        final var fixture = fixture(4);
+        final var journals = new ArrayList<RatisJournal>();
+        final var entered = new java.util.concurrent.CountDownLatch(1);
+        final var release = new java.util.concurrent.CountDownLatch(1);
+        Thread holder = null;
+        try {
+            startAll(fixture, journals, true);
+            final var byLeader = new java.util.HashMap<RatisJournal, List<UUID>>();
+            for (var group : fixture.configurations().getFirst().groups()) {
+                byLeader.computeIfAbsent(leader(journals, group.id()), ignored -> new ArrayList<>()).add(group.id());
+            }
+            final var colocated = byLeader.entrySet().stream().filter(entry -> entry.getValue().size() >= 2).findFirst().orElseThrow();
+            final var local = colocated.getKey();
+            final UUID blocked = colocated.getValue().getFirst();
+            final UUID healthy = colocated.getValue().get(1);
+            final Object monitor = nativeDivisionForStall(local, blocked);
+            holder = org.opensearch.common.util.concurrent.OpenSearchExecutors.daemonThreadFactory("stalled-group-submit").newThread(() -> {
+                synchronized (monitor) {
+                    entered.countDown();
+                    try {
+                        if (release.await(15, TimeUnit.SECONDS) == false) {
+                            throw new AssertionError("test did not release the blocked group");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            holder.start();
+            assertTrue(entered.await(10, TimeUnit.SECONDS));
+            final var stream = new ShardLogId(fixture.deployment(), "blocked-submission-isolation", 0, UUID.randomUUID());
+            final var operation = new OperationEnvelope(stream, OperationEnvelope.Kind.DOCUMENTS, 1, 1, 1, new byte[payloadBytes]);
+            int accepted = 0;
+            for (int i = 0; i < proposals; i++) {
+                try {
+                    local.append(blocked, operation);
+                    accepted++;
+                } catch (IOException exhausted) {
+                    assertTrue(exhausted.getMessage(), exhausted.getMessage().contains("admission"));
+                }
+            }
+            assertTrue("the blocked group must have queued real submissions", accepted > 0);
+            local.append(healthy, operation).toCompletableFuture().get(3, TimeUnit.SECONDS);
+            assertEquals(1, local.scan(healthy, -1, Set.of(stream), 100, 65536).operations().size());
+        } finally {
+            release.countDown();
+            if (holder != null) {
+                holder.join(TimeUnit.SECONDS.toMillis(10));
+                assertFalse(holder.isAlive());
+            }
+            closeAll(journals);
+        }
+    }
+
     public void testCommittedSharedStreamsSurviveLeaderLoss() throws Exception {
         final var fixture = fixture(2);
         final var journals = new ArrayList<RatisJournal>();
@@ -724,7 +811,17 @@ public class RatisJournalTests extends OpenSearchTestCase {
         for (int i = 0; i < groupCount; i++) {
             groups.add(new JournalConfiguration.Group(UUID.randomUUID(), peers));
         }
-        final var limits = new JournalConfiguration.Limits(2, 16384, 32, 1024 * 1024, 1024 * 1024, 2 * 1024 * 1024, 0, 10_000, 1);
+        final var limits = new JournalConfiguration.Limits(
+            Math.max(2, groupCount),
+            16384,
+            32,
+            1024 * 1024,
+            1024 * 1024,
+            2 * 1024 * 1024,
+            0,
+            10_000,
+            1
+        );
         final var configurations = new ArrayList<JournalConfiguration>();
         for (int i = 0; i < 3; i++) {
             configurations.add(new JournalConfiguration(deployment, peers.get(i).id(), directories.get(i), groups, true, limits));

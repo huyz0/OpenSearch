@@ -13,6 +13,7 @@ MIB = 1024 ** 2
 GIB = 1024 ** 3
 ASSUMPTIONS = {
     "maximum_groups_per_host": 16,
+    "maximum_payload_bytes": 4 * MIB,
     "voters_per_group": 3,
     "virtual_buckets_per_cell": 65536,
     "bucket_record_bytes": 32,
@@ -58,8 +59,10 @@ def capacity(descriptors, activity_bps, cells, groups_per_cell, hosts_per_cell, 
     owned = math.ceil(active * peak_led_groups / groups)
     repair_local_groups = math.ceil(groups_per_cell / (hosts_per_cell // 3 - 1))
     engines = owned * a["engines_per_owned_active_shard"]
+    minimum_pending = local_groups * 6 * (a["maximum_payload_bytes"] + 512)
+    pending_budget = max(a["pending_operation_bytes_per_host"], minimum_pending)
     fixed = (a["fixed_runtime_bytes_per_host"] + a["metadata_cache_bytes_per_host"]
-             + a["mapping_cache_bytes_per_host"] + a["pending_operation_bytes_per_host"]
+             + a["mapping_cache_bytes_per_host"] + pending_budget
              + a["virtual_buckets_per_cell"] * a["bucket_record_bytes"])
     journal = local_groups * (a["journal_buffer_bytes_per_group"]
                              + a["retained_entries_per_group"] * a["retained_metadata_bytes_per_entry"])
@@ -72,6 +75,9 @@ def capacity(descriptors, activity_bps, cells, groups_per_cell, hosts_per_cell, 
         "active_logical_shards": active, "cells": cells, "groups_per_cell": groups_per_cell,
         "hosts_per_cell": hosts_per_cell, "total_journal_hosts": hosts, "total_groups": groups,
         "local_group_assignments_ceiling": local_groups,
+        "minimum_pending_bytes_for_group_reservations": minimum_pending,
+        "pending_bytes_used_in_resource_estimate": pending_budget,
+        "default_pending_budget_supports_group_count": a["pending_operation_bytes_per_host"] >= minimum_pending,
         "group_assignment_budget_ok": local_groups <= a["maximum_groups_per_host"],
         "same_az_repair_local_group_ceiling": repair_local_groups,
         "same_az_repair_with_existing_hosts_possible": repair_local_groups <= a["maximum_groups_per_host"],

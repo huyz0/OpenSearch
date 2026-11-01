@@ -14,7 +14,7 @@ archival remain pending.
 | M1 | Append and streaming recovery interfaces, optional async dispatch with cancellation/rejection semantics, existing S3 path integration, bounded versioned log/checkpoint identity codecs | Subscription/token formats and shell adapters for consensus |
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
-| M3a | [Selected cell/active-state design](low-latency-capacity-adr.md), runnable descriptor/resource/failure/cost models and raw local results | Runtime per-group admission, partitioned metadata, stable buckets, bounded active state and weighted capacity routing |
+| M3a | [Selected cell/active-state design](low-latency-capacity-adr.md), runnable descriptor/resource/failure/cost models and raw local results | Per-group proposal admission/workers delivered; metadata routing, dynamic group admission, bounded engines and broader isolation pending |
 | M4–M9 | Not implemented | Quorum writes, fresh readers, selective replication, archival, lifecycle, migration |
 | M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
 | M6a | Planned; no runtime completion claimed | Missing-chunk/resumable bulk shard copies, peer/S3 source selection and live-versus-recovery scheduling |
@@ -293,6 +293,18 @@ dynamic host assignment. This closes a design decision, not runtime M3a delivery
   iterations passed 204 unit, 81 journal, 21 catalog/controller and six consensus
   cases, including successful vote preservation and corrupt-vote refusal after
   real process restarts. Vendor audits and unchanged-upstream checks passed.
+
+- Physical-group proposal isolation: real lock-stall histories reproduced a
+  healthy colocated group's timeout when another group occupied all shared workers,
+  and immediate rejection when that group filled the shared request/byte budget.
+  Each active group now owns one bounded proposal/completion worker and a reserved
+  maximum-size pending proposal; borrowing cannot consume another group's reserve.
+  Node-wide ceilings and cancellation semantics remain intact. Impossible budgets
+  refuse before volume binding. Three iterations passed 213 unit, 93 journal and
+  21 catalog/controller cases, including request/byte borrowing and release,
+  blocked-group progress and pre-binding refusal. The capacity model now includes
+  the minimum per-group pending-byte requirement. Shared peer-RPC and broader cell
+  failure isolation remain separate gates.
 
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.
