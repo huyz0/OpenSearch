@@ -124,6 +124,18 @@ private-engine rebuild after ambiguity, mapping/lifecycle barriers and bounded
 engine admission remain M4 integration work. No duplicate-indexing cost or
 millisecond latency qualification is claimed by these engine tests.
 
+`ResolvedMutation` supplies the shell payload for a future committed application
+pipeline. Its version-one format uses explicit result codes and an internal UUID,
+original sequence/term/version, document ID, nullable routing, raw source and
+auto-ID timestamp, or a no-op reason. It preserves a missing-delete result as
+well as created/updated/deleted results; replay cannot reconstruct the original
+response from current engine state. All variable fields have checked lengths,
+text is strict UTF-8, and encoded size is checked before output allocation. Source
+buffers cannot escape the immutable record. The envelope supplies the checksum,
+shard activation, ownership and schema binding. A stable UUID field alone does
+not implement retry deduplication or its retention policy. The legacy `WalRecord`
+format and launcher behavior remain unchanged.
+
 ### Physical group footprint
 
 Reproduce the bounded probe with:

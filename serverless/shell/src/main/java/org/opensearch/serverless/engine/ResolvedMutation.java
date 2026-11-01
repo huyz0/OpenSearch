@@ -1,0 +1,343 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.serverless.engine;
+
+import org.opensearch.common.annotation.InternalApi;
+import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.index.translog.Translog;
+import org.opensearch.serverless.log.OperationEnvelope;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Immutable shell payload for one resolved operation and its original result. Versioning is independent
+ * of the native translog format. The enclosing {@link OperationEnvelope} supplies shard/schema/ownership
+ * identity and the checksum; this payload alone establishes neither integrity nor committed authority.
+ */
+@InternalApi
+public final class ResolvedMutation {
+    private static final int MAGIC = 0x524d5554;
+    private static final int FORMAT = 1;
+    private static final int MAX_ID_BYTES = 512;
+
+    /** Original successful result; a missing delete still consumes a resolved sequence position. */
+    public enum Outcome {
+        /** A new document was created. */
+        CREATED(1),
+        /** An existing document was replaced. */
+        UPDATED(2),
+        /** An existing document was deleted. */
+        DELETED(3),
+        /** A delete found no live document. */
+        NOT_FOUND(4),
+        /** A resolved sequence position changes no document. */
+        NO_OP(5);
+
+        private final int code;
+
+        Outcome(int code) {
+            this.code = code;
+        }
+
+        private static Outcome read(int code) throws IOException {
+            for (var outcome : values()) {
+                if (outcome.code == code) {
+                    return outcome;
+                }
+            }
+            throw new IOException("unknown resolved mutation outcome " + code);
+        }
+    }
+
+    private final UUID operationId;
+    private final Translog.Operation operation;
+    private final Outcome outcome;
+
+    /**
+     * Copies a successful resolved operation. The caller chooses a stable internal retry identity.
+     * @param operationId internal identity, scoped by the enclosing shard activation
+     * @param operation resolved native operation, including routing and original version
+     * @param outcome original preparation result, not the result of later replay
+     */
+    public ResolvedMutation(UUID operationId, Translog.Operation operation, Outcome outcome) {
+        this.operationId = Objects.requireNonNull(operationId);
+        this.outcome = Objects.requireNonNull(outcome);
+        validate(Objects.requireNonNull(operation), outcome);
+        this.operation = copy(operation);
+    }
+
+    /** Returns the stable internal operation identity. */
+    public UUID operationId() {
+        return operationId;
+    }
+
+    /** Returns the original preparation result. */
+    public Outcome outcome() {
+        return outcome;
+    }
+
+    /** Returns an independent native operation; mutating its source cannot change this record. */
+    public Translog.Operation operation() {
+        return copy(operation);
+    }
+
+    /**
+     * Encodes this payload after checking its complete size, before allocating the output buffer.
+     * @param maximumBytes configured payload admission limit, at most the envelope's absolute limit
+     * @return independent encoded bytes
+     * @throws IOException if the payload exceeds the configured limit
+     */
+    public byte[] encode(int maximumBytes) throws IOException {
+        checkLimit(maximumBytes);
+        final String documentId;
+        final String route;
+        final String reason;
+        final int sourceLength;
+        if (operation instanceof Translog.Index index) {
+            documentId = index.id();
+            route = index.routing();
+            reason = null;
+            sourceLength = index.source().length();
+        } else if (operation instanceof Translog.Delete delete) {
+            documentId = delete.id();
+            route = delete.routing();
+            reason = null;
+            sourceLength = 0;
+        } else {
+            documentId = null;
+            route = null;
+            reason = ((Translog.NoOp) operation).reason();
+            sourceLength = 0;
+        }
+        final long size = 38L + (documentId == null
+            ? 4L + utf8Length(reason)
+            : 16L + utf8Length(documentId) + (route == null ? 0 : utf8Length(route))) + (operation instanceof Translog.Index
+                ? 12L + sourceLength
+                : 0);
+        if (size > maximumBytes) {
+            throw new IOException("resolved mutation exceeds configured payload limit");
+        }
+        final byte[] id = documentId == null ? null : documentId.getBytes(StandardCharsets.UTF_8);
+        final byte[] routing = route == null ? null : route.getBytes(StandardCharsets.UTF_8);
+        final var bytes = new ByteArrayOutputStream((int) size);
+        try (var out = new DataOutputStream(bytes)) {
+            out.writeInt(MAGIC);
+            out.writeByte(FORMAT);
+            out.writeByte(outcome.code);
+            out.writeLong(operationId.getMostSignificantBits());
+            out.writeLong(operationId.getLeastSignificantBits());
+            out.writeLong(operation.seqNo());
+            out.writeLong(operation.primaryTerm());
+            if (operation instanceof Translog.Index index) {
+                out.writeLong(index.version());
+                writeBytes(out, id);
+                writeBytes(out, routing);
+                out.writeLong(index.getAutoGeneratedIdTimestamp());
+                writeBytes(out, BytesReference.toBytes(index.source()));
+            } else if (operation instanceof Translog.Delete delete) {
+                out.writeLong(delete.version());
+                writeBytes(out, id);
+                writeBytes(out, routing);
+            } else {
+                writeBytes(out, reason.getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        assert size == bytes.size();
+        return bytes.toByteArray();
+    }
+
+    /**
+     * Decodes one payload with strict lengths, UTF-8 and trailing-byte validation.
+     * @param encoded bytes obtained from an independently verified enclosing envelope
+     * @param maximumBytes configured payload admission limit
+     * @return immutable resolved record
+     * @throws IOException if the bytes are unsupported, truncated, oversized or invalid
+     */
+    public static ResolvedMutation decode(byte[] encoded, int maximumBytes) throws IOException {
+        checkLimit(maximumBytes);
+        if (encoded.length > maximumBytes) {
+            throw new IOException("resolved mutation exceeds configured payload limit");
+        }
+        try (var in = new DataInputStream(new ByteArrayInputStream(encoded))) {
+            if (in.readInt() != MAGIC || in.readUnsignedByte() != FORMAT) {
+                throw new IOException("unsupported resolved mutation format");
+            }
+            final Outcome outcome = Outcome.read(in.readUnsignedByte());
+            final UUID id = new UUID(in.readLong(), in.readLong());
+            final long seqNo = in.readLong();
+            final long term = in.readLong();
+            if (seqNo < 0 || term <= 0) {
+                throw new IOException("resolved mutation requires an assigned sequence number and positive term");
+            }
+            final Translog.Operation operation;
+            if (outcome == Outcome.NO_OP) {
+                operation = new Translog.NoOp(seqNo, term, text(readBytes(in, maximumBytes, false)));
+            } else {
+                final long version = in.readLong();
+                final String documentId = text(readBytes(in, MAX_ID_BYTES, false));
+                final byte[] route = readBytes(in, maximumBytes, true);
+                final String routing = route == null ? null : text(route);
+                if (outcome == Outcome.CREATED || outcome == Outcome.UPDATED) {
+                    final long timestamp = in.readLong();
+                    operation = new Translog.Index(
+                        documentId,
+                        seqNo,
+                        term,
+                        version,
+                        readBytes(in, maximumBytes, false),
+                        routing,
+                        timestamp
+                    );
+                } else {
+                    operation = new Translog.Delete(documentId, seqNo, term, version, routing);
+                }
+            }
+            if (in.available() != 0) {
+                throw new IOException("trailing bytes after resolved mutation");
+            }
+            try {
+                return new ResolvedMutation(id, operation, outcome);
+            } catch (IllegalArgumentException invalid) {
+                throw new IOException("invalid resolved mutation", invalid);
+            }
+        }
+    }
+
+    private static void validate(Translog.Operation operation, Outcome outcome) {
+        if (operation.seqNo() < 0 || operation.primaryTerm() <= 0) {
+            throw new IllegalArgumentException("resolved mutation requires an assigned sequence number and positive term");
+        }
+        final String id;
+        final String routing;
+        if (operation instanceof Translog.Index index) {
+            if (outcome != Outcome.CREATED && outcome != Outcome.UPDATED || index.version() <= 0) {
+                throw new IllegalArgumentException("invalid resolved index result/version");
+            }
+            if (index.source().length() == 0 || index.source().length() > OperationEnvelope.MAX_PAYLOAD_BYTES) {
+                throw new IllegalArgumentException("invalid resolved index source length");
+            }
+            if (index.getAutoGeneratedIdTimestamp() < -1) {
+                throw new IllegalArgumentException("invalid auto-generated id timestamp");
+            }
+            id = index.id();
+            routing = index.routing();
+        } else if (operation instanceof Translog.Delete delete) {
+            if (outcome != Outcome.DELETED && outcome != Outcome.NOT_FOUND || delete.version() <= 0) {
+                throw new IllegalArgumentException("invalid resolved delete result/version");
+            }
+            id = delete.id();
+            routing = delete.routing();
+        } else if (operation instanceof Translog.NoOp noOp) {
+            if (outcome != Outcome.NO_OP) {
+                throw new IllegalArgumentException("invalid resolved no-op result");
+            }
+            utf8Length(Objects.requireNonNull(noOp.reason()));
+            return;
+        } else {
+            throw new IllegalArgumentException("unsupported resolved operation");
+        }
+        if (Objects.requireNonNull(id).isEmpty() || utf8Length(id) > MAX_ID_BYTES) {
+            throw new IllegalArgumentException("invalid resolved document id length");
+        }
+        if (routing != null) {
+            utf8Length(routing);
+        }
+    }
+
+    private static Translog.Operation copy(Translog.Operation operation) {
+        if (operation instanceof Translog.Index index) {
+            return new Translog.Index(
+                index.id(),
+                index.seqNo(),
+                index.primaryTerm(),
+                index.version(),
+                BytesReference.toBytes(index.source()).clone(),
+                index.routing(),
+                index.getAutoGeneratedIdTimestamp()
+            );
+        }
+        if (operation instanceof Translog.Delete delete) {
+            return new Translog.Delete(delete.id(), delete.seqNo(), delete.primaryTerm(), delete.version(), delete.routing());
+        }
+        final var noOp = (Translog.NoOp) operation;
+        return new Translog.NoOp(noOp.seqNo(), noOp.primaryTerm(), noOp.reason());
+    }
+
+    private static void checkLimit(int maximumBytes) {
+        if (maximumBytes < 0 || maximumBytes > OperationEnvelope.MAX_PAYLOAD_BYTES) {
+            throw new IllegalArgumentException("invalid resolved mutation payload limit");
+        }
+    }
+
+    private static void writeBytes(DataOutputStream out, byte[] bytes) throws IOException {
+        out.writeInt(bytes == null ? -1 : bytes.length);
+        if (bytes != null) {
+            out.write(bytes);
+        }
+    }
+
+    private static byte[] readBytes(DataInputStream in, int limit, boolean nullable) throws IOException {
+        final int length = in.readInt();
+        if (nullable && length == -1) {
+            return null;
+        }
+        if (length < 0 || length > limit || length > in.available()) {
+            throw new IOException("invalid resolved mutation field length");
+        }
+        return in.readNBytes(length);
+    }
+
+    // Compute exact UTF-8 size without allocating a worst-case encoder buffer.
+    private static int utf8Length(String value) {
+        long length = 0;
+        for (int offset = 0; offset < value.length(); offset++) {
+            final char current = value.charAt(offset);
+            if (current < 0x80) {
+                length++;
+            } else if (current < 0x800) {
+                length += 2;
+            } else if (Character.isHighSurrogate(current)) {
+                if (++offset == value.length() || Character.isLowSurrogate(value.charAt(offset)) == false) {
+                    throw new IllegalArgumentException("invalid resolved mutation UTF-16");
+                }
+                length += 4;
+            } else if (Character.isLowSurrogate(current)) {
+                throw new IllegalArgumentException("invalid resolved mutation UTF-16");
+            } else {
+                length += 3;
+            }
+            if (length > OperationEnvelope.MAX_PAYLOAD_BYTES) {
+                throw new IllegalArgumentException("resolved text exceeds maximum length");
+            }
+        }
+        return (int) length;
+    }
+
+    private static String text(byte[] bytes) throws IOException {
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString();
+        } catch (CharacterCodingException invalid) {
+            throw new IOException("invalid resolved mutation UTF-8", invalid);
+        }
+    }
+}
