@@ -28,6 +28,7 @@ import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.log.JournalConfiguration;
 import org.opensearch.serverless.log.JournalDiskIdentity;
+import org.opensearch.serverless.log.LogCheckpoint;
 import org.opensearch.serverless.log.OperationEnvelope;
 import org.opensearch.serverless.log.RatisJournal;
 import org.opensearch.serverless.log.ShardLogId;
@@ -50,7 +51,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Real local committed journal to native shard replay; neither launcher wiring nor an AZ test. */
 @SuppressFileSystems("*")
@@ -58,6 +62,104 @@ import java.util.concurrent.TimeUnit;
 @ThreadLeakFilters(filters = JournalGroupCatalogRuntimeTests.GlobalTimerFilter.class)
 public class CommittedMutationReplayTests extends IndexShardTestCase {
     private final Map<Store, CommittedServingEngine> engines = new IdentityHashMap<>();
+
+    public void testCancelledSequencedWriteStillAppliesBeforeTheNextConditionalPreparation() throws Exception {
+        final IndexShard serving = newServing();
+        try (var fixture = fixture(); var preparation = privatePreparation(fixture, serving)) {
+            final var stream = stream(fixture, serving);
+            final var replay = replayer(fixture, serving, stream);
+            final var committed = new CompletableFuture<LogCheckpoint>();
+            final var heldReply = new CompletableFuture<LogCheckpoint>();
+            final var holdFirst = new AtomicBoolean(true);
+            final var gate = new PreparationCommitSequencer(mutation -> {
+                final var append = fixture.leader.append(fixture.group.id(), envelope(serving, stream, mutation, 1));
+                if (holdFirst.compareAndSet(true, false)) {
+                    return append.thenCompose(checkpoint -> {
+                        committed.complete(checkpoint);
+                        return heldReply;
+                    });
+                }
+                return append;
+            }, (mutation, checkpoint) -> {
+                for (int batch = 0; batch < 64 && replay.throughIndex() < checkpoint.index(); batch++) {
+                    for (var applied : replay.poll()) {
+                        if (applied.checkpoint().equals(checkpoint)) {
+                            return applied;
+                        }
+                    }
+                }
+                throw new IOException("expected committed operation was not applied within bounded replay");
+            });
+            try {
+                final long term = serving.getOperationPrimaryTerm();
+                final var first = gate.submit(() -> {
+                    final var index = preparation.engine()
+                        .prepareIndex(
+                            preparation.engine().config().getDocumentMapperForTypeSupplier().get(),
+                            new SourceToParse(serving.shardId().getIndexName(), "id", new BytesArray("{}"), MediaTypeRegistry.JSON),
+                            SequenceNumbers.UNASSIGNED_SEQ_NO,
+                            term,
+                            Versions.MATCH_ANY,
+                            VersionType.INTERNAL,
+                            Engine.Operation.Origin.PRIMARY,
+                            -1,
+                            false,
+                            SequenceNumbers.UNASSIGNED_SEQ_NO,
+                            0
+                        );
+                    final var result = preparation.engine().index(index);
+                    assertEquals(Engine.Result.Type.SUCCESS, result.getResultType());
+                    preparation.engine().refresh("uncommitted private refresh");
+                    return new ResolvedMutation(UUID.randomUUID(), new Translog.Index(index, result), ResolvedMutation.Outcome.CREATED);
+                });
+                final var checkpoint = committed.get(20, TimeUnit.SECONDS);
+                final var cancelled = first.toCompletableFuture();
+                assertTrue(cancelled.cancel(true));
+                final var rejected = gate.submit(
+                    () -> { throw new AssertionError("dependent preparation must wait for prior commit/application"); }
+                );
+                assertTrue(
+                    expectThrows(ExecutionException.class, () -> rejected.toCompletableFuture().get(20, TimeUnit.SECONDS))
+                        .getCause() instanceof org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
+                );
+                serving.refresh("committed log without serving application");
+                assertDocCount(serving, 0);
+                heldReply.complete(checkpoint);
+                final var applied = first.toCompletableFuture().get(20, TimeUnit.SECONDS);
+                assertEquals(checkpoint, applied.checkpoint());
+                assertTrue(cancelled.isCancelled());
+                serving.refresh("sequenced committed insert");
+                assertDocCount(serving, 1);
+                final var original = applied.mutation().operation();
+                final var removed = gate.submit(() -> {
+                    final var delete = preparation.engine()
+                        .prepareDelete(
+                            "id",
+                            null,
+                            SequenceNumbers.UNASSIGNED_SEQ_NO,
+                            term,
+                            Versions.MATCH_ANY,
+                            VersionType.INTERNAL,
+                            Engine.Operation.Origin.PRIMARY,
+                            original.seqNo(),
+                            original.primaryTerm()
+                        );
+                    final var result = preparation.engine().delete(delete);
+                    assertEquals(Engine.Result.Type.SUCCESS, result.getResultType());
+                    assertTrue(result.isFound());
+                    return new ResolvedMutation(UUID.randomUUID(), new Translog.Delete(delete, result), ResolvedMutation.Outcome.DELETED);
+                }).toCompletableFuture().get(20, TimeUnit.SECONDS);
+                assertEquals(ResolvedMutation.Outcome.DELETED, removed.mutation().outcome());
+                serving.refresh("sequenced committed conditional delete");
+                assertDocCount(serving, 0);
+                assertEquals(1, serving.getProcessedLocalCheckpoint());
+            } finally {
+                gate.closeAsync().toCompletableFuture().get(20, TimeUnit.SECONDS);
+            }
+        } finally {
+            closeShards(serving);
+        }
+    }
 
     public void testPreparedRefreshCannotExposeWritesUntilCommittedJournalApplication() throws Exception {
         IndexShard serving = newServing();

@@ -163,6 +163,27 @@ The real local journal probe now uses this resource owner rather than a second
 preparation shard or a test-only native-store helper. It still enables no client
 storage mode.
 
+`PreparationCommitSequencer` adds a dependency gate around preparation, append
+and verified application. A stream has one pending preparation until the prior
+record is durably appended and applied. Failure fences that context; caller
+cancellation cannot cancel accepted persistence or admit another preparation.
+Native work, SDK submission, application and result callbacks run outside its
+state monitor. Asynchronous close waits for preparation/application before the
+host releases private resources, but it does not wait indefinitely for an
+accepted quorum reply. A reply arriving after close cannot apply to a closed
+serving lifecycle. Original operation/checkpoint correlation is checked before
+success is reported.
+
+This initial gate conservatively fences every preparation exception and does
+not pipeline independent keys. The native adapter still needs proven no-change
+rejection handling, mapping barriers, request-byte admission and bounded runtime
+dispatch. It executes preparation on its caller and application on the append
+completion thread; the local probe is not a production thread-pool design. A
+real journal test holds a committed reply, cancels the client view, verifies
+that a dependent preparation is rejected, then applies the insert and performs
+a conditional delete. No client storage mode or throughput qualification is
+claimed.
+
 The adapter itself is not a commit verifier and is not enabled by the launcher.
 Assigned operation identities are not evidence of commitment. The host must
 validate the committed stream, ownership epoch, schema and shard incarnation
