@@ -142,6 +142,27 @@ admission instance while such resources may remain alive. This is accounting
 infrastructure for the owned context, not an enabled resident-engine controller
 or a measured 256-engine memory qualification.
 
+`PrivatePreparationResources` now owns an admitted fresh generation. It acquires
+the ticket before filesystem/native opening, refuses a nonempty serving engine
+or an existing generation, and atomically claims the directory before creating
+its private filesystem store/translog. Its private shard lock cannot release the
+public shard's node-environment lock. Normal close finishes native IO, closes the
+store, deletes only the claimed generation, then releases admission. Once native
+initialization has started, a failed constructor with unpublished resources is
+quarantined rather than treated as a clean rollback. Subsequent native work can
+still use the retained store, and another opener cannot adopt the generation.
+Concurrent/idempotent close cannot release capacity before cleanup finishes.
+
+The host must independently establish empty committed history and ownership;
+an empty local engine is not proof of an empty durable stream. Rebuild from a
+verified prefix, mutation sequencing, version-map/SSD governors and parent index
+lifecycle integration remain pending. Keep private generations outside journal
+binding directories, retain quarantine owners until process-level recovery, and
+do not close their shared mapper/analyzer owner while native IO may remain alive.
+The real local journal probe now uses this resource owner rather than a second
+preparation shard or a test-only native-store helper. It still enables no client
+storage mode.
+
 The adapter itself is not a commit verifier and is not enabled by the launcher.
 Assigned operation identities are not evidence of commitment. The host must
 validate the committed stream, ownership epoch, schema and shard incarnation

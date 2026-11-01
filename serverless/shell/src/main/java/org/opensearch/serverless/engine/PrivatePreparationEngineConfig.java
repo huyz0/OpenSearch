@@ -144,7 +144,7 @@ public final class PrivatePreparationEngineConfig {
         return configuration;
     }
 
-    private static void requireSeparate(Path left, Path right) throws IOException {
+    static void requireSeparate(Path left, Path right) throws IOException {
         if (left.startsWith(right) || right.startsWith(left) || Files.isSameFile(left, right)) {
             throw new IOException("preparation index/translog paths must be separate from serving paths and each other");
         }

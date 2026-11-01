@@ -19,7 +19,6 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.Engine;
-import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.engine.exec.EngineBackedIndexerFactory;
 import org.opensearch.index.mapper.SourceToParse;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -33,7 +32,6 @@ import org.opensearch.serverless.log.OperationEnvelope;
 import org.opensearch.serverless.log.RatisJournal;
 import org.opensearch.serverless.log.ShardLogId;
 import org.opensearch.serverless.metadata.JournalGroupCatalogRuntimeTests;
-import org.opensearch.test.DummyShardLock;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.TrustManagerFactory;
@@ -50,6 +48,7 @@ import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -79,24 +78,25 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
             } finally {
                 closeShards(other);
             }
-            try (var preparation = privatePreparation(serving)) {
+            try (var preparation = privatePreparation(fixture, serving)) {
                 final long term = serving.getOperationPrimaryTerm();
-                final var prepared = preparation.engine.prepareIndex(
-                    preparation.engine.config().getDocumentMapperForTypeSupplier().get(),
-                    new SourceToParse(serving.shardId().getIndexName(), "id", new BytesArray("{}"), MediaTypeRegistry.JSON),
-                    SequenceNumbers.UNASSIGNED_SEQ_NO,
-                    term,
-                    Versions.MATCH_ANY,
-                    VersionType.INTERNAL,
-                    Engine.Operation.Origin.PRIMARY,
-                    -1,
-                    false,
-                    SequenceNumbers.UNASSIGNED_SEQ_NO,
-                    0
-                );
-                final var first = preparation.engine.index(prepared);
+                final var prepared = preparation.engine()
+                    .prepareIndex(
+                        preparation.engine().config().getDocumentMapperForTypeSupplier().get(),
+                        new SourceToParse(serving.shardId().getIndexName(), "id", new BytesArray("{}"), MediaTypeRegistry.JSON),
+                        SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        term,
+                        Versions.MATCH_ANY,
+                        VersionType.INTERNAL,
+                        Engine.Operation.Origin.PRIMARY,
+                        -1,
+                        false,
+                        SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        0
+                    );
+                final var first = preparation.engine().index(prepared);
                 assertTrue(first.isCreated());
-                preparation.engine.refresh("private speculative refresh");
+                preparation.engine().refresh("private speculative refresh");
                 assertTrue(replay.poll().isEmpty());
                 assertDocCount(serving, 0);
                 final var original = new ResolvedMutation(
@@ -117,18 +117,19 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                 serving.refresh("applied committed insert");
                 assertDocCount(serving, 1);
 
-                final var preparedDelete = preparation.engine.prepareDelete(
-                    "id",
-                    null,
-                    SequenceNumbers.UNASSIGNED_SEQ_NO,
-                    term,
-                    Versions.MATCH_ANY,
-                    VersionType.INTERNAL,
-                    Engine.Operation.Origin.PRIMARY,
-                    first.getSeqNo(),
-                    first.getTerm()
-                );
-                final var deleted = preparation.engine.delete(preparedDelete);
+                final var preparedDelete = preparation.engine()
+                    .prepareDelete(
+                        "id",
+                        null,
+                        SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        term,
+                        Versions.MATCH_ANY,
+                        VersionType.INTERNAL,
+                        Engine.Operation.Origin.PRIMARY,
+                        first.getSeqNo(),
+                        first.getTerm()
+                    );
+                final var deleted = preparation.engine().delete(preparedDelete);
                 assertTrue(deleted.isFound());
                 final var deletion = new ResolvedMutation(
                     UUID.randomUUID(),
@@ -305,51 +306,15 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
         }));
     }
 
-    private Preparation privatePreparation(IndexShard serving) throws IOException {
-        final var privateStore = new Store(
-            serving.shardId(),
-            serving.indexSettings(),
-            newFSDirectory(createTempDir()),
-            new DummyShardLock(serving.shardId())
+    private PrivatePreparationResources privatePreparation(Fixture fixture, IndexShard serving) throws IOException {
+        return PrivatePreparationResources.openEmpty(
+            new PreparationEngineAdmission(Set.of(fixture.group.id()), 4, 256L * 1024 * 1024, 64L * 1024 * 1024),
+            fixture.group.id(),
+            engines.get(serving.store()),
+            createTempDir(),
+            64L * 1024 * 1024,
+            4 * 1024 * 1024
         );
-        InternalEngine engine = null;
-        try {
-            final var configuration = PrivatePreparationEngineConfig.create(
-                engines.get(serving.store()).config(),
-                privateStore,
-                createTempDir(),
-                serving.getOperationPrimaryTerm(),
-                4 * 1024 * 1024,
-                () -> SequenceNumbers.NO_OPS_PERFORMED,
-                new Engine.EventListener() {
-                }
-            );
-            privateStore.createEmpty(configuration.getIndexSettings().getIndexVersionCreated().luceneVersion);
-            privateStore.associateIndexWithNewTranslog(
-                Translog.createEmptyTranslog(
-                    configuration.getTranslogConfig().getTranslogPath(),
-                    SequenceNumbers.NO_OPS_PERFORMED,
-                    serving.shardId(),
-                    serving.getOperationPrimaryTerm()
-                )
-            );
-            engine = new InternalEngine(configuration);
-            engine.translogManager().recoverFromTranslog(snapshot -> {
-                assertNull(snapshot.next());
-                return 0;
-            }, SequenceNumbers.NO_OPS_PERFORMED, Long.MAX_VALUE);
-            return new Preparation(engine, privateStore);
-        } catch (IOException | RuntimeException | Error failure) {
-            IOUtils.closeWhileHandlingException(engine, privateStore);
-            throw failure;
-        }
-    }
-
-    private record Preparation(InternalEngine engine, Store store) implements Closeable {
-        @Override
-        public void close() throws IOException {
-            IOUtils.close(engine, store);
-        }
     }
 
     private static ShardLogId stream(Fixture fixture, IndexShard shard) {
