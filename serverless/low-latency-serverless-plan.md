@@ -1,6 +1,6 @@
 # Low-latency serverless delivery plan
 
-Status: proposed architecture and implementation plan; no runtime changes in this commit.
+Status: implementation in progress; see [delivered scope](low-latency-progress.md).
 Branch: `low-latency-serverless`.
 Starting point: `a6a174ca121` on `feature/serverlessshell`.
 Prepared: 31 October 2026, Australia/Sydney.

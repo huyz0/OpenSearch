@@ -13,7 +13,7 @@ archival remain pending.
 | M0 | Node timing histograms, WAL group counters, explicit open-loop benchmark, initial real-process filesystem baseline | Additional pipeline stages during extraction; actual S3 and sustained-load qualification |
 | M1 | Append and streaming recovery interfaces, optional async dispatch with cancellation/rejection semantics, existing S3 path integration, bounded versioned log/checkpoint identity codecs | Subscription/token formats and shell adapters for consensus |
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
-| M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement and bounded host controller | Command-line assignment/TLS loading, remaining partition/hardware histories and sustained resource qualification |
+| M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
 | M4–M9 | Not implemented | Quorum writes, fresh readers, selective replication, archival, lifecycle, migration |
 | M10–M12 | Not implemented | Scale/cost/failure qualification, controlled rollout, optional attribute/QUIC extensions |
 
@@ -238,6 +238,19 @@ archival remain pending.
   A real child restart preserves its recorded term, refuses another candidate in
   that term, forms the initial quorum and retains writes after leader loss.
   Three iterations passed 192 unit and 78 journal cases, with log module check.
+
+- Launcher assignment: the normal bootstrap reads a bounded versioned placement
+  file before node construction, with strict field/type/UUID validation and
+  dedicated PKCS12 credentials loaded from secure settings. A one-shot identity
+  command provisions or discovers an SSD lineage without starting a node or
+  contacting object storage. Passwords in ordinary settings and ambiguous assignment
+  sources are refused. The real launcher integration loads an OpenSearch keystore,
+  activates a three-host authenticated quorum and appends/replays committed data.
+  Three iterations passed 27 configuration, 21 bootstrap and 21 catalog/controller
+  cases, including the corrected real-filesystem disk provisioning fixture.
+  The full shell module check passed after restoring missing API documentation.
+  The final filesystem-wrapper update passed 27 configuration, 63 scheduler and
+  three launcher-quorum cases over three iterations, plus repository precommit.
 
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

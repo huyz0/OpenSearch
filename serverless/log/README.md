@@ -426,3 +426,11 @@ replacement-quorum survival, colocated availability, metadata-outage backoff,
 10,000 coalesced wakeups without extra catalog reads, startup/close races and
 rejection of an enlarged controller queue. The host API uses local filesystem
 conditional metadata in these tests; cloud/three-AZ qualification remains pending.
+
+## Normal launcher integration
+
+The shell's one-argument bootstrap loads an optional versioned assignment file and
+dedicated PKCS12 credentials from secure settings. The one-shot disk identity
+command does not start a node. See [journal host configuration](../journal-host-configuration.md)
+for the schema, bounds, provisioning command and explicit bootstrap/recovery policy.
+File loading configures the journal host only; index durability remains unchanged.

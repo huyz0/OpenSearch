@@ -265,7 +265,7 @@ public final class ServerlessBootstrap implements Closeable {
      * completes before startup returns; all-voter activation and replacement reconcile asynchronously
      * on the bounded controller executor. The node owns controller/native cleanup on every exit path.
      * @param settings node settings
-     * @param assignment explicit journal host assignment, or null for a legacy-only node
+     * @param assignment programmatic journal assignment, or null to use file configuration when present
      * @return running node
      * @throws Exception on node, catalog, journal or object-store startup failure
      */
@@ -306,6 +306,7 @@ public final class ServerlessBootstrap implements Closeable {
         // could talk to S3 in a test that supplied MockSecureSettings by hand, and not in production.
         final Path configPath = configPath(settings);
         final Settings complete = withSecureSettings(settings, configPath);
+        final JournalAssignment resolvedAssignment = JournalAssignmentLoader.resolve(complete, configPath, assignment);
 
         // The node comes first, and it has to: an s3 store is built through the repository plugin, which
         // wants a ClusterService, and the node is what owns one. The plane is attached immediately
@@ -334,17 +335,17 @@ public final class ServerlessBootstrap implements Closeable {
             final MetadataPlane plane = new MetadataPlane(store.blobStore(), BlobPath.cleanPath(), System::currentTimeMillis, ttl);
             openedPlane = plane;
             logger.info("startup: store open at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
-            if (assignment != null) {
+            if (resolvedAssignment != null) {
                 final var catalog = new org.opensearch.serverless.metadata.JournalGroupCatalog(
                     store.blobStore().blobContainer(org.opensearch.serverless.metadata.RegisterMap.journalGroups(BlobPath.cleanPath())),
-                    assignment.configuration().deploymentId()
+                    resolvedAssignment.configuration().deploymentId()
                 );
                 final var controller = new JournalController(
-                    assignment.configuration(),
+                    resolvedAssignment.configuration(),
                     catalog,
-                    assignment.keyManager(),
-                    assignment.trustManager(),
-                    assignment.diskSpace(),
+                    resolvedAssignment.keyManager(),
+                    resolvedAssignment.trustManager(),
+                    resolvedAssignment.diskSpace(),
                     node.threadPool(),
                     System::nanoTime
                 );
@@ -539,13 +540,29 @@ public final class ServerlessBootstrap implements Closeable {
     /**
      * Runs a node until the process is signalled.
      *
-     * <p>Settings come from system properties, so {@code -Dserverless.store.path=/data} works and there
-     * is no configuration file format to invent before there is anything to configure.
+     * <p>Node settings come from system properties, including {@code -Dserverless.store.path=/data}.
+     * Journal placement comes from the versioned assignment file named by its node setting.
      *
-     * @param args ignored
+     * <p>The one-shot command {@code --journal-identity <provisioned-directory> <output-file>}
+     * durably discovers a disk identity and writes its UUID to a new output file without starting a node.
+     *
+     * @param args empty for daemon startup, or the explicit disk identity command
      * @throws Exception if startup fails
      */
     public static void main(String[] args) throws Exception {
+        if (args.length != 0) {
+            if (args.length != 3 || "--journal-identity".equals(args[0]) == false) {
+                throw new IllegalArgumentException("usage: --journal-identity <provisioned-directory> <new-output-file>");
+            }
+            final var id = org.opensearch.serverless.log.JournalDiskIdentity.discover(Path.of(args[1]));
+            java.nio.file.Files.writeString(
+                Path.of(args[2]),
+                id + System.lineSeparator(),
+                java.nio.file.StandardOpenOption.CREATE_NEW,
+                java.nio.file.StandardOpenOption.WRITE
+            );
+            return;
+        }
         final Settings.Builder settings = Settings.builder();
         // BootstrapInfo rather than System.getProperties(): the latter hands out a mutable view of the
         // JVM's properties and is forbidden across this codebase for that reason.

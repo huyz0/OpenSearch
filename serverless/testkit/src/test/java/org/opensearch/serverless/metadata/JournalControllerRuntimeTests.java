@@ -408,6 +408,115 @@ public class JournalControllerRuntimeTests extends OpenSearchTestCase {
         }
     }
 
+    public void testFileAssignmentStartsThroughNormalBootstrapWithQuorumTls() throws Exception {
+        final var fixture = fixture(1);
+        final var configuration = fixture.configurations().getFirst();
+        final Path files = createTempDir();
+        for (var entry : java.util.Map.of("member.p12", "keystore", "trust.p12", "truststore").entrySet()) {
+            try (var input = getClass().getResourceAsStream("/org/opensearch/serverless/testkit/tls-test-" + entry.getValue() + ".p12")) {
+                Files.copy(input, files.resolve(entry.getKey()));
+            }
+        }
+        final var groups = configuration.groups()
+            .stream()
+            .map(
+                group -> java.util.Map.of(
+                    "id",
+                    group.id().toString(),
+                    "peers",
+                    group.peers()
+                        .stream()
+                        .map(
+                            peer -> java.util.Map.of(
+                                "id",
+                                peer.id().toString(),
+                                "host",
+                                peer.host(),
+                                "port",
+                                peer.port(),
+                                "availability_zone",
+                                peer.availabilityZone()
+                            )
+                        )
+                        .toList()
+                )
+            )
+            .toList();
+        try (var builder = org.opensearch.common.xcontent.json.JsonXContent.contentBuilder()) {
+            builder.map(
+                java.util.Map.of(
+                    "format_version",
+                    1,
+                    "deployment_id",
+                    configuration.deploymentId().toString(),
+                    "local_voter_id",
+                    configuration.localVoterId().toString(),
+                    "directory",
+                    configuration.directory().toString(),
+                    "bootstrap",
+                    true,
+                    "groups",
+                    groups,
+                    "limits",
+                    java.util.Map.of("minimum_free_bytes", 1)
+                )
+            );
+            Files.write(files.resolve("assignment.json"), BytesReference.toBytes(BytesReference.bytes(builder)));
+        }
+        try (var secure = org.opensearch.common.settings.KeyStoreWrapper.create()) {
+            secure.setString("serverless.journal.keystore.secure_password", "testonly".toCharArray());
+            secure.setString("serverless.journal.truststore.secure_password", "testonly".toCharArray());
+            secure.save(files, new char[0]);
+        }
+        final Path storeDirectory = createTempDir();
+        final var settings = Settings.builder()
+            .put("node.name", "journal-file-bootstrap")
+            .put("path.home", createTempDir())
+            .put(ServerlessBootstrap.CONFIG_PATH, files)
+            .put("network.host", "127.0.0.1")
+            .put("http.port", 0)
+            .put("transport.port", 0)
+            .put(ServerlessBootstrap.STORE_PATH, storeDirectory)
+            .put("serverless.journal.assignment_file", files.resolve("assignment.json"))
+            .put("serverless.journal.keystore.path", files.resolve("member.p12"))
+            .put("serverless.journal.truststore.path", files.resolve("trust.p12"))
+            .build();
+        final var companions = new ArrayList<JournalController>();
+        final var pools = new ArrayList<ThreadPool>();
+        try (var store = new FsBlobStore(1024, storeDirectory, false); var bootstrap = ServerlessBootstrap.start(settings)) {
+            final var local = bootstrap.node().journalController().orElseThrow();
+            try {
+                for (var other : fixture.configurations().subList(1, 3)) {
+                    final var pool = pool("journal-file-companion-" + pools.size(), 1);
+                    pools.add(pool);
+                    final var companion = controller(
+                        fixture,
+                        other,
+                        store.blobContainer(RegisterMap.journalGroups(BlobPath.cleanPath())),
+                        pool,
+                        new AtomicLong()
+                    );
+                    companions.add(companion);
+                    companion.start();
+                    companion.awaitOpened();
+                }
+                final UUID group = configuration.groups().getFirst().id();
+                assertBusy(() -> {
+                    assertEquals(JournalController.State.ACTIVE, local.state(group));
+                    companions.forEach(controller -> assertEquals(JournalController.State.ACTIVE, controller.state(group)));
+                }, 40, TimeUnit.SECONDS);
+                final var cohort = new ArrayList<>(companions);
+                cohort.add(local);
+                final var stream = new ShardLogId(fixture.deployment(), "file-configured-journal", 0, UUID.randomUUID());
+                final var leader = leader(cohort, group);
+                leader.awaitOpened().append(group, operation(stream, 1)).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                assertEquals(1, leader.awaitOpened().scan(group, -1, Set.of(stream), 100, 65536).operations().size());
+            } finally {
+                close(companions, pools);
+            }
+        }
+    }
+
     private static OperationEnvelope operation(ShardLogId stream, int value) {
         return new OperationEnvelope(stream, OperationEnvelope.Kind.DOCUMENTS, 1, 1, 1, new byte[] { (byte) value });
     }
