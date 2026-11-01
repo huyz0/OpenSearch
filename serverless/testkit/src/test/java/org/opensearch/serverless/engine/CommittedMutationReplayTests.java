@@ -15,8 +15,13 @@ import org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems;
 import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.VersionType;
+import org.opensearch.index.engine.Engine;
+import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.engine.exec.EngineBackedIndexerFactory;
+import org.opensearch.index.mapper.SourceToParse;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardTestCase;
@@ -28,6 +33,7 @@ import org.opensearch.serverless.log.OperationEnvelope;
 import org.opensearch.serverless.log.RatisJournal;
 import org.opensearch.serverless.log.ShardLogId;
 import org.opensearch.serverless.metadata.JournalGroupCatalogRuntimeTests;
+import org.opensearch.test.DummyShardLock;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.TrustManagerFactory;
@@ -38,7 +44,6 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.util.ArrayList;
@@ -56,7 +61,6 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
     private final Map<Store, CommittedServingEngine> engines = new IdentityHashMap<>();
 
     public void testPreparedRefreshCannotExposeWritesUntilCommittedJournalApplication() throws Exception {
-        final IndexShard preparation = newStartedShard(true);
         IndexShard serving = newServing();
         try (var fixture = fixture()) {
             final var stream = stream(fixture, serving);
@@ -75,52 +79,71 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
             } finally {
                 closeShards(other);
             }
-            final long term = serving.getOperationPrimaryTerm();
-            assertEquals(term, preparation.getOperationPrimaryTerm());
-            final var first = indexDoc(preparation, "_doc", "id", "{}");
-            assertTrue(first.isCreated());
-            preparation.refresh("private speculative refresh");
-            assertTrue(replay.poll().isEmpty());
-            assertDocCount(serving, 0);
-            final var original = new ResolvedMutation(
-                UUID.randomUUID(),
-                new Translog.Index("id", first.getSeqNo(), term, first.getVersion(), "{}".getBytes(StandardCharsets.UTF_8), null, -1),
-                ResolvedMutation.Outcome.CREATED
-            );
-            final var checkpoint = fixture.leader.append(fixture.group.id(), envelope(serving, stream, original, 1))
-                .toCompletableFuture()
-                .get(20, TimeUnit.SECONDS);
-            serving.refresh("committed but not applied");
-            assertDocCount(serving, 0);
-            final var applied = replay.poll();
-            assertEquals(1, applied.size());
-            assertEquals(original.operationId(), applied.getFirst().mutation().operationId());
-            assertEquals(ResolvedMutation.Outcome.CREATED, applied.getFirst().mutation().outcome());
-            assertEquals(checkpoint, replay.lastAppliedCheckpoint().orElseThrow());
-            serving.refresh("applied committed insert");
-            assertDocCount(serving, 1);
+            try (var preparation = privatePreparation(serving)) {
+                final long term = serving.getOperationPrimaryTerm();
+                final var prepared = preparation.engine.prepareIndex(
+                    preparation.engine.config().getDocumentMapperForTypeSupplier().get(),
+                    new SourceToParse(serving.shardId().getIndexName(), "id", new BytesArray("{}"), MediaTypeRegistry.JSON),
+                    SequenceNumbers.UNASSIGNED_SEQ_NO,
+                    term,
+                    Versions.MATCH_ANY,
+                    VersionType.INTERNAL,
+                    Engine.Operation.Origin.PRIMARY,
+                    -1,
+                    false,
+                    SequenceNumbers.UNASSIGNED_SEQ_NO,
+                    0
+                );
+                final var first = preparation.engine.index(prepared);
+                assertTrue(first.isCreated());
+                preparation.engine.refresh("private speculative refresh");
+                assertTrue(replay.poll().isEmpty());
+                assertDocCount(serving, 0);
+                final var original = new ResolvedMutation(
+                    UUID.randomUUID(),
+                    new Translog.Index(prepared, first),
+                    ResolvedMutation.Outcome.CREATED
+                );
+                final var checkpoint = fixture.leader.append(fixture.group.id(), envelope(serving, stream, original, 1))
+                    .toCompletableFuture()
+                    .get(20, TimeUnit.SECONDS);
+                serving.refresh("committed but not applied");
+                assertDocCount(serving, 0);
+                final var applied = replay.poll();
+                assertEquals(1, applied.size());
+                assertEquals(original.operationId(), applied.getFirst().mutation().operationId());
+                assertEquals(ResolvedMutation.Outcome.CREATED, applied.getFirst().mutation().outcome());
+                assertEquals(checkpoint, replay.lastAppliedCheckpoint().orElseThrow());
+                serving.refresh("applied committed insert");
+                assertDocCount(serving, 1);
 
-            final var deleted = preparation.applyDeleteOperationOnPrimary(
-                Versions.MATCH_ANY,
-                "id",
-                null,
-                VersionType.INTERNAL,
-                SequenceNumbers.UNASSIGNED_SEQ_NO,
-                0
-            );
-            assertTrue(deleted.isFound());
-            final var deletion = new ResolvedMutation(
-                UUID.randomUUID(),
-                new Translog.Delete("id", deleted.getSeqNo(), term, deleted.getVersion()),
-                ResolvedMutation.Outcome.DELETED
-            );
-            fixture.leader.append(fixture.group.id(), envelope(serving, stream, deletion, 1))
-                .toCompletableFuture()
-                .get(20, TimeUnit.SECONDS);
-            assertDocCount(serving, 1);
-            assertEquals(ResolvedMutation.Outcome.DELETED, replay.poll().getFirst().mutation().outcome());
-            serving.refresh("applied committed delete");
-            assertDocCount(serving, 0);
+                final var preparedDelete = preparation.engine.prepareDelete(
+                    "id",
+                    null,
+                    SequenceNumbers.UNASSIGNED_SEQ_NO,
+                    term,
+                    Versions.MATCH_ANY,
+                    VersionType.INTERNAL,
+                    Engine.Operation.Origin.PRIMARY,
+                    first.getSeqNo(),
+                    first.getTerm()
+                );
+                final var deleted = preparation.engine.delete(preparedDelete);
+                assertTrue(deleted.isFound());
+                final var deletion = new ResolvedMutation(
+                    UUID.randomUUID(),
+                    new Translog.Delete(preparedDelete, deleted),
+                    ResolvedMutation.Outcome.DELETED
+                );
+                fixture.leader.append(fixture.group.id(), envelope(serving, stream, deletion, 1))
+                    .toCompletableFuture()
+                    .get(20, TimeUnit.SECONDS);
+                assertDocCount(serving, 1);
+                assertEquals(ResolvedMutation.Outcome.DELETED, replay.poll().getFirst().mutation().outcome());
+                serving.refresh("applied committed delete");
+                assertDocCount(serving, 0);
+
+            }
 
             // The retained journal remains authoritative when a serving copy is recreated locally.
             serving = reinitShard(serving);
@@ -134,7 +157,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
             assertDocCount(serving, 0);
             assertEquals(1, serving.getProcessedLocalCheckpoint());
         } finally {
-            closeShards(serving, preparation);
+            closeShards(serving);
         }
     }
 
@@ -280,6 +303,53 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
             engines.put(config.getStore(), engine);
             return engine;
         }));
+    }
+
+    private Preparation privatePreparation(IndexShard serving) throws IOException {
+        final var privateStore = new Store(
+            serving.shardId(),
+            serving.indexSettings(),
+            newFSDirectory(createTempDir()),
+            new DummyShardLock(serving.shardId())
+        );
+        InternalEngine engine = null;
+        try {
+            final var configuration = PrivatePreparationEngineConfig.create(
+                engines.get(serving.store()).config(),
+                privateStore,
+                createTempDir(),
+                serving.getOperationPrimaryTerm(),
+                4 * 1024 * 1024,
+                () -> SequenceNumbers.NO_OPS_PERFORMED,
+                new Engine.EventListener() {
+                }
+            );
+            privateStore.createEmpty(configuration.getIndexSettings().getIndexVersionCreated().luceneVersion);
+            privateStore.associateIndexWithNewTranslog(
+                Translog.createEmptyTranslog(
+                    configuration.getTranslogConfig().getTranslogPath(),
+                    SequenceNumbers.NO_OPS_PERFORMED,
+                    serving.shardId(),
+                    serving.getOperationPrimaryTerm()
+                )
+            );
+            engine = new InternalEngine(configuration);
+            engine.translogManager().recoverFromTranslog(snapshot -> {
+                assertNull(snapshot.next());
+                return 0;
+            }, SequenceNumbers.NO_OPS_PERFORMED, Long.MAX_VALUE);
+            return new Preparation(engine, privateStore);
+        } catch (IOException | RuntimeException | Error failure) {
+            IOUtils.closeWhileHandlingException(engine, privateStore);
+            throw failure;
+        }
+    }
+
+    private record Preparation(InternalEngine engine, Store store) implements Closeable {
+        @Override
+        public void close() throws IOException {
+            IOUtils.close(engine, store);
+        }
     }
 
     private static ShardLogId stream(Fixture fixture, IndexShard shard) {

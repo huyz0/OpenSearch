@@ -107,14 +107,27 @@ every assigned index/delete, so replay and out-of-order delivery cannot use an
 unsafe append-only optimization. This trades some indexing efficiency for a
 simpler initial correctness boundary.
 
-Keep one public `IndexService` and one public serving shard. The next integration
-step is a separately owned private `InternalEngine` with its own SSD store,
-translog, default primary policy, lifecycle and resource budget. Reuse the public
-mapper/analyzers without creating a second plugin/index registration. Direct
-engine preparation must be checked against plugins that depend on shard hooks;
-custom engines and incompatible data formats cannot be silently enabled. The
-private engine must not inherit public refresh listeners, warmers or failure
-callbacks that could expose speculative state or fail the serving shard.
+Keep one public `IndexService` and one public serving shard. A bare private
+`InternalEngine` now has a shared-mapper local journal/native-shard integration
+probe. It uses `PrivatePreparationEngineConfig` to require separate canonical
+filesystem index/translog paths, restore default primary operation planning, and
+create independently owned merge policies through separate index settings. Its
+initial Lucene buffer receives an explicit byte allowance; a core system-property
+override cannot exceed that allowance. Public refresh listeners, warmers, query
+cache access and failure callbacks are removed. Private failures notify only the
+private context. Custom committers, data formats and document lookup/metadata
+providers fail closed in this prototype.
+
+This configuration builder neither opens an engine nor owns its lifetime. The
+host still needs resident-engine admission, private version-map/buffer flushing,
+SSD watermarks and cleanup before runtime integration. A Lucene buffer allowance
+does not cap total heap, native memory, merge IO or retained translog history.
+Share mapper/analyzers without another plugin/index registration, and close the
+private engine before their owner closes. Direct preparation must also be checked
+against plugins that depend on shard hooks; custom engines cannot be silently
+enabled. Conditional operations in the probe wait for the prior journal commit
+and serving application. It does not yet implement scripts, retry sequencing or
+private-engine rebuild after an ambiguous append.
 
 The adapter itself is not a commit verifier and is not enabled by the launcher.
 Assigned operation identities are not evidence of commitment. The host must
