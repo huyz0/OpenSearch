@@ -212,6 +212,9 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
                     Map.of(group.id(), intent)
                 )
             );
+            final var load = new ShardLogId(fixture.deployment(), "during-leader-removal", 0, UUID.randomUUID());
+            oldLeader.startBackgroundWrites(0, operation(load, 7));
+            assertBusy(() -> assertTrue(oldLeader.backgroundStatus().submitted() > 0), 10, TimeUnit.SECONDS);
             assertBusy(() -> {
                 try {
                     final var currentLeader = leader(nodes, 0);
@@ -221,6 +224,13 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
                     throw new AssertionError("waiting for replacement of the previous leader", waiting);
                 }
             }, 45, TimeUnit.SECONDS);
+            oldLeader.stopBackgroundWrites();
+            assertBusy(() -> {
+                final var status = oldLeader.backgroundStatus();
+                assertFalse("removed member's writer must stop", status.running());
+                assertEquals("every accepted proposal must complete after self-removal", 0, status.outstanding());
+            }, 15, TimeUnit.SECONDS);
+            final long acknowledged = oldLeader.backgroundStatus().acknowledged();
             oldLeader.close();
             final var replacement = leader(nodes, 0);
             assertEquals(
@@ -229,6 +239,17 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
             );
             final var stream = new ShardLogId(fixture.deployment(), "leader-replacement", 0, UUID.randomUUID());
             replacement.append(0, operation(stream, 0));
+            long cursor = -1;
+            long observed = 0;
+            for (int batch = 0; batch < 1024; batch++) {
+                final var history = replacement.scan(0, cursor, Set.of(load));
+                observed += history.operations().size();
+                cursor = history.throughIndex();
+                if (cursor >= history.committedIndex()) {
+                    break;
+                }
+            }
+            assertTrue("replacement quorum lost acknowledged concurrent writes", observed >= acknowledged);
             replacement.close();
             // Exactly two members of the new three remain after both leader processes are killed.
             final var remaining = leader(nodes, 0);

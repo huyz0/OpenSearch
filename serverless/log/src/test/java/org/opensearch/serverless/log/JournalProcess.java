@@ -164,6 +164,28 @@ final class JournalProcess implements AutoCloseable {
         });
     }
 
+    void startBackgroundWrites(int group, OperationEnvelope operation) throws IOException {
+        exchange(JournalProcessMain.BACKGROUND_START, out -> {
+            out.writeInt(group);
+            JournalProcessMain.writeFrame(out, operation.encode(16384));
+        }, in -> null);
+    }
+
+    record BackgroundStatus(boolean running, int outstanding, long submitted, long acknowledged) {
+    }
+
+    BackgroundStatus backgroundStatus() throws IOException {
+        return exchange(
+            JournalProcessMain.BACKGROUND_STATUS,
+            out -> {},
+            in -> new BackgroundStatus(in.readBoolean(), in.readInt(), in.readLong(), in.readLong())
+        );
+    }
+
+    void stopBackgroundWrites() throws IOException {
+        exchange(JournalProcessMain.BACKGROUND_STOP, out -> {}, in -> null);
+    }
+
     void release() throws IOException {
         exchange(JournalProcessMain.RELEASE, out -> {}, in -> null);
     }

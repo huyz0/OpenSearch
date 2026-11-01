@@ -69,6 +69,12 @@ work with a single pending slot. Caller cancellation still cannot release accept
 persistence. Close refuses new dispatch and queued proposals not yet submitted;
 it preserves the dispatcher for outstanding native results, including late I/O
 completion after SDK close. Once notifications drain, its workers terminate.
+Managed state machines bypass the redundant SDK client-executor hop. Otherwise
+a removed leader can close its division while holding a monitor needed by a
+queued client worker, then wait for that worker to terminate. Admission also
+requires a running division whose current or previous voter configuration still
+contains the local member; the native leader-ready hint alone can outlive removal.
+
 The extra worker threads and queue hops require workload qualification; they add
 no object-store request and do not change the quorum persistence rule.
 

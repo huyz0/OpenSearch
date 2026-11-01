@@ -26,6 +26,7 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.SetConfigurationRequest;
 import org.apache.ratis.rpc.SupportedRpcType;
+import org.apache.ratis.server.OpenSearchClientRequestDispatch;
 import org.apache.ratis.server.RaftConfiguration;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
@@ -40,6 +41,7 @@ import org.apache.ratis.thirdparty.io.grpc.ServerCallHandler;
 import org.apache.ratis.thirdparty.io.grpc.ServerInterceptor;
 import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.util.ExitUtils;
+import org.apache.ratis.util.LifeCycle;
 import org.apache.ratis.util.SizeInBytes;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.annotation.InternalApi;
@@ -469,7 +471,7 @@ public final class RatisJournal implements Closeable {
      */
     public CompletionStage<Void> activateGroup(UUID groupId) throws IOException {
         final var division = division(groupId);
-        if (division.getInfo().isLeaderReady() == false) {
+        if (leaderEligible(division) == false) {
             throw new IOException("local journal member is not the ready leader");
         }
         if (stateMachines.get(groupId).activation != null) {
@@ -529,7 +531,7 @@ public final class RatisJournal implements Closeable {
     public CompletionStage<Void> advanceReplacement(JournalMembershipRecord intent) throws IOException {
         final UUID group = requireReplacementIntent(intent);
         final var division = division(group);
-        if (division.getInfo().isLeaderReady() == false) {
+        if (leaderEligible(division) == false) {
             throw new IOException("replacement must run on the ready local leader");
         }
         final var nativeConf = division.getRaftConf();
@@ -824,7 +826,7 @@ public final class RatisJournal implements Closeable {
             || operation.payloadLength() > configuration.limits().maximumPayloadBytes()) {
             throw new IOException("operation namespace or size is outside this journal's admission");
         }
-        if (division.getInfo().isLeaderReady() == false) {
+        if (leaderEligible(division) == false) {
             throw new IOException("local journal member is not the ready leader");
         }
         requireDiskSpace();
@@ -934,7 +936,13 @@ public final class RatisJournal implements Closeable {
      * @throws IOException when closed or the group is unavailable
      */
     public boolean isLeaderReady(UUID groupId) throws IOException {
-        return division(groupId).getInfo().isLeaderReady();
+        return leaderEligible(division(groupId));
+    }
+
+    private boolean leaderEligible(RaftServer.Division division) {
+        return division.getInfo().getLifeCycleState() == LifeCycle.State.RUNNING
+            && division.getInfo().isLeaderReady()
+            && division.getRaftConf().getPeer(server.getId(), RaftPeerRole.FOLLOWER) != null;
     }
 
     private RaftServer.Division division(UUID groupId) throws IOException {
@@ -994,7 +1002,7 @@ public final class RatisJournal implements Closeable {
         return true;
     }
 
-    private final class JournalStateMachine extends BaseStateMachine implements OpenSearchLogPersistence {
+    private final class JournalStateMachine extends BaseStateMachine implements OpenSearchLogPersistence, OpenSearchClientRequestDispatch {
         private final UUID group;
         private volatile LogCheckpoint activation;
         private volatile MembershipBarrier membershipBarrier;

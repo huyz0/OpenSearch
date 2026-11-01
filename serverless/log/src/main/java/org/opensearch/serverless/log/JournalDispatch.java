@@ -20,7 +20,8 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Detaches SDK submission and completion from consensus locks. Native "async" submission can join
- * its own client executor; native futures can complete under leader/watch locks. Neither calling
+ * its own client executor (managed state machines bypass that extra handoff); native futures can
+ * complete under leader/watch locks. Neither calling
  * back into the SDK nor running application continuations is safe on those completion threads.
  *
  * At most one queued task belongs to each charged permit: submission is dequeued before completion

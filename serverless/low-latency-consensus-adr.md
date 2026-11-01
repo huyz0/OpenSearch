@@ -454,3 +454,21 @@ or on an explicit placement-change signal, with five-second failure backoff.
 These counts scale with physical groups. Current-read authority, searchable
 checkpoints and the opt-in index write path remain separate work. Command-line
 assignment/TLS loading and cloud qualification are not enabled by this host API.
+
+## Leader removal with concurrent proposals
+
+A process regression exposed an SDK shutdown cycle: a removed leader held the
+consensus monitor while closing its client executor, whose worker needed that
+monitor to finish an append. The host dispatcher was waiting for the SDK's extra
+client-executor handoff. The curated proxy now recognizes an internal marker for
+state machines whose host already bounds submission and detaches completions.
+Those submissions use the host worker directly; other SDK users retain upstream
+behavior. Consensus and durable acknowledgement rules are unchanged.
+
+Local admission also checks division lifecycle and current/previous voter
+membership alongside the native readiness hint. Removed or closing leaders
+therefore refuse new proposals. The native-pool isolation regression fails on
+the old path, and replacement tests drain all accepted concurrent proposals
+before killing the old leader, then verify acknowledged history on the new quorum.
+Connection cleanup remains local: a controller publishing or retrying completion
+reconciles its own transport after checking every colocated group's membership.

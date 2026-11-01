@@ -60,6 +60,9 @@ public final class JournalProcessMain {
     static final int RECEIPT = 16;
     static final int RELEASE = 17;
     static final int VOTERS = 18;
+    static final int BACKGROUND_START = 30;
+    static final int BACKGROUND_STATUS = 31;
+    static final int BACKGROUND_STOP = 32;
     static final int FRAME_LIMIT = 17 * 1024;
 
     private JournalProcessMain() {}
@@ -224,6 +227,7 @@ public final class JournalProcessMain {
                     memberships,
                     originalJoins
                 );
+            var writes = new BackgroundWrites(journal);
             var input = new DataInputStream(new BufferedInputStream(System.in));
             var output = new DataOutputStream(protocolOutput())
         ) {
@@ -265,6 +269,22 @@ public final class JournalProcessMain {
                         }
                         case RELEASE -> {
                             release.countDown();
+                            output.writeByte(0);
+                        }
+                        case BACKGROUND_START -> {
+                            final UUID group = groups.get(input.readInt()).id();
+                            writes.start(group, OperationEnvelope.decode(readFrame(input), 16384));
+                            output.writeByte(0);
+                        }
+                        case BACKGROUND_STATUS -> {
+                            output.writeByte(0);
+                            output.writeBoolean(writes.running.get());
+                            output.writeInt(writes.outstanding.get());
+                            output.writeLong(writes.submitted.get());
+                            output.writeLong(writes.acknowledged.get());
+                        }
+                        case BACKGROUND_STOP -> {
+                            writes.stopping.set(true);
                             output.writeByte(0);
                         }
                         case LEADER -> {
@@ -375,6 +395,81 @@ public final class JournalProcessMain {
                     output.writeUTF(message.substring(0, Math.min(2048, message.length())));
                 }
                 output.flush();
+            }
+        }
+    }
+
+    private static final class BackgroundWrites implements AutoCloseable {
+        private final RatisJournal journal;
+        private final AtomicBoolean stopping = new AtomicBoolean();
+        private final AtomicBoolean running = new AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicInteger outstanding = new java.util.concurrent.atomic.AtomicInteger();
+        private final java.util.concurrent.atomic.AtomicLong submitted = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong acknowledged = new java.util.concurrent.atomic.AtomicLong();
+        private Thread worker;
+
+        private BackgroundWrites(RatisJournal journal) {
+            this.journal = journal;
+        }
+
+        private void start(UUID group, OperationEnvelope operation) throws IOException {
+            if (worker != null) {
+                throw new IOException("fixture background writer already started");
+            }
+            running.set(true);
+            worker = org.apache.ratis.util.Daemon.newBuilder()
+                .setName("journal-fixture-background-writes")
+                .setRunnable(() -> run(group, operation))
+                .build();
+            worker.start();
+        }
+
+        private void run(UUID group, OperationEnvelope operation) {
+            final var pending = new ArrayList<CompletableFuture<?>>();
+            try {
+                while (stopping.get() == false && journal.isLeaderReady(group)) {
+                    pending.removeIf(CompletableFuture::isDone);
+                    if (pending.size() < 24) {
+                        outstanding.incrementAndGet();
+                        try {
+                            final var future = journal.append(group, operation).toCompletableFuture();
+                            submitted.incrementAndGet();
+                            pending.add(future);
+                            future.whenComplete((checkpoint, failure) -> {
+                                if (failure == null) {
+                                    acknowledged.incrementAndGet();
+                                }
+                                outstanding.decrementAndGet();
+                            });
+                        } catch (IOException | RuntimeException rejected) {
+                            outstanding.decrementAndGet();
+                            break;
+                        }
+                    } else {
+                        try {
+                            CompletableFuture.anyOf(pending.toArray(CompletableFuture[]::new)).get(100, TimeUnit.MILLISECONDS);
+                        } catch (java.util.concurrent.TimeoutException awaitingCompletion) {
+                            // Bounded polling of actual accepted work; never cancel its persistence.
+                        } catch (java.util.concurrent.ExecutionException ambiguous) {
+                            break;
+                        }
+                    }
+                }
+            } catch (IOException unavailable) {
+                // Expected when this member loses leadership or is removed.
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            } finally {
+                running.set(false);
+            }
+        }
+
+        @Override
+        public void close() throws InterruptedException {
+            stopping.set(true);
+            if (worker != null) {
+                worker.interrupt();
+                worker.join(TimeUnit.SECONDS.toMillis(2));
             }
         }
     }

@@ -54,6 +54,7 @@ import org.apache.ratis.protocol.exceptions.AlreadyExistsException;
 import org.apache.ratis.protocol.exceptions.GroupMismatchException;
 import org.apache.ratis.rpc.RpcType;
 import org.apache.ratis.server.DataStreamServerRpc;
+import org.apache.ratis.server.OpenSearchClientRequestDispatch;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.RaftServerRpc;
@@ -487,7 +488,16 @@ class RaftServerProxy implements RaftServer {
 
     @Override
     public CompletableFuture<RaftClientReply> submitClientRequestAsync(RaftClientRequest request) {
-        return getImplFuture(request.getRaftGroupId()).thenCompose(impl -> impl.executeSubmitClientRequestAsync(request));
+        return getImplFuture(request.getRaftGroupId()).thenCompose(impl -> {
+            if (impl.getStateMachine() instanceof OpenSearchClientRequestDispatch) {
+                try {
+                    return impl.submitClientRequestAsync(request);
+                } catch (IOException failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+            return impl.executeSubmitClientRequestAsync(request);
+        });
     }
 
     @Override

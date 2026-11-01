@@ -40,7 +40,7 @@ tasks.named('jar').configure {
     exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
   }
   manifest {
-    attributes 'Ratis-Upstream-Version': '3.3.1', 'OpenSearch-Ratis-Patch': 'persistence-boundary-v4'
+    attributes 'Ratis-Upstream-Version': '3.3.1', 'OpenSearch-Ratis-Patch': 'persistence-boundary-v5'
   }
   from('README.md') { into 'META-INF/opensearch-ratis-server' }
 }

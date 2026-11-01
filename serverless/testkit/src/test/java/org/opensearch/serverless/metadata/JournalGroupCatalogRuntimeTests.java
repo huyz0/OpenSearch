@@ -358,7 +358,16 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 }, 30, TimeUnit.SECONDS);
                 final var secondReceipt = completedController.publishReplacement(leader[0], secondIntent);
                 assertEquals(2, secondReceipt.completedMembership().revision());
-                assertTrue("the retired peer's established channel must be released", oldChannel.isShutdown());
+                assertBusy(() -> {
+                    try {
+                        // The new learner can win this election. Reconcile on the retained host
+                        // whose local channel this test captured, independently of the publisher.
+                        assertEquals(secondReceipt, completedController.publishReplacement(retainedJournal, secondIntent));
+                        assertTrue("the retained host must release its retired peer channel", oldChannel.isShutdown());
+                    } catch (IOException waiting) {
+                        throw new AssertionError("waiting for local peer cleanup", waiting);
+                    }
+                }, 10, TimeUnit.SECONDS);
                 assertEquals(published, new JournalGroupCatalog(real, deployment).publishReplacement(leader[0], intent));
                 expectThrows(IOException.class, () -> leader[0].advanceReplacement(intent));
                 final String receiptKey = "completed-" + group.id() + "-" + intent.pending().id();

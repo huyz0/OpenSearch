@@ -437,6 +437,46 @@ public class RatisJournalTests extends OpenSearchTestCase {
         }
     }
 
+    public void testQuorumAppendDoesNotDependOnTheSdkClientPool() throws Exception {
+        final var fixture = fixture(1);
+        final var journals = new ArrayList<RatisJournal>();
+        final var entered = new java.util.concurrent.CountDownLatch(4);
+        final var release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            startAll(fixture, journals, true);
+            final var group = fixture.configurations().getFirst().groups().getFirst().id();
+            final var local = leader(journals, group);
+            final var clients = nativeClientExecutor(local, group);
+            for (int task = 0; task < 4; task++) {
+                clients.execute(() -> {
+                    entered.countDown();
+                    try {
+                        if (release.await(20, TimeUnit.SECONDS) == false) {
+                            throw new AssertionError("test did not release native client workers");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+            }
+            assertTrue(entered.await(10, TimeUnit.SECONDS));
+            final var stream = new ShardLogId(fixture.deployment(), "host-managed-dispatch", 0, UUID.randomUUID());
+            local.append(group, operation(stream, 1)).toCompletableFuture().get(3, TimeUnit.SECONDS);
+            assertEquals(1, local.scan(group, -1, Set.of(stream), 100, 65536).operations().size());
+        } finally {
+            release.countDown();
+            closeAll(journals);
+        }
+    }
+
+    @SuppressForbidden(reason = "Stall the pinned SDK client pool to verify the host dispatch boundary")
+    private static java.util.concurrent.ExecutorService nativeClientExecutor(RatisJournal journal, UUID group) throws Exception {
+        final var division = nativeDivisionForStall(journal, group);
+        final var field = division.getClass().getDeclaredField("clientExecutor");
+        field.setAccessible(true);
+        return (java.util.concurrent.ExecutorService) field.get(division);
+    }
+
     public void testRetiredTransportRemainsUntilEveryColocatedGroupStopsUsingIt() throws Exception {
         final var fixture = fixture(2);
         final var journals = new ArrayList<RatisJournal>();

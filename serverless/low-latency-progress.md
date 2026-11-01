@@ -220,5 +220,16 @@ archival remain pending.
   enforcement, including simultaneous learner/genesis roles in different groups.
   Command-line loading and quorum-mode index writes remain pending.
 
+- Leader-removal dispatch: concurrent proposals exposed an SDK close/client-worker
+  monitor deadlock. Managed state machines now submit directly from the existing
+  bounded host dispatcher; other SDK state machines retain upstream dispatch.
+  A deterministic native-client-pool isolation test fails before the fix, and
+  process replacement now drains accepted proposals before killing the old leader
+  and checks acknowledged writes on the new quorum. Admission rejects closing or
+  removed leaders even if the native readiness hint remains true. Three iterations
+  passed 183 unit, 75 journal, six native probe and 15 controller cases. The catalog
+  integration's local-publisher cleanup assertion was corrected and its three
+  iterations passed. Curated artifact audits and unchanged-upstream checks passed.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

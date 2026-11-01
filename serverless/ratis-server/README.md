@@ -17,7 +17,8 @@ algorithms are unchanged.
 
 The source retains the upstream Apache license. Wildcard imports are expanded,
 the repository formatter is applied, and legacy file/socket API usage is narrowly
-exempted on the upstream class. No new public SDK API is introduced.
+exempted on the upstream class. The upstream public SDK API is unchanged; the
+host integration uses its own internal extension types.
 
 Binary SHA-256: `a635a8c69b5c59089b026992178ecea95ead7d709c5ff4f94834e06eaa0c911d`.
 Original source entry SHA-256: `b3a61cc9a1053d1319ec88d939c7360e2e779bf88b5fa44d62c6fcb319597e5e`.
@@ -82,3 +83,20 @@ entry-size, file-size and directory-entry bounds. It forces a valid existing ope
 tail before the host adopts its end as durable. It never repairs, rewrites, or
 deletes log contents. Snapshot/purged-prefix recovery needs a separate trusted
 catalog proof and remains unsupported here.
+
+## Host-managed client dispatch
+
+`OpenSearchClientRequestDispatch` opts a state machine into direct proxy
+submission on its embedding host's bounded executor. Other state machines keep
+the upstream client-executor path. The journal already detaches both submission
+and application completion from consensus locks.
+
+Upstream asynchronous submission queues a native client worker and joins it.
+During leader removal, the leader closes its division while holding the same
+monitor needed by that worker, then waits for the client executor to terminate.
+A real replacement run reproduced the resulting deadlock. Avoiding the redundant
+handoff for managed state machines removes that cycle without changing log,
+commit, vote, or membership rules. A deterministic regression holds every native
+client worker and verifies a managed quorum append still completes. Process tests
+also require accepted concurrent writes to finish before killing the removed
+leader and verify all acknowledged records survive in the replacement quorum.
