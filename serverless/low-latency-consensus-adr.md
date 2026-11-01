@@ -488,3 +488,19 @@ authority, missing vote metadata, and nonempty histories do not get this permit.
 A child-JVM test grants a real vote, restarts the original voter, verifies the
 term survives and another candidate is refused in that term, then forms the quorum
 and verifies writes survive another leader loss.
+
+## Term and vote corruption
+
+A real process history demonstrated a second same-term vote after a one-bit change
+in the separate native term/vote properties file. That file was atomic and forced,
+but its contents had no checksum. Persisted log-entry checks cannot detect this.
+The curated native writer now seals version, term and voted-for identity in the
+same atomic publication; a bounded reader verifies the seal. A host preflight
+requires this verified metadata before native startup and never uses the SDK's
+initial-format missing-file default for established recovery.
+
+Binding format four enforces this boundary in both upgrade and downgrade
+attempts. Earlier unsealed experimental voters require authorized fresh-identity
+replacement from a healthy quorum, not automatic checksum creation. Recovery
+leaves refused files intact. This integrity guard does not replace the existing
+restriction on copying live voter directories or resurrecting old disk snapshots.

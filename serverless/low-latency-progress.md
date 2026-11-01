@@ -275,5 +275,16 @@ delivered work and validation history below are preserved.
   The final filesystem-wrapper update passed 27 configuration, 63 scheduler and
   three launcher-quorum cases over three iterations, plus repository precommit.
 
+- Voting-state integrity: a child restart reproduced a second vote in the same
+  term after a one-bit change in the separate native term/vote file. The curated
+  writer now includes a version and checksum in the same forced atomic write;
+  bounded preflight verification refuses corrupted, missing, oversized or unsealed
+  voting state before native services start. Binding format four prevents a silent
+  downgrade. Earlier experimental voter directories are preserved on refusal and
+  require authorized fresh-identity replacement from a healthy quorum. Three
+  iterations passed 204 unit, 81 journal, 21 catalog/controller and six consensus
+  cases, including successful vote preservation and corrupt-vote refusal after
+  real process restarts. Vendor audits and unchanged-upstream checks passed.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

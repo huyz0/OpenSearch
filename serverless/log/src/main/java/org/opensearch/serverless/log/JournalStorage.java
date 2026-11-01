@@ -116,6 +116,7 @@ final class JournalStorage implements AutoCloseable {
                     requireDirectory(directory);
                     requireDirectory(directory.resolve("current"));
                     requireRegular(directory.resolve("current/raft-meta"));
+                    org.apache.ratis.server.storage.OpenSearchVotingMetadata.verify(directory.resolve("current/raft-meta"));
                     final Path nativeConfiguration = directory.resolve("current/raft-meta.conf");
                     final boolean learner = configuration.joiningPeer() != null
                         && configuration.groups()
@@ -342,7 +343,7 @@ final class JournalStorage implements AutoCloseable {
     private static byte[] binding(JournalConfiguration configuration) throws IOException {
         final var bytes = new ByteArrayOutputStream();
         try (var out = new DataOutputStream(bytes)) {
-            out.writeInt(3);
+            out.writeInt(4);
             out.writeUTF(configuration.deploymentId().toString());
             out.writeUTF(configuration.localVoterId().toString());
             for (var group : configuration.groups()

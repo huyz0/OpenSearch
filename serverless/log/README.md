@@ -117,7 +117,14 @@ activated may recover its existing native bootstrap configuration only when both
 the durable boundary and verified log are empty. The initialized volume binding
 and recorded term/vote remain mandatory. This resumes a process stopped before
 its first quorum formed; it cannot reset a voter or erase an established prefix.
-Known activated membership never grants this exception. Initialization synchronizes newly created group
+Known activated membership never grants this exception.
+
+Term/vote metadata has its own atomic versioned checksum, separate from log-entry
+CRCs. Recovery verifies that required file with a 4 KiB bound before native startup;
+invalid or unsealed metadata never becomes an empty vote. Binding format four
+requires this integrity check and refuses earlier experimental bindings. Existing
+voter bytes are preserved on refusal; replacement needs a healthy quorum and a
+fresh storage identity rather than an in-place checksum rewrite. Initialization synchronizes newly created group
 directories up to the provisioned volume root before writing its marker.
 
 Before admitting logical operations, the local leader must complete

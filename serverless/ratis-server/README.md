@@ -2,7 +2,8 @@
 
 Pinned upstream: Apache Ratis 3.3.1. The merged artifact replaces only
 `org.apache.ratis.server.impl.RaftServerProxy`, `ServerState`,
-`org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogWorker`, and their nested classes.
+`org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogWorker`,
+`org.apache.ratis.server.storage.RaftStorageMetadataFileImpl`, and their nested classes.
 Other upstream classes and resources are checked byte-for-byte against the
 original JAR by `verifyUpstreamContents`.
 
@@ -100,3 +101,32 @@ commit, vote, or membership rules. A deterministic regression holds every native
 client worker and verifies a managed quorum append still completes. Process tests
 also require accepted concurrent writes to finish before killing the removed
 leader and verify all acknowledged records survive in the replacement quorum.
+
+## Voting metadata integrity
+
+The upstream term/vote file uses unchecksummed properties. A child-process
+regression granted one candidate a vote in term seven, stopped the voter, flipped
+one persisted bit to change its term to six, then restarted it. The voter granted
+a different candidate a vote in term seven. Log-entry CRCs cannot detect this
+separate voting-state corruption.
+
+The curated metadata writer adds a format version and CRC32C over the term and
+exact voted-for identity in the same atomic, forced file publication. Its reader
+bounds the file to 4 KiB and the UTF-8 voter identity to 1 KiB. It refuses missing
+integrity fields, unsupported versions, invalid terms, changed checksums and
+oversized files instead of interpreting them as an empty vote. The native
+missing-file default remains restricted to initial formatting; the host's internal
+`OpenSearchVotingMetadata` verifier always requires the existing file before any
+native service starts.
+
+Journal binding format four prevents an older host silently opening a directory
+that requires these checks. Existing unsealed experimental voter directories are
+not rewritten in place. Preserve them and use authorized replacement with a fresh
+storage identity and a healthy quorum; do not manufacture a checksum over possibly
+corrupt voting state. Whole-quorum disaster recovery remains a separate milestone.
+The consensus voting and commit algorithms and upstream public SDK API are unchanged.
+Checksums detect corruption; they do not authorize restoring old backups under a
+live voter identity or provide protection against malicious stable-storage rollback.
+
+Original `RaftStorageMetadataFileImpl.java` source entry SHA-256:
+`ebe98a2f6c9900e64ded2e83d8e330a723e011802848bd65bcd8d5751ab060df`.

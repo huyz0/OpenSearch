@@ -27,6 +27,42 @@ import java.util.concurrent.TimeUnit;
 /** Real JVM restart/crash tests, distinct from power-loss and three-AZ qualification. */
 @SuppressFileSystems("*")
 public class RatisJournalProcessTests extends OpenSearchTestCase {
+    public void testCorruptedVotingTermCannotGrantASecondVoteInTheSameTerm() throws Exception {
+        final var fixture = fixture(1);
+        final var nodes = new ArrayList<JournalProcess>();
+        try {
+            final var original = fixture.configurations().getFirst();
+            final var first = JournalProcess.startAssigned(original, createTempDir().resolve("vote-before-corruption.log"));
+            nodes.add(first);
+            assertTrue(first.vote(0, 7));
+            assertEquals(7, first.progress(0).term());
+            first.stop();
+            final Path metadata = original.directory().resolve(original.groups().getFirst().id().toString()).resolve("current/raft-meta");
+            final byte[] bytes = Files.readAllBytes(metadata);
+            final String contents = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+            final int offset = contents.indexOf("term=7");
+            assertTrue(contents, offset >= 0);
+            assertEquals((byte) '7', bytes[offset + 5]);
+            bytes[offset + 5] ^= 1; // One persisted bit changes the term from seven to six.
+            Files.write(metadata, bytes);
+            final var recovery = new JournalConfiguration(
+                original.deploymentId(),
+                original.localVoterId(),
+                original.directory(),
+                original.groups(),
+                false,
+                original.limits()
+            );
+            expectThrows(
+                IOException.class,
+                () -> JournalProcess.startAssigned(recovery, createTempDir().resolve("vote-after-corruption.log"))
+            );
+            assertArrayEquals("refusal must preserve the corrupt bytes for diagnosis", bytes, Files.readAllBytes(metadata));
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
     public void testAnEmptyOriginalVoterCanRestartBeforeInitialQuorumWithoutLosingItsVoteTerm() throws Exception {
         final var fixture = fixture(1);
         final var nodes = new ArrayList<JournalProcess>();

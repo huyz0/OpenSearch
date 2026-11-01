@@ -308,12 +308,20 @@ public class JournalStorageTests extends OpenSearchTestCase {
         assertArrayEquals(before, Files.readAllBytes(directory.resolve("journal-floor")));
     }
 
+    @org.opensearch.common.SuppressForbidden(reason = "Pinned native storage builder accepts java.io.File")
     private static void initialize(JournalStorage storage, UUID group) throws Exception {
         final Path root = storage.groupDirectory(group);
-        Files.createDirectories(root.resolve("current"));
-        Files.createDirectories(root.resolve("sm"));
-        Files.write(root.resolve("current/raft-meta"), new byte[] { 1 });
-        Files.write(root.resolve("current/raft-meta.conf"), new byte[] { 1 });
+        try (
+            var nativeStorage = org.apache.ratis.server.storage.RaftStorage.newBuilder()
+                .setDirectory(root.toFile())
+                .setOption(org.apache.ratis.server.storage.RaftStorage.StartupOption.FORMAT)
+                .setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION)
+                .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.valueOf(0))
+                .build()
+        ) {
+            nativeStorage.initialize();
+        }
+        Files.writeString(root.resolve("current/raft-meta.conf"), "configuration");
         storage.initialize(group);
     }
 
