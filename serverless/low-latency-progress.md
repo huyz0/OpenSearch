@@ -14,7 +14,7 @@ archival remain pending.
 | M1 | Append and streaming recovery interfaces, optional async dispatch with cancellation/rejection semantics, existing S3 path integration, bounded versioned log/checkpoint identity codecs | Subscription/token formats and shell adapters for consensus |
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
-| M3a | Design evidence only: compact descriptor microbenchmark and failure/capacity model; no runtime implementation | Cell isolation, partitioned metadata, stable buckets, bounded active state and weighted capacity routing |
+| M3a | [Selected cell/active-state design](low-latency-capacity-adr.md), runnable descriptor/resource/failure/cost models and raw local results | Runtime per-group admission, partitioned metadata, stable buckets, bounded active state and weighted capacity routing |
 | M4–M9 | Not implemented | Quorum writes, fresh readers, selective replication, archival, lifecycle, migration |
 | M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
 | M6a | Planned; no runtime completion claimed | Missing-chunk/resumable bulk shard copies, peer/S3 source selection and live-versus-recovery scheduling |
@@ -39,6 +39,14 @@ evidence. Millions of logical descriptors do not imply millions of open engines.
 Avoiding a global write stop does not promise uninterrupted synchronous commits
 for a stream whose leader fails; minority writes remain forbidden. The original
 delivered work and validation history below are preserved.
+
+The committed [capacity experiments](benchmarks/capacity/README.md) extend the
+initial research with runnable sources, raw trials, a compact active representation,
+per-host limits and cost inputs. The historical speedup estimates above are not
+universal: a sparse gather can lose to a dense scan, while the compact active set
+was faster in this run. The ADR selects prototype profiles and records that
+existing whole-volume bindings still require a per-group admission protocol before
+dynamic host assignment. This closes a design decision, not runtime M3a delivery.
 
 ## Validation so far
 

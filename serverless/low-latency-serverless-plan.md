@@ -788,8 +788,13 @@ uniform lookups, one warmup and three timed trials, twenty scan passes per trial
 Reimplement the fluid sensitivity with 1/16/64/256 groups, uniform/20%-hot traffic,
 50/200/1000 ms assumed pauses, host/AZ failure and a queue bound of 0.5 seconds of
 per-group service capacity. Preserve runnable harnesses and raw results with the
-M3a implementation; those artifacts currently reside in the research chat's
-workspace and are not part of the delivered branch.
+M3a implementation. The original research harnesses were not committed. The
+branch now contains [runnable capacity experiments](benchmarks/capacity/README.md)
+and a [selected cell/active-state ADR](low-latency-capacity-adr.md), with new raw
+trials, compact-active scans, per-host resource/failure accounting and explicit
+cost assumptions. Their results describe the committed implementation rather than
+claiming identical numbers to the earlier exploratory probe. M3a runtime bounds
+and per-group assignment remain implementation work alongside M4.
 
 At 1M 1-KiB operations/s, two follower copies require 16.384 Gbit/s aggregate
 payload egress, and two search deliveries add another 16.384 Gbit/s across serving

@@ -1,0 +1,10 @@
+{
+  "kernel": "Linux-6.18.55-x86_64-with-glibc2.41",
+  "compiler": "g++ (Debian 14.2.0-19) 14.2.0",
+  "flags": "-O3 -std=c++20 -Wall -Wextra -Werror",
+  "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+  "cgroup_memory_max": "17179869184",
+  "note": "Single-thread local packed-array primitives; no concurrent Gradle tests.",
+  "cgroup_cpu_max": "400000 100000",
+  "probe_variants": "full eligibility scan; active-index gather; compact active working set"
+}
