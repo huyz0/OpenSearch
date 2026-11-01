@@ -63,6 +63,13 @@ public final class ServerlessWriterEngine extends InternalEngine {
          */
         List<WalRecord> recordsFor(ShardId shardId) throws IOException;
 
+        /**
+         * Streams the history that this shard must replay.
+         *
+         * @param shardId shard being opened
+         * @param consumer receives records in replay order
+         * @throws IOException if reading or consuming history fails
+         */
         default void forEachRecord(ShardId shardId, org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer)
             throws IOException {
             for (WalRecord record : recordsFor(shardId)) {
@@ -70,7 +77,14 @@ public final class ServerlessWriterEngine extends InternalEngine {
             }
         }
 
-        /** True transfers ownership until the reconciler completes legacy replay. */
+        /**
+         * Offers the validated spool for retention until the reconciler completes legacy replay.
+         *
+         * @param shardId shard being recovered
+         * @param spool validated local replay history
+         * @return true to transfer spool ownership, false to leave it with the caller
+         * @throws IOException if retaining the spool fails
+         */
         default boolean replayed(ShardId shardId, ReplaySpool spool) throws IOException {
             return false;
         }

@@ -200,6 +200,8 @@ public final class BlockCacheDirectory extends FilterDirectory {
      * expensive thing a publish did while holding the shard's exclusive guard: a fleet's thread dumps had a hundred
      * publish threads in fsync and every write to those shards queued behind them, at three seconds' median latency on
      * a store answering in a tenth of one.
+     *
+     * @param names cache files whose synchronization is unnecessary
      */
     @Override
     public void sync(java.util.Collection<String> names) {}

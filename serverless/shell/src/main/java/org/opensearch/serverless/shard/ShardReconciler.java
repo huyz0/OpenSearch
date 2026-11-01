@@ -534,7 +534,13 @@ public final class ShardReconciler {
         return records;
     }
 
-    /** Streams a fenced log once; the engine retains only a disposable local spool. */
+    /**
+     * Streams a fenced log once; the engine retains only a disposable local spool.
+     *
+     * @param shardId shard being recovered
+     * @param consumer receives records in replay order
+     * @throws IOException if reading or consuming a record fails
+     */
     public void forEachReplayRecord(
         ShardId shardId,
         org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
@@ -554,6 +560,14 @@ public final class ShardReconciler {
         }
     }
 
+    /**
+     * Transfers a disposable replay spool to the reconciler until legacy replay completes.
+     *
+     * @param shardId shard whose recovery owns the spool
+     * @param spool validated local history to retain
+     * @return true when ownership has transferred
+     * @throws IOException if another spool is already retained for this shard
+     */
     public boolean retainReplay(ShardId shardId, org.opensearch.serverless.engine.ReplaySpool spool) throws IOException {
         if (replayedRecords.putIfAbsent(shardId, spool) != null) {
             throw new IOException("replay already retained for " + shardId);
@@ -1345,8 +1359,11 @@ public final class ShardReconciler {
 
     /** The role of the failed engine removed, or whether a replacement already owns its slot. */
     public enum FailedShardRelease {
+        /** The failed engine has already been replaced or removed. */
         NOT_CURRENT,
+        /** The current reader was removed. */
         READER,
+        /** The current writer was removed. */
         WRITER
     }
 

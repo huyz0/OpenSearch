@@ -119,7 +119,12 @@ public final class AliasRecord {
         return additions;
     }
 
-    /** Published and preparing members both prevent a concurrent cleanup from removing their hint. */
+    /**
+     * Published and preparing members both prevent a concurrent cleanup from removing their hint.
+     *
+     * @param index index name whose hint is being considered
+     * @return whether this record protects that index hint
+     */
     public boolean protectsHint(String index) {
         return indices.contains(index) || additions.contains(index);
     }

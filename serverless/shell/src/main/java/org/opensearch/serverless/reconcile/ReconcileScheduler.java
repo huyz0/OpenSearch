@@ -135,7 +135,16 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     private final AtomicLong janitorReplays = new AtomicLong();
     private final AtomicLong janitorForgotten = new AtomicLong();
 
-    /** What the janitor has done since the node started, and the store requests its passes made. */
+    /**
+     * What the janitor has done since the node started, and the store requests its passes made.
+     *
+     * @param passes completed janitor passes
+     * @param storeRequests object-store requests attributed to those passes
+     * @param examined shard heads examined
+     * @param released dead owners whose heads were released
+     * @param replays recovery activations started
+     * @param claimsForgotten obsolete claims removed
+     */
     public record JanitorStats(long passes, long storeRequests, long examined, long released, long replays, long claimsForgotten) {
     }
 

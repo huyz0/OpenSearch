@@ -45,8 +45,15 @@ import java.util.zip.CheckedOutputStream;
  * format changes: failure discards this directory and leaves the original WAL available for retry.
  */
 public final class ReplaySpool implements AutoCloseable {
+    /** Streams fenced history into a disposable local spool. */
     @FunctionalInterface
     public interface Source {
+        /**
+         * Supplies records in replay order.
+         *
+         * @param consumer receives each source record
+         * @throws IOException if reading or consuming a record fails
+         */
         void read(CheckedConsumer<WalRecord, IOException> consumer) throws IOException;
     }
 
@@ -68,12 +75,28 @@ public final class ReplaySpool implements AutoCloseable {
         records = path.resolve("records");
     }
 
-    /** Caller must hold the shard's exclusive engine lock; stale files belong to an interrupted open. */
+    /**
+     * Captures history after deleting stale files from an interrupted shard open.
+     * The caller must hold the shard's exclusive engine lock.
+     *
+     * @param ownedDirectory disposable replay directory owned exclusively by this shard
+     * @param source fenced history to capture
+     * @return validated spool whose ownership belongs to the caller
+     * @throws IOException if cleanup, capture or validation fails
+     */
     public static ReplaySpool captureExclusive(Path ownedDirectory, Source source) throws IOException {
         IOUtils.rm(ownedDirectory);
         return capture(ownedDirectory, source);
     }
 
+    /**
+     * Captures and validates fenced history in a new disposable child directory.
+     *
+     * @param parent parent for the temporary spool directory
+     * @param source fenced history to capture
+     * @return validated spool whose ownership belongs to the caller
+     * @throws IOException if writing or validating the spool fails
+     */
     public static ReplaySpool capture(Path parent, Source source) throws IOException {
         final ReplaySpool spool = new ReplaySpool(parent);
         boolean success = false;
@@ -355,14 +378,30 @@ public final class ReplaySpool implements AutoCloseable {
         }
     }
 
+    /**
+     * Returns the number of operations carrying original sequence identities.
+     *
+     * @return number of modern replay operations
+     */
     public int modernCount() {
         return modernCount;
     }
 
+    /**
+     * Returns the highest captured sequence number.
+     *
+     * @return highest sequence number, or -1 when no sequence identity was captured
+     */
     public long highestSeqNo() {
         return highest;
     }
 
+    /**
+     * Opens a streaming snapshot of modern operations, preserving their original identities.
+     *
+     * @return independently closeable snapshot of modern operations
+     * @throws IOException if opening the validated spool fails
+     */
     public Translog.Snapshot snapshot() throws IOException {
         final var input = reader();
         return new Translog.Snapshot() {
@@ -403,6 +442,12 @@ public final class ReplaySpool implements AutoCloseable {
         };
     }
 
+    /**
+     * Streams eligible legacy records in source order, skipping validated collisions with modern records.
+     *
+     * @param consumer receives legacy records requiring replay
+     * @throws IOException if reading, validation or consumption fails
+     */
     public void forEachLegacy(CheckedConsumer<WalRecord, IOException> consumer) throws IOException {
         if (legacy == false) {
             return;

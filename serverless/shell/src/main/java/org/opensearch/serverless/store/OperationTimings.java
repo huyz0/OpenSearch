@@ -76,7 +76,17 @@ public final class OperationTimings {
         return Map.copyOf(result);
     }
 
-    /** One approximate histogram snapshot. All durations are nanoseconds. */
+    /**
+     * One approximate histogram snapshot. All durations are nanoseconds.
+     *
+     * @param samples completed timing samples
+     * @param failures samples reporting a failed operation
+     * @param totalNanos sum of sampled durations
+     * @param maxNanos longest sampled duration
+     * @param p50UpperBoundNanos upper bound of the median histogram bucket
+     * @param p95UpperBoundNanos upper bound of the 95th percentile bucket
+     * @param p99UpperBoundNanos upper bound of the 99th percentile bucket
+     */
     public record Snapshot(long samples, long failures, long totalNanos, long maxNanos, long p50UpperBoundNanos, long p95UpperBoundNanos,
         long p99UpperBoundNanos) {
     }

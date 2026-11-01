@@ -208,6 +208,15 @@ public final class ObjectStores {
         return ATTRIBUTION.get();
     }
 
+    /**
+     * Attributes this thread's object-store requests to a sink while running work, then restores the previous attribution.
+     *
+     * @param sink request counter, or null to keep the current attribution
+     * @param work operation whose requests should be attributed
+     * @param <T> operation result type
+     * @return result returned by the operation
+     * @throws Exception if the operation fails
+     */
     public static <T> T attributedTo(java.util.concurrent.atomic.AtomicLong sink, java.util.concurrent.Callable<T> work) throws Exception {
         if (sink == null) {
             return work.call();
@@ -225,6 +234,7 @@ public final class ObjectStores {
         }
     }
 
+    /** Counts object-store operations and attributes requests to the current work counter. */
     public static final class Metered implements BlobStore {
 
         private final BlobStore delegate;

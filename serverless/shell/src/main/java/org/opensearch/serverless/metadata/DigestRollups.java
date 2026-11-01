@@ -103,7 +103,12 @@ public final class DigestRollups {
         this.base = base;
     }
 
-    /** One shard's part of an entry: the term of a writer holding it, zero if none; and its digest, null if never published. */
+    /**
+     * One shard's ownership and published pruning state.
+     *
+     * @param ownerTerm writer term, or zero when unowned
+     * @param digest published digest, or null when none has been published
+     */
     public record ShardState(long ownerTerm, PruningDigest digest) {
     }
 
@@ -113,6 +118,7 @@ public final class DigestRollups {
      * @param uuid the incarnation the entry was written for
      * @param shards the incarnation's shard count
      * @param states one per shard
+     * @param alias whether this entry represents an alias requiring target resolution
      */
     public record Entry(String uuid, int shards, List<ShardState> states, boolean alias) {
 
@@ -320,7 +326,12 @@ public final class DigestRollups {
         return removed[0];
     }
 
-    /** Whether an entry records no owner and no published digest for any shard. */
+    /**
+     * Whether an entry records no owner and no published digest for any shard.
+     *
+     * @param entry index entry to inspect
+     * @return true if every shard has neither ownership nor a digest
+     */
     public static boolean recordsNothing(Entry entry) {
         for (ShardState state : entry.states()) {
             if (state.ownerTerm() != 0L || state.digest() != null) {

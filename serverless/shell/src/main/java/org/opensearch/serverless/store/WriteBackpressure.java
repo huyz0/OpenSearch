@@ -165,7 +165,14 @@ public final class WriteBackpressure {
         }
     }
 
-    /** What the limiter is doing now. */
+    /**
+     * What the limiter is doing now.
+     *
+     * @param limit current admission limit
+     * @param inFlight admitted writes still running
+     * @param appendMillis smoothed append duration in milliseconds
+     * @param refused cumulative admission refusals
+     */
     public record Stats(int limit, int inFlight, long appendMillis, long refused) {
     }
 

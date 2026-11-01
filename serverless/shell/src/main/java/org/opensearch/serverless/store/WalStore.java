@@ -474,7 +474,12 @@ public final class WalStore implements org.opensearch.serverless.log.DurableOper
         forEachReplayableAfterFencing(consumer);
     }
 
-    /** Reads fenced history without retaining decoded records between read windows. */
+    /**
+     * Reads fenced history without retaining decoded records between read windows.
+     *
+     * @param consumer receives records in recovery order
+     * @throws IOException if listing, reading or consuming history fails
+     */
     public void forEachReplayableAfterFencing(org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer) throws IOException {
         // One listing of the log's root says which terms exist and whether any legacy seal does: the seals
         // directory is listed only when it is there, which on a log begun after fences is never.

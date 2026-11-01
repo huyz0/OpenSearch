@@ -85,7 +85,15 @@ public final class PruningDigest {
      * @param locale for a date, the mapping's locale tag; null otherwise
      */
     public record FieldRange(String type, Number min, Number max, String format, String locale) {
-        /** Bounds held as Long, or Double for a floating type, however they were read. */
+        /**
+         * Normalizes bounds to Long, or Double for floating types, without narrowing integral values.
+         *
+         * @param type mapped numeric or date type
+         * @param min lower bound in its stored unit
+         * @param max upper bound in its stored unit
+         * @param format date mapping format, or null for other types
+         * @param locale date mapping locale, or null for other types
+         */
         public FieldRange {
             // Branches, not a conditional expression: {@code c ? Double : Long} is numeric promotion, which
             // unboxes both to double -- and a long above 2^53 rounded to a double can land below its true value,

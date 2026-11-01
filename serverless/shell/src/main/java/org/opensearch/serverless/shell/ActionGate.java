@@ -288,6 +288,14 @@ public final class ActionGate {
     /**
      * Runs the same asynchronous chain, moving transport-thread work onto the generic pool.
      * A null pool preserves caller-thread execution for existing adapters.
+     *
+     * @param workerPool pool for operation work, or null to run on the caller
+     * @param action action name passed through filters
+     * @param request request admitted by the filter chain
+     * @param work asynchronous operation invoked after admission
+     * @param view converts operation results to and from action responses
+     * @param completion receives the result after the entire chain finishes
+     * @param <T> operation result type
      */
     public <T> void runAsync(
         org.opensearch.threadpool.ThreadPool workerPool,

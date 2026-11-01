@@ -312,7 +312,12 @@ public final class ShardHeadStore {
         return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied();
     }
 
-    /** A dead owner's head given back: the head as the owner left it, and the unowned one that replaced it. */
+    /**
+     * A dead owner's head given back: its previous state and the unowned replacement.
+     *
+     * @param previous head held by the dead owner
+     * @param released unowned head published after fencing that owner
+     */
     public record Abandoned(ShardHead previous, ShardHead released) {
     }
 
@@ -425,7 +430,13 @@ public final class ShardHeadStore {
         return released;
     }
 
-    /** A head of one incarnation, as read, and the generation it was read at. */
+    /**
+     * A head of one incarnation, as read, and the generation it was read at.
+     *
+     * @param blobName register name containing the head
+     * @param generation observed conditional register generation
+     * @param head observed shard ownership and publication state
+     */
     public record HeadAt(String blobName, long generation, ShardHead head) {
     }
 
