@@ -27,6 +27,47 @@ import java.util.concurrent.TimeUnit;
 /** Real JVM restart/crash tests, distinct from power-loss and three-AZ qualification. */
 @SuppressFileSystems("*")
 public class RatisJournalProcessTests extends OpenSearchTestCase {
+    public void testAnEmptyOriginalVoterCanRestartBeforeInitialQuorumWithoutLosingItsVoteTerm() throws Exception {
+        final var fixture = fixture(1);
+        final var nodes = new ArrayList<JournalProcess>();
+        try {
+            final var original = fixture.configurations().getFirst();
+            final var first = JournalProcess.startAssigned(original, createTempDir().resolve("initial-original.log"));
+            nodes.add(first);
+            assertEquals(-1, first.progress(0).flushed());
+            assertTrue(first.vote(0, 7));
+            final long savedTerm = first.progress(0).term();
+            assertTrue(savedTerm >= 7);
+            first.stop();
+            final var recovery = new JournalConfiguration(
+                original.deploymentId(),
+                original.localVoterId(),
+                original.directory(),
+                original.groups(),
+                false,
+                original.limits()
+            );
+            final var recovered = JournalProcess.startAssigned(recovery, createTempDir().resolve("empty-original-restart.log"));
+            nodes.set(0, recovered);
+            assertEquals(-1, recovered.progress(0).flushed());
+            assertTrue("recovery must retain the durable voting term", recovered.progress(0).term() >= savedTerm);
+            assertFalse("the recovered voter cannot grant another candidate the same term", recovered.vote(0, savedTerm, 1));
+            for (int i = 1; i < fixture.configurations().size(); i++) {
+                nodes.add(JournalProcess.startAssigned(fixture.configurations().get(i), createTempDir().resolve("other-original.log")));
+            }
+            final var elected = leader(nodes, 0);
+            elected.activate(0);
+            final var stream = new ShardLogId(fixture.deployment(), "empty-bootstrap-restart", 0, UUID.randomUUID());
+            elected.append(0, operation(stream, 0));
+            elected.close();
+            final var replacement = leader(nodes, 0);
+            replacement.append(0, operation(stream, 1));
+            assertEquals(2, replacement.scan(0, -1, Set.of(stream)).operations().size());
+        } finally {
+            closeAll(nodes);
+        }
+    }
+
     public void testLearnerCatchupPromotionAndReplacementQuorumSurviveRestart() throws Exception {
         final var fixture = fixture(1);
         final var nodes = new ArrayList<JournalProcess>();

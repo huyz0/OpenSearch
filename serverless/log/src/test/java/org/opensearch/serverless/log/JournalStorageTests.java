@@ -270,6 +270,44 @@ public class JournalStorageTests extends OpenSearchTestCase {
         expectThrows(IOException.class, () -> JournalStorage.open(recovery));
     }
 
+    public void testEmptyOriginalRecoveryNeedsAuthorityAndKeepsVotingMetadataMandatory() throws Exception {
+        final var configuration = configuration();
+        final UUID group = configuration.groups().getFirst().id();
+        final Path current = configuration.directory().resolve(group.toString()).resolve("current");
+        try (var storage = JournalStorage.open(configuration)) {
+            for (var assigned : configuration.groups()) {
+                initialize(storage, assigned.id());
+            }
+        }
+        Files.move(current.resolve("raft-meta.conf"), current.resolve("raft-meta.bootstrap"));
+        final var recovery = copy(configuration, configuration.groups(), false);
+        expectThrows(IOException.class, () -> JournalStorage.open(recovery));
+        try (var ignored = JournalStorage.open(recovery, Set.of(), Set.of(group))) {
+            assertTrue(Files.exists(current.resolve("raft-meta")));
+            assertFalse(Files.exists(current.resolve("raft-meta.conf")));
+        }
+        expectThrows(IOException.class, () -> JournalStorage.open(recovery, Set.of(), Set.of(UUID.randomUUID())));
+        Files.delete(current.resolve("raft-meta"));
+        expectThrows(IOException.class, () -> JournalStorage.open(recovery, Set.of(), Set.of(group)));
+    }
+
+    public void testAnEmptyBootstrapPermitCannotEraseAnEstablishedDurableBoundary() throws Exception {
+        final var configuration = configuration();
+        final UUID group = configuration.groups().getFirst().id();
+        try (var storage = JournalStorage.open(configuration)) {
+            for (var assigned : configuration.groups()) {
+                initialize(storage, assigned.id());
+            }
+            storage.recordFlushed(group, 0);
+        }
+        final Path directory = configuration.directory().resolve(group.toString());
+        Files.move(directory.resolve("current/raft-meta.conf"), directory.resolve("current/raft-meta.bootstrap"));
+        final byte[] before = Files.readAllBytes(directory.resolve("journal-floor"));
+        final var recovery = copy(configuration, configuration.groups(), false);
+        expectThrows(IOException.class, () -> JournalStorage.open(recovery, Set.of(), Set.of(group)));
+        assertArrayEquals(before, Files.readAllBytes(directory.resolve("journal-floor")));
+    }
+
     private static void initialize(JournalStorage storage, UUID group) throws Exception {
         final Path root = storage.groupDirectory(group);
         Files.createDirectories(root.resolve("current"));

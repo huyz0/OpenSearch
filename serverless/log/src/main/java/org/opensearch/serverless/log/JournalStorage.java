@@ -64,6 +64,13 @@ final class JournalStorage implements AutoCloseable {
 
     /** The trusted controller must authorize retirement from completed membership before this call. */
     static JournalStorage open(JournalConfiguration configuration, Set<UUID> retiredGroups) throws IOException {
+        return open(configuration, retiredGroups, Set.of());
+    }
+
+    /** Empty original recovery is authorized only for genesis whose catalog activation is still absent. */
+    static JournalStorage open(JournalConfiguration configuration, Set<UUID> retiredGroups, Set<UUID> emptyOriginalGroups)
+        throws IOException {
+        final Set<UUID> emptyOriginals = Set.copyOf(emptyOriginalGroups);
         final Set<UUID> retired = Set.copyOf(retiredGroups);
         final var assigned = configuration.groups()
             .stream()
@@ -71,6 +78,16 @@ final class JournalStorage implements AutoCloseable {
             .collect(java.util.stream.Collectors.toSet());
         if (assigned.containsAll(retired) == false || (configuration.bootstrap() && retired.isEmpty() == false)) {
             throw new IOException("retirement requires assigned groups on an established volume");
+        }
+        if (assigned.containsAll(emptyOriginals) == false
+            || emptyOriginals.stream().anyMatch(retired::contains)
+            || configuration.groups()
+                .stream()
+                .anyMatch(
+                    group -> emptyOriginals.contains(group.id())
+                        && group.peers().stream().noneMatch(peer -> peer.id().equals(configuration.localVoterId()))
+                )) {
+            throw new IOException("empty original recovery requires an assigned original voter outside retirement");
         }
         final var lease = JournalDiskIdentity.acquire(configuration.directory());
         JournalStorage storage = null;
@@ -100,7 +117,7 @@ final class JournalStorage implements AutoCloseable {
                     requireDirectory(directory.resolve("current"));
                     requireRegular(directory.resolve("current/raft-meta"));
                     final Path nativeConfiguration = directory.resolve("current/raft-meta.conf");
-                    final boolean emptyLearner = configuration.joiningPeer() != null
+                    final boolean learner = configuration.joiningPeer() != null
                         && configuration.groups()
                             .stream()
                             .filter(value -> value.id().equals(group))
@@ -108,9 +125,10 @@ final class JournalStorage implements AutoCloseable {
                             .orElseThrow()
                             .peers()
                             .stream()
-                            .noneMatch(peer -> peer.id().equals(configuration.localVoterId()))
+                            .noneMatch(peer -> peer.id().equals(configuration.localVoterId()));
+                    final boolean emptyBootstrap = (learner || emptyOriginals.contains(group))
                         && Files.exists(nativeConfiguration, LinkOption.NOFOLLOW_LINKS) == false;
-                    requireRegular(emptyLearner ? directory.resolve("current/raft-meta.bootstrap") : nativeConfiguration);
+                    requireRegular(emptyBootstrap ? directory.resolve("current/raft-meta.bootstrap") : nativeConfiguration);
                     storage.requireBinding(directory.resolve(INITIALIZED));
                     final var floor = JournalDurableFloor.open(directory.resolve(FLOOR), configuration.deploymentId(), lease.id, group);
                     storage.floors.put(group, floor);
@@ -123,8 +141,10 @@ final class JournalStorage implements AutoCloseable {
                         (long) configuration.limits().segmentBytes() + configuration.limits().queueBytes() + 1024,
                         maximumFiles
                     );
-                    if (emptyLearner && (floor.index() != -1 || observed != -1)) {
-                        throw new IOException("only an empty authorized learner can recover from its native bootstrap configuration");
+                    if (emptyBootstrap && (floor.index() != -1 || observed != -1)) {
+                        throw new IOException(
+                            "only an empty authorized voter or learner can recover from its native bootstrap configuration"
+                        );
                     }
                     storage.requireRetainedIndex(observed);
                     floor.persist(observed);

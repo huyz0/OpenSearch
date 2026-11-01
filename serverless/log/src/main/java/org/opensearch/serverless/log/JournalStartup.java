@@ -25,11 +25,13 @@ import java.util.UUID;
 final class JournalStartup {
     private JournalStartup() {}
 
-    record Authorized(Map<UUID, LogCheckpoint> activations, Set<UUID> retired, Map<UUID, RaftGroup> initialGroups) {
+    record Authorized(Map<UUID, LogCheckpoint> activations, Set<UUID> retired, Map<UUID, RaftGroup> initialGroups, Set<
+        UUID> emptyOriginals) {
         Authorized {
             activations = Map.copyOf(activations);
             retired = Set.copyOf(retired);
             initialGroups = Map.copyOf(initialGroups);
+            emptyOriginals = Set.copyOf(emptyOriginals);
         }
     }
 
@@ -53,6 +55,7 @@ final class JournalStartup {
         final var activations = new HashMap<UUID, LogCheckpoint>();
         final var retired = new HashSet<UUID>();
         final var initial = new HashMap<UUID, RaftGroup>();
+        final var emptyOriginals = new HashSet<UUID>();
         final UUID local = configuration.localVoterId();
         for (var group : configuration.groups()) {
             final boolean original = group.peers().stream().anyMatch(peer -> peer.id().equals(local));
@@ -63,6 +66,7 @@ final class JournalStartup {
                     throw new IOException("a learner requires activated genesis and its original durable intent");
                 }
                 initial.put(group.id(), raftGroup(group));
+                emptyOriginals.add(group.id());
                 continue;
             }
             if (head.genesis().deploymentId().equals(configuration.deploymentId()) == false
@@ -123,7 +127,7 @@ final class JournalStartup {
                 retired.add(group.id());
             }
         }
-        return new Authorized(activations, retired, initial);
+        return new Authorized(activations, retired, initial, emptyOriginals);
     }
 
     static RaftGroup raftGroup(JournalConfiguration.Group group) {

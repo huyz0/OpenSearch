@@ -63,6 +63,8 @@ public final class JournalProcessMain {
     static final int BACKGROUND_START = 30;
     static final int BACKGROUND_STATUS = 31;
     static final int BACKGROUND_STOP = 32;
+    static final int VOTE = 19;
+
     static final int FRAME_LIMIT = 17 * 1024;
 
     private JournalProcessMain() {}
@@ -212,22 +214,24 @@ public final class JournalProcessMain {
         };
         try (
             var journal = memberships.isEmpty()
-                ? RatisJournal.open(
-                    configuration,
-                    (X509KeyManager) keyFactory.getKeyManagers()[0],
-                    (X509TrustManager) trustFactory.getTrustManagers()[0],
-                    probe,
-                    requiredActivations
-                )
-                : RatisJournal.openAssigned(
-                    configuration,
-                    (X509KeyManager) keyFactory.getKeyManagers()[0],
-                    (X509TrustManager) trustFactory.getTrustManagers()[0],
-                    probe,
-                    memberships,
-                    originalJoins
-                );
+                && org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.journal.assigned", "false")) == false
+                    ? RatisJournal.open(
+                        configuration,
+                        (X509KeyManager) keyFactory.getKeyManagers()[0],
+                        (X509TrustManager) trustFactory.getTrustManagers()[0],
+                        probe,
+                        requiredActivations
+                    )
+                    : RatisJournal.openAssigned(
+                        configuration,
+                        (X509KeyManager) keyFactory.getKeyManagers()[0],
+                        (X509TrustManager) trustFactory.getTrustManagers()[0],
+                        probe,
+                        memberships,
+                        originalJoins
+                    );
             var writes = new BackgroundWrites(journal);
+
             var input = new DataInputStream(new BufferedInputStream(System.in));
             var output = new DataOutputStream(protocolOutput())
         ) {
@@ -313,12 +317,56 @@ public final class JournalProcessMain {
                             CompletableFuture.allOf(pending.toArray(CompletableFuture[]::new)).get(10, TimeUnit.SECONDS);
                             output.writeByte(0);
                         }
+                        case VOTE -> {
+                            final var group = groups.get(input.readInt());
+                            final long term = input.readLong();
+                            final int choice = input.readInt();
+                            if (choice < 0 || choice > 1) {
+                                throw new IOException("invalid fixture vote candidate");
+                            }
+                            final var candidate = group.peers()
+                                .stream()
+                                .filter(peer -> peer.id().equals(configuration.localVoterId()) == false)
+                                .skip(choice)
+                                .findFirst()
+                                .orElseThrow();
+                            final var request = org.apache.ratis.proto.RaftProtos.RequestVoteRequestProto.newBuilder()
+                                .setServerRequest(
+                                    org.apache.ratis.proto.RaftProtos.RaftRpcRequestProto.newBuilder()
+                                        .setRequestorId(
+                                            org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(
+                                                candidate.id().toString()
+                                            )
+                                        )
+                                        .setReplyId(
+                                            org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFromUtf8(
+                                                configuration.localVoterId().toString()
+                                            )
+                                        )
+                                        .setRaftGroupId(
+                                            org.apache.ratis.util.ProtoUtils.toRaftGroupIdProtoBuilder(RaftGroupId.valueOf(group.id()))
+                                        )
+                                        .setCallId(0)
+                                )
+                                .setCandidateTerm(term)
+                                .setCandidateLastEntry(
+                                    org.apache.ratis.proto.RaftProtos.TermIndexProto.newBuilder().setTerm(0).setIndex(-1)
+                                )
+                                .setPreVote(false)
+                                .build();
+                            final var reply = ((RaftServer) field(journal, "server")).requestVote(request);
+                            output.writeByte(0);
+                            output.writeBoolean(reply.getServerReply().getSuccess());
+                        }
                         case PROGRESS -> {
                             final UUID group = groups.get(input.readInt()).id();
                             final var log = ((RaftServer) field(journal, "server")).getDivision(RaftGroupId.valueOf(group)).getRaftLog();
                             output.writeByte(0);
                             output.writeLong(log.getFlushIndex());
                             output.writeLong(log.getLastCommittedIndex());
+                            output.writeLong(
+                                ((RaftServer) field(journal, "server")).getDivision(RaftGroupId.valueOf(group)).getInfo().getCurrentTerm()
+                            );
                         }
                         case SCAN -> {
                             final UUID group = groups.get(input.readInt()).id();

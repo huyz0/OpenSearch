@@ -112,7 +112,12 @@ bootstrap after quorum loss is forbidden.
 Recovery checks every assigned group's initialized marker, current directory,
 vote metadata, and persisted configuration before calling Ratis. Missing or
 inconsistent storage fails closed; native `RECOVER` is never allowed to silently
-format a wiped established voter. Initialization synchronizes newly created group
+format a wiped established voter. An assigned original voter whose genesis is not
+activated may recover its existing native bootstrap configuration only when both
+the durable boundary and verified log are empty. The initialized volume binding
+and recorded term/vote remain mandatory. This resumes a process stopped before
+its first quorum formed; it cannot reset a voter or erase an established prefix.
+Known activated membership never grants this exception. Initialization synchronizes newly created group
 directories up to the provisioned volume root before writing its marker.
 
 Before admitting logical operations, the local leader must complete

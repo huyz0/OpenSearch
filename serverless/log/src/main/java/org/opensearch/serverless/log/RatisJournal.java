@@ -314,7 +314,7 @@ public final class RatisJournal implements Closeable {
         if (configuration.joiningPeer() != null) {
             throw new IOException("learner startup requires its catalog-authorized original intent");
         }
-        return open(configuration, keyManager, trustManager, diskSpace, expectedActivations, Set.of(), Map.of());
+        return open(configuration, keyManager, trustManager, diskSpace, expectedActivations, Set.of(), Map.of(), Set.of());
     }
 
     /**
@@ -361,7 +361,7 @@ public final class RatisJournal implements Closeable {
                 retired.add(entry.getKey());
             }
         }
-        return open(configuration, keyManager, trustManager, diskSpace, activations, retired, Map.of());
+        return open(configuration, keyManager, trustManager, diskSpace, activations, retired, Map.of(), Set.of());
     }
 
     /**
@@ -393,7 +393,8 @@ public final class RatisJournal implements Closeable {
             diskSpace,
             authorized.activations(),
             authorized.retired(),
-            authorized.initialGroups()
+            authorized.initialGroups(),
+            authorized.emptyOriginals()
         );
     }
 
@@ -404,7 +405,8 @@ public final class RatisJournal implements Closeable {
         DiskSpaceProbe diskSpace,
         Map<UUID, LogCheckpoint> expectedActivations,
         Set<UUID> retiredGroups,
-        Map<UUID, RaftGroup> initialGroups
+        Map<UUID, RaftGroup> initialGroups,
+        Set<UUID> emptyOriginals
     ) throws IOException {
         Objects.requireNonNull(configuration);
         Objects.requireNonNull(keyManager);
@@ -422,7 +424,7 @@ public final class RatisJournal implements Closeable {
                 throw new IOException("activation requirement differs from authorized group lineage", failure);
             }
         }
-        final var storage = JournalStorage.open(configuration, retiredGroups);
+        final var storage = JournalStorage.open(configuration, retiredGroups, emptyOriginals);
         try {
             return new RatisJournal(configuration, storage, diskSpace, keyManager, trustManager, activations, initialGroups);
         } catch (IOException | RuntimeException | Error failure) {

@@ -231,5 +231,13 @@ archival remain pending.
   integration's local-publisher cleanup assertion was corrected and its three
   iterations passed. Curated artifact audits and unchanged-upstream checks passed.
 
+- Early original restart: an initialized original voter stopped before its first
+  quorum can resume from its native bootstrap configuration under unactivated
+  catalog authority. Term/vote metadata, binding and verified empty history remain
+  mandatory; activated membership and established prefixes refuse this exception.
+  A real child restart preserves its recorded term, refuses another candidate in
+  that term, forms the initial quorum and retains writes after leader loss.
+  Three iterations passed 192 unit and 78 journal cases, with log module check.
+
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.

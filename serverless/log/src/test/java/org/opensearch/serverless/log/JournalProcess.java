@@ -81,10 +81,26 @@ final class JournalProcess implements AutoCloseable {
         Map<UUID, JournalMembershipRecord> memberships,
         Map<UUID, JournalMembershipRecord> originalJoins
     ) throws IOException {
+        return start(configuration, log, requiredActivations, memberships, originalJoins, false);
+    }
+
+    static JournalProcess startAssigned(JournalConfiguration configuration, Path log) throws IOException {
+        return start(configuration, log, Map.of(), Map.of(), Map.of(), true);
+    }
+
+    private static JournalProcess start(
+        JournalConfiguration configuration,
+        Path log,
+        Map<UUID, LogCheckpoint> requiredActivations,
+        Map<UUID, JournalMembershipRecord> memberships,
+        Map<UUID, JournalMembershipRecord> originalJoins,
+        boolean assigned
+    ) throws IOException {
         final List<String> arguments = new ArrayList<>();
         arguments.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
         arguments.add("-Xms64m");
         arguments.add("-Xmx256m");
+        arguments.add("-Dtests.journal.assigned=" + assigned);
         arguments.add("-Dtests.journal.retained=" + configuration.limits().maximumRetainedEntries());
         arguments.add("--enable-native-access=ALL-UNNAMED");
         arguments.add("-Dlog4j2.configurationFile=" + JournalProcessMain.class.getResource("journal-process-log4j2.xml"));
@@ -186,6 +202,18 @@ final class JournalProcess implements AutoCloseable {
         exchange(JournalProcessMain.BACKGROUND_STOP, out -> {}, in -> null);
     }
 
+    boolean vote(int group, long term) throws IOException {
+        return vote(group, term, 0);
+    }
+
+    boolean vote(int group, long term, int candidate) throws IOException {
+        return exchange(JournalProcessMain.VOTE, out -> {
+            out.writeInt(group);
+            out.writeLong(term);
+            out.writeInt(candidate);
+        }, DataInputStream::readBoolean);
+    }
+
     void release() throws IOException {
         exchange(JournalProcessMain.RELEASE, out -> {}, in -> null);
     }
@@ -209,11 +237,15 @@ final class JournalProcess implements AutoCloseable {
         }, in -> null);
     }
 
-    record Progress(long flushed, long committed) {
+    record Progress(long flushed, long committed, long term) {
     }
 
     Progress progress(int group) throws IOException {
-        return exchange(JournalProcessMain.PROGRESS, out -> out.writeInt(group), in -> new Progress(in.readLong(), in.readLong()));
+        return exchange(
+            JournalProcessMain.PROGRESS,
+            out -> out.writeInt(group),
+            in -> new Progress(in.readLong(), in.readLong(), in.readLong())
+        );
     }
 
     RatisJournal.ScanBatch scan(int group, long after, Set<ShardLogId> selection) throws IOException {

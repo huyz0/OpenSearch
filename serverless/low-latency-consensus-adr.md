@@ -472,3 +472,19 @@ the old path, and replacement tests drain all accepted concurrent proposals
 before killing the old leader, then verify acknowledged history on the new quorum.
 Connection cleanup remains local: a controller publishing or retrying completion
 reconciles its own transport after checking every colocated group's membership.
+
+## Restart before initial quorum
+
+An original voter can persist its bootstrap configuration and term/vote without
+receiving any log entry. Before the initial all-voter activation, a restart then
+has no normal `raft-meta.conf`. Requiring that normal configuration stranded the
+voter even though its original authority and vote were intact.
+
+Assigned startup grants a narrowly scoped empty-original permit only while the
+catalog has no activated genesis. Recovery still requires the immutable initialized
+binding, voting metadata, native bootstrap configuration, empty durable boundary,
+and verified empty log. Known activated heads, static startup without catalog
+authority, missing vote metadata, and nonempty histories do not get this permit.
+A child-JVM test grants a real vote, restarts the original voter, verifies the
+term survives and another candidate is refused in that term, then forms the quorum
+and verifies writes survive another leader loss.

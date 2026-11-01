@@ -108,6 +108,31 @@ public class JournalStartupTests extends OpenSearchTestCase {
         );
     }
 
+    public void testOnlyUnactivatedOriginalAssignmentsAuthorizeEmptyRecovery() throws Exception {
+        final var pending = pending();
+        final var group = pending.genesis().initialPlacement();
+        final var configuration = new JournalConfiguration(
+            pending.genesis().deploymentId(),
+            group.peers().getFirst().id(),
+            Path.of("unused"),
+            List.of(group),
+            false,
+            JournalConfiguration.Limits.defaults()
+        );
+        assertEquals(java.util.Set.of(group.id()), JournalStartup.authorize(configuration, Map.of(), Map.of()).emptyOriginals());
+        assertTrue(
+            JournalStartup.authorize(configuration, Map.of(group.id(), JournalMembershipRecord.initial(pending.genesis())), Map.of())
+                .emptyOriginals()
+                .isEmpty()
+        );
+        assertTrue(JournalStartup.authorize(configuration, Map.of(group.id(), pending), Map.of()).emptyOriginals().isEmpty());
+        assertTrue(
+            JournalStartup.authorize(learner(pending, false), Map.of(group.id(), pending), Map.of(group.id(), pending))
+                .emptyOriginals()
+                .isEmpty()
+        );
+    }
+
     private static JournalConfiguration learner(JournalMembershipRecord pending, boolean bootstrap) {
         final var joining = pending.pending()
             .target()
