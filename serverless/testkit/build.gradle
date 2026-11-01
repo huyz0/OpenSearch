@@ -60,6 +60,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessLatencyBenchmarkTests.class'
   exclude '**/JournalGroupCatalogRuntimeTests.class'
   exclude '**/JournalControllerRuntimeTests.class'
+  exclude '**/CommittedMutationReplayTests.class'
   exclude '**/RatisMembershipSpikeTests.class'
   exclude '**/RatisPersistenceSpikeTests.class'
   exclude '**/RatisGroupCountBenchmarkTests.class'
@@ -255,6 +256,16 @@ tasks.register('journalCatalogTest', Test) {
   systemProperty 'tests.system_call_filter', 'false'
 }
 tasks.named('check').configure { dependsOn 'journalCatalogTest' }
+
+tasks.register('journalReplayTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/CommittedMutationReplayTests.class'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'tests.system_call_filter', 'false'
+  jvmArgs '--add-opens=java.base/java.util=ALL-UNNAMED'
+}
+tasks.named('check').configure { dependsOn 'journalReplayTest' }
 
 // Match only SDK-owned global timer threads, independently of their lazy creator's thread group.
 ['consensusTest', 'consensusBenchmark', 'journalCatalogTest'].each { name ->

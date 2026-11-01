@@ -136,6 +136,26 @@ shard activation, ownership and schema binding. A stable UUID field alone does
 not implement retry deduplication or its retention policy. The legacy `WalRecord`
 format and launcher behavior remain unchanged.
 
+`CommittedMutationReplayer` connects a retained journal to a native serving shard
+for one fixed, already installed ownership/term/mapping binding. Each poll obtains
+its own bounded committed scan from `RatisJournal`; callers cannot supply a
+deserialized checkpoint as commit proof. The target must be a primary with the
+exact store owned by the supplied committed-serving engine. Replay validates the
+binding, payload kind/term, and consecutive resolved sequence positions before
+native application, including explicit no-ops. It checks the returned identity
+and advances selected-stream progress only after successful application. Physical
+scan progress also covers skipped streams. A failure permanently stops that
+instance, preserving its successfully applied prefix.
+
+The host must exclude concurrent shard lifecycle/mapping/term changes while
+polling. This adapter starts at the beginning of retained history; it does not
+accept an unverified resume cursor. Ownership/schema transitions, snapshot/archive
+bootstrap and internal retry records need their controllers before runtime
+activation. Its applied checkpoint is neither a refreshed-reader proof nor
+linearizable latest-read authority. Run the local TLS/native-shard integration
+with `./gradlew :serverless:testkit:journalReplayTest`; it is also part of the
+testkit's checks. The launcher still does not enable quorum-mode index writes.
+
 ### Physical group footprint
 
 Reproduce the bounded probe with:

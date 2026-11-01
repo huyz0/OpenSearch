@@ -30,6 +30,10 @@ public final class CommittedServingEngine extends InternalEngine {
         super(configuration.toBuilder().primaryOperationPolicy(CommittedPrimaryOperationPolicy.INSTANCE).build());
     }
 
+    void ensureReplayOpen() {
+        ensureOpen();
+    }
+
     @Override
     public Engine.IndexResult index(Engine.Index operation) throws IOException {
         ensureOpen();
