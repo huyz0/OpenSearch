@@ -14,8 +14,31 @@ archival remain pending.
 | M1 | Append and streaming recovery interfaces, optional async dispatch with cancellation/rejection semantics, existing S3 path integration, bounded versioned log/checkpoint identity codecs | Subscription/token formats and shell adapters for consensus |
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
+| M3a | Design evidence only: compact descriptor microbenchmark and failure/capacity model; no runtime implementation | Cell isolation, partitioned metadata, stable buckets, bounded active state and weighted capacity routing |
 | M4–M9 | Not implemented | Quorum writes, fresh readers, selective replication, archival, lifecycle, migration |
+| M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
+| M6a | Planned; no runtime completion claimed | Missing-chunk/resumable bulk shard copies, peer/S3 source selection and live-versus-recovery scheduling |
+| M9a | Planned; no runtime completion claimed | Fenced hot-shard movement, cell expansion and post-failure capacity headroom |
 | M10–M12 | Not implemented | Scale/cost/failure qualification, controlled rollout, optional attribute/QUIC extensions |
+
+## Revised delivery order (1 November 2026)
+
+The plan now treats local benchmarks and models as exploratory evidence for design
+selection, not as a requirement for a production-like benchmark environment.
+M3a closes the cell/metadata/capacity design before M4 integration is finalized;
+its runtime bounds develop alongside M4. M4a adds failure isolation and explicit
+retry outcomes. M6a makes actual cross-node shard data copying a first-class
+milestone; its design can proceed before consensus tuning finishes. M9a covers
+safe hotspot relocation and cell expansion. M10 retains production qualification.
+
+The initial local compact-array probe suggests active-only scheduling avoids
+43–46x work at 1% activity. The fluid model shows that more equally provisioned
+groups can worsen a 20%-hot-stream overload. These are design estimates, not
+OpenSearch throughput, JVM heap, multi-AZ availability or completed implementation
+evidence. Millions of logical descriptors do not imply millions of open engines.
+Avoiding a global write stop does not promise uninterrupted synchronous commits
+for a stream whose leader fails; minority writes remain forbidden. The original
+delivered work and validation history below are preserved.
 
 ## Validation so far
 

@@ -4,6 +4,7 @@ Status: implementation in progress; see [delivered scope](low-latency-progress.m
 Branch: `low-latency-serverless`.
 Starting point: `a6a174ca121` on `feature/serverlessshell`.
 Prepared: 31 October 2026, Australia/Sydney.
+Revised: 1 November 2026, Australia/Sydney: million-shard scaling and failure isolation.
 
 ## 1. Outcome and boundaries
 
@@ -125,8 +126,9 @@ The initial per-shard-group feasibility probe found substantial per-division thr
 overhead. Follow the [consensus ADR](low-latency-consensus-adr.md): use a bounded
 set of physical groups carrying multiple logical shard streams, with per-shard
 ordering, checkpoint vectors, ownership epochs, and fair scheduling. Qualify 1,000
-and 10,000 logical shards over that bounded group topology; do not extrapolate a
-ten-group probe into a claim of a tested 10,000-group deployment.
+and 10,000 active logical shards over that topology, and use the M3a exploratory
+model for 1M/10M mostly cold descriptors. Neither is evidence of millions of
+resident engines or independent groups; do not extrapolate the ten-group probe.
 
 Leader election is not a vote per write. Normal writes append to the elected
 leader and share persistence work. Membership changes use the library's safe
@@ -149,6 +151,45 @@ reconfiguration protocol, with catch-up before promotion and AZ checks.
 - Local SSD can disappear with an instance. Three replicas tolerate the specified
   one-AZ failure, not simultaneous loss of all unarchived replicas. State this
   failure envelope in the API and operational documentation.
+
+### 3.4 Millions of logical shards and isolated failures
+
+Target millions of logical shard descriptors, not millions of resident Lucene
+engines or independent Raft divisions. Divide the deployment into independently
+recoverable cells. Each cell owns a partition of metadata and a bounded pool of
+physical journal groups; distribute leadership by measured operations/second and
+bytes/second. Size cells and group pools from active load and measured overhead,
+not total descriptor count. A cell must not depend on a global descriptor scan or
+synchronous global metadata update for each document write.
+
+Use stable virtual buckets plus a versioned bucket-to-group map and sparse
+hot-shard overrides. Do not change a live hash-modulo-group-count mapping without
+a fenced handoff. Preserve OpenSearch document routing within each logical shard.
+Partition descriptor/mapping/checkpoint metadata, cache bounded working sets,
+activate engines lazily and schedule active shards only. Bound mapping size,
+cold-activation concurrency, resident engines, subscriptions and deduplication
+state; cold descriptors must not allocate permanent threads, sockets or timers.
+
+A failed group may pause its own ordered streams during election. Healthy groups
+and cells must continue independently; AZ loss can pause every group led in that
+AZ. No architecture here guarantees bounded synchronous write completion without
+a reachable quorum. Request receipt, durable acceptance, operation commit and
+search visibility remain separate states. Default synchronous responses retain
+their existing semantics. A durable asynchronous inbox is an optional API proposal,
+not an implicit success response; it cannot claim the final outcome of a script
+or conditional write before execution, and itself requires durable capacity.
+
+Keep bulk segment recovery/rebalance off the journal leader's critical path.
+Immutable manifests, missing-chunk detection, checksums, resumable peer/S3 fetches
+and fair bandwidth scheduling address actual data-copy costs. Small committed
+operations initially remain in Raft. Externalizing large payloads requires a
+separate proof: fault-domain-qualified payload durability before committing a
+reference, generation fencing and safe retention/GC. It is not a prerequisite for
+the first correct write path.
+
+Use exploratory local benchmarks and sensitivity models to choose designs early.
+They are sufficient for design iteration and are not blocked on provisioned
+three-AZ infrastructure. Production claims and release still need M10 evidence.
 
 ## 4. Correctness contracts and checkpoints
 
@@ -510,6 +551,23 @@ otherwise become difficult to assess. Push reviewed commits to this branch, no P
   loss works; two-AZ loss refuses progress; no independent legacy takeover occurs.
 - Commits: local persistence; group lifecycle; fault harness and recovery proof.
 
+### M3a — Cell isolation, lightweight metadata and capacity routing
+
+- Record an ADR for cells, bounded physical group pools, stable virtual buckets and
+  sparse hot-shard overrides. Keep already delivered M3 durability work intact.
+- Partition descriptors, mappings and checkpoints; bounded caches and active-only
+  scheduling must replace all-shard scans on admission, failover and progress paths.
+- Add lazy engine activation and explicit budgets for resident engines, mapping
+  bytes, FDs, native memory, subscriptions and cold-start concurrency.
+- Estimate 1M/10M logical descriptors at 0.1/1/10% activity using local primitives
+  and models. Probe dense activity at feasible sizes; distinguish descriptors from
+  real engines and publish the limiting resource rather than claiming full scale.
+- Model 1/4/16 cells, 16/64/256 groups and 12/24 journal hosts per cell as candidate
+  points, not deployment defaults. Hold resources constant when comparing layouts.
+- Exit: a reviewable capacity model and bounded runtime design; local estimates
+  support a selected candidate. Multi-host qualification is deferred to M10.
+- Commits: scaling ADR/model; metadata routing/cache; active scheduler and budgets.
+
 ### M4 — Mutation integration and compatibility
 
 - Route opt-in mode through the consensus append/apply pipeline. Preserve scripts,
@@ -519,6 +577,25 @@ otherwise become difficult to assess. Push reviewed commits to this branch, no P
 - Exit: operation histories match the reference model under failure and replay;
   no serving path can open the speculative engine.
 - Commits: index/delete; bulk/update/scripts; mappings/lifecycle and action filters.
+
+### M4a — Failover continuity, retry outcomes and isolation
+
+- Define synchronous commit, timeout/unknown outcome and search visibility clearly.
+  Use stable operation IDs for internal retries and durably preserve original
+  results through failover. Specify a bounded retry/dedup retention contract.
+- Keep healthy groups/cells admitting and committing during another group's
+  election; prevent global admission locks, metadata scans and retry storms.
+- Add bounded queues, deadlines, jittered retry budgets and monotonic route epochs.
+  Stale or minority leaders cannot acknowledge writes or redirect indefinitely.
+- Model single leader-host loss, AZ loss, slow storage and control-plane outage
+  under uniform/skewed load; account for all offered work including rejections and
+  outstanding requests. Measure actual failover pauses later rather than inventing
+  election timing from a simulation.
+- Consider planned leadership transfer where supported. An optional asynchronous
+  inbox needs a separate API/storage review and never silently changes normal ACKs.
+- Exit: deterministic failure histories preserve operation semantics and healthy
+  group progress; no claim of zero-pause commits on the affected stream.
+- Commits: retry/result retention; routing/failure isolation; failure-load harness.
 
 ### M5 — Grouped refresh and freshness API
 
@@ -539,6 +616,23 @@ otherwise become difficult to assess. Push reviewed commits to this branch, no P
 - Exit: adding search replicas increases query capacity without adding voters or
   waiting for every replica on writes. Unassigned nodes receive no shard payload.
 - Commits: placement; stream protocol; replica lifecycle; freshness-aware routing.
+
+### M6a — Bulk shard copies, recovery and live-traffic scheduling
+
+- Copy only missing immutable segment files/chunks with bounded manifests,
+  checksums, resumable offsets and peer/S3 source selection. Search nodes subscribe
+  only to assigned shard data; bulk copies need not pass through journal leaders.
+- Separate bounded live-write, live-tail and bulk-recovery queues and bandwidth
+  budgets. Add tenant fairness, connection-wide limits and short bulk scheduling
+  quanta; separate connections still share NIC, storage and CPU.
+- Keep searchable publication behind complete verified dependencies. Interrupted
+  copies resume safely; corrupt/missing chunks never produce a covering checkpoint.
+- Estimate CPU/GB, payload bytes, transfer time and replication lag locally. Compare
+  recovery budgets of 25/50/80% of link capacity with live traffic before selecting
+  defaults. TCP is the baseline; QUIC remains an optional transport experiment.
+- Exit: repeatable chunk recovery and bounded interference demonstrated in local
+  histories; real-network throughput and latency claims remain M10 qualification.
+- Commits: manifest/chunk protocol; resumable copy; fair transfer scheduler.
 
 ### M7 — Asynchronous S3 archive and segment publication
 
@@ -571,6 +665,22 @@ otherwise become difficult to assess. Push reviewed commits to this branch, no P
   acknowledged operation; old binaries cannot open quorum-mode shards.
 - Commits: mode transitions; operations tooling; migration fault tests.
 
+### M9a — Hot-shard relocation and cell expansion
+
+- Balance measured active load and reserve failure headroom. A 20%-hot stream must
+  not be trapped in a group provisioned only for uniform average load.
+- Implement restartable handoff: durable intent, old-generation fencing, committed
+  end barrier, target catch-up, new routing generation and in-flight reconciliation.
+  Never bypass a failed quorum by accepting the same stream in an arbitrary group.
+- Expand cells/group pools without remapping all live streams or stopping unrelated
+  writes. Recover interrupted transitions and protect retained tokens and archives.
+- Model post-host/AZ-loss capacity, retry amplification and concurrent recovery.
+  Increasing group count alone is not a hotspot fix; one ordered stream still has
+  a serial constraint unless an explicit semantic partition is introduced.
+- Exit: local handoff/failure histories preserve acknowledged operations and keep
+  unrelated streams progressing; weighted capacity and bottlenecks are documented.
+- Commits: load accounting; fenced stream handoff; expansion/recovery controls.
+
 ### M10 — Performance, network, cost, and scale qualification
 
 - Run the full matrix in section 12 with measured three-AZ infrastructure, rather
@@ -593,17 +703,28 @@ otherwise become difficult to assess. Push reviewed commits to this branch, no P
 - Exit: incident drills completed, operators can explain every checkpoint and bound,
   and artifacts are sufficient to reproduce advertised latency/cost claims.
 
-### M12 — Optional attribute and QUIC extensions
+### M12 — Optional attribute, QUIC and alternative ordering experiments
 
 - Attribute prototype from section 9 gets a separate API/storage-format review.
 - QUIC rollout requires the section 8 measurements and TCP fallback interoperability.
-- Neither extension may bypass the durability, visibility, isolation, or PIT contracts.
+- Evaluate disaggregated payload/order paths or leaderless ordering (for example
+  EPaxos*) only if measured leader bottlenecks/failover pauses warrant the complexity.
+  Include conflict-heavy conditional/script traffic and recovery in the comparison.
+- No extension may bypass the durability, visibility, isolation, or PIT contracts.
 
-Dependency order: M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8 -> M9 ->
-M10 -> M11. M7 archive prototypes can start after M3, but traffic cannot depend on
-archive/GC until their invariants pass. M12 follows the baseline it aims to improve.
-Do not promise a calendar completion date before the M2 architecture gates; use
-measured milestone throughput and failure findings to estimate remaining work.
+Dependency order: M0 -> M1 -> M2 -> M3. Next, close the M3a architecture
+decision before finalizing M4 integration. Implement M3a runtime bounds alongside
+M4, then M4a -> M5 -> M6 -> M6a. M7 archive prototypes can start after M3;
+replica recovery/GC cannot rely on them until their invariants pass. M8 and M9
+follow their reader/archive prerequisites. M9a requires M3a, M4a and M7; complete
+M3a/M4a/M6a/M9a before M10 -> M11. M12 is optional.
+
+Immediate next work: commit the M3a design/capacity decision, continue the correct
+document write/serving boundary in M4 with bounded active state, then prove M4a
+failure isolation. Do not defer data-copy protocol design until consensus tuning
+is complete; M6a design and local transfer experiments can proceed after M3a.
+Preserve delivered milestone evidence; new planned work is not completed work.
+Do not promise a calendar date or million-shard product capacity from local probes.
 
 ## 11. Activation, migration, and rollback
 
@@ -640,6 +761,42 @@ can continue using their existing protocols throughout.
 
 ## 12. Verification, benchmarks, and acceptance criteria
 
+### 12.0 Exploratory evidence for design decisions
+
+Local benchmarks here are intended to estimate whether a candidate can scale.
+They do not need production hardware to justify design iteration. Keep measured
+primitives, model assumptions, external research and production qualification
+distinct; publish negative/skewed cases, not only favorable averages.
+
+Initial exploratory evidence (1 November 2026): a single-thread optimized C++
+probe with packed 32-byte descriptors used 32 MB at 1M and 320 MB at 10M entries.
+Median full scans took 0.655/9.918 ms, versus 0.0144/0.232 ms for the active 1%,
+about 43–46x less scheduler work. These are compact-array primitives, not JVM
+objects, mappings, engines, network requests or OpenSearch throughput.
+
+A deterministic fluid model assumed 1M offered ops/s, 2M total service capacity,
+a 200 ms election pause and twelve leader hosts. With 64 uniform groups, six
+affected groups delayed 18,750 arrivals without exhausting the modeled queues.
+With 20% of writes on one group, that group exceeded its equal capacity allocation;
+the five-second model rejected 834,406 requests. This is hotspot overload, not a
+prediction of election duration or real rejection rates. It supports active-only
+scheduling, weighted placement and failure headroom rather than arbitrary group
+count increases. All values are preliminary estimates, not acceptance results.
+
+Reproduce the compact scan with 1M/10M entries, 1% active, two million precomputed
+uniform lookups, one warmup and three timed trials, twenty scan passes per trial.
+Reimplement the fluid sensitivity with 1/16/64/256 groups, uniform/20%-hot traffic,
+50/200/1000 ms assumed pauses, host/AZ failure and a queue bound of 0.5 seconds of
+per-group service capacity. Preserve runnable harnesses and raw results with the
+M3a implementation; those artifacts currently reside in the research chat's
+workspace and are not part of the delivered branch.
+
+At 1M 1-KiB operations/s, two follower copies require 16.384 Gbit/s aggregate
+payload egress, and two search deliveries add another 16.384 Gbit/s across serving
+nodes, before overhead. Use such arithmetic to prioritize actual data-copy work.
+A 1 TiB copy at a sustained 2 Gbit/s already takes at least 73.3 minutes.
+Do not translate these estimates into measured network or durability claims.
+
 ### 12.1 Correctness and fault matrix
 
 | Area | Scenarios and required assertions |
@@ -666,8 +823,10 @@ because in-process mocks cannot establish fsync, process-death, or network behav
   updates, deletes, and vectors. Native numeric updates are a separate experimental row.
 - Source sizes: 1/10/100 KiB plus representative production documents; measure actual
   serialized/compressed sizes, not only nominal payloads.
-- Scale: 1/10/100 indices; 1/8/64 shards per index; dedicated group-count probes at
-  1,000/10,000 active shards; sparse and densely active deployments.
+- Scale: retain the small real-index baselines; extend metadata/routing models to
+  1M/10M logical descriptors at 0.1/1/10% activity. Measure real active engines,
+  mapping size, FDs and cold starts separately. Probe 16/64/256 physical groups at
+  fixed resources before scaling hosts/cells; include 20%-hot streams and Zipf load.
 - Search copies: 1/2/4/8 for a hot shard, with fixed voter count. Mixed hot/cold
   shards, hot keys, skewed tenants, and shard-size imbalance.
 - Query mixes: selective filters, full text, sorted top-K, expensive aggregations,
@@ -704,6 +863,12 @@ These are engineering targets, not current benchmark results or unconditional SL
 - Under the defined write-heavy workload, target >= 10x fewer S3 data PUTs than
   existing group commit. Also publish low-rate/high-shard-count cases where this
   target is unattainable because age limits dominate.
+- No healthy-cell zero-throughput interval at 100 ms observation resolution after
+  another cell's journal host fails, at the agreed offered load. Target healthy-cell
+  p99 <= 2x baseline; separately report affected-stream election/commit pauses.
+  These are provisional targets, not promises of uninterrupted per-stream writes.
+- Hot-shard movement and cell expansion preserve committed history without a
+  deployment-wide write stop; report per-stream handoff interruption.
 - No monotonic memory/disk growth during a six-hour steady-state soak. Archive
   outage tests must trigger configured backpressure before reserve exhaustion.
 - HTTP/3 is adopted only with equivalent correctness/security and a measured benefit;
@@ -770,7 +935,12 @@ reading a token/checkpoint trace without exposing tenant document contents.
 
 Completion requires:
 
-- [ ] Architecture ADRs close consensus, engine preparation, and group-count gates.
+- [ ] Architecture ADRs close consensus, engine preparation, cells, active-state
+  budgets, stable routing and capacity-weighted group-layout gates.
+- [ ] Million-descriptor exploratory evidence is reproducible and distinct from
+  qualified real-engine capacity; no all-shard scan lies on the write/failover path.
+- [ ] Healthy-cell progress, bounded retries, hot-shard handoff and bulk-copy
+  interference satisfy their documented failure/capacity contracts.
 - [ ] No speculative state reaches any committed read/publication surface.
 - [ ] Multi-index/shard selective replication and independent search scale-out work.
 - [ ] Freshness API, errors, mixed-mode behavior, and PIT limits are documented.
@@ -782,6 +952,14 @@ Completion requires:
 - [ ] Reviewed, signed-off commits are pushed to `low-latency-serverless`; no PR.
 
 ## 14. Relevant references
+
+- [LogDevice multiplexed write path](https://logdevice.io/docs/Writepath.html) and
+  [consistency caveats](https://logdevice.io/docs/Concepts.html).
+- [Scalog, NSDI 2020](https://www.usenix.org/system/files/nsdi20-paper-ding.pdf).
+- [Delos, OSDI 2020](https://www.usenix.org/system/files/osdi20-balakrishnan.pdf).
+- [CORFU, NSDI 2012](https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/balakrishnan).
+- [EPaxos Revisited](https://www.usenix.org/conference/nsdi21/presentation/tollman)
+  and [EPaxos* recovery, 2026](https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.OPODIS.2025.22).
 
 - [Current shell architecture](README.md), [feature status](STATUS.md).
 - [Existing fencing argument](rfc-fencing-closure.md).
