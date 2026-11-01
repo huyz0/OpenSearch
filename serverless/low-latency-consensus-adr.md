@@ -129,6 +129,19 @@ enabled. Conditional operations in the probe wait for the prior journal commit
 and serving application. It does not yet implement scripts, retry sequencing or
 private-engine rebuild after an ambiguous append.
 
+`PreparationEngineAdmission` supplies the initial resident-context gate. It keeps
+at most 256 active records and checks both declared resident bytes and context
+count before resource opening. Cold descriptors consume no entry. Assigned groups
+retain one context and the maximum context-byte allowance while idle; another
+group can borrow spare capacity without consuming those protected reservations.
+Duplicate shard contexts, unknown groups and invalid budgets fail before native
+work. Ticket release is idempotent. Uncertain cleanup can quarantine its native
+resource references and retain the reservation for this admission instance's
+lifetime; close cannot silently free that capacity. The host must retain the
+admission instance while such resources may remain alive. This is accounting
+infrastructure for the owned context, not an enabled resident-engine controller
+or a measured 256-engine memory qualification.
+
 The adapter itself is not a commit verifier and is not enabled by the launcher.
 Assigned operation identities are not evidence of commitment. The host must
 validate the committed stream, ownership epoch, schema and shard incarnation
