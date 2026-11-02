@@ -14,6 +14,13 @@ GIB = 1024 ** 3
 ASSUMPTIONS = {
     "maximum_groups_per_host": 16,
     "maximum_payload_bytes": 4 * MIB,
+    "journal_queue_bytes_per_group": 8 * MIB,
+    "peer_rpc_wire_margin_bytes": MIB,
+    "peer_rpc_minimum_calls_per_group": 4,
+    "peer_rpc_maximum_calls_per_host": 128,
+    "peer_rpc_frame_allowance_per_call": 4,
+    "peer_rpc_decoder_workers": 4,
+    "peer_rpc_thread_stack_bytes": MIB,
     "voters_per_group": 3,
     "virtual_buckets_per_cell": 65536,
     "bucket_record_bytes": 32,
@@ -61,8 +68,16 @@ def capacity(descriptors, activity_bps, cells, groups_per_cell, hosts_per_cell, 
     engines = owned * a["engines_per_owned_active_shard"]
     minimum_pending = local_groups * 6 * (a["maximum_payload_bytes"] + 512)
     pending_budget = max(a["pending_operation_bytes_per_host"], minimum_pending)
+    peer_wire = a["journal_queue_bytes_per_group"] + a["peer_rpc_wire_margin_bytes"]
+    peer_per_call = a["peer_rpc_frame_allowance_per_call"] * peer_wire
+    peer_calls = max(a["peer_rpc_minimum_calls_per_group"] * local_groups,
+                     min(a["peer_rpc_maximum_calls_per_host"], pending_budget // peer_per_call))
+    peer_retained = peer_calls * peer_per_call
+    peer_transient = a["peer_rpc_decoder_workers"] * peer_wire
+    peer_stacks = (local_groups + 1) * a["peer_rpc_thread_stack_bytes"]
+    peer_budget = peer_retained + peer_transient + peer_stacks
     fixed = (a["fixed_runtime_bytes_per_host"] + a["metadata_cache_bytes_per_host"]
-             + a["mapping_cache_bytes_per_host"] + pending_budget
+             + a["mapping_cache_bytes_per_host"] + pending_budget + peer_budget
              + a["virtual_buckets_per_cell"] * a["bucket_record_bytes"])
     journal = local_groups * (a["journal_buffer_bytes_per_group"]
                              + a["retained_entries_per_group"] * a["retained_metadata_bytes_per_entry"])
@@ -75,6 +90,12 @@ def capacity(descriptors, activity_bps, cells, groups_per_cell, hosts_per_cell, 
         "active_logical_shards": active, "cells": cells, "groups_per_cell": groups_per_cell,
         "hosts_per_cell": hosts_per_cell, "total_journal_hosts": hosts, "total_groups": groups,
         "local_group_assignments_ceiling": local_groups,
+        "peer_rpc_maximum_message_bytes": peer_wire,
+        "peer_rpc_maximum_calls_per_host": peer_calls,
+        "peer_rpc_retained_message_allowance_bytes": peer_retained,
+        "peer_rpc_decoder_transient_allowance_bytes": peer_transient,
+        "peer_rpc_group_and_timer_stack_bytes": peer_stacks,
+        "peer_rpc_bytes_used_in_resource_estimate": peer_budget,
         "minimum_pending_bytes_for_group_reservations": minimum_pending,
         "pending_bytes_used_in_resource_estimate": pending_budget,
         "default_pending_budget_supports_group_count": a["pending_operation_bytes_per_host"] >= minimum_pending,

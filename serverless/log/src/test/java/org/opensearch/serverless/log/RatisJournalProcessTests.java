@@ -565,6 +565,18 @@ public class RatisJournalProcessTests extends OpenSearchTestCase {
             startAll(fixture, nodes, true);
             final var leader = leader(nodes, 0);
             leader.append(0, operation(stream, 0));
+            // A majority ACK need not include the third voter. Finish initial catch-up before
+            // taking one follower's disk away, so this history tests a failed persistence ACK
+            // rather than combining startup lag with an unrelated short election timeout.
+            assertBusy(() -> {
+                for (var node : nodes) {
+                    try {
+                        assertEquals(1, node.scan(0, -1, Set.of(stream)).operations().size());
+                    } catch (IOException awaitingCatchup) {
+                        throw new AssertionError("waiting for initial committed prefix on every voter", awaitingCatchup);
+                    }
+                }
+            }, 20, TimeUnit.SECONDS);
             final var failed = nodes.stream().filter(node -> node != leader).findFirst().orElseThrow();
             failed.failStorage();
             leader.append(0, operation(stream, 1));

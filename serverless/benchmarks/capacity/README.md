@@ -85,6 +85,15 @@ that exceeds the 128-MiB baseline. At eight groups and a 4-MiB payload this mini
 is about 192 MiB. Actual host configuration must also cover planned repair/growth;
 raising the group-count ceiling alone does not supply that byte budget.
 
+The peer dispatcher adds one worker per assigned group and one first-message timer.
+The resource model charges four maximum-size wire messages per admitted call,
+four transient decoder messages and assumed 1-MiB worker stacks. The call ceiling
+is the larger of four calls per group and the pending-byte-derived allowance,
+limited to 128 calls. A wire message is the configured 8-MiB journal queue plus
+1 MiB. At four assigned groups this adds about 617 MiB; at eight, about 1,197 MiB.
+These are explicit allowances rather than measured heap/RSS, and do not account
+for every transport/protobuf object, socket buffer or native replication task.
+
 The model assumes active shards are uniformly distributed among groups; workload
 skew can exceed its busiest-host estimate. It charges two engines for each owned
 resident writer shard, using the

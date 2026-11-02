@@ -154,6 +154,7 @@ public final class RatisJournal implements Closeable {
     private final JournalAdmission admission;
     private final Map<UUID, JournalDispatch> dispatch;
     private final ThreadPoolExecutor peerRpcExecutor;
+    private final JournalPeerRpcDispatcher peerRpcDispatch;
     private final Map<UUID, JournalConfiguration.Group> groups;
     private final ClientId clientId = ClientId.randomId();
     private final AtomicLong callIds = new AtomicLong();
@@ -193,11 +194,17 @@ public final class RatisJournal implements Closeable {
             4,
             Math.max(128, configuration.limits().maximumPendingRequests())
         );
+        peerRpcDispatch = new JournalPeerRpcDispatcher(
+            configuration.localVoterId().toString(),
+            configuration.limits(),
+            groups.keySet(),
+            peerRpcExecutor
+        );
         final var parameters = new Parameters();
         GrpcConfigKeys.TLS.setConf(parameters, new GrpcTlsConfig(keyManager, trustManager, true));
         GrpcConfigKeys.Server.setServicesCustomizer(
             parameters,
-            (builder, types) -> builder.executor(peerRpcExecutor).intercept(new ServerInterceptor() {
+            (builder, types) -> builder.executor(peerRpcExecutor).intercept(peerRpcDispatch).intercept(new ServerInterceptor() {
                 @Override
                 public <RequestT, ReplyT> ServerCall.Listener<RequestT> interceptCall(
                     ServerCall<RequestT, ReplyT> call,
@@ -236,6 +243,7 @@ public final class RatisJournal implements Closeable {
                 .build();
         } catch (IOException | RuntimeException | Error failure) {
             dispatch.values().forEach(JournalDispatch::close);
+            peerRpcDispatch.close();
             peerRpcExecutor.shutdown();
             throw failure;
         }
@@ -270,6 +278,7 @@ public final class RatisJournal implements Closeable {
                 failure.addSuppressed(closeFailure);
             } finally {
                 dispatch.values().forEach(JournalDispatch::close);
+                peerRpcDispatch.close();
                 peerRpcExecutor.shutdown();
             }
             if (failure instanceof RuntimeException) {
@@ -1214,6 +1223,7 @@ public final class RatisJournal implements Closeable {
         try {
             server.close();
         } finally {
+            peerRpcDispatch.close();
             peerRpcExecutor.shutdown();
         }
         // SDK shutdown may return while an uninterruptible I/O task is still running. Only OS

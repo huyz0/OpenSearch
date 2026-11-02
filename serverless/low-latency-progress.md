@@ -15,7 +15,7 @@ S3 archival remain pending.
 | M1 | Append and streaming recovery interfaces, optional async dispatch with cancellation/rejection semantics, existing S3 path integration, bounded versioned log/checkpoint identity codecs | Subscription/token formats and shell adapters for consensus |
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
-| M3a | [Cell/active-state design](low-latency-capacity-adr.md), runnable models/raw results, per-group proposal isolation and resident-context admission primitive | Metadata routing, dynamic group admission, owned bounded engines and broader isolation pending |
+| M3a | [Cell/active-state design](low-latency-capacity-adr.md), runnable models/raw results, per-group proposal/peer isolation and resident-context admission primitive | Metadata routing, dynamic group admission, owned bounded engines and broader isolation pending |
 | M4 | Committed-serving adapter, resolved payload, fixed-binding replay, admitted private resources, dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and bounded dispatch, buffer/SSD governors, ownership/schema/lifecycle controllers and shell integration |
 | M5–M9 | Not implemented | Fresh readers, selective replication, archival, lifecycle, migration |
 | M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
@@ -310,3 +310,15 @@ dynamic host assignment. This closes a design decision, not runtime M3a delivery
 
 These checks validate the listed foundations. They are not evidence of completed
 three-AZ durability, millisecond quorum latency, or production readiness.
+
+- Peer RPC group isolation: a real held-division monitor reproduced a healthy
+  colocated group's three-second RPC timeout. Parsed callbacks now use one worker
+  per physical group with bounded active calls/messages, group reservations and
+  first-message expiry. Context/order, overload, cancellation charging, unknown
+  groups and snapshot notification versus data are covered. The complete run
+  passed 231 unit, 96 journal process/runtime, 21 catalog/controller and 15 committed
+  replay cases across three iterations, with root precommit (8m45s). The follower
+  persistence history also passed ten repetitions with its failing seed after
+  explicitly waiting for initial catch-up before disk failure. Native snapshot
+  notifications remain available for full-log learner catch-up. Capacity estimates
+  now charge the added peer message/worker allowances; these are not measured RSS.

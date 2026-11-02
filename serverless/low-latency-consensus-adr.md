@@ -520,17 +520,18 @@ RPC handler threads. The native async-request pool setting only configures its
 client-write service, which this runtime denies; peer callbacks still used gRPC's
 unbounded cached executor.
 
-The supported server customizer now installs a separate four-worker node pool and
+The first execution bound installed a separate four-worker node pool and
 a bounded queue of `max(128, maximumPendingRequests)`. The protocol reserve keeps
 one-slot proposal admission usable. Dispatch and peer execution remain separate,
 so blocked peer handlers cannot consume the SDK submission/notification workers.
 Shutdown closes native services before the peer executor, and preserves it across
 interrupted cleanup. No consensus-library or third-party artifact patch is needed.
 
-The overload regression verifies four blocked handlers, queue rejection rather
+The original overload regression verified four blocked handlers, queue rejection rather
 than new threads, and successful quorum append/replay after releasing the monitor.
 The pinned transport reports executor rejection as INTERNAL, a failed peer RPC
-that follows normal retry/backoff. This qualification covers inbound execution;
+that follows normal retry/backoff. The per-group dispatch below further confines
+native callbacks to one worker per group. This qualification covers inbound execution;
 outbound callback behavior and full memory/throughput sizing remain workload and
 membership qualification gates.
 
@@ -656,6 +657,48 @@ group's reservation. Constant-time accounting tracks covered reservations and
 restores them on release, including idempotent close and cancellation semantics.
 Preflight rejects impossible reservations before creating the volume binding.
 
-These histories prove the tested proposal boundary. Shared peer RPC handling,
-shared-device failures and broader cell routing/recovery isolation need their own
-histories; this change does not claim all runtime isolation gates are complete.
+These histories prove the tested proposal boundary. The following peer RPC
+history adds a separate execution boundary; shared-device failures and broader
+cell routing/recovery isolation still need their own qualification.
+
+## Peer RPC isolation between physical groups
+
+Four request-vote calls blocked on one division's monitor occupied every worker
+in the bounded node pool. A request for a healthy colocated group then exceeded
+its three-second deadline. Keep the four-worker pool for gRPC decoding and native
+handler initialization, and dispatch the parsed peer listener callbacks to one
+bounded worker per assigned physical group. Preserve each call's callback order
+and gRPC context without running native code under the dispatcher locks.
+
+The node admits at most 128 calls. Its calculated ceiling reserves four calls per
+group and may borrow additional capacity from a conservative pending-byte-derived
+allowance. A classified group cannot consume another group's reservation. Each
+call has at most eight queued callbacks and two queued messages; ready events
+coalesce. Refusal, deadline, cancellation and shutdown retain the call's charge
+until any running native callback finishes. The queue runner processes one event
+at a time so one stream cannot drain an unlimited backlog ahead of other calls.
+
+Calls without a first message expire after five seconds, with canceled timers
+removed immediately. Before a body identifies its group, a call still occupies
+the bounded shared admission/decoding path; this does not promise isolation from
+an arbitrary header-only flood. Serialized wire-size checks and the capacity
+model's message allowances are not a complete heap/RSS guarantee. Native async
+work, transport buffering and sustained throughput need separate qualification.
+
+Snapshot chunks are refused before the native callback because this journal has
+no archive-backed snapshot recovery proof. Ratis's snapshot notification remains
+allowed: with transfer disabled, an empty learner needs that notification to fall
+back to full retained-log catch-up. Rejecting the whole RPC instead reproduced
+membership staging timeouts. No consensus-library artifact patch is needed.
+
+The focused three-iteration run passed 18 dispatcher unit cases and nine native
+cases covering the original stall, leader replacement and colocated retirement.
+Tests cover callback context/order, group reservations, overflow while a native
+callback remains active, idle-call expiry, unknown/group-changing streams, and
+snapshot-data refusal with notification acceptance. Broader validation is recorded
+in the implementation progress log. The broad fault suite also exposed a fixture
+that removed a follower's persistence before the third voter had caught up with
+the initial write. The surviving leader exceeded its 300-ms election timeout
+while that voter was still behind. This fault history now verifies the initial
+committed prefix on every voter before injecting the disk failure; it still
+requires a healthy majority and refuses a second ACK from the failed disk.

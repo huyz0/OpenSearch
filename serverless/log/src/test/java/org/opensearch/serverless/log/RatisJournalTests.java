@@ -666,7 +666,15 @@ public class RatisJournalTests extends OpenSearchTestCase {
     }
 
     public void testPeerRpcExecutionRemainsBoundedWhenTheConsensusMonitorStalls() throws Exception {
-        final var fixture = fixture(1);
+        assertPeerRpcExecutionBound(false);
+    }
+
+    public void testBlockedPeerGroupDoesNotStopHealthyGroupRpc() throws Exception {
+        assertPeerRpcExecutionBound(true);
+    }
+
+    private void assertPeerRpcExecutionBound(boolean requireHealthyGroup) throws Exception {
+        final var fixture = fixture(requireHealthyGroup ? 2 : 1);
         final var journals = new ArrayList<RatisJournal>();
         final var entered = new java.util.concurrent.CountDownLatch(1);
         final var release = new java.util.concurrent.CountDownLatch(1);
@@ -716,18 +724,35 @@ public class RatisJournalTests extends OpenSearchTestCase {
                 // Establish TLS/HTTP2 before the stall, so cold connection setup cannot consume
                 // the overload window and turn the burst into client-side deadline failures.
                 readyStub.withDeadlineAfter(10, TimeUnit.SECONDS).requestVote(vote).get(10, TimeUnit.SECONDS);
+                final var healthy = requireHealthyGroup
+                    ? vote.toBuilder()
+                        .setServerRequest(
+                            rpc.toBuilder()
+                                .setRaftGroupId(
+                                    org.apache.ratis.util.ProtoUtils.toRaftGroupIdProtoBuilder(
+                                        org.apache.ratis.protocol.RaftGroupId.valueOf(
+                                            fixture.configurations().getFirst().groups().get(1).id()
+                                        )
+                                    )
+                                )
+                        )
+                        .build()
+                    : vote;
+                if (requireHealthyGroup) {
+                    readyStub.withDeadlineAfter(10, TimeUnit.SECONDS).requestVote(healthy).get(10, TimeUnit.SECONDS);
+                }
                 holder.start();
                 assertTrue(entered.await(10, TimeUnit.SECONDS));
                 final var stub = readyStub.withDeadlineAfter(6, TimeUnit.SECONDS);
                 final var requests = new ArrayList<org.apache.ratis.thirdparty.com.google.common.util.concurrent.ListenableFuture<?>>();
-                for (int i = 0; i < 256; i++) {
+                for (int i = 0; i < (requireHealthyGroup ? 4 : 256); i++) {
                     requests.add(stub.requestVote(vote.toBuilder().setServerRequest(rpc.toBuilder().setCallId(i + 1)).build()));
                 }
                 int rejected = 0;
                 for (var request : requests) {
                     final var failure = expectThrows(ExecutionException.class, () -> request.get(10, TimeUnit.SECONDS));
                     final var status = Status.fromThrowable(failure.getCause());
-                    if (status.getCode() == Status.Code.INTERNAL) {
+                    if (status.getCode() == Status.Code.INTERNAL || status.getCode() == Status.Code.RESOURCE_EXHAUSTED) {
                         // The pinned gRPC transport reports executor rejection as an RPC failure.
                         // It must back off rather than create another blocked handler thread.
                         rejected++;
@@ -735,7 +760,9 @@ public class RatisJournalTests extends OpenSearchTestCase {
                         assertEquals(status.toString(), Status.Code.DEADLINE_EXCEEDED, status.getCode());
                     }
                 }
-                assertTrue("the burst must exercise the bounded queue's overload path", rejected > 0);
+                if (requireHealthyGroup == false) {
+                    assertTrue("the burst must exercise the bounded queue's overload path", rejected > 0);
+                }
                 final int identity = System.identityHashCode(monitor);
                 final long blocked = java.util.Arrays.stream(
                     java.lang.management.ManagementFactory.getThreadMXBean().dumpAllThreads(false, false)
@@ -754,7 +781,12 @@ public class RatisJournalTests extends OpenSearchTestCase {
                     )
                     .count();
                 assertTrue("the fixture must reach the blocked peer RPC handler", blocked > 0);
-                assertTrue("peer RPC threads exceeded the node execution bound: " + blocked, blocked <= 4);
+                assertEquals("one stalled group must occupy at most its one native callback worker", 1, blocked);
+                if (requireHealthyGroup) {
+                    // This group has no stalled monitor. Its native RPC must progress on the same host
+                    // while the other group's handlers remain blocked, not only after releasing them.
+                    readyStub.withDeadlineAfter(3, TimeUnit.SECONDS).requestVote(healthy).get(4, TimeUnit.SECONDS);
+                }
             } finally {
                 release.countDown();
                 assertTrue(channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
