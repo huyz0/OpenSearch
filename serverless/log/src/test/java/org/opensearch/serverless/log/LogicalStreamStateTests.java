@@ -187,7 +187,7 @@ public class LogicalStreamStateTests extends OpenSearchTestCase {
         final var cp = fixture.checkpoint();
         assertRejected(
             LogicalStreamState.Rejection.MALFORMED,
-            fixture.state.apply(cp, new OperationEnvelope(fixture.stream, OperationEnvelope.Kind.OWNERSHIP, 1, 1, 0, new byte[0]))
+            fixture.state.apply(cp, new OperationEnvelope(fixture.stream, OperationEnvelope.Kind.LOGICAL, 1, 1, 0, new byte[0]))
         );
         expectThrows(
             IllegalArgumentException.class,
@@ -195,7 +195,7 @@ public class LogicalStreamStateTests extends OpenSearchTestCase {
                 cp,
                 new OperationEnvelope(
                     fixture.stream,
-                    OperationEnvelope.Kind.OWNERSHIP,
+                    OperationEnvelope.Kind.LOGICAL,
                     1,
                     1,
                     0,
@@ -205,6 +205,25 @@ public class LogicalStreamStateTests extends OpenSearchTestCase {
         );
         assertNull(fixture.state.view().owner());
         assertEquals(0, fixture.state.view().retainedOutcomes());
+    }
+
+    public void testLegacyFramingCannotSelectTheLogicalProtocol() throws Exception {
+        final var fixture = new Fixture(8);
+        final var cp = fixture.checkpoint();
+        final var command = command(LogicalCommand.Action.OWNERSHIP, FIRST, 0, -1);
+        for (var kind : OperationEnvelope.Kind.values()) {
+            if (kind != OperationEnvelope.Kind.LOGICAL) {
+                expectThrows(
+                    IllegalArgumentException.class,
+                    () -> fixture.state.apply(cp, new OperationEnvelope(fixture.stream, kind, 1, 1, 0, command.encode(4096)))
+                );
+                assertEquals(-1, fixture.state.view().lastIndex());
+                assertFalse(fixture.state.view().controlled());
+            }
+        }
+        assertAccepted(
+            fixture.state.apply(cp, new OperationEnvelope(fixture.stream, OperationEnvelope.Kind.LOGICAL, 1, 1, 0, command.encode(4096)))
+        );
     }
 
     public void testRebuildingTheOrderedPrefixReproducesOutcomesAndRetentionFence() throws Exception {
@@ -290,7 +309,7 @@ public class LogicalStreamStateTests extends OpenSearchTestCase {
 
         private LogicalStreamState.Decision step(LogicalCommand command, long epoch, long term, long schema) throws Exception {
             final var cp = checkpoint();
-            final var envelope = new OperationEnvelope(stream, OperationEnvelope.Kind.DOCUMENTS, epoch, term, schema, command.encode(4096));
+            final var envelope = new OperationEnvelope(stream, OperationEnvelope.Kind.LOGICAL, epoch, term, schema, command.encode(4096));
             final var decision = state.apply(cp, envelope);
             frames.add(new Frame(cp, envelope, decision));
             return decision;

@@ -180,8 +180,8 @@ public final class LogicalStreamState {
      * @throws IOException if hashing an accepted schema fails
      */
     public Decision apply(LogCheckpoint checkpoint, OperationEnvelope envelope) throws IOException {
-        if (Objects.requireNonNull(envelope).logId().equals(stream) == false) {
-            throw new IllegalArgumentException("logical envelope belongs to another stream");
+        if (Objects.requireNonNull(envelope).logId().equals(stream) == false || envelope.kind() != OperationEnvelope.Kind.LOGICAL) {
+            throw new IllegalArgumentException("logical fold requires its own stream and explicit logical framing");
         }
         advance(checkpoint);
         controlled = true;

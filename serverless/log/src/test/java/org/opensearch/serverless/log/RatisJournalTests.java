@@ -255,6 +255,93 @@ public class RatisJournalTests extends OpenSearchTestCase {
         }
     }
 
+    public void testLogicalReplayFiltersCommittedRetriesAndStaleWritersAfterLeaderLoss() throws Exception {
+        final var fixture = fixture(1);
+        final var journals = new ArrayList<RatisJournal>();
+        try {
+            startAll(fixture, journals, true);
+            final UUID group = fixture.configurations().getFirst().groups().getFirst().id();
+            final var stream = new ShardLogId(fixture.deployment(), "logical-index", 0, UUID.randomUUID());
+            final UUID first = UUID.randomUUID();
+            final UUID second = UUID.randomUUID();
+            final var originalLeader = leader(journals, group);
+            final var owner = logicalCommand(LogicalCommand.Action.OWNERSHIP, first, 0, -1);
+            final var ownerCp = originalLeader.append(group, logicalEnvelope(stream, owner, 1, 1, 0))
+                .toCompletableFuture()
+                .get(10, TimeUnit.SECONDS);
+            final var schema = logicalCommand(LogicalCommand.Action.SCHEMA, first, 0, ownerCp.index());
+            final var schemaCp = originalLeader.append(group, logicalEnvelope(stream, schema, 1, 1, 1))
+                .toCompletableFuture()
+                .get(10, TimeUnit.SECONDS);
+            final var mutation = logicalCommand(LogicalCommand.Action.MUTATION, first, 0, schemaCp.index());
+            final var originalCp = originalLeader.append(group, logicalEnvelope(stream, mutation, 1, 1, 1))
+                .toCompletableFuture()
+                .get(10, TimeUnit.SECONDS);
+            originalLeader.close();
+            journals.remove(originalLeader);
+            final var replacement = leader(journals, group);
+            final var takeover = logicalCommand(LogicalCommand.Action.OWNERSHIP, second, 1, originalCp.index());
+            replacement.append(group, logicalEnvelope(stream, takeover, 2, 2, 1)).toCompletableFuture().get(10, TimeUnit.SECONDS);
+            final var retry = new LogicalCommand(
+                mutation.action(),
+                mutation.requestId(),
+                mutation.firstObservedIndex(),
+                mutation.requestDigest(),
+                second,
+                1,
+                new byte[] { 99 }
+            );
+            final var duplicateCp = replacement.append(group, logicalEnvelope(stream, retry, 2, 2, 1))
+                .toCompletableFuture()
+                .get(10, TimeUnit.SECONDS);
+            final var stale = logicalCommand(LogicalCommand.Action.MUTATION, first, 1, duplicateCp.index());
+            final var staleCp = replacement.append(group, logicalEnvelope(stream, stale, 1, 1, 1))
+                .toCompletableFuture()
+                .get(10, TimeUnit.SECONDS);
+            final var replay = new LogicalStreamReplay(replacement, group, stream, 4, 16384);
+            final var effects = new ArrayList<RatisJournal.CommittedOperation>();
+            final var receipts = new ArrayList<LogicalStreamReplay.Receipt>();
+            LogicalStreamReplay.Batch batch;
+            do {
+                batch = replay.poll(3, 512);
+                effects.addAll(batch.effects());
+                receipts.addAll(batch.receipts());
+            } while (batch.throughIndex() < staleCp.index());
+            assertEquals(4, effects.size());
+            assertEquals(6, receipts.size());
+            assertEquals(LogicalStreamState.Status.DUPLICATE, receipts.get(4).decision().status());
+            assertEquals(duplicateCp, receipts.get(4).checkpoint());
+            assertEquals(originalCp, receipts.get(4).decision().originalCheckpoint());
+            assertEquals(LogicalStreamState.Rejection.STALE_EPOCH, receipts.get(5).decision().rejection());
+            assertEquals(second, batch.state().owner());
+            assertEquals(0, batch.state().lastSequenceNumber());
+            assertEquals(schemaCp, batch.state().schemaCheckpoint());
+            assertTrue(replay.poll(3, 512).effects().isEmpty());
+            final var reconstructed = new LogicalStreamReplay(replacement, group, stream, 4, 16384).poll(100, 65536);
+            assertEquals(batch.state(), reconstructed.state());
+            assertEquals(receipts, reconstructed.receipts());
+        } finally {
+            closeAll(journals);
+        }
+    }
+
+    private static LogicalCommand logicalCommand(LogicalCommand.Action action, UUID actor, long argument, long observed) {
+        return new LogicalCommand(
+            action,
+            UUID.randomUUID(),
+            observed,
+            new byte[32],
+            actor,
+            argument,
+            action == LogicalCommand.Action.OWNERSHIP ? new byte[0] : new byte[] { 7 }
+        );
+    }
+
+    private static OperationEnvelope logicalEnvelope(ShardLogId stream, LogicalCommand command, long epoch, long term, long schema)
+        throws IOException {
+        return new OperationEnvelope(stream, OperationEnvelope.Kind.LOGICAL, epoch, term, schema, command.encode(16384));
+    }
+
     public void testInitialActivationAndReservedControlIdentity() throws Exception {
         final var fixture = fixture(1);
         final var journals = new ArrayList<RatisJournal>();

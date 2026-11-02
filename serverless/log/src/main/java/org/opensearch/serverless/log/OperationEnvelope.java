@@ -47,7 +47,9 @@ public final class OperationEnvelope {
         /** An exact schema dependency or schema transition. */
         SCHEMA(4),
         /** A recovery or archive cut in the committed history. */
-        RECOVERY_BARRIER(5);
+        RECOVERY_BARRIER(5),
+        /** Versioned logical commands, distinct from legacy operation payloads. */
+        LOGICAL(6);
 
         private final int code;
 

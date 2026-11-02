@@ -385,3 +385,15 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   This is a caller-serialized semantic fold, not runtime commit authority: distinct
   protocol framing, authenticated admission, durable retention configuration,
   bounded resident replay state and journal receipts remain integration work.
+
+- Controlled replay now uses a distinct logical frame code, preserving the five
+  existing wire codes. A bounded per-stream cursor starts from the complete local
+  committed history and emits only newly accepted effects, alongside receipts
+  that distinguish physical position from logical acceptance and original retry
+  outcome. Raw legacy records cannot silently become logical writes. Partial
+  replay failure permanently stops the cursor. The log unit suite passed 294
+  cases over three iterations; a real TLS three-voter leader-loss history passed
+  three iterations, confirming takeover, duplicate suppression, stale-write refusal
+  and identical reconstruction across small versus large scan batches. Root
+  precommit passed. Producer authentication, durable protocol configuration,
+  host-wide residency admission, serving application and client integration remain.

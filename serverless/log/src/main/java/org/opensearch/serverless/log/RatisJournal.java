@@ -105,7 +105,7 @@ public final class RatisJournal implements Closeable {
     }
 
     /**
-     * A committed logical operation and its physical-log coordinate.
+     * A physically committed frame and its log coordinate. Semantic acceptance is separate.
      * @param operation immutable operation
      * @param checkpoint committed coordinate, not a searchable-reader guarantee
      */
@@ -463,7 +463,7 @@ public final class RatisJournal implements Closeable {
      *
      * @param groupId assigned physical group
      * @param operation resolved immutable operation
-     * @return committed coordinate after the persistent majority acknowledgement
+     * @return physical coordinate after the persistent majority acknowledgement; not logical acceptance
      * @throws IOException on synchronous validation, leader or admission failure
      */
     public CompletionStage<LogCheckpoint> append(UUID groupId, OperationEnvelope operation) throws IOException {

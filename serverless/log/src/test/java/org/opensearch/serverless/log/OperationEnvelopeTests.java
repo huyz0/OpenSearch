@@ -8,9 +8,11 @@
 
 package org.opensearch.serverless.log;
 
+import org.opensearch.core.common.io.stream.InputStreamStreamInput;
 import org.opensearch.core.common.io.stream.OutputStreamStreamOutput;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
@@ -42,6 +44,26 @@ public class OperationEnvelopeTests extends OpenSearchTestCase {
             final byte[] read = decoded.payloadReader().readAllBytes();
             read[0] ^= 1;
             assertArrayEquals(expected, decoded.payloadReader().readAllBytes());
+        }
+    }
+
+    public void testPersistedKindCodesRemainExplicit() throws Exception {
+        final var kinds = new OperationEnvelope.Kind[] {
+            OperationEnvelope.Kind.DOCUMENTS,
+            OperationEnvelope.Kind.NO_OP,
+            OperationEnvelope.Kind.OWNERSHIP,
+            OperationEnvelope.Kind.SCHEMA,
+            OperationEnvelope.Kind.RECOVERY_BARRIER,
+            OperationEnvelope.Kind.LOGICAL };
+        for (int i = 0; i < kinds.length; i++) {
+            final var id = identity();
+            final var frame = new OperationEnvelope(id, kinds[i], 1, 2, 3, new byte[0]).encode(0);
+            try (var in = new InputStreamStreamInput(new ByteArrayInputStream(frame))) {
+                assertEquals(0x4c4c4f50, in.readInt());
+                assertEquals(1, in.readByte());
+                assertEquals(id, ShardLogId.readFrom(in));
+                assertEquals(i + 1, in.readByte());
+            }
         }
     }
 

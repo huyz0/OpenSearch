@@ -823,3 +823,33 @@ changing retention independently on replicas could change semantic acceptance.
 It does not select a cold-state cache policy, authorize unbounded resident shard
 state, migrate a legacy stream or enable client quorum writes. Distinct logical
 protocol framing and committed receipts/replay remain required integration work.
+
+
+Logical command frames now have explicit envelope kind 6; the existing codes
+1 through 5 are unchanged. The logical fold refuses other kinds before changing
+state. Legacy payloads are not guessed from magic bytes or reinterpreted as
+logical controls.
+
+`LogicalStreamReplay` binds one stream to a real local journal scan and begins
+at physical index -1. It tracks bounded scan progress through other streams and
+configuration entries, folds selected logical commands, and returns two distinct
+lists: newly accepted effects and receipts for all selected physical entries.
+Duplicate receipts point to the first accepted checkpoint. Semantically rejected
+or duplicate entries have no emitted effect despite their physical commitment.
+Legacy records are refused and prevent silent activation over existing history.
+
+The cursor has no externally supplied recovery position. Missing history or
+partial evaluation failure stops it permanently; recovery needs the verified
+complete prefix, or a future authenticated state-base protocol. Application must
+finish the emitted batch before another poll, and application failure requires
+rebuilding the consumer and cursor. Returned receipts describe historical local
+replay, not latest-read authority or a complete client append protocol. Fixed
+protocol limits, authenticated proposal admission and aggregate resident-state
+budgets remain runtime integration requirements. No client storage mode changes.
+
+A real three-voter TLS history commits schema and data, removes the leader,
+commits an owner takeover on its replacement, then commits a retry and stale
+producer frame. Small bounded scans emit the four original control/data effects,
+return the original data checkpoint for the retry and refuse the stale write.
+Reconstruction in a single larger scan reproduces the same semantic state and
+receipts. This is local fault-history coverage, not three-AZ latency qualification.
