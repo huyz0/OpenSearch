@@ -622,3 +622,12 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   and 18 native replay cases passed across three iterations with shell check and
   root precommit (3m25s). Owned lifecycle/frontend integration and client quorum
   mode remain pending.
+
+- Engine configuration copies now preserve the current delete-tombstone GC policy
+  instead of restoring the default. A regression reproduced disabled expiry being
+  re-enabled by `toBuilder`, affecting the committed-serving configuration clone.
+  The builder captures the flag at copy time independently of later changes, and
+  new configurations retain their enabled default. Private preparation uses the
+  common copy behavior without a separate workaround. All 18 core configuration
+  cases and 51 native serving/private rebuild cases passed across three iterations,
+  with shell check and root precommit (5m1s).

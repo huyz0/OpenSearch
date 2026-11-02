@@ -334,6 +334,7 @@ public final class EngineConfig {
         this.checksumStrategies = builder.checksumStrategies;
         this.documentLookupProvider = builder.documentLookupProvider;
         this.documentMetadataResolver = builder.documentMetadataResolver;
+        this.enableGcDeletes = builder.enableGcDeletes;
     }
 
     /**
@@ -389,6 +390,7 @@ public final class EngineConfig {
             .checksumStrategies(this.checksumStrategies)
             .documentLookupProvider(this.documentLookupProvider)
             .documentMetadataResolver(this.documentMetadataResolver)
+            .enableGcDeletes(this.enableGcDeletes)
             .primaryOperationPolicy(this.primaryOperationPolicy);
     }
 
@@ -756,6 +758,7 @@ public final class EngineConfig {
         private MapperService mapperService;
         private CommitterFactory committerFactory;
         private PrimaryOperationPolicy primaryOperationPolicy;
+        private boolean enableGcDeletes = true;
         private Map<String, FormatChecksumStrategy> checksumStrategies = Collections.emptyMap();
         @Nullable
         private DocumentLookupProvider documentLookupProvider;
@@ -954,6 +957,12 @@ public final class EngineConfig {
 
         public Builder documentMetadataResolver(@Nullable DocumentMetadataResolver documentMetadataResolver) {
             this.documentMetadataResolver = documentMetadataResolver;
+            return this;
+        }
+
+        /** Sets the initial delete-tombstone garbage collection policy. */
+        public Builder enableGcDeletes(boolean enableGcDeletes) {
+            this.enableGcDeletes = enableGcDeletes;
             return this;
         }
 

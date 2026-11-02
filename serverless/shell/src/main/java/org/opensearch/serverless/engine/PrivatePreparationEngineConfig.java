@@ -136,7 +136,6 @@ public final class PrivatePreparationEngineConfig {
             .queryCache(null)
             .mergedSegmentTransferTracker(null)
             .build();
-        configuration.setEnableGcDeletes(serving.isEnableGcDeletes());
         // Core's legacy system-property escape hatch must not silently exceed this private budget.
         if (configuration.getIndexingBufferSize().getBytes() > indexingBufferBytes
             || configuration.getIndexingBufferSize().getBytes() <= 0) {

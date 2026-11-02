@@ -91,6 +91,22 @@ public class EngineConfigTests extends OpenSearchTestCase {
         assertSame(checksumStrategies, copy.getChecksumStrategies());
     }
 
+    public void testToBuilderPreservesDeleteRetentionAtCopyTime() {
+        final var original = new EngineConfig.Builder().indexSettings(defaultIndexSettings)
+            .retentionLeasesSupplier(() -> RetentionLeases.EMPTY)
+            .build();
+        assertTrue(original.isEnableGcDeletes());
+        original.setEnableGcDeletes(false);
+        final var snapshot = original.toBuilder();
+        original.setEnableGcDeletes(true);
+        final var retained = snapshot.build();
+        assertFalse("copy must not enable tombstone expiry", retained.isEnableGcDeletes());
+        assertTrue(original.isEnableGcDeletes());
+        assertTrue(original.toBuilder().build().isEnableGcDeletes());
+        retained.setEnableGcDeletes(true);
+        assertFalse("building one copy must not change the builder snapshot", snapshot.build().isEnableGcDeletes());
+    }
+
     private EngineConfig createReadOnlyEngine(IndexSettings indexSettings) {
         return new EngineConfig.Builder().indexSettings(indexSettings)
             .retentionLeasesSupplier(() -> RetentionLeases.EMPTY)
