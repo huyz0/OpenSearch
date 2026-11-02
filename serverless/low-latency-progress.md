@@ -501,3 +501,14 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   replay cases across three iterations, shell check and root precommit (2m52s).
   Host byte admission, pre-preparation retry lookup and fencing after speculative
   failure remain required; physical replies alone do not complete the host gate.
+
+- Private recovery now has a bounded copy-on-write Lucene directory primitive. It
+  reads only the captured immutable commit files, while all outputs, renames,
+  deletions, locks and synchronization remain local. Private deletions never
+  reappear from the base, and later source commits never enter the private view.
+  File-count, retained-name metadata and pinned-disk limits are checked before
+  retaining the snapshot; the caller supplies a commit/store lifetime pin. Real
+  Lucene commits, deletion and merging preserve the source index, and failure
+  paths preserve caller ownership. Nine cases across three iterations passed
+  with shell check and root precommit (27s). This is a disposable in-process
+  primitive; native rebuild and recent-delete version transfer remain pending.
