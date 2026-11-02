@@ -16,7 +16,7 @@ S3 archival remain pending.
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
 | M3a | [Cell/active-state design](low-latency-capacity-adr.md), runnable models/raw results, per-group proposal/peer isolation and resident-context admission primitive | Metadata routing, dynamic group admission, owned bounded engines and broader isolation pending |
-| M4 | Committed-serving adapter, resolved payload, fixed-binding replay, admitted private resources, mapping/identity guard, private native-buffer spill/fencing, owned-worker dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and host request admission/dispatch, serving/total-memory and SSD governors, ownership/schema/lifecycle controllers and shell integration |
+| M4 | Committed-serving adapter, resolved payload, fixed-binding replay, admitted private resources, mapping/identity guard, private native-buffer spill/fencing, admitted group-worker dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and shell admission/dispatch integration, serving/total-memory and SSD governors, ownership/schema/lifecycle controllers and shell integration |
 | M5–M9 | Not implemented | Fresh readers, selective replication, archival, lifecycle, migration |
 | M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
 | M6a | Planned; no runtime completion claimed | Missing-chunk/resumable bulk shard copies, peer/S3 source selection and live-versus-recovery scheduling |
@@ -354,3 +354,15 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   passed 153 unit and 15 journal replay cases over three iterations, with shell
   check and root precommit. Host-wide request bytes, queued-wrapper ownership and
   group worker lifecycle/admission still need runtime integration.
+
+- Host preparation dispatch now bounds active bindings, pending request count and
+  declared bytes, using one worker per assigned group. Both binding and request
+  admission reserve progress for every group. Queued/running wrappers retain
+  their byte charge through close and uncertain scheduling failure until they
+  drain. Tests cover healthy-group continuity during a stall, queued close,
+  accepted-append cancellation isolation and post-queue failure. The real journal
+  probe now uses this host dispatcher. The full run passed 171 unit and 15 journal
+  replay cases across three iterations, shell check and root precommit (3m7s).
+  Capacity estimates now include the separate preparation budget and worker stacks;
+  they still do not qualify parsed documents, plugins, real JVM residency or cloud
+  throughput. Engine/resource lifecycle and durable logical controls remain pending.

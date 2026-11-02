@@ -234,6 +234,29 @@ An accepted journal append still runs to its real outcome. Per-host request-byte
 admission and group worker ownership are integration requirements, not supplied
 by the executor parameter alone.
 
+`PreparationWorkDispatcher` now owns one bounded worker per assigned physical
+group, using the host's thread context. It admits bounded active bindings and
+pending request count/declared bytes, with one binding and a maximum-size request
+reserved per group. Reuse the tested constant-time reservation accounting; cold
+descriptors do not allocate a binding. A stream admits one pending preparation.
+Workers have enough queue slots for admitted application handoffs and finishing
+runners, without caller-thread fallback.
+
+A request keeps its admission until its outcome is known and all queued/running
+wrappers drain. Closing a queued gate cannot prematurely free that byte charge.
+Binding close waits for retained wrappers and running work, then releases its
+binding reservation; accepted journal persistence is not canceled or awaited
+indefinitely. An unknown scheduling failure retains capacity until its wrapper
+drains, or until process recovery if it never runs. No native work/result callback
+runs under the host state monitor. The real journal probe uses this dispatcher,
+including cancellation and a dependent conditional delete.
+
+These are declared request limits and active binding bounds, not measured heap,
+resident engine ownership, a durable retry cache or logical ownership/schema
+controllers. The trusted adapter still computes request weights, opens/closes
+private/serving resources in the correct order and supplies verified replay.
+The capacity model charges both request-stage and journal budgets independently.
+
 The adapter itself is not a commit verifier and is not enabled by the launcher.
 Assigned operation identities are not evidence of commitment. The host must
 validate the committed stream, ownership epoch, schema and shard incarnation

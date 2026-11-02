@@ -28,6 +28,9 @@ ASSUMPTIONS = {
     "retained_entries_per_group": 100000,
     "retained_metadata_bytes_per_entry": 128,
     "pending_operation_bytes_per_host": 128 * MIB,
+    "preparation_request_bytes_per_host": 128 * MIB,
+    "preparation_retained_request_multiplier": 6,
+    "preparation_worker_stack_bytes": MIB,
     "fixed_runtime_bytes_per_host": 2 * GIB,
     "metadata_cache_bytes_per_host": 64 * MIB,
     "mapping_cache_bytes_per_host": 64 * MIB,
@@ -68,6 +71,9 @@ def capacity(descriptors, activity_bps, cells, groups_per_cell, hosts_per_cell, 
     engines = owned * a["engines_per_owned_active_shard"]
     minimum_pending = local_groups * 6 * (a["maximum_payload_bytes"] + 512)
     pending_budget = max(a["pending_operation_bytes_per_host"], minimum_pending)
+    preparation_request_charge = a["preparation_retained_request_multiplier"] * (a["maximum_payload_bytes"] + 512)
+    preparation_pending = max(a["preparation_request_bytes_per_host"], local_groups * preparation_request_charge)
+    preparation_stacks = local_groups * a["preparation_worker_stack_bytes"]
     peer_wire = a["journal_queue_bytes_per_group"] + a["peer_rpc_wire_margin_bytes"]
     peer_per_call = a["peer_rpc_frame_allowance_per_call"] * peer_wire
     peer_calls = max(a["peer_rpc_minimum_calls_per_group"] * local_groups,
@@ -77,7 +83,7 @@ def capacity(descriptors, activity_bps, cells, groups_per_cell, hosts_per_cell, 
     peer_stacks = (local_groups + 1) * a["peer_rpc_thread_stack_bytes"]
     peer_budget = peer_retained + peer_transient + peer_stacks
     fixed = (a["fixed_runtime_bytes_per_host"] + a["metadata_cache_bytes_per_host"]
-             + a["mapping_cache_bytes_per_host"] + pending_budget + peer_budget
+             + a["mapping_cache_bytes_per_host"] + pending_budget + peer_budget + preparation_pending + preparation_stacks
              + a["virtual_buckets_per_cell"] * a["bucket_record_bytes"])
     journal = local_groups * (a["journal_buffer_bytes_per_group"]
                              + a["retained_entries_per_group"] * a["retained_metadata_bytes_per_entry"])
@@ -90,6 +96,9 @@ def capacity(descriptors, activity_bps, cells, groups_per_cell, hosts_per_cell, 
         "active_logical_shards": active, "cells": cells, "groups_per_cell": groups_per_cell,
         "hosts_per_cell": hosts_per_cell, "total_journal_hosts": hosts, "total_groups": groups,
         "local_group_assignments_ceiling": local_groups,
+        "preparation_maximum_declared_request_bytes": preparation_request_charge,
+        "preparation_pending_bytes_used_in_resource_estimate": preparation_pending,
+        "preparation_worker_stack_bytes_used_in_resource_estimate": preparation_stacks,
         "peer_rpc_maximum_message_bytes": peer_wire,
         "peer_rpc_maximum_calls_per_host": peer_calls,
         "peer_rpc_retained_message_allowance_bytes": peer_retained,

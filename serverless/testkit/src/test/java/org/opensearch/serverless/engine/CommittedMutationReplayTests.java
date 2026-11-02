@@ -72,14 +72,16 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
             final var heldReply = new CompletableFuture<LogCheckpoint>();
             final var holdFirst = new AtomicBoolean(true);
             final var context = new org.opensearch.common.util.concurrent.ThreadContext(Settings.EMPTY);
-            final var worker = org.opensearch.common.util.concurrent.OpenSearchExecutors.newFixed(
+            final var dispatcher = new PreparationWorkDispatcher(
                 "private-preparation-probe",
-                1,
-                1,
-                org.opensearch.common.util.concurrent.OpenSearchExecutors.daemonThreadFactory("private-preparation-probe"),
+                Set.of(fixture.group.id()),
+                4,
+                4,
+                256L * 1024,
+                64L * 1024,
                 context
             );
-            final var gate = new PreparationCommitSequencer(worker, mutation -> {
+            final var gate = dispatcher.bind(fixture.group.id(), serving.shardId(), mutation -> {
                 final var append = fixture.leader.append(fixture.group.id(), envelope(serving, stream, mutation, 1));
                 if (holdFirst.compareAndSet(true, false)) {
                     return append.thenCompose(checkpoint -> {
@@ -101,7 +103,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
             });
             try {
                 final long term = serving.getOperationPrimaryTerm();
-                final var first = gate.submit(() -> {
+                final var first = gate.submit(64L * 1024, () -> {
                     assertTrue(Thread.currentThread().getName().contains("private-preparation-probe"));
                     final var index = preparation.engine()
                         .prepareIndex(
@@ -125,9 +127,9 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                 final var checkpoint = committed.get(20, TimeUnit.SECONDS);
                 final var cancelled = first.toCompletableFuture();
                 assertTrue(cancelled.cancel(true));
-                final var rejected = gate.submit(
-                    () -> { throw new AssertionError("dependent preparation must wait for prior commit/application"); }
-                );
+                final var rejected = gate.submit(64L * 1024, () -> {
+                    throw new AssertionError("dependent preparation must wait for prior commit/application");
+                });
                 assertTrue(
                     expectThrows(ExecutionException.class, () -> rejected.toCompletableFuture().get(20, TimeUnit.SECONDS))
                         .getCause() instanceof org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
@@ -141,7 +143,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                 serving.refresh("sequenced committed insert");
                 assertDocCount(serving, 1);
                 final var original = applied.mutation().operation();
-                final var removed = gate.submit(() -> {
+                final var removed = gate.submit(64L * 1024, () -> {
                     assertTrue(Thread.currentThread().getName().contains("private-preparation-probe"));
                     final var delete = preparation.engine()
                         .prepareDelete(
@@ -168,8 +170,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                 try {
                     gate.closeAsync().toCompletableFuture().get(20, TimeUnit.SECONDS);
                 } finally {
-                    worker.shutdown();
-                    assertTrue(worker.awaitTermination(20, TimeUnit.SECONDS));
+                    dispatcher.closeAsync().toCompletableFuture().get(20, TimeUnit.SECONDS);
                 }
             }
         } finally {

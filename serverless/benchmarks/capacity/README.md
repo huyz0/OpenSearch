@@ -94,6 +94,14 @@ limited to 128 calls. A wire message is the configured 8-MiB journal queue plus
 These are explicit allowances rather than measured heap/RSS, and do not account
 for every transport/protobuf object, socket buffer or native replication task.
 
+Preparation dispatch has its own retained request budget in addition to journal
+admission. The model reserves an assumed `6 * (maximum payload bytes + 512)` for
+one pending request per assigned group, starting from a separate 128-MiB baseline,
+and one 1-MiB preparation worker stack per group. Four groups add 132 MiB; eight
+add about 200 MiB. These budgets are charged separately because the two stages
+can retain different work. The multiplier is an assumption, not a qualified
+bound on document parsing, analysis or plugin allocations.
+
 The model assumes active shards are uniformly distributed among groups; workload
 skew can exceed its busiest-host estimate. It charges two engines for each owned
 resident writer shard, using the

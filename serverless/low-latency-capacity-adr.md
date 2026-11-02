@@ -75,16 +75,17 @@ closed. PIT retention and delayed close cannot bypass these limits.
 The capacity model uses a 16-GiB host, a 75% admission envelope and an assumed
 32-MiB resident contribution per engine; these are sensitivity inputs, not measured
 JVM sizing. Under those inputs, 1M descriptors at 0.1% activity fit the small
-one-cell profile at about 10.84 GiB on its busiest leader host. For 10M descriptors
-at 0.1%, four dense-profile cells use about 11.20 GiB per busiest host across 96
-journal hosts; sixteen small-profile cells use about 7.96 GiB across 192 hosts.
+one-cell profile at about 10.97 GiB on its busiest leader host. For 10M descriptors
+at 0.1%, four dense-profile cells use about 11.40 GiB per busiest host across 96
+journal hosts; sixteen small-profile cells use about 8.09 GiB across 192 hosts.
 The modeled grid does not fit 10M descriptors at 1% activity within the assumed
 host-memory envelope. More memory/cells, smaller measured engine footprints or a
 smaller resident working set would be required. These are not product limits or
 validated deployment recommendations. These estimates now include bounded peer
 RPC message allowances, transient decoding and the additional group/timer workers;
-the default four-group assignment adds about 617 MiB. This is conservative model
-accounting, not a measured gRPC/JVM resident-memory limit.
+the default four-group peer assignment adds about 617 MiB. Separate preparation
+request admission adds another assumed 128 MiB and four 1-MiB worker stacks.
+This is conservative model accounting, not a measured gRPC/JVM memory limit.
 
 For comparisons of cell boundaries, hold the fleet constant: the report also
 models 384 journal hosts and 1,024 total groups split over 1/4/16 cells. Per-cell
