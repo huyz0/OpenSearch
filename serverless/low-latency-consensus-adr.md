@@ -1217,3 +1217,27 @@ alone is not an ownership proof or a verified native recovery-base certificate.
 The host still owns admission, schema/lifecycle exclusion and accepted-effect
 validation. This does not implement a nonempty logical recovery controller, dynamic
 mapping changes, fresh-reader authority, or the client quorum-mode frontend.
+
+### Private resource lifetime through request drain
+
+`OwnedPreparationContext` transfers actual admitted private resources only after
+successful group/shard binding. Close first drains the dependency gate and every
+request wrapper, then submits native cleanup to a host-owned bounded lifecycle
+executor with reserved cleanup capacity. Resident admission remains held while
+cleanup is queued or running. The host must keep that executor alive until closure
+finishes and release dependent mapper/index services only after successful close.
+This is a resource owner, not a consensus ownership or schema controller.
+
+Inline cleanup is refused. Rejection or an unknown scheduling failure before a
+cleanup job starts cancels its wrapper and quarantines the native handles, owned
+generation and resident reservation. A queued wrapper cannot later close that
+quarantined lifecycle. If native cleanup already started, its actual completion
+determines closure. A failed close does not authorize dependent service teardown;
+quarantine survives until process-level recovery. Close cancellation is detached,
+and unresolved accepted persistence is not canceled or awaited indefinitely. A late
+quorum reply cannot invoke native application after cleanup.
+
+The TLS result-only history now owns its private context through canonical result
+verification and native cleanup before the next ownership/rebuild stage. The host
+still supplies request/resident weights, verified history, lifecycle/schema permits
+and bounded cleanup worker provisioning; client quorum mode remains inactive.

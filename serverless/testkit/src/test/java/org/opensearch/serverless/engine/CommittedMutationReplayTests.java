@@ -304,12 +304,23 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                         65536,
                         threadPool.getThreadContext()
                     );
-                    try {
-                        final PreparationWorkDispatcher.Binding<
+                    try (
+                        var lifecycle = org.opensearch.common.util.concurrent.OpenSearchExecutors.newFixed(
+                            "logical-result-cleanup",
+                            1,
+                            1,
+                            org.opensearch.common.util.concurrent.OpenSearchExecutors.daemonThreadFactory("logical-result-cleanup"),
+                            threadPool.getThreadContext()
+                        )
+                    ) {
+                        final var gate = new OwnedPreparationContext<
                             PreparedLogicalResultOnly,
-                            Map.Entry<LogCheckpoint, ResolvedResultOnly>> gate = noOpDispatcher.bind(
+                            Map.Entry<LogCheckpoint, ResolvedResultOnly>>(
+                                noOpDispatcher,
+                                lifecycle,
                                 fixture.group.id(),
                                 serving.shardId(),
+                                preparation,
                                 packetOnly -> packetOnly.appendTo(fixture.leader),
                                 (packetOnly, committed) -> {
                                     LogicalOwnershipSession.Progress appliedProgress;
@@ -334,6 +345,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                                     );
                                 },
                                 (packetOnly, committed, appliedOnly) -> {
+                                    assertEquals(0, preparation.engine().getProcessedLocalCheckpoint());
                                     if (committed.equals(appliedOnly.getKey()) == false
                                         || appliedOnly.getValue().status() != originalNoOpValue.get().status()
                                         || java.util.Arrays.equals(
@@ -391,7 +403,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                     final var noOpCp = noOpReceipt.getKey();
                     final var noOpResult = noOpReceipt.getValue();
                     assertEquals(0, applier.lastSequenceNumber());
-                    assertEquals(0, preparation.engine().getProcessedLocalCheckpoint());
+                    expectThrows(IllegalStateException.class, preparation::engine);
                     final var knownNoOp = session.knownClientOutcome(noOpId, retryCp.index(), new byte[32]).outcome().orElseThrow();
                     assertEquals(noOpCp, knownNoOp.originalCheckpoint());
                     final var originalNoOp = fixture.leader.readCommitted(assignment, knownNoOp.originalCheckpoint());

@@ -663,3 +663,20 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   cases). Native journal/catalog/replay, installed plugins, transport TLS and
   filesystem crash/handoff histories ran. Real-provider and multi-AZ qualification
   remain outstanding; client quorum mode remains off.
+
+- Private resource ownership now extends through admitted request drain and native
+  cleanup. The owned context validates group/shard binding, keeps resident admission
+  during queued cleanup, refuses inline native cleanup and quarantines handles,
+  generation and capacity after rejected/unknown cleanup scheduling. A canceled
+  close view cannot release resources; running preparation/application finish first,
+  and a late quorum reply cannot apply to the closed native engine. Successful
+  cleanup drops context callbacks/references; quarantined failures do not permit
+  mapper/service teardown. Actual native tests cover prepare/application stalls,
+  queued cleanup, cancellation, scope/binding refusal, inline/unknown dispatch and
+  dispatch failure after known native completion. The TLS no-op history now uses
+  the owned context before next-owner private rebuild. All 204 selected engine
+  cases and 18 native replay cases passed across three iterations with shell check
+  and root precommit (3m33s); all 15 lifecycle cases passed after adding the late
+  quorum-reply regression, with shell check/root precommit (32s). Host lifecycle
+  service provisioning, ownership/schema/frontend integration and client quorum
+  mode remain pending.

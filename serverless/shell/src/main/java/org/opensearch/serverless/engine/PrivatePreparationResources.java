@@ -479,6 +479,18 @@ public final class PrivatePreparationResources implements Closeable {
         return engine;
     }
 
+    /** Retains native ownership after an uncertain lifecycle handoff without running cleanup inline. */
+    synchronized void quarantineLifecycleFailure(Throwable failure) {
+        Objects.requireNonNull(failure);
+        if (closed && closeFailure == null) {
+            return;
+        }
+        if (preparationFailure == null) {
+            preparationFailure = failure;
+        }
+        ticket.quarantine(this);
+    }
+
     /**
      * Closes native IO before its store, removes the owned generation, then releases admission.
      * Any uncertain cleanup retains the generation and reservation; the host must keep the admission
