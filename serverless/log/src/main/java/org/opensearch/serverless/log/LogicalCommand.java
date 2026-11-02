@@ -167,12 +167,8 @@ public final class LogicalCommand {
      * @throws IOException if the complete command exceeds admission
      */
     public byte[] encode(int maximumBytes) throws IOException {
-        checkLimit(maximumBytes);
-        final long size = HEADER_BYTES + (long) payload.length;
-        if (size > maximumBytes) {
-            throw new IOException("logical command exceeds payload admission");
-        }
-        final var bytes = new ByteArrayOutputStream((int) size);
+        final int size = encodedLength(maximumBytes);
+        final var bytes = new ByteArrayOutputStream(size);
         try (var out = new DataOutputStream(bytes)) {
             out.writeInt(MAGIC);
             out.writeByte(FORMAT);
@@ -186,6 +182,15 @@ public final class LogicalCommand {
             out.write(payload);
         }
         return bytes.toByteArray();
+    }
+
+    int encodedLength(int maximumBytes) throws IOException {
+        checkLimit(maximumBytes);
+        final long size = HEADER_BYTES + (long) payload.length;
+        if (size > maximumBytes) {
+            throw new IOException("logical command exceeds payload admission");
+        }
+        return (int) size;
     }
 
     /**

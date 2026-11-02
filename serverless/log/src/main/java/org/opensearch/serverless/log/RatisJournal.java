@@ -467,14 +467,78 @@ public final class RatisJournal implements Closeable {
      * @throws IOException on synchronous validation, leader or admission failure
      */
     public CompletionStage<LogCheckpoint> append(UUID groupId, OperationEnvelope operation) throws IOException {
+        if (Objects.requireNonNull(operation).kind() == OperationEnvelope.Kind.LOGICAL) {
+            throw new IOException("logical commands require explicit local-producer admission");
+        }
+        return appendAdmitted(groupId, operation);
+    }
+
+    /**
+     * Proposes an explicitly framed logical command from this disk-bound voter identity. A logical
+     * producer cannot impersonate another voter. As with ordinary append, only the ready local
+     * leader can propose; prepared commands are never transparently redirected. The returned
+     * physical checkpoint does not assert semantic acceptance: the committed logical controller
+     * must evaluate ownership, schema, retry identity and sequence state before application.
+     *
+     * @param groupId assigned physical group
+     * @param stream exact logical activation identity
+     * @param command immutable logical command; actor must equal this journal's local voter UUID
+     * @param producerEpoch proposed logical producer epoch
+     * @param primaryTerm proposed engine term, independent of the Raft term
+     * @param schemaVersion proposed schema dependency or transition
+     * @return physically committed position, not a logical success or visibility guarantee
+     * @throws IOException on invalid producer, namespace, size, leadership or admission
+     */
+    public CompletionStage<LogCheckpoint> appendLogical(
+        UUID groupId,
+        ShardLogId stream,
+        LogicalCommand command,
+        long producerEpoch,
+        long primaryTerm,
+        long schemaVersion
+    ) throws IOException {
+        Objects.requireNonNull(command);
+        requireLocalProducer(command);
+        requireCustomerStream(groupId, stream);
+        if (producerEpoch < 0 || primaryTerm < 0 || schemaVersion < 0) {
+            throw new IllegalArgumentException("logical epochs, terms and schema versions must be non-negative");
+        }
+        final int payloadBytes = command.encodedLength(configuration.limits().maximumPayloadBytes());
+        return appendFrame(
+            groupId,
+            stream,
+            payloadBytes,
+            false,
+            () -> new OperationEnvelope(
+                stream,
+                OperationEnvelope.Kind.LOGICAL,
+                producerEpoch,
+                primaryTerm,
+                schemaVersion,
+                command.encode(configuration.limits().maximumPayloadBytes())
+            )
+        );
+    }
+
+    private void requireLocalProducer(LogicalCommand command) throws IOException {
+        if (command.actor().equals(configuration.localVoterId()) == false) {
+            throw new IOException("logical producer differs from local voter identity");
+        }
+    }
+
+    private CompletionStage<LogCheckpoint> appendAdmitted(UUID groupId, OperationEnvelope operation) throws IOException {
+        requireCustomerStream(groupId, operation.logId());
+        return appendFrame(groupId, operation);
+    }
+
+    private void requireCustomerStream(UUID groupId, ShardLogId stream) throws IOException {
         division(groupId);
-        if (operation.logId().equals(activationIdentity(groupId)) || operation.logId().indexUuid().startsWith("__journal_membership/")) {
+        if (stream.equals(activationIdentity(groupId)) || stream.indexUuid().startsWith("__journal_membership/")) {
             throw new IOException("physical group control identity is reserved");
         }
         if (stateMachines.get(groupId).activation == null) {
             throw new IOException("physical group has not completed initial voter activation");
         }
-        return appendFrame(groupId, operation);
     }
 
     /**
@@ -838,24 +902,38 @@ public final class RatisJournal implements Closeable {
         }
     }
 
+    @FunctionalInterface
+    private interface AdmittedEnvelope {
+        OperationEnvelope create() throws IOException;
+    }
+
     private CompletionStage<LogCheckpoint> appendFrame(UUID groupId, OperationEnvelope operation) throws IOException {
-        final var division = division(groupId);
         Objects.requireNonNull(operation);
-        if (operation.logId().deploymentId().equals(configuration.deploymentId()) == false
-            || operation.payloadLength() > configuration.limits().maximumPayloadBytes()) {
+        return appendFrame(groupId, operation.logId(), operation.payloadLength(), isMembershipBarrier(operation, groupId), () -> operation);
+    }
+
+    private CompletionStage<LogCheckpoint> appendFrame(
+        UUID groupId,
+        ShardLogId expectedIdentity,
+        int payloadBytes,
+        boolean membershipBarrier,
+        AdmittedEnvelope envelope
+    ) throws IOException {
+        final var division = division(groupId);
+        if (expectedIdentity.deploymentId().equals(configuration.deploymentId()) == false
+            || payloadBytes > configuration.limits().maximumPayloadBytes()) {
             throw new IOException("operation namespace or size is outside this journal's admission");
         }
         if (leaderEligible(division) == false) {
             throw new IOException("local journal member is not the ready leader");
         }
         requireDiskSpace();
-        if (isMembershipBarrier(operation, groupId) == false) {
+        if (membershipBarrier == false) {
             requireRetainedCapacity(groupId);
         }
-        final var permit = admission.acquire(groupId, operation.payloadLength());
+        final var permit = admission.acquire(groupId, payloadBytes);
         try {
-            final byte[] frame = operation.encode(configuration.limits().maximumPayloadBytes());
-            final var expectedIdentity = operation.logId();
+            final byte[] frame = envelope.create().encode(configuration.limits().maximumPayloadBytes());
             final var request = RaftClientRequest.newBuilder()
                 .setClientId(clientId)
                 .setServerId(server.getId())
@@ -1073,6 +1151,11 @@ public final class RatisJournal implements Closeable {
         public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
             requireDiskSpace();
             final var operation = decodeOperation(request.getMessage().getContent());
+            if (operation.kind() == OperationEnvelope.Kind.LOGICAL) {
+                requireLocalProducer(
+                    LogicalCommand.decode(operation.payloadReader().readAllBytes(), configuration.limits().maximumPayloadBytes())
+                );
+            }
             if (isMembershipBarrier(operation, group) == false) {
                 requireRetainedCapacity(group);
             }

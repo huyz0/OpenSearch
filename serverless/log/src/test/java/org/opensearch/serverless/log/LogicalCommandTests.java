@@ -99,8 +99,10 @@ public class LogicalCommandTests extends OpenSearchTestCase {
     public void testConfiguredWholeCommandLimitIncludesHeader() throws Exception {
         final var command = command();
         expectThrows(IOException.class, () -> command.encode(90));
+        expectThrows(IOException.class, () -> command.encodedLength(90));
         final byte[] encoded = command.encode(91);
         assertEquals(91, encoded.length);
+        assertEquals(encoded.length, command.encodedLength(91));
         expectThrows(IOException.class, () -> LogicalCommand.decode(encoded, 90));
         expectThrows(IllegalArgumentException.class, () -> command.encode(0));
         expectThrows(IllegalArgumentException.class, () -> LogicalCommand.decode(encoded, Integer.MAX_VALUE));

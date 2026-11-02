@@ -30,6 +30,7 @@ tasks.named('forbiddenApisMain').configure { replaceSignatureFiles 'jdk-signatur
 // Persistent socket-based journal tests need native gRPC access, isolated from ordinary unit tests.
 tasks.named('test').configure {
   exclude '**/RatisJournalTests.class'
+  exclude '**/LogicalJournalTests.class'
   exclude '**/RatisFailureCleanupTests.class'
   exclude '**/RatisJournalProcessTests.class'
 }
@@ -39,7 +40,10 @@ tasks.register('journalTest', Test) {
   systemProperty 'tests.journal.classpath', sourceSets.test.runtimeClasspath.asPath
   // Exact ownership checks for the SDK's persistent global Timer threads.
   jvmArgs '--add-opens=java.base/java.util=ALL-UNNAMED'
+  // Native volume leases intentionally survive close. Isolate suites instead of raising that cap.
+  forkEvery = 1
   include '**/RatisJournalTests.class'
+  include '**/LogicalJournalTests.class'
   include '**/RatisFailureCleanupTests.class'
   include '**/RatisJournalProcessTests.class'
   systemProperty 'tests.security.manager', 'false'

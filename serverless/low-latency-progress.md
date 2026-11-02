@@ -397,3 +397,17 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   and identical reconstruction across small versus large scan batches. Root
   precommit passed. Producer authentication, durable protocol configuration,
   host-wide residency admission, serving application and client integration remain.
+
+- Logical proposals now require the ready local journal leader's disk-bound voter
+  identity. Raw append cannot bypass explicit logical admission, and native
+  transaction admission rechecks the actor. Full command size is validated without
+  encoding, then serialization/envelope allocation occurs only after the existing
+  request/byte permit is acquired. Native tests cover impersonation, direct native
+  admission, follower submission, reserved/foreign identities, oversized commands
+  and takeover/retry replay. The final run passed 294 unit and 57 native cases over
+  three iterations plus root precommit (5m43s). The broader run also passed 45
+  process/recovery, 21 catalog and 15 serving-replay cases. Its repeated in-process
+  suite exposed the deliberate 128-volume lifetime cap; native suites now fork
+  separately with a shared fixture, preserving that production safeguard. This
+  admission API returns physical commitment; logical acceptance still requires
+  verified semantic replay, and client quorum mode remains disabled.

@@ -853,3 +853,23 @@ producer frame. Small bounded scans emit the four original control/data effects,
 return the original data checkpoint for the retry and refuse the stale write.
 Reconstruction in a single larger scan reproduces the same semantic state and
 receipts. This is local fault-history coverage, not three-AZ latency qualification.
+
+
+Logical proposal admission now explicitly binds the command actor to the local
+journal's persistent voter UUID. Only the ready local leader may append; a
+prepared operation is never redirected after an election. Ordinary append refuses
+logical frames, and the native transaction entry point revalidates their decoded
+actor. Trusted host orchestration must still establish the logical owner epoch,
+exact schema and retry outcome from committed history: a physically acknowledged
+proposal is not a logical success.
+
+Complete command size, including its header, is checked without allocating an
+encoding. Logical serialization and envelope construction run only after the
+normal journal request/byte permit is acquired. Failure releases the permit; an
+accepted proposal retains the existing cancellation and persistence behavior.
+This uses the existing transport and admission queues and adds no per-write S3 IO.
+
+Native tests now use separate suite JVMs because volume leases intentionally
+survive journal close until process exit. Adding repeated fixtures had reached
+the fixed 128-volume process cap. A shared fixture and per-suite forks keep that
+safeguard intact rather than increasing it or resetting retained identities.
