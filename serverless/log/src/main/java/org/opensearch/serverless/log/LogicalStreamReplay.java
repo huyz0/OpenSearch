@@ -74,6 +74,22 @@ public final class LogicalStreamReplay {
     private Throwable failure;
 
     /**
+     * Replays using permanent lineage and semantic limits loaded from the authorized catalog.
+     * The trusted host must bound resident cursors and separately authorize active storage mode.
+     * @param journal authorized local journal
+     * @param assignment permanent catalog assignment, not a client-supplied proof
+     * @throws IOException on mismatched physical history or unsupported local frame capability
+     */
+    public LogicalStreamReplay(RatisJournal journal, LogicalStreamRecord assignment) throws IOException {
+        this(boundSource(journal, assignment), assignment.stream(), assignment.maximumOutcomes(), assignment.maximumPayloadBytes());
+    }
+
+    private static Source boundSource(RatisJournal journal, LogicalStreamRecord assignment) throws IOException {
+        journal.verifyLogicalStream(assignment);
+        return source(journal, assignment.group(), assignment.stream());
+    }
+
+    /**
      * Starts from the beginning of one activated stream's retained committed history.
      * @param journal authorized local journal
      * @param group assigned physical group
@@ -81,7 +97,7 @@ public final class LogicalStreamReplay {
      * @param maximumOutcomes fixed protocol retry-retention count
      * @param maximumPayloadBytes fixed protocol frame limit
      */
-    public LogicalStreamReplay(RatisJournal journal, UUID group, ShardLogId stream, int maximumOutcomes, int maximumPayloadBytes) {
+    LogicalStreamReplay(RatisJournal journal, UUID group, ShardLogId stream, int maximumOutcomes, int maximumPayloadBytes) {
         this(source(journal, group, stream), stream, maximumOutcomes, maximumPayloadBytes);
     }
 

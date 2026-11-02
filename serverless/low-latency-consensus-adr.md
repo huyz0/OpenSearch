@@ -873,3 +873,34 @@ Native tests now use separate suite JVMs because volume leases intentionally
 survive journal close until process exit. Adding repeated fixtures had reached
 the fixed 128-volume process cap. A shared fixture and per-suite forks keep that
 safeguard intact rather than increasing it or resetting retained identities.
+
+
+`LogicalStreamRecord` permanently binds an exact deployment/index/shard/activation
+to one physical group, its original committed activation checkpoint, and fixed
+semantic retention and frame limits. Its bounded versioned encoding checks all
+fields with CRC32C; the trusted catalog, not deserialization alone, supplies
+provenance. Changing physical history or semantic limits requires a new explicitly
+fenced activation, not an in-place record overwrite.
+
+The group catalog creates one `stream-<activation UUID>` conditional register after
+the physical activation is durably published. Reusing a nonce for another shard,
+group or limit is a conflict. Reads use that key directly and verify both logical
+identity and durable group lineage. They neither enumerate the descriptor
+population nor allocate resident rows for cold streams. Lost creation replies
+reconcile the identical immutable assignment. Group membership replacement leaves
+the logical assignment and original activation unchanged.
+
+Public logical proposal and replay construction now take this catalog-loaded
+record, verify local physical lineage and frame capability, and use its fixed
+semantic limits. Proposal encoding also respects the record's complete payload
+limit even when the local journal admits larger frames. These checks perform no
+S3 IO per mutation. The caller is trusted to load an authorized record; a record
+received from a client is not a proof. Assignment alone does not activate an index
+storage mode, fence legacy writers or provide current logical ownership. Those
+lifecycle and runtime controllers remain required before client quorum writes.
+
+Local frame-capability validation is not proof that every existing or replacement
+voter has the same capability. Before enabling client writes, bootstrap and
+membership startup must enforce a durable group-wide protocol/frame capability
+without enumerating every logical stream. A smaller-capability follower must be
+refused before native startup rather than fence while applying a larger frame.

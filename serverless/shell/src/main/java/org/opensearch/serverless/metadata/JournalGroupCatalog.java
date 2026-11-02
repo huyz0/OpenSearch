@@ -16,7 +16,9 @@ import org.opensearch.serverless.log.JournalConfiguration;
 import org.opensearch.serverless.log.JournalGroupRecord;
 import org.opensearch.serverless.log.JournalMembershipRecord;
 import org.opensearch.serverless.log.JournalReplacementReceipt;
+import org.opensearch.serverless.log.LogicalStreamRecord;
 import org.opensearch.serverless.log.RatisJournal;
+import org.opensearch.serverless.log.ShardLogId;
 
 import javax.net.ssl.X509KeyManager;
 import javax.net.ssl.X509TrustManager;
@@ -84,6 +86,77 @@ public final class JournalGroupCatalog {
         ensureNamespace(false);
         final var value = container.readRegister(name(group));
         return value.isEmpty() ? Optional.empty() : Optional.of(decode(group, value.get()));
+    }
+
+    /**
+     * Permanently assigns one exact logical activation to an already activated physical history.
+     * The first successful conditional creation fixes group lineage and semantic limits. Retrying
+     * the identical assignment is idempotent; no later call can move or reconfigure it. This is a
+     * lifecycle operation, not per-document S3 traffic or authorization to switch storage modes.
+     * @param stream exact customer stream incarnation and activation
+     * @param group durably activated physical group
+     * @param maximumOutcomes fixed accepted-request retention count
+     * @param maximumPayloadBytes fixed complete logical command limit
+     * @return permanent assignment, including after an uncertain creation reply
+     * @throws IOException on foreign namespace, inactive group, conflicting assignment or storage failure
+     */
+    public LogicalStreamRecord reserveStream(ShardLogId stream, UUID group, int maximumOutcomes, int maximumPayloadBytes)
+        throws IOException {
+        requireStreamNamespace(stream);
+        final var genesis = readRequired(group);
+        if (genesis.activation() == null) {
+            throw new IOException("logical assignment requires a durably activated physical group");
+        }
+        final var expected = new LogicalStreamRecord(stream, group, genesis.activation(), maximumOutcomes, maximumPayloadBytes);
+        final var result = container.createRegisterIfAbsent(streamName(stream), new BytesArray(expected.encode()));
+        if (result.applied()) {
+            return expected;
+        }
+        final var current = readStream(stream).orElseThrow(() -> new IOException("logical assignment disappeared after creation conflict"));
+        if (current.equals(expected) == false) {
+            throw new IOException("logical activation is permanently assigned to different history or protocol limits");
+        }
+        return current;
+    }
+
+    /**
+     * Reads one immutable assignment by activation UUID without enumerating shards or groups.
+     * The host must use a bounded working-set cache; no resident row is required for cold streams.
+     * An absent assignment never authorizes recovery of a previously activated stream from scratch.
+     * @param stream exact customer stream identity expected at this key
+     * @return immutable assignment, or empty before initial reservation
+     * @throws IOException on key/namespace mismatch, missing group lineage, corruption or storage failure
+     */
+    public Optional<LogicalStreamRecord> readStream(ShardLogId stream) throws IOException {
+        requireStreamNamespace(stream);
+        ensureNamespace(false);
+        final var register = container.readRegister(streamName(stream));
+        if (register.isEmpty()) {
+            return Optional.empty();
+        }
+        final LogicalStreamRecord record;
+        try (var in = register.get().value().streamInput()) {
+            record = LogicalStreamRecord.read(in);
+        }
+        if (record.stream().equals(stream) == false) {
+            throw new IOException("logical assignment key or namespace differs from its contents");
+        }
+        final var genesis = readRequired(record.group());
+        if (record.groupActivation().equals(genesis.activation()) == false) {
+            throw new IOException("logical assignment differs from durable physical activation");
+        }
+        return Optional.of(record);
+    }
+
+    private void requireStreamNamespace(ShardLogId stream) throws IOException {
+        if (Objects.requireNonNull(stream).deploymentId().equals(deploymentId) == false) {
+            throw new IOException("logical assignment differs from catalog deployment");
+        }
+    }
+
+    private static String streamName(ShardLogId stream) {
+        // Reusing an activation UUID for another shard is a conflict, not a second namespace.
+        return "stream-" + stream.activationId();
     }
 
     /**

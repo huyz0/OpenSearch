@@ -26,6 +26,10 @@ import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.serverless.log.JournalConfiguration;
 import org.opensearch.serverless.log.JournalDiskIdentity;
+import org.opensearch.serverless.log.LogCheckpoint;
+import org.opensearch.serverless.log.LogicalCommand;
+import org.opensearch.serverless.log.LogicalStreamRecord;
+import org.opensearch.serverless.log.LogicalStreamReplay;
 import org.opensearch.serverless.log.OperationEnvelope;
 import org.opensearch.serverless.log.RatisJournal;
 import org.opensearch.serverless.log.ShardLogId;
@@ -123,6 +127,7 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
         }
         final var group = new JournalConfiguration.Group(UUID.randomUUID(), peers);
         final UUID deployment = UUID.randomUUID();
+        final var logicalStream = new ShardLogId(deployment, "bound-logical-index", 0, UUID.randomUUID());
         final var keys = KeyStore.getInstance("PKCS12");
         try (var input = getClass().getResourceAsStream("/org/opensearch/serverless/testkit/tls-test-keystore.p12")) {
             keys.load(input, "testonly".toCharArray());
@@ -210,6 +215,7 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                     fail("no ready journal leader");
                 }, 30, TimeUnit.SECONDS);
                 leader[0].activateGroup(group.id()).toCompletableFuture().get(20, TimeUnit.SECONDS);
+                expectThrows(IOException.class, () -> catalog.reserveStream(logicalStream, group.id(), 8, 128));
                 loseMembershipReply.set(true);
                 expectThrows(IOException.class, () -> catalog.publishActivation(leader[0], group.id()));
                 assertEquals(reservation, catalog.read(group.id()).orElseThrow());
@@ -224,6 +230,55 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 assertEquals(active, restartedController.reserve(group));
                 assertEquals(active, restartedController.membership(group.id()).genesis());
                 assertNull(restartedController.membership(group.id()).pending());
+                final var assigned = restartedController.reserveStream(logicalStream, group.id(), 8, 128);
+                assertEquals(active.activation(), assigned.groupActivation());
+                final var producer = peers.get(journals.indexOf(leader[0])).id();
+                final var claim = new LogicalCommand(
+                    LogicalCommand.Action.OWNERSHIP,
+                    UUID.randomUUID(),
+                    -1,
+                    new byte[32],
+                    producer,
+                    0,
+                    new byte[0]
+                );
+                final var ownerCp = leader[0].appendLogical(assigned, claim, 1, 1, 0).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                final var logical = new LogicalStreamReplay(leader[0], assigned).poll(100, 65536);
+                assertEquals(1, logical.effects().size());
+                assertEquals(ownerCp, logical.effects().getFirst().checkpoint());
+                assertEquals(producer, logical.state().owner());
+                final var oversized = new LogicalCommand(
+                    LogicalCommand.Action.SCHEMA,
+                    UUID.randomUUID(),
+                    ownerCp.index(),
+                    new byte[32],
+                    producer,
+                    0,
+                    new byte[39]
+                );
+                expectThrows(IOException.class, () -> leader[0].appendLogical(assigned, oversized, 1, 1, 1));
+                final var wrongHistory = new LogicalStreamRecord(
+                    logicalStream,
+                    group.id(),
+                    new LogCheckpoint(
+                        assigned.groupActivation().logId(),
+                        assigned.groupActivation().index() + 1,
+                        assigned.groupActivation().entryTerm()
+                    ),
+                    8,
+                    128
+                );
+                expectThrows(IOException.class, () -> leader[0].appendLogical(wrongHistory, claim, 1, 1, 0));
+                expectThrows(IOException.class, () -> new LogicalStreamReplay(leader[0], wrongHistory));
+                final var unsupported = new LogicalStreamRecord(
+                    logicalStream,
+                    group.id(),
+                    assigned.groupActivation(),
+                    8,
+                    limits.maximumPayloadBytes() + 1
+                );
+                expectThrows(IOException.class, () -> new LogicalStreamReplay(leader[0], unsupported));
+                assertEquals(assigned, new JournalGroupCatalog(real, deployment).readStream(logicalStream).orElseThrow());
                 final var configuration = new JournalConfiguration(
                     deployment,
                     peers.getFirst().id(),
@@ -358,6 +413,11 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 }, 30, TimeUnit.SECONDS);
                 final var secondReceipt = completedController.publishReplacement(leader[0], secondIntent);
                 assertEquals(2, secondReceipt.completedMembership().revision());
+                assertEquals(assigned, completedController.readStream(logicalStream).orElseThrow());
+                leader[0].verifyLogicalStream(assigned);
+                final var afterReplacement = new LogicalStreamReplay(leader[0], assigned).poll(100, 65536);
+                assertEquals(logical.state(), afterReplacement.state());
+                assertEquals(logical.receipts(), afterReplacement.receipts());
                 assertBusy(() -> {
                     try {
                         // The new learner can win this election. Reconcile on the retained host

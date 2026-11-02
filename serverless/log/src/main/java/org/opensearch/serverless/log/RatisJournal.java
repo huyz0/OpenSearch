@@ -474,6 +474,46 @@ public final class RatisJournal implements Closeable {
     }
 
     /**
+     * Proposes within a permanent assignment loaded by the trusted host from its durable catalog.
+     * This performs no object-store IO. The record itself is not an authorization proof supplied
+     * by a client. Physical commitment still requires semantic acceptance before application.
+     * @param assignment immutable catalog assignment and protocol limits
+     * @param command command from this local voter identity
+     * @param producerEpoch proposed logical epoch
+     * @param primaryTerm proposed engine term
+     * @param schemaVersion proposed schema dependency
+     * @return physically committed checkpoint, not logical success or search visibility
+     * @throws IOException on lineage, capability, producer, size, leadership or admission failure
+     */
+    public CompletionStage<LogCheckpoint> appendLogical(
+        LogicalStreamRecord assignment,
+        LogicalCommand command,
+        long producerEpoch,
+        long primaryTerm,
+        long schemaVersion
+    ) throws IOException {
+        verifyLogicalStream(assignment);
+        Objects.requireNonNull(command).encodedLength(assignment.maximumPayloadBytes());
+        return appendLogical(assignment.group(), assignment.stream(), command, producerEpoch, primaryTerm, schemaVersion);
+    }
+
+    /**
+     * Verifies historical physical lineage and local frame capability for a trusted catalog record.
+     * This does not establish current ownership, latest-read authority or storage-mode activation.
+     * @param assignment record obtained from the authorized durable catalog
+     * @throws IOException on mismatched history or unsupported frame capability
+     */
+    public void verifyLogicalStream(LogicalStreamRecord assignment) throws IOException {
+        Objects.requireNonNull(assignment);
+        if (assignment.maximumPayloadBytes() > configuration.limits().maximumPayloadBytes()) {
+            throw new IOException("logical protocol exceeds local journal frame capability");
+        }
+        if (groupActivation(assignment.group()).checkpoint().equals(assignment.groupActivation()) == false) {
+            throw new IOException("logical assignment differs from local physical activation");
+        }
+    }
+
+    /**
      * Proposes an explicitly framed logical command from this disk-bound voter identity. A logical
      * producer cannot impersonate another voter. As with ordinary append, only the ready local
      * leader can propose; prepared commands are never transparently redirected. The returned
@@ -489,7 +529,7 @@ public final class RatisJournal implements Closeable {
      * @return physically committed position, not a logical success or visibility guarantee
      * @throws IOException on invalid producer, namespace, size, leadership or admission
      */
-    public CompletionStage<LogCheckpoint> appendLogical(
+    CompletionStage<LogCheckpoint> appendLogical(
         UUID groupId,
         ShardLogId stream,
         LogicalCommand command,

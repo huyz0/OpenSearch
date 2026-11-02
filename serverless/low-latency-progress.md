@@ -411,3 +411,17 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   separately with a shared fixture, preserving that production safeguard. This
   admission API returns physical commitment; logical acceptance still requires
   verified semantic replay, and client quorum mode remains disabled.
+
+- Permanent logical stream assignments now bind each activation UUID to one
+  activated physical history and fixed outcome-retention/payload limits. Creation
+  uses a dedicated per-activation conditional register; direct reads validate key,
+  deployment, checksum and original group activation. Conflicting group, shard or
+  protocol changes are refused, including after lost replies and concurrent
+  reservation. Public proposal and replay APIs validate this catalog-loaded
+  binding without per-write S3 IO. The run passed 309 log and 54 catalog unit cases
+  across three iterations, plus three native catalog histories, shell check and
+  root precommit (1m12s). The native history verifies refusal before durable group
+  publication, exact payload admission, wrong-history/capability refusal and stable
+  replay through leader loss and two voter replacements. Storage-mode activation,
+  host-wide state budgets, group-wide voter frame-capability checks and the
+  ownership/schema/application controller remain.
