@@ -1385,7 +1385,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             );
             return getIndexer().index(index);
         }
-        assert opPrimaryTerm <= getOperationPrimaryTerm() : "op term [ "
+        assert acceptsOperationPrimaryTerm(indexer, seqNo, opPrimaryTerm) : "op term [ "
             + opPrimaryTerm
             + " ] > shard term ["
             + getOperationPrimaryTerm()
@@ -1524,7 +1524,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     private Engine.NoOpResult markSeqNoAsNoop(Indexer engine, long seqNo, long opPrimaryTerm, String reason, Engine.Operation.Origin origin)
         throws IOException {
-        assert opPrimaryTerm <= getOperationPrimaryTerm() : "op term [ "
+        assert acceptsOperationPrimaryTerm(engine, seqNo, opPrimaryTerm) : "op term [ "
             + opPrimaryTerm
             + " ] > shard term ["
             + getOperationPrimaryTerm()
@@ -1645,7 +1645,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         long ifPrimaryTerm,
         Engine.Operation.Origin origin
     ) throws IOException {
-        assert opPrimaryTerm <= getOperationPrimaryTerm() : "op term [ "
+        assert acceptsOperationPrimaryTerm(engine, seqNo, opPrimaryTerm) : "op term [ "
             + opPrimaryTerm
             + " ] > shard term ["
             + getOperationPrimaryTerm()
@@ -3585,6 +3585,18 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     /** returns true if the {@link IndexShardState} allows reading */
     public boolean isReadAllowed() {
         return readAllowedStates.contains(state);
+    }
+
+    private boolean acceptsOperationPrimaryTerm(Indexer indexer, long sequenceNumber, long primaryTerm) {
+        if (primaryTerm <= getOperationPrimaryTerm()) {
+            return true;
+        }
+        final var configuration = indexer.config();
+        final var policy = configuration.getPrimaryOperationPolicy();
+        return sequenceNumber >= 0
+            && policy.acceptsPreAssignedSeqNos()
+            && policy.acceptsPreAssignedPrimaryTerms()
+            && primaryTerm <= configuration.getPrimaryTermSupplier().getAsLong();
     }
 
     private void ensureWriteAllowed(Engine.Operation.Origin origin) throws IllegalIndexShardStateException {

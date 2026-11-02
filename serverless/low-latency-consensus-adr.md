@@ -1008,10 +1008,11 @@ accepted effects from logical replay, not physically committed raw frames or
 client-supplied assertions. Producer adapters must validate the opaque native
 payload before irreversible proposal admission as well.
 
-The current native adapter supports an empty verified serving state, one exact
-already installed schema/analysis context, and operation terms at or below its
-installed native term. Dynamic schema/native-term lifecycle and verified recovery
-bases require their controllers; it does not reindex history with a newer schema.
+The current native adapter supports an empty verified serving state and one exact
+already installed schema/analysis context. Accepted ownership controls install an
+upstream operation-term bound independently of native shard allocation, as described
+below. Dynamic schema/lifecycle and verified nonempty recovery bases require their
+controllers; it does not reindex history with a newer schema.
 A real private native preparation -> TLS quorum -> logical ownership/schema ->
 serving history verifies visibility only after accepted application, original
 identity, a changed-result retry and conditional delete. No frontend storage mode
@@ -1191,3 +1192,28 @@ mutation binding retains the same exact-resolution verifier. Direct gate tests
 cover mandatory verification, failed verification and late commitment after close.
 These are host building blocks, not a production request frontend or lifecycle
 controller, and declared request bytes do not establish actual heap residency.
+
+
+### Native operation terms across logical ownership changes
+
+The committed-serving policy explicitly opts into upstream-assigned operation
+terms alongside assigned sequence numbers. Ordinary engines keep native shard
+term validation. Shard parsing, listeners and translog replay accept a higher
+assigned term only under that policy and within the engine's installed term bound;
+ordinary client operations still cannot allocate identities in this engine.
+Native allocation authority remains separate and unchanged. The logical applier
+continues to fence if that allocation binding, mapper or store changes.
+
+Before exposing an accepted new owner, the applier checks that both native maximum
+sequence and processed checkpoint equal its applied document prefix. It advances
+the operation-term supplier monotonically, rolls the translog generation and syncs
+it before any higher-term operation can be applied. Roll/sync failure stops the
+native engine and the logical consumer. Existing document terms stay unchanged,
+so a subsequent private rebuild can perform CAS against the prior owner's identity.
+A term floor supplied from host-verified history is required before reopening
+higher-term native history; historical controls cannot lower that floor. The floor
+alone is not an ownership proof or a verified native recovery-base certificate.
+
+The host still owns admission, schema/lifecycle exclusion and accepted-effect
+validation. This does not implement a nonempty logical recovery controller, dynamic
+mapping changes, fresh-reader authority, or the client quorum-mode frontend.

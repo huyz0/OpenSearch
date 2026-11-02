@@ -15,12 +15,130 @@ import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineTestCase;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.Store;
+import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.Translog;
+import org.opensearch.index.translog.TranslogFactory;
 
 import java.io.IOException;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
+
 /** Native primary-serving boundary, separate from quorum authority and launcher integration. */
 public class CommittedServingPrimaryTests extends EngineTestCase {
+    public void testTermRollOrSyncFailurePermanentlyStopsNativeApplication() throws Exception {
+        for (boolean failRoll : new boolean[] { true, false }) {
+            final var armed = new java.util.concurrent.atomic.AtomicBoolean();
+            final var rolled = new java.util.concurrent.atomic.AtomicBoolean();
+            final var injected = new IOException(failRoll ? "injected term roll failure" : "injected term sync failure");
+            final var factory = spy(new InternalTranslogFactory());
+            doAnswer(
+                invocation -> new org.opensearch.index.translog.LocalTranslog(
+                    invocation.getArgument(0),
+                    invocation.getArgument(1),
+                    invocation.getArgument(2),
+                    invocation.getArgument(3),
+                    invocation.getArgument(4),
+                    invocation.getArgument(5),
+                    invocation.getArgument(7),
+                    null
+                ) {
+                    @Override
+                    public void rollGeneration() throws IOException {
+                        if (armed.get() && failRoll) {
+                            throw injected;
+                        }
+                        super.rollGeneration();
+                        if (armed.get()) {
+                            rolled.set(true);
+                        }
+                    }
+
+                    @Override
+                    public void sync() throws IOException {
+                        if (armed.get() && failRoll == false && rolled.get()) {
+                            throw injected;
+                        }
+                        super.sync();
+                    }
+                }
+            ).when(factory).newTranslog(any(), anyString(), any(), any(), any(), any(), any(), any());
+            try (var store = createStore(); var serving = serving(store, factory)) {
+                armed.set(true);
+                final var failure = expectThrows(Exception.class, () -> serving.installCommittedTerm(primaryTerm.get() + 1, -1));
+                assertTrue(failure.toString(), failure == injected || failure.getCause() == injected);
+                expectThrows(org.apache.lucene.store.AlreadyClosedException.class, serving::ensureReplayOpen);
+                expectThrows(
+                    org.apache.lucene.store.AlreadyClosedException.class,
+                    () -> serving.noOp(
+                        new Engine.NoOp(0, primaryTerm.get() + 1, Engine.Operation.Origin.PRIMARY, System.nanoTime(), "must not apply")
+                    )
+                );
+            }
+        }
+    }
+
+    public void testUninstalledTermAndWrongSequencePrefixCannotChangeTheEngine() throws Exception {
+        try (var store = createStore(); var serving = serving(store)) {
+            final long future = primaryTerm.get() + 1;
+            final var operation = new Engine.NoOp(0, future, Engine.Operation.Origin.PRIMARY, System.nanoTime(), "future");
+            expectThrows(IllegalStateException.class, () -> serving.noOp(operation));
+            expectThrows(IOException.class, () -> serving.installCommittedTerm(future, 0));
+            assertEquals(primaryTerm.get(), serving.config().getPrimaryTermSupplier().getAsLong());
+            assertEquals(-1, serving.getSeqNoStats(-1).getMaxSeqNo());
+            serving.installCommittedTerm(future, -1);
+            assertEquals(Engine.Result.Type.SUCCESS, serving.noOp(operation).getResultType());
+            serving.installCommittedTerm(primaryTerm.get(), 0);
+            assertEquals(
+                "historical control must not lower the recovery floor",
+                future,
+                serving.config().getPrimaryTermSupplier().getAsLong()
+            );
+            assertEquals(0, serving.getProcessedLocalCheckpoint());
+        }
+    }
+
+    public void testVerifiedTermFloorRecoversHigherTermNativeHistory() throws Exception {
+        try (var store = createStore()) {
+            final var serving = serving(store);
+            final var configuration = serving.config();
+            final long future = primaryTerm.get() + 1;
+            try {
+                serving.installCommittedTerm(future, -1);
+                serving.noOp(new Engine.NoOp(0, future, Engine.Operation.Origin.PRIMARY, System.nanoTime(), "accepted"));
+                serving.translogManager().syncTranslog();
+            } finally {
+                serving.close();
+            }
+            // Use the original allocation supplier, not the old engine's live operation-term wrapper.
+            final var recoveredConfiguration = configuration.toBuilder()
+                .mergePolicy(newMergePolicy())
+                .primaryTermSupplier(primaryTerm::get)
+                .build();
+            try (var recovered = new CommittedServingEngine(recoveredConfiguration, future)) {
+                recovered.translogManager()
+                    .recoverFromTranslog(
+                        createTranslogHandler(recoveredConfiguration.getIndexSettings(), recovered),
+                        recovered.getProcessedLocalCheckpoint(),
+                        Long.MAX_VALUE
+                    );
+                assertEquals(0, recovered.getProcessedLocalCheckpoint());
+                try (var history = recovered.newChangesSnapshot("higher-term-recovery", 0, 0, true, true)) {
+                    final var operation = history.next();
+                    assertEquals(0, operation.seqNo());
+                    assertEquals(future, operation.primaryTerm());
+                    assertEquals(Translog.Operation.Type.NO_OP, operation.opType());
+                    assertNull(history.next());
+                }
+                recovered.installCommittedTerm(future + 1, 0);
+                recovered.noOp(new Engine.NoOp(1, future + 1, Engine.Operation.Origin.PRIMARY, System.nanoTime(), "next accepted"));
+                assertEquals(1, recovered.getProcessedLocalCheckpoint());
+            }
+        }
+    }
+
     public void testOrdinaryClientIndexDeleteAndGapFillingCannotChangeServingState() throws Exception {
         try (var store = createStore(); var serving = serving(store)) {
             expectThrows(IllegalStateException.class, () -> serving.index(indexForDoc(createParsedDoc("speculative", null))));
@@ -190,7 +308,13 @@ public class CommittedServingPrimaryTests extends EngineTestCase {
     }
 
     private CommittedServingEngine serving(Store store) throws IOException {
-        final var config = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+        return serving(store, new InternalTranslogFactory());
+    }
+
+    private CommittedServingEngine serving(Store store, TranslogFactory factory) throws IOException {
+        final var config = config(defaultSettings, store, createTempDir(), newMergePolicy(), null).toBuilder()
+            .translogFactory(factory)
+            .build();
         store.createEmpty(config.getIndexSettings().getIndexVersionCreated().luceneVersion);
         final String uuid = Translog.createEmptyTranslog(
             config.getTranslogConfig().getTranslogPath(),

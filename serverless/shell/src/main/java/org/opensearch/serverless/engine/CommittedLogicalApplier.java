@@ -32,9 +32,10 @@ import java.util.UUID;
  * Native application of newly accepted logical effects into an empty committed-serving primary.
  * Input must come from verified logical replay, not raw physical scans or client checkpoints. The
  * trusted host must serialize application/lifecycle and pin an already installed exact native
- * schema/analysis context. This adapter supports that single schema and engine terms no greater
- * than the serving shard's installed term; schema changes and native term/rebuild transitions need
- * their lifecycle controller. It provides no latest-reader proof or original outcome-only codec.
+ * schema/analysis context. Accepted ownership effects install upstream operation terms independently
+ * of native shard allocation. This adapter supports a single schema; schema changes, verified
+ * nonempty recovery bases and lifecycle transitions still need their controller. It provides no
+ * latest-reader proof or original outcome-only codec.
  */
 @InternalApi
 public final class CommittedLogicalApplier {
@@ -118,8 +119,7 @@ public final class CommittedLogicalApplier {
                 || envelope.logId().equals(stream) == false
                 || checkpoint.logId().equals(stream) == false
                 || checkpoint.index() <= lastIndex
-                || envelope.payloadLength() > maximumPayloadBytes
-                || envelope.primaryTerm() > nativePrimaryTerm) {
+                || envelope.payloadLength() > maximumPayloadBytes) {
                 throw new IOException("logical effect differs from ordered native serving binding");
             }
             final var command = LogicalCommand.decode(envelope.payloadReader().readAllBytes(), maximumPayloadBytes);
@@ -132,6 +132,7 @@ public final class CommittedLogicalApplier {
                     || envelope.schemaVersion() != schema) {
                     throw new IOException("logical ownership transition is inconsistent with native replay");
                 }
+                engine.installCommittedTerm(envelope.primaryTerm(), lastSequence);
                 owner = command.actor();
                 epoch = envelope.producerEpoch();
                 term = envelope.primaryTerm();

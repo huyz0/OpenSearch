@@ -21,6 +21,11 @@ import java.io.IOException;
 final class CommittedPrimaryOperationPolicy implements PrimaryOperationPolicy {
     static final CommittedPrimaryOperationPolicy INSTANCE = new CommittedPrimaryOperationPolicy();
 
+    @Override
+    public boolean acceptsPreAssignedPrimaryTerms() {
+        return true;
+    }
+
     private CommittedPrimaryOperationPolicy() {}
 
     @Override

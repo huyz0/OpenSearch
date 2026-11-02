@@ -403,52 +403,91 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                     assertEquals(noOpResult.status(), recoveredNoOp.status());
                     assertArrayEquals(noOpResult.json(), recoveredNoOp.json());
                     preparation.close();
-                    try (
-                        var rebuilt = PrivatePreparationResources.openCommitted(
-                            new PreparationEngineAdmission(Set.of(fixture.group.id()), 4, 256L * 1024 * 1024, 64L * 1024 * 1024),
-                            fixture.group.id(),
-                            engines.get(serving.store()),
-                            createTempDir(),
-                            64L * 1024 * 1024,
-                            4L * 1024 * 1024,
-                            applier.lastSequenceNumber(),
-                            term,
-                            new PrivatePreparationResources.RebuildLimits(10_000, 1024 * 1024, 1L << 30, 10_000, 4L * 1024 * 1024)
-                        )
-                    ) {
-                        final var deletion = rebuilt.engine()
-                            .prepareDelete(
-                                "id",
-                                null,
-                                SequenceNumbers.UNASSIGNED_SEQ_NO,
-                                term,
-                                Versions.MATCH_ANY,
-                                VersionType.INTERNAL,
-                                Engine.Operation.Origin.PRIMARY,
-                                first.getSeqNo(),
-                                first.getTerm()
+                    final var nextServing = newServing();
+                    try {
+                        final var nextApplier = new CommittedLogicalApplier(
+                            nextServing,
+                            engines.get(nextServing.store()),
+                            stream,
+                            1,
+                            definition,
+                            16384
+                        );
+                        try (var nextSession = new LogicalOwnershipSession(fixture.leader, assignment, actor, nextApplier::apply)) {
+                            // Rebuild from the same permanent history into an empty independent serving copy.
+                            LogicalOwnershipSession.Progress recovered;
+                            do {
+                                recovered = nextSession.advance(100, 65536);
+                            } while (recovered.throughIndex() < recovered.committedIndex());
+                            assertEquals(0, nextApplier.lastSequenceNumber());
+                            assertEquals(
+                                noOpCp,
+                                nextSession.knownClientOutcome(noOpId, retryCp.index(), new byte[32])
+                                    .outcome()
+                                    .orElseThrow()
+                                    .originalCheckpoint()
                             );
-                        final var removed = rebuilt.delete(deletion);
-                        assertTrue(removed.isFound());
-                        final var resolvedDelete = new ResolvedMutation(
-                            UUID.randomUUID(),
-                            new Translog.Delete(deletion, removed),
-                            ResolvedMutation.Outcome.DELETED
-                        );
-                        final var deletePacket = PreparedLogicalMutation.create(
-                            assignment,
-                            session.ownership().orElseThrow(),
-                            resolvedDelete,
-                            noOpCp.index(),
-                            new byte[32]
-                        );
-                        final var deleteCp = deletePacket.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
-                        while (applier.lastAppliedCheckpoint().orElseThrow().index() < deleteCp.index()) {
-                            session.advance(100, 65536);
+                            final long nextNativeTerm = nextServing.getOperationPrimaryTerm();
+                            final long nextTerm = Math.max(term, nextNativeTerm) + 1;
+                            nextSession.beginClaim(nextTerm).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                            while (nextSession.ownership().isEmpty()) {
+                                nextSession.advance(100, 65536);
+                            }
+                            assertEquals(2, nextSession.ownership().orElseThrow().state().producerEpoch());
+                            assertEquals(nextNativeTerm, nextServing.getOperationPrimaryTerm());
+                            try (
+                                var rebuilt = PrivatePreparationResources.openCommitted(
+                                    new PreparationEngineAdmission(Set.of(fixture.group.id()), 4, 256L * 1024 * 1024, 64L * 1024 * 1024),
+                                    fixture.group.id(),
+                                    engines.get(nextServing.store()),
+                                    createTempDir(),
+                                    64L * 1024 * 1024,
+                                    4L * 1024 * 1024,
+                                    nextApplier.lastSequenceNumber(),
+                                    nextTerm,
+                                    new PrivatePreparationResources.RebuildLimits(10_000, 1024 * 1024, 1L << 30, 10_000, 4L * 1024 * 1024)
+                                )
+                            ) {
+                                final var deletion = rebuilt.engine()
+                                    .prepareDelete(
+                                        "id",
+                                        null,
+                                        SequenceNumbers.UNASSIGNED_SEQ_NO,
+                                        nextTerm,
+                                        Versions.MATCH_ANY,
+                                        VersionType.INTERNAL,
+                                        Engine.Operation.Origin.PRIMARY,
+                                        first.getSeqNo(),
+                                        first.getTerm()
+                                    );
+                                final var removed = rebuilt.delete(deletion);
+                                assertTrue(removed.isFound());
+                                assertEquals(nextTerm, removed.getTerm());
+                                final var resolvedDelete = new ResolvedMutation(
+                                    UUID.randomUUID(),
+                                    new Translog.Delete(deletion, removed),
+                                    ResolvedMutation.Outcome.DELETED
+                                );
+                                final var deletePacket = PreparedLogicalMutation.create(
+                                    assignment,
+                                    nextSession.ownership().orElseThrow(),
+                                    resolvedDelete,
+                                    noOpCp.index(),
+                                    new byte[32]
+                                );
+                                final var deleteCp = deletePacket.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                                while (nextApplier.lastAppliedCheckpoint().orElseThrow().index() < deleteCp.index()) {
+                                    nextSession.advance(100, 65536);
+                                }
+                                nextServing.refresh("accepted new-owner conditional delete using old-term CAS");
+                                assertDocCount(nextServing, 0);
+                                assertEquals(1, nextApplier.lastSequenceNumber());
+                                // The old lifecycle has not applied this owner change and cannot claim freshness.
+                                assertEquals(0, applier.lastSequenceNumber());
+                            }
                         }
-                        serving.refresh("accepted logical conditional delete");
-                        assertDocCount(serving, 0);
-                        assertEquals(1, applier.lastSequenceNumber());
+                    } finally {
+                        closeShards(nextServing);
                     }
                 }
             }

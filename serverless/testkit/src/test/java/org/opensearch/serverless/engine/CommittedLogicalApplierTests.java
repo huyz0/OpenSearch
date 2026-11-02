@@ -34,6 +34,118 @@ public class CommittedLogicalApplierTests extends IndexShardTestCase {
     private static final UUID OWNER = new UUID(5, 6);
     private final Map<Store, CommittedServingEngine> engines = new IdentityHashMap<>();
 
+    public void testAcceptedOwnerChangePreservesNativeIdentityAboveAllocationTerm() throws Exception {
+        final var serving = newServing();
+        try {
+            final var fixture = new Fixture(serving);
+            fixture.activate();
+            final var first = new ResolvedMutation(
+                UUID.randomUUID(),
+                new Translog.Index("id", 0, fixture.term, 1, "{}".getBytes(StandardCharsets.UTF_8), null, -1),
+                ResolvedMutation.Outcome.CREATED
+            );
+            fixture.applier.apply(fixture.frame(mutationCommand(first, OWNER), 1));
+            final var nextOwner = UUID.randomUUID();
+            final long nextTerm = fixture.term + 1;
+            fixture.applier.apply(
+                fixture.frame(
+                    new LogicalCommand(LogicalCommand.Action.OWNERSHIP, UUID.randomUUID(), 1, new byte[32], nextOwner, 1, new byte[0]),
+                    2,
+                    nextTerm,
+                    1
+                )
+            );
+            assertEquals("logical ownership must not mutate native allocation authority", fixture.term, serving.getOperationPrimaryTerm());
+            assertEquals(nextTerm, fixture.engine.config().getPrimaryTermSupplier().getAsLong());
+            final var update = new ResolvedMutation(
+                UUID.randomUUID(),
+                new Translog.Index("id", 1, nextTerm, 2, "{}".getBytes(StandardCharsets.UTF_8), null, -1),
+                ResolvedMutation.Outcome.UPDATED
+            );
+            final var updated = fixture.applier.apply(fixture.frame(mutationCommand(update, nextOwner), 2, nextTerm, 1)).orElseThrow();
+            assertEquals(nextTerm, updated.mutation().primaryTerm());
+            try (
+                var got = fixture.engine.get(
+                    new Engine.Get(
+                        true,
+                        true,
+                        "id",
+                        new org.apache.lucene.index.Term(
+                            org.opensearch.index.mapper.IdFieldMapper.NAME,
+                            org.opensearch.index.mapper.Uid.encodeId("id")
+                        )
+                    ),
+                    fixture.engine::acquireSearcher
+                )
+            ) {
+                assertTrue(got.exists());
+                assertEquals(nextTerm, got.docIdAndVersion().primaryTerm);
+                assertEquals(1, got.docIdAndVersion().seqNo);
+                assertEquals(2, got.version());
+            }
+            final var removed = new ResolvedMutation(
+                UUID.randomUUID(),
+                new Translog.Delete("id", 2, nextTerm, 3),
+                ResolvedMutation.Outcome.DELETED
+            );
+            fixture.applier.apply(fixture.frame(mutationCommand(removed, nextOwner), 2, nextTerm, 1));
+            final var noop = new ResolvedMutation(
+                UUID.randomUUID(),
+                new Translog.NoOp(3, nextTerm, "accepted slot"),
+                ResolvedMutation.Outcome.NO_OP
+            );
+            fixture.applier.apply(fixture.frame(mutationCommand(noop, nextOwner), 2, nextTerm, 1));
+            serving.sync();
+            serving.refresh("accepted new owner");
+            assertDocCount(serving, 0);
+            assertEquals(3, fixture.applier.lastSequenceNumber());
+            assertEquals(3, serving.getProcessedLocalCheckpoint());
+        } finally {
+            closeShards(serving);
+        }
+    }
+
+    public void testOwnerTermCannotHideSpeculativeNativeStateOrUnprocessedGap() throws Exception {
+        for (long sequence : new long[] { 0, 1 }) {
+            final var serving = newServing();
+            try {
+                final var fixture = new Fixture(serving);
+                fixture.activate();
+                serving.applyTranslogOperation(
+                    new Translog.NoOp(sequence, fixture.term, "not in applied logical history"),
+                    Engine.Operation.Origin.PRIMARY
+                );
+                final var owner = new LogicalCommand(
+                    LogicalCommand.Action.OWNERSHIP,
+                    UUID.randomUUID(),
+                    1,
+                    new byte[32],
+                    OWNER,
+                    1,
+                    new byte[0]
+                );
+                expectThrows(IOException.class, () -> fixture.applier.apply(fixture.frame(owner, 2, fixture.term + 1, 1)));
+                assertEquals(fixture.term, fixture.engine.config().getPrimaryTermSupplier().getAsLong());
+                assertEquals(-1, fixture.applier.lastSequenceNumber());
+                expectThrows(IOException.class, () -> fixture.applier.apply(fixture.frame(owner, 2, fixture.term + 1, 1)));
+            } finally {
+                closeShards(serving);
+            }
+        }
+    }
+
+    private static LogicalCommand mutationCommand(ResolvedMutation mutation, UUID owner) throws IOException {
+        return new LogicalCommand(
+            LogicalCommand.Action.MUTATION,
+            mutation.operationId(),
+            1,
+            new byte[32],
+            owner,
+            mutation.sequenceNumber(),
+            mutation.encode(4000)
+        );
+    }
+
     public void testMismatchedResolvedIdentitySequenceAndTermFailBeforeNativeMutation() throws Exception {
         for (int invalid = 0; invalid < 3; invalid++) {
             final var serving = newServing();
@@ -272,8 +384,13 @@ public class CommittedLogicalApplierTests extends IndexShardTestCase {
         }
 
         private RatisJournal.CommittedOperation frame(LogicalCommand command, long schema) throws IOException {
+            return frame(command, 1, term, schema);
+        }
+
+        private RatisJournal.CommittedOperation frame(LogicalCommand command, long epoch, long operationTerm, long schema)
+            throws IOException {
             return new RatisJournal.CommittedOperation(
-                new OperationEnvelope(stream, OperationEnvelope.Kind.LOGICAL, 1, term, schema, command.encode(4096)),
+                new OperationEnvelope(stream, OperationEnvelope.Kind.LOGICAL, epoch, operationTerm, schema, command.encode(4096)),
                 new LogCheckpoint(stream, index++, 1)
             );
         }

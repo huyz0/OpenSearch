@@ -57,6 +57,18 @@ public interface PrimaryOperationPolicy {
     boolean acceptsPreAssignedSeqNos();
 
     /**
+     * Whether assigned operations use an upstream primary-term namespace independent of native
+     * shard allocation. This requires pre-assigned sequence numbers as well. The engine's primary
+     * term supplier must bound accepted operation terms, including during recovery, and the host
+     * must roll its translog before applying a higher term. This is not proof of upstream authority.
+     * Ordinary primary and replica policies retain native shard term validation.
+     * @return {@code true} only for an explicitly managed upstream term namespace
+     */
+    default boolean acceptsPreAssignedPrimaryTerms() {
+        return false;
+    }
+
+    /**
      * Plans an index operation that arrived on the primary.
      * <p>
      * The engine handles non-primary origins itself; this method is consulted only for

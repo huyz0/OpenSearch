@@ -80,6 +80,8 @@ public class PrimaryOperationPolicyTests extends OpenSearchTestCase {
     public void testDefaultPolicyCapabilities() {
         PrimaryOperationPolicy provider = DefaultPrimaryOperationPolicy.INSTANCE;
         assertFalse(provider.acceptsPreAssignedSeqNos());
+        assertFalse(provider.acceptsPreAssignedPrimaryTerms());
+        assertFalse(FakePreAssignedSeqNoPrimaryOperationPolicy.INSTANCE.acceptsPreAssignedPrimaryTerms());
     }
 
     public void testDefaultPolicyPlansAsPrimaryWithoutCopying() throws IOException {

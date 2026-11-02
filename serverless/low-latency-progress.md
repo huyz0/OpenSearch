@@ -631,3 +631,20 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   common copy behavior without a separate workaround. All 18 core configuration
   cases and 51 native serving/private rebuild cases passed across three iterations,
   with shell check and root precommit (5m1s).
+
+- Accepted logical ownership changes now install upstream operation terms above
+  the native allocation term. An explicit policy keeps ordinary engines on native
+  term checks and requires assigned sequences plus an installed supplier bound.
+  The serving adapter verifies its exact applied sequence/processed prefix, rolls
+  and syncs the translog before higher-term writes, and stops permanently on roll
+  or sync failure. Native allocation binding and old document identities remain
+  unchanged. A host-verified term floor supports reopening higher-term native
+  history; it does not certify a nonempty logical recovery base. Tests cover
+  ordinary policy isolation, uninstalled terms, speculative state/gaps, old controls,
+  native restart and injected roll/sync failures. The TLS history reconstructs an
+  independent empty serving copy, recovers the original no-op response coordinate,
+  claims a higher term and rebuilds private state before CAS delete using the old
+  document term. All 18 TLS replay cases passed across three iterations (2m21s),
+  followed by 45 core and 297 shell engine cases across three iterations with shell
+  check and root precommit (4m12s). Owned lifecycle/frontend, nonempty recovery-base
+  integration and client quorum mode remain pending.

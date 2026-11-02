@@ -32,6 +32,38 @@ import java.util.List;
 
 /** Exercises resolved primary replay through shard parsing, listeners, GET and search. */
 public class CommittedServingShardTests extends IndexShardTestCase {
+    public void testOrdinaryEngineStillRejectsFutureShardTermsDespiteHigherTranslogSupplier() throws Exception {
+        final var ordinary = new java.util.concurrent.atomic.AtomicReference<org.opensearch.index.engine.InternalEngine>();
+        final var serving = newStartedShard(true, Settings.EMPTY, new EngineBackedIndexerFactory(configuration -> {
+            final var nativeTerm = configuration.getPrimaryTermSupplier();
+            final var engine = new org.opensearch.index.engine.InternalEngine(
+                configuration.toBuilder().primaryTermSupplier(() -> nativeTerm.getAsLong() + 10).build()
+            );
+            ordinary.set(engine);
+            return engine;
+        }));
+        try {
+            final long future = serving.getOperationPrimaryTerm() + 1;
+            assertTrue(ordinary.get().config().getPrimaryTermSupplier().getAsLong() > future);
+            final List<Translog.Operation> operations = List.of(
+                resolvedIndex(0, future, 1, "{}"),
+                new Translog.Delete("id", 0, future, 1),
+                new Translog.NoOp(0, future, "not assigned")
+            );
+            for (var operation : operations) {
+                final var failure = expectThrows(
+                    AssertionError.class,
+                    () -> serving.applyTranslogOperation(operation, Engine.Operation.Origin.PRIMARY)
+                );
+                assertTrue(failure.getMessage(), failure.getMessage().contains("op term"));
+            }
+            assertEquals(-1, ordinary.get().getSeqNoStats(-1).getMaxSeqNo());
+            assertEquals(-1, serving.getProcessedLocalCheckpoint());
+        } finally {
+            closeShards(serving);
+        }
+    }
+
     public void testResolvedPrimaryReplayRetainsIdentityRoutingAndPublicListeners() throws Exception {
         final List<Engine.Operation> applied = new ArrayList<>();
         final IndexingOperationListener listener = new IndexingOperationListener() {
