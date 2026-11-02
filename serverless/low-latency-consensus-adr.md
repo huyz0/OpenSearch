@@ -1070,3 +1070,19 @@ closes. Uncertain native initialization retains its pin, generation and admissio
 in quarantine. The current remote cache and tiered backends are refused: their
 independent object/cache GC requires an immutable-file lease before such a source
 can be used safely. No client storage-mode activation is implied by this factory.
+
+### Ownership-driver retry inspection
+
+`LogicalOwnershipSession.knownClientOutcome` inspects the driver's existing bounded
+identity cache at its successfully applied prefix. The host can recover a retained
+original result before claiming a new owner, without allocating another replay fold
+or executing a script. Mutation and result-only requests share the client domain;
+control request IDs do not. The lookup neither scans history nor promotes retention.
+It returns the canonical accepted checkpoint and historical replay progress, while
+the host reserves frame bytes before reading the original result from the journal.
+
+Application callbacks, uninitialized sessions, partial-application failure and
+closed sessions cannot use this interface. Unknown means only unknown at that
+prefix: an applied ownership barrier, caught-up consumer, admitted private context
+and exclusive unresolved-request gate are still required before preparation. The
+lookup does not establish current leadership, a continuing lease or latest reads.

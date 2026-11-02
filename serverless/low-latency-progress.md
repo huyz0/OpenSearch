@@ -532,3 +532,15 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   iterations, shell check and root precommit (3m21s). This process-local recovery
   primitive does not implement cross-node delete-state recovery, schema/term
   lifecycle, host dispatch integration or client quorum-mode activation.
+
+- The ownership driver now exposes historical client retry lookup through its
+  existing bounded applied-state cache. It can find an original mutation or
+  result-only outcome before another ownership claim, without scanning, retaining
+  another payload cache, running preparation or extending retention. Uninitialized
+  sessions, application callbacks, fencing and close refuse lookup. Unknown is
+  explicitly not preparation authority. Unit tests cover partial-prefix progress,
+  conflicts, control/client identity separation, eviction/retirement and failure;
+  the real replacement-leader history reads original result bytes through the
+  recovered canonical checkpoint before claiming ownership. All 372 log unit
+  cases and nine native logical cases passed across three iterations with shell
+  check and root precommit. Host sequencing/frontend integration remains pending.

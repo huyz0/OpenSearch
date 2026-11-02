@@ -108,7 +108,28 @@ public class LogicalJournalTests extends JournalTestCase {
             assertEquals(batch.state(), reconstructed.state());
             assertEquals(receipts, reconstructed.receipts());
             final var assignment = new LogicalStreamRecord(stream, group, replacement.groupActivation(group).checkpoint(), 4, 16384);
-            final var original = replacement.readCommitted(assignment, originalCp);
+            final LogCheckpoint recoveredOriginal;
+            try (var session = new LogicalOwnershipSession(replacement, assignment, second, ignored -> {})) {
+                LogicalOwnershipSession.Progress progress;
+                do {
+                    progress = session.advance(3, 512);
+                } while (progress.throughIndex() < staleCp.index());
+                assertEquals(LogicalOwnershipSession.Stage.REPLAYING, session.stage());
+                assertTrue(session.ownership().isEmpty());
+                final var found = session.knownClientOutcome(mutation.requestId(), mutation.firstObservedIndex(), mutation.requestDigest());
+                assertEquals(LogicalStreamState.Status.DUPLICATE, found.outcome().orElseThrow().status());
+                recoveredOriginal = found.outcome().orElseThrow().originalCheckpoint();
+                assertEquals(originalCp, recoveredOriginal);
+                assertEquals(
+                    outcomeCp,
+                    session.knownClientOutcome(outcome.requestId(), outcome.firstObservedIndex(), outcome.requestDigest())
+                        .outcome()
+                        .orElseThrow()
+                        .originalCheckpoint()
+                );
+                assertEquals(progress.throughIndex(), found.throughIndex());
+            }
+            final var original = replacement.readCommitted(assignment, recoveredOriginal);
             assertEquals(originalCp, original.checkpoint());
             final var recoveredMutation = LogicalCommand.decode(original.operation().payloadReader().readAllBytes(), 16384);
             assertEquals(mutation.requestId(), recoveredMutation.requestId());

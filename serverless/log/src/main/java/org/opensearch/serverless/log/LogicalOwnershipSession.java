@@ -156,6 +156,27 @@ public final class LogicalOwnershipSession implements Closeable {
     }
 
     /**
+     * Inspects a client retry identity in this session's successfully applied prefix without scanning,
+     * retaining a payload or executing preparation. Both mutation and result-only outcomes share the
+     * client request domain; control request identities remain distinct. Known outcomes can be used
+     * during recovery before claiming ownership. An unknown result grants no permission to execute:
+     * the host still needs an applied ownership barrier, caught-up consumer and exclusive pending gate.
+     * The returned progress is historical and does not assert current leadership or latest-read authority.
+     * @param requestId stable internal client request UUID
+     * @param firstObservedIndex immutable original request observation
+     * @param requestDigest original-input SHA-256 digest
+     * @return bounded cached disposition and exact successfully applied replay position
+     * @throws IOException before first application, during an application callback, or after fencing/close
+     */
+    public LogicalStreamReplay.Lookup knownClientOutcome(UUID requestId, long firstObservedIndex, byte[] requestDigest) throws IOException {
+        requireOpen();
+        if (applying || view == null) {
+            throw new IOException("client outcome lookup requires an initialized successfully applied prefix");
+        }
+        return replay.knownOutcome(requestId, LogicalCommand.Action.MUTATION, firstObservedIndex, requestDigest);
+    }
+
+    /**
      * Applies one bounded scan without waiting for an unresolved physical claim future. Failure
      * permanently fences this session; a new session must rebuild the consumer and claim again.
      * @param maximumEntries physical positions per scan, at most 4096

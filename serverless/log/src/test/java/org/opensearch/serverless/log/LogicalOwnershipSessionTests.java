@@ -230,6 +230,121 @@ public class LogicalOwnershipSessionTests extends OpenSearchTestCase {
         session.close();
     }
 
+    public void testClientLookupUsesOnlyTheAppliedPrefixAndKeepsTheOriginalResult() throws Exception {
+        final var fixture = new Fixture();
+        try (var session = fixture.session(fixture.applied::add)) {
+            final UUID request = UUID.randomUUID();
+            expectThrows(IOException.class, () -> session.knownClientOutcome(request, -1, new byte[32]));
+            session.advance(16, 4096);
+            session.beginClaim(1);
+            fixture.commit(true);
+            session.advance(16, 4096);
+            fixture.effect(LogicalCommand.Action.SCHEMA, UUID.randomUUID(), 0, 0, new byte[] { 1 });
+            final var original = fixture.effect(LogicalCommand.Action.MUTATION, request, 1, 0, new byte[] { 7 });
+            session.advance(1, 4096); // Schema applied; mutation is committed but not applied.
+            final int scans = fixture.scans;
+            final var unknown = session.knownClientOutcome(request, 1, new byte[32]);
+            assertTrue(unknown.outcome().isEmpty());
+            assertEquals(1, unknown.throughIndex());
+            assertEquals(scans, fixture.scans);
+            assertEquals(2, fixture.applied.size());
+            session.advance(1, 4096);
+            final var found = session.knownClientOutcome(request, 1, new byte[32]);
+            assertEquals(LogicalStreamState.Status.DUPLICATE, found.outcome().orElseThrow().status());
+            assertEquals(original.checkpoint(), found.outcome().orElseThrow().originalCheckpoint());
+            assertEquals(2, found.throughIndex());
+            final byte[] conflict = new byte[32];
+            conflict[0] = 1;
+            assertEquals(
+                LogicalStreamState.Rejection.IDENTITY_CONFLICT,
+                session.knownClientOutcome(request, 1, conflict).outcome().orElseThrow().rejection()
+            );
+            assertEquals(
+                LogicalStreamState.Rejection.IDENTITY_CONFLICT,
+                session.knownClientOutcome(request, 0, new byte[32]).outcome().orElseThrow().rejection()
+            );
+            fixture.effect(LogicalCommand.Action.OUTCOME_ONLY, request, 1, -1, new byte[] { 99 });
+            session.advance(1, 4096);
+            final int after = fixture.scans;
+            assertEquals(
+                original.checkpoint(),
+                session.knownClientOutcome(request, 1, new byte[32]).outcome().orElseThrow().originalCheckpoint()
+            );
+            assertEquals(after, fixture.scans);
+            assertEquals(3, fixture.applied.size());
+            assertEquals(0, session.ownership().orElseThrow().state().lastSequenceNumber());
+        }
+    }
+
+    public void testRecoveredResultCanBeFoundBeforeClaimWithoutExtendingRetention() throws Exception {
+        final var fixture = new Fixture();
+        fixture.control(PRODUCER, 0, 1, 1, 0);
+        fixture.effect(LogicalCommand.Action.SCHEMA, UUID.randomUUID(), 0, 0, new byte[] { 1 });
+        final UUID request = UUID.randomUUID();
+        final var original = fixture.effect(LogicalCommand.Action.OUTCOME_ONLY, request, 1, -1, new byte[] { 7 });
+        try (var session = fixture.session(fixture.applied::add)) {
+            session.advance(16, 4096);
+            final int scans = fixture.scans;
+            for (int lookup = 0; lookup < 50; lookup++) {
+                assertEquals(
+                    original.checkpoint(),
+                    session.knownClientOutcome(request, 1, new byte[32]).outcome().orElseThrow().originalCheckpoint()
+                );
+            }
+            assertEquals(scans, fixture.scans);
+            assertEquals(0, fixture.submissions);
+            assertEquals(LogicalOwnershipSession.Stage.REPLAYING, session.stage());
+            assertTrue(session.ownership().isEmpty());
+            for (int next = 0; next < 10; next++) {
+                fixture.effect(LogicalCommand.Action.OUTCOME_ONLY, UUID.randomUUID(), fixture.history.size() - 1, -1, new byte[] { 9 });
+            }
+            session.advance(16, 4096);
+            assertEquals(
+                LogicalStreamState.Rejection.OBSERVATION_EXPIRED,
+                session.knownClientOutcome(request, 1, new byte[32]).outcome().orElseThrow().rejection()
+            );
+            fixture.effect(LogicalCommand.Action.RETIRE, UUID.randomUUID(), fixture.history.size() - 1, -1, new byte[0]);
+            session.advance(16, 4096);
+            assertEquals(
+                LogicalStreamState.Rejection.RETIRED,
+                session.knownClientOutcome(UUID.randomUUID(), fixture.history.size() - 1, new byte[32]).outcome().orElseThrow().rejection()
+            );
+        }
+    }
+
+    public void testClientLookupCannotReadInsideApplicationOrAfterFailureAndClose() throws Exception {
+        final var fixture = new Fixture();
+        final var holder = new LogicalOwnershipSession[1];
+        holder[0] = fixture.session(effect -> {
+            expectThrows(IOException.class, () -> holder[0].knownClientOutcome(UUID.randomUUID(), -1, new byte[32]));
+            fixture.applied.add(effect);
+        });
+        final var session = holder[0];
+        session.advance(16, 4096);
+        session.beginClaim(1);
+        fixture.commit(true);
+        session.advance(16, 4096);
+        assertTrue(session.ownership().isPresent());
+        // Control request IDs cannot masquerade as client retry identities.
+        assertEquals(
+            LogicalStreamState.Rejection.IDENTITY_CONFLICT,
+            session.knownClientOutcome(fixture.claim.requestId(), fixture.claim.firstObservedIndex(), fixture.claim.requestDigest())
+                .outcome()
+                .orElseThrow()
+                .rejection()
+        );
+        session.close();
+        expectThrows(IOException.class, () -> session.knownClientOutcome(UUID.randomUUID(), -1, new byte[32]));
+        final var failedFixture = new Fixture();
+        failedFixture.control(PRODUCER, 0, 1, 1, 0);
+        try (var failed = failedFixture.session(effect -> { throw new IOException("partial native application"); })) {
+            expectThrows(IOException.class, () -> failed.advance(16, 4096));
+            final int scans = failedFixture.scans;
+            expectThrows(IOException.class, () -> failed.knownClientOutcome(UUID.randomUUID(), -1, new byte[32]));
+            assertEquals(scans, failedFixture.scans);
+        }
+    }
+
     private static final class Fixture implements LogicalOwnershipSession.Source {
         private final ShardLogId stream = new ShardLogId(UUID.randomUUID(), "index", 0, UUID.randomUUID());
         private final UUID group = UUID.randomUUID();
@@ -315,6 +430,22 @@ public class LogicalOwnershipSessionTests extends OpenSearchTestCase {
             } catch (IOException impossible) {
                 throw new AssertionError(impossible);
             }
+        }
+
+        private RatisJournal.CommittedOperation effect(
+            LogicalCommand.Action action,
+            UUID request,
+            long observed,
+            long argument,
+            byte[] body
+        ) throws IOException {
+            final var command = new LogicalCommand(action, request, observed, new byte[32], PRODUCER, argument, body);
+            final var effect = new RatisJournal.CommittedOperation(
+                new OperationEnvelope(stream, OperationEnvelope.Kind.LOGICAL, 1, 1, 1, command.encode(4096)),
+                new LogCheckpoint(stream, history.size(), 1)
+            );
+            history.add(effect);
+            return effect;
         }
 
         private void skip() {
