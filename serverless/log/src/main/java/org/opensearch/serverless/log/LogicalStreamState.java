@@ -199,7 +199,7 @@ public final class LogicalStreamState {
         }
         final var previous = outcomes.get(command.requestId());
         if (previous != null) {
-            if (previous.action() != command.action()
+            if (retryActionMatches(previous.action(), command.action()) == false
                 || previous.observedIndex() != command.firstObservedIndex()
                 || Arrays.equals(previous.digest(), command.requestDigest()) == false) {
                 return reject(Rejection.IDENTITY_CONFLICT);
@@ -291,6 +291,19 @@ public final class LogicalStreamState {
 
     private LogCheckpoint canonical(LogCheckpoint checkpoint) {
         return new LogCheckpoint(stream, checkpoint.index(), checkpoint.entryTerm());
+    }
+
+    private static boolean retryActionMatches(LogicalCommand.Action accepted, LogicalCommand.Action proposed) {
+        if (accepted == proposed) {
+            return true;
+        }
+        // A script/update can resolve differently after takeover. Its input identity, rather
+        // than a later mutation/noop/error classification, determines the original outcome.
+        return switch (accepted) {
+            case MUTATION -> proposed == LogicalCommand.Action.OUTCOME_ONLY;
+            case OUTCOME_ONLY -> proposed == LogicalCommand.Action.MUTATION;
+            default -> false;
+        };
     }
 
     private static Decision reject(Rejection rejection) {

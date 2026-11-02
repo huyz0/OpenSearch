@@ -104,6 +104,54 @@ public class LogicalStreamStateTests extends OpenSearchTestCase {
         assertEquals(0, fixture.state.view().lastSequenceNumber());
     }
 
+    public void testRetryKeepsOriginalOutcomeWhenResolutionChangesBetweenMutationAndNoop() throws Exception {
+        final var fixture = active(16);
+        final var mutation = command(LogicalCommand.Action.MUTATION, FIRST, 0, 1);
+        final var originalMutation = fixture.step(mutation, 1, 1, 1);
+        assertAccepted(originalMutation);
+        assertAccepted(fixture.step(command(LogicalCommand.Action.OWNERSHIP, SECOND, 1, 2), 2, 2, 1));
+        final var nowNoop = new LogicalCommand(
+            LogicalCommand.Action.OUTCOME_ONLY,
+            mutation.requestId(),
+            mutation.firstObservedIndex(),
+            mutation.requestDigest(),
+            SECOND,
+            -1,
+            new byte[] { 99 }
+        );
+        final var mutationRetry = fixture.step(nowNoop, 2, 2, 1);
+        assertEquals(LogicalStreamState.Status.DUPLICATE, mutationRetry.status());
+        assertEquals(originalMutation.originalCheckpoint(), mutationRetry.originalCheckpoint());
+        final var noop = command(LogicalCommand.Action.OUTCOME_ONLY, SECOND, -1, fixture.index - 1);
+        final var originalNoop = fixture.step(noop, 2, 2, 1);
+        assertAccepted(originalNoop);
+        final var nowMutation = new LogicalCommand(
+            LogicalCommand.Action.MUTATION,
+            noop.requestId(),
+            noop.firstObservedIndex(),
+            noop.requestDigest(),
+            SECOND,
+            1,
+            new byte[] { 88 }
+        );
+        final var noopRetry = fixture.step(nowMutation, 2, 2, 1);
+        assertEquals(LogicalStreamState.Status.DUPLICATE, noopRetry.status());
+        assertEquals(originalNoop.originalCheckpoint(), noopRetry.originalCheckpoint());
+        assertEquals(0, fixture.state.view().lastSequenceNumber());
+        final var differentControl = new LogicalCommand(
+            LogicalCommand.Action.SCHEMA,
+            noop.requestId(),
+            noop.firstObservedIndex(),
+            noop.requestDigest(),
+            SECOND,
+            1,
+            new byte[] { 88 }
+        );
+        assertRejected(LogicalStreamState.Rejection.IDENTITY_CONFLICT, fixture.step(differentControl, 2, 2, 2));
+        assertAccepted(fixture.step(command(LogicalCommand.Action.MUTATION, SECOND, 1, fixture.index - 1), 2, 2, 1));
+        assertEquals(1, fixture.state.view().lastSequenceNumber());
+    }
+
     public void testEvictedOutcomeCannotBecomeANewMutation() throws Exception {
         final var fixture = active(2);
         final var original = command(LogicalCommand.Action.MUTATION, FIRST, 0, 1);

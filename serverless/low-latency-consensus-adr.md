@@ -904,3 +904,14 @@ voter has the same capability. Before enabling client writes, bootstrap and
 membership startup must enforce a durable group-wide protocol/frame capability
 without enumerating every logical stream. A smaller-capability follower must be
 refused before native startup rather than fence while applying a larger frame.
+
+
+A client retry's mutation versus outcome-only classification is a resolved
+result, not its original request identity. A script/update may resolve as a no-op
+or error after its original mutation committed, or mutate after an original
+no-op committed. Both classifications therefore share a retry identity domain.
+The accepted UUID, original observation and original-input digest return the first
+accepted checkpoint regardless of that later classification, actor or resolution.
+Ownership, schema and retirement control actions remain distinct identity domains.
+This changes no accepted data effect for those historical retries: a previously
+rejected retry becomes a duplicate, and neither consumes another engine sequence.

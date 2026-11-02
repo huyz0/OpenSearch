@@ -425,3 +425,12 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   replay through leader loss and two voter replacements. Storage-mode activation,
   host-wide state budgets, group-wide voter frame-capability checks and the
   ownership/schema/application controller remain.
+
+- Fixed retry identity when an ambiguous client operation resolves differently on
+  a new owner. A reproduced regression rejected an original mutation retried as
+  an outcome-only result. Mutation and outcome-only records now share the client
+  request identity domain; control actions, original observation and input digest
+  still must match. The original checkpoint is returned in both directions, with
+  no extra sequence allocation. The run passed 312 unit and six native logical
+  cases across three iterations, plus root precommit (1m17s). The native history
+  covers both classifications after leader loss and deterministic reconstruction.

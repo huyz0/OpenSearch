@@ -54,18 +54,34 @@ public class LogicalJournalTests extends JournalTestCase {
             final var takeover = logicalCommand(LogicalCommand.Action.OWNERSHIP, second, 1, originalCp.index());
             replacement.appendLogical(group, stream, takeover, 2, 2, 1).toCompletableFuture().get(10, TimeUnit.SECONDS);
             final var retry = new LogicalCommand(
-                mutation.action(),
+                LogicalCommand.Action.OUTCOME_ONLY,
                 mutation.requestId(),
                 mutation.firstObservedIndex(),
                 mutation.requestDigest(),
                 second,
-                1,
+                -1,
                 new byte[] { 99 }
             );
             final var duplicateCp = replacement.appendLogical(group, stream, retry, 2, 2, 1)
                 .toCompletableFuture()
                 .get(10, TimeUnit.SECONDS);
-            final var stale = logicalCommand(LogicalCommand.Action.MUTATION, second, 1, duplicateCp.index());
+            final var outcome = logicalCommand(LogicalCommand.Action.OUTCOME_ONLY, second, -1, duplicateCp.index());
+            final var outcomeCp = replacement.appendLogical(group, stream, outcome, 2, 2, 1)
+                .toCompletableFuture()
+                .get(10, TimeUnit.SECONDS);
+            final var changedOutcome = new LogicalCommand(
+                LogicalCommand.Action.MUTATION,
+                outcome.requestId(),
+                outcome.firstObservedIndex(),
+                outcome.requestDigest(),
+                second,
+                1,
+                new byte[] { 88 }
+            );
+            final var outcomeRetryCp = replacement.appendLogical(group, stream, changedOutcome, 2, 2, 1)
+                .toCompletableFuture()
+                .get(10, TimeUnit.SECONDS);
+            final var stale = logicalCommand(LogicalCommand.Action.MUTATION, second, 1, outcomeRetryCp.index());
             final var staleCp = replacement.appendLogical(group, stream, stale, 1, 1, 1).toCompletableFuture().get(10, TimeUnit.SECONDS);
             final var replay = new LogicalStreamReplay(replacement, group, stream, 4, 16384);
             final var effects = new ArrayList<RatisJournal.CommittedOperation>();
@@ -76,12 +92,14 @@ public class LogicalJournalTests extends JournalTestCase {
                 effects.addAll(batch.effects());
                 receipts.addAll(batch.receipts());
             } while (batch.throughIndex() < staleCp.index());
-            assertEquals(4, effects.size());
-            assertEquals(6, receipts.size());
+            assertEquals(5, effects.size());
+            assertEquals(8, receipts.size());
             assertEquals(LogicalStreamState.Status.DUPLICATE, receipts.get(4).decision().status());
             assertEquals(duplicateCp, receipts.get(4).checkpoint());
             assertEquals(originalCp, receipts.get(4).decision().originalCheckpoint());
-            assertEquals(LogicalStreamState.Rejection.STALE_EPOCH, receipts.get(5).decision().rejection());
+            assertEquals(LogicalStreamState.Status.DUPLICATE, receipts.get(6).decision().status());
+            assertEquals(outcomeCp, receipts.get(6).decision().originalCheckpoint());
+            assertEquals(LogicalStreamState.Rejection.STALE_EPOCH, receipts.get(7).decision().rejection());
             assertEquals(second, batch.state().owner());
             assertEquals(0, batch.state().lastSequenceNumber());
             assertEquals(schemaCp, batch.state().schemaCheckpoint());
