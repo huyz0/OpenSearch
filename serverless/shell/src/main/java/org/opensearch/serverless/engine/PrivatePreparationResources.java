@@ -15,7 +15,6 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.ShardLock;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
-import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
@@ -37,21 +36,30 @@ import java.util.UUID;
 public final class PrivatePreparationResources implements Closeable {
     @FunctionalInterface
     interface NativeOpener {
-        InternalEngine open(EngineConfig configuration) throws IOException;
+        PrivatePreparationEngine open(EngineConfig configuration) throws IOException;
     }
 
     private final PreparationEngineAdmission.Ticket ticket;
     private final Path generation;
     private final Store store;
-    private final InternalEngine engine;
+    private final PrivatePreparationEngine engine;
+    private final long maximumBufferBytes;
+    private Throwable preparationFailure;
     private boolean closed;
     private Throwable closeFailure;
 
-    private PrivatePreparationResources(PreparationEngineAdmission.Ticket ticket, Path generation, Store store, InternalEngine engine) {
+    private PrivatePreparationResources(
+        PreparationEngineAdmission.Ticket ticket,
+        Path generation,
+        Store store,
+        PrivatePreparationEngine engine,
+        long maximumBufferBytes
+    ) {
         this.ticket = ticket;
         this.generation = generation;
         this.store = store;
         this.engine = engine;
+        this.maximumBufferBytes = maximumBufferBytes;
     }
 
     /**
@@ -62,7 +70,7 @@ public final class PrivatePreparationResources implements Closeable {
      * @param serving open empty serving engine supplying schema/analysis context
      * @param generation existing empty directory owned by this operation; deleted on successful close
      * @param residentBytes declared resident reservation, including qualified engine/mapping overhead
-     * @param indexingBufferBytes explicit initial private Lucene buffer allowance
+     * @param indexingBufferBytes native buffer ceiling including writer, version map and in-flight writing estimates
      * @return resource owner; private native access is restricted to the engine adapter package
      * @throws IOException if paths, empty-history checks or native initialization fail
      */
@@ -74,7 +82,7 @@ public final class PrivatePreparationResources implements Closeable {
         long residentBytes,
         long indexingBufferBytes
     ) throws IOException {
-        return openEmpty(admission, group, serving, generation, residentBytes, indexingBufferBytes, InternalEngine::new);
+        return openEmpty(admission, group, serving, generation, residentBytes, indexingBufferBytes, PrivatePreparationEngine::new);
     }
 
     static PrivatePreparationResources openEmpty(
@@ -95,7 +103,7 @@ public final class PrivatePreparationResources implements Closeable {
         Path root = null;
         FSDirectory directory = null;
         Store store = null;
-        InternalEngine engine = null;
+        PrivatePreparationEngine engine = null;
         boolean claimed = false;
         boolean nativeInitializationStarted = false;
         try {
@@ -150,7 +158,7 @@ public final class PrivatePreparationResources implements Closeable {
                 }
                 return 0;
             }, SequenceNumbers.NO_OPS_PERFORMED, Long.MAX_VALUE);
-            return new PrivatePreparationResources(ticket, root, store, engine);
+            return new PrivatePreparationResources(ticket, root, store, engine, indexingBufferBytes);
         } catch (IOException | RuntimeException | Error failed) {
             if (nativeInitializationStarted && engine == null) {
                 ticket.quarantine(new UncertainResources(root, store, directory, failed));
@@ -189,16 +197,49 @@ public final class PrivatePreparationResources implements Closeable {
         final var target = engine();
         requireUnassignedPrimary(target, operation);
         final var mapping = operation.parsedDoc().dynamicMappingsUpdate();
-        return mapping == null ? target.index(operation) : new Engine.IndexResult(mapping);
+        return mapping == null ? (Engine.IndexResult) apply(target, operation) : new Engine.IndexResult(mapping);
     }
 
     Engine.DeleteResult delete(Engine.Delete operation) throws IOException {
         final var target = engine();
         requireUnassignedPrimary(target, operation);
-        return target.delete(operation);
+        return (Engine.DeleteResult) apply(target, operation);
     }
 
-    private static void requireUnassignedPrimary(InternalEngine target, Engine.Operation operation) {
+    private Engine.Result apply(PrivatePreparationEngine target, Engine.Operation operation) throws IOException {
+        try {
+            reclaimBuffers(target);
+            final Engine.Result result = operation instanceof Engine.Index index
+                ? target.index(index)
+                : target.delete((Engine.Delete) operation);
+            reclaimBuffers(target);
+            return result;
+        } catch (IOException | RuntimeException | Error failed) {
+            synchronized (this) {
+                if (preparationFailure == null) {
+                    preparationFailure = failed;
+                }
+            }
+            throw failed;
+        }
+    }
+
+    private void reclaimBuffers(PrivatePreparationEngine target) throws IOException {
+        if (target.buffers().totalBytes() > maximumBufferBytes) {
+            // Internal refresh spills native buffers to SSD without publishing a serving reader.
+            target.writeIndexingBuffer();
+            final long retained = target.buffers().totalBytes();
+            if (retained > maximumBufferBytes) {
+                // Recent delete versions must not be forgotten to make room: that changes CAS/
+                // external-version semantics. This context needs verified rebuild or retirement.
+                throw new IOException(
+                    "private preparation buffers remain above limit after spilling: " + retained + " > " + maximumBufferBytes
+                );
+            }
+        }
+    }
+
+    private static void requireUnassignedPrimary(PrivatePreparationEngine target, Engine.Operation operation) {
         Objects.requireNonNull(operation);
         if (operation.origin() != Engine.Operation.Origin.PRIMARY
             || operation.seqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO
@@ -207,9 +248,12 @@ public final class PrivatePreparationResources implements Closeable {
         }
     }
 
-    synchronized InternalEngine engine() {
+    synchronized PrivatePreparationEngine engine() {
         if (closed) {
             throw new IllegalStateException("private preparation resources are closed", closeFailure);
+        }
+        if (preparationFailure != null) {
+            throw new IllegalStateException("private preparation requires rebuild after failure", preparationFailure);
         }
         return engine;
     }

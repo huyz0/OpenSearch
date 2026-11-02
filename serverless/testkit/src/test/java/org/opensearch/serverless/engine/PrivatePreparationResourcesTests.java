@@ -10,8 +10,10 @@ package org.opensearch.serverless.engine;
 
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems;
+import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
+import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineTestCase;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -213,6 +215,96 @@ public class PrivatePreparationResourcesTests extends EngineTestCase {
                 unpublishedStore.get().close();
                 IOUtils.rm(generation);
             }
+        }
+    }
+
+    public void testRetainedDeleteTombstonesCannotBypassThePrivateBufferLimit() throws Exception {
+        final UUID group = UUID.randomUUID();
+        final var admission = budget(group);
+        final long limit = 64L * 1024;
+        try (
+            var fixture = fixture();
+            var resources = PrivatePreparationResources.openEmpty(admission, group, fixture.serving, createTempDir(), RESIDENT_BYTES, limit)
+        ) {
+            final var nativeEngine = resources.engine();
+            nativeEngine.config().setEnableGcDeletes(false);
+            final var failure = expectThrows(IOException.class, () -> {
+                for (int i = 0; i < 512; i++) {
+                    final var deletion = nativeEngine.prepareDelete(
+                        "id-" + i + "-" + "x".repeat(240),
+                        null,
+                        SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        primaryTerm.get(),
+                        Versions.MATCH_ANY,
+                        VersionType.INTERNAL,
+                        Engine.Operation.Origin.PRIMARY,
+                        SequenceNumbers.UNASSIGNED_SEQ_NO,
+                        0
+                    );
+                    resources.delete(deletion);
+                    nativeEngine.writeIndexingBuffer();
+                }
+                fail("retained delete buffers must eventually refuse private preparation");
+            });
+            assertTrue(failure.getMessage(), failure.getMessage().contains("private preparation buffers"));
+            final var buffers = nativeEngine.buffers();
+            assertTrue(buffers.toString(), buffers.versionMapBytes() > limit / 2);
+            assertTrue(buffers.toString(), buffers.totalBytes() > limit);
+            assertTrue(
+                "refreshable bytes must not stand in for retained tombstones",
+                nativeEngine.getIndexBufferRAMBytesUsed() < buffers.versionMapBytes()
+            );
+            assertEquals(new PreparationEngineAdmission.Stats(1, RESIDENT_BYTES, 0), admission.stats());
+            final long stoppedAt = nativeEngine.getSeqNoStats(-1).getMaxSeqNo();
+            expectThrows(IllegalStateException.class, resources::engine);
+            expectThrows(IllegalStateException.class, () -> resources.index(indexForDoc(createParsedDoc("after-fence", null))));
+            assertEquals(stoppedAt, nativeEngine.getSeqNoStats(-1).getMaxSeqNo());
+            assertVisibleCount(fixture.serving, 0);
+        }
+        assertEquals(new PreparationEngineAdmission.Stats(0, 0, 0), admission.stats());
+    }
+
+    public void testPrivateBuffersSpillToSsdWithoutChangingVersionOrPublicVisibility() throws Exception {
+        final UUID group = UUID.randomUUID();
+        final long limit = 64L * 1024;
+        final Path generation = createTempDir();
+        try (
+            var fixture = fixture();
+            var resources = PrivatePreparationResources.openEmpty(budget(group), group, fixture.serving, generation, RESIDENT_BYTES, limit)
+        ) {
+            final var nativeEngine = resources.engine();
+            for (int i = 0; i < 200; i++) {
+                final var result = resources.index(indexForDoc(createParsedDoc("id-" + i, null)));
+                assertEquals(Engine.Result.Type.SUCCESS, result.getResultType());
+                assertEquals(i, result.getSeqNo());
+                final var buffers = nativeEngine.buffers();
+                assertTrue(buffers.toString(), buffers.totalBytes() <= limit);
+            }
+            try (var files = Files.list(generation.resolve("index"))) {
+                assertTrue(
+                    "private buffering must spill real Lucene segments to local storage",
+                    files.anyMatch(file -> file.getFileName().toString().endsWith(".si"))
+                );
+            }
+            final var deleted = resources.delete(
+                nativeEngine.prepareDelete(
+                    "id-0",
+                    null,
+                    SequenceNumbers.UNASSIGNED_SEQ_NO,
+                    primaryTerm.get(),
+                    Versions.MATCH_ANY,
+                    VersionType.INTERNAL,
+                    Engine.Operation.Origin.PRIMARY,
+                    0,
+                    primaryTerm.get()
+                )
+            );
+            assertEquals(Engine.Result.Type.SUCCESS, deleted.getResultType());
+            assertTrue(deleted.isFound());
+            assertEquals(200, deleted.getSeqNo());
+            assertEquals(2, deleted.getVersion());
+            assertVisibleCount(nativeEngine, 199);
+            assertVisibleCount(fixture.serving, 0);
         }
     }
 

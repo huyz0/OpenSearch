@@ -16,7 +16,7 @@ S3 archival remain pending.
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
 | M3a | [Cell/active-state design](low-latency-capacity-adr.md), runnable models/raw results, per-group proposal/peer isolation and resident-context admission primitive | Metadata routing, dynamic group admission, owned bounded engines and broader isolation pending |
-| M4 | Committed-serving adapter, resolved payload, fixed-binding replay, admitted private resources, mapping/identity guard, dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and bounded dispatch, buffer/SSD governors, ownership/schema/lifecycle controllers and shell integration |
+| M4 | Committed-serving adapter, resolved payload, fixed-binding replay, admitted private resources, mapping/identity guard, private native-buffer spill/fencing, dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and bounded dispatch, request/serving/total-memory and SSD governors, ownership/schema/lifecycle controllers and shell integration |
 | M5–M9 | Not implemented | Fresh readers, selective replication, archival, lifecycle, migration |
 | M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
 | M6a | Planned; no runtime completion claimed | Missing-chunk/resumable bulk shard copies, peer/S3 source selection and live-versus-recovery scheduling |
@@ -333,3 +333,13 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   journal replay passed 15 cases over three iterations. Shell check and root
   precommit passed. A local mapping update
   in this test is not a committed schema/ownership barrier or enabled client mode.
+
+- Private buffer governance now includes delete tombstones and in-flight version
+  maps. A delete/refresh loop first reproduced the old counter's continued
+  admission beyond the limit. Guarded mutations spill reclaimable buffers to SSD;
+  persistent excess or native buffer work failure fences the context and retains
+  its admission until cleanup. The broader run passed 138 unit and 15 real-journal
+  replay cases over three iterations, shell check and root precommit. The final
+  review avoids double-counting writer flush bytes already in native writer RAM.
+  This bounds known buffer estimates at operation boundaries, with one-operation
+  overshoot; it does not establish total heap/RSS, parsing, mmap or SSD limits.

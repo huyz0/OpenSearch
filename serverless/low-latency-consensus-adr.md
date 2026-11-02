@@ -178,6 +178,28 @@ to fence/rebuild the private context. The tests' quiescent local mapping update
 is not a durable schema barrier, current ownership proof, a script adapter or
 public lifecycle integration. The real journal probes use this boundary too.
 
+The owned private engine also samples native writer, complete version-map
+(including delete tombstones), and in-flight refresh/flush byte estimates. It uses
+the native writer-statistics hook with a reused accumulator, without walking
+segment readers on the mutation path. The ordinary indexing-buffer counter omits
+tombstones: a delete/refresh loop reproduced continued admission beyond the
+configured tracked-buffer allowance.
+
+Before and after each guarded mutation, excess buffers trigger an internal refresh
+to spill recoverable data to local SSD. If retained estimates still exceed the
+allowance, or native buffer work fails, the owner fences the context and refuses
+further preparation. Recent delete versions are preserved for conditional and
+external-version semantics. Admission stays charged until successful close.
+Tests cover tombstones that survive every refresh, actual local segment output,
+continued bounded live indexing, conditional deletion after spilling, and an
+unchanged public serving reader.
+
+This is an operation-boundary governor for known native buffer estimates. One
+operation can overshoot before refusal; parsing/request admission, analysis
+amplification, merges, mapping/index overhead, mmap residency, total host memory
+and local disk occupancy still need their own bounds. The setting is not a hard
+heap/RSS ceiling, and this does not enable client quorum mode or private rebuild.
+
 `PreparationCommitSequencer` adds a dependency gate around preparation, append
 and verified application. A stream has one pending preparation until the prior
 record is durably appended and applied. Failure fences that context; caller
