@@ -544,3 +544,17 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   recovered canonical checkpoint before claiming ownership. All 372 log unit
   cases and nine native logical cases passed across three iterations with shell
   check and root precommit. Host sequencing/frontend integration remains pending.
+
+- Private update translation now reuses core UpdateHelper and stored-source/routing
+  loading over the private engine's real-time get result. Its get metrics are
+  separate from public shard metrics. Native CAS runs before a script, and neither
+  document merge, script, upsert nor no-op translation allocates a document sequence
+  or applies a write. The adapter pins shard/mapper/version context; the host owns
+  admitted request memory, retry lookup, serialization and immutable result encoding.
+  Tests cover private-only source, routing, clocks, merge/no-op, script delete,
+  upserts, stale CAS before script execution, source filtering and unversioned
+  schema changes. Source policy is installed in initial shard metadata as core
+  requires. Native path fixtures explicitly disable injected filesystem extras.
+  All 96 selected preparation/update engine cases passed across three iterations
+  with shell check and root precommit (1m13s). Result-only wire encoding, host
+  dispatch/lifecycle and frontend integration remain; client quorum mode is off.

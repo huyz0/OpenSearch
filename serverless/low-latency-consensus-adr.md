@@ -1086,3 +1086,23 @@ closed sessions cannot use this interface. Unknown means only unknown at that
 prefix: an applied ownership barrier, caught-up consumer, admitted private context
 and exclusive unresolved-request gate are still required before preparation. The
 lookup does not establish current leadership, a continuing lease or latest reads.
+
+### Private native update translation
+
+The internal `PrivateUpdatePreparer` adapts core `UpdateHelper` to the private
+engine's real-time document lookup. A separate `ShardGetService` loads the supplied
+private engine result with the shared pinned mapper, source policy and routing;
+it does not read the public serving engine or charge public get metrics. Native
+CAS checks precede script execution. The helper translates a request into a native
+index/delete request or no-op response without applying a mutation or allocating
+a document sequence. The current private context and mapper identity/version are
+checked around translation, including unversioned mapper replacement.
+
+The host must look up retained retries first, serialize the admitted request with
+ownership/schema/lifecycle work, budget parsed source/script/output memory, and
+encode a bounded immutable result before append. The mutable core translation
+belongs to that one request. This adapter does not supply a script heap sandbox,
+result-only wire codec, request sequencer or frontend integration; unexpected native
+failure still requires host fencing/rebuild. Native source-field policies must be
+installed at shard creation where core requires that, rather than silently changing
+an immutable mapping parameter during an update.
