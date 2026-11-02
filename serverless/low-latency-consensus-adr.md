@@ -799,3 +799,27 @@ The committed controller must use the original observation/retention fence to
 report an explicit expired/unknown outcome when it cannot safely establish the
 original result. A coordinator must not renew an ambiguous request's identity or
 observation and then blindly execute it again.
+
+
+`LogicalStreamState` supplies the deterministic semantic fold for a single
+verified ordered stream. Accepted ownership claims compare the preceding epoch
+and advance the engine primary term independently of the Raft term. Schema
+transitions compare the prior version and preserve the exact definition's digest
+and checkpoint. Mutations extend one contiguous engine sequence prefix; outcome
+records consume no engine sequence. Retirement permanently closes the activation.
+Legacy history cannot silently switch protocols.
+
+The bounded accepted-outcome table keeps request action, original observation,
+input digest and first accepted checkpoint. A retained retry returns that first
+checkpoint even after owner changes; changed identity fields are refused. Eviction
+advances an observation floor, so a cache miss older than the floor is explicitly
+expired rather than re-executed. Recovery with the same ordered prefix and limits
+reproduces the decisions, floor and state projection. Payloads remain in the log.
+
+The fold requires caller serialization and authenticated, verified committed
+input; it does not provide either by itself. Its retention and frame limits must
+be fixed by the eventual durable protocol configuration before runtime use:
+changing retention independently on replicas could change semantic acceptance.
+It does not select a cold-state cache policy, authorize unbounded resident shard
+state, migrate a legacy stream or enable client quorum writes. Distinct logical
+protocol framing and committed receipts/replay remain required integration work.

@@ -374,3 +374,14 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   and envelope integrity are covered. The log suite passed 249 cases over three
   iterations, with root precommit. This codec does not yet implement committed
   logical authority, outcome retention or controlled replay in the runtime.
+
+- Logical state validation now folds one verified ordered stream with producer
+  epoch/engine term, exact schema dependency, contiguous mutation sequence and
+  permanent retirement. Bounded retry identities return the original checkpoint;
+  an evicted identity below the retention fence is refused instead of executed
+  again. Tests cover competing owners, stale producers, schema/sequence refusal,
+  malformed and legacy histories, outcome-only records and deterministic recovery.
+  The log suite passed 270 cases across three iterations, with root precommit.
+  This is a caller-serialized semantic fold, not runtime commit authority: distinct
+  protocol framing, authenticated admission, durable retention configuration,
+  bounded resident replay state and journal receipts remain integration work.
