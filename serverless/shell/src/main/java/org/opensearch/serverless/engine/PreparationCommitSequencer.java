@@ -167,8 +167,7 @@ final class PreparationCommitSequencer {
         boolean succeeded = false;
         try {
             applied = Objects.requireNonNull(application.apply(Objects.requireNonNull(mutation), Objects.requireNonNull(checkpoint)));
-            if (applied.mutation().operationId().equals(mutation.operationId()) == false
-                || applied.checkpoint().equals(checkpoint) == false) {
+            if (mutation.sameResolution(applied.mutation()) == false || applied.checkpoint().equals(checkpoint) == false) {
                 throw new IOException("serving application returned a different operation or committed checkpoint");
             }
             synchronized (this) {

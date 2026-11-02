@@ -16,6 +16,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -360,6 +361,90 @@ public class PreparationCommitSequencerTests extends OpenSearchTestCase {
             );
             assertFailure(IOException.class, gate.submit(() -> mutation(0)));
             assertEquals(PreparationCommitSequencer.State.FENCED, gate.state());
+        }
+    }
+
+    public void testSameRequestIdCannotHideChangedAppliedResolution() throws Exception {
+        final UUID request = UUID.randomUUID();
+        final byte[] source = new byte[] { '{', '}' };
+        final var original = new ResolvedMutation(
+            request,
+            new Translog.Index("id", 0, 1, 1, source, "route", -1),
+            ResolvedMutation.Outcome.CREATED
+        );
+        for (int changed = 0; changed < 8; changed++) {
+            final var wrong = new ResolvedMutation(
+                request,
+                new Translog.Index(
+                    changed == 0 ? "other" : "id",
+                    changed == 1 ? 1 : 0,
+                    changed == 2 ? 2 : 1,
+                    changed == 3 ? 2 : 1,
+                    changed == 4 ? new byte[] { '{', ' ', '}' } : source,
+                    changed == 5 ? "other-route" : "route",
+                    changed == 6 ? 123 : -1
+                ),
+                changed == 7 ? ResolvedMutation.Outcome.UPDATED : ResolvedMutation.Outcome.CREATED
+            );
+            final var committed = checkpoint(0);
+            final var gate = new PreparationCommitSequencer(
+                Runnable::run,
+                mutation -> CompletableFuture.completedStage(committed),
+                (mutation, cp) -> new CommittedMutationReplayer.AppliedMutation(wrong, cp)
+            );
+            assertFailure(IOException.class, gate.submit(() -> original));
+            assertEquals(PreparationCommitSequencer.State.FENCED, gate.state());
+            gate.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        }
+        final var originalDelete = new ResolvedMutation(
+            request,
+            new Translog.Delete("id", 0, 1, 2, "route"),
+            ResolvedMutation.Outcome.DELETED
+        );
+        for (int changed = 0; changed < 6; changed++) {
+            final var wrongDelete = new ResolvedMutation(
+                request,
+                new Translog.Delete(
+                    changed == 0 ? "other" : "id",
+                    changed == 1 ? 1 : 0,
+                    changed == 2 ? 2 : 1,
+                    changed == 3 ? 3 : 2,
+                    changed == 4 ? "other-route" : "route"
+                ),
+                changed == 5 ? ResolvedMutation.Outcome.NOT_FOUND : ResolvedMutation.Outcome.DELETED
+            );
+            final var deleteGate = new PreparationCommitSequencer(
+                Runnable::run,
+                mutation -> CompletableFuture.completedStage(checkpoint(0)),
+                (mutation, cp) -> new CommittedMutationReplayer.AppliedMutation(wrongDelete, cp)
+            );
+            assertFailure(IOException.class, deleteGate.submit(() -> originalDelete));
+            assertEquals(PreparationCommitSequencer.State.FENCED, deleteGate.state());
+            deleteGate.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        }
+        final var originalNoop = new ResolvedMutation(request, new Translog.NoOp(0, 1, "original"), ResolvedMutation.Outcome.NO_OP);
+        final var wrongNoop = new ResolvedMutation(request, new Translog.NoOp(0, 1, "different"), ResolvedMutation.Outcome.NO_OP);
+        final var noopGate = new PreparationCommitSequencer(
+            Runnable::run,
+            mutation -> CompletableFuture.completedStage(checkpoint(0)),
+            (mutation, cp) -> new CommittedMutationReplayer.AppliedMutation(wrongNoop, cp)
+        );
+        assertFailure(IOException.class, noopGate.submit(() -> originalNoop));
+        assertEquals(PreparationCommitSequencer.State.FENCED, noopGate.state());
+        noopGate.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        for (var expected : List.of(original, originalDelete, originalNoop)) {
+            final var equivalent = ResolvedMutation.decode(expected.encode(4096), 4096);
+            final var gate = new PreparationCommitSequencer(
+                Runnable::run,
+                mutation -> CompletableFuture.completedStage(checkpoint(0)),
+                (mutation, cp) -> new CommittedMutationReplayer.AppliedMutation(equivalent, cp)
+            );
+            assertEquals(
+                equivalent.operationId(),
+                gate.submit(() -> expected).toCompletableFuture().get(10, TimeUnit.SECONDS).mutation().operationId()
+            );
+            assertEquals(PreparationCommitSequencer.State.READY, gate.state());
+            gate.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
         }
     }
 

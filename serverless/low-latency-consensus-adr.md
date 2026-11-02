@@ -1151,3 +1151,14 @@ through proposal and verified application. Matching native counters is not a con
 certificate or continuing authority. In particular, physical acknowledgement alone
 cannot resolve ambiguous outcomes or authorize another script execution. Admission
 and the journal continue to enforce their own independent resident/frame budgets.
+
+### Exact mutation completion matching
+
+The mutation dependency gate compares the returned immutable resolution with the
+prepared request, including ID, operation kind, sequence, term, version, routing,
+source, auto-ID timestamp and original outcome, together with the committed
+checkpoint. Matching only the request UUID can acknowledge a different result.
+The comparison reads owned fields without copying source buffers and accepts an
+independently decoded equivalent operation. It checks delete document IDs directly
+rather than relying on native delete equality, which omits that field. A mismatch
+fences the context before success completion.

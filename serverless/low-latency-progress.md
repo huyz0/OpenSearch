@@ -588,3 +588,14 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   cases and 18 native replay cases passed across three iterations with shell
   check and root precommit (3m22s). Host dispatch/lifecycle and frontend remain
   pending; client quorum mode is off.
+
+- The mutation completion gate now verifies the full returned resolution rather
+  than just its request UUID and physical checkpoint. A regression first showed
+  a changed document being acknowledged under the same UUID. Immutable-field
+  comparison now covers document ID, sequence, term, version, routing, source,
+  auto-ID timestamp, no-op reason and original outcome without copying buffers;
+  the common same-object path remains constant time. Delete ID is checked
+  explicitly because native delete equality omits it. Tests reject changed index,
+  delete and no-op results and accept independently decoded equivalents. All 87
+  gate/dispatcher/codec cases passed across three iterations with shell check and
+  root precommit (31s). Host lifecycle/frontend integration remains pending.
