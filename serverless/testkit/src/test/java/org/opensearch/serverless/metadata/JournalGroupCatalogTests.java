@@ -505,6 +505,7 @@ public class JournalGroupCatalogTests extends OpenSearchTestCase {
     private static void activate(BlobContainer container, JournalGroupCatalog catalog, JournalConfiguration.Group group)
         throws IOException {
         final var reserved = catalog.reserve(group);
+        catalog.reserveProtocol(group, JournalConfiguration.Limits.defaults());
         final var active = reserved.activate(
             new LogCheckpoint(JournalGroupRecord.controlIdentity(reserved.deploymentId(), group.id()), 2, 1)
         );

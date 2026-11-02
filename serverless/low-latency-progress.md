@@ -434,3 +434,17 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   no extra sequence allocation. The run passed 312 unit and six native logical
   cases across three iterations, plus root precommit (1m17s). The native history
   covers both classifications after leader loss and deterministic reconstruction.
+
+- Voter wire/history compatibility now has a permanent per-group protocol record.
+  The controller reserves it explicitly before bootstrap; original, recovering and
+  replacement voter startup compares payload, queue/batch, request-count and
+  retained-history limits before native volume access. Missing/corrupt active
+  contracts cannot be recreated, and logical streams cannot exceed the group
+  payload bound. Node-wide memory/cache/disk allowances remain local. Tests cover
+  conflicting profiles on both startup paths, lost replies, corruption, key
+  mismatch, stream bounds and an actual incompatible learner. The file-bootstrap
+  fixture exposed previously hidden mixed voter limits and now declares its shared
+  profile. The run passed 324 log and 69 metadata unit cases plus 21 native
+  catalog/controller cases across three iterations, shell check and root precommit
+  (1m59s). Existing experimental groups without this contract are refused; no
+  automatic metadata upgrade or client quorum storage mode is enabled.

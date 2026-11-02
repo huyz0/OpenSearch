@@ -458,7 +458,18 @@ public class JournalControllerRuntimeTests extends OpenSearchTestCase {
                     "groups",
                     groups,
                     "limits",
-                    java.util.Map.of("minimum_free_bytes", 1)
+                    java.util.Map.of(
+                        "minimum_free_bytes",
+                        1,
+                        "maximum_payload_bytes",
+                        configuration.limits().maximumPayloadBytes(),
+                        "maximum_pending_requests",
+                        configuration.limits().maximumPendingRequests(),
+                        "queue_bytes",
+                        configuration.limits().queueBytes(),
+                        "maximum_retained_entries",
+                        configuration.limits().maximumRetainedEntries()
+                    )
                 )
             );
             Files.write(files.resolve("assignment.json"), BytesReference.toBytes(BytesReference.bytes(builder)));

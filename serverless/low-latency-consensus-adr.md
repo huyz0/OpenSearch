@@ -915,3 +915,32 @@ accepted checkpoint regardless of that later classification, actor or resolution
 Ownership, schema and retirement control actions remain distinct identity domains.
 This changes no accepted data effect for those historical retries: a previously
 rejected retry becomes a duplicate, and neither consumes another engine sequence.
+
+
+`JournalGroupProtocol` now fixes the wire and unpurged-history contract in one
+61-byte versioned, checksummed register per physical group. It captures maximum
+payload, queue/appender batch bytes, native pending-request count and retained log
+positions. Payload/queue agreement prevents a voter from persisting or receiving
+traffic that its decoder or peer RPC limit cannot handle; count/history agreement
+preserves the same retained-prefix safety margin. The current host configuration
+has one shared profile, so all assigned groups must match it. Node-wide proposal
+bytes, caches, free-space reserves and local segment settings remain local,
+subject to their existing validation and recovery constraints.
+
+The controller explicitly reserves the protocol with the genesis placement before
+native bootstrap. Both static and membership-aware startup read and compare the
+contract before volume access, including replacement learners. Activation
+publication also verifies the local journal's configured contract. Startup itself
+cannot create a missing contract. A missing contract on an active group cannot be
+inferred from a new assignment or overwritten on retry; older experimental groups
+need a separately verified upgrade or fenced migration. Logical assignment creation
+and reads verify their payload bound against this same permanent group contract.
+These are lifecycle/cold-activation S3 accesses, with no per-document S3 request.
+
+Fault checks cover lost reservation replies, immutable conflicts, corruption,
+foreign keys/namespaces, missing active contracts and incompatible original or
+replacement startup. A native learner with the wrong frame limit is refused
+before `journal-binding` creation. The file-based bootstrap test also exposed an
+actual configuration mismatch: its default wire limits differed from its fixture
+companions. It now explicitly declares the common protocol while retaining local
+resource allowances. No client quorum storage mode is enabled by these checks.

@@ -162,6 +162,7 @@ public class LogicalStreamCatalogTests extends OpenSearchTestCase {
     private static UUID activate(JournalGroupCatalog catalog, BlobContainer container, UUID deployment) throws IOException {
         final var group = group();
         final var reserved = catalog.reserve(group);
+        catalog.reserveProtocol(group, JournalConfiguration.Limits.defaults());
         final var active = reserved.activate(new LogCheckpoint(JournalGroupRecord.controlIdentity(deployment, group.id()), 2, 1));
         final var name = "group-" + group.id();
         final var register = container.readRegister(name).orElseThrow();

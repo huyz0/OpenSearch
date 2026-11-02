@@ -158,7 +158,7 @@ public final class JournalController implements Closeable {
                 for (var group : configuration.groups()) {
                     if (group.peers().stream().anyMatch(peer -> peer.id().equals(configuration.localVoterId()))) {
                         requireOpen();
-                        catalog.reserve(group);
+                        catalog.reserveProtocol(group, configuration.limits());
                     }
                 }
             }

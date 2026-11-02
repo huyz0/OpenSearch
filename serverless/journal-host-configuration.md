@@ -106,6 +106,23 @@ The defaults support the default four-group bound. More active groups can requir
 a larger byte budget or smaller payload limit; changing `maximum_groups` alone
 is insufficient. This check runs before binding/opening native journal storage.
 
+Before bootstrap the controller permanently reserves a per-group protocol
+contract. Every original voter, recovering voter and replacement must match its
+`maximum_payload_bytes`, `maximum_pending_requests`, `queue_bytes` and
+`maximum_retained_entries`. Payload and batch agreement prevents a follower from
+rejecting traffic accepted by its leader; count/history agreement preserves the
+same retained-log safety margin. Colocated groups currently share the host's
+single wire profile. Local cache, segment, memory and free-space allowances may
+vary, subject to their existing validation and recovery requirements.
+
+Startup reads this contract before opening native journal storage. A conflicting,
+corrupt or missing contract is refused; an activated group's missing contract is
+never inferred or recreated from a new assignment file. Experimental groups
+created before this contract require an explicit verified upgrade or fenced
+migration before use with this controller. A limit change must not silently
+replace the permanent contract. These are lifecycle metadata operations, not S3
+requests on every document write.
+
 The assignment is limited to 64 KiB. Unknown or duplicate fields, trailing content,
 unsupported versions, noncanonical UUIDs, coercions from strings/floating point,
 invalid three-AZ placements and oversized assignments are refused before node

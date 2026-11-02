@@ -625,6 +625,18 @@ public final class RatisJournal implements Closeable {
     }
 
     /**
+     * Reports the configured wire/history contract for controller verification before publication.
+     * This is local configuration evidence, not proof of another voter's capability or read authority.
+     * @param groupId assigned physical group
+     * @return immutable shared protocol fields
+     * @throws IOException when closed, fenced or unassigned
+     */
+    public JournalGroupProtocol groupProtocol(UUID groupId) throws IOException {
+        division(groupId);
+        return new JournalGroupProtocol(configuration.deploymentId(), groupId, configuration.limits());
+    }
+
+    /**
      * Returns the original activation marker after committed local application. The controller
      * must persist it against the same reserved placement before authorizing logical shards.
      * This historical evidence remains valid through leadership changes and quorum loss.

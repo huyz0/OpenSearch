@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.serverless.log.JournalConfiguration;
+import org.opensearch.serverless.log.JournalGroupProtocol;
 import org.opensearch.serverless.log.JournalGroupRecord;
 import org.opensearch.serverless.log.JournalMembershipRecord;
 import org.opensearch.serverless.log.JournalReplacementReceipt;
@@ -77,6 +78,19 @@ public final class JournalGroupCatalog {
     }
 
     /**
+     * Fixes one group's wire/history limits before native bootstrap. Existing protocols may be
+     * verified but never replaced; a missing contract on an active group is not reconstructed.
+     * @param group permanent genesis placement
+     * @param limits required shared protocol fields of every voter
+     * @return immutable protocol reservation
+     * @throws IOException on conflicting, missing active, corrupt or foreign protocol state
+     */
+    public JournalGroupProtocol reserveProtocol(JournalConfiguration.Group group, JournalConfiguration.Limits limits) throws IOException {
+        final var genesis = reserve(group);
+        return ensureProtocol(genesis, new JournalGroupProtocol(deploymentId, group.id(), limits), genesis.activation() == null);
+    }
+
+    /**
      * Reads one group directly without listing or depending on the shard population.
      * @param group physical group identity
      * @return current reservation, or empty for an unreserved group
@@ -106,6 +120,9 @@ public final class JournalGroupCatalog {
         final var genesis = readRequired(group);
         if (genesis.activation() == null) {
             throw new IOException("logical assignment requires a durably activated physical group");
+        }
+        if (maximumPayloadBytes > readProtocol(genesis).maximumPayloadBytes()) {
+            throw new IOException("logical payload limit exceeds the permanent physical group protocol");
         }
         final var expected = new LogicalStreamRecord(stream, group, genesis.activation(), maximumOutcomes, maximumPayloadBytes);
         final var result = container.createRegisterIfAbsent(streamName(stream), new BytesArray(expected.encode()));
@@ -142,6 +159,9 @@ public final class JournalGroupCatalog {
             throw new IOException("logical assignment key or namespace differs from its contents");
         }
         final var genesis = readRequired(record.group());
+        if (record.maximumPayloadBytes() > readProtocol(genesis).maximumPayloadBytes()) {
+            throw new IOException("logical payload limit exceeds the permanent physical group protocol");
+        }
         if (record.groupActivation().equals(genesis.activation()) == false) {
             throw new IOException("logical assignment differs from durable physical activation");
         }
@@ -187,6 +207,7 @@ public final class JournalGroupCatalog {
             if (configuration.bootstrap() && current.activation() != null) {
                 throw new IOException("an activated physical group cannot bootstrap a new independent history");
             }
+            ensureProtocol(current, new JournalGroupProtocol(deploymentId, group.id(), configuration.limits()), false);
             if (current.activation() != null) {
                 final var membership = readMembership(current);
                 if (membership.pending() != null) {
@@ -218,6 +239,7 @@ public final class JournalGroupCatalog {
             .orElseThrow(() -> new IOException("physical group has no durable bootstrap reservation"));
         final var current = decode(group, register);
         requirePlacement(current, expected);
+        ensureProtocol(current, journal.groupProtocol(group), false);
         final JournalGroupRecord active;
         try {
             active = current.activate(proof.checkpoint());
@@ -324,6 +346,7 @@ public final class JournalGroupCatalog {
         for (var group : configuration.groups()) {
             final var genesis = readRequired(group.id());
             requirePlacement(genesis, new JournalGroupRecord(deploymentId, group, null));
+            ensureProtocol(genesis, new JournalGroupProtocol(deploymentId, group.id(), configuration.limits()), false);
             if (genesis.activation() == null) {
                 continue;
             }
@@ -514,6 +537,47 @@ public final class JournalGroupCatalog {
             throw new IOException("journal membership differs from permanent genesis reservation");
         }
         return record;
+    }
+
+    private JournalGroupProtocol ensureProtocol(JournalGroupRecord genesis, JournalGroupProtocol expected, boolean create)
+        throws IOException {
+        final String key = protocolName(genesis.initialPlacement().id());
+        var register = container.readRegister(key);
+        if (register.isEmpty() && create) {
+            if (container.createRegisterIfAbsent(key, new BytesArray(expected.encode())).applied()) {
+                return expected;
+            }
+            register = container.readRegister(key);
+        }
+        final var current = decodeProtocol(
+            genesis,
+            register.orElseThrow(() -> new IOException("physical group protocol is missing; refusing unsafe reconstruction"))
+        );
+        if (current.equals(expected) == false) {
+            throw new IOException("voter wire or retained-history limits differ from permanent physical group protocol");
+        }
+        return current;
+    }
+
+    private JournalGroupProtocol readProtocol(JournalGroupRecord genesis) throws IOException {
+        final var register = container.readRegister(protocolName(genesis.initialPlacement().id()))
+            .orElseThrow(() -> new IOException("physical group protocol is missing; refusing unsafe reconstruction"));
+        return decodeProtocol(genesis, register);
+    }
+
+    private JournalGroupProtocol decodeProtocol(JournalGroupRecord genesis, BlobRegister register) throws IOException {
+        final JournalGroupProtocol protocol;
+        try (var in = register.value().streamInput()) {
+            protocol = JournalGroupProtocol.read(in);
+        }
+        if (protocol.deploymentId().equals(deploymentId) == false || protocol.group().equals(genesis.initialPlacement().id()) == false) {
+            throw new IOException("physical group protocol key or namespace differs from contents");
+        }
+        return protocol;
+    }
+
+    private static String protocolName(UUID group) {
+        return "protocol-" + group;
     }
 
     private static String membershipName(UUID group) {

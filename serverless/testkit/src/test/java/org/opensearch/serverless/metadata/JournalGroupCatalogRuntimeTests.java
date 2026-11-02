@@ -190,6 +190,7 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
             };
             final var catalog = new JournalGroupCatalog(wrapper, deployment);
             final var reservation = catalog.reserve(group);
+            final var protocol = catalog.reserveProtocol(group, limits);
             try {
                 for (int i = 0; i < 3; i++) {
                     final var configuration = new JournalConfiguration(
@@ -232,6 +233,7 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                 assertNull(restartedController.membership(group.id()).pending());
                 final var assigned = restartedController.reserveStream(logicalStream, group.id(), 8, 128);
                 assertEquals(active.activation(), assigned.groupActivation());
+                assertEquals(protocol, leader[0].groupProtocol(group.id()));
                 final var producer = peers.get(journals.indexOf(leader[0])).id();
                 final var claim = new LogicalCommand(
                     LogicalCommand.Action.OWNERSHIP,
@@ -323,6 +325,32 @@ public class JournalGroupCatalogRuntimeTests extends OpenSearchTestCase {
                     limits,
                     joining
                 );
+                final var incompatible = new JournalConfiguration.Limits(
+                    limits.maximumGroups(),
+                    limits.maximumPayloadBytes() / 2,
+                    limits.maximumPendingRequests(),
+                    limits.maximumPendingBytes(),
+                    limits.queueBytes(),
+                    limits.segmentBytes(),
+                    limits.cachedSegmentBytes(),
+                    limits.maximumRetainedEntries(),
+                    limits.minimumFreeBytes()
+                );
+                final var refusedLearner = new JournalConfiguration(
+                    deployment,
+                    joining.id(),
+                    learnerDirectory,
+                    List.of(group),
+                    true,
+                    incompatible,
+                    joining
+                );
+                assertTrue(
+                    expectThrows(IOException.class, () -> catalog.openAssignedJournal(refusedLearner, key, trusted, () -> Long.MAX_VALUE))
+                        .getMessage()
+                        .contains("protocol")
+                );
+                assertFalse(java.nio.file.Files.exists(learnerDirectory.resolve("journal-binding")));
                 journals.add(catalog.openAssignedJournal(learnerConfiguration, key, trusted, () -> Long.MAX_VALUE));
                 expectThrows(IOException.class, () -> catalog.publishReplacement(leader[0], intent));
                 assertBusy(() -> {
