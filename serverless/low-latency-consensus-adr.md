@@ -990,3 +990,29 @@ callbacks cannot reenter lifecycle work. These cuts are historical evidence, not
 continuing leases, latest-read proofs or completed native engine integration.
 A real three-voter probe verifies an applied initial claim and epoch/term advancement
 on the replacement after leader loss. No client storage-mode activation changes.
+
+
+`CommittedLogicalApplier` connects newly accepted logical replay effects to the
+native committed-serving primary. It independently verifies ordered identity,
+producer transitions, the pinned schema definition/dependency, resolved request
+UUID, sequence and engine term before native mutation. Native success must retain
+the original assigned sequence/term/version. Controls and outcome-only records do
+not allocate document sequences; an explicit resolved translog no-op does.
+Failures fence the consumer rather than continuing an uncertain native prefix.
+
+The adapter pins the mapper object and mapping version, so an unversioned mapper
+replacement cannot silently change parsing. Definitions are hashed in bounded
+chunks. It retains only small progress metadata; original mutation results are
+returned to the caller under its result-byte reservation. Inputs must be newly
+accepted effects from logical replay, not physically committed raw frames or
+client-supplied assertions. Producer adapters must validate the opaque native
+payload before irreversible proposal admission as well.
+
+The current native adapter supports an empty verified serving state, one exact
+already installed schema/analysis context, and operation terms at or below its
+installed native term. Dynamic schema/native-term lifecycle and verified recovery
+bases require their controllers; it does not reindex history with a newer schema.
+A real private native preparation -> TLS quorum -> logical ownership/schema ->
+serving history verifies visibility only after accepted application, original
+identity, a changed-result retry and conditional delete. No frontend storage mode
+is activated, and these tests do not qualify all plugin or update-script behavior.

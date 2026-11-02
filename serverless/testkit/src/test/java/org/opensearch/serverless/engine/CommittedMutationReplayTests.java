@@ -29,6 +29,9 @@ import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.log.JournalConfiguration;
 import org.opensearch.serverless.log.JournalDiskIdentity;
 import org.opensearch.serverless.log.LogCheckpoint;
+import org.opensearch.serverless.log.LogicalCommand;
+import org.opensearch.serverless.log.LogicalOwnershipSession;
+import org.opensearch.serverless.log.LogicalStreamRecord;
 import org.opensearch.serverless.log.OperationEnvelope;
 import org.opensearch.serverless.log.RatisJournal;
 import org.opensearch.serverless.log.ShardLogId;
@@ -171,6 +174,164 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                     gate.closeAsync().toCompletableFuture().get(20, TimeUnit.SECONDS);
                 } finally {
                     dispatcher.closeAsync().toCompletableFuture().get(20, TimeUnit.SECONDS);
+                }
+            }
+        } finally {
+            closeShards(serving);
+        }
+    }
+
+    public void testLogicalOwnershipAndSchemaGateNativeApplicationAndSuppressRetries() throws Exception {
+        final IndexShard serving = newServing();
+        try (var fixture = fixture()) {
+            final var stream = stream(fixture, serving);
+            final var actor = fixture.group.peers().get(fixture.journals.indexOf(fixture.leader)).id();
+            final var assignment = new LogicalStreamRecord(
+                stream,
+                fixture.group.id(),
+                fixture.leader.groupActivation(fixture.group.id()).checkpoint(),
+                8,
+                16384
+            );
+            final byte[] definition = org.opensearch.core.common.bytes.BytesReference.toBytes(
+                serving.mapperService().documentMapper().mappingSource().uncompressed()
+            );
+            final var applier = new CommittedLogicalApplier(serving, engines.get(serving.store()), stream, 1, definition, 16384);
+            try (var session = new LogicalOwnershipSession(fixture.leader, assignment, actor, applier::apply)) {
+                LogicalOwnershipSession.Progress progress;
+                do {
+                    progress = session.advance(100, 65536);
+                } while (progress.throughIndex() < progress.committedIndex());
+                final long term = serving.getOperationPrimaryTerm();
+                final var ownerCp = session.beginClaim(term).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                while (session.ownership().isEmpty()) {
+                    session.advance(100, 65536);
+                }
+                final var schema = new LogicalCommand(
+                    LogicalCommand.Action.SCHEMA,
+                    UUID.randomUUID(),
+                    ownerCp.index(),
+                    new byte[32],
+                    actor,
+                    0,
+                    definition
+                );
+                final var schemaCp = fixture.leader.appendLogical(assignment, schema, 1, term, 1)
+                    .toCompletableFuture()
+                    .get(10, TimeUnit.SECONDS);
+                while (applier.lastAppliedCheckpoint().orElseThrow().index() < schemaCp.index()) {
+                    session.advance(100, 65536);
+                }
+                assertEquals(1, session.ownership().orElseThrow().state().schemaVersion());
+                try (var preparation = privatePreparation(fixture, serving)) {
+                    final var prepared = preparation.engine()
+                        .prepareIndex(
+                            preparation.engine().config().getDocumentMapperForTypeSupplier().get(),
+                            new SourceToParse(serving.shardId().getIndexName(), "id", new BytesArray("{}"), MediaTypeRegistry.JSON),
+                            SequenceNumbers.UNASSIGNED_SEQ_NO,
+                            term,
+                            Versions.MATCH_ANY,
+                            VersionType.INTERNAL,
+                            Engine.Operation.Origin.PRIMARY,
+                            -1,
+                            false,
+                            SequenceNumbers.UNASSIGNED_SEQ_NO,
+                            0
+                        );
+                    final var first = preparation.index(prepared);
+                    final var mutation = new ResolvedMutation(
+                        UUID.randomUUID(),
+                        new Translog.Index(prepared, first),
+                        ResolvedMutation.Outcome.CREATED
+                    );
+                    final var command = new LogicalCommand(
+                        LogicalCommand.Action.MUTATION,
+                        mutation.operationId(),
+                        schemaCp.index(),
+                        new byte[32],
+                        actor,
+                        first.getSeqNo(),
+                        mutation.encode(16000)
+                    );
+                    preparation.engine().refresh("private logical preparation");
+                    serving.refresh("before logical commit");
+                    assertDocCount(serving, 0);
+                    final var cp = fixture.leader.appendLogical(assignment, command, 1, term, 1)
+                        .toCompletableFuture()
+                        .get(10, TimeUnit.SECONDS);
+                    serving.refresh("physical logical commit before serving apply");
+                    assertDocCount(serving, 0);
+                    while (applier.lastAppliedCheckpoint().orElseThrow().index() < cp.index()) {
+                        session.advance(100, 65536);
+                    }
+                    serving.refresh("accepted logical native apply");
+                    assertDocCount(serving, 1);
+                    final var actual = serving.getService()
+                        .get(
+                            "id",
+                            null,
+                            true,
+                            Versions.MATCH_ANY,
+                            VersionType.INTERNAL,
+                            org.opensearch.search.fetch.subphase.FetchSourceContext.FETCH_SOURCE
+                        );
+                    assertEquals(first.getSeqNo(), actual.getSeqNo());
+                    assertEquals(first.getTerm(), actual.getPrimaryTerm());
+                    assertEquals(first.getVersion(), actual.getVersion());
+                    final var retry = new LogicalCommand(
+                        LogicalCommand.Action.OUTCOME_ONLY,
+                        command.requestId(),
+                        command.firstObservedIndex(),
+                        command.requestDigest(),
+                        actor,
+                        -1,
+                        new byte[] { 99 }
+                    );
+                    final var retryCp = fixture.leader.appendLogical(assignment, retry, 1, term, 1)
+                        .toCompletableFuture()
+                        .get(10, TimeUnit.SECONDS);
+                    do {
+                        progress = session.advance(100, 65536);
+                    } while (progress.throughIndex() < retryCp.index());
+                    assertEquals(0, applier.lastSequenceNumber());
+                    assertEquals(cp, applier.lastAppliedCheckpoint().orElseThrow());
+                    final var deletion = preparation.engine()
+                        .prepareDelete(
+                            "id",
+                            null,
+                            SequenceNumbers.UNASSIGNED_SEQ_NO,
+                            term,
+                            Versions.MATCH_ANY,
+                            VersionType.INTERNAL,
+                            Engine.Operation.Origin.PRIMARY,
+                            first.getSeqNo(),
+                            first.getTerm()
+                        );
+                    final var removed = preparation.delete(deletion);
+                    assertTrue(removed.isFound());
+                    final var resolvedDelete = new ResolvedMutation(
+                        UUID.randomUUID(),
+                        new Translog.Delete(deletion, removed),
+                        ResolvedMutation.Outcome.DELETED
+                    );
+                    final var deleteCommand = new LogicalCommand(
+                        LogicalCommand.Action.MUTATION,
+                        resolvedDelete.operationId(),
+                        retryCp.index(),
+                        new byte[32],
+                        actor,
+                        removed.getSeqNo(),
+                        resolvedDelete.encode(16000)
+                    );
+                    final var deleteCp = fixture.leader.appendLogical(assignment, deleteCommand, 1, term, 1)
+                        .toCompletableFuture()
+                        .get(10, TimeUnit.SECONDS);
+                    while (applier.lastAppliedCheckpoint().orElseThrow().index() < deleteCp.index()) {
+                        session.advance(100, 65536);
+                    }
+                    serving.refresh("accepted logical conditional delete");
+                    assertDocCount(serving, 0);
+                    assertEquals(1, applier.lastSequenceNumber());
                 }
             }
         } finally {

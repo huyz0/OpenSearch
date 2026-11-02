@@ -474,3 +474,17 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   reclaim. The final run passed 363 unit and nine native logical cases across three
   iterations with root precommit (1m36s). Host admission/serialization and a verified
   native schema/private-context rebuild remain required; client quorum mode is off.
+
+- Accepted logical effects can now reach a real committed-serving shard through a
+  guarded native applier. It validates producer transitions, exact pinned schema,
+  request UUID, resolved sequence/term and native result version/identity; a mismatch
+  or partial failure stops the instance. Outcome-only records consume no document
+  sequence, while explicit resolved no-ops do. The mapper instance is pinned as
+  well as its version, catching unversioned replacement; schema hashing streams.
+  A real TLS/private-engine/ownership/schema/native-serving history proves neither
+  private refresh nor physical commitment alone exposes data, then verifies retry
+  suppression and conditional delete. The run passed 36 unit and 18 native replay
+  cases across three iterations, shell check and root precommit (2m38s). This
+  adapter requires an empty verified serving state, one installed exact schema and
+  an adequate native term; dynamic lifecycle, recovery bases, producer validation
+  and client mode integration remain. Default client writes still use S3 mode.
