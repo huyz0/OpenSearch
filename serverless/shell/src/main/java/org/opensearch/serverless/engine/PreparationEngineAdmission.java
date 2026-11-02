@@ -161,6 +161,10 @@ public final class PreparationEngineAdmission {
             this.bytes = bytes;
         }
 
+        UUID group() {
+            return group;
+        }
+
         void quarantine(Object uncertainResources) {
             owner.quarantine(this, uncertainResources);
         }

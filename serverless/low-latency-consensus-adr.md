@@ -1133,3 +1133,21 @@ replicates its encoded result-only record, applies it without consuming a docume
 sequence and retrieves the original status/body through the driver's canonical
 retry checkpoint. This does not enable client quorum mode or replace the pending
 host lifecycle, request gate and frontend integration.
+
+### Guarded result-only proposal
+
+`PreparedLogicalResultOnly` checks the actual admitted private engine before body
+encoding: physical group, index/shard, fixed native term, maximum sequence and
+processed checkpoint must match the current applied logical projection. A private
+mutation, assigned no-op or processing gap cannot be hidden behind an error/no-op
+response. Complete logical-command overhead is deducted before result encoding,
+and header actor/epoch/term/schema are derived from the same validated projection.
+Mutation and result-only factories share owner/schema/barrier checks; only mutations
+require and consume the next document sequence.
+
+The host must still bind verified history to the activation, classify the client
+result correctly and hold ownership/schema/lifecycle and pending-request gates
+through proposal and verified application. Matching native counters is not a content
+certificate or continuing authority. In particular, physical acknowledgement alone
+cannot resolve ambiguous outcomes or authorize another script execution. Admission
+and the journal continue to enforce their own independent resident/frame budgets.

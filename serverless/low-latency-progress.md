@@ -573,3 +573,18 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   passed 114 selected engine/codec cases and 18 native replay cases across three
   iterations with shell check and root precommit (3m24s). Typed outcome proposal,
   host request/lifecycle integration and client quorum mode remain pending.
+
+- Typed result-only proposals now verify the actual admitted private group's
+  index/shard, fixed term, maximum sequence and processed checkpoint against the
+  applied logical projection before encoding. A speculative mutation, assigned
+  no-op or unprocessed gap is refused instead of being hidden behind an error
+  response. Mutation/outcome producers share owner/schema/barrier validation,
+  while only mutations consume the next document slot. Native-counter equality
+  is not a history-content certificate; the host still binds verified history to
+  the activation and holds pending/lifecycle gates through semantic application.
+  Tests cover native speculative/gap failures, missing schema, group/shard/term
+  mismatch, close, immutable identity and full-command byte bounds. The actual
+  TLS no-op history now uses the typed packet. All 138 selected engine/proposal
+  cases and 18 native replay cases passed across three iterations with shell
+  check and root precommit (3m22s). Host dispatch/lifecycle and frontend remain
+  pending; client quorum mode is off.

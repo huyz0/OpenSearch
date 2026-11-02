@@ -313,18 +313,16 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                         noOpResult = ResolvedResultOnly.noOp(plan.action(), LogicalCommand.maximumBodyBytes(16384));
                     }
                     final UUID noOpId = UUID.randomUUID();
-                    final var noOpCommand = new LogicalCommand(
-                        LogicalCommand.Action.OUTCOME_ONLY,
+                    final var noOpPacket = PreparedLogicalResultOnly.create(
+                        assignment,
+                        session.ownership().orElseThrow(),
+                        preparation,
                         noOpId,
+                        noOpResult,
                         retryCp.index(),
-                        new byte[32],
-                        actor,
-                        -1,
-                        noOpResult.encode(LogicalCommand.maximumBodyBytes(16384))
+                        new byte[32]
                     );
-                    final var noOpCp = fixture.leader.appendLogical(assignment, noOpCommand, 1, term, 1)
-                        .toCompletableFuture()
-                        .get(10, TimeUnit.SECONDS);
+                    final var noOpCp = noOpPacket.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
                     do {
                         progress = session.advance(100, 65536);
                     } while (progress.throughIndex() < noOpCp.index());

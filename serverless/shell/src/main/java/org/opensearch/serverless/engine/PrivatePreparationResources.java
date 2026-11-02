@@ -465,6 +465,10 @@ public final class PrivatePreparationResources implements Closeable {
         }
     }
 
+    UUID group() {
+        return ticket.group();
+    }
+
     synchronized PrivatePreparationEngine engine() {
         if (closed) {
             throw new IllegalStateException("private preparation resources are closed", closeFailure);

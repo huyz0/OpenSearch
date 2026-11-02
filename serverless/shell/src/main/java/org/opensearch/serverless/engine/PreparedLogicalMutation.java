@@ -61,30 +61,9 @@ public final class PreparedLogicalMutation {
         long firstObservedIndex,
         byte[] inputDigest
     ) throws IOException {
-        Objects.requireNonNull(assignment);
-        Objects.requireNonNull(ownership);
         Objects.requireNonNull(mutation);
-        if (firstObservedIndex < -1 || Objects.requireNonNull(inputDigest).length != 32) {
-            throw new IllegalArgumentException("invalid original logical request identity");
-        }
-        final var state = Objects.requireNonNull(ownership.state());
-        final var barrier = Objects.requireNonNull(ownership.checkpoint());
-        if (barrier.logId().equals(assignment.stream()) == false
-            || barrier.index() < 0
-            || barrier.entryTerm() < 1
-            || state.owner() == null
-            || state.producerEpoch() < 1
-            || state.primaryTerm() < 1
-            || state.retired()
-            || state.schemaVersion() < 1
-            || state.schemaCheckpoint() == null
-            || state.schemaCheckpoint().logId().equals(assignment.stream()) == false
-            || state.schemaCheckpoint().index() < 0
-            || state.schemaCheckpoint().entryTerm() < 1
-            || state.lastIndex() < barrier.index()
-            || state.lastIndex() < state.schemaCheckpoint().index()
-            || state.lastSequenceNumber() < -1
-            || state.lastSequenceNumber() == Long.MAX_VALUE
+        final var state = LogicalPreparationBinding.require(assignment, ownership, firstObservedIndex, inputDigest);
+        if (state.lastSequenceNumber() == Long.MAX_VALUE
             || mutation.sequenceNumber() != state.lastSequenceNumber() + 1
             || mutation.primaryTerm() != state.primaryTerm()) {
             throw new IOException("native resolution differs from applied logical owner, schema or sequence prefix");
