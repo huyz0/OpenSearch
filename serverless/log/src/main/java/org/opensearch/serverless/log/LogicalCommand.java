@@ -161,6 +161,20 @@ public final class LogicalCommand {
     }
 
     /**
+     * Computes body admission before allocating an engine payload, including this format's header.
+     * @param maximumCommandBytes complete enclosing command limit
+     * @return maximum opaque body size; zero is usable only for body-free controls
+     * @throws IOException if the command header itself cannot fit
+     */
+    public static int maximumBodyBytes(int maximumCommandBytes) throws IOException {
+        checkLimit(maximumCommandBytes);
+        if (maximumCommandBytes < HEADER_BYTES) {
+            throw new IOException("logical command header exceeds payload admission");
+        }
+        return maximumCommandBytes - HEADER_BYTES;
+    }
+
+    /**
      * Encodes after checking the entire output size, before allocation.
      * @param maximumBytes configured enclosing payload limit
      * @return independent versioned bytes

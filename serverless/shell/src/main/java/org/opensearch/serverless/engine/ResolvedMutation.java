@@ -92,6 +92,16 @@ public final class ResolvedMutation {
         return outcome;
     }
 
+    /** Returns the assigned sequence without copying the native operation/source. */
+    public long sequenceNumber() {
+        return operation.seqNo();
+    }
+
+    /** Returns the assigned engine term without copying the native operation/source. */
+    public long primaryTerm() {
+        return operation.primaryTerm();
+    }
+
     /** Returns an independent native operation; mutating its source cannot change this record. */
     public Translog.Operation operation() {
         return copy(operation);

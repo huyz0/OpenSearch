@@ -1016,3 +1016,25 @@ A real private native preparation -> TLS quorum -> logical ownership/schema ->
 serving history verifies visibility only after accepted application, original
 identity, a changed-result retry and conditional delete. No frontend storage mode
 is activated, and these tests do not qualify all plugin or update-script behavior.
+
+
+`PreparedLogicalMutation` binds a successful native resolution to the current
+applied owner projection before irreversible proposal. It derives the request UUID
+and sequence from the immutable resolved operation, checks the engine term and
+next sequence against the applied prefix, and requires the installed schema and
+same activation. The envelope epoch/term/schema fields are retained with this
+validated proposal rather than independently assembled at submission.
+
+The codec exposes the current command body's admission after header overhead,
+so excessive native bodies fail before encoding allocation. Scalar resolved
+sequence/term access avoids cloning a full native source solely for validation.
+Original observation/input digest remain stable across retries; command arrays
+are owned immutably. The native quorum/application probe now uses these typed
+proposals for both insert and conditional delete.
+
+This is not a sequencer or an authority proof. The host must obtain its current
+serialized ownership projection, perform outcome lookup before native preparation,
+reserve parsed/encoded bytes, and keep one pending operation through verified
+semantic/native application. Any failure after speculative preparation requires
+fencing the private context. Native physical completion alone is not logical
+acceptance or reader visibility. Client storage-mode integration remains disabled.

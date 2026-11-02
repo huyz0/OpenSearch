@@ -488,3 +488,16 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   adapter requires an empty verified serving state, one installed exact schema and
   an adequate native term; dynamic lifecycle, recovery bases, producer validation
   and client mode integration remain. Default client writes still use S3 mode.
+
+- Native producers now build immutable logical mutation proposals from a successful
+  resolution and the current applied ownership projection. Header request ID,
+  sequence, actor, epoch, term and schema are derived/validated together before
+  proposal, including installed schema and activation scope. Complete command
+  overhead is deducted before native body encoding; scalar accessors avoid copying
+  the operation/source merely to check sequence and term. Tests cover exact byte
+  boundaries, missing/retired/foreign contexts, stale projections, wrong native
+  identities and mutable aliases. The real logical insert/delete history now uses
+  this builder. The run passed 363 log and 48 engine/codec unit cases plus 18 native
+  replay cases across three iterations, shell check and root precommit (2m52s).
+  Host byte admission, pre-preparation retry lookup and fencing after speculative
+  failure remain required; physical replies alone do not complete the host gate.

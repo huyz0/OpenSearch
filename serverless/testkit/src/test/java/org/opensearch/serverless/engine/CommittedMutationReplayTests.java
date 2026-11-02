@@ -244,21 +244,18 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                         new Translog.Index(prepared, first),
                         ResolvedMutation.Outcome.CREATED
                     );
-                    final var command = new LogicalCommand(
-                        LogicalCommand.Action.MUTATION,
-                        mutation.operationId(),
+                    final var packet = PreparedLogicalMutation.create(
+                        assignment,
+                        session.ownership().orElseThrow(),
+                        mutation,
                         schemaCp.index(),
-                        new byte[32],
-                        actor,
-                        first.getSeqNo(),
-                        mutation.encode(16000)
+                        new byte[32]
                     );
+                    final var command = packet.command();
                     preparation.engine().refresh("private logical preparation");
                     serving.refresh("before logical commit");
                     assertDocCount(serving, 0);
-                    final var cp = fixture.leader.appendLogical(assignment, command, 1, term, 1)
-                        .toCompletableFuture()
-                        .get(10, TimeUnit.SECONDS);
+                    final var cp = packet.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
                     serving.refresh("physical logical commit before serving apply");
                     assertDocCount(serving, 0);
                     while (applier.lastAppliedCheckpoint().orElseThrow().index() < cp.index()) {
@@ -314,18 +311,14 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                         new Translog.Delete(deletion, removed),
                         ResolvedMutation.Outcome.DELETED
                     );
-                    final var deleteCommand = new LogicalCommand(
-                        LogicalCommand.Action.MUTATION,
-                        resolvedDelete.operationId(),
+                    final var deletePacket = PreparedLogicalMutation.create(
+                        assignment,
+                        session.ownership().orElseThrow(),
+                        resolvedDelete,
                         retryCp.index(),
-                        new byte[32],
-                        actor,
-                        removed.getSeqNo(),
-                        resolvedDelete.encode(16000)
+                        new byte[32]
                     );
-                    final var deleteCp = fixture.leader.appendLogical(assignment, deleteCommand, 1, term, 1)
-                        .toCompletableFuture()
-                        .get(10, TimeUnit.SECONDS);
+                    final var deleteCp = deletePacket.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
                     while (applier.lastAppliedCheckpoint().orElseThrow().index() < deleteCp.index()) {
                         session.advance(100, 65536);
                     }
