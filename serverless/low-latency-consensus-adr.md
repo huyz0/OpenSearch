@@ -963,3 +963,30 @@ The caller must reserve a frame's result budget and use a bounded worker. Readin
 a physical coordinate alone does not establish semantic acceptance or latest-read
 authority; use the canonical checkpoint from verified logical outcome evaluation.
 Missing history never authorizes executing the ambiguous request again.
+
+
+`LogicalOwnershipSession` is the caller-serialized runtime ownership driver for
+one admitted activation. It applies verified bounded history on the host's worker,
+then proposes a fresh internal ownership CAS with an advancing engine term. A
+physical reply alone cannot expose ownership: subsequent bounded replay must find
+the same accepted claim, apply every preceding effect and still observe the
+claimed owner/epoch/term with local leader readiness. No engine sequence may be
+allocated until the host also has a verified rebuilt native context at that cut.
+The caller supplies an engine term compatible with native serving/migration floors.
+
+The driver does not block waiting for an unresolved claim or register a callback
+that retains the resident fold. Callers schedule further work from detached physical
+completion. Ambiguous submission/reply, rejected/superseded claims, lost readiness
+and partial application fence the session permanently. A fresh session must rebuild
+its consumer and commit another barrier, so late old proposals cannot authorize
+new speculative preparation. Close after host work drains releases references
+without waiting for or canceling accepted physical persistence.
+
+Schema/data effects apply before ownership is exposed; a successful schema update
+can retain the same owner and term. The ordered consumer must quiesce/install native
+schema and preparation state accordingly. Progress contains only small immutable
+metadata, not opaque frame batches. Ownership is hidden during application, and
+callbacks cannot reenter lifecycle work. These cuts are historical evidence, not
+continuing leases, latest-read proofs or completed native engine integration.
+A real three-voter probe verifies an applied initial claim and epoch/term advancement
+on the replacement after leader loss. No client storage-mode activation changes.

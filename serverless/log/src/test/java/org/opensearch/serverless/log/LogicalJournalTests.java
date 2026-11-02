@@ -144,6 +144,59 @@ public class LogicalJournalTests extends JournalTestCase {
         }
     }
 
+    public void testOwnershipSessionInstallsOnlyAnAppliedAcceptedClaimAndReclaimsAfterLeaderLoss() throws Exception {
+        final var fixture = fixture(1);
+        final var journals = new ArrayList<RatisJournal>();
+        try {
+            startAll(fixture, journals, true);
+            final var identities = new java.util.IdentityHashMap<RatisJournal, UUID>();
+            for (int i = 0; i < journals.size(); i++) {
+                identities.put(journals.get(i), fixture.configurations().get(i).localVoterId());
+            }
+            final UUID group = fixture.configurations().getFirst().groups().getFirst().id();
+            final var stream = new ShardLogId(fixture.deployment(), "owned-session", 0, UUID.randomUUID());
+            final var first = leader(journals, group);
+            final var assignment = new LogicalStreamRecord(stream, group, first.groupActivation(group).checkpoint(), 8, 16384);
+            final var applied = new ArrayList<RatisJournal.CommittedOperation>();
+            try (var session = new LogicalOwnershipSession(first, assignment, identities.get(first), applied::add)) {
+                LogicalOwnershipSession.Progress batch;
+                do {
+                    batch = session.advance(3, 512);
+                } while (batch.throughIndex() < batch.committedIndex());
+                final var cp = session.beginClaim(1).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                assertTrue(session.ownership().isEmpty());
+                while (session.stage() != LogicalOwnershipSession.Stage.OWNED) {
+                    session.advance(3, 512);
+                }
+                assertEquals(cp, session.ownership().orElseThrow().checkpoint());
+                assertEquals(1, applied.size());
+                assertEquals(cp, applied.getFirst().checkpoint());
+            }
+            first.close();
+            journals.remove(first);
+            final var replacement = leader(journals, group);
+            applied.clear();
+            try (var session = new LogicalOwnershipSession(replacement, assignment, identities.get(replacement), applied::add)) {
+                LogicalOwnershipSession.Progress batch;
+                do {
+                    batch = session.advance(3, 512);
+                } while (batch.throughIndex() < batch.committedIndex());
+                expectThrows(IllegalArgumentException.class, () -> session.beginClaim(1));
+                final var cp = session.beginClaim(2).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                while (session.stage() != LogicalOwnershipSession.Stage.OWNED) {
+                    session.advance(3, 512);
+                }
+                assertEquals(cp, session.ownership().orElseThrow().checkpoint());
+                assertEquals(identities.get(replacement), session.ownership().orElseThrow().state().owner());
+                assertEquals(2, session.ownership().orElseThrow().state().producerEpoch());
+                assertEquals(2, session.ownership().orElseThrow().state().primaryTerm());
+                assertEquals(2, applied.size());
+            }
+        } finally {
+            closeAll(journals);
+        }
+    }
+
     public void testLogicalProposalAdmissionCannotImpersonateAnotherVoter() throws Exception {
         final var fixture = fixture(1);
         final var journals = new ArrayList<RatisJournal>();

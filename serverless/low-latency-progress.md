@@ -460,3 +460,17 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   mutation/result-only bytes after leader loss, plus invalid coordinates. The run
   passed 333 unit and six native logical cases across three iterations with root
   precommit (1m24s). Opaque outcome payloads remain in the log rather than the cache.
+
+- Runtime ownership sessions now apply bounded verified history, submit a fresh
+  epoch/engine-term CAS, and expose ownership only after its physical acknowledgement,
+  semantic acceptance and ordered consumer application. The driver never blocks on
+  unresolved quorum futures or allocates threads/timers. Ambiguous submission,
+  supersession, lost leader readiness and replay/application failure fence the
+  context. Close after host work drains clears resident references without canceling
+  accepted persistence. Successful schema transitions retain the owner and update
+  the projection; progress excludes opaque payload batches and ownership is hidden
+  during application. Tests cover competing claims, cancellation, late commit,
+  rebuild after ambiguity, schema/data order and actual three-voter leader-loss
+  reclaim. The final run passed 363 unit and nine native logical cases across three
+  iterations with root precommit (1m36s). Host admission/serialization and a verified
+  native schema/private-context rebuild remain required; client quorum mode is off.
