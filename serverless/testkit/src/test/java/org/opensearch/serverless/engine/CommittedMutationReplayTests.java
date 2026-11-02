@@ -295,19 +295,21 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                     final UUID noOpId = UUID.randomUUID();
                     final var originalNoOpValue = new java.util.concurrent.atomic.AtomicReference<ResolvedResultOnly>();
                     final Map.Entry<LogCheckpoint, ResolvedResultOnly> noOpReceipt;
-                    try (
-                        var worker = org.opensearch.common.util.concurrent.OpenSearchExecutors.newFixed(
-                            "logical-result-probe",
-                            1,
-                            4,
-                            org.opensearch.common.util.concurrent.OpenSearchExecutors.daemonThreadFactory("logical-result-probe"),
-                            threadPool.getThreadContext()
-                        )
-                    ) {
-                        final var gate = new PreparationDependencyGate<
+                    final var noOpDispatcher = new PreparationWorkDispatcher(
+                        "logical-result-probe",
+                        Set.of(fixture.group.id()),
+                        1,
+                        1,
+                        65536,
+                        65536,
+                        threadPool.getThreadContext()
+                    );
+                    try {
+                        final PreparationWorkDispatcher.Binding<
                             PreparedLogicalResultOnly,
-                            Map.Entry<LogCheckpoint, ResolvedResultOnly>>(
-                                worker,
+                            Map.Entry<LogCheckpoint, ResolvedResultOnly>> gate = noOpDispatcher.bind(
+                                fixture.group.id(),
+                                serving.shardId(),
                                 packetOnly -> packetOnly.appendTo(fixture.leader),
                                 (packetOnly, committed) -> {
                                     LogicalOwnershipSession.Progress appliedProgress;
@@ -343,7 +345,8 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                                 }
                             );
                         try {
-                            noOpReceipt = gate.submit(() -> {
+                            noOpReceipt = gate.submit(65536, () -> {
+                                assertEquals(65536, noOpDispatcher.stats().pendingBytes());
                                 assertTrue(session.knownClientOutcome(noOpId, retryCp.index(), new byte[32]).outcome().isEmpty());
                                 try (
                                     var scripts = new org.opensearch.script.ScriptService(
@@ -382,6 +385,8 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                         } finally {
                             gate.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
                         }
+                    } finally {
+                        noOpDispatcher.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
                     }
                     final var noOpCp = noOpReceipt.getKey();
                     final var noOpResult = noOpReceipt.getValue();

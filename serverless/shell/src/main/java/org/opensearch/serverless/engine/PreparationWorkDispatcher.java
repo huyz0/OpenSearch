@@ -35,7 +35,7 @@ final class PreparationWorkDispatcher {
     private final PreparationEngineAdmission bindingAdmission;
     private final PreparationEngineAdmission requestAdmission;
     private final Map<UUID, ThreadPoolExecutor> workers;
-    private final Map<ShardId, Binding> bindings = new HashMap<>();
+    private final Map<ShardId, Binding<?, ?>> bindings = new HashMap<>();
     private final CompletableFuture<Void> closed = new CompletableFuture<>();
     private boolean closing;
     private boolean workersStopped;
@@ -94,9 +94,27 @@ final class PreparationWorkDispatcher {
         }
     }
 
-    Binding bind(UUID group, ShardId shard, PreparationCommitSequencer.Appender appender, PreparationCommitSequencer.Applier applier) {
+    Binding<ResolvedMutation, CommittedMutationReplayer.AppliedMutation> bind(
+        UUID group,
+        ShardId shard,
+        PreparationCommitSequencer.Appender appender,
+        PreparationCommitSequencer.Applier applier
+    ) {
         Objects.requireNonNull(appender);
         Objects.requireNonNull(applier);
+        return bind(group, shard, appender::append, applier::apply, PreparationCommitSequencer::verifyMutation);
+    }
+
+    <P, R> Binding<P, R> bind(
+        UUID group,
+        ShardId shard,
+        PreparationDependencyGate.Appender<P> appender,
+        PreparationDependencyGate.Applier<P, R> applier,
+        PreparationDependencyGate.ResultVerifier<P, R> verifier
+    ) {
+        Objects.requireNonNull(appender);
+        Objects.requireNonNull(applier);
+        Objects.requireNonNull(verifier);
         synchronized (this) {
             if (closing) {
                 throw new OpenSearchRejectedExecutionException("private work dispatcher is closing");
@@ -106,7 +124,7 @@ final class PreparationWorkDispatcher {
             }
             final var ticket = bindingAdmission.acquire(group, shard, 1);
             try {
-                final var binding = new Binding(group, shard, ticket, appender, applier);
+                final var binding = new Binding<P, R>(group, shard, ticket, appender, applier, verifier);
                 bindings.put(shard, binding);
                 return binding;
             } catch (RuntimeException | Error failure) {
@@ -121,13 +139,13 @@ final class PreparationWorkDispatcher {
         return new Stats(bindings.size(), pending.contexts(), pending.reservedBytes());
     }
 
-    final class Binding {
+    final class Binding<P, R> {
         private final UUID group;
         private final ShardId shard;
         private final PreparationEngineAdmission.Ticket ticket;
-        private final PreparationCommitSequencer gate;
+        private final PreparationDependencyGate<P, R> gate;
         private final CompletableFuture<Void> closed = new CompletableFuture<>();
-        private Request pending;
+        private Request<R> pending;
         private boolean closing;
         private boolean gateClosed;
         private boolean finalizing;
@@ -136,21 +154,19 @@ final class PreparationWorkDispatcher {
             UUID group,
             ShardId shard,
             PreparationEngineAdmission.Ticket ticket,
-            PreparationCommitSequencer.Appender appender,
-            PreparationCommitSequencer.Applier applier
+            PreparationDependencyGate.Appender<P> appender,
+            PreparationDependencyGate.Applier<P, R> applier,
+            PreparationDependencyGate.ResultVerifier<P, R> verifier
         ) {
             this.group = group;
             this.shard = shard;
             this.ticket = ticket;
-            gate = new PreparationCommitSequencer(task -> enqueue(this, task), appender, applier);
+            gate = new PreparationDependencyGate<>(task -> enqueue(this, task), appender, applier, verifier);
         }
 
-        CompletionStage<CommittedMutationReplayer.AppliedMutation> submit(
-            long retainedBytes,
-            PreparationCommitSequencer.Preparer preparer
-        ) {
+        CompletionStage<R> submit(long retainedBytes, PreparationDependencyGate.Preparer<P> preparer) {
             Objects.requireNonNull(preparer);
-            final Request request;
+            final Request<R> request;
             synchronized (PreparationWorkDispatcher.this) {
                 if (closing || PreparationWorkDispatcher.this.closing || pending != null) {
                     return CompletableFuture.failedStage(
@@ -158,7 +174,7 @@ final class PreparationWorkDispatcher {
                     );
                 }
                 try {
-                    request = new Request(this, requestAdmission.acquire(group, shard, retainedBytes));
+                    request = new Request<>(this, requestAdmission.acquire(group, shard, retainedBytes));
                 } catch (RuntimeException rejected) {
                     return CompletableFuture.failedStage(rejected);
                 }
@@ -192,29 +208,29 @@ final class PreparationWorkDispatcher {
         }
     }
 
-    private final class Request {
-        private final Binding binding;
+    private final class Request<R> {
+        private final Binding<?, R> binding;
         private final PreparationEngineAdmission.Ticket ticket;
-        private final CompletableFuture<CommittedMutationReplayer.AppliedMutation> result = new CompletableFuture<>();
+        private final CompletableFuture<R> result = new CompletableFuture<>();
         private int jobs;
         private boolean outcomeKnown;
         private boolean settled;
-        private CommittedMutationReplayer.AppliedMutation value;
+        private R value;
         private Throwable failure;
 
-        private Request(Binding binding, PreparationEngineAdmission.Ticket ticket) {
+        private Request(Binding<?, R> binding, PreparationEngineAdmission.Ticket ticket) {
             this.binding = binding;
             this.ticket = ticket;
         }
     }
 
     private final class Job implements Runnable {
-        private final Request request;
+        private final Request<?> request;
         private Runnable action;
         private boolean started;
         private boolean finished;
 
-        private Job(Request request, Runnable action) {
+        private Job(Request<?> request, Runnable action) {
             this.request = request;
             this.action = action;
         }
@@ -240,7 +256,7 @@ final class PreparationWorkDispatcher {
         }
     }
 
-    private void enqueue(Binding binding, Runnable action) {
+    private void enqueue(Binding<?, ?> binding, Runnable action) {
         final Job job;
         synchronized (this) {
             if (closing || binding.closing || binding.pending == null) {
@@ -280,7 +296,7 @@ final class PreparationWorkDispatcher {
         settle(job.request);
     }
 
-    private void outcome(Request request, CommittedMutationReplayer.AppliedMutation value, Throwable failure) {
+    private <R> void outcome(Request<R> request, R value, Throwable failure) {
         synchronized (this) {
             if (request.outcomeKnown) {
                 return;
@@ -292,7 +308,7 @@ final class PreparationWorkDispatcher {
         settle(request);
     }
 
-    private void settle(Request request) {
+    private <R> void settle(Request<R> request) {
         synchronized (this) {
             if (request.settled || request.outcomeKnown == false || request.jobs != 0) {
                 return;
@@ -309,7 +325,7 @@ final class PreparationWorkDispatcher {
         }
     }
 
-    private void finishBinding(Binding binding) {
+    private void finishBinding(Binding<?, ?> binding) {
         synchronized (this) {
             if (binding.finalizing || binding.closing == false || binding.gateClosed == false || binding.pending != null) {
                 return;
@@ -325,10 +341,10 @@ final class PreparationWorkDispatcher {
     }
 
     CompletionStage<Void> closeAsync() {
-        final Binding[] snapshot;
+        final Binding<?, ?>[] snapshot;
         synchronized (this) {
             closing = true;
-            snapshot = bindings.values().toArray(Binding[]::new);
+            snapshot = bindings.values().toArray(Binding<?, ?>[]::new);
         }
         for (var binding : snapshot) {
             binding.closeAsync();

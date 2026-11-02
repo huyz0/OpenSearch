@@ -12,12 +12,16 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.log.LogCheckpoint;
+import org.opensearch.serverless.log.LogicalCommand;
 import org.opensearch.serverless.log.ShardLogId;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -256,7 +260,121 @@ public class PreparationWorkDispatcherTests extends OpenSearchTestCase {
         );
     }
 
-    private static PreparationWorkDispatcher.Binding binding(PreparationWorkDispatcher dispatcher, UUID group, int shard) {
+    public void testResultOnlyAndMutationShareGroupCreditsAcrossCancellation() throws Exception {
+        final UUID first = UUID.randomUUID();
+        final UUID second = UUID.randomUUID();
+        final var dispatcher = dispatcher(Set.of(first, second), 4, 2, 200, 100);
+        final var append = new CompletableFuture<LogCheckpoint>();
+        final var prepared = new CountDownLatch(1);
+        final var verified = new CountDownLatch(1);
+        try {
+            final var only = resultBinding(dispatcher, first, 0, append, verified);
+            final var spare = binding(dispatcher, first, 1);
+            final var healthy = binding(dispatcher, second, 2);
+            final var pending = only.submit(100, () -> {
+                prepared.countDown();
+                return resultProposal();
+            }).toCompletableFuture();
+            assertTrue(prepared.await(10, TimeUnit.SECONDS));
+            assertTrue(pending.cancel(true));
+            assertFalse(append.isCancelled());
+            assertFailure(OpenSearchRejectedExecutionException.class, spare.submit(100, () -> {
+                throw new AssertionError("result-only request must keep the other group's credit reserved");
+            }));
+            healthy.submit(100, PreparationWorkDispatcherTests::mutation).toCompletableFuture().get(10, TimeUnit.SECONDS);
+            assertEquals(new PreparationWorkDispatcher.Stats(3, 1, 100), dispatcher.stats());
+            append.complete(checkpoint());
+            assertTrue(verified.await(10, TimeUnit.SECONDS));
+            assertBusy(() -> assertEquals(new PreparationWorkDispatcher.Stats(3, 0, 0), dispatcher.stats()));
+        } finally {
+            dispatcher.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        }
+    }
+
+    public void testQueuedClosedResultOnlyKeepsItsCountAndBytesUntilDrain() throws Exception {
+        final UUID group = UUID.randomUUID();
+        final var entered = new CountDownLatch(1);
+        final var release = new CountDownLatch(1);
+        final var prepared = new AtomicInteger();
+        final var dispatcher = dispatcher(Set.of(group), 4, 2, 200, 100);
+        try {
+            final var running = binding(dispatcher, group, 0);
+            final var queued = resultBinding(dispatcher, group, 1, CompletableFuture.completedFuture(checkpoint()), new CountDownLatch(1));
+            final var extra = binding(dispatcher, group, 2);
+            final var first = running.submit(100, () -> {
+                entered.countDown();
+                await(release);
+                return mutation();
+            });
+            assertTrue(entered.await(10, TimeUnit.SECONDS));
+            final var result = queued.submit(100, () -> {
+                prepared.incrementAndGet();
+                return resultProposal();
+            });
+            final var closed = queued.closeAsync();
+            assertFalse(closed.toCompletableFuture().isDone());
+            assertFalse(result.toCompletableFuture().isDone());
+            assertEquals(new PreparationWorkDispatcher.Stats(3, 2, 200), dispatcher.stats());
+            assertFailure(OpenSearchRejectedExecutionException.class, extra.submit(1, PreparationWorkDispatcherTests::mutation));
+            release.countDown();
+            first.toCompletableFuture().get(10, TimeUnit.SECONDS);
+            assertFailure(IOException.class, result);
+            closed.toCompletableFuture().get(10, TimeUnit.SECONDS);
+            assertEquals(0, prepared.get());
+            assertEquals(new PreparationWorkDispatcher.Stats(2, 0, 0), dispatcher.stats());
+        } finally {
+            release.countDown();
+            dispatcher.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        }
+    }
+
+    private static PreparationWorkDispatcher.Binding<LogicalCommand, ResolvedResultOnly> resultBinding(
+        PreparationWorkDispatcher dispatcher,
+        UUID group,
+        int shard,
+        CompletableFuture<LogCheckpoint> append,
+        CountDownLatch verified
+    ) {
+        return dispatcher.bind(
+            group,
+            new ShardId("index", "uuid", shard),
+            command -> append,
+            (command, committed) -> ResolvedResultOnly.decode(command.payloadReader().readAllBytes(), 4096),
+            (command, committed, result) -> {
+                final var original = ResolvedResultOnly.decode(command.payloadReader().readAllBytes(), 4096);
+                if (command.action() != LogicalCommand.Action.OUTCOME_ONLY
+                    || committed.equals(checkpoint()) == false
+                    || result.status() != original.status()
+                    || Arrays.equals(result.json(), original.json()) == false) {
+                    throw new IOException("wrong result-only response");
+                }
+                verified.countDown();
+            }
+        );
+    }
+
+    private static LogicalCommand resultProposal() throws IOException {
+        final var value = ResolvedResultOnly.rejected(
+            RestStatus.CONFLICT,
+            "{\"error\":\"conflict\"}".getBytes(StandardCharsets.UTF_8),
+            4096
+        );
+        return new LogicalCommand(
+            LogicalCommand.Action.OUTCOME_ONLY,
+            UUID.randomUUID(),
+            0,
+            new byte[32],
+            new UUID(5, 6),
+            -1,
+            value.encode(4096)
+        );
+    }
+
+    private static PreparationWorkDispatcher.Binding<ResolvedMutation, CommittedMutationReplayer.AppliedMutation> binding(
+        PreparationWorkDispatcher dispatcher,
+        UUID group,
+        int shard
+    ) {
         return dispatcher.bind(
             group,
             shard(shard),

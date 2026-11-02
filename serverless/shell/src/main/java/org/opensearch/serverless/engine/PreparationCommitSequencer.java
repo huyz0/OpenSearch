@@ -46,11 +46,14 @@ final class PreparationCommitSequencer {
     PreparationCommitSequencer(Executor executor, Appender appender, Applier applier) {
         Objects.requireNonNull(appender);
         Objects.requireNonNull(applier);
-        gate = new PreparationDependencyGate<>(executor, appender::append, applier::apply, (mutation, checkpoint, applied) -> {
-            if (mutation.sameResolution(applied.mutation()) == false || applied.checkpoint().equals(checkpoint) == false) {
-                throw new IOException("serving application returned a different operation or committed checkpoint");
-            }
-        });
+        gate = new PreparationDependencyGate<>(executor, appender::append, applier::apply, PreparationCommitSequencer::verifyMutation);
+    }
+
+    static void verifyMutation(ResolvedMutation mutation, LogCheckpoint checkpoint, CommittedMutationReplayer.AppliedMutation applied)
+        throws IOException {
+        if (mutation.sameResolution(applied.mutation()) == false || applied.checkpoint().equals(checkpoint) == false) {
+            throw new IOException("serving application returned a different operation or committed checkpoint");
+        }
     }
 
     CompletionStage<CommittedMutationReplayer.AppliedMutation> submit(Preparer preparer) {

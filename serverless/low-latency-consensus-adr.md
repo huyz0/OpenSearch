@@ -1181,6 +1181,13 @@ and ownership/schema/lifecycle gates. The general gate does not supply those pro
 
 The TLS no-op history now performs retry lookup, native private translation,
 result-only proposal, applied-prefix catch-up and original response recovery through
-this gate on a bounded worker. The old mutation facade and dispatcher tests cover
-the same state/work accounting; direct result-only tests cover cancellation,
-mandatory verification, failed verification and late commitment after close.
+this gate through `PreparationWorkDispatcher`. Its typed bindings admit both
+mutation and result-only proposal/result pairs through the same declared request
+count, byte limits and reserved group credits. Admission happens before retry
+lookup, native translation or encoding. Canceling the detached result or closing
+a queued binding keeps its charge until all retained wrappers drain; an unresolved
+result-only request cannot take another group's reserved capacity. The legacy
+mutation binding retains the same exact-resolution verifier. Direct gate tests
+cover mandatory verification, failed verification and late commitment after close.
+These are host building blocks, not a production request frontend or lifecycle
+controller, and declared request bytes do not establish actual heap residency.

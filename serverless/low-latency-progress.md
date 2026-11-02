@@ -611,3 +611,14 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   All 234 selected engine/gate cases and 18 native replay cases passed across three
   iterations with shell check and root precommit (3m24s). Host admission/dispatch,
   lifecycle and frontend integration remain; client quorum mode is off.
+
+- Typed preparation dispatch now shares count/byte admission and reserved group
+  credits across mutation and result-only requests. Admission precedes retry
+  lookup, native translation and encoding. Canceling a result-only client view
+  retains its charge and does not consume another group's reserved capacity;
+  closing queued work retains bytes until its wrapper drains without executing
+  preparation. The native TLS no-op history now uses the admitted dispatcher
+  through canonical response verification. All 240 selected engine/admission cases
+  and 18 native replay cases passed across three iterations with shell check and
+  root precommit (3m25s). Owned lifecycle/frontend integration and client quorum
+  mode remain pending.
