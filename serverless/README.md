@@ -103,9 +103,19 @@ If something here looks like a hang, measure before concluding.
 
 ## Testing
 
-`:serverless:testkit:test` is 549 tests. `processTest` forks real JVMs, `pluginTest` installs a
-real assembled plugin, `tlsTest` does a real handshake. `s3Test` needs a live MinIO or SeaweedFS
-endpoint and assume-skips without one.
+`:serverless:testkit:test` runs the in-process suite. `processTest` forks real JVMs,
+`pluginTest` installs real assembled plugins, and `tlsTest` performs real transport
+handshakes. The log module's `journalTest` and testkit's `journalCatalogTest` and
+`journalReplayTest` exercise native journal persistence, host control and serving
+replay. Run the complete serverless checks with:
+
+```sh
+./gradlew :serverless:log:check :serverless:shell:check :serverless:testkit:check
+```
+
+`s3Test` needs a configured live object-store endpoint for its conformance and
+measurement cases; those cases assume-skip without one. Passing the local suites
+does not substitute for provider or multi-AZ qualification.
 
 Two dependency-direction rules are enforced as build tasks rather than conventions:
 `server/` may never name `org.opensearch.serverless`, and the auth plugin may reach only for

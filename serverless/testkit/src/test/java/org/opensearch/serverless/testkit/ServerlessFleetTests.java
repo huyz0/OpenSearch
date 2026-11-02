@@ -137,40 +137,36 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
      */
     public void testAShardSurvivesBeingHandedOverTwice() throws Exception {
         final var store = createTempDir();
-        try (NodeProcess c = NodeProcess.start("chain-c", store, createTempDir(), settings())) {
-            final List<Long> terms = new ArrayList<>();
-
-            final NodeProcess a = NodeProcess.start("chain-a", store, createTempDir(), settings());
-            final NodeProcess b = NodeProcess.start("chain-b", store, createTempDir(), settings());
-            try {
-                assertEquals(200, send(a, "PUT", "/alpha?shards=1", MAPPING).status());
-                for (int i = 1; i <= 5; i++) {
-                    assertEquals(201, putDoc(a, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
-                }
-                assertEquals("a should hold it first", a.nodeId(), owner(store));
-                terms.add(term(store));
-
+        final List<Long> terms = new ArrayList<>();
+        try (NodeProcess a = NodeProcess.start("chain-a", store, createTempDir(), settings())) {
+            assertEquals(200, send(a, "PUT", "/alpha?shards=1", MAPPING).status());
+            for (int i = 1; i <= 5; i++) {
+                assertEquals(201, putDoc(a, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
+            }
+            assertEquals("a should hold it first", a.nodeId(), owner(store));
+            terms.add(term(store));
+            try (NodeProcess b = NodeProcess.start("chain-b", store, createTempDir(), settings())) {
                 a.killHard();
                 for (int i = 6; i <= 10; i++) {
                     assertEquals(201, putDoc(b, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
                 }
                 assertEquals("b should have taken it", b.nodeId(), owner(store));
                 terms.add(term(store));
-            } finally {
                 b.killHard();
             }
-
+        }
+        // A third live writer can legitimately win the first takeover. Start it only after B's
+        // crash so this history proves A -> B -> C, rather than depending on placement winning a race.
+        try (NodeProcess c = NodeProcess.start("chain-c", store, createTempDir(), settings())) {
             for (int i = 11; i <= 15; i++) {
                 assertEquals(201, putDoc(c, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
             }
             assertEquals("c should have taken it in turn", c.nodeId(), owner(store));
             terms.add(term(store));
-
             logger.info("chain of custody: terms {}", terms);
             assertEquals("each handover must bump the term", 3, terms.size());
             assertTrue("terms must strictly increase across handovers: " + terms, terms.get(1) > terms.get(0));
             assertTrue("including the second handover: " + terms, terms.get(2) > terms.get(1));
-
             send(c, "POST", "/alpha/_refresh", null);
             final Response found = search(c, "msg:chain");
             assertEquals(200, found.status());

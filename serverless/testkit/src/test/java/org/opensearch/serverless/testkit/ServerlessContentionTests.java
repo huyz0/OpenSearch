@@ -224,10 +224,12 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 assertEquals(201, putDoc(b, "alpha", "warm", "{\"msg\":\"before\",\"n\":0}").status());
             }
 
+            final var beforePause = plane(store).heads().read("alpha", 0).orElseThrow();
             a.pause();
             try {
-                // Immediately, while a's lease still reads as live: b has no choice but to forward, and
-                // there is nobody on the other end.
+                final var frozenLease = plane(store).membership().read(a.nodeId()).orElseThrow();
+                // The forward may outlast the remaining lease. A successful takeover after expiry is
+                // legitimate; success while the frozen process still owns the head is not.
                 final long startedAt = System.nanoTime();
                 final Response response;
                 try {
@@ -257,7 +259,24 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 );
 
                 assertTrue("a forward to a frozen owner must give up, not hang: took " + elapsedMillis + "ms", elapsedMillis < 20_000L);
-                assertNotEquals("and it must not claim success", 201, response.status());
+                if (response.status() == 201) {
+                    final var after = plane(store).heads().read("alpha", 0).orElseThrow();
+                    assertEquals("success requires the responding node to have taken ownership", b.nodeId(), after.ownerNodeId());
+                    assertTrue("takeover must advance the original term", after.term() > beforePause.term());
+                    assertTrue("a live frozen owner must not be taken over", frozenLease.expiresAtMillis() <= System.currentTimeMillis());
+                    assertTrue(
+                        "the old process must be unable to renew",
+                        plane(store).membership().read(a.nodeId()).orElseThrow().revoked()
+                    );
+                    assertEquals("the accepted new document must be visible", 1, hitCount(search(b, "alpha", "msg:during").body()));
+                    assertEquals(
+                        "the original acknowledged data must survive takeover",
+                        warmTheConnection ? 2 : 1,
+                        hitCount(search(b, "alpha", "msg:before").body())
+                    );
+                } else {
+                    assertTrue("a failed forward must return an error: " + response.body(), response.status() >= 400);
+                }
             } finally {
                 a.resume();
             }

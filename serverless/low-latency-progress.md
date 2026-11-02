@@ -16,7 +16,7 @@ S3 archival remain pending.
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
 | M3a | [Cell/active-state design](low-latency-capacity-adr.md), runnable models/raw results, per-group proposal/peer isolation and resident-context admission primitive | Metadata routing, dynamic group admission, owned bounded engines and broader isolation pending |
-| M4 | Committed-serving adapter, resolved payload, fixed-binding replay, admitted private resources, mapping/identity guard, private native-buffer spill/fencing, admitted group-worker dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and shell admission/dispatch integration, serving/total-memory and SSD governors, ownership/schema/lifecycle controllers and shell integration |
+| M4 | Committed-serving adapter, resolved payload, fixed-binding replay and accepted-owner term transitions, admitted private resources, mapping/identity guard, private native-buffer spill/fencing, admitted group-worker dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and shell admission/dispatch integration, serving/total-memory and SSD governors, ownership/schema/lifecycle controllers and shell integration |
 | M5–M9 | Not implemented | Fresh readers, selective replication, archival, lifecycle, migration |
 | M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
 | M6a | Planned; no runtime completion claimed | Missing-chunk/resumable bulk shard copies, peer/S3 source selection and live-versus-recovery scheduling |
@@ -648,3 +648,18 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   followed by 45 core and 297 shell engine cases across three iterations with shell
   check and root precommit (4m12s). Owned lifecycle/frontend, nonempty recovery-base
   integration and client quorum mode remain pending.
+
+- Full serverless regression after the core copy/term changes exposed two process
+  test assumptions. A cold forward returned success after its eight-second owner
+  lease expired; the test now retains its latency bound and accepts success only
+  with a newer local-owner term, expired/revoked old lease and visible original/new
+  data. A third live node legitimately won a handoff that demanded B as the next
+  owner; that history now starts C only after B crashes, preserving the strict
+  A -> B -> C term and all-acknowledged-data assertions. Process resources also
+  close on earlier assertion failures. All nine targeted cases passed across
+  three iterations with the original failing seed. The complete log/shell/testkit
+  checks and root precommit then passed in 13m19s: 1,878 cases, zero failures/errors,
+  123 skips (including 118 endpoint-dependent S3 cases and three bucket process
+  cases). Native journal/catalog/replay, installed plugins, transport TLS and
+  filesystem crash/handoff histories ran. Real-provider and multi-AZ qualification
+  remain outstanding; client quorum mode remains off.
