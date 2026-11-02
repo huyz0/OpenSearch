@@ -1106,3 +1106,30 @@ result-only wire codec, request sequencer or frontend integration; unexpected na
 failure still requires host fencing/rebuild. Native source-field policies must be
 installed at shard creation where core requires that, rather than silently changing
 an immutable mapping parameter during an update.
+
+### Original result-only responses
+
+`ResolvedResultOnly` carries a versioned kind, supported HTTP status and immutable
+original JSON for native update no-ops and host-proven non-mutating failures. Its
+shell format is independent of native transport serialization. No-op construction
+requires a successful native NOOP response and streams rendering into a capped
+output buffer, including JSON escaping and source expansion in the body limit.
+Failure construction copies an already admitted exact JSON error response; it does
+not decide which failures are suitable for durable retention. The complete codec
+header is included in the bound, in addition to the enclosing logical-command
+header that the producer must reserve separately.
+
+Decode checks version, kind, status, exact lengths and top-level response shape
+without materializing the source map. Nested source/error properties do not become
+outer control fields. Duplicate semantic fields, inconsistent status, malformed
+JSON and trailing data are refused. Returned arrays cannot modify the retained
+result. Journal integrity, semantic acceptance, stable request identity and proof
+that no document mutation was assigned remain host responsibilities; the value
+itself establishes none of those. Rendering buffers, parser overhead and output
+copies still require the host's admitted request-memory reservation.
+
+The TLS logical/native history now translates an actual private update no-op,
+replicates its encoded result-only record, applies it without consuming a document
+sequence and retrieves the original status/body through the driver's canonical
+retry checkpoint. This does not enable client quorum mode or replace the pending
+host lifecycle, request gate and frontend integration.

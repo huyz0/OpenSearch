@@ -89,6 +89,8 @@ public class PrivateUpdatePreparerTests extends IndexShardTestCase {
             final UpdateResponse response = noop.action();
             assertEquals(1, response.getSeqNo());
             assertEquals(2, response.getVersion());
+            final var durable = ResolvedResultOnly.noOp(response, 4096);
+            assertArrayEquals(durable.json(), ResolvedResultOnly.decode(durable.encode(4096), 4096).json());
             assertEquals(1, resources.engine().getProcessedLocalCheckpoint());
             assertDocCount(serving, 0);
         } finally {

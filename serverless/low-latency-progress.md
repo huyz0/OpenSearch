@@ -558,3 +558,18 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   All 96 selected preparation/update engine cases passed across three iterations
   with shell check and root precommit (1m13s). Result-only wire encoding, host
   dispatch/lifecycle and frontend integration remain; client quorum mode is off.
+
+- Result-only outcomes now have an immutable versioned status/JSON codec independent
+  of native transport serialization. Successful native update no-ops render into
+  a capped output buffer; host-proven non-mutating failures copy admitted original
+  error JSON. Header bytes, escaping and source expansion are included in size
+  checks. Decode refuses malformed framing/JSON, unknown kinds/statuses, duplicate
+  semantic fields, inconsistent status and trailing bytes without materializing a
+  source map. The codec itself neither establishes ownership/commitment nor decides
+  which failures should be retained. Tests cover native no-op and missing-upsert
+  responses, exact boundaries, large source output, mutable aliases and malformed
+  frames. A real private-update/TLS/logical/native history replicates and recovers
+  the original no-op status/body without consuming a document sequence. The run
+  passed 114 selected engine/codec cases and 18 native replay cases across three
+  iterations with shell check and root precommit (3m24s). Typed outcome proposal,
+  host request/lifecycle integration and client quorum mode remain pending.

@@ -292,6 +292,54 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                     } while (progress.throughIndex() < retryCp.index());
                     assertEquals(0, applier.lastSequenceNumber());
                     assertEquals(cp, applier.lastAppliedCheckpoint().orElseThrow());
+                    final ResolvedResultOnly noOpResult;
+                    try (
+                        var scripts = new org.opensearch.script.ScriptService(
+                            Settings.EMPTY,
+                            Map.of(
+                                org.opensearch.script.MockScriptEngine.NAME,
+                                new org.opensearch.script.MockScriptEngine(org.opensearch.script.MockScriptEngine.NAME, Map.of(), Map.of())
+                            ),
+                            org.opensearch.script.ScriptModule.CORE_CONTEXTS
+                        )
+                    ) {
+                        final var plan = new PrivateUpdatePreparer(preparation, serving, scripts).prepare(
+                            new org.opensearch.action.update.UpdateRequest(serving.shardId().getIndexName(), "id").doc(
+                                new org.opensearch.action.index.IndexRequest().source("{}", MediaTypeRegistry.JSON)
+                            ),
+                            () -> 123
+                        );
+                        assertEquals(org.opensearch.action.DocWriteResponse.Result.NOOP, plan.getResponseResult());
+                        noOpResult = ResolvedResultOnly.noOp(plan.action(), LogicalCommand.maximumBodyBytes(16384));
+                    }
+                    final UUID noOpId = UUID.randomUUID();
+                    final var noOpCommand = new LogicalCommand(
+                        LogicalCommand.Action.OUTCOME_ONLY,
+                        noOpId,
+                        retryCp.index(),
+                        new byte[32],
+                        actor,
+                        -1,
+                        noOpResult.encode(LogicalCommand.maximumBodyBytes(16384))
+                    );
+                    final var noOpCp = fixture.leader.appendLogical(assignment, noOpCommand, 1, term, 1)
+                        .toCompletableFuture()
+                        .get(10, TimeUnit.SECONDS);
+                    do {
+                        progress = session.advance(100, 65536);
+                    } while (progress.throughIndex() < noOpCp.index());
+                    assertEquals(0, applier.lastSequenceNumber());
+                    assertEquals(0, preparation.engine().getProcessedLocalCheckpoint());
+                    final var knownNoOp = session.knownClientOutcome(noOpId, retryCp.index(), new byte[32]).outcome().orElseThrow();
+                    assertEquals(noOpCp, knownNoOp.originalCheckpoint());
+                    final var originalNoOp = fixture.leader.readCommitted(assignment, knownNoOp.originalCheckpoint());
+                    final var recoveredCommand = LogicalCommand.decode(originalNoOp.operation().payloadReader().readAllBytes(), 16384);
+                    final var recoveredNoOp = ResolvedResultOnly.decode(
+                        recoveredCommand.payloadReader().readAllBytes(),
+                        LogicalCommand.maximumBodyBytes(16384)
+                    );
+                    assertEquals(noOpResult.status(), recoveredNoOp.status());
+                    assertArrayEquals(noOpResult.json(), recoveredNoOp.json());
                     preparation.close();
                     try (
                         var rebuilt = PrivatePreparationResources.openCommitted(
@@ -329,7 +377,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                             assignment,
                             session.ownership().orElseThrow(),
                             resolvedDelete,
-                            retryCp.index(),
+                            noOpCp.index(),
                             new byte[32]
                         );
                         final var deleteCp = deletePacket.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
