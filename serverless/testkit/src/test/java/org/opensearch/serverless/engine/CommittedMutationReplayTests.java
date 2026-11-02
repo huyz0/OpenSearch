@@ -292,39 +292,54 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                     } while (progress.throughIndex() < retryCp.index());
                     assertEquals(0, applier.lastSequenceNumber());
                     assertEquals(cp, applier.lastAppliedCheckpoint().orElseThrow());
-                    final var deletion = preparation.engine()
-                        .prepareDelete(
-                            "id",
-                            null,
-                            SequenceNumbers.UNASSIGNED_SEQ_NO,
+                    preparation.close();
+                    try (
+                        var rebuilt = PrivatePreparationResources.openCommitted(
+                            new PreparationEngineAdmission(Set.of(fixture.group.id()), 4, 256L * 1024 * 1024, 64L * 1024 * 1024),
+                            fixture.group.id(),
+                            engines.get(serving.store()),
+                            createTempDir(),
+                            64L * 1024 * 1024,
+                            4L * 1024 * 1024,
+                            applier.lastSequenceNumber(),
                             term,
-                            Versions.MATCH_ANY,
-                            VersionType.INTERNAL,
-                            Engine.Operation.Origin.PRIMARY,
-                            first.getSeqNo(),
-                            first.getTerm()
+                            new PrivatePreparationResources.RebuildLimits(10_000, 1024 * 1024, 1L << 30, 10_000, 4L * 1024 * 1024)
+                        )
+                    ) {
+                        final var deletion = rebuilt.engine()
+                            .prepareDelete(
+                                "id",
+                                null,
+                                SequenceNumbers.UNASSIGNED_SEQ_NO,
+                                term,
+                                Versions.MATCH_ANY,
+                                VersionType.INTERNAL,
+                                Engine.Operation.Origin.PRIMARY,
+                                first.getSeqNo(),
+                                first.getTerm()
+                            );
+                        final var removed = rebuilt.delete(deletion);
+                        assertTrue(removed.isFound());
+                        final var resolvedDelete = new ResolvedMutation(
+                            UUID.randomUUID(),
+                            new Translog.Delete(deletion, removed),
+                            ResolvedMutation.Outcome.DELETED
                         );
-                    final var removed = preparation.delete(deletion);
-                    assertTrue(removed.isFound());
-                    final var resolvedDelete = new ResolvedMutation(
-                        UUID.randomUUID(),
-                        new Translog.Delete(deletion, removed),
-                        ResolvedMutation.Outcome.DELETED
-                    );
-                    final var deletePacket = PreparedLogicalMutation.create(
-                        assignment,
-                        session.ownership().orElseThrow(),
-                        resolvedDelete,
-                        retryCp.index(),
-                        new byte[32]
-                    );
-                    final var deleteCp = deletePacket.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
-                    while (applier.lastAppliedCheckpoint().orElseThrow().index() < deleteCp.index()) {
-                        session.advance(100, 65536);
+                        final var deletePacket = PreparedLogicalMutation.create(
+                            assignment,
+                            session.ownership().orElseThrow(),
+                            resolvedDelete,
+                            retryCp.index(),
+                            new byte[32]
+                        );
+                        final var deleteCp = deletePacket.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                        while (applier.lastAppliedCheckpoint().orElseThrow().index() < deleteCp.index()) {
+                            session.advance(100, 65536);
+                        }
+                        serving.refresh("accepted logical conditional delete");
+                        assertDocCount(serving, 0);
+                        assertEquals(1, applier.lastSequenceNumber());
                     }
-                    serving.refresh("accepted logical conditional delete");
-                    assertDocCount(serving, 0);
-                    assertEquals(1, applier.lastSequenceNumber());
                 }
             }
         } finally {

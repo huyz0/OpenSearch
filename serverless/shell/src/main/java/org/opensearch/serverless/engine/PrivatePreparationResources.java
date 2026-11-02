@@ -8,16 +8,24 @@
 
 package org.opensearch.serverless.engine;
 
+import org.apache.lucene.index.IndexCommit;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FilterDirectory;
 import org.opensearch.common.annotation.InternalApi;
+import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.ShardLock;
+import org.opensearch.index.engine.DeleteVersionMapSnapshot;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.index.store.CompositeDirectory;
+import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
+import org.opensearch.serverless.store.BlockCacheDirectory;
 import org.opensearch.storage.utils.DirectoryUtils;
 
 import java.io.Closeable;
@@ -29,7 +37,7 @@ import java.util.UUID;
 
 /**
  * Owns one admitted, disposable private engine and its fresh local generation. No public shard,
- * index service or search endpoint is registered. This empty-history primitive is not a mutation
+ * index service or search endpoint is registered. This resource primitive is not a mutation
  * sequencer, replay/rebuild controller, disk governor or proof of committed ownership.
  */
 @InternalApi
@@ -85,6 +93,116 @@ public final class PrivatePreparationResources implements Closeable {
         return openEmpty(admission, group, serving, generation, residentBytes, indexingBufferBytes, PrivatePreparationEngine::new);
     }
 
+    /**
+     * Limits charged by the host before a process-local committed-history rebuild.
+     * @param maximumFiles retained source file count
+     * @param maximumMetadataBytes retained source filename/overlay metadata reservation
+     * @param maximumPinnedBytes source disk reservation held by the immutable commit pin
+     * @param maximumDeleteEntries recent delete identity count
+     * @param maximumDeleteBytes reservation for each temporary/native copy of recent delete state
+     */
+    public record RebuildLimits(int maximumFiles, long maximumMetadataBytes, long maximumPinnedBytes, int maximumDeleteEntries,
+        long maximumDeleteBytes) {
+        /**
+         * Validates positive snapshot bounds.
+         * @param maximumFiles retained source file count
+         * @param maximumMetadataBytes retained filename/overlay reservation
+         * @param maximumPinnedBytes pinned source disk reservation
+         * @param maximumDeleteEntries recent delete identity count
+         * @param maximumDeleteBytes reservation for each copy of recent delete state
+         */
+        public RebuildLimits {
+            new PreparationOverlayDirectory.Limits(maximumFiles, maximumMetadataBytes, maximumPinnedBytes);
+            if (maximumDeleteEntries <= 0 || maximumDeleteBytes < 128) {
+                throw new IllegalArgumentException("invalid recent-delete rebuild bounds");
+            }
+        }
+    }
+
+    /**
+     * Clones a quiescent committed serving history without reindexing old sources under a newer
+     * mapping. The trusted host must hold the ownership/schema/lifecycle and mutation exclusion
+     * permits throughout this call, and prove the expected sequence from its applied logical prefix.
+     * The clone shares only pinned immutable commit files, retains original recent-delete expiry,
+     * and owns a fresh private translog. No source pin survives process loss; this is not archival.
+     * Snapshot metadata and both temporary/native delete-state copies are charged to residentBytes.
+     * The host separately reserves maximumPinnedBytes in its SSD governor before calling.
+     * Currently supports local source storage; remote GC needs an independent immutable-file lease.
+     * @param admission host-owned resident admission
+     * @param group assigned physical journal group
+     * @param serving quiescent serving engine containing only the verified accepted prefix
+     * @param generation existing empty separately owned private directory
+     * @param residentBytes total resident reservation including snapshot copies and native overhead
+     * @param indexingBufferBytes native writer/version-map buffer ceiling
+     * @param expectedSequenceNumber exact contiguous accepted native sequence, or -1 for empty
+     * @param primaryTerm fixed accepted preparation term, no smaller than the native serving term
+     * @param limits host-admitted snapshot metadata, pinned-disk and recent-delete limits
+     * @return private resource owner retaining its source pin until cleanup completes
+     * @throws IOException if history, local paths, native initialization or verification fail
+     */
+    public static PrivatePreparationResources openCommitted(
+        PreparationEngineAdmission admission,
+        UUID group,
+        CommittedServingEngine serving,
+        Path generation,
+        long residentBytes,
+        long indexingBufferBytes,
+        long expectedSequenceNumber,
+        long primaryTerm,
+        RebuildLimits limits
+    ) throws IOException {
+        return openCommitted(
+            admission,
+            group,
+            serving,
+            generation,
+            residentBytes,
+            indexingBufferBytes,
+            expectedSequenceNumber,
+            primaryTerm,
+            limits,
+            PrivatePreparationEngine::new
+        );
+    }
+
+    static PrivatePreparationResources openCommitted(
+        PreparationEngineAdmission admission,
+        UUID group,
+        CommittedServingEngine serving,
+        Path generation,
+        long residentBytes,
+        long indexingBufferBytes,
+        long expectedSequenceNumber,
+        long primaryTerm,
+        RebuildLimits limits,
+        NativeOpener opener
+    ) throws IOException {
+        Objects.requireNonNull(limits);
+        if (residentBytes <= 0
+            || indexingBufferBytes <= 0
+            || indexingBufferBytes > Integer.MAX_VALUE
+            || indexingBufferBytes > residentBytes
+            || expectedSequenceNumber < SequenceNumbers.NO_OPS_PERFORMED
+            || primaryTerm <= 0
+            || limits.maximumMetadataBytes() > residentBytes - indexingBufferBytes
+            || limits.maximumDeleteBytes() > (residentBytes - indexingBufferBytes - limits.maximumMetadataBytes()) / 2) {
+            throw new IllegalArgumentException("committed rebuild exceeds its identity or resident reservation");
+        }
+        return open(
+            admission,
+            group,
+            serving,
+            generation,
+            residentBytes,
+            indexingBufferBytes,
+            opener,
+            new Rebuild(expectedSequenceNumber, primaryTerm, limits)
+        );
+    }
+
+    private record Rebuild(long checkpoint, long term, RebuildLimits limits) {
+    }
+
     static PrivatePreparationResources openEmpty(
         PreparationEngineAdmission admission,
         UUID group,
@@ -94,6 +212,19 @@ public final class PrivatePreparationResources implements Closeable {
         long indexingBufferBytes,
         NativeOpener opener
     ) throws IOException {
+        return open(admission, group, serving, generation, residentBytes, indexingBufferBytes, opener, null);
+    }
+
+    private static PrivatePreparationResources open(
+        PreparationEngineAdmission admission,
+        UUID group,
+        CommittedServingEngine serving,
+        Path generation,
+        long residentBytes,
+        long indexingBufferBytes,
+        NativeOpener opener,
+        Rebuild rebuild
+    ) throws IOException {
         Objects.requireNonNull(serving);
         Objects.requireNonNull(opener);
         if (indexingBufferBytes <= 0 || indexingBufferBytes > Integer.MAX_VALUE || residentBytes < indexingBufferBytes) {
@@ -101,17 +232,31 @@ public final class PrivatePreparationResources implements Closeable {
         }
         final var ticket = Objects.requireNonNull(admission).acquire(group, serving.config().getShardId(), residentBytes);
         Path root = null;
-        FSDirectory directory = null;
+        Directory directory = null;
+        Closeable sourcePin = null;
         Store store = null;
         PrivatePreparationEngine engine = null;
         boolean claimed = false;
         boolean nativeInitializationStarted = false;
         try {
             serving.ensureReplayOpen();
-            if (serving.getSeqNoStats(SequenceNumbers.NO_OPS_PERFORMED).getMaxSeqNo() != SequenceNumbers.NO_OPS_PERFORMED) {
+            if (rebuild == null
+                && serving.getSeqNoStats(SequenceNumbers.NO_OPS_PERFORMED).getMaxSeqNo() != SequenceNumbers.NO_OPS_PERFORMED) {
                 throw new IOException("nonempty serving history requires verified private-engine rebuild");
             }
             final var publicConfig = serving.config();
+            final var mapper = publicConfig.getMapperService();
+            final var documentMapper = mapper == null ? null : mapper.documentMapper();
+            final boolean gcDeletesEnabled = publicConfig.isEnableGcDeletes();
+            final long servingTerm = publicConfig.getPrimaryTermSupplier().getAsLong();
+            final long mappingVersion = publicConfig.getIndexSettings().getIndexMetadata().getMappingVersion();
+            if (rebuild != null) {
+                requireLocalRebuildSource(publicConfig.getStore().directory());
+                requireRebuildPrefix(serving, rebuild);
+                if (rebuild.term() < servingTerm) {
+                    throw new IOException("private rebuild term precedes serving term");
+                }
+            }
             root = Objects.requireNonNull(generation).toRealPath();
             PrivatePreparationEngineConfig.requireSeparate(
                 root,
@@ -129,39 +274,85 @@ public final class PrivatePreparationResources implements Closeable {
             final Path index = Files.createDirectory(root.resolve("index"));
             final Path translog = Files.createDirectory(root.resolve("translog"));
             directory = FSDirectory.open(index);
+            DeleteVersionMapSnapshot deleteVersions = null;
+            if (rebuild != null) {
+                final var publicStore = publicConfig.getStore();
+                publicStore.incRef();
+                final GatedCloseable<IndexCommit> commit;
+                try {
+                    commit = serving.acquireLastIndexCommit(true);
+                } catch (RuntimeException | Error failed) {
+                    publicStore.decRef();
+                    throw failed;
+                }
+                sourcePin = () -> {
+                    try {
+                        commit.close();
+                    } finally {
+                        publicStore.decRef();
+                    }
+                };
+                requireRebuildPrefix(serving, rebuild);
+                final var limits = rebuild.limits();
+                deleteVersions = serving.captureDeleteVersions(commit.get(), limits.maximumDeleteEntries(), limits.maximumDeleteBytes());
+                directory = new PreparationOverlayDirectory(
+                    directory,
+                    commit.get(),
+                    sourcePin,
+                    new PreparationOverlayDirectory.Limits(
+                        limits.maximumFiles(),
+                        limits.maximumMetadataBytes(),
+                        limits.maximumPinnedBytes()
+                    )
+                );
+                sourcePin = null; // The overlay now owns the commit AND source-store reference.
+            }
             store = new Store(
                 publicConfig.getShardId(),
                 publicConfig.getIndexSettings(),
                 directory,
                 new PrivateShardLock(publicConfig.getShardId())
             );
-            final long term = publicConfig.getPrimaryTermSupplier().getAsLong();
+            final long term = rebuild == null ? publicConfig.getPrimaryTermSupplier().getAsLong() : rebuild.term();
+            final long checkpoint = rebuild == null ? SequenceNumbers.NO_OPS_PERFORMED : rebuild.checkpoint();
             final var configuration = PrivatePreparationEngineConfig.create(
                 publicConfig,
                 store,
                 translog,
                 term,
                 indexingBufferBytes,
-                () -> SequenceNumbers.NO_OPS_PERFORMED,
+                () -> checkpoint,
                 new Engine.EventListener() {
                 }
             );
             nativeInitializationStarted = true;
-            store.createEmpty(configuration.getIndexSettings().getIndexVersionCreated().luceneVersion);
-            store.associateIndexWithNewTranslog(
-                Translog.createEmptyTranslog(translog, SequenceNumbers.NO_OPS_PERFORMED, configuration.getShardId(), term)
-            );
+            if (rebuild == null) {
+                store.createEmpty(configuration.getIndexSettings().getIndexVersionCreated().luceneVersion);
+            }
+            store.associateIndexWithNewTranslog(Translog.createEmptyTranslog(translog, checkpoint, configuration.getShardId(), term));
             engine = Objects.requireNonNull(opener.open(configuration));
             engine.translogManager().recoverFromTranslog(snapshot -> {
                 if (snapshot.next() != null) {
                     throw new IOException("fresh private preparation translog unexpectedly contains history");
                 }
                 return 0;
-            }, SequenceNumbers.NO_OPS_PERFORMED, Long.MAX_VALUE);
-            return new PrivatePreparationResources(ticket, root, store, engine, indexingBufferBytes);
+            }, checkpoint, Long.MAX_VALUE);
+            if (rebuild != null) {
+                engine.installDeleteVersions(Objects.requireNonNull(deleteVersions));
+                requireRebuildPrefix(serving, rebuild);
+                if ((mapper != null && mapper.documentMapper() != documentMapper)
+                    || publicConfig.getIndexSettings().getIndexMetadata().getMappingVersion() != mappingVersion
+                    || publicConfig.isEnableGcDeletes() != gcDeletesEnabled
+                    || publicConfig.getPrimaryTermSupplier().getAsLong() != servingTerm) {
+                    throw new IOException("serving schema changed during private rebuild");
+                }
+            }
+            final var resources = new PrivatePreparationResources(ticket, root, store, engine, indexingBufferBytes);
+            resources.reclaimBuffers(engine);
+            return resources;
         } catch (IOException | RuntimeException | Error failed) {
             if (nativeInitializationStarted && engine == null) {
-                ticket.quarantine(new UncertainResources(root, store, directory, failed));
+                ticket.quarantine(new UncertainResources(root, store, directory, sourcePin, engine, failed));
             } else {
                 try {
                     if (engine != null) {
@@ -172,6 +363,9 @@ public final class PrivatePreparationResources implements Closeable {
                     } else if (directory != null) {
                         directory.close();
                     }
+                    if (sourcePin != null) {
+                        sourcePin.close();
+                    }
                     if (claimed) {
                         IOUtils.rm(root);
                     }
@@ -180,10 +374,33 @@ public final class PrivatePreparationResources implements Closeable {
                     if (cleanup != failed) {
                         failed.addSuppressed(cleanup);
                     }
-                    ticket.quarantine(new UncertainResources(root, store, directory, failed));
+                    ticket.quarantine(new UncertainResources(root, store, directory, sourcePin, engine, failed));
                 }
             }
             throw failed;
+        }
+    }
+
+    private static void requireLocalRebuildSource(Directory directory) throws IOException {
+        Directory current = directory;
+        while (current instanceof FilterDirectory filter) {
+            if (current instanceof BlockCacheDirectory
+                || current instanceof CompositeDirectory
+                || current instanceof RemoteSegmentStoreDirectory) {
+                throw new IOException("remote preparation rebuild requires an immutable source-file lease");
+            }
+            current = filter.getDelegate();
+        }
+        if (current instanceof FSDirectory == false) {
+            throw new IOException("preparation rebuild requires a pinned local filesystem source");
+        }
+    }
+
+    private static void requireRebuildPrefix(CommittedServingEngine serving, Rebuild rebuild) throws IOException {
+        serving.ensureReplayOpen();
+        if (serving.getProcessedLocalCheckpoint() != rebuild.checkpoint()
+            || serving.getSeqNoStats(SequenceNumbers.NO_OPS_PERFORMED).getMaxSeqNo() != rebuild.checkpoint()) {
+            throw new IOException("committed rebuild requires the exact applied contiguous serving prefix");
         }
     }
 
@@ -285,7 +502,8 @@ public final class PrivatePreparationResources implements Closeable {
         }
     }
 
-    private record UncertainResources(Path generation, Store store, FSDirectory directory, Throwable failure) {
+    private record UncertainResources(Path generation, Store store, Directory directory, Closeable sourcePin,
+        PrivatePreparationEngine engine, Throwable failure) {
     }
 
     // The public shard owns NodeEnvironment's shard lock. The private generation instead has its

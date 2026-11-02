@@ -512,3 +512,23 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   paths preserve caller ownership. Nine cases across three iterations passed
   with shell check and root precommit (27s). This is a disposable in-process
   primitive; native rebuild and recent-delete version transfer remain pending.
+
+- Private preparation can now rebuild from an exact quiescent committed local
+  serving prefix. It pins the immutable commit and source store, writes private
+  commit/translog metadata without copying segment data, and preserves bounded
+  recent delete versions with their source engine's original clock/GC policy.
+  Snapshot hooks remain independent of serverless in core and refuse a foreign,
+  advanced or already initialized target. Source checkpoint, term and mapper
+  changes stop initialization; resident and pinned-disk budgets are explicit.
+  Uncertain native initialization/cleanup keeps resource references and admission
+  quarantined. Remote cache/tiered bases require independent immutable-object
+  leases and are currently refused. The stale external-version regression first
+  reproduced acceptance of version 4 after a version-5 delete without transfer,
+  then passed with transfer. Tests also cover expiry without resetting its clock,
+  disabled GC, old-term conditional updates, surviving serving-owner close, bounds
+  and cleanup, and preserving old indexed fields under a newer mapping. The real
+  TLS/logical/native history now rebuilds before its conditional delete. The main
+  run passed 84 selected engine cases and 18 native replay cases across three
+  iterations, shell check and root precommit (3m21s). This process-local recovery
+  primitive does not implement cross-node delete-state recovery, schema/term
+  lifecycle, host dispatch integration or client quorum-mode activation.

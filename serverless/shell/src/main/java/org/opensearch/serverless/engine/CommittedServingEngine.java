@@ -8,7 +8,9 @@
 
 package org.opensearch.serverless.engine;
 
+import org.apache.lucene.index.IndexCommit;
 import org.opensearch.common.annotation.InternalApi;
+import org.opensearch.index.engine.DeleteVersionMapSnapshot;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.InternalEngine;
@@ -28,6 +30,10 @@ public final class CommittedServingEngine extends InternalEngine {
      */
     public CommittedServingEngine(EngineConfig configuration) {
         super(configuration.toBuilder().primaryOperationPolicy(CommittedPrimaryOperationPolicy.INSTANCE).build());
+    }
+
+    DeleteVersionMapSnapshot captureDeleteVersions(IndexCommit commit, int maximumEntries, long maximumBytes) throws IOException {
+        return snapshotDeleteVersions(commit, maximumEntries, maximumBytes);
     }
 
     void ensureReplayOpen() {

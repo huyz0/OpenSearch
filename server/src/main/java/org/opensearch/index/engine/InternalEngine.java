@@ -117,6 +117,7 @@ import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -1873,6 +1874,125 @@ public class InternalEngine extends Engine {
             } finally {
                 optimizeLock.unlock();
             }
+        }
+    }
+
+    /**
+     * Captures recent deletes for a process-local clone. The caller must exclude operations and
+     * schema/lifecycle changes from the flush/pin through capture; the engine read lock only excludes
+     * close. The commit must cover the complete contiguous current history. Bounds are checked before
+     * copying UID bytes. Background native tombstone expiry may continue with its original clock.
+     * @param commit pinned complete local commit from this engine
+     * @param maximumEntries admitted recent-delete count
+     * @param maximumBytes admitted snapshot resident reservation
+     * @return process-local snapshot retaining original delete expiry
+     * @throws IOException if history differs or snapshot bounds are exceeded
+     */
+    protected final DeleteVersionMapSnapshot snapshotDeleteVersions(IndexCommit commit, int maximumEntries, long maximumBytes)
+        throws IOException {
+        if (maximumEntries <= 0 || maximumBytes < 128) {
+            throw new IllegalArgumentException("invalid delete-version snapshot limits");
+        }
+        try (ReleasableLock ignored = readLock.acquire()) {
+            ensureOpen();
+            final var data = commit.getUserData();
+            if (commit.getDirectory() != store.directory()
+                || historyUUID.equals(data.get(HISTORY_UUID_KEY)) == false
+                || data.containsKey(SequenceNumbers.LOCAL_CHECKPOINT_KEY) == false
+                || data.containsKey(SequenceNumbers.MAX_SEQ_NO) == false) {
+                throw new IOException("delete-version snapshot requires this engine's pinned history");
+            }
+            final var info = SequenceNumbers.loadSeqNoInfoFromLuceneCommit(data.entrySet());
+            final long checkpoint = info.localCheckpoint;
+            if (info.maxSeqNo != checkpoint) {
+                throw new IOException("delete-version snapshot requires a contiguous committed prefix");
+            }
+            requireDeleteSnapshotCheckpoint(checkpoint);
+            if (versionMap.getAllTombstones().size() > maximumEntries) {
+                throw new IOException("delete-version snapshot exceeds entry budget");
+            }
+            final var entries = new ArrayList<DeleteVersionMapSnapshot.Entry>();
+            long retainedBytes = 128;
+            for (BytesRef uid : versionMap.getAllTombstones().keySet()) {
+                try (Releasable uidLock = versionMap.acquireLock(uid)) {
+                    final VersionValue current = versionMap.getUnderLock(uid);
+                    if (current instanceof DeleteVersionValue delete) {
+                        if (delete.seqNo < 0 || delete.seqNo > checkpoint || delete.version <= 0 || delete.term <= 0) {
+                            throw new IOException("delete-version snapshot contains an invalid identity");
+                        }
+                        final long charge = 256L + uid.length;
+                        if (entries.size() >= maximumEntries || charge > maximumBytes - retainedBytes) {
+                            throw new IOException("delete-version snapshot exceeds resident budget");
+                        }
+                        entries.add(
+                            new DeleteVersionMapSnapshot.Entry(
+                                Arrays.copyOfRange(uid.bytes, uid.offset, uid.offset + uid.length),
+                                delete.version,
+                                delete.seqNo,
+                                delete.term,
+                                delete.time
+                            )
+                        );
+                        retainedBytes += charge;
+                    }
+                }
+            }
+            requireDeleteSnapshotCheckpoint(checkpoint);
+            return new DeleteVersionMapSnapshot(
+                shardId,
+                historyUUID,
+                checkpoint,
+                engineConfig.getThreadPool(),
+                engineConfig.isEnableGcDeletes(),
+                getGcDeletesInMillis(),
+                entries,
+                retainedBytes
+            );
+        }
+    }
+
+    /**
+     * Installs recent deletes into a newly opened, unexposed clone before accepting any operation.
+     * The caller must serialize initialization and abandon the clone after any installation failure.
+     * The target must have the same shard/history, contiguous checkpoint and native clock.
+     * @param snapshot bounded snapshot of the exact source history
+     * @throws IOException if target identity, checkpoint, clock, term or GC policy differs
+     */
+    protected final void restoreDeleteVersions(DeleteVersionMapSnapshot snapshot) throws IOException {
+        Objects.requireNonNull(snapshot);
+        try (ReleasableLock ignored = readLock.acquire()) {
+            ensureOpen();
+            if (shardId.equals(snapshot.shard) == false
+                || historyUUID.equals(snapshot.historyUUID) == false
+                || engineConfig.getThreadPool() != snapshot.clock
+                || engineConfig.isEnableGcDeletes() != snapshot.gcDeletesEnabled
+                || getGcDeletesInMillis() != snapshot.gcDeletesInMillis
+                || versionMap.getAllCurrent().isEmpty() == false
+                || versionMap.getAllTombstones().isEmpty() == false) {
+                throw new IOException("delete-version restore requires a pristine clone of the same local history");
+            }
+            requireDeleteSnapshotCheckpoint(snapshot.checkpoint);
+            final long term = engineConfig.getPrimaryTermSupplier().getAsLong();
+            for (var entry : snapshot.entries) {
+                if (entry.sequenceNumber() > snapshot.checkpoint || entry.term() > term) {
+                    throw new IOException("delete-version restore exceeds target checkpoint or term");
+                }
+            }
+            for (var entry : snapshot.entries) {
+                final var uid = new BytesRef(entry.uid().clone());
+                try (Releasable uidLock = versionMap.acquireLock(uid)) {
+                    versionMap.putDeleteUnderLock(
+                        uid,
+                        new DeleteVersionValue(entry.version(), entry.sequenceNumber(), entry.term(), entry.time())
+                    );
+                }
+            }
+        }
+    }
+
+    private void requireDeleteSnapshotCheckpoint(long checkpoint) throws IOException {
+        if (localCheckpointTracker.getProcessedCheckpoint() != checkpoint || localCheckpointTracker.getMaxSeqNo() != checkpoint) {
+            throw new IOException("delete-version snapshot checkpoint does not match quiescent native history");
         }
     }
 

@@ -21,6 +21,7 @@ import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.tests.store.MockDirectoryWrapper;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -42,10 +43,15 @@ public class PreparationOverlayDirectoryTests extends OpenSearchTestCase {
             writer.commit();
             final var commit = policy.snapshot();
             final var releases = new AtomicInteger();
-            final var overlay = new PreparationOverlayDirectory(newDirectory(), commit, () -> {
-                policy.release(commit);
-                releases.incrementAndGet();
-            }, LIMITS);
+            final var overlay = new PreparationOverlayDirectory(
+                new MockDirectoryWrapper(random(), new ByteBuffersDirectory()),
+                commit,
+                () -> {
+                    policy.release(commit);
+                    releases.incrementAndGet();
+                },
+                LIMITS
+            );
             try (
                 overlay;
                 var privateWriter = new IndexWriter(overlay, newIndexWriterConfig().setOpenMode(IndexWriterConfig.OpenMode.APPEND))
@@ -121,7 +127,11 @@ public class PreparationOverlayDirectoryTests extends OpenSearchTestCase {
     }
 
     public void testLimitsAndFailedConstructionRetainCallerOwnership() throws Exception {
-        try (var source = newDirectory(); var writer = new IndexWriter(source, newIndexWriterConfig()); var local = newDirectory()) {
+        try (
+            var source = newDirectory();
+            var writer = new IndexWriter(source, newIndexWriterConfig());
+            var local = new ByteBuffersDirectory()
+        ) {
             writer.addDocument(document("base"));
             writer.commit();
             final var commit = DirectoryReader.listCommits(source).get(0);

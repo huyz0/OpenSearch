@@ -1038,3 +1038,35 @@ reserve parsed/encoded bytes, and keep one pending operation through verified
 semantic/native application. Any failure after speculative preparation requires
 fencing the private context. Native physical completion alone is not logical
 acceptance or reader visibility. Client storage-mode integration remains disabled.
+
+### Local private preparation rebuild
+
+`PrivatePreparationResources.openCommitted` clones a quiescent, verified serving
+prefix into a fresh admitted private generation. The host must hold its ownership,
+mutation, schema and lifecycle permits, supply the exact contiguous native sequence
+and accepted term, and reserve source-pin SSD capacity. The factory checks the
+current sequence, native term floor, mapper identity/version and delete-GC policy;
+it does not establish journal authority or replace the logical ownership driver.
+
+The immutable commit files remain at the source behind a Lucene commit pin and a
+separate store reference. A bounded overlay reads exactly that file set, with all
+outputs, locks, deletes and commit/translog metadata written locally. Old documents
+keep their indexed fields even when the current mapper can index additional fields;
+rebuild never reparses their source. A new private translog UUID and committed
+checkpoint preserve native sequence generation without adopting speculative data.
+
+Recent delete versions require more than a commit-file clone. Core's protected,
+serverless-independent snapshot hooks copy bounded UID/version/sequence/term and
+original native timestamps, tied to the same shard, history, contiguous checkpoint,
+process clock and GC policy. Restore is restricted to a pristine clone before any
+operation. The original source-engine expiry remains in force, including disabled
+GC. This process-local transfer is not a durable or cross-node delete-state format.
+
+Resident admission includes retained file metadata and both temporary/native delete
+state copies. Native buffer spilling remains subject to the existing ceiling;
+retained recent delete state can cause explicit refusal rather than silent eviction.
+The source store pin survives serving-owner close and is released after private IO
+closes. Uncertain native initialization retains its pin, generation and admission
+in quarantine. The current remote cache and tiered backends are refused: their
+independent object/cache GC requires an immutable-file lease before such a source
+can be used safely. No client storage-mode activation is implied by this factory.

@@ -8,9 +8,12 @@
 
 package org.opensearch.serverless.engine;
 
+import org.opensearch.index.engine.DeleteVersionMapSnapshot;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.engine.SegmentsStats;
+
+import java.io.IOException;
 
 /** Native private engine with constant-space writer/version-map accounting, without walking readers. */
 final class PrivatePreparationEngine extends InternalEngine {
@@ -18,6 +21,10 @@ final class PrivatePreparationEngine extends InternalEngine {
 
     PrivatePreparationEngine(EngineConfig configuration) {
         super(configuration);
+    }
+
+    void installDeleteVersions(DeleteVersionMapSnapshot snapshot) throws IOException {
+        restoreDeleteVersions(snapshot);
     }
 
     /** Estimates native buffers only, including tombstones and bytes moving through refresh/flush. */
