@@ -1079,6 +1079,48 @@ public final class RatisJournal implements Closeable {
     }
 
     /**
+     * Reads one physically committed coordinate, for example an original outcome located by verified
+     * semantic replay. The coordinate alone is not logical acceptance or latest-read authority.
+     * The host must reserve a frame's result budget and use a bounded worker before calling this.
+     * Missing history is refused; it never becomes permission to execute the request again.
+     * @param assignment permanent catalog-loaded logical assignment
+     * @param checkpoint exact expected historical coordinate, including entry term
+     * @return verified physical frame; semantic acceptance must be established separately
+     * @throws IOException on uncommitted, missing, mismatched or invalid history
+     */
+    public CommittedOperation readCommitted(LogicalStreamRecord assignment, LogCheckpoint checkpoint) throws IOException {
+        verifyLogicalStream(assignment);
+        Objects.requireNonNull(checkpoint);
+        if (checkpoint.logId().equals(assignment.stream()) == false || checkpoint.index() < 0) {
+            throw new IOException("historical coordinate differs from logical assignment");
+        }
+        final var division = division(assignment.group());
+        final var log = division.getRaftLog();
+        final long committed = Math.min(log.getLastCommittedIndex(), division.getInfo().getLastAppliedIndex());
+        if (checkpoint.index() > committed || checkpoint.index() < log.getStartIndex()) {
+            throw new IOException("historical coordinate is uncommitted or requires archive recovery");
+        }
+        final var entry = log.get(checkpoint.index());
+        if (entry == null
+            || entry.getIndex() != checkpoint.index()
+            || entry.getTerm() != checkpoint.entryTerm()
+            || entry.hasStateMachineLogEntry() == false) {
+            throw new IOException("historical coordinate is missing or differs from committed entry");
+        }
+        final var data = entry.getStateMachineLogEntry().getLogData();
+        if (data.size() > assignment.maximumPayloadBytes() + 512L) {
+            throw new IOException("historical frame exceeds logical assignment limit");
+        }
+        final var operation = decodeOperation(data);
+        if (operation.logId().equals(assignment.stream()) == false
+            || operation.kind() != OperationEnvelope.Kind.LOGICAL
+            || operation.payloadLength() > assignment.maximumPayloadBytes()) {
+            throw new IOException("historical frame differs from logical assignment");
+        }
+        return new CommittedOperation(operation, new LogCheckpoint(assignment.stream(), entry.getIndex(), entry.getTerm()));
+    }
+
+    /**
      * Reports local leader readiness as a routing hint. This is not quorum read authority.
      * @param groupId assigned physical group
      * @return whether the local member currently reports a ready leader role

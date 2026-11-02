@@ -107,6 +107,38 @@ public class LogicalJournalTests extends JournalTestCase {
             final var reconstructed = new LogicalStreamReplay(replacement, group, stream, 4, 16384).poll(100, 65536);
             assertEquals(batch.state(), reconstructed.state());
             assertEquals(receipts, reconstructed.receipts());
+            final var assignment = new LogicalStreamRecord(stream, group, replacement.groupActivation(group).checkpoint(), 4, 16384);
+            final var original = replacement.readCommitted(assignment, originalCp);
+            assertEquals(originalCp, original.checkpoint());
+            final var recoveredMutation = LogicalCommand.decode(original.operation().payloadReader().readAllBytes(), 16384);
+            assertEquals(mutation.requestId(), recoveredMutation.requestId());
+            assertEquals(LogicalCommand.Action.MUTATION, recoveredMutation.action());
+            assertArrayEquals(new byte[] { 7 }, recoveredMutation.payloadReader().readAllBytes());
+            final var recoveredOutcome = LogicalCommand.decode(
+                replacement.readCommitted(assignment, outcomeCp).operation().payloadReader().readAllBytes(),
+                16384
+            );
+            assertEquals(outcome.requestId(), recoveredOutcome.requestId());
+            assertEquals(LogicalCommand.Action.OUTCOME_ONLY, recoveredOutcome.action());
+            final var retryFrame = LogicalCommand.decode(
+                replacement.readCommitted(assignment, duplicateCp).operation().payloadReader().readAllBytes(),
+                16384
+            );
+            assertEquals(LogicalCommand.Action.OUTCOME_ONLY, retryFrame.action());
+            assertArrayEquals(new byte[] { 99 }, retryFrame.payloadReader().readAllBytes());
+            expectThrows(
+                IOException.class,
+                () -> replacement.readCommitted(assignment, new LogCheckpoint(stream, originalCp.index(), originalCp.entryTerm() + 1))
+            );
+            expectThrows(
+                IOException.class,
+                () -> replacement.readCommitted(assignment, new LogCheckpoint(stream, staleCp.index() + 100, staleCp.entryTerm()))
+            );
+            final var otherStream = new ShardLogId(stream.deploymentId(), "other-index", 0, UUID.randomUUID());
+            expectThrows(
+                IOException.class,
+                () -> replacement.readCommitted(assignment, new LogCheckpoint(otherStream, originalCp.index(), originalCp.entryTerm()))
+            );
         } finally {
             closeAll(journals);
         }

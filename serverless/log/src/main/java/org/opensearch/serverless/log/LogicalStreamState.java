@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -158,6 +159,39 @@ public final class LogicalStreamState {
     }
 
     /**
+     * Checks a request before expensive preparation, without retaining its input or resolving a
+     * script. An empty result means only that this folded prefix has no retained accepted identity;
+     * it does not prove that execution is safe, that no later proposal committed or that the caller
+     * owns the stream. The host still needs its committed ownership barrier and exclusive sequencer.
+     * @param requestId stable internal request UUID
+     * @param action request domain; mutation and outcome-only share the client request domain
+     * @param firstObservedIndex immutable original physical observation
+     * @param requestDigest 32-byte digest of the original input
+     * @return original accepted checkpoint, explicit refusal, or unknown in this prefix
+     */
+    public Optional<Decision> knownOutcome(UUID requestId, LogicalCommand.Action action, long firstObservedIndex, byte[] requestDigest) {
+        Objects.requireNonNull(requestId);
+        Objects.requireNonNull(action);
+        if (firstObservedIndex < -1 || Objects.requireNonNull(requestDigest).length != 32) {
+            throw new IllegalArgumentException("invalid logical request identity");
+        }
+        if (legacyHistory) {
+            return Optional.of(reject(Rejection.LEGACY_HISTORY));
+        }
+        final var previous = outcomes.get(requestId);
+        if (previous != null) {
+            return Optional.of(matchOutcome(previous, action, firstObservedIndex, requestDigest));
+        }
+        if (retired) {
+            return Optional.of(reject(Rejection.RETIRED));
+        }
+        if (firstObservedIndex < minimumRequestIndex) {
+            return Optional.of(reject(Rejection.OBSERVATION_EXPIRED));
+        }
+        return Optional.empty();
+    }
+
+    /**
      * Observes an untyped old-protocol record while reconstructing the prefix.
      * @param checkpoint verified physical position for this stream
      * @return whether legacy application remains allowed; false after logical activation
@@ -199,12 +233,7 @@ public final class LogicalStreamState {
         }
         final var previous = outcomes.get(command.requestId());
         if (previous != null) {
-            if (retryActionMatches(previous.action(), command.action()) == false
-                || previous.observedIndex() != command.firstObservedIndex()
-                || Arrays.equals(previous.digest(), command.requestDigest()) == false) {
-                return reject(Rejection.IDENTITY_CONFLICT);
-            }
-            return new Decision(Status.DUPLICATE, Rejection.NONE, previous.checkpoint());
+            return matchOutcome(previous, command.action(), command.firstObservedIndex(), command.requestDigest());
         }
         if (retired) {
             return reject(Rejection.RETIRED);
@@ -304,6 +333,15 @@ public final class LogicalStreamState {
             case OUTCOME_ONLY -> proposed == LogicalCommand.Action.MUTATION;
             default -> false;
         };
+    }
+
+    private static Decision matchOutcome(Seen previous, LogicalCommand.Action action, long observed, byte[] digest) {
+        if (retryActionMatches(previous.action(), action) == false
+            || previous.observedIndex() != observed
+            || Arrays.equals(previous.digest(), digest) == false) {
+            return reject(Rejection.IDENTITY_CONFLICT);
+        }
+        return new Decision(Status.DUPLICATE, Rejection.NONE, previous.checkpoint());
     }
 
     private static Decision reject(Rejection rejection) {

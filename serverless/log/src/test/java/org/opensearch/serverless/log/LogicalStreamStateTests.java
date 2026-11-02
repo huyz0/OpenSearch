@@ -187,6 +187,71 @@ public class LogicalStreamStateTests extends OpenSearchTestCase {
         assertEquals(2, fixture.state.view().retainedOutcomes());
     }
 
+    public void testOutcomeLookupDoesNotChangeStateOrRefreshRetention() throws Exception {
+        final var fixture = active(2);
+        final var mutation = command(LogicalCommand.Action.MUTATION, FIRST, 0, 1);
+        final var original = fixture.step(mutation, 1, 1, 1);
+        assertAccepted(original);
+        final var before = fixture.state.view();
+        for (int i = 0; i < 10; i++) {
+            final var found = fixture.state.knownOutcome(
+                mutation.requestId(),
+                LogicalCommand.Action.OUTCOME_ONLY,
+                mutation.firstObservedIndex(),
+                mutation.requestDigest()
+            ).orElseThrow();
+            assertEquals(LogicalStreamState.Status.DUPLICATE, found.status());
+            assertEquals(original.originalCheckpoint(), found.originalCheckpoint());
+        }
+        assertEquals(before, fixture.state.view());
+        assertTrue(fixture.state.knownOutcome(UUID.randomUUID(), LogicalCommand.Action.MUTATION, 2, new byte[32]).isEmpty());
+        final byte[] changed = mutation.requestDigest();
+        changed[0] ^= 1;
+        assertRejected(
+            LogicalStreamState.Rejection.IDENTITY_CONFLICT,
+            fixture.state.knownOutcome(mutation.requestId(), mutation.action(), mutation.firstObservedIndex(), changed).orElseThrow()
+        );
+        assertAccepted(fixture.step(command(LogicalCommand.Action.MUTATION, FIRST, 1, 2), 1, 1, 1));
+        assertAccepted(fixture.step(command(LogicalCommand.Action.MUTATION, FIRST, 2, 3), 1, 1, 1));
+        assertRejected(
+            LogicalStreamState.Rejection.OBSERVATION_EXPIRED,
+            fixture.state.knownOutcome(mutation.requestId(), mutation.action(), mutation.firstObservedIndex(), mutation.requestDigest())
+                .orElseThrow()
+        );
+        assertEquals(2, fixture.state.view().retainedOutcomes());
+    }
+
+    public void testRetiredOutcomeLookupKeepsOriginalResultsAndRejectsUnknownRequests() throws Exception {
+        final var fixture = active(8);
+        final var outcome = command(LogicalCommand.Action.OUTCOME_ONLY, FIRST, -1, 1);
+        final var original = fixture.step(outcome, 1, 1, 1);
+        assertAccepted(original);
+        assertAccepted(fixture.step(command(LogicalCommand.Action.RETIRE, FIRST, -1, 2), 1, 1, 1));
+        final var before = fixture.state.view();
+        assertEquals(
+            original.originalCheckpoint(),
+            fixture.state.knownOutcome(
+                outcome.requestId(),
+                LogicalCommand.Action.MUTATION,
+                outcome.firstObservedIndex(),
+                outcome.requestDigest()
+            ).orElseThrow().originalCheckpoint()
+        );
+        assertRejected(
+            LogicalStreamState.Rejection.RETIRED,
+            fixture.state.knownOutcome(UUID.randomUUID(), LogicalCommand.Action.MUTATION, 3, new byte[32]).orElseThrow()
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> fixture.state.knownOutcome(UUID.randomUUID(), LogicalCommand.Action.MUTATION, -2, new byte[32])
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> fixture.state.knownOutcome(UUID.randomUUID(), LogicalCommand.Action.MUTATION, 3, new byte[31])
+        );
+        assertEquals(before, fixture.state.view());
+    }
+
     public void testOutcomeOnlyAndExactSchemaPointerDoNotMintDocumentSequenceNumbers() throws Exception {
         final var fixture = active(8);
         final var view = fixture.state.view();

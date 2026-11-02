@@ -944,3 +944,22 @@ before `journal-binding` creation. The file-based bootstrap test also exposed an
 actual configuration mismatch: its default wire limits differed from its fixture
 companions. It now explicitly declares the common protocol while retaining local
 resource allowances. No client quorum storage mode is enabled by these checks.
+
+
+The folded stream now supports a bounded request-identity lookup before expensive
+payload preparation. It returns a retained original checkpoint, explicit refusal
+or unknown without advancing the physical cursor or refreshing FIFO retention.
+`LogicalStreamReplay` serializes this lookup and returns its inspected physical
+prefix; a partially failed cursor refuses further lookup. Unknown is not permission
+to execute: the host still needs its committed ownership barrier, a caught-up
+consumer and exclusion of ambiguous in-flight proposals.
+
+`RatisJournal.readCommitted` retrieves one exact historical physical frame using
+the permanent assignment and expected entry term. It checks the locally applied
+committed prefix, history availability, logical identity, frame kind, checksum and
+payload admission. Original results can therefore be fetched on demand without
+retaining opaque result bodies in the identity cache or rescanning the prefix.
+The caller must reserve a frame's result budget and use a bounded worker. Reading
+a physical coordinate alone does not establish semantic acceptance or latest-read
+authority; use the canonical checkpoint from verified logical outcome evaluation.
+Missing history never authorizes executing the ambiguous request again.

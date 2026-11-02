@@ -448,3 +448,15 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   catalog/controller cases across three iterations, shell check and root precommit
   (1m59s). Existing experimental groups without this contract are refused; no
   automatic metadata upgrade or client quorum storage mode is enabled.
+
+- Retry recovery now exposes a bounded identity lookup before payload preparation
+  and a direct verified read of the original physical result frame. Lookups do not
+  scan, advance state or extend outcome retention, and partial replay failure
+  fences them. Unknown means only unknown in the inspected prefix, requiring the
+  ownership barrier and exclusive sequencer before execution. Historical reads
+  verify assignment, committed/applied prefix, stream, entry term, frame integrity
+  and payload bounds; they do not assert logical acceptance or latest authority.
+  Tests cover expiry, retirement, identity conflicts, cursor progress and original
+  mutation/result-only bytes after leader loss, plus invalid coordinates. The run
+  passed 333 unit and six native logical cases across three iterations with root
+  precommit (1m24s). Opaque outcome payloads remain in the log rather than the cache.

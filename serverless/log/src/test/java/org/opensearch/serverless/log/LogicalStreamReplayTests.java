@@ -77,6 +77,40 @@ public class LogicalStreamReplayTests extends OpenSearchTestCase {
         expectThrows(UnsupportedOperationException.class, () -> last.receipts().clear());
     }
 
+    public void testIdentityLookupUsesItsFoldedPrefixWithoutScanningOrRetainingPayloads() throws Exception {
+        final var calls = new AtomicInteger();
+        final var owner = command(LogicalCommand.Action.OWNERSHIP, FIRST, 0, -1);
+        final var schema = command(LogicalCommand.Action.SCHEMA, FIRST, 0, 0);
+        final var mutation = command(LogicalCommand.Action.MUTATION, FIRST, 0, 1);
+        final var replay = new LogicalStreamReplay((after, entries, bytes) -> {
+            calls.incrementAndGet();
+            return new RatisJournal.ScanBatch(
+                List.of(record(0, owner, 1, 1, 0), record(1, schema, 1, 1, 1), record(2, mutation, 1, 1, 1)),
+                8,
+                8
+            );
+        }, STREAM, 8, 4096);
+        final var unseen = replay.knownOutcome(
+            mutation.requestId(),
+            mutation.action(),
+            mutation.firstObservedIndex(),
+            mutation.requestDigest()
+        );
+        assertTrue(unseen.outcome().isEmpty());
+        assertEquals(-1, unseen.throughIndex());
+        assertEquals(0, calls.get());
+        replay.poll(16, 4096);
+        final var found = replay.knownOutcome(
+            mutation.requestId(),
+            LogicalCommand.Action.OUTCOME_ONLY,
+            mutation.firstObservedIndex(),
+            mutation.requestDigest()
+        );
+        assertEquals(8, found.throughIndex());
+        assertEquals(2, found.outcome().orElseThrow().originalCheckpoint().index());
+        assertEquals(1, calls.get());
+    }
+
     public void testLegacyHistoryAndRawInjectionCannotBecomeLogicalEffects() throws Exception {
         final var raw = new RatisJournal.CommittedOperation(
             new OperationEnvelope(STREAM, OperationEnvelope.Kind.DOCUMENTS, 1, 1, 1, new byte[] { 7 }),
@@ -115,6 +149,7 @@ public class LogicalStreamReplayTests extends OpenSearchTestCase {
         expectThrows(IOException.class, () -> replay.poll(16, 4096));
         assertTrue(expectThrows(IOException.class, () -> replay.poll(16, 4096)).getMessage().contains("earlier failure"));
         assertEquals(1, calls.get());
+        expectThrows(IOException.class, () -> replay.knownOutcome(UUID.randomUUID(), LogicalCommand.Action.OWNERSHIP, -1, new byte[32]));
     }
 
     public void testMissingHistoryStopsInsteadOfSkippingToTheCurrentPrefix() throws Exception {

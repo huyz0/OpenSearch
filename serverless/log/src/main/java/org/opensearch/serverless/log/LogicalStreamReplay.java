@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -35,6 +36,15 @@ public final class LogicalStreamReplay {
      */
     @InternalApi
     public record Receipt(LogCheckpoint checkpoint, LogicalStreamState.Decision decision) {
+    }
+
+    /**
+     * A bounded identity lookup at one historical replay position, not latest-read or write authority.
+     * @param outcome original result/refusal, or unknown in this folded prefix
+     * @param throughIndex physical prefix inspected by this cursor
+     */
+    @InternalApi
+    public record Lookup(Optional<LogicalStreamState.Decision> outcome, long throughIndex) {
     }
 
     /**
@@ -112,6 +122,24 @@ public final class LogicalStreamReplay {
         Objects.requireNonNull(group);
         final var selection = Set.of(stream);
         return (afterIndex, entries, bytes) -> journal.scan(group, afterIndex, selection, entries, bytes);
+    }
+
+    /**
+     * Looks up an identity without decoding a payload or scanning the log. Unknown does not authorize
+     * preparation: ownership fencing and exclusion of ambiguous in-flight proposals remain required.
+     * @param requestId stable internal UUID
+     * @param action original request domain
+     * @param firstObservedIndex immutable initial observation
+     * @param requestDigest original-input digest
+     * @return immutable lookup and its exact replay progress
+     * @throws IOException if partial replay failure has fenced this cursor
+     */
+    public synchronized Lookup knownOutcome(UUID requestId, LogicalCommand.Action action, long firstObservedIndex, byte[] requestDigest)
+        throws IOException {
+        if (failure != null) {
+            throw new IOException("logical replay is stopped after an earlier failure", failure);
+        }
+        return new Lookup(state.knownOutcome(requestId, action, firstObservedIndex, requestDigest), throughIndex);
     }
 
     /**
