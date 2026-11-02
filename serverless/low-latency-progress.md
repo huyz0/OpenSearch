@@ -599,3 +599,15 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   delete and no-op results and accept independently decoded equivalents. All 87
   gate/dispatcher/codec cases passed across three iterations with shell check and
   root precommit (31s). Host lifecycle/frontend integration remains pending.
+
+- The shared prepared-request dependency gate now supports result-only and mutation
+  proposal/result types through the same pending, cancellation, work-drain and
+  fencing rules. Result verification is mandatory before success. The mutation
+  facade keeps exact resolution/checkpoint matching. Tests cover result-only
+  cancellation without canceling persistence, failed/missing verification, close
+  and late commitment, with work/verification outside the actual state monitor.
+  The TLS no-op flow runs retry lookup before native translation, append, applied
+  catch-up and canonical status/body recovery on a bounded worker through the gate.
+  All 234 selected engine/gate cases and 18 native replay cases passed across three
+  iterations with shell check and root precommit (3m24s). Host admission/dispatch,
+  lifecycle and frontend integration remain; client quorum mode is off.

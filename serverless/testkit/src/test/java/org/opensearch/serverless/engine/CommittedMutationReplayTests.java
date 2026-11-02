@@ -292,40 +292,99 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                     } while (progress.throughIndex() < retryCp.index());
                     assertEquals(0, applier.lastSequenceNumber());
                     assertEquals(cp, applier.lastAppliedCheckpoint().orElseThrow());
-                    final ResolvedResultOnly noOpResult;
+                    final UUID noOpId = UUID.randomUUID();
+                    final var originalNoOpValue = new java.util.concurrent.atomic.AtomicReference<ResolvedResultOnly>();
+                    final Map.Entry<LogCheckpoint, ResolvedResultOnly> noOpReceipt;
                     try (
-                        var scripts = new org.opensearch.script.ScriptService(
-                            Settings.EMPTY,
-                            Map.of(
-                                org.opensearch.script.MockScriptEngine.NAME,
-                                new org.opensearch.script.MockScriptEngine(org.opensearch.script.MockScriptEngine.NAME, Map.of(), Map.of())
-                            ),
-                            org.opensearch.script.ScriptModule.CORE_CONTEXTS
+                        var worker = org.opensearch.common.util.concurrent.OpenSearchExecutors.newFixed(
+                            "logical-result-probe",
+                            1,
+                            4,
+                            org.opensearch.common.util.concurrent.OpenSearchExecutors.daemonThreadFactory("logical-result-probe"),
+                            threadPool.getThreadContext()
                         )
                     ) {
-                        final var plan = new PrivateUpdatePreparer(preparation, serving, scripts).prepare(
-                            new org.opensearch.action.update.UpdateRequest(serving.shardId().getIndexName(), "id").doc(
-                                new org.opensearch.action.index.IndexRequest().source("{}", MediaTypeRegistry.JSON)
-                            ),
-                            () -> 123
-                        );
-                        assertEquals(org.opensearch.action.DocWriteResponse.Result.NOOP, plan.getResponseResult());
-                        noOpResult = ResolvedResultOnly.noOp(plan.action(), LogicalCommand.maximumBodyBytes(16384));
+                        final var gate = new PreparationDependencyGate<
+                            PreparedLogicalResultOnly,
+                            Map.Entry<LogCheckpoint, ResolvedResultOnly>>(
+                                worker,
+                                packetOnly -> packetOnly.appendTo(fixture.leader),
+                                (packetOnly, committed) -> {
+                                    LogicalOwnershipSession.Progress appliedProgress;
+                                    do {
+                                        appliedProgress = session.advance(100, 65536);
+                                    } while (appliedProgress.throughIndex() < committed.index());
+                                    final var commandOnly = packetOnly.command();
+                                    final var known = session.knownClientOutcome(
+                                        commandOnly.requestId(),
+                                        commandOnly.firstObservedIndex(),
+                                        commandOnly.requestDigest()
+                                    ).outcome().orElseThrow();
+                                    final var canonical = known.originalCheckpoint();
+                                    final var raw = fixture.leader.readCommitted(assignment, canonical);
+                                    final var saved = LogicalCommand.decode(raw.operation().payloadReader().readAllBytes(), 16384);
+                                    return Map.entry(
+                                        canonical,
+                                        ResolvedResultOnly.decode(
+                                            saved.payloadReader().readAllBytes(),
+                                            LogicalCommand.maximumBodyBytes(16384)
+                                        )
+                                    );
+                                },
+                                (packetOnly, committed, appliedOnly) -> {
+                                    if (committed.equals(appliedOnly.getKey()) == false
+                                        || appliedOnly.getValue().status() != originalNoOpValue.get().status()
+                                        || java.util.Arrays.equals(
+                                            appliedOnly.getValue().json(),
+                                            originalNoOpValue.get().json()
+                                        ) == false) {
+                                        throw new IOException("result-only application returned a different original response");
+                                    }
+                                }
+                            );
+                        try {
+                            noOpReceipt = gate.submit(() -> {
+                                assertTrue(session.knownClientOutcome(noOpId, retryCp.index(), new byte[32]).outcome().isEmpty());
+                                try (
+                                    var scripts = new org.opensearch.script.ScriptService(
+                                        Settings.EMPTY,
+                                        Map.of(
+                                            org.opensearch.script.MockScriptEngine.NAME,
+                                            new org.opensearch.script.MockScriptEngine(
+                                                org.opensearch.script.MockScriptEngine.NAME,
+                                                Map.of(),
+                                                Map.of()
+                                            )
+                                        ),
+                                        org.opensearch.script.ScriptModule.CORE_CONTEXTS
+                                    )
+                                ) {
+                                    final var plan = new PrivateUpdatePreparer(preparation, serving, scripts).prepare(
+                                        new org.opensearch.action.update.UpdateRequest(serving.shardId().getIndexName(), "id").doc(
+                                            new org.opensearch.action.index.IndexRequest().source("{}", MediaTypeRegistry.JSON)
+                                        ),
+                                        () -> 123
+                                    );
+                                    assertEquals(org.opensearch.action.DocWriteResponse.Result.NOOP, plan.getResponseResult());
+                                    final var value = ResolvedResultOnly.noOp(plan.action(), LogicalCommand.maximumBodyBytes(16384));
+                                    originalNoOpValue.set(value);
+                                    return PreparedLogicalResultOnly.create(
+                                        assignment,
+                                        session.ownership().orElseThrow(),
+                                        preparation,
+                                        noOpId,
+                                        value,
+                                        retryCp.index(),
+                                        new byte[32]
+                                    );
+                                }
+                            }).toCompletableFuture().get(10, TimeUnit.SECONDS);
+                        } finally {
+                            gate.closeAsync().toCompletableFuture().get(10, TimeUnit.SECONDS);
+                        }
                     }
-                    final UUID noOpId = UUID.randomUUID();
-                    final var noOpPacket = PreparedLogicalResultOnly.create(
-                        assignment,
-                        session.ownership().orElseThrow(),
-                        preparation,
-                        noOpId,
-                        noOpResult,
-                        retryCp.index(),
-                        new byte[32]
-                    );
-                    final var noOpCp = noOpPacket.appendTo(fixture.leader).toCompletableFuture().get(10, TimeUnit.SECONDS);
-                    do {
-                        progress = session.advance(100, 65536);
-                    } while (progress.throughIndex() < noOpCp.index());
+                    final var noOpCp = noOpReceipt.getKey();
+                    final var noOpResult = noOpReceipt.getValue();
                     assertEquals(0, applier.lastSequenceNumber());
                     assertEquals(0, preparation.engine().getProcessedLocalCheckpoint());
                     final var knownNoOp = session.knownClientOutcome(noOpId, retryCp.index(), new byte[32]).outcome().orElseThrow();

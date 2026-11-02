@@ -1162,3 +1162,25 @@ The comparison reads owned fields without copying source buffers and accepts an
 independently decoded equivalent operation. It checks delete document IDs directly
 rather than relying on native delete equality, which omits that field. A mismatch
 fences the context before success completion.
+
+### Shared prepared-request dependency gate
+
+`PreparationDependencyGate` holds one pending prepared request through physical
+append, ordered application and mandatory result verification. It supports both
+mutation and result-only proposal/result types; no fake document operation or
+sequence is needed for a no-op. The mutation facade retains exact resolution and
+checkpoint checks. A supplied verifier must validate the original request/result
+identity and applicable canonical checkpoint before success is released.
+
+Native work, verification and completion callbacks run outside the state monitor.
+Cancellation does not cancel accepted persistence or release the pending gate.
+Close waits for actual preparation/application work, not an unresolved quorum
+future, and drops queued payload/callback references after work drains. The host
+still supplies bounded group workers, request/resident admission, verified replay
+and ownership/schema/lifecycle gates. The general gate does not supply those proofs.
+
+The TLS no-op history now performs retry lookup, native private translation,
+result-only proposal, applied-prefix catch-up and original response recovery through
+this gate on a bounded worker. The old mutation facade and dispatcher tests cover
+the same state/work accounting; direct result-only tests cover cancellation,
+mandatory verification, failed verification and late commitment after close.
