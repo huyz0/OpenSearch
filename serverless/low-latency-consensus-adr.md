@@ -775,3 +775,27 @@ the initial write. The surviving leader exceeded its 300-ms election timeout
 while that voter was still behind. This fault history now verifies the initial
 committed prefix on every voter before injecting the disk failure; it still
 requires a healthy majority and refuses a second ACK from the failed disk.
+
+
+## Logical control payload groundwork
+
+`LogicalCommand` defines an engine-independent, versioned payload for ownership
+claims, schema definitions, resolved mutations, outcome-only records and stream
+retirement. Identity includes an internal request UUID, its original observed
+physical-log index and a digest of the original input. Those fields stay stable
+across possibly executed retries, including after owner changes. The digest is
+not a substitute for authentication or the enclosing envelope's checksum.
+
+The codec uses explicit action codes, fixed-width identity fields, strict
+per-action arguments and payload presence, bounded decoding and complete-size
+admission before encoding allocation. It owns its arrays and exposes read-only
+payload streams. This is a protocol building block: no journal runtime decision,
+authoritative owner transition, retry cache or client storage mode is enabled by
+serializing one of these commands. Committed semantic validation and receipts,
+bounded outcome retention and controlled replay remain the next integration work.
+
+In particular, an evicted retry UUID must not become an apparently new mutation.
+The committed controller must use the original observation/retention fence to
+report an explicit expired/unknown outcome when it cannot safely establish the
+original result. A coordinator must not renew an ambiguous request's identity or
+observation and then blindly execute it again.

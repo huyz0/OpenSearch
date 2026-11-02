@@ -366,3 +366,11 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   Capacity estimates now include the separate preparation budget and worker stacks;
   they still do not qualify parsed documents, plugins, real JVM residency or cloud
   throughput. Engine/resource lifecycle and durable logical controls remain pending.
+
+- Logical control payload groundwork: a bounded versioned codec for ownership,
+  schema, mutation, outcome-only and retirement actions. Retry identity retains
+  the original UUID, physical-log observation and input digest. Golden encoding,
+  malformed/truncated/oversized inputs, action-specific fields, mutable aliases
+  and envelope integrity are covered. The log suite passed 249 cases over three
+  iterations, with root precommit. This codec does not yet implement committed
+  logical authority, outcome retention or controlled replay in the runtime.
